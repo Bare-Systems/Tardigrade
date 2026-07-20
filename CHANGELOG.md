@@ -24,8 +24,29 @@ All notable user-facing changes to Tardigrade are documented here.
   in any profile. `tardi check` performs the complete credential preflight
   without binding sockets, and hot reload rejects credential-affecting
   configuration changes in the appliance profile instead of silently keeping
-  stale credentials. See `docs/BARE_APPLIANCE_TLS.md` for the full supported
-  and unsupported contract.
+  stale credentials — including turning TLS on or off relative to how the
+  process started, independent of whether it happened to construct a
+  credential owner at startup. `tardi run` performs the identical preflight
+  before any daemon fork, PID file, or master/worker startup, so invalid
+  credentials are reported synchronously with exit code 2 rather than as a
+  false "started" daemon message or a master worker-respawn loop.
+  Every certificate-chain entry beyond the leaf is now parsed and validated
+  for chain coherence — issuer/subject linkage, CA `basicConstraints`/
+  `keyUsage`, and inter-certificate signature verification — proving an
+  independent client can actually walk the transmitted chain to a trusted
+  root, not merely that each entry is individually well-formed DER; the
+  leaf's SAN is bound to the configured server name (RFC 9525, SAN-only),
+  and its SPKI AlgorithmIdentifier is required to carry no parameters at
+  all. The Certificate-flight size preflight now reuses the handshake
+  writer's own exported framing constants instead of an approximate
+  headroom, proven writer-identical by tests driving the real writer at
+  that exact boundary for both the native TCP and HTTP/3 profiles. The
+  appliance profile also rejects, deterministically, active configuration
+  its engine cannot honor (non-1.3 TLS versions, cipher selection, client
+  certificate verification, OCSP/CRL/ACME, session resumption, and
+  HTTP/3 0-RTT/connection migration or HTTP/3 without a complete identity).
+  See `docs/BARE_APPLIANCE_TLS.md` for the full supported and unsupported
+  contract.
 - **Negotiated HTTPS protocol dispatch foundation (#356, refs #355, epic #325)** —
   adds a transport-neutral HTTP dispatch seam that receives only an
   authenticated encrypted byte stream plus a typed negotiated protocol

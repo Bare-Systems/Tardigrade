@@ -724,7 +724,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     var tls_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_KEY_PATH", "") catch unreachable;
     errdefer allocator.free(tls_key_path);
-    const tls_min_version = envOrDefault(allocator, "TARDIGRADE_TLS_MIN_VERSION", "1.2") catch unreachable;
+    // The appliance profile's native engine is TLS 1.3-only regardless of
+    // this setting; default it to "1.3" there instead of the general
+    // profile's "1.2" so an operator who never touches it gets a config
+    // that accurately describes what the engine does, and an explicit
+    // override to anything else is caught by validateApplianceTlsProfile.
+    const tls_min_version = envOrDefault(allocator, "TARDIGRADE_TLS_MIN_VERSION", if (is_appliance_tls_profile) "1.3" else "1.2") catch unreachable;
     errdefer allocator.free(tls_min_version);
     const tls_max_version = envOrDefault(allocator, "TARDIGRADE_TLS_MAX_VERSION", "1.3") catch unreachable;
     errdefer allocator.free(tls_max_version);
@@ -745,10 +750,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(tls_sni_certs);
     }
-    const tls_session_cache_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_SESSION_CACHE", true);
+    // Session cache/tickets are OpenSSL-terminator-only features this
+    // owner never constructs in the appliance profile; default them off
+    // there (general profile keeps its on-by-default resumption behavior)
+    // so an operator who never touches these gets an accurate config, and
+    // an explicit override to `true` is caught by validateApplianceTlsProfile.
+    const tls_session_cache_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_SESSION_CACHE", !is_appliance_tls_profile);
     const tls_session_cache_size = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_SESSION_CACHE_SIZE", 20_480);
     const tls_session_timeout_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS", 300);
-    const tls_session_tickets_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_SESSION_TICKETS", true);
+    const tls_session_tickets_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_SESSION_TICKETS", !is_appliance_tls_profile);
     const tls_ocsp_stapling_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_OCSP_STAPLING", false);
     const tls_ocsp_response_path = envOrDefault(allocator, "TARDIGRADE_TLS_OCSP_RESPONSE_PATH", "") catch unreachable;
     errdefer allocator.free(tls_ocsp_response_path);
@@ -2614,6 +2624,69 @@ fn validateTlsServerNamePolicy(cfg: *const EdgeConfig) !void {
     }
 }
 
+/// Reject appliance-profile configuration that requests behavior the native
+/// engine cannot honor, rather than silently accepting it and either
+/// dropping every connection at runtime (client-cert verification), doing
+/// nothing (OCSP/CRL/ACME/session resumption — all OpenSSL-terminator-only
+/// features this owner never constructs), or binding a UDP socket that can
+/// never bootstrap (HTTP/3 without a complete identity). Every check here
+/// is a request the operator explicitly made — none of the fields checked
+/// default to a rejected value in the appliance profile (`loadFromEnv` sets
+/// appliance-appropriate defaults for `tls_min_version` and the session
+/// cache/ticket flags), so a config that never touches these settings
+/// always passes.
+fn validateApplianceTlsProfile(cfg: *const EdgeConfig) !void {
+    if (!is_appliance_tls_profile) return;
+
+    if (cfg.http3_enabled and !hasTlsFiles(cfg)) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile requires TARDIGRADE_TLS_CERT_PATH/TARDIGRADE_TLS_KEY_PATH when TARDIGRADE_HTTP3_ENABLED is true; HTTP/3 cannot bootstrap without a complete identity", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
+    if (cfg.http3_enabled and cfg.http3_enable_0rtt) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_HTTP3_ENABLE_0RTT", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
+    if (cfg.http3_enabled and cfg.http3_connection_migration) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_HTTP3_CONNECTION_MIGRATION", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
+
+    if (!hasTlsFiles(cfg)) return;
+
+    if (!std.mem.eql(u8, cfg.tls_min_version, "1.3") or !std.mem.eql(u8, cfg.tls_max_version, "1.3")) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile is TLS 1.3-only; TARDIGRADE_TLS_MIN_VERSION and TARDIGRADE_TLS_MAX_VERSION must both be \"1.3\"", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
+    if (cfg.tls_cipher_list.len > 0 or cfg.tls_cipher_suites.len > 0) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile has a fixed cipher (TLS_AES_128_GCM_SHA256); TARDIGRADE_TLS_CIPHER_LIST/TARDIGRADE_TLS_CIPHER_SUITES must be empty", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
+    if (cfg.tls_client_verify) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_TLS_CLIENT_VERIFY (downstream client certificate verification)", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
+    if (cfg.tls_session_cache_enabled) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_TLS_SESSION_CACHE", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
+    if (cfg.tls_session_tickets_enabled) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_TLS_SESSION_TICKETS", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
+    if (cfg.tls_ocsp_stapling_enabled) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_TLS_OCSP_STAPLING", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
+    if (cfg.tls_crl_check) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_TLS_CRL_CHECK", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
+    if (cfg.tls_acme_enabled) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_TLS_ACME_ENABLED", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
+}
+
 pub fn validate(cfg: *const EdgeConfig) !void {
     if (cfg.listen_port == 0) {
         std.log.err("config validation failed: listen_port must be between 1 and 65535", .{});
@@ -2634,6 +2707,7 @@ pub fn validate(cfg: *const EdgeConfig) !void {
     try validateOptionalFile(cfg.tls_cert_path, "tls_cert_path");
     try validateOptionalFile(cfg.tls_key_path, "tls_key_path");
     try validateTlsServerNamePolicy(cfg);
+    try validateApplianceTlsProfile(cfg);
     for (cfg.tls_sni_certs) |entry| {
         try validateOptionalFile(entry.cert_path, "tls_sni_cert.cert_path");
         try validateOptionalFile(entry.key_path, "tls_sni_cert.key_path");
@@ -3397,6 +3471,97 @@ test "validate TLS cert/key pair rejects mismatched presence" {
     try validateTlsCertKeyPair("/cert.pem", "/key.pem");
     try std.testing.expectError(error.InvalidConfigPath, validateTlsCertKeyPair("/cert.pem", ""));
     try std.testing.expectError(error.InvalidConfigPath, validateTlsCertKeyPair("", "/key.pem"));
+}
+
+test "appliance profile defaults never trip validateApplianceTlsProfile" {
+    if (!is_appliance_tls_profile) return;
+    const allocator = std.testing.allocator;
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    try validateApplianceTlsProfile(&cfg);
+}
+
+test "appliance profile rejects unsupported TLS settings one at a time" {
+    if (!is_appliance_tls_profile) return;
+    const allocator = std.testing.allocator;
+
+    const cert_path = "tests/fixtures/tls/native_ed25519.crt";
+    const key_path = "tests/fixtures/tls/native_ed25519.key";
+
+    var base = try loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    allocator.free(base.tls_cert_path);
+    base.tls_cert_path = try allocator.dupe(u8, cert_path);
+    allocator.free(base.tls_key_path);
+    base.tls_key_path = try allocator.dupe(u8, key_path);
+    allocator.free(base.tls_server_name);
+    base.tls_server_name = try allocator.dupe(u8, "tardigrade.test");
+    try validateApplianceTlsProfile(&base);
+
+    {
+        // `cfg` is a shallow copy of `base` (aliasing its owned slices); do
+        // not free the aliased original, only the fresh override, so
+        // `base.deinit` at the end of this test frees each allocation once.
+        var cfg = base;
+        cfg.tls_min_version = "1.2";
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+    {
+        var cfg = base;
+        cfg.tls_cipher_list = "ECDHE-RSA-AES128-GCM-SHA256";
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+    {
+        var cfg = base;
+        cfg.tls_client_verify = true;
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+    {
+        var cfg = base;
+        cfg.tls_session_cache_enabled = true;
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+    {
+        var cfg = base;
+        cfg.tls_session_tickets_enabled = true;
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+    {
+        var cfg = base;
+        cfg.tls_ocsp_stapling_enabled = true;
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+    {
+        var cfg = base;
+        cfg.tls_crl_check = true;
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+    {
+        var cfg = base;
+        cfg.tls_acme_enabled = true;
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+    {
+        var cfg = base;
+        cfg.http3_enabled = true;
+        cfg.http3_enable_0rtt = true;
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+    {
+        var cfg = base;
+        cfg.http3_enabled = true;
+        cfg.http3_connection_migration = true;
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+}
+
+test "appliance profile rejects HTTP/3 without a complete identity" {
+    if (!is_appliance_tls_profile) return;
+    const allocator = std.testing.allocator;
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    cfg.http3_enabled = true;
+    try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
 }
 
 test "validate mTLS consistency requires CA path when verify is enabled" {

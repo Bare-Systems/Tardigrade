@@ -37,6 +37,7 @@ const crypto = std.crypto;
 const provider = @import("provider.zig");
 const profile = @import("profile.zig");
 const rsa = @import("rsa.zig");
+const secrets = @import("crypto_secrets");
 
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const HmacSha384 = crypto.auth.hmac.sha2.HmacSha384;
@@ -425,6 +426,10 @@ pub const SoftwareSigningKey = struct {
     key_pair: Ed25519.KeyPair,
 
     /// Load from a 32-byte Ed25519 seed (RFC 8032 secret scalar seed).
+    /// General-purpose entry point for callers (tests, fixtures) that do not
+    /// carry the seed in a typed secret container; production callers
+    /// holding one should prefer `fromSeedSecret` instead, which avoids this
+    /// by-value parameter's own caller-side copy.
     pub fn fromSeed(seed: [Ed25519.KeyPair.seed_length]u8) provider.SignError!SoftwareSigningKey {
         // The by-value parameter is itself a caller-owned copy of secret seed
         // bytes; wipe this frame's copy once the deterministic key pair has
@@ -433,6 +438,22 @@ pub const SoftwareSigningKey = struct {
         var local_seed = seed;
         defer crypto.secureZero(u8, &local_seed);
         const key_pair = Ed25519.KeyPair.generateDeterministic(local_seed) catch return error.ProviderFailure;
+        return .{ .key_pair = key_pair };
+    }
+
+    /// Load from a seed already held in a typed `secrets.FixedSecret`
+    /// container (#372), consuming and clearing it. This is the narrow
+    /// bridge a caller with typed secret ownership should use instead of
+    /// `fromSeed`: `seed`'s bytes are copied exactly once into a scoped
+    /// local wiped in the same function, `seed` itself is cleared before
+    /// key derivation runs, and no other by-value copy of the caller's seed
+    /// is created at this boundary.
+    pub fn fromSeedSecret(seed: *secrets.FixedSecret(Ed25519.KeyPair.seed_length)) provider.SignError!SoftwareSigningKey {
+        var bridge: [Ed25519.KeyPair.seed_length]u8 = undefined;
+        defer crypto.secureZero(u8, &bridge);
+        @memcpy(&bridge, seed.slice());
+        seed.deinit();
+        const key_pair = Ed25519.KeyPair.generateDeterministic(bridge) catch return error.ProviderFailure;
         return .{ .key_pair = key_pair };
     }
 
@@ -752,6 +773,25 @@ test "Ed25519 sign then verify, with tamper and wrong-key rejection" {
     defer other_key.deinit();
     const other_public = other_key.publicKey();
     try testing.expectError(error.AuthenticationFailed, cp.verify(.ed25519, &other_public, message, &signature));
+}
+
+test "fromSeedSecret clears the caller's typed secret immediately and derives the same key as fromSeed" {
+    const seed_bytes = [_]u8{0x5a} ** Ed25519.KeyPair.seed_length;
+
+    var via_secret = try secrets.FixedSecret(Ed25519.KeyPair.seed_length).init(&seed_bytes);
+    var from_secret_key = try SoftwareSigningKey.fromSeedSecret(&via_secret);
+    defer from_secret_key.deinit();
+
+    // The source container is cleared by `fromSeedSecret` itself — this
+    // observes the call boundary directly rather than scanning an allocator
+    // arena, which cannot see stack/parameter copies.
+    try testing.expectEqual(@as(usize, 0), via_secret.len);
+    for (via_secret.bytes) |byte| try testing.expectEqual(@as(u8, 0), byte);
+
+    // Same seed through the by-value entry point derives the identical key.
+    var from_array_key = try SoftwareSigningKey.fromSeed(seed_bytes);
+    defer from_array_key.deinit();
+    try testing.expectEqualSlices(u8, &from_array_key.publicKey(), &from_secret_key.publicKey());
 }
 
 test "randomBytes surfaces entropy failure as a provider error" {

@@ -2077,6 +2077,11 @@ const CurlRequestSpec = struct {
     /// Cap the client's maximum TLS version (curl `--tls-max`), e.g. "1.1" to
     /// verify the server rejects a below-minimum handshake.
     tls_max: ?[]const u8 = null,
+    /// Trust only this CA certificate (curl `--cacert`) instead of the
+    /// system trust store, and perform real chain/hostname verification
+    /// (implies not `insecure`). Used to prove an out-of-process client can
+    /// actually validate the appliance-transmitted chain (#392).
+    cacert: ?[]const u8 = null,
 };
 
 fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !CurlRunResult {
@@ -2103,6 +2108,10 @@ fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !Curl
     try argv.append("-D");
     try argv.append("-");
     if (spec.insecure) try argv.append("-k");
+    if (spec.cacert) |cacert| {
+        try argv.append("--cacert");
+        try argv.append(cacert);
+    }
     for (spec.headers) |header| {
         const line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ header.name, header.value });
         try owned_args.append(line);
@@ -7282,13 +7291,128 @@ test "native TLS listener appliance rejects unknown SNI before HTTP dispatch" {
 test "native TLS listener appliance refuses startup with a mismatched key" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
-    try expectApplianceStartupFailure(allocator, "native_ed25519_mismatch.key", "appliance TLS credential rejected (KeyCertificateMismatch)");
+    try expectApplianceStartupFailure(allocator, "native_ed25519_mismatch.key", "error.KeyCertificateMismatch");
 }
 
 test "native TLS listener appliance refuses startup with an unsupported key algorithm" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
-    try expectApplianceStartupFailure(allocator, "native_p256.key", "appliance TLS credential rejected (UnsupportedPrivateKeyAlgorithm)");
+    try expectApplianceStartupFailure(allocator, "native_p256.key", "error.UnsupportedPrivateKeyAlgorithm");
+}
+
+test "appliance run --daemon rejects a mismatched key synchronously, without ever backgrounding" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    const cert_path = try applianceFixturePath(allocator, "native_ed25519.crt");
+    defer allocator.free(cert_path);
+    const key_path = try applianceFixturePath(allocator, "native_ed25519_mismatch.key");
+    defer allocator.free(key_path);
+
+    const port = try findFreePort();
+    const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-appliance-daemon-fail-{d}.conf", .{port});
+    defer {
+        compat.cwd().deleteFile(config_rel) catch {};
+        allocator.free(config_rel);
+    }
+    try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = "" });
+    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
+    defer allocator.free(port_str);
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("TARDIGRADE_CONFIG_PATH", config_rel);
+    try env_map.put("TARDIGRADE_LISTEN_HOST", test_host);
+    try env_map.put("TARDIGRADE_LISTEN_PORT", port_str);
+    try env_map.put("TARDIGRADE_WORKER_THREADS", "1");
+    try env_map.put("TARDIGRADE_TLS_CERT_PATH", cert_path);
+    try env_map.put("TARDIGRADE_TLS_KEY_PATH", key_path);
+    try env_map.put("TARDIGRADE_TLS_SERVER_NAME", "tardigrade.test");
+
+    // `--daemon` without `--daemonized` is the foreground invocation that
+    // decides whether to fork a background process; run it directly (not
+    // detached) so the test observes exactly what the invoking shell would.
+    const run_res = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "run", "-c", config_rel, "--daemon" },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(run_res.stdout);
+    defer allocator.free(run_res.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, run_res.term);
+    try assertContains(run_res.stderr, "KeyCertificateMismatch");
+    // No "started ... in background" success message — the parent never
+    // reached the fork.
+    try std.testing.expect(std.mem.indexOf(u8, run_res.stdout, "started tardigrade in background") == null);
+
+    // Give a wrongly-spawned background process a moment to bind, then
+    // confirm nothing is listening.
+    compat.sleepNs(300 * std.time.ns_per_ms);
+    if (compat.tcpConnectToHost(allocator, test_host, port)) |conn| {
+        var open_stream = conn;
+        open_stream.close();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "appliance master mode rejects a mismatched key before writing a PID file or spawning workers" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    const cert_path = try applianceFixturePath(allocator, "native_ed25519.crt");
+    defer allocator.free(cert_path);
+    const key_path = try applianceFixturePath(allocator, "native_ed25519_mismatch.key");
+    defer allocator.free(key_path);
+
+    const port = try findFreePort();
+    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const pid_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tardigrade-appliance-master-fail-{d}.pid", .{ cwd, port });
+    defer allocator.free(pid_path);
+    defer compat.cwd().deleteFile(pid_path) catch {};
+    const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-appliance-master-fail-{d}.conf", .{port});
+    defer {
+        compat.cwd().deleteFile(config_rel) catch {};
+        allocator.free(config_rel);
+    }
+    try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = "" });
+    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
+    defer allocator.free(port_str);
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("TARDIGRADE_CONFIG_PATH", config_rel);
+    try env_map.put("TARDIGRADE_LISTEN_HOST", test_host);
+    try env_map.put("TARDIGRADE_LISTEN_PORT", port_str);
+    try env_map.put("TARDIGRADE_WORKER_THREADS", "1");
+    try env_map.put("TARDIGRADE_TLS_CERT_PATH", cert_path);
+    try env_map.put("TARDIGRADE_TLS_KEY_PATH", key_path);
+    try env_map.put("TARDIGRADE_TLS_SERVER_NAME", "tardigrade.test");
+    try env_map.put("TARDIGRADE_MASTER_PROCESS_ENABLED", "true");
+    try env_map.put("TARDIGRADE_PID_FILE", pid_path);
+
+    const run_res = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "run", "-c", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(run_res.stdout);
+    defer allocator.free(run_res.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, run_res.term);
+    try assertContains(run_res.stderr, "KeyCertificateMismatch");
+
+    // The master process never got far enough to write a PID file, spawn a
+    // worker, or bind the listener it would otherwise respawn workers for.
+    try std.testing.expectError(error.FileNotFound, compat.cwd().statFile(pid_path));
+    if (compat.tcpConnectToHost(allocator, test_host, port)) |conn| {
+        var open_stream = conn;
+        open_stream.close();
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }
 
 test "native TLS listener appliance check command validates credentials without binding" {
@@ -7496,4 +7620,69 @@ test "appliance hot reload rejects turning TLS off for a server that started wit
     defer allocator.free(after);
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(after, "HTTP/1.1 200 OK"));
     try assertContains(after, "alive");
+}
+
+test "an independent client trusting only the root validates the transmitted leaf+intermediate chain and hostname" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    // `openssl s_client` runs as a separate process from the appliance
+    // binary (which links no OpenSSL/libcrypto): this is exactly the
+    // "out-of-process client" proof that the transmitted leaf+intermediate
+    // chain is actually walkable to a trusted root, not merely two
+    // independently well-formed certificates (#392 review). It is given
+    // only the root CA as a trust anchor — not the server's own chain.
+    const ca_path = try applianceFixturePath(allocator, "native_ed25519_ca.crt");
+    defer allocator.free(ca_path);
+    const chain_path = try applianceFixturePath(allocator, "native_ed25519_chain.crt");
+    defer allocator.free(chain_path);
+    const key_path = try applianceFixturePath(allocator, "native_ed25519.key");
+    defer allocator.free(key_path);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = chain_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const port_str = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{tardigrade.port});
+    defer allocator.free(port_str);
+    const run_res = std.process.run(allocator, compat.io(), .{
+        .argv = &.{
+            "openssl",         "s_client",
+            "-connect",        port_str,
+            "-tls1_3",         "-alpn",
+            "http/1.1",        "-CAfile",
+            ca_path,           "-verify_hostname",
+            "tardigrade.test", "-verify_return_error",
+            "-brief",
+        },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch |err| {
+        // `openssl` may be unavailable on some CI runners; the appliance
+        // credential loader itself is still covered by the pure-Zig client
+        // tests above. Do not fail the suite over a missing test tool.
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer allocator.free(run_res.stdout);
+    defer allocator.free(run_res.stderr);
+
+    // The client closes without sending a request (empty stdin), so the
+    // process may exit nonzero on the abrupt shutdown after a successful
+    // handshake — the trust/hostname verdict is what this test proves.
+    // `openssl s_client -brief` writes the session summary to stderr.
+    try assertContains(run_res.stderr, "Verification: OK");
+    try assertContains(run_res.stderr, "Verified peername: tardigrade.test");
 }

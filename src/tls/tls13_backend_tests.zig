@@ -1468,6 +1468,10 @@ const ClientHelloOptions = struct {
     include_signature_algorithms: bool = true,
     sig_schemes: []const u16 = &.{ 0x0807, 0x0403 },
     alpn_protocols: ?[]const []const u8 = &.{"h2"},
+    /// The opaque transport extension (e.g. QUIC transport parameters) to
+    /// offer, for driving an extension-profile (#392 HTTP/3) server through
+    /// selection the same way a real QUIC client would.
+    transport_extension: ?struct { extension_type: u16, payload: []const u8 } = null,
 };
 
 /// Build a minimal, well-formed TLS 1.3 ClientHello the server engine accepts,
@@ -1538,6 +1542,13 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
         try w.bytes(sni);
         w.patch(2, sni_list);
         w.patch(2, sni_ext);
+    }
+    // opaque transport extension (extension-profile / QUIC servers require
+    // seeing this before selection completes)
+    if (opts.transport_extension) |transport| {
+        try w.u16_(transport.extension_type);
+        try w.u16_(@intCast(transport.payload.len));
+        try w.bytes(transport.payload);
     }
     w.patch(2, extensions_len);
     w.patch(3, message_len);
@@ -3116,6 +3127,115 @@ test "the client flight preflight rejects a chain that overflows with the messag
     try std.testing.expectError(error.CredentialProviderFailed, deliverServerFlightToClient(&client, &server, &client_sink, &server_sink));
     try std.testing.expectEqual(tls_backend.CredentialFailure.malformed_credential_chain, client.credentialFailure().?);
     try std.testing.expectEqual(@as(usize, 1), big.release_count);
+}
+
+// --- #392 review: the appliance credential loader's flight-size preflight
+//     bound must be writer-identical — a chain it accepts must actually
+//     serialize through the real server flight, for both native TCP (record
+//     ALPN) and native HTTP/3 (the QUIC transport-extension profile sharing
+//     the same credential). A `BigChain*Provider` proves the writer's own
+//     behavior directly; it does not need real X.509 DER (the writer's size
+//     preflight, unlike `appliance_credentials.zig`'s, does not parse
+//     entries), only a real Ed25519 signer so the flight actually completes.
+
+/// Like `BigChainProvider`, but signs for real with the fixture Ed25519
+/// identity so a size-preflight-passing chain's flight fully emits rather
+/// than failing before reaching the signing step.
+const BigChainSigningProvider = struct {
+    entry_len: usize,
+    entry_count: usize,
+    storage: [tls_backend.max_certificate_len]u8 = [_]u8{0x2c} ** tls_backend.max_certificate_len,
+    entries: [credentials.max_chain_entries][]const u8 = undefined,
+    identity: tls_backend.Identity = undefined,
+    sign_count: usize = 0,
+
+    fn init(entry_len: usize, entry_count: usize) BigChainSigningProvider {
+        return .{ .entry_len = entry_len, .entry_count = entry_count, .identity = fixtureIdentity() };
+    }
+
+    fn provider(self: *BigChainSigningProvider) credentials.CredentialProvider {
+        return .{ .ctx = self, .vtable = &prov_vtable };
+    }
+    const prov_vtable = credentials.CredentialProvider.VTable{ .select = select };
+    fn select(ctx: *anyopaque, selection: *const credentials.SelectionContext) credentials.SelectError!credentials.Progress(credentials.SelectedCredential) {
+        const self: *BigChainSigningProvider = @ptrCast(@alignCast(ctx));
+        if (!selection.offersScheme(.ed25519)) return error.NoCompatibleSignatureAlgorithm;
+        return .{ .complete = .{ .handle = self, .scheme = .ed25519, .vtable = &cred_vtable } };
+    }
+    const cred_vtable = credentials.SelectedCredential.VTable{ .chain = chain, .sign = sign, .release = release };
+    fn chain(handle: *anyopaque) credentials.CertificateChain {
+        const self: *BigChainSigningProvider = @ptrCast(@alignCast(handle));
+        for (0..self.entry_count) |i| self.entries[i] = self.storage[0..self.entry_len];
+        return .{ .entries = self.entries[0..self.entry_count] };
+    }
+    fn sign(handle: *anyopaque, _: credentials.SignatureScheme, input: []const u8, out: []u8) credentials.SignError!credentials.Progress(usize) {
+        const self: *BigChainSigningProvider = @ptrCast(@alignCast(handle));
+        self.sign_count += 1;
+        return .{ .complete = try self.identity.sign(input, out) };
+    }
+    fn release(_: *anyopaque) void {}
+};
+
+/// Split `total` bytes of certificate-chain contribution as evenly as
+/// possible across `entry_count` entries (each within
+/// `tls_backend.max_certificate_len`), returning the per-entry length. This
+/// mirrors exactly what the writer counts: `certificate_message_overhead`
+/// once, plus `certificate_entry_overhead + entry_len` per entry.
+fn chainEntryLenForTotal(total: usize, entry_count: usize) usize {
+    const per_entry_with_overhead = (total - tls_backend.certificate_message_overhead) / entry_count;
+    return per_entry_with_overhead - tls_backend.certificate_entry_overhead;
+}
+
+test "a chain at appliance's flight-size boundary serializes through the real record-mode server flight" {
+    const entry_count = 4;
+    const entry_len = chainEntryLenForTotal(
+        tls_core.appliance_credentials.default_max_certificate_flight_bytes,
+        entry_count,
+    );
+    try std.testing.expect(entry_len <= tls_backend.max_certificate_len);
+
+    var big = BigChainSigningProvider.init(entry_len, entry_count);
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), big.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    // No CredentialProviderFailed / malformed_credential_chain: the chain
+    // this appliance-computed boundary allows actually fits the live writer.
+    try server.backend().receive(.initial, hello, &sink);
+    try std.testing.expectEqual(@as(usize, 1), big.sign_count);
+    try std.testing.expect(sink.len > 0); // EncryptedExtensions/Certificate/CertificateVerify/Finished were emitted
+}
+
+test "a chain at appliance's flight-size boundary serializes through the real HTTP/3 extension-profile server flight" {
+    const entry_count = 4;
+    const entry_len = chainEntryLenForTotal(
+        tls_core.appliance_credentials.default_max_certificate_flight_bytes,
+        entry_count,
+    );
+    try std.testing.expect(entry_len <= tls_backend.max_certificate_len);
+
+    var big = BigChainSigningProvider.init(entry_len, entry_count);
+    const local_transport_params = [_]u8{0xab} ** tls_backend.max_transport_extension_len;
+    var server = tls_backend.Tls13Backend.initServerWithProvider(
+        serverEntropy(),
+        big.provider(),
+        .{ .extension = .{ .alpn = "h3", .extension_type = 57, .local = &local_transport_params } },
+    );
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [2048]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{
+        .alpn_protocols = &.{"h3"},
+        .transport_extension = .{ .extension_type = 57, .payload = &local_transport_params },
+    });
+    try server.backend().receive(.initial, hello, &sink);
+    try std.testing.expectEqual(@as(usize, 1), big.sign_count);
+    try std.testing.expect(sink.len > 0); // EncryptedExtensions/Certificate/CertificateVerify/Finished were emitted
 }
 
 // --- F8: a wrong-kind async completion releases every owned handle once. ---

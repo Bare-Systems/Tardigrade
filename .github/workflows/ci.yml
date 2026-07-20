@@ -147,6 +147,61 @@ jobs:
       - name: Run unit tests
         run: zig build test --summary all --error-style verbose
 
+  # ── Appliance profile tests ──────────────────────────────────────────────────
+  # The default `test` job above only exercises the general (OpenSSL-adapter)
+  # profile: `requireNativeTlsProfile()` skips every native-listener/appliance
+  # test under it. This job runs the appliance (`-Dtls-profile=appliance`)
+  # profile's own unit suite plus the native-listener and full integration
+  # suites, so appliance credential/TLS regressions (#392) are caught before
+  # merge, not only discovered by a separate manual run.
+  test-appliance:
+    name: Test appliance profile (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y openssl
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-test-appliance-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-test-appliance-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-test-appliance-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Print Zig version
+        run: zig version
+
+      - name: Run appliance profile unit tests
+        run: zig build test -Dtls-profile=appliance --summary all --error-style verbose
+
+      - name: Run native TLS listener integration tests
+        run: zig build test-integration-native-tls -Dtls-profile=appliance --summary all --error-style verbose
+
+      - name: Run full integration suite (appliance profile)
+        run: zig build test-integration -Dtls-profile=appliance --summary all --error-style verbose
+
   # ── PKI differential corpus ──────────────────────────────────────────────────
   # Replays the bounded core corpus against the pure-Zig validator, OpenSSL,
   # and Go crypto/x509. External validators remain out of process.

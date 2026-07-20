@@ -26,20 +26,22 @@ const production_crypto = @import("production_crypto.zig");
 const secrets = crypto.secrets;
 const Ed25519 = std.crypto.sign.Ed25519;
 
-/// Fixed framing the TLS Certificate message adds around the raw chain: 1-byte
-/// msg_type + 3-byte length + 1-byte certificate_request_context length +
-/// 3-byte CertificateList length. Mirrors `tls13_backend`.
-const certificate_message_overhead = 1 + 3 + 1 + 3;
-/// Per-CertificateEntry framing: 3-byte cert_data length + 2-byte extensions
-/// length. Mirrors `tls13_backend`.
-const certificate_entry_overhead = 3 + 2;
-/// Headroom reserved for the other messages sharing the server's one flight
-/// buffer (EncryptedExtensions with ALPN and the optional CertificateRequest
-/// are each well under this).
-const flight_headroom = 512;
+// Certificate flight framing is the writer's own accounting
+// (`tls13_backend.certificate_message_overhead` /
+// `.certificate_entry_overhead`), not a locally duplicated copy, so this
+// preflight cannot silently drift from what the writer actually emits.
+const certificate_message_overhead = tls13_backend.certificate_message_overhead;
+const certificate_entry_overhead = tls13_backend.certificate_entry_overhead;
 
+/// The largest a certificate chain's encoded Certificate-message
+/// contribution may be while still fitting the shared server flight buffer
+/// alongside everything else it can carry (EncryptedExtensions, ALPN, the
+/// QUIC/H3 transport extension, an optional CertificateRequest) — see
+/// `tls13_backend.max_non_certificate_server_flight_bytes`. Same shared
+/// credential, same flight buffer, whichever transport (native TCP or
+/// QUIC/H3) is currently authenticating.
 pub const default_max_certificate_flight_bytes =
-    tls13_backend.max_message_len - flight_headroom;
+    tls13_backend.max_message_len - tls13_backend.max_non_certificate_server_flight_bytes;
 
 pub const Limits = struct {
     max_certificate_file_bytes: usize = 256 * 1024,
@@ -47,6 +49,19 @@ pub const Limits = struct {
     max_chain_entries: usize = credentials.max_chain_entries,
     max_certificate_der_bytes: usize = tls13_backend.max_certificate_len,
     max_certificate_flight_bytes: usize = default_max_certificate_flight_bytes,
+
+    /// Clamp every field to the engine's hard bounds, so a caller-supplied
+    /// `Limits` can only tighten these checks, never loosen them past what
+    /// the writer/engine can actually serialize or the wire format allows.
+    fn clamped(self: Limits) Limits {
+        return .{
+            .max_certificate_file_bytes = self.max_certificate_file_bytes,
+            .max_private_key_file_bytes = self.max_private_key_file_bytes,
+            .max_chain_entries = @min(self.max_chain_entries, credentials.max_chain_entries),
+            .max_certificate_der_bytes = @min(self.max_certificate_der_bytes, tls13_backend.max_certificate_len),
+            .max_certificate_flight_bytes = @min(self.max_certificate_flight_bytes, default_max_certificate_flight_bytes),
+        };
+    }
 };
 
 pub const Options = struct {
@@ -76,6 +91,7 @@ pub const Error = error{
     InvalidPrivateKeySize,
     InvalidPrivateKey,
     UnsupportedLeafKeyAlgorithm,
+    UnsupportedLeafKeyParameters,
     KeyCertificateMismatch,
     CertificateFlightTooLarge,
     InvalidServerName,
@@ -84,6 +100,31 @@ pub const Error = error{
     AccessDenied,
     FileNotFound,
     OutOfMemory,
+    /// The configured `server_name` does not appear in the leaf's
+    /// subjectAltName (SAN-only per RFC 9525; no Common Name fallback).
+    CertificateNameMismatch,
+    /// A certificate other than the leaf asserts it is not (or lacks)
+    /// `basicConstraints CA:TRUE`.
+    IntermediateNotCa,
+    /// The leaf certificate asserts `basicConstraints CA:TRUE`.
+    InvalidLeafCertificate,
+    /// A present `keyUsage` extension is inconsistent with the entry's role:
+    /// the leaf must assert `digitalSignature`; an intermediate must assert
+    /// `keyCertSign`.
+    CertificateKeyUsageViolation,
+    /// A present `extendedKeyUsage` on the leaf does not include (or imply)
+    /// `serverAuth`.
+    CertificateExtendedKeyUsageViolation,
+    /// A certificate carries a critical extension this profile does not
+    /// recognize (RFC 5280 §4.2 requires rejecting it).
+    UnhandledCriticalCertificateExtension,
+    /// Two chain entries are byte-identical DER.
+    DuplicateCertificateEntry,
+    /// Entry `i`'s issuer does not name-chain to entry `i+1`'s subject, so
+    /// the transmitted sequence is not an ordered signing chain.
+    InvalidCertificateChainOrder,
+    /// Entry `i`'s signature does not verify under entry `i+1`'s public key.
+    CertificateSignatureInvalid,
 };
 
 var os_entropy_state: production_crypto.OsEntropy = .{};
@@ -153,7 +194,7 @@ pub const ApplianceCredentials = struct {
         options: Options,
     ) Error!void {
         try validateServerName(options.server_name);
-        const limits = options.limits;
+        const limits = options.limits.clamped();
 
         // Certificate chain: strict whole-input PEM contract, then the shared
         // #340 loader for base64/DER decoding and ownership.
@@ -161,11 +202,12 @@ pub const ApplianceCredentials = struct {
         var chain = pki.pem.loadChainPem(self.allocator, certificate_pem, pemLimits(limits)) catch |err|
             return mapChainPemError(err);
         defer chain.deinit(self.allocator);
-        try preflightChain(self.allocator, &chain, limits);
 
-        // Leaf certificate: must carry a canonical RFC 8410 Ed25519 SPKI.
+        // Every entry parses as X.509, forms a coherent signing chain, and
+        // the leaf carries a canonical RFC 8410 Ed25519 SPKI matching
+        // `options.server_name`'s SAN.
         var leaf_public: [Ed25519.PublicKey.encoded_length]u8 = undefined;
-        try extractEd25519LeafPublicKey(self.allocator, chain.certificates[0].der, &leaf_public);
+        try validateChainAndExtractLeafPublicKey(self.allocator, &chain, limits, options.server_name, &leaf_public);
 
         // Private key: strict single PKCS#8 PEM block, Ed25519 only. Every
         // intermediate secret buffer is wiped on all paths.
@@ -281,11 +323,15 @@ pub const ApplianceCredentials = struct {
 
         const owner = self.allocator.create(OwnedSigner) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(owner);
+        // `fromSeedSecret` takes the typed secret by pointer, copies it
+        // exactly once into a bridge it wipes itself, and clears `seed`
+        // before deriving the key pair — no separate by-value array copy of
+        // the seed is created at this call boundary. The `defer seed.deinit()`
+        // above remains a correct (if now redundant on success) safety net
+        // for any early-return path before this call.
         owner.* = .{
             .allocator = self.allocator,
-            .key = crypto.pure_zig.SoftwareSigningKey.fromSeed(
-                seed.bytes[0..Ed25519.KeyPair.seed_length].*,
-            ) catch return error.InvalidPrivateKey,
+            .key = crypto.pure_zig.SoftwareSigningKey.fromSeedSecret(&seed) catch return error.InvalidPrivateKey,
         };
         return owner;
     }
@@ -355,7 +401,11 @@ fn mapChainPemError(err: pki.pem.Error) Error {
     };
 }
 
-fn preflightChain(allocator: std.mem.Allocator, chain: *const pki.pem.CertificateChain, limits: Limits) Error!void {
+var verify_entropy_state: production_crypto.OsEntropy = .{};
+
+/// Size/count preflight only — cheap, and rejects pathological input before
+/// any DER is parsed as X.509.
+fn preflightChainSize(chain: *const pki.pem.CertificateChain, limits: Limits) Error!void {
     const count = chain.certificates.len;
     if (count == 0) return error.EmptyCertificateChain;
     if (count > limits.max_chain_entries or count > credentials.max_chain_entries)
@@ -369,44 +419,101 @@ fn preflightChain(allocator: std.mem.Allocator, chain: *const pki.pem.Certificat
             return error.CertificateFlightTooLarge;
         if (flight > limits.max_certificate_flight_bytes) return error.CertificateFlightTooLarge;
     }
+}
 
-    // Every entry — not only the leaf — must be a structurally well-formed
-    // X.509 certificate object, validated with the same pure-Zig parser used
-    // for the leaf (no second SPKI/X.509 parser). This deterministically
-    // rejects a malformed intermediate as `MalformedCertificateDer` here,
-    // before `sni_provider.reload` ever sees it, rather than surfacing as an
-    // undifferentiated `ProviderPublicationFailed` from its own (leaf-only)
-    // DER check. Chain-of-trust policy — issuer/subject linkage, CA-bit
-    // enforcement, duplicate/reorder detection — remains outside #392's
-    // scope (no public-PKI path validation); this only proves parse validity.
-    for (chain.certificates[1..]) |cert| {
-        var parsed = pki.x509.Certificate.parse(allocator, cert.der, .{}) catch |err| switch (err) {
+/// Parse every chain entry as a full X.509 certificate (the same pure-Zig
+/// parser used throughout; no second SPKI/X.509 parser), prove the
+/// transmitted sequence is an internally coherent, ordered signing chain,
+/// and bind the leaf to the configured server name — then return the leaf's
+/// canonical Ed25519 public key.
+///
+/// "Coherent chain" here means: each non-leaf entry is a CA certificate,
+/// each entry's issuer name-chains (RFC 5280 §7.1) to the next entry's
+/// subject, and each entry's signature verifies under the next entry's
+/// public key (RFC 5280 §6.1, restricted to signature validity — this
+/// module makes no trust decision about any root, and does not require the
+/// final transmitted certificate to be self-signed). That is deliberately
+/// short of full public-PKI path validation (no root/trust-store policy,
+/// no revocation, no path-length/name-constraint enforcement) — #392
+/// explicitly excludes that — but it is enough that an independent client
+/// which already trusts the issuer of the last transmitted certificate can
+/// actually validate the presented chain and hostname.
+fn validateChainAndExtractLeafPublicKey(
+    allocator: std.mem.Allocator,
+    chain: *const pki.pem.CertificateChain,
+    limits: Limits,
+    server_name: []const u8,
+    out: *[Ed25519.PublicKey.encoded_length]u8,
+) Error!void {
+    try preflightChainSize(chain, limits);
+    const count = chain.certificates.len;
+
+    var parsed: [credentials.max_chain_entries]pki.x509.Certificate = undefined;
+    var parsed_count: usize = 0;
+    defer for (parsed[0..parsed_count]) |*cert| cert.deinit(allocator);
+
+    for (chain.certificates) |cert| {
+        parsed[parsed_count] = pki.x509.Certificate.parse(allocator, cert.der, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.MalformedCertificateDer,
         };
-        parsed.deinit(allocator);
+        parsed_count += 1;
+        if (parsed[parsed_count - 1].hasUnhandledCriticalExtension())
+            return error.UnhandledCriticalCertificateExtension;
     }
-}
 
-/// Parse the leaf with the shared pure-Zig X.509 parser and require the
-/// canonical RFC 8410 Ed25519 SubjectPublicKeyInfo: Ed25519 algorithm, zero
-/// BIT STRING unused bits, exactly 32 public-key bytes.
-fn extractEd25519LeafPublicKey(
-    allocator: std.mem.Allocator,
-    leaf_der: []const u8,
-    out: *[Ed25519.PublicKey.encoded_length]u8,
-) Error!void {
-    var leaf = pki.x509.Certificate.parse(allocator, leaf_der, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.MalformedCertificateDer,
-    };
-    defer leaf.deinit(allocator);
+    // Reject byte-identical duplicate entries anywhere in the chain.
+    for (0..count) |i| {
+        for (i + 1..count) |j| {
+            if (std.mem.eql(u8, chain.certificates[i].der, chain.certificates[j].der))
+                return error.DuplicateCertificateEntry;
+        }
+    }
+
+    const leaf = &parsed[0];
     if (leaf.subject_public_key_info.key_type != .ed25519)
         return error.UnsupportedLeafKeyAlgorithm;
-    const public_key = leaf.subject_public_key_info.subject_public_key;
-    if (public_key.unused_bits != 0 or public_key.data.len != Ed25519.PublicKey.encoded_length)
+    // Canonical RFC 8410 Ed25519 AlgorithmIdentifier: OID only, no
+    // parameters (not even an explicit ASN.1 NULL).
+    if (leaf.subject_public_key_info.algorithm.parameters_raw != null)
+        return error.UnsupportedLeafKeyParameters;
+    const leaf_key = leaf.subject_public_key_info.subject_public_key;
+    if (leaf_key.unused_bits != 0 or leaf_key.data.len != Ed25519.PublicKey.encoded_length)
         return error.MalformedCertificateDer;
-    @memcpy(out, public_key.data);
+    if (leaf.basicConstraints()) |bc| {
+        if (bc.is_ca) return error.InvalidLeafCertificate;
+    }
+    if (leaf.keyUsage()) |ku| {
+        if (!ku.digital_signature) return error.CertificateKeyUsageViolation;
+    }
+    if (leaf.extendedKeyUsage()) |eku| {
+        if (!eku.allowsServerAuth()) return error.CertificateExtendedKeyUsageViolation;
+    }
+    const verdict = pki.identity.verifyHost(leaf, server_name) catch return error.InvalidServerName;
+    if (!verdict.isMatch()) return error.CertificateNameMismatch;
+
+    for (parsed[1..count]) |*intermediate| {
+        const bc = intermediate.basicConstraints() orelse return error.IntermediateNotCa;
+        if (!bc.is_ca) return error.IntermediateNotCa;
+        if (intermediate.keyUsage()) |ku| {
+            if (!ku.key_cert_sign) return error.CertificateKeyUsageViolation;
+        }
+    }
+
+    if (count > 1) {
+        var verify_provider_state = crypto.pure_zig.Provider.init(verify_entropy_state.entropy());
+        const crypto_provider = verify_provider_state.cryptoProvider();
+        for (0..count - 1) |i| {
+            const child = &parsed[i];
+            const issuer = &parsed[i + 1];
+            if (!child.issuer.eqlForChaining(&issuer.subject))
+                return error.InvalidCertificateChainOrder;
+            pki.verify.verifyCertificateSignature(crypto_provider, child, &issuer.subject_public_key_info) catch
+                return error.CertificateSignatureInvalid;
+        }
+    }
+
+    @memcpy(out, leaf_key.data);
 }
 
 /// Fixed sign-and-verify probe: defends against future signer-adapter wiring
@@ -734,18 +841,46 @@ const test_key_pkcs8_bytes = hexBytes(
 );
 const test_seed_hex = "bfa19b67713278fd5be2639dd1bec0a1cfebae6ef671304f3b2c7df4fd894f23";
 const test_certificate_der: []const u8 = &test_certificate_bytes;
+
+// `test_certificate_bytes` with an explicit ASN.1 NULL inserted as the
+// Ed25519 AlgorithmIdentifier's parameters (SEQUENCE { OID, NULL } instead
+// of the canonical RFC 8410 SEQUENCE { OID }), with every enclosing
+// definite-length header adjusted for the two extra bytes. The TBS content
+// changed, so the embedded signature no longer verifies — irrelevant here,
+// since this fixture is only ever used as a lone (single-entry) chain,
+// which this module never self-verifies.
+const test_certificate_null_params_bytes = hexBytes(
+    "3082016430820116a00302010202140d25d9bad95fdf952191eca5b90b4fba4f44d871300506032b6570301a3118301606035504030c0f746172646967726164652e74657374301e170d3236303731393138353935365a170d3436303731343138353935365a301a3118301606035504030c0f746172646967726164652e74657374302c300706032b65700500032100d496b9d3f3dcd0b56e18654498312633ea922faff390e6ce0b5fdf9a8acd3b1ca36c306a301d0603551d0e041604140c6407b86ac0dde833bb1bc6295091048b50dc8e301f0603551d230418301680140c6407b86ac0dde833bb1bc6295091048b50dc8e301a0603551d1104133011820f746172646967726164652e74657374300c0603551d130101ff04023000300506032b6570034100a6ae237ee3f1420b5685da59f0a01e392f7a318b567069c57ab202476d29859c619b6c230d2fdc0ca947d3d2752178f03b42199951787c9c64ea73bcf743170b",
+);
+const test_certificate_null_params_der: []const u8 = &test_certificate_null_params_bytes;
+
+// A leaf self-signed with the same private key as `test_certificate_der`,
+// but with SAN `*.example.test` instead of `tardigrade.test`, to prove
+// wildcard SAN matching. Matches native_ed25519.key.
+const test_wildcard_certificate_bytes = hexBytes(
+    "3082015d3082010fa00302010202147a1432e455cd5f8a21f1002427541de383b7c48d300506032b657030183116301406035504030c0d77696c64636172642e74657374301e170d3236303732303035323133395a170d3336303731373035323133395a30183116301406035504030c0d77696c64636172642e74657374302a300506032b6570032100d496b9d3f3dcd0b56e18654498312633ea922faff390e6ce0b5fdf9a8acd3b1ca36b3069301d0603551d0e041604140c6407b86ac0dde833bb1bc6295091048b50dc8e301f0603551d230418301680140c6407b86ac0dde833bb1bc6295091048b50dc8e30190603551d1104123010820e2a2e6578616d706c652e74657374300c0603551d130101ff04023000300506032b6570034100600149b20fc929ab078b2077f40aa668e3422df1335835cc848e1fa9d3d6982f2f7721a4f99821ca3e64aabfbf7c4a8695f0972f507b2123bfe8ba64403d5407",
+);
+const test_wildcard_certificate_der: []const u8 = &test_wildcard_certificate_bytes;
 const test_key_pkcs8_der: []const u8 = &test_key_pkcs8_bytes;
 
-// A genuinely distinct, well-formed Ed25519 certificate (a self-signed CA,
-// CN=tardigrade-appliance-test-ca) — unrelated to `test_certificate_der` and
-// signed by a different key pair. Used as a real second chain entry so
-// "leaf plus intermediate" tests exercise actual per-entry X.509 parsing
-// rather than the leaf certificate concatenated with itself. Matches
-// tests/fixtures/tls/native_ed25519_ca.crt. Test-only material.
-const test_intermediate_bytes = hexBytes(
-    "3082017330820125a00302010202144d6912bb8891217b860072374c89988d7b4f1ea7300506032b657030273125302306035504030c1c746172646967726164652d6170706c69616e63652d746573742d6361301e170d3236303732303032313633315a170d3436303731353032313633315a30273125302306035504030c1c746172646967726164652d6170706c69616e63652d746573742d6361302a300506032b6570032100a8981092bd43b60e31c558261f905d21536fe3697d3c21640b8866c3c7856cfaa3633061301d0603551d0e04160414799aa1f0d9d10847d595a837622ddd18cc107d23301f0603551d23041830168014799aa1f0d9d10847d595a837622ddd18cc107d23300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300506032b657003410079a9f4b24f84c5773c8bc462a900e594b8376b46791854f2e7871e3bdd4d63e428626d34df9fe2d9fc238d943f54701b37abca52e38f7d63409a4c9ba22ed805",
+// A real self-signed Ed25519 CA (CN=tardigrade-appliance-test-ca,
+// basicConstraints critical CA:TRUE, keyUsage keyCertSign) and a leaf that CA
+// actually issued for CN=tardigrade.test — a genuine two-certificate signing
+// chain (issuer/subject linkage and signature both verify), not the same
+// certificate concatenated with itself. `test_chained_leaf_der` carries the
+// same public key as `test_certificate_der`/the configured private key, but
+// is issued by this CA instead of self-signed, and asserts basicConstraints
+// CA:FALSE, keyUsage digitalSignature, extendedKeyUsage serverAuth. Matches
+// tests/fixtures/tls/native_ed25519_ca.crt and native_ed25519_chain.crt (leaf+CA concatenated).
+// Test-only material — never a production credential.
+const test_ca_bytes = hexBytes(
+    "3082017330820125a003020102021472ee82a184b918862600fbccf3518328b739bb72300506032b657030273125302306035504030c1c746172646967726164652d6170706c69616e63652d746573742d6361301e170d3236303732303035313934355a170d3436303731353035313934355a30273125302306035504030c1c746172646967726164652d6170706c69616e63652d746573742d6361302a300506032b6570032100111aaa214b7c6ca7d1573f3ae9009410bd8fd99d6f6eb22e85e060d6278e7678a3633061301d0603551d0e041604146af06826c936cf4dc19ba719104d0e718313660a301f0603551d230418301680146af06826c936cf4dc19ba719104d0e718313660a300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300506032b6570034100c416328e72f8272450fe12b7799a6168e377b45fdfba11071bf0d0dbcc5bc618f5b17cb87cff9405806deeaf92e594e300633af1fb02aa8ce5cd183857ad030b",
 );
-const test_intermediate_der: []const u8 = &test_intermediate_bytes;
+const test_ca_der: []const u8 = &test_ca_bytes;
+const test_chained_leaf_bytes = hexBytes(
+    "3082019630820148a003020102021463f9fa0b2c74f1faebbe4d965a0e674dfea7ed4d300506032b657030273125302306035504030c1c746172646967726164652d6170706c69616e63652d746573742d6361301e170d3236303732303035313934355a170d3336303731373035313934355a301a3118301606035504030c0f746172646967726164652e74657374302a300506032b6570032100d496b9d3f3dcd0b56e18654498312633ea922faff390e6ce0b5fdf9a8acd3b1ca3819230818f300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301301a0603551d1104133011820f746172646967726164652e74657374301d0603551d0e041604140c6407b86ac0dde833bb1bc6295091048b50dc8e301f0603551d230418301680146af06826c936cf4dc19ba719104d0e718313660a300506032b6570034100487f78908d2d88a8a5ff0de641249f8bd61be566b8a83726b4e9779c4750c4d6d713c91732298b270225f4ac3651dd154933af374e9190717dc3504b9a9cba06",
+);
+const test_chained_leaf_der: []const u8 = &test_chained_leaf_bytes;
 
 fn pemEncode(allocator: std.mem.Allocator, label: []const u8, der: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -912,17 +1047,24 @@ test "byte and file APIs produce equivalent provider behavior" {
     );
 }
 
-test "leaf plus a genuinely distinct intermediate preserves transmission order" {
+fn chainedLeafPem(allocator: std.mem.Allocator) ![]u8 {
+    return pemEncode(allocator, "CERTIFICATE", test_chained_leaf_der);
+}
+
+fn caPem(allocator: std.mem.Allocator) ![]u8 {
+    return pemEncode(allocator, "CERTIFICATE", test_ca_der);
+}
+
+test "leaf plus a genuine intermediate that actually issued it preserves transmission order" {
     const allocator = testing.allocator;
-    const leaf_pem = try testCertificatePem(allocator);
+    // The leaf is issued by, and its issuer name-chains to, the CA that
+    // follows — a real two-certificate signing chain an independent client
+    // can walk, not the same certificate concatenated with itself.
+    const leaf_pem = try chainedLeafPem(allocator);
     defer allocator.free(leaf_pem);
-    // A real second certificate — a different key pair, different subject,
-    // different signature — not the leaf concatenated with itself. Proves
-    // the intermediate is actually parsed as its own X.509 object rather
-    // than trivially accepted because it happens to equal the leaf.
-    const intermediate_pem = try pemEncode(allocator, "CERTIFICATE", test_intermediate_der);
-    defer allocator.free(intermediate_pem);
-    const chain_pem = try std.mem.concat(allocator, u8, &.{ leaf_pem, intermediate_pem });
+    const ca_pem = try caPem(allocator);
+    defer allocator.free(ca_pem);
+    const chain_pem = try std.mem.concat(allocator, u8, &.{ leaf_pem, ca_pem });
     defer allocator.free(chain_pem);
     const key_pem = try testPrivateKeyPem(allocator);
     defer allocator.free(key_pem);
@@ -935,8 +1077,8 @@ test "leaf plus a genuinely distinct intermediate preserves transmission order" 
     defer selected.release();
     const chain = selected.certificateChain();
     try testing.expectEqual(@as(usize, 2), chain.count());
-    try testing.expectEqualSlices(u8, test_certificate_der, chain.entries[0]);
-    try testing.expectEqualSlices(u8, test_intermediate_der, chain.entries[1]);
+    try testing.expectEqualSlices(u8, test_chained_leaf_der, chain.entries[0]);
+    try testing.expectEqualSlices(u8, test_ca_der, chain.entries[1]);
 }
 
 test "a structurally malformed intermediate is rejected deterministically, not as a provider-publication failure" {
@@ -949,7 +1091,7 @@ test "a structurally malformed intermediate is rejected deterministically, not a
     // Well-formed outer DER SEQUENCE/length (passes pki.pem's structural
     // check) but garbage TBSCertificate content, so only a real per-entry
     // X.509 parse — not just DER-shape validation — catches it.
-    var garbage_tbs = test_intermediate_der[0..test_intermediate_der.len].*;
+    var garbage_tbs = test_ca_der[0..test_ca_der.len].*;
     // Corrupt bytes inside the TBSCertificate body without touching the
     // outer SEQUENCE header, so the DER shape itself stays well-formed.
     for (garbage_tbs[40..80]) |*byte| byte.* ^= 0xff;
@@ -964,26 +1106,128 @@ test "a structurally malformed intermediate is rejected deterministically, not a
     );
 }
 
-test "a reordered chain (intermediate first) fails key/certificate matching, not silent acceptance" {
+test "a reordered chain (CA first) rejects the CA as an invalid leaf" {
     const allocator = testing.allocator;
-    const leaf_pem = try testCertificatePem(allocator);
+    const leaf_pem = try chainedLeafPem(allocator);
     defer allocator.free(leaf_pem);
-    const intermediate_pem = try pemEncode(allocator, "CERTIFICATE", test_intermediate_der);
-    defer allocator.free(intermediate_pem);
-    // Intermediate first, leaf second — violates the documented "leaf
-    // first" contract. #392 does not implement chain-order/path validation,
-    // but the mandatory leaf/key match still fails closed here because
-    // entries[0] is no longer the certificate for the configured key: it is
-    // also Ed25519, so the key-type check passes, but its public key differs
-    // from the one derived from the configured private key.
-    const reordered_pem = try std.mem.concat(allocator, u8, &.{ intermediate_pem, leaf_pem });
+    const ca_pem = try caPem(allocator);
+    defer allocator.free(ca_pem);
+    // CA first, leaf second — violates the documented "leaf first" contract.
+    // The CA certificate asserts basicConstraints CA:TRUE, so it is rejected
+    // outright as an invalid leaf before key/certificate matching or
+    // chain-order linkage is even considered.
+    const reordered_pem = try std.mem.concat(allocator, u8, &.{ ca_pem, leaf_pem });
     defer allocator.free(reordered_pem);
     const key_pem = try testPrivateKeyPem(allocator);
     defer allocator.free(key_pem);
 
     try testing.expectError(
-        error.KeyCertificateMismatch,
+        error.InvalidLeafCertificate,
         ApplianceCredentials.initFromBytes(allocator, reordered_pem, key_pem, test_options),
+    );
+}
+
+test "an intermediate unrelated to the leaf (issuer does not name-chain) is rejected" {
+    const allocator = testing.allocator;
+    // The self-signed leaf and this CA share no issuer/subject relationship
+    // at all: structurally valid X.509 individually, but not an ordered
+    // signing chain.
+    const leaf_pem = try testCertificatePem(allocator);
+    defer allocator.free(leaf_pem);
+    const ca_pem = try caPem(allocator);
+    defer allocator.free(ca_pem);
+    const chain_pem = try std.mem.concat(allocator, u8, &.{ leaf_pem, ca_pem });
+    defer allocator.free(chain_pem);
+    const key_pem = try testPrivateKeyPem(allocator);
+    defer allocator.free(key_pem);
+
+    try testing.expectError(
+        error.InvalidCertificateChainOrder,
+        ApplianceCredentials.initFromBytes(allocator, chain_pem, key_pem, test_options),
+    );
+}
+
+test "a non-CA intermediate is rejected" {
+    const allocator = testing.allocator;
+    // A second entry that is a valid, unrelated leaf-shaped certificate
+    // (self-signed `test_certificate_der`, no basicConstraints CA:TRUE) is
+    // not an acceptable intermediate regardless of any other property.
+    const leaf_pem = try chainedLeafPem(allocator);
+    defer allocator.free(leaf_pem);
+    const non_ca_pem = try testCertificatePem(allocator);
+    defer allocator.free(non_ca_pem);
+    const chain_pem = try std.mem.concat(allocator, u8, &.{ leaf_pem, non_ca_pem });
+    defer allocator.free(chain_pem);
+    const key_pem = try testPrivateKeyPem(allocator);
+    defer allocator.free(key_pem);
+
+    try testing.expectError(
+        error.IntermediateNotCa,
+        ApplianceCredentials.initFromBytes(allocator, chain_pem, key_pem, test_options),
+    );
+}
+
+test "duplicate chain entries are rejected" {
+    const allocator = testing.allocator;
+    const leaf_pem = try testCertificatePem(allocator);
+    defer allocator.free(leaf_pem);
+    const chain_pem = try std.mem.concat(allocator, u8, &.{ leaf_pem, leaf_pem });
+    defer allocator.free(chain_pem);
+    const key_pem = try testPrivateKeyPem(allocator);
+    defer allocator.free(key_pem);
+
+    try testing.expectError(
+        error.DuplicateCertificateEntry,
+        ApplianceCredentials.initFromBytes(allocator, chain_pem, key_pem, test_options),
+    );
+}
+
+test "configured server name must appear in the leaf SAN" {
+    const allocator = testing.allocator;
+    const cert_pem = try testCertificatePem(allocator);
+    defer allocator.free(cert_pem);
+    const key_pem = try testPrivateKeyPem(allocator);
+    defer allocator.free(key_pem);
+
+    // Absent/wrong SAN: the leaf's only SAN entry is `tardigrade.test`.
+    try testing.expectError(
+        error.CertificateNameMismatch,
+        ApplianceCredentials.initFromBytes(allocator, cert_pem, key_pem, .{ .server_name = "other.example.test" }),
+    );
+
+    // Case-insensitive exact SAN match still succeeds.
+    var mixed_case = try ApplianceCredentials.initFromBytes(allocator, cert_pem, key_pem, .{ .server_name = "Tardigrade.Test" });
+    mixed_case.deinit();
+}
+
+test "a matching presented wildcard SAN is accepted" {
+    const allocator = testing.allocator;
+    const wildcard_pem = try pemEncode(allocator, "CERTIFICATE", test_wildcard_certificate_der);
+    defer allocator.free(wildcard_pem);
+    const key_pem = try testPrivateKeyPem(allocator);
+    defer allocator.free(key_pem);
+
+    // `*.example.test` covers `www.example.test`.
+    var owner = try ApplianceCredentials.initFromBytes(allocator, wildcard_pem, key_pem, .{ .server_name = "www.example.test" });
+    defer owner.deinit();
+
+    // But not the apex (RFC 9525: a wildcard matches exactly one label).
+    try testing.expectError(
+        error.CertificateNameMismatch,
+        ApplianceCredentials.initFromBytes(allocator, wildcard_pem, key_pem, .{ .server_name = "example.test" }),
+    );
+}
+
+test "an Ed25519 SPKI carrying illegal NULL AlgorithmIdentifier parameters is rejected" {
+    const allocator = testing.allocator;
+    const cert_pem = try pemEncode(allocator, "CERTIFICATE", test_certificate_null_params_der);
+    defer allocator.free(cert_pem);
+    const key_pem = try testPrivateKeyPem(allocator);
+    defer allocator.free(key_pem);
+
+    try testing.expectError(
+        error.UnsupportedLeafKeyParameters,
+        ApplianceCredentials.initFromBytes(allocator, cert_pem, key_pem, test_options),
     );
 }
 
@@ -1318,5 +1562,37 @@ test "oversized inputs are rejected before parsing" {
     try testing.expectError(
         error.PrivateKeyFileTooLarge,
         ApplianceCredentials.initFromBytes(allocator, cert_pem, key_pem, small_key),
+    );
+}
+
+test "oversized key file is rejected by the file API's own probe-read path" {
+    // `initFromBytes`'s oversized-input checks run before any parsing on an
+    // in-memory buffer, so they never exercise `readFileIntoSecret`'s
+    // one-byte probe-read branch, which is the file API's own distinct
+    // temporary-buffer lifecycle (#392 review). Drive it directly here: the
+    // key file on disk must be strictly larger than
+    // `max_private_key_file_bytes` so the probe actually reads a byte.
+    const allocator = testing.allocator;
+    const cert_pem = try testCertificatePem(allocator);
+    defer allocator.free(cert_pem);
+    const key_pem = try testPrivateKeyPem(allocator);
+    defer allocator.free(key_pem);
+    try testing.expect(key_pem.len > 16);
+
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "oversized.crt", .data = cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "oversized.key", .data = key_pem });
+    const cert_path = try tmp.dir.realPathFileAlloc(io, "oversized.crt", allocator);
+    defer allocator.free(cert_path);
+    const key_path = try tmp.dir.realPathFileAlloc(io, "oversized.key", allocator);
+    defer allocator.free(key_path);
+
+    var small_key = test_options;
+    small_key.limits.max_private_key_file_bytes = 16;
+    try testing.expectError(
+        error.PrivateKeyFileTooLarge,
+        ApplianceCredentials.initFromFiles(allocator, cert_path, key_path, small_key),
     );
 }

@@ -407,6 +407,27 @@ fn executeValidationCommandOrExit(allocator: std.mem.Allocator, options: CommonO
     };
 }
 
+/// Appliance TLS profile (#392): the complete credential preflight — exact
+/// PEM/PKCS#8 contract, chain parse, Ed25519 key parse, leaf/key match,
+/// server-name policy, flight bounds, provider snapshot construction and
+/// clean teardown — without binding any socket. Shared by `check` and by
+/// `run` (called before any daemon fork, PID file, or master/worker
+/// startup, so invalid credentials are reported synchronously to the
+/// invoking shell rather than surfacing later as a silently failed
+/// background process or a master respawn loop). The long-lived credential
+/// owner actually serving connections is still constructed separately in
+/// `edge_gateway.run`.
+fn preflightApplianceCredentials(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !void {
+    if (edge_config.is_appliance_tls_profile and edge_config.hasTlsFiles(cfg)) {
+        try tls_core.appliance_credentials.validateFiles(
+            allocator,
+            cfg.tls_cert_path,
+            cfg.tls_key_path,
+            .{ .server_name = cfg.tls_server_name },
+        );
+    }
+}
+
 fn executeValidateCommand(allocator: std.mem.Allocator, options: CommonOptions, mode: ValidationMode) !void {
     const resolved_config_path = try resolveValidationConfigPath(allocator, options.config_path, mode);
     defer if (resolved_config_path) |path| allocator.free(path);
@@ -415,18 +436,7 @@ fn executeValidateCommand(allocator: std.mem.Allocator, options: CommonOptions, 
     var cfg = try edge_config.loadFromEnv(allocator);
     defer cfg.deinit(allocator);
     try edge_config.validate(&cfg);
-    // Appliance TLS profile (#392): `check` performs the complete credential
-    // preflight — exact PEM/PKCS#8 contract, chain parse, Ed25519 key parse,
-    // leaf/key match, server-name policy, flight bounds, provider snapshot
-    // construction and clean teardown — without binding any socket.
-    if (edge_config.is_appliance_tls_profile and edge_config.hasTlsFiles(&cfg)) {
-        try tls_core.appliance_credentials.validateFiles(
-            allocator,
-            cfg.tls_cert_path,
-            cfg.tls_key_path,
-            .{ .server_name = cfg.tls_server_name },
-        );
-    }
+    try preflightApplianceCredentials(allocator, &cfg);
     edge_config.warnRiskyConfig(&cfg);
     var stdout_buf: [2048]u8 = undefined;
     var stdout = compat.stdoutWriter(&stdout_buf);
@@ -812,15 +822,26 @@ fn executeRunCommand(allocator: std.mem.Allocator, args: []const []const u8, opt
     const worker_mode = hasArg(args, "--worker");
     const worker_id = parseWorkerIdArg(args) orelse 0;
 
+    // Load and fully validate configuration — including the appliance
+    // credential preflight — before any daemon fork, PID file, or
+    // master/worker startup. `spawnDaemonizedProcess` backgrounds a child
+    // and cannot itself report the child's later failure to the invoking
+    // shell, and `runMaster` respawns every worker that exits, so invalid
+    // credentials discovered only after that point would either print a
+    // false "started" message or loop respawning a worker that can never
+    // start. The long-lived credential owner that actually serves
+    // connections is still constructed separately in `edge_gateway.run`.
+    var cfg = try edge_config.loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    try edge_config.validate(&cfg);
+    try preflightApplianceCredentials(allocator, &cfg);
+    edge_config.warnRiskyConfig(&cfg);
+
     if (options.daemon and !options.daemonized and !worker_mode) {
         try spawnDaemonizedProcess(allocator, resolved_config_path);
         return;
     }
 
-    var cfg = try edge_config.loadFromEnv(allocator);
-    defer cfg.deinit(allocator);
-    try edge_config.validate(&cfg);
-    edge_config.warnRiskyConfig(&cfg);
     try configureErrorLog(&cfg);
     try writePidFile(&cfg);
     defer removePidFile(&cfg);

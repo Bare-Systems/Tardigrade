@@ -496,7 +496,7 @@ fn opensslDecision(allocator: std.mem.Allocator, case: manifest.Case, deadline_m
     const classified = if (exit_code == 0)
         OpenSSLClassification{ .status = .accept, .reason = .accepted }
     else
-        classifyOpenSSLRejection(case, result.stdout, result.stderr, diagnostic);
+        classifyOpenSSLRejection(result.stdout, result.stderr, diagnostic);
     return .{
         .validator = .openssl,
         .status = classified.status,
@@ -589,7 +589,6 @@ fn opensslReasonForCode(code: u16) Reason {
 }
 
 fn classifyOpenSSLRejection(
-    case: manifest.Case,
     stdout: []const u8,
     stderr: []const u8,
     diagnostic: []const u8,
@@ -609,7 +608,7 @@ fn classifyOpenSSLRejection(
     if (std.mem.indexOf(u8, diagnostic, "Could not find certificate file from ") != null or
         std.mem.indexOf(u8, diagnostic, "Could not read certificate file from ") != null)
     {
-        return .{ .status = .reject, .reason = opensslCommittedParseFailureReason(case) };
+        return .{ .status = .reject, .reason = .malformed_der };
     }
     if (std.mem.startsWith(u8, diagnostic, "verify:") or
         std.mem.indexOf(u8, diagnostic, "No such file") != null or
@@ -619,11 +618,6 @@ fn classifyOpenSSLRejection(
         return .{ .status = .tool_failure, .reason = .oracle_failure };
     }
     return .{ .status = .reject, .reason = .unclassified_rejection };
-}
-
-fn opensslCommittedParseFailureReason(case: manifest.Case) Reason {
-    _ = case;
-    return .malformed_der;
 }
 
 const GoDecision = struct {
@@ -2077,13 +2071,40 @@ test "pki reduce: OpenSSL verify parser ignores subject text that contains an er
     try testing.expectEqual(@as(?u16, null), parseOpenSSLVerifyCode("prefix error 62 at 0 depth lookup: hostname mismatch"));
 
     const classified = classifyOpenSSLRejection(
-        manifest.cases[0],
         "CN = attacker error 62 at 0 depth lookup\n",
         "error 47 at 1 depth lookup: permitted subtree violation\n",
         "unused combined diagnostic",
     );
     try testing.expectEqual(Status.reject, classified.status);
     try testing.expectEqual(Reason.name_constraints_violation, classified.reason);
+}
+
+test "pki reduce: OpenSSL STORE parse classification has no manifest metadata input" {
+    const algorithm_case = manifestCaseById("algorithm-malformed-signature-oid");
+    const der_case = manifestCaseById("der-invalid-bit-string-unused");
+    try testing.expect(!std.mem.eql(u8, algorithm_case.id, der_case.id));
+    try testing.expect(algorithm_case.category != der_case.category);
+
+    const store_stdout = "";
+    const store_stderr =
+        "Could not read certificate file from tests/vectors/pki/algorithm-malformed-signature-oid.crt\n" ++
+        "40C7D313947F0000:error:1608010C:STORE routines:ossl_store_handle_load_result:unsupported:../crypto/store/store_result.c:151:\n" ++
+        "Unable to load certificate file";
+    const store_diagnostic = store_stderr;
+
+    const algorithm_classified = classifyOpenSSLRejection(
+        store_stdout,
+        store_stderr,
+        store_diagnostic,
+    );
+    const der_classified = classifyOpenSSLRejection(
+        store_stdout,
+        store_stderr,
+        store_diagnostic,
+    );
+    try testing.expectEqual(algorithm_classified, der_classified);
+    try testing.expectEqual(Status.reject, algorithm_classified.status);
+    try testing.expectEqual(Reason.malformed_der, algorithm_classified.reason);
 }
 
 test "pki reduce: missing and non-file fixtures are tool failures while malformed certificates reject" {
@@ -2121,7 +2142,6 @@ test "pki reduce: missing and non-file fixtures are tool failures while malforme
     try testing.expectEqual(Reason.malformed_der, malformed.reason);
 
     const openssl30_malformed = classifyOpenSSLRejection(
-        manifestCaseById("malformed-truncated-certificate"),
         "",
         "Could not read certificate file from tests/vectors/pki/malformed-truncated.crt\n" ++
             "40C7D313947F0000:error:1608010C:STORE routines:ossl_store_handle_load_result:unsupported:../crypto/store/store_result.c:151:\n" ++

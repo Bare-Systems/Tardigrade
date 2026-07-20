@@ -19,6 +19,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -305,6 +306,9 @@ func generate(out string) error {
 	if err != nil {
 		return fmt.Errorf("create DER fixtures: %w", err)
 	}
+	if err := assertUniqueHostileDER(algorithmFixtures, derFixtures); err != nil {
+		return err
+	}
 
 	validationTime := time.Unix(validationTimeUnix, 0).UTC()
 	if err := expectVerify(true, valid.parsed, []*x509.Certificate{root.parsed}, []*x509.Certificate{intermediate.parsed}, "api.example.test", validationTime); err != nil {
@@ -385,6 +389,30 @@ func generate(out string) error {
 		if err := os.WriteFile(filepath.Join(out, name), contents, 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", name, err)
 		}
+	}
+	return nil
+}
+
+func assertUniqueHostileDER(algorithmFixtures, derFixtures map[string][]byte) error {
+	fixtures := make(map[string][]byte, len(algorithmFixtures)+len(derFixtures))
+	names := make([]string, 0, len(algorithmFixtures)+len(derFixtures))
+	for name, der := range algorithmFixtures {
+		fixtures[name] = der
+		names = append(names, name)
+	}
+	for name, der := range derFixtures {
+		fixtures[name] = der
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	seen := make(map[[sha256.Size]byte]string, len(names))
+	for _, name := range names {
+		digest := sha256.Sum256(fixtures[name])
+		if first, ok := seen[digest]; ok {
+			return fmt.Errorf("duplicate hostile DER payload: %s and %s", first, name)
+		}
+		seen[digest] = name
 	}
 	return nil
 }

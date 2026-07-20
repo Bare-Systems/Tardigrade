@@ -3,6 +3,9 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const compat = @import("zig_compat.zig");
 const http = @import("http.zig");
+const tls_core = @import("tls_core");
+
+const encrypted_stream = tls_core.encrypted_stream;
 
 var active_file_overrides: ?*const http.config_file.Overrides = null;
 var active_secret_overrides: ?*const http.secrets.Overrides = null;
@@ -397,6 +400,9 @@ pub const EdgeConfig = struct {
     /// Applied as SO_RCVTIMEO before SSL_accept to bound slow or stalled clients.
     /// 0 falls back to keep_alive_timeout_ms. Default: 5000.
     tls_handshake_timeout_ms: u32,
+    /// Runtime-effective TLS record-stream watermarks for the native pure-Zig
+    /// listener path. Defaults are derived from the fixed record-stream queues.
+    tls_buffer_limits: encrypted_stream.BufferLimits,
     /// Downstream write timeout in milliseconds (TARDIGRADE_DOWNSTREAM_WRITE_TIMEOUT_MS).
     /// Applied as SO_SNDTIMEO during response writes; distinct from read timeouts.
     /// 0 = no explicit write deadline. Default: 30000.
@@ -1176,6 +1182,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const request_total_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS", 0);
     const tls_handshake_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS", 5_000);
+    const tls_buffer_limits = try tlsBufferLimitsFromEnv(allocator);
     const downstream_write_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_DOWNSTREAM_WRITE_TIMEOUT_MS", 30_000);
 
     const max_req_conn_str = envOrDefault(allocator, "TARDIGRADE_MAX_REQUESTS_PER_CONNECTION", "100") catch unreachable;
@@ -1571,6 +1578,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
         .request_total_timeout_ms = request_total_timeout_ms,
         .tls_handshake_timeout_ms = tls_handshake_timeout_ms,
+        .tls_buffer_limits = tls_buffer_limits,
         .downstream_write_timeout_ms = downstream_write_timeout_ms,
         .max_requests_per_connection = max_requests_per_connection,
         .connection_pool_size = connection_pool_size,
@@ -2589,7 +2597,6 @@ pub const is_appliance_tls_profile =
 /// present when TLS is enabled and the multi-identity `tls_sni_certs`
 /// mechanism is rejected.
 fn validateTlsServerNamePolicy(cfg: *const EdgeConfig) !void {
-    const tls_core = @import("tls_core");
     if (cfg.tls_server_name.len > 0) {
         tls_core.appliance_credentials.validateServerName(cfg.tls_server_name) catch {
             std.log.err("config validation failed: TARDIGRADE_TLS_SERVER_NAME must be a single non-wildcard DNS host name", .{});
@@ -2818,6 +2825,10 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES must be at least 1", .{});
         return error.InvalidConfigValue;
     };
+    cfg.tls_buffer_limits.validate() catch {
+        std.log.err("config validation failed: TLS buffer watermarks must satisfy low < high <= hard, fit native queue capacity, and preserve record/handshake reserves", .{});
+        return error.InvalidConfigValue;
+    };
     cfg.proxy_buffer_limits.validate() catch {
         std.log.err("config validation failed: proxy buffer watermarks must satisfy low < high <= hard and aggregate hard limits must be 0 or at least the per-stream hard limit", .{});
         return error.InvalidConfigValue;
@@ -2873,6 +2884,40 @@ fn validateUpstreamRetryAttempts(attempts: u32) !void {
 
 fn validateBufferedUpstreamResponseLimit(limit: usize) !void {
     if (limit == 0) return error.InvalidConfigValue;
+}
+
+fn tlsBufferLimitsFromEnv(allocator: std.mem.Allocator) !encrypted_stream.BufferLimits {
+    const defaults = encrypted_stream.BufferLimits.defaults();
+    const limits = encrypted_stream.BufferLimits{
+        .inbound_ciphertext = try tlsWatermarkFromEnv(allocator, "TARDIGRADE_TLS_INBOUND_CIPHERTEXT", defaults.inbound_ciphertext),
+        .inbound_plaintext = try tlsWatermarkFromEnv(allocator, "TARDIGRADE_TLS_INBOUND_PLAINTEXT", defaults.inbound_plaintext),
+        .outbound_ciphertext = try tlsWatermarkFromEnv(allocator, "TARDIGRADE_TLS_OUTBOUND_CIPHERTEXT", defaults.outbound_ciphertext),
+        .handshake = try tlsWatermarkFromEnv(allocator, "TARDIGRADE_TLS_HANDSHAKE", defaults.handshake),
+    };
+    limits.validate() catch |err| {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_* buffer limits are invalid: {}", .{err});
+        return error.InvalidConfigValue;
+    };
+    return limits;
+}
+
+fn tlsWatermarkFromEnv(allocator: std.mem.Allocator, comptime prefix: []const u8, defaults: encrypted_stream.Watermark) !encrypted_stream.Watermark {
+    return .{
+        .low = try parseTlsLimitEnv(allocator, prefix ++ "_LOW_WATERMARK_BYTES", defaults.low),
+        .high = try parseTlsLimitEnv(allocator, prefix ++ "_HIGH_WATERMARK_BYTES", defaults.high),
+        .hard = try parseTlsLimitEnv(allocator, prefix ++ "_HARD_LIMIT_BYTES", defaults.hard),
+    };
+}
+
+fn parseTlsLimitEnv(allocator: std.mem.Allocator, key: []const u8, default_value: usize) !usize {
+    const raw = envOrDefault(allocator, key, "") catch return default_value;
+    defer allocator.free(raw);
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len == 0) return default_value;
+    return std.fmt.parseInt(usize, value, 10) catch {
+        logConfigDiagnostic("config validation failed: {s} must be a non-negative integer byte count", .{key});
+        return error.InvalidConfigValue;
+    };
 }
 
 fn validateProxyStreamBufferSize(size: usize) !void {
@@ -3266,6 +3311,98 @@ test "conflicting file override value detects env/file mismatch" {
     try std.testing.expectEqualStrings("8069", conflictingFileOverrideValue("TARDIGRADE_LISTEN_PORT", "18069").?);
     try std.testing.expect(conflictingFileOverrideValue("TARDIGRADE_LISTEN_PORT", "8069") == null);
     try std.testing.expect(conflictingFileOverrideValue("TARDIGRADE_WORKER_THREADS", "4") == null);
+}
+
+const TestConfigOverride = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+fn putTestOverride(allocator: std.mem.Allocator, overrides: *http.config_file.Overrides, key: []const u8, value: []const u8) !void {
+    try overrides.map.put(try allocator.dupe(u8, key), try allocator.dupe(u8, value));
+}
+
+fn putTestOverrideFmt(
+    allocator: std.mem.Allocator,
+    overrides: *http.config_file.Overrides,
+    key: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    try overrides.map.put(try allocator.dupe(u8, key), try std.fmt.allocPrint(allocator, fmt, args));
+}
+
+fn expectTlsLimitOverridesError(allocator: std.mem.Allocator, entries: []const TestConfigOverride) !void {
+    var overrides = http.config_file.Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    for (entries) |entry| try putTestOverride(allocator, &overrides, entry.key, entry.value);
+
+    const previous = active_file_overrides;
+    active_file_overrides = &overrides;
+    defer active_file_overrides = previous;
+
+    try std.testing.expectError(error.InvalidConfigValue, tlsBufferLimitsFromEnv(allocator));
+}
+
+test "TLS buffer limits parse explicit override values" {
+    const allocator = std.testing.allocator;
+    const defaults = encrypted_stream.BufferLimits.defaults();
+    var overrides = http.config_file.Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES", "{d}", .{defaults.inbound_ciphertext.low + 1});
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_HIGH_WATERMARK_BYTES", "{d}", .{defaults.inbound_ciphertext.high});
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_HARD_LIMIT_BYTES", "{d}", .{defaults.inbound_ciphertext.hard});
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_INBOUND_PLAINTEXT_LOW_WATERMARK_BYTES", "{d}", .{defaults.inbound_plaintext.low + 1});
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_INBOUND_PLAINTEXT_HIGH_WATERMARK_BYTES", "{d}", .{defaults.inbound_plaintext.high});
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_INBOUND_PLAINTEXT_HARD_LIMIT_BYTES", "{d}", .{defaults.inbound_plaintext.hard});
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_OUTBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES", "{d}", .{defaults.outbound_ciphertext.low + 1});
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_OUTBOUND_CIPHERTEXT_HIGH_WATERMARK_BYTES", "{d}", .{defaults.outbound_ciphertext.high});
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_OUTBOUND_CIPHERTEXT_HARD_LIMIT_BYTES", "{d}", .{defaults.outbound_ciphertext.hard});
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_HANDSHAKE_LOW_WATERMARK_BYTES", "{d}", .{defaults.handshake.low + 1});
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_HANDSHAKE_HIGH_WATERMARK_BYTES", "{d}", .{defaults.handshake.high});
+    try putTestOverrideFmt(allocator, &overrides, "TARDIGRADE_TLS_HANDSHAKE_HARD_LIMIT_BYTES", "{d}", .{defaults.handshake.hard});
+
+    const previous = active_file_overrides;
+    active_file_overrides = &overrides;
+    defer active_file_overrides = previous;
+
+    const limits = try tlsBufferLimitsFromEnv(allocator);
+    try std.testing.expectEqual(defaults.inbound_ciphertext.low + 1, limits.inbound_ciphertext.low);
+    try std.testing.expectEqual(defaults.inbound_plaintext.low + 1, limits.inbound_plaintext.low);
+    try std.testing.expectEqual(defaults.outbound_ciphertext.low + 1, limits.outbound_ciphertext.low);
+    try std.testing.expectEqual(defaults.handshake.low + 1, limits.handshake.low);
+}
+
+test "TLS buffer limits reject malformed explicit override values" {
+    const allocator = std.testing.allocator;
+    try expectTlsLimitOverridesError(allocator, &.{.{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES", .value = "not-a-number" }});
+    try expectTlsLimitOverridesError(allocator, &.{.{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES", .value = "-1" }});
+    try expectTlsLimitOverridesError(allocator, &.{.{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES", .value = "184467440737095516160" }});
+}
+
+test "TLS buffer limits reject ordering capacity and reserve violations" {
+    const allocator = std.testing.allocator;
+    try expectTlsLimitOverridesError(allocator, &.{.{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES", .value = "0" }});
+    try expectTlsLimitOverridesError(allocator, &.{
+        .{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES", .value = "4096" },
+        .{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_HIGH_WATERMARK_BYTES", .value = "4096" },
+    });
+    try expectTlsLimitOverridesError(allocator, &.{
+        .{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES", .value = "4096" },
+        .{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_HIGH_WATERMARK_BYTES", .value = "8192" },
+        .{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_HARD_LIMIT_BYTES", .value = "4096" },
+    });
+    try expectTlsLimitOverridesError(allocator, &.{
+        .{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES", .value = "1" },
+        .{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_HIGH_WATERMARK_BYTES", .value = "2" },
+        .{ .key = "TARDIGRADE_TLS_INBOUND_CIPHERTEXT_HARD_LIMIT_BYTES", .value = "18446744073709551615" },
+    });
+    try expectTlsLimitOverridesError(allocator, &.{
+        .{ .key = "TARDIGRADE_TLS_OUTBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES", .value = "1" },
+        .{ .key = "TARDIGRADE_TLS_OUTBOUND_CIPHERTEXT_HIGH_WATERMARK_BYTES", .value = "2" },
+        .{ .key = "TARDIGRADE_TLS_OUTBOUND_CIPHERTEXT_HARD_LIMIT_BYTES", .value = "3" },
+    });
 }
 
 test "parse upstream health success status overrides" {
@@ -3709,4 +3846,14 @@ test "proxy buffer limits validate low high hard ordering" {
         .per_origin_hard_limit = 512 * 1024,
         .global_hard_limit = 0,
     }).validate());
+}
+
+test "TLS buffer limits default from TLS core" {
+    const allocator = std.testing.allocator;
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+
+    try std.testing.expectEqualDeep(encrypted_stream.BufferLimits.defaults(), cfg.tls_buffer_limits);
+    cfg.tls_buffer_limits.inbound_plaintext.low = cfg.tls_buffer_limits.inbound_plaintext.high;
+    try std.testing.expectError(error.InvalidBufferLimits, cfg.tls_buffer_limits.validate());
 }

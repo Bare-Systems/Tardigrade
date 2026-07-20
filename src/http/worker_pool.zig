@@ -25,11 +25,31 @@ const compat = @import("../zig_compat.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 
-pub const HandlerFn = *const fn (ctx: *anyopaque, fd: std.posix.fd_t) void;
+pub const WorkItem = union(enum) {
+    accepted: std.posix.fd_t,
+    parked_ready: std.posix.fd_t,
+    active_socket_ready: std.posix.fd_t,
+    active_drive_poll: std.posix.fd_t,
+
+    pub fn fd(self: WorkItem) std.posix.fd_t {
+        return switch (self) {
+            inline else => |value| value,
+        };
+    }
+
+    fn queueOwnsFd(self: WorkItem) bool {
+        return switch (self) {
+            .accepted => true,
+            .parked_ready, .active_socket_ready, .active_drive_poll => false,
+        };
+    }
+};
+
+pub const HandlerFn = *const fn (ctx: *anyopaque, item: WorkItem) void;
 pub const WaitCallbackFn = *const fn (ctx: *anyopaque, wait_ns: i64) void;
 
 const QueueEntry = struct {
-    fd: std.posix.fd_t,
+    item: WorkItem,
     enqueued_ns: i128,
 };
 
@@ -140,8 +160,24 @@ pub const WorkerPool = struct {
     }
 
     pub fn submit(self: *WorkerPool, fd: std.posix.fd_t) !void {
+        return self.submitWork(.{ .accepted = fd });
+    }
+
+    pub fn submitParkedReady(self: *WorkerPool, fd: std.posix.fd_t) !void {
+        return self.submitWork(.{ .parked_ready = fd });
+    }
+
+    pub fn submitActiveSocketReady(self: *WorkerPool, fd: std.posix.fd_t) !void {
+        return self.submitWork(.{ .active_socket_ready = fd });
+    }
+
+    pub fn submitActiveDrivePoll(self: *WorkerPool, fd: std.posix.fd_t) !void {
+        return self.submitWork(.{ .active_drive_poll = fd });
+    }
+
+    fn submitWork(self: *WorkerPool, item: WorkItem) !void {
         if (builtin.single_threaded) {
-            self.handler(self.handler_ctx, fd);
+            self.handler(self.handler_ctx, item);
             return;
         }
 
@@ -157,7 +193,7 @@ pub const WorkerPool = struct {
             self.worker_queues[queue_index].items.len >= self.max_per_worker_queue_len)
             return error.QueueFull;
         try self.worker_queues[queue_index].items.pushBack(self.allocator, .{
-            .fd = fd,
+            .item = item,
             .enqueued_ns = compat.nanoTimestamp(),
         });
         self.queued_jobs += 1;
@@ -222,8 +258,10 @@ pub const WorkerPool = struct {
             // Immediate: close queued fds without waiting (configured no-drain).
             for (self.worker_queues) |*wq| {
                 while (wq.items.popFront()) |entry| {
-                    _ = std.c.close(entry.fd);
-                    result.forced_closes += 1;
+                    if (entry.item.queueOwnsFd()) {
+                        _ = std.c.close(entry.item.fd());
+                        result.forced_closes += 1;
+                    }
                 }
             }
             self.queued_jobs = 0;
@@ -237,8 +275,10 @@ pub const WorkerPool = struct {
                     result.timed_out = true;
                     for (self.worker_queues) |*wq| {
                         while (wq.items.popFront()) |entry| {
-                            _ = std.c.close(entry.fd);
-                            result.forced_closes += 1;
+                            if (entry.item.queueOwnsFd()) {
+                                _ = std.c.close(entry.item.fd());
+                                result.forced_closes += 1;
+                            }
                         }
                     }
                     self.queued_jobs = 0;
@@ -290,7 +330,7 @@ pub const WorkerPool = struct {
                 cb(self.wait_callback_ctx.?, wait_ns);
             }
 
-            self.handler(self.handler_ctx, entry.fd);
+            self.handler(self.handler_ctx, entry.item);
 
             self.mutex.lock();
             self.active_jobs -= 1;
@@ -353,10 +393,10 @@ test "worker pool processes submitted items" {
     var ctx = Ctx{};
 
     const handler = struct {
-        fn run(raw_ctx: *anyopaque, fd: std.posix.fd_t) void {
+        fn run(raw_ctx: *anyopaque, item: WorkItem) void {
             const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
             typed.mutex.lock();
-            typed.total += @intCast(fd);
+            typed.total += @intCast(item.fd());
             typed.mutex.unlock();
         }
     }.run;
@@ -386,7 +426,7 @@ test "worker pool shutdown drains in-flight work" {
     var ctx = Ctx{};
 
     const handler = struct {
-        fn run(raw_ctx: *anyopaque, _: std.posix.fd_t) void {
+        fn run(raw_ctx: *anyopaque, _: WorkItem) void {
             const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
             std.Io.sleep(compat.io(), .fromMilliseconds(20), .awake) catch unreachable;
             typed.mutex.lock();
@@ -422,9 +462,9 @@ test "worker pool queue selection prefers least-loaded worker queue" {
         for (queues) |*q| q.items.deinit(std.testing.allocator);
     }
 
-    try queues[0].items.pushBack(std.testing.allocator, .{ .fd = 10, .enqueued_ns = 0 });
-    try queues[0].items.pushBack(std.testing.allocator, .{ .fd = 11, .enqueued_ns = 0 });
-    try queues[1].items.pushBack(std.testing.allocator, .{ .fd = 20, .enqueued_ns = 0 });
+    try queues[0].items.pushBack(std.testing.allocator, .{ .item = .{ .accepted = 10 }, .enqueued_ns = 0 });
+    try queues[0].items.pushBack(std.testing.allocator, .{ .item = .{ .accepted = 11 }, .enqueued_ns = 0 });
+    try queues[1].items.pushBack(std.testing.allocator, .{ .item = .{ .accepted = 20 }, .enqueued_ns = 0 });
 
     var pool = WorkerPool{
         .allocator = std.testing.allocator,
@@ -475,7 +515,7 @@ test "worker pool popWorkLocked steals from peer queue" {
         for (queues) |*q| q.items.deinit(std.testing.allocator);
     }
 
-    try queues[1].items.pushBack(std.testing.allocator, .{ .fd = 42, .enqueued_ns = 0 });
+    try queues[1].items.pushBack(std.testing.allocator, .{ .item = .{ .accepted = 42 }, .enqueued_ns = 0 });
 
     var pool = WorkerPool{
         .allocator = std.testing.allocator,
@@ -490,7 +530,7 @@ test "worker pool popWorkLocked steals from peer queue" {
     };
 
     const stolen = pool.popWorkLocked(0);
-    try std.testing.expectEqual(@as(?QueueEntry, .{ .fd = 42, .enqueued_ns = 0 }), stolen);
+    try std.testing.expectEqual(@as(?QueueEntry, .{ .item = .{ .accepted = 42 }, .enqueued_ns = 0 }), stolen);
     try std.testing.expectEqual(@as(usize, 0), pool.queued_jobs);
 }
 
@@ -506,7 +546,7 @@ test "shutdownAndJoin drain_timeout_ms=0 closes queued fds immediately" {
     var ctx = Ctx{};
 
     const handler = struct {
-        fn run(raw_ctx: *anyopaque, _: std.posix.fd_t) void {
+        fn run(raw_ctx: *anyopaque, _: WorkItem) void {
             // This should not be called because we force-close before dispatch.
             const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
             typed.mutex.lock();
@@ -540,7 +580,7 @@ test "shutdownAndJoin drain_timeout_ms positive drains in-flight work before tim
     var ctx = Ctx{};
 
     const handler = struct {
-        fn run(raw_ctx: *anyopaque, _: std.posix.fd_t) void {
+        fn run(raw_ctx: *anyopaque, _: WorkItem) void {
             const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
             std.Io.sleep(compat.io(), .fromMilliseconds(10), .awake) catch unreachable;
             typed.mutex.lock();
@@ -581,7 +621,7 @@ test "shutdownAndJoin drain_timeout_ms expires and returns" {
     var ctx = Ctx{};
 
     const handler = struct {
-        fn run(ctx_ptr: *anyopaque, _: std.posix.fd_t) void {
+        fn run(ctx_ptr: *anyopaque, _: WorkItem) void {
             const c: *Ctx = @ptrCast(@alignCast(ctx_ptr));
             c.started.store(true, .release);
             const deadline = compat.milliTimestamp() + 200;
@@ -624,9 +664,9 @@ test "shutdownAndJoin counts queued connections force-closed (#170)" {
     for (queues) |*q| q.* = .{ .items = .empty };
     defer for (queues) |*q| q.items.deinit(std.testing.allocator);
 
-    try queues[0].items.pushBack(std.testing.allocator, .{ .fd = 90001, .enqueued_ns = 0 });
-    try queues[0].items.pushBack(std.testing.allocator, .{ .fd = 90002, .enqueued_ns = 0 });
-    try queues[1].items.pushBack(std.testing.allocator, .{ .fd = 90003, .enqueued_ns = 0 });
+    try queues[0].items.pushBack(std.testing.allocator, .{ .item = .{ .accepted = 90001 }, .enqueued_ns = 0 });
+    try queues[0].items.pushBack(std.testing.allocator, .{ .item = .{ .accepted = 90002 }, .enqueued_ns = 0 });
+    try queues[1].items.pushBack(std.testing.allocator, .{ .item = .{ .accepted = 90003 }, .enqueued_ns = 0 });
 
     var pool = WorkerPool{
         .allocator = std.testing.allocator,
@@ -647,6 +687,36 @@ test "shutdownAndJoin counts queued connections force-closed (#170)" {
     try std.testing.expectEqual(@as(usize, 0), pool.queued_jobs);
 }
 
+test "shutdownAndJoin does not force-close queued registry-owned work" {
+    if (builtin.single_threaded) return;
+
+    var queues = try std.testing.allocator.alloc(WorkerQueue, 1);
+    defer std.testing.allocator.free(queues);
+    queues[0] = .{ .items = .empty };
+    defer queues[0].items.deinit(std.testing.allocator);
+
+    try queues[0].items.pushBack(std.testing.allocator, .{ .item = .{ .accepted = 90001 }, .enqueued_ns = 0 });
+    try queues[0].items.pushBack(std.testing.allocator, .{ .item = .{ .active_drive_poll = 90002 }, .enqueued_ns = 0 });
+    try queues[0].items.pushBack(std.testing.allocator, .{ .item = .{ .active_socket_ready = 90003 }, .enqueued_ns = 0 });
+
+    var pool = WorkerPool{
+        .allocator = std.testing.allocator,
+        .threads = if (builtin.single_threaded) .{} else &.{},
+        .worker_queues = queues,
+        .worker_ids = &.{},
+        .handler = undefined,
+        .handler_ctx = undefined,
+        .max_queue_len = 128,
+        .queued_jobs = 3,
+        .next_queue = 0,
+    };
+
+    const drain = pool.shutdownAndJoin(0);
+    try std.testing.expect(!drain.timed_out);
+    try std.testing.expectEqual(@as(usize, 1), drain.forced_closes);
+    try std.testing.expectEqual(@as(usize, 0), pool.queued_jobs);
+}
+
 test "worker pool global queue cap rejects without unbounded growth" {
     if (builtin.single_threaded) return;
 
@@ -660,7 +730,7 @@ test "worker pool global queue cap rejects without unbounded growth" {
     var ctx = Ctx{};
 
     const handler = struct {
-        fn run(raw_ctx: *anyopaque, _: std.posix.fd_t) void {
+        fn run(raw_ctx: *anyopaque, _: WorkItem) void {
             const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
             while (true) {
                 std.Io.sleep(compat.io(), .fromMilliseconds(1), .awake) catch {};
@@ -712,7 +782,7 @@ test "worker pool per-worker queue depth limit rejects when all worker queues ar
     var ctx = Ctx{};
 
     const handler = struct {
-        fn run(raw_ctx: *anyopaque, _: std.posix.fd_t) void {
+        fn run(raw_ctx: *anyopaque, _: WorkItem) void {
             const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
             // Block until the test signals proceed so the queue doesn't drain.
             while (true) {

@@ -100,3 +100,16 @@ ciphertext queue; there is no hidden pending-plaintext staging queue. HTTP/1.1
 and HTTP/2 consumers should use `can_write_plaintext`, `can_read_plaintext`,
 `wants_read`, `wants_write`, and the buffer snapshot to register only socket
 readiness that can make progress.
+
+Production native TLS listeners receive an immutable `BufferLimits` policy from
+validated edge configuration. The environment keys are
+`TARDIGRADE_TLS_{INBOUND_CIPHERTEXT,INBOUND_PLAINTEXT,OUTBOUND_CIPHERTEXT,HANDSHAKE}_{LOW_WATERMARK_BYTES,HIGH_WATERMARK_BYTES,HARD_LIMIT_BYTES}`;
+omitted values use `BufferLimits.defaults()`. Reload rejects invalid ordering,
+capacity, or atomic-reserve violations before replacing the active config.
+
+For encrypted HTTP transports, application readiness and raw fd readiness are
+intentionally separate. `can_read_plaintext` and `can_write_plaintext` allow
+immediate application work; raw socket registration is derived only from
+`wants_read` and `wants_write`. A plaintext read blocked on a TLS write retry
+therefore registers only write interest, and a plaintext write blocked on a TLS
+read retry registers only read interest.

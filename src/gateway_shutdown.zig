@@ -313,6 +313,7 @@ pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Ga
     state.max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes;
     state.connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE;
     state.proxy_buffer_limits = cfg.proxy_buffer_limits;
+    state.tls_buffer_limits = cfg.tls_buffer_limits;
     state.compression_config = .{
         .enabled = cfg.compression_enabled,
         .min_size = cfg.compression_min_size,
@@ -352,6 +353,7 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
         .per_origin_hard_limit = 2 * 1024 * 1024,
         .global_hard_limit = 4 * 1024 * 1024,
     };
+    cfg.tls_buffer_limits.outbound_ciphertext.high = cfg.tls_buffer_limits.outbound_ciphertext.low + 16;
 
     var state: GatewayState = undefined;
     state.allocator = allocator;
@@ -380,6 +382,7 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
         .per_origin_hard_limit = 0,
         .global_hard_limit = 0,
     };
+    state.tls_buffer_limits = @import("tls_core").encrypted_stream.BufferLimits.defaults();
     state.compression_config = .{};
     state.logger = http.logger.Logger.init(.info, "test");
     state.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
@@ -399,6 +402,9 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
     defer allocator.free(prom);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 393216\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"global\",limit=\"hard\"} 4194304\n") != null);
+    const tls_high = try std.fmt.allocPrint(allocator, "tardigrade_tls_buffer_config_limit_bytes{{queue=\"outbound_ciphertext\",limit=\"high\"}} {d}\n", .{cfg.tls_buffer_limits.outbound_ciphertext.high});
+    defer allocator.free(tls_high);
+    try std.testing.expect(std.mem.find(u8, prom, tls_high) != null);
 }
 
 /// Context passed to the background health-probe thread.

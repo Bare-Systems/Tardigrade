@@ -454,6 +454,7 @@ pub const GatewayState = struct {
     connection_memory_estimate_bytes: usize, // cfg-derived; updated on reload [runtime_mutex]
     max_total_connection_memory_bytes: usize, // cfg snapshot; updated on reload [runtime_mutex]
     proxy_buffer_limits: http.proxy_buffer_account.Limits, // cfg snapshot; updated on reload [runtime_mutex]
+    tls_buffer_limits: @import("tls_core").encrypted_stream.BufferLimits, // cfg snapshot for native TLS; updated on reload [runtime_mutex]
     upstream_rr_index: usize, // LB selection state [upstream_mutex]
     upstream_backup_rr_index: usize, // LB selection state [upstream_mutex]
     lb_random_state: u64, // LB selection state [upstream_mutex]
@@ -1700,8 +1701,10 @@ pub const GatewayState = struct {
         try combined.appendSlice(base);
         self.runtime_mutex.lock();
         const proxy_buffer_limits = self.proxy_buffer_limits;
+        const tls_buffer_limits = self.tls_buffer_limits;
         self.runtime_mutex.unlock();
         try appendProxyBufferConfigPrometheus(&combined, proxy_buffer_limits);
+        try appendTlsBufferConfigPrometheus(&combined, tls_buffer_limits);
         if (mux_snapshot.device_counts.len > 0) {
             try combined.appendSlice(
                 \\# HELP tardigrade_mux_device_channels Current active mux channels by device
@@ -1730,6 +1733,24 @@ pub const GatewayState = struct {
             try out.print("tardigrade_buffer_config_limit_bytes{{direction=\"{s}\",scope=\"stream\",limit=\"hard\"}} {d}\n", .{ direction, limits.per_stream_hard_limit });
             try out.print("tardigrade_buffer_config_limit_bytes{{direction=\"{s}\",scope=\"origin\",limit=\"hard\"}} {d}\n", .{ direction, limits.per_origin_hard_limit });
             try out.print("tardigrade_buffer_config_limit_bytes{{direction=\"{s}\",scope=\"global\",limit=\"hard\"}} {d}\n", .{ direction, limits.global_hard_limit });
+        }
+    }
+
+    fn appendTlsBufferConfigPrometheus(out: *std.array_list.Managed(u8), limits: @import("tls_core").encrypted_stream.BufferLimits) !void {
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_buffer_config_limit_bytes Configured native TLS buffer limits in bytes
+            \\# TYPE tardigrade_tls_buffer_config_limit_bytes gauge
+            \\
+        );
+        inline for (.{
+            .{ "inbound_ciphertext", limits.inbound_ciphertext },
+            .{ "inbound_plaintext", limits.inbound_plaintext },
+            .{ "outbound_ciphertext", limits.outbound_ciphertext },
+            .{ "handshake", limits.handshake },
+        }) |entry| {
+            try out.print("tardigrade_tls_buffer_config_limit_bytes{{queue=\"{s}\",limit=\"low\"}} {d}\n", .{ entry[0], entry[1].low });
+            try out.print("tardigrade_tls_buffer_config_limit_bytes{{queue=\"{s}\",limit=\"high\"}} {d}\n", .{ entry[0], entry[1].high });
+            try out.print("tardigrade_tls_buffer_config_limit_bytes{{queue=\"{s}\",limit=\"hard\"}} {d}\n", .{ entry[0], entry[1].hard });
         }
     }
 
@@ -3158,6 +3179,7 @@ fn initSlotTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
         .per_origin_hard_limit = 0,
         .global_hard_limit = 0,
     };
+    gs.tls_buffer_limits = @import("tls_core").encrypted_stream.BufferLimits.defaults();
     gs.active_connections_by_ip = std.StringHashMap(u32).init(allocator);
     gs.active_fds = std.AutoHashMap(std.posix.fd_t, void).init(allocator);
     gs.fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(allocator);
@@ -3423,6 +3445,7 @@ fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) voi
         .per_origin_hard_limit = 0,
         .global_hard_limit = 0,
     };
+    gs.tls_buffer_limits = @import("tls_core").encrypted_stream.BufferLimits.defaults();
 }
 
 test "served metrics JSON exposes every counter the canonical serializer does" {
@@ -3477,6 +3500,7 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_upstream_h2_streaming_upload_fallback_total counter") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_upstream_h2_streaming_upload_fallback_total 1\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 786432\n") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_config_limit_bytes{queue=\"outbound_ciphertext\",limit=\"hard\"}") != null);
 }
 
 test "served Prometheus metrics reflect updated proxy buffer limit snapshot" {
@@ -3494,6 +3518,7 @@ test "served Prometheus metrics reflect updated proxy buffer limit snapshot" {
         .per_origin_hard_limit = 2 * 1024 * 1024,
         .global_hard_limit = 4 * 1024 * 1024,
     };
+    gs.tls_buffer_limits.outbound_ciphertext.high = gs.tls_buffer_limits.outbound_ciphertext.low + 16;
     gs.runtime_mutex.unlock();
 
     const prom = try gs.metricsToPrometheus(std.testing.allocator);

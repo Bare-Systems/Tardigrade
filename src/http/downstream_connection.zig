@@ -2,6 +2,7 @@ const std = @import("std");
 const tls_core = @import("tls_core");
 const compat = @import("../zig_compat.zig");
 const event_loop = @import("event_loop.zig");
+const metrics_mod = @import("metrics.zig");
 const native_tls_connection = @import("native_tls_connection.zig");
 const request_mod = @import("request.zig");
 const response_mod = @import("response.zig");
@@ -15,6 +16,19 @@ pub const RuntimeOutcome = union(enum) {
     wait: event_loop.Interest,
     idle_keepalive,
     close,
+};
+
+pub const EncryptedOperation = enum {
+    read_plaintext,
+    write_plaintext,
+    drive,
+};
+
+pub const EncryptedWait = union(enum) {
+    ready_now,
+    socket: event_loop.Interest,
+    retry_at_ms: u64,
+    stalled,
 };
 
 pub const OpenSslTransport = struct {
@@ -228,6 +242,10 @@ pub const ManagedConnection = struct {
         release_config_fn: ?*const fn (*anyopaque, *anyopaque) void = null,
         close_ctx: ?*anyopaque = null,
         close_fn: ?*const fn (*anyopaque, std.posix.fd_t) void = null,
+        metrics: ?*metrics_mod.Metrics = null,
+        metrics_mutex: ?*compat.Mutex = null,
+        tls_buffer_metrics: metrics_mod.TlsBufferConnectionMetrics = .{},
+        drive_poll_due_ms: u64 = 0,
         owned_ip: ?[]u8 = null,
         allocator: ?std.mem.Allocator = null,
         config_generation: u64 = 0,
@@ -266,6 +284,7 @@ pub const ManagedConnection = struct {
     transport: DownstreamTransport,
     phase: ConnectionPhase,
     interest: event_loop.Interest,
+    active_work_queued: bool = false,
     lifecycle: Lifecycle = .{},
 
     pub fn init(transport: DownstreamTransport, phase: ConnectionPhase) ManagedConnection {
@@ -284,19 +303,77 @@ pub const ManagedConnection = struct {
     }
 
     pub fn updateInterestFor(self: *ManagedConnection, requested: event_loop.Interest) event_loop.Interest {
-        self.interest = switch (self.transport) {
-            .plaintext => requested,
-            else => combinedInterest(requested, self.transport.readiness()),
-        };
+        _ = self.updateWaitFor(requested, 0, 0);
         return self.interest;
+    }
+
+    pub fn updateWaitFor(
+        self: *ManagedConnection,
+        requested: event_loop.Interest,
+        now_ms: u64,
+        retry_interval_ms: u64,
+    ) ?EncryptedWait {
+        const wait: ?EncryptedWait = switch (self.transport) {
+            .plaintext => null,
+            else => encryptedWaitForInterestAt(self.transport.readiness(), requested, now_ms, retry_interval_ms),
+        };
+        self.interest = switch (wait orelse EncryptedWait{ .socket = requested }) {
+            .socket => |interest| interest,
+            .ready_now, .retry_at_ms, .stalled => .{},
+        };
+        self.lifecycle.drive_poll_due_ms = switch (wait orelse EncryptedWait{ .socket = requested }) {
+            .retry_at_ms => |due| due,
+            else => 0,
+        };
+        self.observeTlsBufferMetrics();
+        return wait;
+    }
+
+    pub fn encryptedWaitFor(self: *ManagedConnection, requested: event_loop.Interest) ?EncryptedWait {
+        return self.encryptedWaitForAt(requested, 0, 0);
+    }
+
+    pub fn encryptedWaitForAt(
+        self: *ManagedConnection,
+        requested: event_loop.Interest,
+        now_ms: u64,
+        retry_interval_ms: u64,
+    ) ?EncryptedWait {
+        return switch (self.transport) {
+            .plaintext => null,
+            else => encryptedWaitForInterestAt(self.transport.readiness(), requested, now_ms, retry_interval_ms),
+        };
     }
 
     pub fn deinit(self: *ManagedConnection) void {
         const fd = self.fd;
+        self.observeTlsBufferMetrics();
+        self.releaseTlsBufferMetrics();
         deinitPhase(&self.phase);
         self.transport.deinit();
         self.lifecycle.deinit(fd);
         self.* = undefined;
+    }
+
+    pub fn observeTlsBufferMetrics(self: *ManagedConnection) void {
+        const metrics = self.lifecycle.metrics orelse return;
+        const mutex = self.lifecycle.metrics_mutex orelse return;
+        var transport = self.transport;
+        const stream = transport.encryptedStream() orelse return;
+        const snapshot = stream.bufferSnapshot();
+        mutex.lock();
+        defer mutex.unlock();
+        metrics.observeTlsBufferSnapshot(&self.lifecycle.tls_buffer_metrics, stream.backend(), snapshot) catch
+            @panic("TLS buffer accounting underflow");
+    }
+
+    pub fn releaseTlsBufferMetrics(self: *ManagedConnection) void {
+        const metrics = self.lifecycle.metrics orelse return;
+        const mutex = self.lifecycle.metrics_mutex orelse return;
+        mutex.lock();
+        defer mutex.unlock();
+        metrics.releaseTlsBufferSnapshot(&self.lifecycle.tls_buffer_metrics) catch
+            @panic("TLS buffer accounting underflow");
     }
 
     pub fn expired(self: *const ManagedConnection, now_ms: u64) bool {
@@ -335,6 +412,7 @@ pub const ActiveRegistry = struct {
 
         if (self.map.contains(conn.fd)) return error.DuplicateConnection;
         try self.map.ensureUnusedCapacity(1);
+        conn.active_work_queued = false;
         self.map.putAssumeCapacity(conn.fd, conn.*);
         conn.* = undefined;
     }
@@ -356,6 +434,15 @@ pub const ActiveRegistry = struct {
         const interest = conn.interest;
         try self.insert(conn);
         return interest;
+    }
+
+    pub fn reserveWork(self: *ActiveRegistry, fd: std.posix.fd_t) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const conn = self.map.getPtr(fd) orelse return false;
+        if (conn.active_work_queued) return false;
+        conn.active_work_queued = true;
+        return true;
     }
 
     pub fn close(self: *ActiveRegistry, fd: std.posix.fd_t) bool {
@@ -400,6 +487,7 @@ pub const ActiveRegistry = struct {
             var expired_fd: ?std.posix.fd_t = null;
             var it = self.map.iterator();
             while (it.next()) |entry| {
+                if (entry.value_ptr.active_work_queued) continue;
                 if (!entry.value_ptr.expired(now_ms)) continue;
                 expired_fd = entry.key_ptr.*;
                 break;
@@ -407,6 +495,26 @@ pub const ActiveRegistry = struct {
             const fd = expired_fd orelse break;
             const removed = self.map.fetchRemove(fd).?;
             out[out_len] = removed.value;
+            out_len += 1;
+        }
+        return out_len;
+    }
+
+    pub fn dueDrivePollFds(self: *ActiveRegistry, now_ms: u64, out: []std.posix.fd_t) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var out_len: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            if (out_len >= out.len) break;
+            if (entry.value_ptr.expired(now_ms)) continue;
+            if (entry.value_ptr.active_work_queued) continue;
+            const due = entry.value_ptr.lifecycle.drive_poll_due_ms;
+            if (due == 0 or now_ms < due) continue;
+            entry.value_ptr.lifecycle.drive_poll_due_ms = 0;
+            entry.value_ptr.active_work_queued = true;
+            out[out_len] = entry.key_ptr.*;
             out_len += 1;
         }
         return out_len;
@@ -422,11 +530,46 @@ fn deinitPhase(phase: *ConnectionPhase) void {
     phase.* = .idle_http1;
 }
 
-pub fn combinedInterest(requested: event_loop.Interest, readiness: encrypted_stream.Readiness) event_loop.Interest {
-    return .{
-        .read = requested.read or readiness.wants_read,
-        .write = requested.write or readiness.wants_write,
-    };
+pub fn encryptedWait(readiness: encrypted_stream.Readiness, operation: EncryptedOperation) EncryptedWait {
+    return encryptedWaitAt(readiness, operation, 0, 0);
+}
+
+pub fn encryptedWaitAt(
+    readiness: encrypted_stream.Readiness,
+    operation: EncryptedOperation,
+    now_ms: u64,
+    retry_interval_ms: u64,
+) EncryptedWait {
+    switch (operation) {
+        .read_plaintext => if (readiness.can_read_plaintext) return .ready_now,
+        .write_plaintext => if (readiness.can_write_plaintext) return .ready_now,
+        .drive => {},
+    }
+    const interest = native_tls_connection.interestForReadiness(readiness);
+    if (interest.read or interest.write) return .{ .socket = interest };
+    if (retry_interval_ms > 0) {
+        return .{ .retry_at_ms = std.math.add(u64, now_ms, retry_interval_ms) catch std.math.maxInt(u64) };
+    }
+    return .stalled;
+}
+
+pub fn encryptedWaitForInterest(readiness: encrypted_stream.Readiness, requested: event_loop.Interest) EncryptedWait {
+    return encryptedWaitForInterestAt(readiness, requested, 0, 0);
+}
+
+pub fn encryptedWaitForInterestAt(
+    readiness: encrypted_stream.Readiness,
+    requested: event_loop.Interest,
+    now_ms: u64,
+    retry_interval_ms: u64,
+) EncryptedWait {
+    const operation: EncryptedOperation = if (requested.read and !requested.write)
+        .read_plaintext
+    else if (requested.write and !requested.read)
+        .write_plaintext
+    else
+        .drive;
+    return encryptedWaitAt(readiness, operation, now_ms, retry_interval_ms);
 }
 
 fn closeFd(fd: std.posix.fd_t) void {
@@ -550,6 +693,53 @@ test "active registry reaps expired protocol deadlines" {
     try std.testing.expect(registry.contains(-2));
 }
 
+test "active registry returns due drive polls exactly once without extending deadlines" {
+    var registry = ActiveRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var pending = ManagedConnection.init(
+        .{ .plaintext = -1 },
+        .{ .native_handshake = .{ .deadline_ms = 100 } },
+    );
+    pending.lifecycle.drive_poll_due_ms = 10;
+    try registry.insert(&pending);
+
+    var out: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(usize, 0), registry.dueDrivePollFds(9, out[0..]));
+    try std.testing.expectEqual(@as(usize, 1), registry.dueDrivePollFds(10, out[0..]));
+    try std.testing.expectEqual(@as(std.posix.fd_t, -1), out[0]);
+    try std.testing.expectEqual(@as(usize, 0), registry.dueDrivePollFds(10, out[0..]));
+    var expired: [1]ManagedConnection = undefined;
+    try std.testing.expectEqual(@as(usize, 0), registry.reapExpired(101, expired[0..]));
+
+    var checked_out = registry.checkout(-1) orelse return error.TestExpectedConnection;
+    defer checked_out.deinit();
+    try std.testing.expectEqual(@as(u64, 100), checked_out.phase.native_handshake.deadline_ms);
+    try std.testing.expect(checked_out.expired(101));
+}
+
+test "active registry reserves socket-ready work and skips duplicate queueing" {
+    var registry = ActiveRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var managed = ManagedConnection.init(
+        .{ .plaintext = -1 },
+        .{ .native_handshake = .{ .deadline_ms = 10 } },
+    );
+    try registry.insert(&managed);
+
+    try std.testing.expect(registry.reserveWork(-1));
+    try std.testing.expect(!registry.reserveWork(-1));
+    try std.testing.expect(!registry.reserveWork(-2));
+
+    var expired: [1]ManagedConnection = undefined;
+    try std.testing.expectEqual(@as(usize, 0), registry.reapExpired(11, expired[0..]));
+
+    var checked_out = registry.checkout(-1) orelse return error.TestExpectedConnection;
+    defer checked_out.deinit();
+    try std.testing.expect(checked_out.expired(11));
+}
+
 test "managed connection preserves protocol write interest for plaintext wait-write" {
     const h1 = try Http1ConnectionState.init(std.testing.allocator, 1024);
     var managed = ManagedConnection.init(
@@ -573,14 +763,26 @@ test "native http1 managed phase does not allocate request buffer state" {
     try std.testing.expectEqual(@as(u32, 1), managed.phase.native_http1.served);
 }
 
-test "combined interest keeps phase demand and TLS carrier readiness" {
+test "encrypted wait maps blocked operations to TLS raw readiness only" {
     try std.testing.expectEqual(
-        event_loop.Interest{ .read = true, .write = true },
-        combinedInterest(.{ .read = true }, .{ .wants_write = true }),
+        EncryptedWait{ .socket = .{ .write = true } },
+        encryptedWaitForInterest(.{ .wants_write = true }, .{ .read = true }),
     );
     try std.testing.expectEqual(
-        event_loop.Interest{ .read = true, .write = true },
-        combinedInterest(.{ .write = true }, .{ .wants_read = true }),
+        EncryptedWait{ .socket = .{ .read = true } },
+        encryptedWaitForInterest(.{ .wants_read = true }, .{ .write = true }),
+    );
+    try std.testing.expectEqual(
+        EncryptedWait.ready_now,
+        encryptedWaitForInterest(.{ .can_read_plaintext = true }, .{ .read = true }),
+    );
+    try std.testing.expectEqual(
+        EncryptedWait.stalled,
+        encryptedWaitForInterest(.{}, .{ .read = true }),
+    );
+    try std.testing.expectEqual(
+        EncryptedWait{ .retry_at_ms = 1250 },
+        encryptedWaitForInterestAt(.{}, .{ .read = true }, 1000, 250),
     );
 }
 

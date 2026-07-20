@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("../zig_compat.zig");
 const acme_client = @import("acme_client.zig");
 const encrypted_stream = @import("tls_core").encrypted_stream;
+const metrics_mod = @import("metrics.zig");
 const negotiated_dispatch = @import("negotiated_dispatch.zig");
 
 const c = @cImport({
@@ -401,11 +402,16 @@ pub const TlsConnection = struct {
     stream_peak_total: usize = 0,
     stream_pause_state: encrypted_stream.PauseState = .{},
     stream_buffer_counters: encrypted_stream.BufferCounters = .{},
+    metrics: ?*metrics_mod.Metrics = null,
+    metrics_mutex: ?*compat.Mutex = null,
+    tls_buffer_metrics: metrics_mod.TlsBufferConnectionMetrics = .{},
     protocol_policy: negotiated_dispatch.ListenerProtocolPolicy = .{},
     policy_box: ?*negotiated_dispatch.ListenerProtocolPolicy = null,
     policy_ex_index: c_int = -1,
 
     pub fn deinit(self: *TlsConnection) void {
+        self.observeTlsBufferMetrics();
+        self.releaseTlsBufferMetrics();
         if (self.policy_ex_index >= 0) _ = c.SSL_set_ex_data(self.ssl, self.policy_ex_index, null);
         if (opensslShouldShutdownOnDeinit(self)) {
             c.ERR_clear_error();
@@ -417,10 +423,16 @@ pub const TlsConnection = struct {
     }
 
     pub fn read(self: *TlsConnection, buf: []u8) TlsError!usize {
+        defer self.observeTlsBufferMetrics();
         const rc = c.SSL_read(self.ssl, buf.ptr, @intCast(buf.len));
         if (rc > 0) return @intCast(rc);
         if (c.SSL_get_error(self.ssl, rc) == c.SSL_ERROR_ZERO_RETURN) return 0;
         return error.TlsReadFailed;
+    }
+
+    pub fn attachBufferMetrics(self: *TlsConnection, metrics: *metrics_mod.Metrics, mutex: *compat.Mutex) void {
+        self.metrics = metrics;
+        self.metrics_mutex = mutex;
     }
 
     /// Bytes of already-decrypted application data buffered inside OpenSSL,
@@ -489,9 +501,29 @@ pub const TlsConnection = struct {
     }
 
     fn writeFn(self: *TlsConnection, data: []const u8) TlsError!usize {
+        defer self.observeTlsBufferMetrics();
         const rc = c.SSL_write(self.ssl, data.ptr, @intCast(data.len));
         if (rc > 0) return @intCast(rc);
         return error.TlsWriteFailed;
+    }
+
+    fn observeTlsBufferMetrics(self: *TlsConnection) void {
+        const metrics = self.metrics orelse return;
+        const mutex = self.metrics_mutex orelse return;
+        const snapshot = opensslStreamBufferSnapshot(self);
+        mutex.lock();
+        defer mutex.unlock();
+        metrics.observeTlsBufferSnapshot(&self.tls_buffer_metrics, .openssl, snapshot) catch
+            @panic("TLS buffer accounting underflow");
+    }
+
+    fn releaseTlsBufferMetrics(self: *TlsConnection) void {
+        const metrics = self.metrics orelse return;
+        const mutex = self.metrics_mutex orelse return;
+        mutex.lock();
+        defer mutex.unlock();
+        metrics.releaseTlsBufferSnapshot(&self.tls_buffer_metrics) catch
+            @panic("TLS buffer accounting underflow");
     }
 };
 
@@ -618,6 +650,7 @@ fn opensslStreamRead(ptr: *anyopaque, out: []u8) encrypted_stream.Error!usize {
     if (self.stream_lifecycle != .open) return error.StreamClosed;
     if (self.pending_write != null) return error.RetryOperationPending;
     if (self.close_requested) return error.StreamClosed;
+    defer self.observeTlsBufferMetrics();
     _ = opensslObserveBufferUsage(self);
     c.ERR_clear_error();
     const rc = c.SSL_read(self.ssl, out.ptr, @intCast(out.len));
@@ -661,6 +694,7 @@ fn opensslStreamWrite(ptr: *anyopaque, bytes: []const u8) encrypted_stream.Error
         if (self.close_requested) return error.StreamClosed;
         if (bytes.len == 0) return 0;
     }
+    defer self.observeTlsBufferMetrics();
     c.ERR_clear_error();
     const rc = c.SSL_write(self.ssl, bytes.ptr, @intCast(bytes.len));
     if (rc > 0) {
@@ -766,6 +800,7 @@ fn opensslStreamReadiness(ptr: *anyopaque) encrypted_stream.Readiness {
 fn opensslStreamDrive(ptr: *anyopaque) encrypted_stream.Error!encrypted_stream.DriveResult {
     const self: *TlsConnection = @ptrCast(@alignCast(ptr));
     if (self.stream_failure) |err| return err;
+    defer self.observeTlsBufferMetrics();
     const made_progress = if (self.stream_lifecycle == .closing or (self.close_requested and self.pending_write == null))
         try opensslAdvanceShutdown(self)
     else
@@ -2257,6 +2292,57 @@ test "openssl encrypted stream records pending plaintext peak before first snaps
     try std.testing.expect(snapshot.peak_total >= "-payload".len);
     try std.testing.expect(!snapshot.limits_enforced);
     try std.testing.expect(snapshot.limits == null);
+}
+
+test "openssl TLS metrics export measurable pending and retry state then release" {
+    const allocator = std.testing.allocator;
+    var metrics = metrics_mod.Metrics.init();
+    var metrics_mutex = compat.Mutex{};
+
+    var pair = try makeTestTlsPair(allocator);
+    pair.server.attachBufferMetrics(&metrics, &metrics_mutex);
+    const stream = pair.server.stream();
+
+    try clientWriteAll(pair.client_ssl, "client-payload");
+    var scratch: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), try stream.read(&scratch));
+    try std.testing.expectEqualStrings("client", &scratch);
+
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffered_bytes_current{backend=\"openssl\",queue=\"inbound_plaintext\"} 8\n") != null);
+    }
+
+    var rest: [16]u8 = undefined;
+    const rest_len = try stream.read(&rest);
+    try std.testing.expectEqualStrings("-payload", rest[0..rest_len]);
+
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffered_bytes_current{backend=\"openssl\",queue=\"inbound_plaintext\"} 0\n") != null);
+    }
+
+    var blocked: ForcedWriteBlock = .{};
+    defer blocked.deinit(allocator);
+    try forceOpenSslWriteBackpressure(allocator, &pair, stream, &blocked);
+    _ = try stream.drive();
+
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_pause_events_total{backend=\"openssl\",direction=\"plaintext_write\"} 1\n") != null);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_stalled_drives_total{backend=\"openssl\"} 1\n") != null);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_pause_events_total{backend=\"pure_zig_record\",direction=\"plaintext_write\"} 0\n") != null);
+    }
+
+    pair.deinit();
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffered_bytes_current{backend=\"openssl\",queue=\"inbound_plaintext\"} 0\n") != null);
+    }
 }
 
 test "openssl encrypted stream preserves close requested during pending write retry" {

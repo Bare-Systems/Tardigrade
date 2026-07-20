@@ -48,17 +48,23 @@ logs are written through `src/http/logger.zig`.
   `tardigrade_buffer_config_limit_bytes{direction,scope,limit}` for the
   per-stream low/high/hard watermarks plus per-origin/global hard-limit
   settings.
-- TLS record-stream backpressure state is exposed to runtime consumers through
-  the allocation-free `EncryptedStream.bufferSnapshot()` seam. The snapshot
-  contains current and peak stream-owned bytes for inbound carrier ciphertext,
-  decrypted plaintext, outbound ciphertext, and handshake bytes; optional
-  low/high/hard limits plus whether the backend enforces them; latched
-  carrier-read and plaintext-write pause state; pause/resume counters;
-  hard-limit counters by TLS queue; and stalled-drive counts. These values are
-  per TLS connection and deliberately carry no SNI, URL, request ID, stream ID,
-  or arbitrary protocol labels. OpenSSL-backed adapters may expose measurable
-  BIO/adapter bytes only and leave unknown limits unset; opaque internal OpenSSL
-  memory is outside the complete stream-owned accounting boundary.
+- TLS record-stream backpressure gauges/counters from the allocation-free
+  `EncryptedStream.bufferSnapshot()` seam:
+  `tardigrade_tls_buffered_bytes_current{backend,queue}`,
+  `tardigrade_tls_buffer_pause_events_total{backend,direction}`,
+  `tardigrade_tls_buffer_resume_events_total{backend,direction}`,
+  `tardigrade_tls_buffer_limit_exceeded_total{backend,queue}`, and
+  `tardigrade_tls_buffer_stalled_drives_total{backend}`. Labels are fixed to
+  `pure_zig_record`/`openssl`, the four TLS queues, and the two pause
+  directions; they never include SNI, URL, IP, request ID, connection ID, or
+  stream ID. OpenSSL-backed adapters expose only measurable adapter/BIO bytes
+  and mark opaque internal OpenSSL memory outside complete stream-owned
+  accounting.
+- configured native TLS buffer limits:
+  `tardigrade_tls_buffer_config_limit_bytes{queue,limit}` for the pure-Zig
+  listener's inbound ciphertext, inbound plaintext, outbound ciphertext, and
+  handshake low/high/hard watermarks. These are not described as enforced by
+  OpenSSL.
 - reverse-proxy abort counters:
   `tardigrade_proxy_client_aborts_total` and
   `tardigrade_proxy_upstream_aborts_total`
@@ -128,6 +134,10 @@ Two outcome shapes exist:
 | Proxy per-stream buffer hard limit | `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES` | 1 MiB | proxy buffer accounting | Hard-limit exceedance is observable through `tardigrade_buffer_limit_exceeded_total`; enforcement lands per proxy path as backpressure work expands |
 | Proxy per-origin buffer hard limit | `TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` | 0 (not enforced yet) | future aggregate proxy buffer accounting | When non-zero, must be at least the per-stream hard limit |
 | Proxy global buffer hard limit | `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` | 0 (not enforced yet) | future aggregate proxy buffer accounting | When non-zero, must be at least the per-stream hard limit |
+| Native TLS inbound ciphertext watermarks | `TARDIGRADE_TLS_INBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES`, `TARDIGRADE_TLS_INBOUND_CIPHERTEXT_HIGH_WATERMARK_BYTES`, `TARDIGRADE_TLS_INBOUND_CIPHERTEXT_HARD_LIMIT_BYTES` | TLS core defaults | pure-Zig TLS record stream | Invalid ordering, capacity overflow, or reserve violations reject startup/reload |
+| Native TLS inbound plaintext watermarks | `TARDIGRADE_TLS_INBOUND_PLAINTEXT_LOW_WATERMARK_BYTES`, `TARDIGRADE_TLS_INBOUND_PLAINTEXT_HIGH_WATERMARK_BYTES`, `TARDIGRADE_TLS_INBOUND_PLAINTEXT_HARD_LIMIT_BYTES` | TLS core defaults | pure-Zig TLS record stream | High pauses carrier reads; resume occurs only after all inbound queues drain to low |
+| Native TLS outbound ciphertext watermarks | `TARDIGRADE_TLS_OUTBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES`, `TARDIGRADE_TLS_OUTBOUND_CIPHERTEXT_HIGH_WATERMARK_BYTES`, `TARDIGRADE_TLS_OUTBOUND_CIPHERTEXT_HARD_LIMIT_BYTES` | TLS core defaults | pure-Zig TLS record stream | High pauses plaintext writes; hard-limit rejection does not advance write state |
+| Native TLS handshake watermarks | `TARDIGRADE_TLS_HANDSHAKE_LOW_WATERMARK_BYTES`, `TARDIGRADE_TLS_HANDSHAKE_HIGH_WATERMARK_BYTES`, `TARDIGRADE_TLS_HANDSHAKE_HARD_LIMIT_BYTES` | TLS core defaults | pure-Zig TLS record stream | Handshake buffering is bounded separately from application plaintext |
 | Parked keepalive backlog | idle-park timeout / `max_requests_per_connection` | — | `keepalive_park.ParkedRegistry` | Idle parked connections reaped on the timer tick (`timeouts_total`); none hold a worker while idle |
 
 The request-size limits are enforced in two layers: the HTTP parser

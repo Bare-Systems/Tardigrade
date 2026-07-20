@@ -14,6 +14,7 @@ pub const messages = @import("messages.zig");
 pub const new_session_ticket = @import("new_session_ticket.zig");
 pub const negotiation = @import("negotiation.zig");
 pub const policy = @import("policy.zig");
+pub const pre_shared_key = @import("pre_shared_key.zig");
 pub const identity_loader = @import("identity_loader.zig");
 pub const production_crypto = @import("production_crypto.zig");
 pub const record_codec = @import("record_codec.zig");

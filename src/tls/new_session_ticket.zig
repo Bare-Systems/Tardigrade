@@ -228,7 +228,7 @@ pub fn buildServerRecoverableState(
     });
 
     var state: session.ServerRecoverableState = .{};
-    state.init(&common);
+    state.init(&common, params.ticket_age_add);
     return state;
 }
 

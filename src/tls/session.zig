@@ -615,14 +615,22 @@ pub const ClientTicketState = struct {
 /// client-only bookkeeping and no provider/runtime handles.
 pub const ServerRecoverableState = struct {
     common: ResumableSessionCommon = .{},
+    /// The server's per-ticket `ticket_age_add` obfuscation value (#361
+    /// prerequisite amendment for #362/#363), recovered alongside `common`
+    /// after a stateful cache lookup or stateless-ticket decryption. Needed
+    /// to deobfuscate the client's offered `obfuscated_ticket_age` and
+    /// compute the age-skew observation; not itself secret, but scoped to
+    /// this record like every other recovered ticket field.
+    ticket_age_add: u32 = 0,
 
     /// Initializes `self` in place and takes ownership of `common` by
     /// moving it out of the caller's variable (see `ClientTicketState.init`).
     /// `self` must be zero-valued or a previously-initialized, live value
     /// — never `undefined` memory.
-    pub fn init(self: *ServerRecoverableState, common: *ResumableSessionCommon) void {
+    pub fn init(self: *ServerRecoverableState, common: *ResumableSessionCommon, ticket_age_add: u32) void {
         var next: ServerRecoverableState = .{};
         next.common.moveFrom(common);
+        next.ticket_age_add = ticket_age_add;
         self.moveFrom(&next);
     }
 
@@ -644,6 +652,7 @@ pub const ServerRecoverableState = struct {
         var next: ServerRecoverableState = .{};
         errdefer next.deinit();
         try self.common.cloneInto(allocator, &next.common);
+        next.ticket_age_add = self.ticket_age_add;
         out.moveFrom(&next);
     }
 
@@ -906,7 +915,7 @@ pub fn clientEncodedLen(state: *const ClientTicketState) usize {
 }
 
 pub fn serverEncodedLen(state: *const ServerRecoverableState) usize {
-    return header_len + commonEncodedLen(&state.common);
+    return header_len + commonEncodedLen(&state.common) + tlvLen(4);
 }
 
 fn commonFieldCount(common: *const ResumableSessionCommon) usize {
@@ -1004,7 +1013,7 @@ pub fn serverEncodedLenWithLimits(state: *const ServerRecoverableState, limits: 
     try limits.validate();
     try validateCommonForEncoding(&state.common);
     try checkCommonAgainstLimits(&state.common, limits);
-    const field_count = commonFieldCount(&state.common);
+    const field_count = commonFieldCount(&state.common) + 1; // ticket_age_add
     if (field_count > limits.max_fields) return error.TooManyFields;
     const needed = serverEncodedLen(state);
     if (needed > limits.max_serialized_len) return error.StateTooLarge;
@@ -1115,6 +1124,10 @@ pub fn encodeServer(state: *const ServerRecoverableState, limits: Limits, out: [
 
     var compat_scratch: [4 + hard_max_compat_len]u8 = undefined;
     writeCommon(out, &pos, &state.common, &compat_scratch);
+
+    var age_add_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &age_add_bytes, state.ticket_age_add, .big);
+    writeTlv(out, &pos, field_ticket_age_add, &age_add_bytes);
 
     std.debug.assert(pos == needed);
     return out[0..pos];
@@ -1365,21 +1378,31 @@ fn decodeClient(allocator: std.mem.Allocator, limits: Limits, bytes: []const u8)
 
 fn decodeServer(allocator: std.mem.Allocator, limits: Limits, bytes: []const u8) DecodeError!ServerRecoverableState {
     var common_fields = CommonFields{};
+    var ticket_age_add: ?u32 = null;
 
     var tracker = FieldTracker{ .max_fields = limits.max_fields };
     var offset: usize = 0;
     while (try nextTlv(bytes, &offset)) |tlv| {
         try tracker.observe(tlv.field_id);
         if (try parseSharedField(&common_fields, limits, tlv.field_id, tlv.value)) continue;
-        if (tlv.field_id & optional_field_mask != 0) continue;
-        return error.UnknownCriticalField;
+        switch (tlv.field_id) {
+            field_ticket_age_add => {
+                if (tlv.value.len != 4) return error.MalformedLength;
+                ticket_age_add = std.mem.readInt(u32, tlv.value[0..4], .big);
+            },
+            else => {
+                if (tlv.field_id & optional_field_mask != 0) continue;
+                return error.UnknownCriticalField;
+            },
+        }
     }
+    const age_add = ticket_age_add orelse return error.MissingField;
 
     var common: ResumableSessionCommon = .{};
     try buildCommon(allocator, limits, common_fields, &common);
 
     var state: ServerRecoverableState = .{};
-    state.init(&common);
+    state.init(&common, age_add);
     return state;
 }
 
@@ -1765,7 +1788,7 @@ test "client and server internal state round-trips deterministically" {
 
     var server_common = try sampleCommon(testing.allocator, &([_]u8{0xcd} ** 32));
     var server: ServerRecoverableState = .{};
-    server.init(&server_common);
+    server.init(&server_common, 0);
     defer server.deinit();
 
     var server_buf: [Limits.default.max_serialized_len]u8 = undefined;
@@ -1791,7 +1814,7 @@ test "absent SNI/ALPN round-trip without emitting a TLV" {
         .lifetime_seconds = 100,
     });
     var server: ServerRecoverableState = .{};
-    server.init(&common);
+    server.init(&common, 0);
     defer server.deinit();
 
     var buf: [Limits.default.max_serialized_len]u8 = undefined;
@@ -1951,7 +1974,7 @@ test "field-count limit accepts exactly max_fields and rejects one more" {
     // optional filler fields up to and past a tight max_fields boundary.
     var common = try sampleCommon(testing.allocator, &([_]u8{0xab} ** 32));
     var server: ServerRecoverableState = .{};
-    server.init(&common);
+    server.init(&common, 0);
     defer server.deinit();
 
     var buf: [Limits.default.max_serialized_len]u8 = undefined;
@@ -2180,7 +2203,7 @@ test "encode enforces max_transport_compat_len symmetrically with decode" {
         .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = &wide_blob },
     });
     var server: ServerRecoverableState = .{};
-    server.init(&common);
+    server.init(&common, 0);
     defer server.deinit();
 
     var tight_transport = wide;
@@ -2215,7 +2238,7 @@ test "encode enforces max_application_compat_len symmetrically with decode" {
         .application_compat = .{ .format_id = 2, .format_version = 1, .bytes = &wide_blob },
     });
     var server: ServerRecoverableState = .{};
-    server.init(&common);
+    server.init(&common, 0);
     defer server.deinit();
 
     var tight_application = wide;
@@ -2315,7 +2338,7 @@ test "clone produces an independent deep copy" {
 
     var server_common = try sampleCommon(testing.allocator, &([_]u8{0xef} ** 32));
     var server: ServerRecoverableState = .{};
-    server.init(&server_common);
+    server.init(&server_common, 0);
     defer server.deinit();
 
     var cloned_server: ServerRecoverableState = .{};
@@ -2424,7 +2447,7 @@ test "cloneInto is a safe no-op on every owning type when self == out" {
 
     var server_common = try sampleCommon(testing.allocator, &([_]u8{0xef} ** 32));
     var server: ServerRecoverableState = .{};
-    server.init(&server_common);
+    server.init(&server_common, 0);
     defer server.deinit();
     try server.cloneInto(testing.allocator, &server);
     try testing.expectEqualStrings("example.test", server.common.server_name.?.slice());
@@ -2449,12 +2472,12 @@ test "cloneInto into an already-live destination on every owning aggregate relea
 
     var server_common = try sampleCommon(testing.allocator, &([_]u8{0xcd} ** 32));
     var server: ServerRecoverableState = .{};
-    server.init(&server_common);
+    server.init(&server_common, 0);
     defer server.deinit();
 
     var stale_server_common = try sampleCommon(testing.allocator, &([_]u8{0xee} ** 32));
     var stale_server: ServerRecoverableState = .{};
-    stale_server.init(&stale_server_common);
+    stale_server.init(&stale_server_common, 0);
     try server.cloneInto(testing.allocator, &stale_server);
     defer stale_server.deinit();
     try testing.expectEqualStrings(
@@ -2733,8 +2756,8 @@ const client_fixture: [229]u8 = .{
     0x60,
 };
 
-const server_fixture: [177]u8 = .{
-    0x54, 0x52, 0x53, 0x31, 0x01, 0x02, 0x00, 0x00, 0x00, 0xa7, 0x00, 0x01,
+const server_fixture: [185]u8 = .{
+    0x54, 0x52, 0x53, 0x31, 0x01, 0x02, 0x00, 0x00, 0x00, 0xaf, 0x00, 0x01,
     0x00, 0x02, 0x13, 0x01, 0x00, 0x02, 0x00, 0x20, 0xcd, 0xcd, 0xcd, 0xcd,
     0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
     0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
@@ -2748,7 +2771,8 @@ const server_fixture: [177]u8 = .{
     0x00, 0x05, 0x01, 0x00, 0x00, 0x40, 0x00, 0x80, 0x01, 0x00, 0x0f, 0x00,
     0x01, 0x00, 0x01, 0x71, 0x75, 0x69, 0x63, 0x2d, 0x70, 0x61, 0x72, 0x61,
     0x6d, 0x73, 0x80, 0x02, 0x00, 0x0f, 0x00, 0x02, 0x00, 0x01, 0x68, 0x33,
-    0x2d, 0x73, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73,
+    0x2d, 0x73, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73, 0x00, 0x11, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x00,
 };
 
 fn fixtureCommonParams(psk: []const u8) ResumableSessionCommon.InitParams {
@@ -2808,6 +2832,7 @@ test "checked-in literal server-record byte fixture decodes to every expected fi
     try testing.expectEqualStrings("quic-params", s.common.transport_compat.?.slice());
     try testing.expectEqual(@as(u16, 2), s.common.application_compat.?.format_id);
     try testing.expectEqualStrings("h3-settings", s.common.application_compat.?.slice());
+    try testing.expectEqual(@as(u32, 0), s.ticket_age_add);
 }
 
 test "current encoder output exactly equals the checked-in fixtures" {
@@ -2828,7 +2853,7 @@ test "current encoder output exactly equals the checked-in fixtures" {
     var server_common: ResumableSessionCommon = .{};
     try server_common.init(testing.allocator, Limits.default, fixtureCommonParams(&([_]u8{0xcd} ** 32)));
     var server: ServerRecoverableState = .{};
-    server.init(&server_common);
+    server.init(&server_common, 0);
     defer server.deinit();
     var buf2: [Limits.default.max_serialized_len]u8 = undefined;
     const encoded2 = try encodeServer(&server, Limits.default, &buf2);
@@ -2924,7 +2949,7 @@ test "duplicating any known server field is rejected" {
     const all_server_field_ids = [_]u16{
         field_cipher_suite,     field_resumption_psk,     field_server_name,      field_application_protocol,
         field_auth_binding,     field_issued_at,          field_lifetime_seconds, field_early_data,
-        field_transport_compat, field_application_compat,
+        field_transport_compat, field_application_compat, field_ticket_age_add,
     };
     for (all_server_field_ids) |field_id| {
         var buf: [server_fixture.len + 64]u8 = undefined;
@@ -2935,8 +2960,9 @@ test "duplicating any known server field is rejected" {
 
 test "removing any mandatory server field is rejected as missing" {
     const mandatory_server_field_ids = [_]u16{
-        field_cipher_suite, field_resumption_psk,   field_auth_binding,
-        field_issued_at,    field_lifetime_seconds, field_early_data,
+        field_cipher_suite,   field_resumption_psk,   field_auth_binding,
+        field_issued_at,      field_lifetime_seconds, field_early_data,
+        field_ticket_age_add,
     };
     for (mandatory_server_field_ids) |field_id| {
         var buf: [server_fixture.len]u8 = undefined;

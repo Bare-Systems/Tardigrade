@@ -1,0 +1,650 @@
+//! TLS 1.3 resumption `pre_shared_key` / `psk_key_exchange_modes` extensions
+//! (RFC 8446 §4.2.11, RFC 9846). Resumption PSKs only — no external PSKs, no
+//! `ext binder`, no `psk_ke` selection, no 0-RTT.
+//!
+//! Owns only:
+//!   - `psk_key_exchange_modes` encode/decode;
+//!   - `OfferedPsks` (identities + binders) encode/decode and borrowed
+//!     paired iteration;
+//!   - the exact ClientHello binder-vector offset calculation;
+//!   - resumption binder derivation/verification for SHA-256 and SHA-384;
+//!   - obfuscated-ticket-age and age-observation helpers;
+//!   - the owned, move-oriented client offer set (`ClientPskOfferSet`);
+//!   - the provider-neutral server resolver contract (`ServerPskResolver`).
+//!
+//! It does not parse ClientHello beyond this one extension, does not choose
+//! the final selected identity (that is the backend's server-selection
+//! algorithm), does not own full-handshake fallback, and must not import
+//! cache, keyring, HTTP, QUIC packet, record-layer, or runtime policy types.
+
+const std = @import("std");
+const provider = @import("crypto").provider;
+const messages = @import("messages.zig");
+const session = @import("session.zig");
+
+const crypto = std.crypto;
+const tls = crypto.tls;
+const Sha256 = crypto.hash.sha2.Sha256;
+const Sha384 = crypto.hash.sha2.Sha384;
+const HmacSha384 = crypto.auth.hmac.sha2.HmacSha384;
+const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
+const HkdfSha384 = crypto.kdf.hkdf.Hkdf(HmacSha384);
+const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
+
+pub const ext_pre_shared_key: u16 = 41;
+pub const ext_psk_key_exchange_modes: u16 = 45;
+
+/// Hard ceiling on offered/candidate identities per ClientHello (also the
+/// bound on server-side identity-resolution attempts).
+pub const max_offered_identities: usize = 8;
+
+pub const min_binder_len: usize = 32;
+pub const max_binder_len: usize = 255;
+
+pub const PskKeyExchangeMode = enum(u8) {
+    psk_ke = 0,
+    psk_dhe_ke = 1,
+};
+
+pub const WriteError = messages.WriteError || error{TooManyIdentities};
+
+pub const ReadError = error{
+    MalformedHandshake,
+    EmptyVector,
+    EmptyIdentity,
+    CountMismatch,
+    InvalidBinderLength,
+};
+
+pub const BinderError = error{InvalidSecretLength};
+
+// -----------------------------------------------------------------------
+// psk_key_exchange_modes (RFC 8446 §4.2.9)
+// -----------------------------------------------------------------------
+
+/// Writes `struct { PskKeyExchangeMode ke_modes<1..255>; }` into `w`.
+pub fn writeModes(w: *messages.Writer, modes: []const PskKeyExchangeMode) messages.WriteError!void {
+    const len_idx = try w.reserve(1);
+    for (modes) |m| try w.u8_(@intFromEnum(m));
+    w.patch(1, len_idx);
+}
+
+/// Whether `mode` appears in a decoded `psk_key_exchange_modes` extension
+/// body. Malformed length/truncation/trailing bytes are decode failures.
+pub fn hasMode(ext_data: []const u8, mode: PskKeyExchangeMode) ReadError!bool {
+    var r = messages.Reader{ .bytes = ext_data };
+    const len = try r.u8_();
+    if (len == 0) return error.EmptyVector;
+    const list = try r.slice(len);
+    try r.expectEnd();
+    return std.mem.indexOfScalar(u8, list, @intFromEnum(mode)) != null;
+}
+
+// -----------------------------------------------------------------------
+// OfferedPsks (RFC 8446 §4.2.11): PskIdentity identities, PskBinderEntry
+// binders.
+// -----------------------------------------------------------------------
+
+pub const Identity = struct {
+    identity: []const u8,
+    obfuscated_ticket_age: u32,
+};
+
+/// A parsed, borrowed view over a received `pre_shared_key` extension body.
+/// Identities and binders are validated to be non-empty, well-formed, and
+/// of exactly equal entry count at parse time; per-entry contents are read
+/// lazily through `pairs()`.
+pub const OfferedPsks = struct {
+    identities_bytes: []const u8,
+    binders_bytes: []const u8,
+    /// Offset within the extension body (`ext_data`) where the 2-byte
+    /// binders-vector length field begins. Binders are computed over the
+    /// exact framed ClientHello up to (but excluding) this point — see
+    /// `deriveBinder`.
+    binder_vector_offset: usize,
+    count: usize,
+
+    pub fn parse(ext_data: []const u8) ReadError!OfferedPsks {
+        var r = messages.Reader{ .bytes = ext_data };
+        const identities_len = try r.u16_();
+        if (identities_len == 0) return error.EmptyVector;
+        const identities_bytes = try r.slice(identities_len);
+
+        const binder_vector_offset = r.offset;
+        const binders_len = try r.u16_();
+        if (binders_len == 0) return error.EmptyVector;
+        const binders_bytes = try r.slice(binders_len);
+        try r.expectEnd();
+
+        var id_count: usize = 0;
+        {
+            var ir = messages.Reader{ .bytes = identities_bytes };
+            while (ir.remaining() > 0) {
+                const id_len = try ir.u16_();
+                if (id_len == 0) return error.EmptyIdentity;
+                _ = try ir.slice(id_len);
+                _ = try ir.slice(4); // obfuscated_ticket_age
+                id_count += 1;
+            }
+        }
+        var binder_count: usize = 0;
+        {
+            var br = messages.Reader{ .bytes = binders_bytes };
+            while (br.remaining() > 0) {
+                const blen = try br.u8_();
+                if (blen < min_binder_len or blen > max_binder_len) return error.InvalidBinderLength;
+                _ = try br.slice(blen);
+                binder_count += 1;
+            }
+        }
+        if (id_count == 0 or binder_count == 0) return error.EmptyVector;
+        if (id_count != binder_count) return error.CountMismatch;
+
+        return .{
+            .identities_bytes = identities_bytes,
+            .binders_bytes = binders_bytes,
+            .binder_vector_offset = binder_vector_offset,
+            .count = id_count,
+        };
+    }
+
+    pub const PairIterator = struct {
+        id_reader: messages.Reader,
+        binder_reader: messages.Reader,
+
+        pub const Pair = struct { identity: Identity, binder: []const u8 };
+
+        pub fn next(self: *PairIterator) ReadError!?Pair {
+            if (self.id_reader.remaining() == 0) return null;
+            const id_len = try self.id_reader.u16_();
+            const identity = try self.id_reader.slice(id_len);
+            const age_bytes = try self.id_reader.slice(4);
+            const age = std.mem.readInt(u32, age_bytes[0..4], .big);
+            const blen = try self.binder_reader.u8_();
+            const binder = try self.binder_reader.slice(blen);
+            return .{ .identity = .{ .identity = identity, .obfuscated_ticket_age = age }, .binder = binder };
+        }
+    };
+
+    /// A borrowed, in-order (identity, binder) iterator. Both vectors were
+    /// already validated to have exactly equal, well-formed entry counts by
+    /// `parse`, so this cannot desynchronize.
+    pub fn pairs(self: *const OfferedPsks) PairIterator {
+        return .{
+            .id_reader = .{ .bytes = self.identities_bytes },
+            .binder_reader = .{ .bytes = self.binders_bytes },
+        };
+    }
+};
+
+pub const OfferItem = struct {
+    identity: []const u8,
+    obfuscated_ticket_age: u32,
+    /// The binder digest length for this identity's associated hash
+    /// (32 for SHA-256, 48 for SHA-384) — the caller computes and
+    /// overwrites this many placeholder bytes after `writeOffer` returns.
+    digest_len: usize,
+};
+
+pub const BinderSlot = struct { offset: usize, len: usize };
+
+pub const ClientOfferWrite = struct {
+    /// The exact prefix of the framed ClientHello (measured from the start
+    /// of the writer's buffer, i.e. including the handshake header) that
+    /// every binder must be computed over, once every enclosing length
+    /// field — message, extensions block, this extension, identities, and
+    /// binders — has been patched to its final value (RFC 8446 §4.2.11.2).
+    truncated_len: usize,
+    slots: [max_offered_identities]BinderSlot = undefined,
+    count: usize = 0,
+};
+
+/// Writes the `pre_shared_key` extension: identities followed by
+/// zero-valued binder placeholders sized to each item's digest length, with
+/// every length field patched. Per RFC 8446 §4.2.11, this must be the last
+/// extension the caller writes into `w`; the caller still patches the
+/// outer extensions-vector and message-length fields afterward, and must do
+/// so *before* hashing `w.written()[0..result.truncated_len]` — see
+/// `deriveBinder`. Returns the binder slot positions so the caller can
+/// overwrite each placeholder with the real binder afterward.
+pub fn writeOffer(w: *messages.Writer, items: []const OfferItem) WriteError!ClientOfferWrite {
+    if (items.len == 0 or items.len > max_offered_identities) return error.TooManyIdentities;
+
+    try w.u16_(ext_pre_shared_key);
+    const ext_len_idx = try w.reserve(2);
+
+    const ids_len_idx = try w.reserve(2);
+    for (items) |item| {
+        try w.u16_(@intCast(item.identity.len));
+        try w.bytes(item.identity);
+        var age_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &age_bytes, item.obfuscated_ticket_age, .big);
+        try w.bytes(&age_bytes);
+    }
+    w.patch(2, ids_len_idx);
+
+    var result: ClientOfferWrite = .{ .truncated_len = w.len };
+
+    const binders_len_idx = try w.reserve(2);
+    for (items, 0..) |item, i| {
+        const entry_len_idx = try w.reserve(1);
+        const slot_offset = w.len;
+        const zeros = [_]u8{0} ** provider.max_digest_len;
+        try w.bytes(zeros[0..item.digest_len]);
+        w.patch(1, entry_len_idx);
+        result.slots[i] = .{ .offset = slot_offset, .len = item.digest_len };
+        result.count += 1;
+    }
+    w.patch(2, binders_len_idx);
+    w.patch(2, ext_len_idx);
+    return result;
+}
+
+// -----------------------------------------------------------------------
+// Resumption binder derivation (RFC 8446 §4.2.11.2, §7.1):
+//   early_secret  = HKDF-Extract(0, PSK)
+//   binder_key    = Derive-Secret(early_secret, "res binder", "")
+//   finished_key  = HKDF-Expand-Label(binder_key, "finished", "", L)
+//   binder        = HMAC(finished_key, Hash(truncated ClientHello))
+// -----------------------------------------------------------------------
+
+/// Derives the resumption binder for `psk` (already exactly
+/// `hash.digestLength()` bytes — the caller derives it via
+/// `key_schedule.KeySchedule.resumptionPsk`) over `truncated_client_hello`
+/// (the exact framed-message prefix ending just before the binders
+/// vector's own length field) into `out` (must be exactly
+/// `hash.digestLength()` bytes).
+pub fn deriveBinder(
+    hash: provider.Hash,
+    psk: []const u8,
+    truncated_client_hello: []const u8,
+    out: []u8,
+) BinderError!void {
+    const expected_len = hash.digestLength();
+    if (psk.len != expected_len or out.len != expected_len) return error.InvalidSecretLength;
+    switch (hash) {
+        .sha256 => {
+            var empty_hash: [Sha256.digest_length]u8 = undefined;
+            Sha256.hash("", &empty_hash, .{});
+
+            var psk_fixed: [Sha256.digest_length]u8 = undefined;
+            @memcpy(&psk_fixed, psk);
+            defer crypto.secureZero(u8, &psk_fixed);
+
+            var early_secret = HkdfSha256.extract("", &psk_fixed);
+            defer crypto.secureZero(u8, &early_secret);
+            var binder_key = tls.hkdfExpandLabel(HkdfSha256, early_secret, "res binder", &empty_hash, Sha256.digest_length);
+            defer crypto.secureZero(u8, &binder_key);
+            var finished_key = tls.hkdfExpandLabel(HkdfSha256, binder_key, "finished", "", Sha256.digest_length);
+            defer crypto.secureZero(u8, &finished_key);
+
+            var transcript_hash: [Sha256.digest_length]u8 = undefined;
+            Sha256.hash(truncated_client_hello, &transcript_hash, .{});
+            var mac: [HmacSha256.mac_length]u8 = undefined;
+            HmacSha256.create(&mac, &transcript_hash, &finished_key);
+            @memcpy(out, &mac);
+        },
+        .sha384 => {
+            var empty_hash: [Sha384.digest_length]u8 = undefined;
+            Sha384.hash("", &empty_hash, .{});
+
+            var psk_fixed: [HmacSha384.mac_length]u8 = undefined;
+            @memcpy(&psk_fixed, psk);
+            defer crypto.secureZero(u8, &psk_fixed);
+
+            var early_secret = HkdfSha384.extract("", &psk_fixed);
+            defer crypto.secureZero(u8, &early_secret);
+            var binder_key = tls.hkdfExpandLabel(HkdfSha384, early_secret, "res binder", &empty_hash, HmacSha384.mac_length);
+            defer crypto.secureZero(u8, &binder_key);
+            var finished_key = tls.hkdfExpandLabel(HkdfSha384, binder_key, "finished", "", HmacSha384.mac_length);
+            defer crypto.secureZero(u8, &finished_key);
+
+            var transcript_hash: [Sha384.digest_length]u8 = undefined;
+            Sha384.hash(truncated_client_hello, &transcript_hash, .{});
+            var mac: [HmacSha384.mac_length]u8 = undefined;
+            HmacSha384.create(&mac, &transcript_hash, &finished_key);
+            @memcpy(out, &mac);
+        },
+    }
+}
+
+/// Constant-time binder verification: derives the expected binder for `psk`
+/// over `truncated_client_hello` and compares it against `candidate_binder`
+/// without early-exiting on a byte mismatch. A length mismatch (the binder
+/// on the wire is not `hash.digestLength()` bytes) is reported as a
+/// non-match, not an error — a wrong-length binder is simply wrong.
+pub fn verifyBinder(
+    hash: provider.Hash,
+    psk: []const u8,
+    truncated_client_hello: []const u8,
+    candidate_binder: []const u8,
+) BinderError!bool {
+    var computed: [provider.max_digest_len]u8 = undefined;
+    const out = computed[0..hash.digestLength()];
+    defer crypto.secureZero(u8, out);
+    try deriveBinder(hash, psk, truncated_client_hello, out);
+    if (out.len != candidate_binder.len) return false;
+    return switch (out.len) {
+        32 => crypto.timing_safe.eql([32]u8, out[0..32].*, candidate_binder[0..32].*),
+        48 => crypto.timing_safe.eql([48]u8, out[0..48].*, candidate_binder[0..48].*),
+        else => false,
+    };
+}
+
+// -----------------------------------------------------------------------
+// Obfuscated ticket age (RFC 8446 §4.2.11.1).
+// -----------------------------------------------------------------------
+
+/// `obfuscated_ticket_age = uint32(age_ms mod 2^32) +% ticket_age_add`.
+pub fn obfuscateTicketAge(age_ms: u64, ticket_age_add: u32) u32 {
+    const age_mod: u32 = @truncate(age_ms);
+    return age_mod +% ticket_age_add;
+}
+
+/// Recovers the client's apparent ticket age via wrapping subtraction.
+pub fn deobfuscateTicketAge(obfuscated_ticket_age: u32, ticket_age_add: u32) u32 {
+    return obfuscated_ticket_age -% ticket_age_add;
+}
+
+pub const AgeSkew = struct {
+    /// The apparent age the client reported (after deobfuscation).
+    apparent_age_ms: u32,
+    /// The server's own view of elapsed time since issuance.
+    actual_age_ms: u64,
+    /// `apparent - actual`, in milliseconds; positive means the client
+    /// reported an older ticket than the server's clock would expect.
+    skew_ms: i64,
+};
+
+/// Computes the signed age-skew observation used by #366 to reject or allow
+/// early data; skew alone never rejects ordinary 1-RTT resumption.
+pub fn observeAgeSkew(obfuscated_ticket_age: u32, ticket_age_add: u32, actual_age_ms: u64) AgeSkew {
+    const apparent = deobfuscateTicketAge(obfuscated_ticket_age, ticket_age_add);
+    const bounded_actual: i64 = @intCast(@min(actual_age_ms, @as(u64, std.math.maxInt(i64))));
+    return .{
+        .apparent_age_ms = apparent,
+        .actual_age_ms = actual_age_ms,
+        .skew_ms = @as(i64, apparent) - bounded_actual,
+    };
+}
+
+// -----------------------------------------------------------------------
+// Client offer ownership.
+// -----------------------------------------------------------------------
+
+/// An owned, move-oriented set of resumption tickets a client may offer,
+/// bounded to `max_offered_identities`. The backend takes ownership of a
+/// caller-built set at ClientHello emission and is responsible for wiping
+/// every entry on every success, fallback, and teardown path.
+pub const ClientPskOfferSet = struct {
+    tickets: [max_offered_identities]session.ClientTicketState = [_]session.ClientTicketState{.{}} ** max_offered_identities,
+    len: usize = 0,
+
+    pub const Error = error{TooManyOffers};
+
+    /// Moves ownership of `ticket` into the set; `ticket` is zero-valued on
+    /// success. Fails (leaving `ticket` untouched) once the set is full.
+    pub fn push(self: *ClientPskOfferSet, ticket: *session.ClientTicketState) Error!void {
+        if (self.len >= max_offered_identities) return error.TooManyOffers;
+        self.tickets[self.len].moveFrom(ticket);
+        self.len += 1;
+    }
+
+    pub fn slice(self: *ClientPskOfferSet) []session.ClientTicketState {
+        return self.tickets[0..self.len];
+    }
+
+    pub fn constSlice(self: *const ClientPskOfferSet) []const session.ClientTicketState {
+        return self.tickets[0..self.len];
+    }
+
+    pub fn isEmpty(self: *const ClientPskOfferSet) bool {
+        return self.len == 0;
+    }
+
+    /// Transfers ownership of `source`'s tickets into `self`, deinitializing
+    /// whatever `self` previously held first. `source` is left empty.
+    pub fn moveFrom(self: *ClientPskOfferSet, source: *ClientPskOfferSet) void {
+        if (self == source) return;
+        self.deinit();
+        self.* = source.*;
+        source.* = .{};
+    }
+
+    /// Wipes and deinitializes every remaining offer (unselected offers
+    /// after a selection, or the whole set when the server did not select
+    /// PSK, or on any error/teardown path).
+    pub fn deinit(self: *ClientPskOfferSet) void {
+        for (self.tickets[0..self.len]) |*t| t.deinit();
+        self.len = 0;
+    }
+
+    /// Moves the ticket at `index` out into `dest` (the backend's resumed
+    /// session state) and wipes every other, now-unselected offer.
+    pub fn takeSelected(self: *ClientPskOfferSet, index: usize, dest: *session.ClientTicketState) void {
+        dest.moveFrom(&self.tickets[index]);
+        self.deinit();
+    }
+};
+
+// -----------------------------------------------------------------------
+// Server resolver contract, shared by stateful (#364) and stateless (#363)
+// providers.
+// -----------------------------------------------------------------------
+
+pub const ResolveError = error{ResolverFailed};
+
+/// Provider-neutral identity resolver. `resolveFn` returns `true` with a
+/// completely owned, zero-valued-on-failure `out` when `identity` is a
+/// usable ticket/session identity; `false` (with `out` left untouched/zero)
+/// for any malformed, unknown, retired, or otherwise unusable identity —
+/// including a stateless envelope's own decode/authentication failures
+/// (#363), which are never distinguished from "unknown" at this contract.
+/// Operational failures (allocation, provider/configuration faults) are the
+/// typed `ResolveError`, never silently folded into an ordinary `false`.
+pub const ServerPskResolver = struct {
+    ctx: *anyopaque,
+    nowUnixMsFn: *const fn (*anyopaque) i64,
+    resolveFn: *const fn (
+        ctx: *anyopaque,
+        identity: []const u8,
+        out: *session.ServerRecoverableState,
+    ) ResolveError!bool,
+
+    pub fn nowUnixMs(self: ServerPskResolver) i64 {
+        return self.nowUnixMsFn(self.ctx);
+    }
+
+    pub fn resolve(self: ServerPskResolver, identity: []const u8, out: *session.ServerRecoverableState) ResolveError!bool {
+        return self.resolveFn(self.ctx, identity, out);
+    }
+};
+
+// -----------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "psk_key_exchange_modes round-trips and rejects malformed vectors" {
+    var buf: [16]u8 = undefined;
+    var w = messages.Writer{ .buf = &buf };
+    try writeModes(&w, &.{ .psk_ke, .psk_dhe_ke });
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 1 }, w.written());
+
+    try testing.expect(try hasMode(w.written(), .psk_dhe_ke));
+    try testing.expect(try hasMode(w.written(), .psk_ke));
+
+    // Empty vector.
+    try testing.expectError(error.EmptyVector, hasMode(&.{0}, .psk_dhe_ke));
+    // Truncated (declares 2 bytes, has 1).
+    try testing.expectError(error.MalformedHandshake, hasMode(&.{ 2, 1 }, .psk_dhe_ke));
+    // Trailing bytes after the declared vector.
+    try testing.expectError(error.MalformedHandshake, hasMode(&.{ 1, 1, 0xff }, .psk_dhe_ke));
+}
+
+test "OfferedPsks encode/decode round-trip via writeOffer and parse" {
+    var buf: [512]u8 = undefined;
+    var w = messages.Writer{ .buf = &buf };
+    const items = [_]OfferItem{
+        .{ .identity = "ticket-one", .obfuscated_ticket_age = 0x11223344, .digest_len = 32 },
+        .{ .identity = "ticket-two", .obfuscated_ticket_age = 0xaabbccdd, .digest_len = 48 },
+    };
+    const offer = try writeOffer(&w, &items);
+    try testing.expectEqual(@as(usize, 2), offer.count);
+
+    // ext_id(2) + ext_len(2) precede the region writeOffer wrote.
+    const ext_data = w.written()[4..];
+    var parsed = try OfferedPsks.parse(ext_data);
+    try testing.expectEqual(@as(usize, 2), parsed.count);
+
+    var it = parsed.pairs();
+    const first = (try it.next()).?;
+    try testing.expectEqualStrings("ticket-one", first.identity.identity);
+    try testing.expectEqual(@as(u32, 0x11223344), first.identity.obfuscated_ticket_age);
+    try testing.expectEqual(@as(usize, 32), first.binder.len);
+    try testing.expect(std.mem.allEqual(u8, first.binder, 0)); // placeholder, not yet patched
+
+    const second = (try it.next()).?;
+    try testing.expectEqualStrings("ticket-two", second.identity.identity);
+    try testing.expectEqual(@as(usize, 48), second.binder.len);
+
+    try testing.expectEqual(@as(?OfferedPsks.PairIterator.Pair, null), try it.next());
+}
+
+test "OfferedPsks.parse rejects mismatched identity/binder counts" {
+    // One identity, zero binders.
+    var buf: [64]u8 = undefined;
+    var w = messages.Writer{ .buf = &buf };
+    const id_len_idx = try w.reserve(2);
+    try w.u16_(4);
+    try w.bytes("abcd");
+    try w.bytes(&[_]u8{0} ** 4); // age
+    w.patch(2, id_len_idx);
+    try w.u16_(0); // empty binders vector length -- caught as EmptyVector first
+    try testing.expectError(error.EmptyVector, OfferedPsks.parse(w.written()));
+}
+
+test "OfferedPsks.parse rejects truncated and oversized binder lengths" {
+    var buf: [64]u8 = undefined;
+
+    // Binder length 31 (< 32) is illegal.
+    {
+        var w = messages.Writer{ .buf = &buf };
+        const id_len_idx = try w.reserve(2);
+        try w.u16_(4);
+        try w.bytes("abcd");
+        try w.bytes(&[_]u8{0} ** 4);
+        w.patch(2, id_len_idx);
+        const b_len_idx = try w.reserve(2);
+        try w.u8_(31);
+        try w.bytes(&[_]u8{0} ** 31);
+        w.patch(2, b_len_idx);
+        try testing.expectError(error.InvalidBinderLength, OfferedPsks.parse(w.written()));
+    }
+}
+
+test "resumption binder derivation matches independently computed HKDF chain (SHA-256)" {
+    // Vector reuses the SHA-256 RFC 8448-style resumption PSK from
+    // key_schedule.zig's own resumption test so binder derivation is
+    // checked against a value derived independently of this module.
+    const key_schedule = @import("key_schedule.zig");
+    const psk = hexBytes("c1392efd98f6932d62f5ccd42c724230871638e8ad0ac9ce9b2af89f5f919fed");
+    const client_hello_prefix = "pretend-truncated-clienthello-bytes";
+
+    var binder: [32]u8 = undefined;
+    try deriveBinder(.sha256, &psk, client_hello_prefix, &binder);
+
+    // Independently recompute the same chain inline to cross-check.
+    var empty_hash: [32]u8 = undefined;
+    Sha256.hash("", &empty_hash, .{});
+    var early_secret = HkdfSha256.extract("", &psk);
+    var binder_key = tls.hkdfExpandLabel(HkdfSha256, early_secret, "res binder", &empty_hash, 32);
+    var finished_key = tls.hkdfExpandLabel(HkdfSha256, binder_key, "finished", "", 32);
+    var transcript: [32]u8 = undefined;
+    Sha256.hash(client_hello_prefix, &transcript, .{});
+    var expected: [32]u8 = undefined;
+    HmacSha256.create(&expected, &transcript, &finished_key);
+    crypto.secureZero(u8, &early_secret);
+    crypto.secureZero(u8, &binder_key);
+    crypto.secureZero(u8, &finished_key);
+
+    try testing.expectEqualSlices(u8, &expected, &binder);
+    try testing.expect(try verifyBinder(.sha256, &psk, client_hello_prefix, &binder));
+    try testing.expect(!try verifyBinder(.sha256, &psk, "different prefix bytes here", &binder));
+
+    _ = key_schedule;
+}
+
+test "resumption binder derivation supports SHA-384 and rejects mismatched PSK length" {
+    const psk384 = [_]u8{0x77} ** 48;
+    var binder: [48]u8 = undefined;
+    try deriveBinder(.sha384, &psk384, "prefix", &binder);
+    try testing.expect(!std.mem.allEqual(u8, &binder, 0));
+
+    var short_binder: [47]u8 = undefined;
+    try testing.expectError(error.InvalidSecretLength, deriveBinder(.sha384, &psk384, "prefix", &short_binder));
+    try testing.expectError(error.InvalidSecretLength, deriveBinder(.sha256, &psk384, "prefix", short_binder[0..32]));
+}
+
+test "verifyBinder rejects a wrong-length candidate without erroring" {
+    const psk = [_]u8{0x11} ** 32;
+    var binder: [32]u8 = undefined;
+    try deriveBinder(.sha256, &psk, "prefix", &binder);
+    try testing.expect(!try verifyBinder(.sha256, &psk, "prefix", binder[0..31]));
+}
+
+test "obfuscated ticket age round-trips including u32 wraparound" {
+    const add: u32 = 0xffff_fff0;
+    const age_ms: u64 = 1000;
+    const obfuscated = obfuscateTicketAge(age_ms, add);
+    try testing.expectEqual(@as(u32, 1000) +% add, obfuscated);
+    try testing.expectEqual(@as(u32, 1000), deobfuscateTicketAge(obfuscated, add));
+
+    // age_ms itself exceeds 2^32: only the low 32 bits participate.
+    const huge_age: u64 = (@as(u64, 1) << 33) + 42;
+    const obfuscated2 = obfuscateTicketAge(huge_age, add);
+    try testing.expectEqual(@as(u32, 42) +% add, obfuscated2);
+}
+
+test "age skew observation reports signed drift without rejecting on its own" {
+    const add: u32 = 500;
+    const obfuscated = obfuscateTicketAge(10_000, add);
+    const skew = observeAgeSkew(obfuscated, add, 9_000);
+    try testing.expectEqual(@as(u32, 10_000), skew.apparent_age_ms);
+    try testing.expectEqual(@as(i64, 1_000), skew.skew_ms);
+}
+
+test "ClientPskOfferSet is bounded to eight, move-oriented, and fully wiped on deinit" {
+    var set: ClientPskOfferSet = .{};
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(testing.allocator, .default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0x42} ** 32),
+        .auth_binding = .{ .bytes = [_]u8{0} ** session.auth_binding_len },
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 1000,
+    });
+    var ticket: session.ClientTicketState = .{};
+    try ticket.init(testing.allocator, .default, &common, .{
+        .ticket = "opaque-ticket",
+        .ticket_age_add = 7,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    try set.push(&ticket);
+    try testing.expectEqual(@as(usize, 0), ticket.ticket.slice().len); // moved out
+    try testing.expectEqual(@as(usize, 1), set.len);
+
+    var dest: session.ClientTicketState = .{};
+    set.takeSelected(0, &dest);
+    try testing.expectEqualStrings("opaque-ticket", dest.ticket.slice());
+    try testing.expectEqual(@as(usize, 0), set.len);
+    dest.deinit();
+}
+
+fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
+    var bytes: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
+    return bytes;
+}

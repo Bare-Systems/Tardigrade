@@ -78,12 +78,31 @@ pub const Core = struct {
     client_auth_inbound: ClientAuthInbound = .inactive,
     /// Client outbound sub-state for its own certificate flight.
     client_auth_outbound: ClientAuthOutbound = .inactive,
+    /// Set once a PSK-resumed handshake (#362) has been selected: the
+    /// server flight after EncryptedExtensions goes straight to Finished
+    /// (no CertificateRequest, Certificate, or CertificateVerify), and the
+    /// client expects Finished immediately after EncryptedExtensions. Both
+    /// sides set this — via `enterPskAuthenticated` — once they know a PSK
+    /// was selected (server: after choosing to accept it, before its own
+    /// EncryptedExtensions is sent; client: after parsing ServerHello's
+    /// selected_identity, before EncryptedExtensions arrives). Never set
+    /// together with `request_client_certificate`/a client-auth flight:
+    /// handshake-time client authentication forces full-handshake fallback.
+    psk_authenticated: bool = false,
 
     pub const ClientAuthInbound = enum { inactive, expect_certificate, expect_certificate_verify, expect_finished };
     pub const ClientAuthOutbound = enum { inactive, send_certificate, send_certificate_verify, send_finished };
 
     pub fn init(role: state.Role) Core {
         return .{ .role = role };
+    }
+
+    /// Declare that a PSK-resumed handshake was selected (#362): the
+    /// remaining flight on both sides skips straight from EncryptedExtensions
+    /// to Finished. Must be called before the EncryptedExtensions message
+    /// is sent (server) or accepted (client).
+    pub fn enterPskAuthenticated(self: *Core) void {
+        self.psk_authenticated = true;
     }
 
     /// Server: request that the client authenticate. Call before the server
@@ -250,8 +269,8 @@ pub const Core = struct {
                     self.expected_inbound = .encrypted_extensions;
                 },
                 .encrypted_extensions => {
-                    self.handshake_state = .certificate;
-                    self.expected_inbound = .certificate;
+                    self.handshake_state = if (self.psk_authenticated) .finished else .certificate;
+                    self.expected_inbound = if (self.psk_authenticated) .finished else .certificate;
                 },
                 .certificate => {
                     self.handshake_state = .certificate_verify;
@@ -287,8 +306,12 @@ pub const Core = struct {
             },
             .server => switch (kind) {
                 .server_hello => self.handshake_state = .encrypted_extensions,
-                .encrypted_extensions => self.handshake_state =
-                    if (self.request_client_certificate) .certificate_request else .certificate,
+                .encrypted_extensions => self.handshake_state = if (self.psk_authenticated)
+                    .finished
+                else if (self.request_client_certificate)
+                    .certificate_request
+                else
+                    .certificate,
                 .certificate_request => self.handshake_state = .certificate,
                 .certificate => self.handshake_state = .certificate_verify,
                 .certificate_verify => self.handshake_state = .finished,
@@ -333,6 +356,47 @@ test "core records both directions of a client and server flight" {
     const cf = try messages.encode(.finished, "", &bytes);
     try client.recordSent(cf);
     _ = try server.acceptReceived(cf);
+    try std.testing.expectEqual(.complete, client.handshake_lifecycle);
+    try std.testing.expectEqual(.complete, server.handshake_lifecycle);
+    const client_hash = client.transcriptHash();
+    const server_hash = server.transcriptHash();
+    try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+}
+
+test "PSK-authenticated core skips Certificate/CertificateVerify and still completes both directions" {
+    var client = Core.init(.client);
+    var server = Core.init(.server);
+    try client.start();
+    try server.start();
+
+    var bytes: [8]u8 = undefined;
+    const ch = try messages.encode(.client_hello, "", &bytes);
+    try client.recordSent(ch);
+    _ = try server.acceptReceived(ch);
+    const sh = try messages.encode(.server_hello, "", &bytes);
+    try server.recordSent(sh);
+    _ = try client.acceptReceived(sh);
+
+    // Both sides learn PSK was selected before EncryptedExtensions crosses
+    // the wire (server: before sending it; client: before receiving it).
+    server.enterPskAuthenticated();
+    client.enterPskAuthenticated();
+
+    const ee = try messages.encode(.encrypted_extensions, "", &bytes);
+    try server.recordSent(ee);
+    _ = try client.acceptReceived(ee);
+
+    // Certificate/CertificateVerify are neither expected nor legal now.
+    const cert = try messages.encode(.certificate, "", &bytes);
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, client.acceptReceived(cert));
+
+    const sf = try messages.encode(.finished, "", &bytes);
+    try server.recordSent(sf);
+    _ = try client.acceptReceived(sf);
+    const cf = try messages.encode(.finished, "", &bytes);
+    try client.recordSent(cf);
+    _ = try server.acceptReceived(cf);
+
     try std.testing.expectEqual(.complete, client.handshake_lifecycle);
     try std.testing.expectEqual(.complete, server.handshake_lifecycle);
     const client_hash = client.transcriptHash();

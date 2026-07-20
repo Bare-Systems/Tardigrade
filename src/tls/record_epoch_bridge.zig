@@ -209,6 +209,25 @@ pub const Bridge = struct {
         };
     }
 
+    pub fn sealedHandshakeLen(self: *Bridge, epoch: events.EncryptionEpoch, bytes_len: usize) Error!usize {
+        return switch (epoch) {
+            .initial => if (self.initial_discarded)
+                error.UnsupportedRecordEpoch
+            else
+                plaintextHandshakeRecordLen(bytes_len),
+            .handshake => blk: {
+                const write = self.writeHandshake() orelse return error.MissingWriteKeys;
+                break :blk protectedHandshakeRecordLen(write, bytes_len);
+            },
+            .application => blk: {
+                if (!self.handshake_complete) return error.HandshakeNotComplete;
+                const write = self.writeApplication() orelse return error.MissingWriteKeys;
+                break :blk protectedHandshakeRecordLen(write, bytes_len);
+            },
+            .zero_rtt => error.UnsupportedRecordEpoch,
+        };
+    }
+
     pub fn sealProtected(
         self: *Bridge,
         epoch: events.EncryptionEpoch,

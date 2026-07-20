@@ -139,6 +139,15 @@ pub const SecretStore = struct {
         self.write[level.index()] = null;
     }
 
+    pub fn deinit(self: *SecretStore) void {
+        inline for (0..4) |index| {
+            if (self.read[index]) |*secret| wipe(secret);
+            if (self.write[index]) |*secret| wipe(secret);
+            self.read[index] = null;
+            self.write[index] = null;
+        }
+    }
+
     fn installSlot(slot: *?Secret, secret: Secret) void {
         if (slot.*) |*old_secret| wipe(old_secret);
         slot.* = secret;
@@ -371,23 +380,28 @@ pub const CryptoStream = struct {
         return self.buffer[@intCast(self.consumed_offset - self.base_offset)..@intCast(end - self.base_offset)];
     }
 
-    pub fn consumeContiguous(self: *CryptoStream) []const u8 {
-        const end = self.contiguousEnd();
-        if (end <= self.consumed_offset) return &.{};
-        const bytes = self.buffer[@intCast(self.consumed_offset - self.base_offset)..@intCast(end - self.base_offset)];
-        self.consumed_offset = end;
+    pub fn discardContiguous(self: *CryptoStream, len: usize) void {
+        const available = self.contiguous().len;
+        const n = @min(len, available);
+        if (n == 0) return;
+        const start: usize = @intCast(self.consumed_offset - self.base_offset);
+        crypto_secrets.secureZero(self.buffer[start..][0..n]);
+        self.consumed_offset += n;
         self.dropConsumedRanges();
-        return bytes;
     }
 
     fn compactConsumed(self: *CryptoStream) void {
         if (self.consumed_offset == self.base_offset) return;
         const keep_start = self.consumed_offset;
         const keep_end = self.bufferedEnd();
+        const old_end: usize = @intCast(keep_end - self.base_offset);
         if (keep_end > keep_start) {
             const old_start: usize = @intCast(keep_start - self.base_offset);
             const keep_len: usize = @intCast(keep_end - keep_start);
             std.mem.copyForwards(u8, self.buffer[0..keep_len], self.buffer[old_start..][0..keep_len]);
+            crypto_secrets.secureZero(self.buffer[keep_len..old_end]);
+        } else {
+            crypto_secrets.secureZero(self.buffer[0..old_end]);
         }
         self.base_offset = self.consumed_offset;
     }
@@ -473,9 +487,14 @@ pub const CryptoReassembler = struct {
         return self.streams[index].contiguous();
     }
 
-    pub fn consumeContiguous(self: *CryptoReassembler, level: EncryptionLevel) error{InvalidCryptoLevel}![]const u8 {
+    pub fn discardContiguous(self: *CryptoReassembler, level: EncryptionLevel, len: usize) error{InvalidCryptoLevel}!void {
         const index = try cryptoStreamIndex(level);
-        return self.streams[index].consumeContiguous();
+        self.streams[index].discardContiguous(len);
+    }
+
+    pub fn deinit(self: *CryptoReassembler) void {
+        crypto_secrets.secureZero(std.mem.asBytes(self));
+        self.* = .{};
     }
 };
 
@@ -511,27 +530,39 @@ pub const CryptoOutput = struct {
         return self.end - self.start;
     }
 
-    pub fn take(self: *CryptoOutput, max_bytes: usize) ?struct { offset: u64, bytes: []const u8 } {
+    pub fn peek(self: *CryptoOutput, max_bytes: usize) ?struct { offset: u64, bytes: []const u8 } {
         const available = self.pending();
         if (available == 0) return null;
         const len = @min(available, max_bytes);
         const offset = self.next_offset;
         const bytes = self.buffer[self.start .. self.start + len];
-        self.start += len;
-        self.next_offset += len;
+        return .{ .offset = offset, .bytes = bytes };
+    }
+
+    pub fn discardTaken(self: *CryptoOutput, len: usize) void {
+        const n = @min(len, self.pending());
+        if (n == 0) return;
+        crypto_secrets.secureZero(self.buffer[self.start..][0..n]);
+        self.start += n;
+        self.next_offset += n;
         if (self.start == self.end) {
             self.start = 0;
             self.end = 0;
         }
-        return .{ .offset = offset, .bytes = bytes };
     }
 
     fn compact(self: *CryptoOutput) void {
         if (self.start == 0) return;
         const available = self.pending();
         if (available > 0) std.mem.copyForwards(u8, self.buffer[0..available], self.buffer[self.start..self.end]);
+        crypto_secrets.secureZero(self.buffer[available..self.end]);
         self.start = 0;
         self.end = available;
+    }
+
+    pub fn deinit(self: *CryptoOutput) void {
+        crypto_secrets.secureZero(std.mem.asBytes(self));
+        self.* = .{};
     }
 };
 
@@ -560,6 +591,14 @@ pub const QuicTlsAdapter = struct {
     application_write_key_phase: u1 = 0,
     application_read_key_phase: u1 = 0,
     metrics: Metrics = .{},
+
+    pub fn deinit(self: *QuicTlsAdapter) void {
+        self.secrets.deinit();
+        self.reassembler.deinit();
+        for (&self.outbound) |*out| out.deinit();
+        crypto_secrets.secureZero(std.mem.asBytes(self));
+        self.* = .{};
+    }
 
     pub fn setLocalTransportParameters(self: *QuicTlsAdapter, params: config.TransportParameters) void {
         self.local_transport_parameters = params;
@@ -605,9 +644,13 @@ pub const QuicTlsAdapter = struct {
     }
 
     pub fn nextHandshakeInput(self: *QuicTlsAdapter, level: EncryptionLevel) error{InvalidCryptoLevel}!?HandshakeInput {
-        const bytes = try self.reassembler.consumeContiguous(level);
+        const bytes = try self.reassembler.contiguous(level);
         if (bytes.len == 0) return null;
         return .{ .level = level, .bytes = bytes };
+    }
+
+    pub fn discardHandshakeInput(self: *QuicTlsAdapter, level: EncryptionLevel, len: usize) error{InvalidCryptoLevel}!void {
+        try self.reassembler.discardContiguous(level, len);
     }
 
     pub fn queueHandshakeOutput(self: *QuicTlsAdapter, level: EncryptionLevel, bytes: []const u8) error{ CryptoBufferTooLarge, InvalidCryptoLevel }!void {
@@ -618,8 +661,13 @@ pub const QuicTlsAdapter = struct {
     pub fn nextHandshakeOutput(self: *QuicTlsAdapter, level: EncryptionLevel, max_bytes: usize) error{InvalidCryptoLevel}!?HandshakeOutput {
         const index = try cryptoStreamIndex(level);
         if (max_bytes == 0) return null;
-        const output = self.outbound[index].take(max_bytes) orelse return null;
+        const output = self.outbound[index].peek(max_bytes) orelse return null;
         return .{ .level = level, .offset = output.offset, .bytes = output.bytes };
+    }
+
+    pub fn discardHandshakeOutput(self: *QuicTlsAdapter, level: EncryptionLevel, len: usize) error{InvalidCryptoLevel}!void {
+        const index = try cryptoStreamIndex(level);
+        self.outbound[index].discardTaken(len);
     }
 
     pub fn installSecret(self: *QuicTlsAdapter, installed_secret: Secret) void {
@@ -1213,11 +1261,13 @@ test "CRYPTO reassembly emits only contiguous bytes by encryption level" {
     try testing.expectEqual(@as(usize, 0), (try reassembler.contiguous(.initial)).len);
 
     try reassembler.insert(.handshake, 0, "other");
-    try testing.expectEqualStrings("other", try reassembler.consumeContiguous(.handshake));
+    try testing.expectEqualStrings("other", try reassembler.contiguous(.handshake));
+    try reassembler.discardContiguous(.handshake, "other".len);
 
     try reassembler.insert(.initial, 0, "hello ");
-    try testing.expectEqualStrings("hello world", try reassembler.consumeContiguous(.initial));
-    try testing.expectEqual(@as(usize, 0), (try reassembler.consumeContiguous(.initial)).len);
+    try testing.expectEqualStrings("hello world", try reassembler.contiguous(.initial));
+    try reassembler.discardContiguous(.initial, "hello world".len);
+    try testing.expectEqual(@as(usize, 0), (try reassembler.contiguous(.initial)).len);
 }
 
 test "CRYPTO reassembly merges duplicate and overlapping fragments" {
@@ -1227,20 +1277,23 @@ test "CRYPTO reassembly merges duplicate and overlapping fragments" {
     try stream.insert(6, "g");
 
     try testing.expectEqual(@as(usize, 1), stream.range_count);
-    try testing.expectEqualStrings("abcdefg", stream.consumeContiguous());
+    try testing.expectEqualStrings("abcdefg", stream.contiguous());
+    stream.discardContiguous("abcdefg".len);
 }
 
 test "CRYPTO reassembly preserves a gap after consumed bytes" {
     var stream = CryptoStream{};
     try stream.insert(0, "abc");
     try stream.insert(6, "ghi");
-    try testing.expectEqualStrings("abc", stream.consumeContiguous());
+    try testing.expectEqualStrings("abc", stream.contiguous());
+    stream.discardContiguous("abc".len);
     try testing.expectEqual(@as(u64, 3), stream.consumed_offset);
     try testing.expectEqual(@as(usize, 1), stream.range_count);
     try testing.expectEqual(@as(usize, 0), stream.contiguous().len);
 
     try stream.insert(3, "def");
-    try testing.expectEqualStrings("defghi", stream.consumeContiguous());
+    try testing.expectEqualStrings("defghi", stream.contiguous());
+    stream.discardContiguous("defghi".len);
 }
 
 test "CRYPTO insert merges a full range set without partial failure" {
@@ -1278,7 +1331,8 @@ test "CRYPTO insert does not mutate bytes when range insertion fails" {
 test "CRYPTO insert ignores and trims consumed retransmits" {
     var stream = CryptoStream{};
     try stream.insert(0, "hello");
-    try testing.expectEqualStrings("hello", stream.consumeContiguous());
+    try testing.expectEqualStrings("hello", stream.contiguous());
+    stream.discardContiguous("hello".len);
     try testing.expectEqual(@as(u64, 5), stream.consumed_offset);
 
     try stream.insert(0, "hello");
@@ -1286,7 +1340,8 @@ test "CRYPTO insert ignores and trims consumed retransmits" {
     try testing.expectEqual(@as(usize, 0), stream.contiguous().len);
 
     try stream.insert(3, "lo world");
-    try testing.expectEqualStrings(" world", stream.consumeContiguous());
+    try testing.expectEqualStrings(" world", stream.contiguous());
+    stream.discardContiguous(" world".len);
 }
 
 test "adapter tracks transport parameters ALPN secrets and handshake input" {
@@ -1310,10 +1365,12 @@ test "adapter tracks transport parameters ALPN secrets and handshake input" {
     const first_input = (try adapter.nextHandshakeInput(.initial)).?;
     try testing.expectEqual(EncryptionLevel.initial, first_input.level);
     try testing.expectEqualStrings("hel", first_input.bytes);
+    try adapter.discardHandshakeInput(.initial, first_input.bytes.len);
     try adapter.receiveCrypto(.initial, 3, "l");
     const input = (try adapter.nextHandshakeInput(.initial)).?;
     try testing.expectEqual(EncryptionLevel.initial, input.level);
     try testing.expectEqualStrings("llo", input.bytes);
+    try adapter.discardHandshakeInput(.initial, input.bytes.len);
 }
 
 test "secret store returns pointers and wipes discarded secret bytes" {
@@ -1342,16 +1399,36 @@ test "adapter queues outbound TLS handshake bytes as CRYPTO stream data" {
     try testing.expectEqual(EncryptionLevel.initial, first.level);
     try testing.expectEqual(@as(u64, 0), first.offset);
     try testing.expectEqualStrings("client", first.bytes);
+    try adapter.discardHandshakeOutput(.initial, first.bytes.len);
 
     const second = (try adapter.nextHandshakeOutput(.initial, 32)).?;
     try testing.expectEqual(@as(u64, 6), second.offset);
     try testing.expectEqualStrings(" hello", second.bytes);
+    try adapter.discardHandshakeOutput(.initial, second.bytes.len);
     try testing.expect((try adapter.nextHandshakeOutput(.initial, 1)) == null);
 
     const handshake = (try adapter.nextHandshakeOutput(.handshake, 32)).?;
     try testing.expectEqual(EncryptionLevel.handshake, handshake.level);
     try testing.expectEqual(@as(u64, 0), handshake.offset);
     try testing.expectEqualStrings("server", handshake.bytes);
+    try adapter.discardHandshakeOutput(.handshake, handshake.bytes.len);
+}
+
+test "adapter wipes consumed CRYPTO input and drained output bytes" {
+    var adapter = QuicTlsAdapter{};
+    const input_pattern = "ticket-input-pattern";
+    try adapter.receiveCrypto(.application, 0, input_pattern);
+    const input = (try adapter.nextHandshakeInput(.application)).?;
+    try testing.expectEqualStrings(input_pattern, input.bytes);
+    try adapter.discardHandshakeInput(.application, input.bytes.len);
+    try testing.expect(std.mem.indexOf(u8, &adapter.reassembler.streams[EncryptionLevel.application.index()].buffer, input_pattern) == null);
+
+    const output_pattern = "ticket-output-pattern";
+    try adapter.queueHandshakeOutput(.application, output_pattern);
+    const output = (try adapter.nextHandshakeOutput(.application, output_pattern.len)).?;
+    try testing.expectEqualStrings(output_pattern, output.bytes);
+    try adapter.discardHandshakeOutput(.application, output.bytes.len);
+    try testing.expect(std.mem.indexOf(u8, &adapter.outbound[EncryptionLevel.application.index()].buffer, output_pattern) == null);
 }
 
 test "CRYPTO input storage is bounded by outstanding data, not lifetime offset" {
@@ -1360,9 +1437,11 @@ test "CRYPTO input storage is bounded by outstanding data, not lifetime offset" 
     const second = [_]u8{0x22} ** (40 * 1024);
 
     try stream.insert(0, &first);
-    try testing.expectEqualSlices(u8, &first, stream.consumeContiguous());
+    try testing.expectEqualSlices(u8, &first, stream.contiguous());
+    stream.discardContiguous(first.len);
     try stream.insert(first.len, &second);
-    try testing.expectEqualSlices(u8, &second, stream.consumeContiguous());
+    try testing.expectEqualSlices(u8, &second, stream.contiguous());
+    stream.discardContiguous(second.len);
     try testing.expect(stream.consumed_offset > 64 * 1024);
 }
 

@@ -54,7 +54,7 @@ pub const max_new_session_ticket_message_len = tls13_transport.max_new_session_t
 const handshake_header_len = 4;
 
 const PostHandshakeInput = struct {
-    allocator: std.mem.Allocator = std.heap.page_allocator,
+    allocator: ?std.mem.Allocator = null,
     buf_allocator: ?std.mem.Allocator = null,
     header: [handshake_header_len]u8 = undefined,
     header_len: usize = 0,
@@ -91,7 +91,7 @@ const PostHandshakeInput = struct {
                 const body_len: usize = @intCast(std.mem.readInt(u24, self.header[1..4], .big));
                 const frame_len = handshake_header_len + body_len;
                 if (frame_len > max_new_session_ticket_message_len) return error.HandshakeBufferOverflow;
-                const allocator = self.allocator;
+                const allocator = self.allocator orelse return error.InvalidHandshakeState;
                 self.buf = allocator.alloc(u8, frame_len) catch return error.CredentialProviderFailed;
                 self.buf_allocator = allocator;
                 @memcpy(self.buf[0..handshake_header_len], &self.header);
@@ -2845,6 +2845,7 @@ test "client parses and drops NewSessionTicket when no consumer is configured" {
         .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
     );
     defer backend.deinit();
+    try backend.setPostHandshakeAllocator(std.testing.allocator);
     backend.core.handshake_lifecycle = .complete;
 
     var body_buf: [128]u8 = undefined;
@@ -3047,6 +3048,7 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
         .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
     );
     defer client.deinit();
+    try client.setPostHandshakeAllocator(std.testing.allocator);
     client.core.handshake_lifecycle = .complete;
 
     const max_message = try buildMaxNewSessionTicketMessage(std.testing.allocator);
@@ -3064,6 +3066,7 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
         .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
     );
     defer over_client.deinit();
+    try over_client.setPostHandshakeAllocator(std.testing.allocator);
     over_client.core.handshake_lifecycle = .complete;
     const over = try std.testing.allocator.alloc(u8, max_new_session_ticket_message_len + 1);
     defer std.testing.allocator.free(over);

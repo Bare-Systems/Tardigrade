@@ -796,6 +796,7 @@ const SocketHarness = struct {
         server_provider: ?tls_backend.CredentialProvider = null,
         client_verifier: ?tls_backend.PeerVerifier = null,
         client_options: tls_backend.Tls13Backend.ClientOptions = .{},
+        client_post_handshake_allocator: ?std.mem.Allocator = null,
     };
 
     fn create(opts: Options) !*SocketHarness {
@@ -821,6 +822,9 @@ const SocketHarness = struct {
             tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider, server_record_profile)
         else
             tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), server_record_profile);
+        if (opts.client_post_handshake_allocator) |post_allocator| {
+            try self.client_engine.setPostHandshakeAllocator(post_allocator);
+        }
         self.client_carrier = .{ .fd = self.fds[0], .max_chunk = opts.client_chunk, .one_write_per_drive = opts.one_write_per_drive };
         self.server_carrier = .{ .fd = self.fds[1], .max_chunk = opts.server_chunk, .one_write_per_drive = opts.one_write_per_drive };
 
@@ -1026,7 +1030,11 @@ test "record stream delivers maximum post-handshake ticket and remains usable" {
 }
 
 test "record stream drops valid ticket with no consumer and remains usable" {
-    const h = try SocketHarness.create(.{ .client_chunk = 1024, .server_chunk = 1024 });
+    const h = try SocketHarness.create(.{
+        .client_chunk = 1024,
+        .server_chunk = 1024,
+        .client_post_handshake_allocator = std.testing.allocator,
+    });
     defer h.destroy();
     try h.driveUntil(SocketHarness.bothComplete);
 

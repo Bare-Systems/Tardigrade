@@ -55,6 +55,7 @@ pub const Event = TransportContract.Event;
 pub const EventSink = TransportContract.EventSink;
 pub const TlsTransportBackend = TransportContract.Backend;
 pub const CoreDriver = tls_core.engine.Driver(TransportContract);
+pub const EmitNewSessionTicketParams = tls_core.tls13_backend.Tls13Backend.EmitNewSessionTicketParams;
 
 /// Runtime interface to a concrete TLS 1.3 engine. The engine consumes and
 /// produces raw handshake bytes and reports keying material / negotiation
@@ -68,6 +69,13 @@ pub const TlsBackend = struct {
     /// in-memory test backend leaves them null.
     setCidBindingFn: ?*const fn (ptr: *anyopaque, binding: config.CidBinding) void = null,
     peerCidBindingFn: ?*const fn (ptr: *anyopaque) config.CidBinding = null,
+    emitNewSessionTicketFn: ?*const fn (
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        sink: *EventSink,
+        params: EmitNewSessionTicketParams,
+        limits: tls_core.session.Limits,
+    ) HandshakeError!tls_core.session.ServerRecoverableState = null,
 
     fn start(self: TlsBackend, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {
         return self.transport.start(role, params, sink);
@@ -84,6 +92,17 @@ pub const TlsBackend = struct {
     pub fn peerCidBinding(self: TlsBackend) config.CidBinding {
         if (self.peerCidBindingFn) |get| return get(self.transport.ptr);
         return .{};
+    }
+
+    pub fn emitNewSessionTicket(
+        self: TlsBackend,
+        allocator: std.mem.Allocator,
+        sink: *EventSink,
+        params: EmitNewSessionTicketParams,
+        limits: tls_core.session.Limits,
+    ) HandshakeError!tls_core.session.ServerRecoverableState {
+        const emit = self.emitNewSessionTicketFn orelse return error.InvalidHandshakeState;
+        return emit(self.transport.ptr, allocator, sink, params, limits);
     }
 
     pub fn deinit(self: TlsBackend) void {
@@ -154,7 +173,12 @@ pub const Handshake = struct {
         });
         while (true) {
             const input = (self.adapter.nextHandshakeInput(level) catch return self.fail(error.UnexpectedCryptoLevel)) orelse break;
-            try self.applyEvents(try self.driver.receive(input.level, input.bytes));
+            const sink = self.driver.receive(input.level, input.bytes) catch |err| {
+                self.adapter.discardHandshakeInput(input.level, input.bytes.len) catch {};
+                return err;
+            };
+            self.adapter.discardHandshakeInput(input.level, input.bytes.len) catch {};
+            try self.applyEvents(sink);
         }
     }
 
@@ -173,6 +197,9 @@ pub const Handshake = struct {
             error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
         })) orelse return null;
         @memcpy(buf[0..output.bytes.len], output.bytes);
+        self.adapter.discardHandshakeOutput(level, output.bytes.len) catch |err| return self.fail(switch (err) {
+            error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
+        });
         return .{ .offset = output.offset, .bytes = buf[0..output.bytes.len] };
     }
 

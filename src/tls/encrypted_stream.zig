@@ -321,7 +321,7 @@ pub const Carrier = struct {
 
 pub const PureZigRecordStream = struct {
     pub const max_plaintext_queue = 32 * 1024;
-    pub const max_ciphertext_queue = 8 * record_codec.max_ciphertext_record_len;
+    pub const max_ciphertext_queue = 4 * record_codec.max_ciphertext_record_len;
     pub const max_carrier_input_queue = 4 * record_codec.max_ciphertext_record_len;
     pub const max_handshake_queue = 16 * 1024;
     const drive_read_budget = 2 * record_codec.max_ciphertext_record_len;
@@ -720,15 +720,14 @@ pub const PureZigRecordStream = struct {
             self.hasHardRoom(.outbound_ciphertext, self.outbound_ciphertext.len, record_codec.max_ciphertext_record_len);
     }
 
-    fn canReserveOutboundRecords(self: *const PureZigRecordStream, count: usize) bool {
-        const needed = count * record_codec.max_ciphertext_record_len;
+    fn canReserveOutboundHandshakeBytes(self: *PureZigRecordStream, epoch: events.EncryptionEpoch, bytes_len: usize) Error!bool {
+        const needed = try self.bridge.sealedHandshakeLen(epoch, bytes_len);
         return self.outbound_ciphertext.available() >= needed and
             self.hasHardRoom(.outbound_ciphertext, self.outbound_ciphertext.len, needed);
     }
 
     fn emitHandshakeRecords(self: *PureZigRecordStream, epoch: events.EncryptionEpoch, bytes: []const u8) Error!void {
-        const count = handshakeRecordCount(bytes.len);
-        if (!self.canReserveOutboundRecords(count)) return error.WouldBlock;
+        if (!try self.canReserveOutboundHandshakeBytes(epoch, bytes.len)) return error.WouldBlock;
 
         var offset: usize = 0;
         while (offset < bytes.len) {
@@ -799,8 +798,7 @@ pub const PureZigRecordStream = struct {
         if (self.failed) |err| return err;
         if (self.lifecycle == .closed or self.lifecycle == .failed or self.lifecycle == .closing) return error.StreamClosed;
         if (event == .handshake_bytes) {
-            const count = handshakeRecordCount(event.handshake_bytes.data.len);
-            const needed = count * record_codec.max_ciphertext_record_len;
+            const needed = try self.bridge.sealedHandshakeLen(event.handshake_bytes.epoch, event.handshake_bytes.data.len);
             if (!self.hasHardRoom(.outbound_ciphertext, self.outbound_ciphertext.len, needed)) return self.rejectHardLimit(.outbound_ciphertext, error.WouldBlock);
             if (self.outbound_ciphertext.available() < needed) return error.WouldBlock;
         }
@@ -1998,6 +1996,14 @@ test "TLS buffer defaults validate and expose bounded snapshot" {
     try testing.expect(!snapshot.pause_state.inbound_read_paused);
     try testing.expect(!snapshot.pause_state.plaintext_write_paused);
     try testing.expectEqual(AccountingBoundary.complete_stream_owned, snapshot.accounting_boundary);
+}
+
+test "record stream maximum emitted ticket fits four-record ciphertext queue" {
+    try std.testing.expectEqual(4 * record_codec.max_ciphertext_record_len, PureZigRecordStream.max_ciphertext_queue);
+    const bytes_len = tls13_transport.max_emitted_new_session_ticket_message_len;
+    const records = handshakeRecordCount(bytes_len);
+    const protected_len = bytes_len + records * (record_codec.header_len + 1 + 16);
+    try std.testing.expect(protected_len <= PureZigRecordStream.max_ciphertext_queue);
 }
 
 test "TLS buffer policy rejects invalid watermarks and over-capacity hard limits" {

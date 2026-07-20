@@ -86,7 +86,7 @@ pub fn ContractWithOptions(
             pub const max_events = max_event_count;
             pub const max_bytes = max_byte_count;
 
-            const OwnedPayload = struct {
+            pub const OwnedPayload = struct {
                 allocator: std.mem.Allocator,
                 bytes: []u8,
             };
@@ -189,16 +189,23 @@ pub fn ContractWithOptions(
                 );
             }
 
-            pub fn emitOwnedHandshakeBytesCopy(self: *EventSink, epoch: Epoch, data: []const u8) ErrorSet!void {
+            pub fn takeOwnedHandshakePayload(self: *EventSink, index: usize) ?OwnedPayload {
+                if (index >= self.len) return null;
+                const payload = self.owned[index] orelse return null;
+                self.owned[index] = null;
+                return payload;
+            }
+
+            pub fn emitOwnedHandshakeBytesCopy(self: *EventSink, allocator: std.mem.Allocator, epoch: Epoch, data: []const u8) ErrorSet!void {
                 if (self.hasByteCapacity(data.len)) return self.emitHandshakeBytes(epoch, data);
                 if (!self.hasEventCapacity()) return buffer_overflow_error;
-                const copy = std.heap.page_allocator.alloc(u8, data.len) catch return buffer_overflow_error;
+                const copy = allocator.alloc(u8, data.len) catch return buffer_overflow_error;
                 errdefer {
                     crypto_secrets.secureZero(copy);
-                    std.heap.page_allocator.free(copy);
+                    allocator.free(copy);
                 }
                 @memcpy(copy, data);
-                try self.emitOwnedHandshakeBytes(std.heap.page_allocator, epoch, copy);
+                try self.emitOwnedHandshakeBytes(allocator, epoch, copy);
             }
 
             /// Compatibility spelling for QUIC callers, where handshake bytes

@@ -11,13 +11,14 @@
 //! an earlier record-mode-only `record_transport.zig` duplicated this and has
 //! been removed). Ownership rules are narrow and testable:
 //!
-//! - Every byte slice in an emitted event is copied into the driver-owned
-//!   `EventSink`. Slices borrow the sink and remain valid only until the next
-//!   `Driver.start`/`Driver.receive` call, both of which reset the sink.
-//! - `EventSink.reset` and `EventSink.deinit` securely zero the scratch range
-//!   a copied traffic secret occupied, so it does not survive past the event
-//!   lifetime above. `Driver.deinit` calls the latter; every owner of a
-//!   `Driver` must call it exactly once at teardown.
+//! - Byte slices in emitted events borrow the driver-owned `EventSink` and
+//!   remain valid only until the next `Driver.start`/`Driver.receive` call,
+//!   both of which reset the sink. Most payloads are copied into fixed scratch;
+//!   unusually large handshake messages may be transferred as owned allocations.
+//! - `EventSink.reset` and `EventSink.deinit` securely zero copied scratch and
+//!   owned payloads, so traffic secrets and large handshake bytes do not survive
+//!   past the event lifetime above. `Driver.deinit` calls the latter; every
+//!   owner of a `Driver` must call it exactly once at teardown.
 //! - Event emission is atomic: a rejected emit (event-count or byte overflow)
 //!   never leaves a partial payload in scratch or a phantom event in `items`.
 //! - The contract can carry terminal alert output (`Event.fatal_alert`) so a
@@ -85,7 +86,13 @@ pub fn ContractWithOptions(
             pub const max_events = max_event_count;
             pub const max_bytes = max_byte_count;
 
+            const OwnedPayload = struct {
+                allocator: std.mem.Allocator,
+                bytes: []u8,
+            };
+
             items: [max_events]Event = undefined,
+            owned: [max_events]?OwnedPayload = [_]?OwnedPayload{null} ** max_events,
             len: usize = 0,
             scratch: [max_bytes]u8 = undefined,
             used: usize = 0,
@@ -94,6 +101,7 @@ pub fn ContractWithOptions(
             /// traffic secrets (and other emitted bytes) occupied, so they do
             /// not survive past the event lifetime documented on `Backend`.
             pub fn reset(self: *EventSink) void {
+                self.freeOwnedPayloads();
                 self.zeroUsedScratch();
                 self.len = 0;
                 self.used = 0;
@@ -110,6 +118,16 @@ pub fn ContractWithOptions(
 
             fn zeroUsedScratch(self: *EventSink) void {
                 if (self.used > 0) crypto_secrets.secureZero(self.scratch[0..self.used]);
+            }
+
+            fn freeOwnedPayloads(self: *EventSink) void {
+                for (self.owned[0..self.len]) |*owned| {
+                    if (owned.*) |payload| {
+                        crypto_secrets.secureZero(payload.bytes);
+                        payload.allocator.free(payload.bytes);
+                        owned.* = null;
+                    }
+                }
             }
 
             /// True when `len` bytes can be copied into `scratch` without
@@ -137,6 +155,13 @@ pub fn ContractWithOptions(
             /// with `hasEventCapacity`; this never fails.
             fn pushUnchecked(self: *EventSink, event: Event) void {
                 self.items[self.len] = event;
+                self.owned[self.len] = null;
+                self.len += 1;
+            }
+
+            fn pushOwnedUnchecked(self: *EventSink, event: Event, payload: OwnedPayload) void {
+                self.items[self.len] = event;
+                self.owned[self.len] = payload;
                 self.len += 1;
             }
 
@@ -154,10 +179,36 @@ pub fn ContractWithOptions(
                 self.pushUnchecked(.{ .handshake_bytes = .{ .epoch = epoch, .data = stored } });
             }
 
+            /// Transfer a caller-owned allocation into this sink as one
+            /// handshake event. On failure, ownership remains with the caller.
+            pub fn emitOwnedHandshakeBytes(self: *EventSink, allocator: std.mem.Allocator, epoch: Epoch, data: []u8) ErrorSet!void {
+                if (!self.hasEventCapacity()) return buffer_overflow_error;
+                self.pushOwnedUnchecked(
+                    .{ .handshake_bytes = .{ .epoch = epoch, .data = data } },
+                    .{ .allocator = allocator, .bytes = data },
+                );
+            }
+
+            pub fn emitOwnedHandshakeBytesCopy(self: *EventSink, epoch: Epoch, data: []const u8) ErrorSet!void {
+                if (self.hasByteCapacity(data.len)) return self.emitHandshakeBytes(epoch, data);
+                if (!self.hasEventCapacity()) return buffer_overflow_error;
+                const copy = std.heap.page_allocator.alloc(u8, data.len) catch return buffer_overflow_error;
+                errdefer {
+                    crypto_secrets.secureZero(copy);
+                    std.heap.page_allocator.free(copy);
+                }
+                @memcpy(copy, data);
+                try self.emitOwnedHandshakeBytes(std.heap.page_allocator, epoch, copy);
+            }
+
             /// Compatibility spelling for QUIC callers, where handshake bytes
             /// are carried in CRYPTO streams.
             pub fn emitCrypto(self: *EventSink, epoch: Epoch, data: []const u8) ErrorSet!void {
                 try self.emitHandshakeBytes(epoch, data);
+            }
+
+            pub fn emitOwnedCrypto(self: *EventSink, allocator: std.mem.Allocator, epoch: Epoch, data: []u8) ErrorSet!void {
+                try self.emitOwnedHandshakeBytes(allocator, epoch, data);
             }
 
             pub fn emitSecret(self: *EventSink, epoch: Epoch, direction: events.SecretDirection, data: []const u8) ErrorSet!void {
@@ -277,6 +328,21 @@ test "generic transport sink enforces bounded payload storage" {
     var sink = T.EventSink{};
     const oversized = [_]u8{0} ** (T.EventSink.max_bytes + 1);
     try std.testing.expectError(error.TransportBufferOverflow, sink.emitHandshakeBytes(.initial, &oversized));
+}
+
+test "generic transport sink owns large transferred handshake payloads" {
+    const ErrorSet = error{TransportBufferOverflow};
+    const Epoch = enum { application };
+    const T = ContractWithOptions(void, Epoch, ErrorSet, 1, 4, error.TransportBufferOverflow);
+
+    var sink = T.EventSink{};
+    const payload = try std.testing.allocator.alloc(u8, 32);
+    @memset(payload, 0xa5);
+    try sink.emitOwnedHandshakeBytes(std.testing.allocator, .application, payload);
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+    try std.testing.expectEqualSlices(u8, payload, sink.items[0].handshake_bytes.data);
+    sink.reset();
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
 }
 
 test "generic transport sink accepts caller-owned limits and overflow error names" {

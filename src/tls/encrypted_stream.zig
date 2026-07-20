@@ -159,6 +159,10 @@ pub const QueueCounters = struct {
     }
 };
 
+fn handshakeRecordCount(bytes_len: usize) usize {
+    return (bytes_len + record_codec.max_plaintext_fragment_len - 1) / record_codec.max_plaintext_fragment_len;
+}
+
 pub const BufferCounters = struct {
     inbound_read_pauses: u64 = 0,
     inbound_read_resumes: u64 = 0,
@@ -317,7 +321,7 @@ pub const Carrier = struct {
 
 pub const PureZigRecordStream = struct {
     pub const max_plaintext_queue = 32 * 1024;
-    pub const max_ciphertext_queue = 4 * record_codec.max_ciphertext_record_len;
+    pub const max_ciphertext_queue = 8 * record_codec.max_ciphertext_record_len;
     pub const max_carrier_input_queue = 4 * record_codec.max_ciphertext_record_len;
     pub const max_handshake_queue = 16 * 1024;
     const drive_read_budget = 2 * record_codec.max_ciphertext_record_len;
@@ -716,6 +720,26 @@ pub const PureZigRecordStream = struct {
             self.hasHardRoom(.outbound_ciphertext, self.outbound_ciphertext.len, record_codec.max_ciphertext_record_len);
     }
 
+    fn canReserveOutboundRecords(self: *const PureZigRecordStream, count: usize) bool {
+        const needed = count * record_codec.max_ciphertext_record_len;
+        return self.outbound_ciphertext.available() >= needed and
+            self.hasHardRoom(.outbound_ciphertext, self.outbound_ciphertext.len, needed);
+    }
+
+    fn emitHandshakeRecords(self: *PureZigRecordStream, epoch: events.EncryptionEpoch, bytes: []const u8) Error!void {
+        const count = handshakeRecordCount(bytes.len);
+        if (!self.canReserveOutboundRecords(count)) return error.WouldBlock;
+
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const take = @min(record_codec.max_plaintext_fragment_len, bytes.len - offset);
+            var record_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+            const record = self.bridge.sealHandshake(epoch, bytes[offset..][0..take], &record_buf) catch |err| return self.fail(err);
+            self.appendOutboundCiphertext(record) catch |err| return self.fail(err);
+            offset += take;
+        }
+    }
+
     fn canReserveHandshakeOutputBatch(self: *PureZigRecordStream) bool {
         return self.outbound_ciphertext.available() >= handshake_output_reserve and
             self.hasHardRoom(.outbound_ciphertext, self.outbound_ciphertext.len, handshake_output_reserve);
@@ -775,12 +799,18 @@ pub const PureZigRecordStream = struct {
         if (self.failed) |err| return err;
         if (self.lifecycle == .closed or self.lifecycle == .failed or self.lifecycle == .closing) return error.StreamClosed;
         if (event == .handshake_bytes) {
-            if (!self.hasHardRoom(.outbound_ciphertext, self.outbound_ciphertext.len, record_codec.max_ciphertext_record_len)) return self.rejectHardLimit(.outbound_ciphertext, error.WouldBlock);
-            if (self.outbound_ciphertext.available() < record_codec.max_ciphertext_record_len) return error.WouldBlock;
+            const count = handshakeRecordCount(event.handshake_bytes.data.len);
+            const needed = count * record_codec.max_ciphertext_record_len;
+            if (!self.hasHardRoom(.outbound_ciphertext, self.outbound_ciphertext.len, needed)) return self.rejectHardLimit(.outbound_ciphertext, error.WouldBlock);
+            if (self.outbound_ciphertext.available() < needed) return error.WouldBlock;
         }
-        var record_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
-        if (self.bridge.applyEvent(event, &record_buf) catch |err| return self.fail(err)) |record| {
-            self.appendOutboundCiphertext(record) catch |err| return self.fail(err);
+        if (event == .handshake_bytes) {
+            self.emitHandshakeRecords(event.handshake_bytes.epoch, event.handshake_bytes.data) catch |err| return self.fail(err);
+        } else {
+            var record_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+            if (self.bridge.applyEvent(event, &record_buf) catch |err| return self.fail(err)) |record| {
+                self.appendOutboundCiphertext(record) catch |err| return self.fail(err);
+            }
         }
         // The initial epoch's plaintext parser is only safe to keep once
         // its keys are gone: nothing should ever arrive at that epoch
@@ -891,9 +921,7 @@ pub const PureZigRecordStream = struct {
         for (sink.items[0..sink.len]) |event| {
             switch (event) {
                 .handshake_bytes => |hb| {
-                    var record_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
-                    const record = self.bridge.sealHandshake(hb.epoch, hb.data, &record_buf) catch |err| return self.fail(err);
-                    self.appendOutboundCiphertext(record) catch |err| return self.fail(err);
+                    self.emitHandshakeRecords(hb.epoch, hb.data) catch |err| return self.fail(err);
                 },
                 .traffic_secret => |ts| {
                     self.bridge.installTrafficSecret(ts.epoch, ts.direction, ts.data) catch |err| return self.fail(err);
@@ -1144,7 +1172,13 @@ pub const PureZigRecordStream = struct {
             const opened = self.bridge.openProtected(.application, record, &plaintext_buf) catch |err| return self.fail(err);
             switch (opened.inner.content_type) {
                 .application_data => self.appendInboundPlaintext(opened.inner.content) catch |err| return self.fail(err),
-                .handshake => self.appendInboundHandshake(opened.inner.content) catch |err| return self.fail(err),
+                .handshake => {
+                    if (self.driverPresent()) {
+                        try self.driveReceive(.application, opened.inner.content);
+                    } else {
+                        self.appendInboundHandshake(opened.inner.content) catch |err| return self.fail(err);
+                    }
+                },
                 .alert => self.handleAlert(opened.inner.content) catch |err| return self.fail(err),
                 .change_cipher_spec => return self.fail(error.UnsupportedRecordContent),
             }

@@ -314,7 +314,7 @@ pub const Tls13Backend = struct {
 fn translate(source: *const RecordSink, destination: *EventSink) HandshakeError!void {
     for (source.items[0..source.len]) |event| {
         switch (event) {
-            .handshake_bytes => |item| try destination.emitHandshakeBytes(toLevel(item.epoch), item.data),
+            .handshake_bytes => |item| try destination.emitOwnedHandshakeBytesCopy(toLevel(item.epoch), item.data),
             .traffic_secret => |item| try destination.emitSecret(toLevel(item.epoch), item.direction, item.data),
             .peer_transport_parameters => {},
             .alpn => |protocol| try destination.emitAlpn(protocol),
@@ -555,7 +555,7 @@ test "QUIC TLS backend delivers large post-handshake tickets through application
     var harness = try RealHandshakeHarness.init();
     defer harness.deinit();
     var capture = Capture{};
-    const limits = tls_core.session.Limits{ .max_ticket_len = 20 * 1024, .max_serialized_len = 32 * 1024 };
+    const limits = tls_core.session.Limits{ .max_ticket_len = tls_core.session.absolute_ticket_wire_max, .max_serialized_len = 128 * 1024 };
     try harness.client_backend.engine.setSessionTicketConsumer(std.testing.allocator, limits, .{
         .ctx = &capture,
         .nowUnixMsFn = Capture.now,
@@ -564,7 +564,7 @@ test "QUIC TLS backend delivers large post-handshake tickets through application
     try harness.wire();
     try harness.run();
 
-    const opaque_ticket = try std.testing.allocator.alloc(u8, 20 * 1024);
+    const opaque_ticket = try std.testing.allocator.alloc(u8, tls_core.session.absolute_ticket_wire_max);
     defer std.testing.allocator.free(opaque_ticket);
     @memset(opaque_ticket, 0xa5);
 
@@ -599,6 +599,42 @@ test "QUIC TLS backend delivers large post-handshake tickets through application
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqual(opaque_ticket.len, capture.ticket_len);
     try std.testing.expectEqualSlices(u8, server_state.common.resumption_psk.slice(), &capture.psk);
+}
+
+test "QUIC TLS backend drops valid post-handshake ticket with no consumer" {
+    var harness = try RealHandshakeHarness.init();
+    defer harness.deinit();
+    try harness.wire();
+    try harness.run();
+
+    var shared_sink = RecordSink{};
+    defer shared_sink.deinit();
+    var server_state = try harness.server_backend.engine.emitNewSessionTicket(std.testing.allocator, &shared_sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "drop-ticket",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer server_state.deinit();
+
+    var quic_sink = EventSink{};
+    defer quic_sink.deinit();
+    try translate(&shared_sink, &quic_sink);
+    try harness.server_adapter.queueHandshakeOutput(
+        quic_sink.items[0].handshake_bytes.epoch,
+        quic_sink.items[0].handshake_bytes.data,
+    );
+
+    var chunks: usize = 0;
+    var buf: [4]u8 = undefined;
+    while (try harness.server.pollOutput(.application, &buf)) |out| {
+        chunks += 1;
+        try harness.client.onCrypto(.application, out.offset, out.bytes);
+    }
+    try std.testing.expect(chunks > 1);
+    try std.testing.expect(harness.client.isComplete());
+    try std.testing.expect(harness.server.isComplete());
 }
 
 fn quicSniConfig(patterns: []const []const u8, chain: []const []const u8) tls_core.sni_provider.CredentialBundleConfig {

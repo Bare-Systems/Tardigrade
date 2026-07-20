@@ -28,7 +28,7 @@ const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 const Aes128 = crypto.core.aes.Aes128;
 
-pub const max_crypto_buffer = 64 * 1024;
+pub const max_crypto_buffer = tls_core.tls13_transport.max_emitted_new_session_ticket_message_len;
 pub const max_crypto_ranges = 32;
 pub const max_handshake_record = 16 * 1024;
 pub const max_secret_len = 64;
@@ -340,14 +340,11 @@ pub const CryptoStream = struct {
     buffer: [max_crypto_buffer]u8 = undefined,
     ranges: [max_crypto_ranges]ByteRange = undefined,
     range_count: usize = 0,
+    base_offset: u64 = 0,
     consumed_offset: u64 = 0,
 
     pub fn insert(self: *CryptoStream, offset: u64, data: []const u8) error{ CryptoBufferTooLarge, TooManyCryptoRanges }!void {
         if (data.len == 0) return;
-        if (offset >= max_crypto_buffer) return error.CryptoBufferTooLarge;
-        const offset_usize: usize = @intCast(offset);
-        if (data.len > max_crypto_buffer - offset_usize) return error.CryptoBufferTooLarge;
-
         var start = offset;
         var bytes = data;
         if (start + bytes.len <= self.consumed_offset) return;
@@ -357,24 +354,50 @@ pub const CryptoStream = struct {
             bytes = bytes[skip..];
         }
         const end = start + bytes.len;
+        self.compactConsumed();
+        if (start < self.base_offset) return error.CryptoBufferTooLarge;
+        const relative_start = start - self.base_offset;
+        if (relative_start >= max_crypto_buffer) return error.CryptoBufferTooLarge;
+        const relative_end = end - self.base_offset;
+        if (relative_end > max_crypto_buffer) return error.CryptoBufferTooLarge;
 
         try self.addRangeMerged(.{ .start = start, .end = end });
-        @memcpy(self.buffer[@intCast(start)..@intCast(end)], bytes);
+        @memcpy(self.buffer[@intCast(relative_start)..@intCast(relative_end)], bytes);
     }
 
     pub fn contiguous(self: *const CryptoStream) []const u8 {
         const end = self.contiguousEnd();
         if (end <= self.consumed_offset) return &.{};
-        return self.buffer[@intCast(self.consumed_offset)..@intCast(end)];
+        return self.buffer[@intCast(self.consumed_offset - self.base_offset)..@intCast(end - self.base_offset)];
     }
 
     pub fn consumeContiguous(self: *CryptoStream) []const u8 {
         const end = self.contiguousEnd();
         if (end <= self.consumed_offset) return &.{};
-        const bytes = self.buffer[@intCast(self.consumed_offset)..@intCast(end)];
+        const bytes = self.buffer[@intCast(self.consumed_offset - self.base_offset)..@intCast(end - self.base_offset)];
         self.consumed_offset = end;
         self.dropConsumedRanges();
         return bytes;
+    }
+
+    fn compactConsumed(self: *CryptoStream) void {
+        if (self.consumed_offset == self.base_offset) return;
+        const keep_start = self.consumed_offset;
+        const keep_end = self.bufferedEnd();
+        if (keep_end > keep_start) {
+            const old_start: usize = @intCast(keep_start - self.base_offset);
+            const keep_len: usize = @intCast(keep_end - keep_start);
+            std.mem.copyForwards(u8, self.buffer[0..keep_len], self.buffer[old_start..][0..keep_len]);
+        }
+        self.base_offset = self.consumed_offset;
+    }
+
+    fn bufferedEnd(self: *const CryptoStream) u64 {
+        var end = self.consumed_offset;
+        for (self.ranges[0..self.range_count]) |range| {
+            end = @max(end, range.end);
+        }
+        return end;
     }
 
     fn addRangeMerged(self: *CryptoStream, new_range: ByteRange) error{TooManyCryptoRanges}!void {
@@ -1329,6 +1352,18 @@ test "adapter queues outbound TLS handshake bytes as CRYPTO stream data" {
     try testing.expectEqual(EncryptionLevel.handshake, handshake.level);
     try testing.expectEqual(@as(u64, 0), handshake.offset);
     try testing.expectEqualStrings("server", handshake.bytes);
+}
+
+test "CRYPTO input storage is bounded by outstanding data, not lifetime offset" {
+    var stream = CryptoStream{};
+    const first = [_]u8{0x11} ** (40 * 1024);
+    const second = [_]u8{0x22} ** (40 * 1024);
+
+    try stream.insert(0, &first);
+    try testing.expectEqualSlices(u8, &first, stream.consumeContiguous());
+    try stream.insert(first.len, &second);
+    try testing.expectEqualSlices(u8, &second, stream.consumeContiguous());
+    try testing.expect(stream.consumed_offset > 64 * 1024);
 }
 
 test "0-RTT secrets are allowed but CRYPTO streams reject zero_rtt level" {

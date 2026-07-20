@@ -54,20 +54,22 @@ pub const max_new_session_ticket_message_len = tls13_transport.max_new_session_t
 const handshake_header_len = 4;
 
 const PostHandshakeInput = struct {
-    allocator: ?std.mem.Allocator = null,
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+    buf_allocator: ?std.mem.Allocator = null,
     header: [handshake_header_len]u8 = undefined,
     header_len: usize = 0,
     buf: []u8 = &.{},
     len: usize = 0,
 
-    fn setAllocator(self: *PostHandshakeInput, allocator: std.mem.Allocator) void {
+    fn setAllocator(self: *PostHandshakeInput, allocator: std.mem.Allocator) HandshakeError!void {
+        if (self.buf.len > 0 and !sameAllocator(self.buf_allocator.?, allocator)) return error.InvalidHandshakeState;
         self.allocator = allocator;
     }
 
     fn deinit(self: *PostHandshakeInput) void {
         if (self.buf.len > 0) {
             crypto.secureZero(u8, self.buf);
-            self.allocator.?.free(self.buf);
+            self.buf_allocator.?.free(self.buf);
         }
         if (self.header_len > 0) crypto.secureZero(u8, self.header[0..self.header_len]);
         self.* = .{};
@@ -89,8 +91,9 @@ const PostHandshakeInput = struct {
                 const body_len: usize = @intCast(std.mem.readInt(u24, self.header[1..4], .big));
                 const frame_len = handshake_header_len + body_len;
                 if (frame_len > max_new_session_ticket_message_len) return error.HandshakeBufferOverflow;
-                const allocator = self.allocator orelse return error.InvalidHandshakeState;
+                const allocator = self.allocator;
                 self.buf = allocator.alloc(u8, frame_len) catch return error.CredentialProviderFailed;
+                self.buf_allocator = allocator;
                 @memcpy(self.buf[0..handshake_header_len], &self.header);
                 self.len = handshake_header_len;
                 crypto.secureZero(u8, &self.header);
@@ -113,11 +116,16 @@ const PostHandshakeInput = struct {
     fn discard(self: *PostHandshakeInput, len: usize) tls_handshake_codec.Error!void {
         if (self.buf.len == 0 or len != self.buf.len) return error.MalformedHandshake;
         crypto.secureZero(u8, self.buf);
-        self.allocator.?.free(self.buf);
+        self.buf_allocator.?.free(self.buf);
+        self.buf_allocator = null;
         self.buf = &.{};
         self.len = 0;
     }
 };
+
+fn sameAllocator(a: std.mem.Allocator, b: std.mem.Allocator) bool {
+    return a.ptr == b.ptr and a.vtable == b.vtable;
+}
 pub const max_certificate_len = 2048;
 /// The Certificate handshake message's fixed framing overhead, counted in the
 /// flight-size preflight so a chain cannot pass validation and then overflow the
@@ -671,8 +679,9 @@ pub const Tls13Backend = struct {
         consumer: SessionTicketConsumer,
     ) HandshakeError!void {
         if (self.role != .client) return error.InvalidHandshakeState;
+        if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
         limits.validate() catch return error.InvalidTransportProfile;
-        self.application_input.setAllocator(allocator);
+        try self.application_input.setAllocator(allocator);
         self.session_ticket_consumer = .{
             .allocator = allocator,
             .limits = limits,
@@ -682,7 +691,8 @@ pub const Tls13Backend = struct {
 
     pub fn setPostHandshakeAllocator(self: *Tls13Backend, allocator: std.mem.Allocator) HandshakeError!void {
         if (self.role != .client) return error.InvalidHandshakeState;
-        self.application_input.setAllocator(allocator);
+        if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        try self.application_input.setAllocator(allocator);
     }
 
     pub fn backend(self: *Tls13Backend) TlsBackend {
@@ -2446,7 +2456,6 @@ pub const Tls13Backend = struct {
         const body_len = new_session_ticket.encodedLen(emit_params) catch |err| return mapTicketEncodeError(err);
         if (body_len > max_new_session_ticket_message_len - 4) return error.TransportBufferOverflow;
         const message_len = handshake_header_len + body_len;
-        if (message_len > EventSink.max_bytes) return error.TransportBufferOverflow;
 
         var state = new_session_ticket.buildServerRecoverableState(
             allocator,
@@ -2459,7 +2468,7 @@ pub const Tls13Backend = struct {
         errdefer state.deinit();
 
         const buf = allocator.alloc(u8, message_len) catch return error.CredentialProviderFailed;
-        defer {
+        errdefer {
             crypto.secureZero(u8, buf);
             allocator.free(buf);
         }
@@ -2470,7 +2479,7 @@ pub const Tls13Backend = struct {
         w.len += body.len;
         w.patch(3, body_len_index);
         const message = buf[0..w.len];
-        try sink.emitCrypto(.application, message);
+        try sink.emitOwnedCrypto(allocator, .application, message);
         self.core.transcript.update(message);
         return state;
     }
@@ -2797,13 +2806,13 @@ test "client NewSessionTicket callback receives owned state and lifetime zero is
         .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
     );
     defer backend.deinit();
-    backend.core.handshake_lifecycle = .complete;
-    try backend.resumption_master_secret.replace(&([_]u8{0x42} ** hash_len));
     try backend.setSessionTicketConsumer(std.testing.allocator, session.Limits.default, .{
         .ctx = &capture,
         .nowUnixMsFn = TicketCapture.now,
         .onTicketFn = TicketCapture.onTicket,
     });
+    backend.core.handshake_lifecycle = .complete;
+    try backend.resumption_master_secret.replace(&([_]u8{0x42} ** hash_len));
 
     var body_buf: [128]u8 = undefined;
     const body = try new_session_ticket.encode(.{
@@ -2837,7 +2846,6 @@ test "client parses and drops NewSessionTicket when no consumer is configured" {
     );
     defer backend.deinit();
     backend.core.handshake_lifecycle = .complete;
-    try backend.setPostHandshakeAllocator(std.testing.allocator);
 
     var body_buf: [128]u8 = undefined;
     const body = try new_session_ticket.encode(.{
@@ -2859,6 +2867,29 @@ test "client parses and drops NewSessionTicket when no consumer is configured" {
     try backend.backend().receive(.application, message[5..], &sink);
     try std.testing.expectEqual(@as(usize, 0), backend.application_input.len);
     try std.testing.expectEqual(@as(usize, 0), backend.application_input.buf.len);
+}
+
+test "post-handshake input rejects allocator replacement while a frame is active" {
+    var backing_a: [64]u8 = undefined;
+    var backing_b: [64]u8 = undefined;
+    var fba_a = std.heap.FixedBufferAllocator.init(&backing_a);
+    var fba_b = std.heap.FixedBufferAllocator.init(&backing_b);
+    var input = PostHandshakeInput{};
+    defer input.deinit();
+    try input.setAllocator(fba_a.allocator());
+
+    const prefix = [_]u8{
+        @intFromEnum(MessageType.new_session_ticket),
+        0,
+        0,
+        4,
+        1,
+    };
+    try std.testing.expectEqual(prefix.len, try input.append(&prefix));
+    try std.testing.expect(input.buf.len > 0);
+    try std.testing.expectError(error.InvalidHandshakeState, input.setAllocator(fba_b.allocator()));
+    try std.testing.expectEqual(@as(usize, 3), try input.append(&.{ 2, 3, 4 }));
+    try input.discard(input.buf.len);
 }
 
 test "server explicitly emits NewSessionTicket and returns recoverable state" {
@@ -2957,8 +2988,8 @@ test "large emitted ticket is delivered once after fragmented application receiv
         }
     };
 
-    const limits = session.Limits{ .max_ticket_len = 20 * 1024, .max_serialized_len = 32 * 1024 };
-    const opaque_ticket = try std.testing.allocator.alloc(u8, 20 * 1024);
+    const limits = session.Limits{ .max_ticket_len = session.absolute_ticket_wire_max, .max_serialized_len = 128 * 1024 };
+    const opaque_ticket = try std.testing.allocator.alloc(u8, session.absolute_ticket_wire_max);
     defer std.testing.allocator.free(opaque_ticket);
     @memset(opaque_ticket, 0xa5);
 
@@ -2977,14 +3008,14 @@ test "large emitted ticket is delivered once after fragmented application receiv
         .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
     );
     defer client.deinit();
-    client.core.handshake_lifecycle = .complete;
-    try client.resumption_master_secret.replace(&([_]u8{0x44} ** hash_len));
     var capture = Capture{};
     try client.setSessionTicketConsumer(std.testing.allocator, limits, .{
         .ctx = &capture,
         .nowUnixMsFn = Capture.now,
         .onTicketFn = Capture.onTicket,
     });
+    client.core.handshake_lifecycle = .complete;
+    try client.resumption_master_secret.replace(&([_]u8{0x44} ** hash_len));
 
     var sink = EventSink{};
     defer sink.deinit();
@@ -3017,7 +3048,6 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
     );
     defer client.deinit();
     client.core.handshake_lifecycle = .complete;
-    try client.setPostHandshakeAllocator(std.testing.allocator);
 
     const max_message = try buildMaxNewSessionTicketMessage(std.testing.allocator);
     defer std.testing.allocator.free(max_message);
@@ -3035,7 +3065,6 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
     );
     defer over_client.deinit();
     over_client.core.handshake_lifecycle = .complete;
-    try over_client.setPostHandshakeAllocator(std.testing.allocator);
     const over = try std.testing.allocator.alloc(u8, max_new_session_ticket_message_len + 1);
     defer std.testing.allocator.free(over);
     @memset(over, 0);

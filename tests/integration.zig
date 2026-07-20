@@ -7686,3 +7686,79 @@ test "an independent client trusting only the root validates the transmitted lea
     try assertContains(run_res.stderr, "Verification: OK");
     try assertContains(run_res.stderr, "Verified peername: tardigrade.test");
 }
+
+test "a post-validation runtime failure is not misreported as a configuration error" {
+    // `AccessDenied`/`FileNotFound` are both legitimate configuration-error
+    // classes (a config-referenced path that doesn't exist or isn't
+    // readable) *and* plausible runtime failures unrelated to config at all
+    // (here: the PID file's directory not being writable). `run`'s error
+    // classification is phase-based, not name-based: once
+    // `edge_config.validate` and the appliance credential preflight have
+    // already succeeded, a later failure of the same error name must report
+    // as a runtime failure (exit 1), never "configuration validation
+    // failed" (exit 2). This is independent of the appliance profile, so it
+    // is not gated by requireNativeTlsProfile.
+    const allocator = std.testing.allocator;
+
+    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const readonly_dir = try std.fmt.allocPrintSentinel(allocator, "{s}/.zig-cache/tardigrade-readonly-pid-{d}", .{ cwd, compat.nanoTimestamp() }, 0);
+    defer allocator.free(readonly_dir);
+    try compat.cwd().makePath(readonly_dir);
+    // The directory must exist (so PID-file creation gets past
+    // ensureParentPath's auto-create step) but not be writable.
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(readonly_dir.ptr, 0o555));
+    defer {
+        _ = std.c.chmod(readonly_dir.ptr, 0o755);
+        compat.cwd().deleteTree(readonly_dir) catch {};
+    }
+    const pid_path = try std.fmt.allocPrint(allocator, "{s}/tardi.pid", .{readonly_dir});
+    defer allocator.free(pid_path);
+
+    // Skip rather than false-fail when the filesystem/user doesn't actually
+    // enforce the permission bit (e.g. tests running as root).
+    const probe_path = try std.fmt.allocPrint(allocator, "{s}/probe", .{readonly_dir});
+    defer allocator.free(probe_path);
+    if (compat.createFileAbsolute(probe_path, .{})) |probe_file| {
+        var f = probe_file;
+        f.close();
+        compat.cwd().deleteFile(probe_path) catch {};
+        return error.SkipZigTest;
+    } else |_| {}
+
+    const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-runtime-fail-{d}.conf", .{compat.nanoTimestamp()});
+    defer {
+        compat.cwd().deleteFile(config_rel) catch {};
+        allocator.free(config_rel);
+    }
+    try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = "" });
+
+    const port = try findFreePort();
+    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
+    defer allocator.free(port_str);
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("TARDIGRADE_CONFIG_PATH", config_rel);
+    try env_map.put("TARDIGRADE_LISTEN_HOST", test_host);
+    try env_map.put("TARDIGRADE_LISTEN_PORT", port_str);
+    try env_map.put("TARDIGRADE_PID_FILE", pid_path);
+    // No TLS configured: this property holds for the general run path, not
+    // only the appliance credential preflight.
+    _ = env_map.swapRemove("TARDIGRADE_TLS_CERT_PATH");
+    _ = env_map.swapRemove("TARDIGRADE_TLS_KEY_PATH");
+
+    const run_res = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "run", "-c", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(run_res.stdout);
+    defer allocator.free(run_res.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, run_res.term);
+    try assertContains(run_res.stderr, "tardigrade exited");
+    try assertContains(run_res.stderr, "AccessDenied");
+    try std.testing.expect(std.mem.indexOf(u8, run_res.stderr, "configuration validation failed") == null);
+}

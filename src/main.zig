@@ -534,9 +534,19 @@ fn isConfigValidationError(err: anyerror) bool {
         error.InvalidPrivateKeySize,
         error.InvalidPrivateKey,
         error.UnsupportedLeafKeyAlgorithm,
+        error.UnsupportedLeafKeyParameters,
         error.KeyCertificateMismatch,
         error.CertificateFlightTooLarge,
         error.InvalidServerName,
+        error.CertificateNameMismatch,
+        error.IntermediateNotCa,
+        error.InvalidLeafCertificate,
+        error.CertificateKeyUsageViolation,
+        error.CertificateExtendedKeyUsageViolation,
+        error.UnhandledCriticalCertificateExtension,
+        error.DuplicateCertificateEntry,
+        error.InvalidCertificateChainOrder,
+        error.CertificateSignatureInvalid,
         error.UnsupportedApplianceConfiguration,
         => true,
         else => false,
@@ -804,56 +814,99 @@ fn executeStatusCommand(allocator: std.mem.Allocator, options: SignalOptions) !v
 /// Post-startup errors (the server crashing after already accepting
 /// connections) are comparatively rare in practice and still fall through to
 /// the internal-error exit code with `@errorName`.
+/// Config discovery, validation, and the appliance credential preflight are
+/// one config-error-classified stage; everything after — daemon fork, PID
+/// file, master/worker startup, the long-running gateway itself — is a
+/// separate runtime stage whose failures must never be relabeled as
+/// "configuration validation failed" merely because a runtime error (e.g.
+/// `FileNotFound`/`AccessDenied` from unrelated post-start filesystem work)
+/// happens to share a name with one of the config error classes.
+const RunPlan = struct {
+    cfg: edge_config.EdgeConfig,
+    resolved_config_path: ?[]u8,
+    worker_mode: bool,
+    worker_id: usize,
+
+    fn deinit(self: *RunPlan, allocator: std.mem.Allocator) void {
+        self.cfg.deinit(allocator);
+        if (self.resolved_config_path) |path| allocator.free(path);
+        self.* = undefined;
+    }
+};
+
+/// Resolve, load, and fully validate configuration — including the
+/// appliance credential preflight — before any daemon fork, PID file, or
+/// master/worker startup. `spawnDaemonizedProcess` backgrounds a child and
+/// cannot itself report the child's later failure to the invoking shell,
+/// and `runMaster` respawns every worker that exits, so invalid credentials
+/// discovered only after this point would either print a false "started"
+/// message or loop respawning a worker that can never start. The long-lived
+/// credential owner that actually serves connections is still constructed
+/// separately in `edge_gateway.run`. Every error this returns is a
+/// configuration error by construction.
+fn prepareRunPlan(allocator: std.mem.Allocator, args: []const []const u8, options: RunOptions) !RunPlan {
+    const resolved_config_path = try resolveRuntimeConfigPath(allocator, options.common.config_path);
+    errdefer if (resolved_config_path) |path| allocator.free(path);
+    if (resolved_config_path) |path| try setProcessEnv(allocator, ENV_CONFIG_PATH, path);
+
+    const worker_mode = hasArg(args, "--worker");
+    const worker_id = parseWorkerIdArg(args) orelse 0;
+
+    var cfg = try edge_config.loadFromEnv(allocator);
+    errdefer cfg.deinit(allocator);
+    try edge_config.validate(&cfg);
+    try preflightApplianceCredentials(allocator, &cfg);
+    edge_config.warnRiskyConfig(&cfg);
+
+    return .{
+        .cfg = cfg,
+        .resolved_config_path = resolved_config_path,
+        .worker_mode = worker_mode,
+        .worker_id = worker_id,
+    };
+}
+
+/// Execute the validated plan: daemon fork, PID file, master/worker
+/// startup, and the long-running gateway. Every error here is a runtime
+/// failure, not a configuration failure — config was already proven valid
+/// by `prepareRunPlan`.
+fn runPlan(allocator: std.mem.Allocator, plan: *RunPlan, options: RunOptions) !void {
+    if (options.daemon and !options.daemonized and !plan.worker_mode) {
+        try spawnDaemonizedProcess(allocator, plan.resolved_config_path);
+        return;
+    }
+
+    try configureErrorLog(&plan.cfg);
+    try writePidFile(&plan.cfg);
+    defer removePidFile(&plan.cfg);
+
+    if (plan.cfg.master_process_enabled and !plan.worker_mode) {
+        try runMaster(allocator, &plan.cfg);
+        return;
+    }
+
+    applyWorkerCpuAffinity(&plan.cfg, plan.worker_id) catch {}; // CPU affinity is optional; worker runs on any core if unavailable
+    startWorkerRecycleTimer(&plan.cfg);
+    try edge_gateway.run(&plan.cfg);
+}
+
 fn executeRunCommandOrExit(allocator: std.mem.Allocator, args: []const []const u8, options: RunOptions) !void {
-    executeRunCommand(allocator, args, options) catch |err| {
+    var plan = prepareRunPlan(allocator, args, options) catch |err| {
         var stderr_buf: [2048]u8 = undefined;
         var stderr = compat.stderrWriter(&stderr_buf);
         try printConfigCommandError(&stderr, err, options.common, .legacy);
         try stderr.flush();
         std.process.exit(configCommandExitCode(err));
     };
-}
+    defer plan.deinit(allocator);
 
-fn executeRunCommand(allocator: std.mem.Allocator, args: []const []const u8, options: RunOptions) !void {
-    const resolved_config_path = try resolveRuntimeConfigPath(allocator, options.common.config_path);
-    defer if (resolved_config_path) |path| allocator.free(path);
-    if (resolved_config_path) |path| try setProcessEnv(allocator, ENV_CONFIG_PATH, path);
-
-    const worker_mode = hasArg(args, "--worker");
-    const worker_id = parseWorkerIdArg(args) orelse 0;
-
-    // Load and fully validate configuration — including the appliance
-    // credential preflight — before any daemon fork, PID file, or
-    // master/worker startup. `spawnDaemonizedProcess` backgrounds a child
-    // and cannot itself report the child's later failure to the invoking
-    // shell, and `runMaster` respawns every worker that exits, so invalid
-    // credentials discovered only after that point would either print a
-    // false "started" message or loop respawning a worker that can never
-    // start. The long-lived credential owner that actually serves
-    // connections is still constructed separately in `edge_gateway.run`.
-    var cfg = try edge_config.loadFromEnv(allocator);
-    defer cfg.deinit(allocator);
-    try edge_config.validate(&cfg);
-    try preflightApplianceCredentials(allocator, &cfg);
-    edge_config.warnRiskyConfig(&cfg);
-
-    if (options.daemon and !options.daemonized and !worker_mode) {
-        try spawnDaemonizedProcess(allocator, resolved_config_path);
-        return;
-    }
-
-    try configureErrorLog(&cfg);
-    try writePidFile(&cfg);
-    defer removePidFile(&cfg);
-
-    if (cfg.master_process_enabled and !worker_mode) {
-        try runMaster(allocator, &cfg);
-        return;
-    }
-
-    applyWorkerCpuAffinity(&cfg, worker_id) catch {}; // CPU affinity is optional; worker runs on any core if unavailable
-    startWorkerRecycleTimer(&cfg);
-    try edge_gateway.run(&cfg);
+    runPlan(allocator, &plan, options) catch |err| {
+        var stderr_buf: [2048]u8 = undefined;
+        var stderr = compat.stderrWriter(&stderr_buf);
+        try stderr.print("error: tardigrade exited: {}\n", .{err});
+        try stderr.flush();
+        std.process.exit(EXIT_INTERNAL_ERROR);
+    };
 }
 
 fn executeSignalCommand(

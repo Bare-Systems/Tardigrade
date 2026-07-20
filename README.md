@@ -84,7 +84,10 @@ Published release binaries use the default "general" TLS profile, which
 links OpenSSL at runtime — installing via this script or the raw archive
 requires OpenSSL 1.1/3.x already present on the target host, the same
 runtime dependency the DEB/RPM packages declare explicitly. On macOS, install
-it with Homebrew first: `brew install openssl@3`.
+it with Homebrew first: `brew install openssl@3`. The macOS archives are
+unsigned and not notarized; see the Gatekeeper note in
+[packaging/README.md](packaging/README.md#macos-gatekeeper--unsigned-binary-note)
+if Gatekeeper blocks the extracted binary.
 
 Other install paths:
 

@@ -15,7 +15,7 @@ versus what is a local-build-only tool.
 | RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Smoke-tested via `scripts/test-rpm-package.sh`. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and exercised end-to-end by both the DEB and RPM smoke tests. |
 | launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | Ships as a template for macOS host-native installs; the release workflow now publishes native Darwin archives, but nothing installs or smoke-tests this plist yet. |
-| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present, tap not published** | The Darwin archives referenced by the `on_macos` blocks now resolve to real release assets; the formula's checksum placeholders and tap publication/automation remain tracked separately (#466). No `Bare-Systems/homebrew-tap` repo exists yet. |
+| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present, not installable** | The Darwin archives referenced by the `on_macos` blocks now resolve to real release assets, but the checked-in formula is not yet usable as-is: `version "0.50"` constructs a `v0.50` release URL rather than `v0.5.0`, the `sha256` values are still `REPLACE_WITH_ACTUAL_SHA256_*` placeholders, and the formula does not declare a Homebrew `openssl@3` dependency (required at runtime by the `general`-profile binary). Fixing the version/checksums/dependency and publishing to a tap are tracked separately in #466. No `Bare-Systems/homebrew-tap` repo exists yet. |
 | Docker / OCI image | **Not implemented** | No `Dockerfile` or container-publishing workflow exists in this repository. |
 
 ## Quick install (recommended)
@@ -163,11 +163,23 @@ sudo systemctl reload tardigrade   # or: restart, if reload is insufficient
 
 The Darwin URLs referenced by the `on_macos` blocks now resolve, since the
 release workflow builds and publishes `tardigrade-darwin-x86_64.tar.gz` and
-`tardigrade-darwin-arm64.tar.gz` (see "Current status" above). The formula's
-`sha256` placeholders and publishing the formula to a Homebrew tap remain
-tracked separately in #466 and are out of scope here.
+`tardigrade-darwin-arm64.tar.gz` (see "Current status" above). The checked-in
+formula is **not installable yet**, though:
 
-The formula at `packaging/homebrew/tardigrade.rb` can be installed locally:
+- `version "0.50"` constructs the release URL `.../v0.50/...`, not
+  `.../v0.5.0/...` — it does not match this project's `vMAJOR.MINOR.PATCH`
+  tag format.
+- All four `sha256` values are still `REPLACE_WITH_ACTUAL_SHA256_*`
+  placeholders.
+- The formula does not declare a Homebrew `openssl@3` dependency, even
+  though the `general`-profile binary it installs links OpenSSL at runtime.
+
+Fixing the version string, filling in real checksums per release, declaring
+the `openssl@3` dependency, and publishing to a tap are all tracked
+separately in #466 and are out of scope for the archive pipeline itself.
+
+The formula at `packaging/homebrew/tardigrade.rb` can be installed locally
+once #466 lands:
 
 ```bash
 brew install --formula packaging/homebrew/tardigrade.rb
@@ -188,6 +200,26 @@ brew install tardigrade
 2. Update `version` in the formula.
 3. Replace the four `REPLACE_WITH_ACTUAL_SHA256_*` placeholders with the SHA-256 values from the checksums file.
 4. Commit and push the formula to the tap repo.
+
+## macOS Gatekeeper / unsigned binary note
+
+The Darwin archives are **not code-signed, hardened-runtime, or notarized**.
+`tardi`/`tardigrade` extracted from `tardigrade-darwin-x86_64.tar.gz` or
+`tardigrade-darwin-arm64.tar.gz` will carry a `com.apple.quarantine` extended
+attribute if downloaded through a browser (curl/`install.sh` downloads are
+not quarantined), and Gatekeeper will refuse to run a quarantined,
+unsigned binary by default. If you hit that, either download via
+`install.sh`/`curl` (recommended) or clear the attribute yourself after
+verifying the checksum:
+
+```bash
+xattr -d com.apple.quarantine ./tardi
+```
+
+This is a known, intentional distribution gap for the initial archives — see
+"Out of scope" in #463. Code signing, hardened runtime, and notarization are
+not yet implemented and would need a separate issue before Gatekeeper
+behavior can be part of the supported install contract.
 
 ## Service files
 

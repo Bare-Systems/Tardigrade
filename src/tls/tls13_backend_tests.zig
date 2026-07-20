@@ -656,6 +656,139 @@ test "PSK round trip falls back to a full handshake when the resolver has no mat
     try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
 }
 
+test "an ineligible offered ticket is filtered without desyncing the wire index of a later valid one" {
+    // Regression coverage: `sendClientHello` used to filter eligible
+    // tickets while writing the wire offer, but `onServerHello` indexed
+    // the *original*, unfiltered `client_psk_offers` array. With an
+    // expired ticket first and a valid one second, the wire would contain
+    // only the valid ticket at index 0, but the client would resolve
+    // `selected_identity = 0` back to the expired ticket's PSK — a silent
+    // secret mismatch. `client_psk_offers` is now compacted to exactly the
+    // wire-emitted, wire-ordered subset before `core.start()`, so this
+    // must complete cleanly with matching keys on both sides.
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+
+    const psk = [_]u8{0x77} ** tls_backend.hash_len;
+    var expired_common: session.ResumableSessionCommon = .{};
+    try expired_common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 1,
+    });
+    var expired_ticket: session.ClientTicketState = .{};
+    try expired_ticket.init(std.testing.allocator, session.Limits.default, &expired_common, .{
+        .ticket = "expired-ticket",
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+
+    var valid_common: session.ResumableSessionCommon = .{};
+    try valid_common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var valid_ticket: session.ClientTicketState = .{};
+    try valid_ticket.init(std.testing.allocator, session.Limits.default, &valid_common, .{
+        .ticket = "valid-ticket",
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&expired_ticket); // offer index 0: filtered out at plan time
+    try offers.push(&valid_ticket); // offer index 1: the only one actually sent, as wire index 0
+
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 10_000; // well past the expired ticket's 1-second lifetime
+        }
+    };
+    harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "valid-ticket" };
+    harness.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    // Exactly one identity was ever offered (or resolved): the expired one
+    // never reached the wire at all.
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(harness.client_backend.core.psk_authenticated);
+    try std.testing.expect(harness.server_backend.core.psk_authenticated);
+}
+
+test "handshake-time client authentication forces a full handshake even when a PSK is offered" {
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    harness.configureClientAuth(.required, true, .{ .pinned_certificate = tls_backend.testdata.certificate_der });
+
+    const psk = [_]u8{0x88} ** tls_backend.hash_len;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var ticket: session.ClientTicketState = .{};
+    try ticket.init(std.testing.allocator, session.Limits.default, &common, .{
+        .ticket = "client-auth-ticket",
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 0;
+        }
+    };
+    harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "client-auth-ticket" };
+    harness.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expect(!harness.client_backend.core.psk_authenticated);
+    try std.testing.expect(!harness.server_backend.core.psk_authenticated);
+    // The resolver is never even consulted: client_auth forces the full
+    // fallback before PSK selection begins.
+    try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+}
+
 test "direct shared driver cleanup wipes secrets after record authentication failure" {
     var harness = DirectHarness.init();
     defer harness.deinit();
@@ -1959,6 +2092,25 @@ const ClientHelloOptions = struct {
     /// offer, for driving an extension-profile (#392 HTTP/3) server through
     /// selection the same way a real QUIC client would.
     transport_extension: ?struct { extension_type: u16, payload: []const u8 } = null,
+    /// #362: offer one or more resumption PSKs, in order, as the
+    /// (necessarily last) ClientHello extension. Each binder is computed
+    /// over the exact bytes this function ends up producing, from the
+    /// per-entry `binder_psk` — pass a value other than the identity's real
+    /// PSK to model a wrong binder.
+    psk: ?PskOfferOptions = null,
+};
+
+const PskOfferOptions = struct {
+    items: []const PskOfferItemOptions,
+    /// Skip writing `psk_key_exchange_modes` — for the missing-extension
+    /// malformed-input test.
+    omit_modes: bool = false,
+};
+
+const PskOfferItemOptions = struct {
+    identity: []const u8,
+    binder_psk: []const u8,
+    obfuscated_ticket_age: u32 = 0,
 };
 
 /// Build a minimal, well-formed TLS 1.3 ClientHello the server engine accepts,
@@ -2037,8 +2189,38 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
         try w.u16_(@intCast(transport.payload.len));
         try w.bytes(transport.payload);
     }
+    // pre_shared_key (#362): must be the last extension.
+    var psk_offer: ?pre_shared_key.ClientOfferWrite = null;
+    var psk_items_buf: [pre_shared_key.max_offered_identities]pre_shared_key.OfferItem = undefined;
+    if (opts.psk) |psk_opt| {
+        if (!psk_opt.omit_modes) {
+            try w.u16_(pre_shared_key.ext_psk_key_exchange_modes);
+            const modes_ext_len = try w.reserve(2);
+            try pre_shared_key.writeModes(&w, &.{.psk_dhe_ke});
+            w.patch(2, modes_ext_len);
+        }
+        for (psk_opt.items, 0..) |item, i| {
+            psk_items_buf[i] = .{
+                .identity = item.identity,
+                .obfuscated_ticket_age = item.obfuscated_ticket_age,
+                .digest_len = tls_backend.hash_len,
+            };
+        }
+        psk_offer = try pre_shared_key.writeOffer(&w, psk_items_buf[0..psk_opt.items.len]);
+    }
+
     w.patch(2, extensions_len);
     w.patch(3, message_len);
+
+    if (psk_offer) |offer| {
+        const prefix = buf[0..offer.truncated_len];
+        for (opts.psk.?.items, 0..) |item, i| {
+            var binder: [tls_backend.hash_len]u8 = undefined;
+            try pre_shared_key.deriveBinder(.sha256, item.binder_psk, prefix, &binder);
+            const slot = offer.slots[i];
+            @memcpy(buf[slot.offset..][0..slot.len], &binder);
+        }
+    }
     return buf[0..w.len];
 }
 
@@ -2647,6 +2829,245 @@ test "an async credential selection suspends the handshake and resumes to comple
     try std.testing.expectEqual(@as(usize, 1), mock.op_release_count);
     try std.testing.expectEqual(@as(usize, 1), mock.sign_count);
     try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+    try std.testing.expect(server.credentialFailure() == null);
+}
+
+fn pskStoredState(psk: []const u8) session.ServerRecoverableState {
+    return pskStoredStateWithBinding(psk, session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der));
+}
+
+/// Like `pskStoredState`, but with an explicit `auth_binding` — for modelling
+/// a ticket issued under a *different* server certificate than the one
+/// currently selected (certificate-rotation fallback).
+fn pskStoredStateWithBinding(psk: []const u8, auth_binding: session.AuthBinding) session.ServerRecoverableState {
+    var common: session.ResumableSessionCommon = .{};
+    common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = psk,
+        // Matches `buildClientHello`'s default `alpn_protocols = &.{"h2"}`
+        // and `serverWithProvider`'s "h2" record policy, so the candidate
+        // compatibility check (negotiated ALPN vs. stored) is satisfied.
+        .application_protocol = "h2",
+        .auth_binding = auth_binding,
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    }) catch unreachable;
+    var state: session.ServerRecoverableState = .{};
+    state.init(&common, 0);
+    return state;
+}
+
+const CountingResolver = struct {
+    state: *session.ServerRecoverableState,
+    identity: []const u8,
+    calls: usize = 0,
+
+    fn now(_: *anyopaque) i64 {
+        return 0;
+    }
+    fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (!std.mem.eql(u8, identity, self.identity)) return false;
+        self.state.cloneInto(std.testing.allocator, out) catch return error.ResolverFailed;
+        return true;
+    }
+};
+
+test "async credential selection resumes PSK selection identically to the synchronous path" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_select = true;
+    mock.pending_polls = 2;
+    var server = serverWithProvider(&mock);
+    defer server.deinit();
+
+    const psk = [_]u8{0x5a} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "async-ticket" };
+    server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .psk = .{ .items = &.{.{ .identity = "async-ticket", .binder_psk = &psk }} } });
+    try server.backend().receive(.initial, hello, &sink);
+
+    // Parked awaiting the async credential selection: no resolver or binder
+    // work has happened yet — PSK selection only runs once a credential is
+    // in hand, exactly as it does synchronously.
+    try std.testing.expect(server.authPending());
+    try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+
+    try server.resumeAuth(&sink); // poll #1: still pending
+    try server.resumeAuth(&sink); // poll #2: still pending
+    try server.resumeAuth(&sink); // poll #3: completes, runs PSK selection + the rest of the flight
+    try std.testing.expect(!server.authPending());
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(server.core.psk_authenticated);
+    try std.testing.expect(server.credentialFailure() == null);
+    try std.testing.expect(server.client_hello_psk == null);
+}
+
+test "async credential selection failure clears the captured PSK offer" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_select = true;
+    mock.pending_polls = 0;
+    mock.pending_fails = true;
+    var server = serverWithProvider(&mock);
+    defer server.deinit();
+
+    const psk = [_]u8{0x5a} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "async-ticket" };
+    server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .psk = .{ .items = &.{.{ .identity = "async-ticket", .binder_psk = &psk }} } });
+    try server.backend().receive(.initial, hello, &sink);
+    try std.testing.expect(server.authPending());
+
+    try std.testing.expectError(error.CredentialProviderFailed, server.resumeAuth(&sink));
+    try std.testing.expect(!server.authPending());
+    try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+    try std.testing.expect(server.client_hello_psk == null);
+}
+
+test "server selects the first compatible identity: unknown first, valid second" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    const psk = [_]u8{0x11} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "known-ticket" };
+    server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{
+        .{ .identity = "unknown-ticket", .binder_psk = &psk },
+        .{ .identity = "known-ticket", .binder_psk = &psk },
+    } } });
+
+    try std.testing.expectEqual(@as(usize, 2), resolver_state.calls);
+    try std.testing.expect(server.core.psk_authenticated);
+    try std.testing.expect(server.credentialFailure() == null);
+}
+
+test "a compatible candidate with a wrong binder is fatal and never probes a later identity" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    const psk = [_]u8{0x22} ** tls_backend.hash_len;
+    const wrong_psk = [_]u8{0x33} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "ticket-a" };
+    server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try std.testing.expectError(error.DecryptError, driveServerSelection(&server, .{
+        .psk = .{
+            .items = &.{
+                .{ .identity = "ticket-a", .binder_psk = &wrong_psk }, // resolvable and compatible, wrong binder
+                .{ .identity = "ticket-b", .binder_psk = &psk }, // would otherwise succeed; must never be tried
+            },
+        },
+    }));
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+}
+
+test "a ticket bound to a different server certificate falls back to a full handshake" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    const psk = [_]u8{0x44} ** tls_backend.hash_len;
+    var stored_state = pskStoredStateWithBinding(&psk, session.AuthBinding.fromLeafCertificateDer("a different certificate entirely"));
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "rotated-ticket" };
+    server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{
+        .{ .identity = "rotated-ticket", .binder_psk = &psk },
+    } } });
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!server.core.psk_authenticated);
+    // Falls back to the ordinary full-certificate flight rather than
+    // failing the connection outright.
+    try std.testing.expectEqual(.running, server.core.handshake_lifecycle);
+    try std.testing.expect(server.credentialFailure() == null);
+}
+
+test "PSK offered without psk_key_exchange_modes is a missing_extension failure" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+    const psk = [_]u8{0x55} ** tls_backend.hash_len;
+    try std.testing.expectError(error.MissingExtension, driveServerSelection(&server, .{ .psk = .{
+        .omit_modes = true,
+        .items = &.{.{ .identity = "ticket", .binder_psk = &psk }},
+    } }));
+}
+
+test "an SNI mismatch falls back to a full handshake instead of rejecting the connection" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    const psk = [_]u8{0x66} ** tls_backend.hash_len;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .application_protocol = "h2",
+        .server_name = "original.example",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var stored_state: session.ServerRecoverableState = .{};
+    stored_state.init(&common, 0);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "sni-ticket" };
+    server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    // The client now connects to a *different* host name than the ticket
+    // was issued for.
+    try driveServerSelection(&server, .{
+        .sni = "different.example",
+        .psk = .{ .items = &.{.{ .identity = "sni-ticket", .binder_psk = &psk }} },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!server.core.psk_authenticated);
     try std.testing.expect(server.credentialFailure() == null);
 }
 

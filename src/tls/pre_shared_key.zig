@@ -46,7 +46,15 @@ pub const PskKeyExchangeMode = enum(u8) {
     psk_dhe_ke = 1,
 };
 
-pub const WriteError = messages.WriteError || error{TooManyIdentities};
+pub const WriteError = messages.WriteError || error{
+    TooManyIdentities,
+    EmptyIdentity,
+    IdentityTooLarge,
+    IdentitiesVectorTooLarge,
+    InvalidBinderLength,
+    BindersVectorTooLarge,
+    ExtensionTooLarge,
+};
 
 pub const ReadError = error{
     MalformedHandshake,
@@ -62,8 +70,14 @@ pub const BinderError = error{InvalidSecretLength};
 // psk_key_exchange_modes (RFC 8446 §4.2.9)
 // -----------------------------------------------------------------------
 
-/// Writes `struct { PskKeyExchangeMode ke_modes<1..255>; }` into `w`.
-pub fn writeModes(w: *messages.Writer, modes: []const PskKeyExchangeMode) messages.WriteError!void {
+pub const ModeError = error{ EmptyModes, TooManyModes };
+
+/// Writes `struct { PskKeyExchangeMode ke_modes<1..255>; }` into `w`. Rejects
+/// an empty or over-255 list before touching `w` — the 1-byte vector length
+/// otherwise cannot represent the count, and patching it would trap.
+pub fn writeModes(w: *messages.Writer, modes: []const PskKeyExchangeMode) (messages.WriteError || ModeError)!void {
+    if (modes.len == 0) return error.EmptyModes;
+    if (modes.len > 255) return error.TooManyModes;
     const len_idx = try w.reserve(1);
     for (modes) |m| try w.u8_(@intFromEnum(m));
     w.patch(1, len_idx);
@@ -199,6 +213,8 @@ pub const ClientOfferWrite = struct {
     count: usize = 0,
 };
 
+pub const max_vector_len = std.math.maxInt(u16);
+
 /// Writes the `pre_shared_key` extension: identities followed by
 /// zero-valued binder placeholders sized to each item's digest length, with
 /// every length field patched. Per RFC 8446 §4.2.11, this must be the last
@@ -207,8 +223,37 @@ pub const ClientOfferWrite = struct {
 /// so *before* hashing `w.written()[0..result.truncated_len]` — see
 /// `deriveBinder`. Returns the binder slot positions so the caller can
 /// overwrite each placeholder with the real binder afterward.
+///
+/// The complete structure — entry count, every identity length, and both
+/// vector totals — is validated against the wire's u16 vector limits before
+/// `w` is touched at all, so a caller-input structure this function's own
+/// parser would reject can never be written, and an oversized field can
+/// never reach the writer's `@intCast` length patch.
 pub fn writeOffer(w: *messages.Writer, items: []const OfferItem) WriteError!ClientOfferWrite {
     if (items.len == 0 or items.len > max_offered_identities) return error.TooManyIdentities;
+
+    var identities_total: usize = 0;
+    var binders_total: usize = 0;
+    for (items) |item| {
+        if (item.identity.len == 0) return error.EmptyIdentity;
+        if (item.identity.len > max_vector_len) return error.IdentityTooLarge;
+        identities_total += 2 + item.identity.len + 4;
+        if (identities_total > max_vector_len) return error.IdentitiesVectorTooLarge;
+        // This writer only ever produces the digest lengths the module's own
+        // binder derivation supports (32 for SHA-256, 48 for SHA-384), a
+        // stricter bound than the wire's general 32..255 `PskBinderEntry`
+        // range — and exactly what fits the fixed zero-placeholder buffer
+        // below.
+        if (item.digest_len < min_binder_len or item.digest_len > provider.max_digest_len)
+            return error.InvalidBinderLength;
+        binders_total += 1 + item.digest_len;
+        if (binders_total > max_vector_len) return error.BindersVectorTooLarge;
+    }
+    // extension_data = 2-byte identities_len + identities + 2-byte
+    // binders_len + binders; not itself wire-length-limited beyond the
+    // enclosing 2-byte extension-data length field.
+    const ext_data_len = 2 + identities_total + 2 + binders_total;
+    if (ext_data_len > max_vector_len) return error.ExtensionTooLarge;
 
     try w.u16_(ext_pre_shared_key);
     const ext_len_idx = try w.reserve(2);
@@ -483,6 +528,70 @@ test "psk_key_exchange_modes round-trips and rejects malformed vectors" {
     try testing.expectError(error.MalformedHandshake, hasMode(&.{ 1, 1, 0xff }, .psk_dhe_ke));
 }
 
+test "writeModes rejects empty and over-255 mode lists before touching the writer" {
+    var buf: [16]u8 = undefined;
+    var w = messages.Writer{ .buf = &buf };
+    try testing.expectError(error.EmptyModes, writeModes(&w, &.{}));
+    try testing.expectEqual(@as(usize, 0), w.len);
+
+    const too_many = [_]PskKeyExchangeMode{.psk_ke} ** 256;
+    try testing.expectError(error.TooManyModes, writeModes(&w, &too_many));
+    try testing.expectEqual(@as(usize, 0), w.len);
+}
+
+test "writeOffer rejects illegal shapes without ever mutating the writer" {
+    var buf: [512]u8 = undefined;
+
+    // Zero items.
+    {
+        var w = messages.Writer{ .buf = &buf };
+        try testing.expectError(error.TooManyIdentities, writeOffer(&w, &.{}));
+        try testing.expectEqual(@as(usize, 0), w.len);
+    }
+    // More than the maximum offered identities.
+    {
+        var w = messages.Writer{ .buf = &buf };
+        const items = [_]OfferItem{.{ .identity = "x", .obfuscated_ticket_age = 0, .digest_len = 32 }} ** (max_offered_identities + 1);
+        try testing.expectError(error.TooManyIdentities, writeOffer(&w, &items));
+        try testing.expectEqual(@as(usize, 0), w.len);
+    }
+    // Empty identity.
+    {
+        var w = messages.Writer{ .buf = &buf };
+        const items = [_]OfferItem{.{ .identity = "", .obfuscated_ticket_age = 0, .digest_len = 32 }};
+        try testing.expectError(error.EmptyIdentity, writeOffer(&w, &items));
+        try testing.expectEqual(@as(usize, 0), w.len);
+    }
+    // Binder/digest length outside what this module can produce (32..48).
+    {
+        var w = messages.Writer{ .buf = &buf };
+        const too_short = [_]OfferItem{.{ .identity = "id", .obfuscated_ticket_age = 0, .digest_len = min_binder_len - 1 }};
+        try testing.expectError(error.InvalidBinderLength, writeOffer(&w, &too_short));
+        try testing.expectEqual(@as(usize, 0), w.len);
+
+        var w2 = messages.Writer{ .buf = &buf };
+        const too_long = [_]OfferItem{.{ .identity = "id", .obfuscated_ticket_age = 0, .digest_len = provider.max_digest_len + 1 }};
+        try testing.expectError(error.InvalidBinderLength, writeOffer(&w2, &too_long));
+        try testing.expectEqual(@as(usize, 0), w2.len);
+    }
+    // Exact boundary values succeed: min/max supported digest length, and a
+    // full eight-identity offer.
+    {
+        var w = messages.Writer{ .buf = &buf };
+        const items = [_]OfferItem{
+            .{ .identity = "a", .obfuscated_ticket_age = 0, .digest_len = min_binder_len },
+            .{ .identity = "b", .obfuscated_ticket_age = 0, .digest_len = provider.max_digest_len },
+        };
+        _ = try writeOffer(&w, &items);
+
+        var w3 = messages.Writer{ .buf = &buf };
+        var eight: [max_offered_identities]OfferItem = undefined;
+        for (&eight) |*item| item.* = .{ .identity = "id", .obfuscated_ticket_age = 0, .digest_len = 32 };
+        const offer = try writeOffer(&w3, &eight);
+        try testing.expectEqual(max_offered_identities, offer.count);
+    }
+}
+
 test "OfferedPsks encode/decode round-trip via writeOffer and parse" {
     var buf: [512]u8 = undefined;
     var w = messages.Writer{ .buf = &buf };
@@ -641,6 +750,42 @@ test "ClientPskOfferSet is bounded to eight, move-oriented, and fully wiped on d
     try testing.expectEqualStrings("opaque-ticket", dest.ticket.slice());
     try testing.expectEqual(@as(usize, 0), set.len);
     dest.deinit();
+}
+
+test "ClientPskOfferSet accepts exactly eight offers and rejects a ninth" {
+    var set: ClientPskOfferSet = .{};
+    defer set.deinit();
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(testing.allocator, .default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0x42} ** 32),
+        .auth_binding = .{ .bytes = [_]u8{0} ** session.auth_binding_len },
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 1000,
+    });
+    defer common.deinit();
+
+    var tickets: [max_offered_identities + 1]session.ClientTicketState = undefined;
+    for (&tickets, 0..) |*ticket, i| {
+        ticket.* = .{};
+        var clone: session.ResumableSessionCommon = .{};
+        try common.cloneInto(testing.allocator, &clone);
+        var id_buf: [1]u8 = .{@intCast(i)};
+        try ticket.init(testing.allocator, .default, &clone, .{
+            .ticket = &id_buf,
+            .ticket_age_add = 0,
+            .ticket_nonce = "n",
+            .received_at_unix_ms = 0,
+        });
+    }
+    defer for (&tickets) |*ticket| ticket.deinit();
+
+    for (tickets[0..max_offered_identities]) |*ticket| try set.push(ticket);
+    try testing.expectEqual(max_offered_identities, set.len);
+    try testing.expectError(error.TooManyOffers, set.push(&tickets[max_offered_identities]));
+    // A rejected push leaves both the set and the ticket untouched.
+    try testing.expectEqual(max_offered_identities, set.len);
+    try testing.expectEqualStrings(&[_]u8{max_offered_identities}, tickets[max_offered_identities].ticket.slice());
 }
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {

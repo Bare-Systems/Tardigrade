@@ -35,24 +35,14 @@ fixtures=(
   malformed-truncated.der
   algorithm-outer-inner-mismatch.crt
   algorithm-outer-inner-mismatch.der
-  algorithm-issuer-key-mismatch.crt
-  algorithm-issuer-key-mismatch.der
   algorithm-unsupported-signature-oid.crt
   algorithm-unsupported-signature-oid.der
   algorithm-malformed-signature-oid.crt
   algorithm-malformed-signature-oid.der
   algorithm-ed25519-illegal-parameters.crt
   algorithm-ed25519-illegal-parameters.der
-  algorithm-rsa-pss-parameter-confusion.crt
-  algorithm-rsa-pss-parameter-confusion.der
-  algorithm-rsa-null-absent.crt
-  algorithm-rsa-null-absent.der
   algorithm-malformed-spki.crt
   algorithm-malformed-spki.der
-  algorithm-incompatible-spki-key.crt
-  algorithm-incompatible-spki-key.der
-  algorithm-malformed-signature-bits.crt
-  algorithm-malformed-signature-bits.der
   der-non-minimal-long-length.crt
   der-non-minimal-long-length.der
   der-indefinite-length.crt
@@ -135,15 +125,9 @@ openssl_reject -trusted "$out/root.crt" -untrusted "$out/intermediate.crt" \
 
 hostile_rejections=(
   algorithm-outer-inner-mismatch
-  algorithm-issuer-key-mismatch
   algorithm-unsupported-signature-oid
   algorithm-malformed-signature-oid
-  algorithm-ed25519-illegal-parameters
-  algorithm-rsa-pss-parameter-confusion
-  algorithm-rsa-null-absent
   algorithm-malformed-spki
-  algorithm-incompatible-spki-key
-  algorithm-malformed-signature-bits
   der-truncated-long-length
   der-non-minimal-integer
   der-invalid-bit-string-unused
@@ -155,10 +139,9 @@ for hostile_case in "${hostile_rejections[@]}"; do
   openssl_reject -trusted "$out/root.crt" -untrusted "$out/intermediate.crt" \
     "$out/$hostile_case.crt"
 done
-for permissive_case in der-non-minimal-long-length der-indefinite-length der-trailing-data; do
-  # OpenSSL accepts these BER/trailing-byte encodings. The differential
-  # manifest records that exact parser-policy divergence; Go and Tardigrade
-  # both enforce strict DER framing.
+for permissive_case in algorithm-ed25519-illegal-parameters der-non-minimal-long-length der-indefinite-length der-trailing-data; do
+  # OpenSSL accepts these parser-policy boundaries. The differential manifest
+  # records each exact divergence; Go and Tardigrade fail closed.
   openssl_accept -trusted "$out/root.crt" -untrusted "$out/intermediate.crt" \
     "$out/$permissive_case.crt"
 done

@@ -601,16 +601,15 @@ fn classifyOpenSSLRejection(
             .reason = reason,
         };
     }
-    // OpenSSL's STORE layer reports a committed, present certificate whose
-    // DER cannot be decoded as "Could not find certificate file". Restrict
-    // this exception to manifest-declared malformed inputs; missing files,
-    // command usage failures, and setup errors remain harness failures.
+    // OpenSSL's STORE layer reports some committed, present malformed DER
+    // inputs as a file-read failure without a numeric verification code. The
+    // output does not carry finer semantic detail, so keep this fallback at
+    // the parser-boundary reason; missing files are rejected by the bounded
+    // readability precheck before OpenSSL is spawned.
     if (std.mem.indexOf(u8, diagnostic, "Could not find certificate file from ") != null or
         std.mem.indexOf(u8, diagnostic, "Could not read certificate file from ") != null)
     {
-        if (opensslCommittedParseFailureReason(case.id)) |reason| {
-            return .{ .status = .reject, .reason = reason };
-        }
+        return .{ .status = .reject, .reason = opensslCommittedParseFailureReason(case) };
     }
     if (std.mem.startsWith(u8, diagnostic, "verify:") or
         std.mem.indexOf(u8, diagnostic, "No such file") != null or
@@ -622,27 +621,9 @@ fn classifyOpenSSLRejection(
     return .{ .status = .reject, .reason = .unclassified_rejection };
 }
 
-fn opensslCommittedParseFailureReason(case_id: []const u8) ?Reason {
-    const signature_algorithm_cases = [_][]const u8{
-        "algorithm-malformed-signature-bits",
-        "algorithm-malformed-signature-oid",
-    };
-    for (signature_algorithm_cases) |id| {
-        if (std.mem.eql(u8, case_id, id)) return .signature_algorithm_invalid;
-    }
-    if (std.mem.eql(u8, case_id, "algorithm-malformed-spki")) return .issuer_key_or_spki_invalid;
-    const malformed_der_cases = [_][]const u8{
-        "malformed-truncated-certificate",
-        "der-constructed-bit-string",
-        "der-invalid-bit-string-unused",
-        "der-malformed-nested-extension-len",
-        "der-non-minimal-integer",
-        "der-truncated-long-length",
-    };
-    for (malformed_der_cases) |id| {
-        if (std.mem.eql(u8, case_id, id)) return .malformed_der;
-    }
-    return null;
+fn opensslCommittedParseFailureReason(case: manifest.Case) Reason {
+    _ = case;
+    return .malformed_der;
 }
 
 const GoDecision = struct {

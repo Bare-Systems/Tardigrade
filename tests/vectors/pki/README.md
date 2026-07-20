@@ -69,10 +69,11 @@ the case. The legacy directoryName fixtures remain in the extended corpus with
 an explicit normalization for Go's unsupported critical directoryName
 constraint.
 
-The `algorithm-*` family mutates Ed25519 certificate AlgorithmIdentifier,
-SubjectPublicKeyInfo, and signature BIT STRING encodings without adding
-production support for new algorithms. Unsupported or incompatible algorithms
-therefore exercise fail-closed parser/path behavior.
+The `algorithm-*` family mutates Ed25519 certificate AlgorithmIdentifier and
+SubjectPublicKeyInfo OID encodings without adding production support for new
+algorithms. The generated TBS bytes are re-signed whenever the mutation leaves
+a certificate-shaped object, so these cases do not depend on stale-signature
+rejection.
 
 The `der-*` family records strict DER policy boundaries such as non-minimal
 lengths, indefinite lengths, malformed INTEGER/BIT STRING encodings,

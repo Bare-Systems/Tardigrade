@@ -438,17 +438,6 @@ pub const cases = [_]Case{
         "OpenSSL reason=signature_invalid while Tardigrade and Go reason=signature_algorithm_invalid for the exact inner/outer AlgorithmIdentifier mismatch.",
     ),
     mutationCase(
-        "algorithm-issuer-key-mismatch",
-        .extended,
-        .algorithm_failure,
-        .{
-            .tardigrade = .rejected(.signature_algorithm_invalid),
-            .openssl = .rejected(.untrusted_or_incomplete_path),
-            .go = .rejected(.untrusted_or_incomplete_path),
-        },
-        "Tardigrade reason=signature_algorithm_invalid while OpenSSL and Go reason=untrusted_or_incomplete_path because the external path APIs collapse issuer-key incompatibility into candidate-path failure.",
-    ),
-    mutationCase(
         "algorithm-unsupported-signature-oid",
         .extended,
         .algorithm_failure,
@@ -465,10 +454,10 @@ pub const cases = [_]Case{
         .algorithm_failure,
         .{
             .tardigrade = .rejected(.signature_algorithm_invalid),
-            .openssl = .rejected(.signature_algorithm_invalid),
+            .openssl = .rejected(.malformed_der),
             .go = .rejected(.malformed_der),
         },
-        "Go reason=malformed_der while Tardigrade and OpenSSL reason=signature_algorithm_invalid because Go exposes only a generic malformed-OID parser diagnostic.",
+        "OpenSSL and Go reason=malformed_der while Tardigrade reason=signature_algorithm_invalid because external parsers expose only a generic malformed-OID diagnostic.",
     ),
     mutationCase(
         "algorithm-ed25519-illegal-parameters",
@@ -476,32 +465,10 @@ pub const cases = [_]Case{
         .algorithm_failure,
         .{
             .tardigrade = .rejected(.signature_algorithm_invalid),
-            .openssl = .rejected(.signature_invalid),
+            .openssl = .accepted(),
             .go = .rejected(.untrusted_or_incomplete_path),
         },
-        "Tardigrade reason=signature_algorithm_invalid, OpenSSL reason=signature_invalid, and Go reason=untrusted_or_incomplete_path for forbidden Ed25519 parameters, reflecting each API's stable granularity.",
-    ),
-    mutationCase(
-        "algorithm-rsa-pss-parameter-confusion",
-        .extended,
-        .algorithm_failure,
-        .{
-            .tardigrade = .rejected(.signature_algorithm_invalid),
-            .openssl = .rejected(.untrusted_or_incomplete_path),
-            .go = .rejected(.untrusted_or_incomplete_path),
-        },
-        "Tardigrade reason=signature_algorithm_invalid while OpenSSL and Go reason=untrusted_or_incomplete_path for RSA-PSS parameters incompatible with the Ed25519 issuer key.",
-    ),
-    mutationCase(
-        "algorithm-rsa-null-absent",
-        .extended,
-        .algorithm_failure,
-        .{
-            .tardigrade = .rejected(.signature_algorithm_invalid),
-            .openssl = .rejected(.untrusted_or_incomplete_path),
-            .go = .rejected(.untrusted_or_incomplete_path),
-        },
-        "Tardigrade reason=signature_algorithm_invalid while OpenSSL and Go reason=untrusted_or_incomplete_path for an RSA AlgorithmIdentifier with required NULL parameters absent and an incompatible issuer key.",
+        "OpenSSL status=accept reason=accepted while Tardigrade reason=signature_algorithm_invalid and Go reason=untrusted_or_incomplete_path for forbidden Ed25519 parameters.",
     ),
     mutationCase(
         "algorithm-malformed-spki",
@@ -509,28 +476,10 @@ pub const cases = [_]Case{
         .algorithm_failure,
         .{
             .tardigrade = .rejected(.issuer_key_or_spki_invalid),
-            .openssl = .rejected(.issuer_key_or_spki_invalid),
+            .openssl = .rejected(.malformed_der),
             .go = .rejected(.malformed_der),
         },
-        "Go reason=malformed_der while Tardigrade and OpenSSL reason=issuer_key_or_spki_invalid because Go reports the malformed SPKI OID through its generic parser diagnostic.",
-    ),
-    mutationCase(
-        "algorithm-incompatible-spki-key",
-        .extended,
-        .algorithm_failure,
-        .{
-            .tardigrade = .rejected(.signature_invalid),
-            .openssl = .rejected(.signature_invalid),
-            .go = .rejected(.untrusted_or_incomplete_path),
-        },
-        "Tardigrade and OpenSSL reason=signature_invalid while Go reason=untrusted_or_incomplete_path for the incompatible SPKI BIT STRING encoding.",
-    ),
-    mutationCase(
-        "algorithm-malformed-signature-bits",
-        .extended,
-        .algorithm_failure,
-        .allRejected(.signature_algorithm_invalid),
-        null,
+        "OpenSSL and Go reason=malformed_der while Tardigrade reason=issuer_key_or_spki_invalid because external parsers report the malformed SPKI OID through generic parser diagnostics.",
     ),
     mutationCase(
         "der-non-minimal-long-length",

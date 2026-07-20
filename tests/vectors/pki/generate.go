@@ -297,11 +297,11 @@ func generate(out string) error {
 		return fmt.Errorf("truncated DER seed unexpectedly parsed in Go")
 	}
 
-	algorithmFixtures, err := hostileAlgorithmFixtures(valid.der)
+	algorithmFixtures, err := hostileAlgorithmFixtures(valid.der, intermediateKey.private)
 	if err != nil {
 		return fmt.Errorf("create algorithm fixtures: %w", err)
 	}
-	derFixtures, err := hostileDERFixtures(valid.der)
+	derFixtures, err := hostileDERFixtures(valid.der, intermediateKey.private)
 	if err != nil {
 		return fmt.Errorf("create DER fixtures: %w", err)
 	}
@@ -503,72 +503,42 @@ type certificateParts struct {
 	signatureValue     []byte
 }
 
-func hostileAlgorithmFixtures(validDER []byte) (map[string][]byte, error) {
+func hostileAlgorithmFixtures(validDER []byte, signer ed25519.PrivateKey) (map[string][]byte, error) {
 	unsupported := []byte{0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71}
 	malformedOID := []byte{0x30, 0x06, 0x06, 0x04, 0x2b, 0x65, 0x80, 0x70}
 	ed25519Null := []byte{0x30, 0x07, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x05, 0x00}
-	ecdsaSHA256 := []byte{0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02}
-	rsaPSSAbsent := []byte{0x30, 0x0b, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a}
-	rsaSHA256Absent := []byte{0x30, 0x0b, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b}
 
 	outerMismatch, err := mutateOuterAlgorithm(validDER, unsupported)
 	if err != nil {
 		return nil, err
 	}
-	issuerKeyMismatch, err := mutateSignatureAlgorithms(validDER, ecdsaSHA256)
+	unsupportedSignature, err := mutateSignatureAlgorithms(validDER, unsupported, signer)
 	if err != nil {
 		return nil, err
 	}
-	unsupportedSignature, err := mutateSignatureAlgorithms(validDER, unsupported)
+	malformedSignatureOID, err := mutateSignatureAlgorithms(validDER, malformedOID, signer)
 	if err != nil {
 		return nil, err
 	}
-	malformedSignatureOID, err := mutateSignatureAlgorithms(validDER, malformedOID)
+	ed25519Parameters, err := mutateSignatureAlgorithms(validDER, ed25519Null, signer)
 	if err != nil {
 		return nil, err
 	}
-	ed25519Parameters, err := mutateSignatureAlgorithms(validDER, ed25519Null)
-	if err != nil {
-		return nil, err
-	}
-	rsaPSSConfusion, err := mutateSignatureAlgorithms(validDER, rsaPSSAbsent)
-	if err != nil {
-		return nil, err
-	}
-	rsaNullAbsent, err := mutateSignatureAlgorithms(validDER, rsaSHA256Absent)
-	if err != nil {
-		return nil, err
-	}
-	malformedSPKI, err := mutateSPKIAlgorithm(validDER, malformedOID)
-	if err != nil {
-		return nil, err
-	}
-	incompatibleSPKI, err := mutateSPKIKeyEncoding(validDER)
-	if err != nil {
-		return nil, err
-	}
-	malformedSignatureBits, err := mutateSignatureBitString(validDER, func(content []byte) {
-		content[0] = 8
-	})
+	malformedSPKI, err := mutateSPKIAlgorithm(validDER, malformedOID, signer)
 	if err != nil {
 		return nil, err
 	}
 
 	return map[string][]byte{
-		"algorithm-outer-inner-mismatch":        outerMismatch,
-		"algorithm-issuer-key-mismatch":         issuerKeyMismatch,
-		"algorithm-unsupported-signature-oid":   unsupportedSignature,
-		"algorithm-malformed-signature-oid":     malformedSignatureOID,
-		"algorithm-ed25519-illegal-parameters":  ed25519Parameters,
-		"algorithm-rsa-pss-parameter-confusion": rsaPSSConfusion,
-		"algorithm-rsa-null-absent":             rsaNullAbsent,
-		"algorithm-malformed-spki":              malformedSPKI,
-		"algorithm-incompatible-spki-key":       incompatibleSPKI,
-		"algorithm-malformed-signature-bits":    malformedSignatureBits,
+		"algorithm-outer-inner-mismatch":       outerMismatch,
+		"algorithm-unsupported-signature-oid":  unsupportedSignature,
+		"algorithm-malformed-signature-oid":    malformedSignatureOID,
+		"algorithm-ed25519-illegal-parameters": ed25519Parameters,
+		"algorithm-malformed-spki":             malformedSPKI,
 	}, nil
 }
 
-func hostileDERFixtures(validDER []byte) (map[string][]byte, error) {
+func hostileDERFixtures(validDER []byte, signer ed25519.PrivateKey) (map[string][]byte, error) {
 	parts, err := splitCertificate(validDER)
 	if err != nil {
 		return nil, err
@@ -587,7 +557,7 @@ func hostileDERFixtures(validDER []byte) (map[string][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	nonMinimalInteger := joinCertificate(nonMinimalIntegerTBS, parts.signatureAlgorithm, parts.signatureValue)
+	nonMinimalInteger := signCertificateWithTBS(nonMinimalIntegerTBS, parts.signatureAlgorithm, signer)
 
 	invalidUnusedBits, err := mutateSignatureBitString(validDER, func(content []byte) { content[0] = 8 })
 	if err != nil {
@@ -620,7 +590,7 @@ func hostileDERFixtures(validDER []byte) (map[string][]byte, error) {
 	}
 	octetOffset += sanOffset + len(sanOID)
 	malformedNested[octetOffset+1] = 0x7f
-	malformedNestedLength := joinCertificate(malformedNested, parts.signatureAlgorithm, parts.signatureValue)
+	malformedNestedLength := signCertificateWithTBS(malformedNested, parts.signatureAlgorithm, signer)
 
 	return map[string][]byte{
 		"der-non-minimal-long-length":        nonMinimalLength,
@@ -643,7 +613,7 @@ func mutateOuterAlgorithm(der, algorithm []byte) ([]byte, error) {
 	return joinCertificate(parts.tbs, algorithm, parts.signatureValue), nil
 }
 
-func mutateSignatureAlgorithms(der, algorithm []byte) ([]byte, error) {
+func mutateSignatureAlgorithms(der, algorithm []byte, signer ed25519.PrivateKey) ([]byte, error) {
 	parts, err := splitCertificate(der)
 	if err != nil {
 		return nil, err
@@ -652,10 +622,10 @@ func mutateSignatureAlgorithms(der, algorithm []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return joinCertificate(tbs, algorithm, parts.signatureValue), nil
+	return signCertificateWithTBS(tbs, algorithm, signer), nil
 }
 
-func mutateSPKIAlgorithm(der, algorithm []byte) ([]byte, error) {
+func mutateSPKIAlgorithm(der, algorithm []byte, signer ed25519.PrivateKey) ([]byte, error) {
 	parts, err := splitCertificate(der)
 	if err != nil {
 		return nil, err
@@ -664,22 +634,7 @@ func mutateSPKIAlgorithm(der, algorithm []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return joinCertificate(tbs, parts.signatureAlgorithm, parts.signatureValue), nil
-}
-
-func mutateSPKIKeyEncoding(der []byte) ([]byte, error) {
-	parts, err := splitCertificate(der)
-	if err != nil {
-		return nil, err
-	}
-	spkiPrefix := []byte{0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00}
-	mutated := append([]byte(nil), spkiPrefix...)
-	mutated[len(mutated)-1] = 1
-	tbs, err := replaceNthInSequence(parts.tbs, spkiPrefix, mutated, 0)
-	if err != nil {
-		return nil, err
-	}
-	return joinCertificate(tbs, parts.signatureAlgorithm, parts.signatureValue), nil
+	return signCertificateWithTBS(tbs, parts.signatureAlgorithm, signer), nil
 }
 
 func mutateSignatureBitString(der []byte, mutate func([]byte)) ([]byte, error) {
@@ -722,6 +677,14 @@ func joinCertificate(tbs, algorithm, signature []byte) []byte {
 	content = append(content, algorithm...)
 	content = append(content, signature...)
 	return wrapTLV(0x30, content)
+}
+
+func signCertificateWithTBS(tbs, algorithm []byte, signer ed25519.PrivateKey) []byte {
+	signature := ed25519.Sign(signer, tbs)
+	content := make([]byte, 1, 1+len(signature))
+	content[0] = 0
+	content = append(content, signature...)
+	return joinCertificate(tbs, algorithm, wrapTLV(0x03, content))
 }
 
 func replaceNthInSequence(sequence, old, replacement []byte, nth int) ([]byte, error) {

@@ -1033,7 +1033,6 @@ test "record stream drops valid ticket with no consumer and remains usable" {
     const h = try SocketHarness.create(.{
         .client_chunk = 1024,
         .server_chunk = 1024,
-        .client_post_handshake_allocator = std.testing.allocator,
     });
     defer h.destroy();
     try h.driveUntil(SocketHarness.bothComplete);

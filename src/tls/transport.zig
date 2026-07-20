@@ -281,6 +281,7 @@ pub fn ContractWithOptions(
             /// handshake when it resolves.
             authPendingFn: ?*const fn (ptr: *anyopaque) bool = null,
             resumeFn: ?*const fn (ptr: *anyopaque, sink: *EventSink) ErrorSet!void = null,
+            setPostHandshakeAllocatorFn: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) ErrorSet!void = null,
 
             pub fn start(self: Backend, role: state.Role, params: TransportParameters, sink: *EventSink) ErrorSet!void {
                 return self.startFn(self.ptr, role, params, sink);
@@ -301,6 +302,10 @@ pub fn ContractWithOptions(
             /// backend does not support suspension.
             pub fn resumeAuth(self: Backend, sink: *EventSink) ErrorSet!void {
                 if (self.resumeFn) |f| return f(self.ptr, sink);
+            }
+
+            pub fn setPostHandshakeAllocator(self: Backend, allocator: std.mem.Allocator) ErrorSet!void {
+                if (self.setPostHandshakeAllocatorFn) |f| return f(self.ptr, allocator);
             }
 
             pub fn deinit(self: Backend) void {

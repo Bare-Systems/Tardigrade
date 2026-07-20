@@ -703,6 +703,7 @@ pub const Tls13Backend = struct {
             .deinitFn = deinitImpl,
             .authPendingFn = authPendingImpl,
             .resumeFn = resumeImpl,
+            .setPostHandshakeAllocatorFn = setPostHandshakeAllocatorImpl,
         };
     }
 
@@ -714,6 +715,11 @@ pub const Tls13Backend = struct {
     fn resumeImpl(ptr: *anyopaque, sink: *EventSink) HandshakeError!void {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
         return self.resumeAuth(sink);
+    }
+
+    fn setPostHandshakeAllocatorImpl(ptr: *anyopaque, allocator: std.mem.Allocator) HandshakeError!void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.setPostHandshakeAllocator(allocator);
     }
 
     pub fn alpn(self: *const Tls13Backend) []const u8 {

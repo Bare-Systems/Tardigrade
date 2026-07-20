@@ -466,6 +466,7 @@ pub const PureZigRecordStream = struct {
         backend: RecordHandshakeBackend,
     ) PureZigRecordStream {
         var stream_state = init(role, crypto_provider, cipher_suite);
+        if (role == .client) backend.setPostHandshakeAllocator(std.heap.smp_allocator) catch unreachable;
         stream_state.handshake_driver = RecordHandshakeDriver.init(role, backend);
         return stream_state;
     }
@@ -478,6 +479,7 @@ pub const PureZigRecordStream = struct {
         limits: BufferLimits,
     ) Error!PureZigRecordStream {
         var stream_state = try initWithLimits(role, crypto_provider, cipher_suite, limits);
+        if (role == .client) try backend.setPostHandshakeAllocator(std.heap.smp_allocator);
         stream_state.handshake_driver = RecordHandshakeDriver.init(role, backend);
         return stream_state;
     }

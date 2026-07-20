@@ -57,6 +57,7 @@ pub const State = enum {
 /// until DPLPMTUD lands under #256.
 pub const max_datagram_size: usize = recovery.max_datagram_size;
 pub const max_application_crypto_outstanding: usize = 2 * tls_core.tls13_transport.max_emitted_new_session_ticket_message_len;
+const min_application_crypto_payload: usize = max_datagram_size / 2;
 /// RFC 9000 §14.1: datagrams carrying Initial packets are padded to 1200.
 pub const min_initial_datagram: usize = 1200;
 
@@ -208,6 +209,28 @@ const RangeList = struct {
         try self.items.insert(allocator, index, merged);
     }
 
+    fn ensureUnusedCapacity(self: *RangeList, allocator: std.mem.Allocator, additional_count: usize) !void {
+        try self.items.ensureUnusedCapacity(allocator, additional_count);
+    }
+
+    fn insertAssumeCapacity(self: *RangeList, incoming: Range) void {
+        if (incoming.start >= incoming.end) return;
+        var merged = incoming;
+        var index: usize = 0;
+        while (index < self.items.items.len) {
+            const current = self.items.items[index];
+            if (merged.end < current.start) break;
+            if (current.end < merged.start) {
+                index += 1;
+                continue;
+            }
+            merged.start = @min(merged.start, current.start);
+            merged.end = @max(merged.end, current.end);
+            _ = self.items.orderedRemove(index);
+        }
+        self.items.insertAssumeCapacity(index, merged);
+    }
+
     /// Remove and return up to `max_len` bytes from the lowest range.
     fn takeFirst(self: *RangeList, max_len: u64) ?Range {
         if (self.items.items.len == 0) return null;
@@ -266,11 +289,11 @@ const CryptoTx = struct {
 
     fn markAcked(self: *CryptoTx, allocator: std.mem.Allocator, range: Range) void {
         const live = self.liveRange(range) orelse return;
-        self.acked.insert(allocator, live) catch {};
-        self.compactAcked();
+        self.acked.insertAssumeCapacity(live);
+        self.compactAcked(allocator);
     }
 
-    fn compactAcked(self: *CryptoTx) void {
+    fn compactAcked(self: *CryptoTx, allocator: std.mem.Allocator) void {
         while (self.acked.items.items.len > 0 and self.acked.items.items[0].end <= self.base) {
             _ = self.acked.items.orderedRemove(0);
         }
@@ -295,6 +318,12 @@ const CryptoTx = struct {
             self.acked.items.items[0].start = self.base;
         }
         self.trimPendingBelowBase();
+        if (self.data.items.len == 0 and self.data.capacity > 0) {
+            crypto_secrets.secureZero(self.data.allocatedSlice());
+            self.data.clearAndFree(allocator);
+            self.pending.items.clearAndFree(allocator);
+            self.acked.items.clearAndFree(allocator);
+        }
     }
 
     fn trimPendingBelowBase(self: *CryptoTx) void {
@@ -313,11 +342,13 @@ const CryptoTx = struct {
         if (bytes_len > max_outstanding) return error.CryptoBufferTooLarge;
         if (self.data.items.len > max_outstanding - bytes_len) return error.CryptoBufferTooLarge;
         if (self.data.capacity == 0) {
-            try self.data.ensureTotalCapacity(allocator, max_outstanding);
+            try self.data.ensureTotalCapacityPrecise(allocator, bytes_len);
         } else if (self.data.capacity < self.data.items.len + bytes_len) {
             return error.CryptoBufferTooLarge;
         }
-        try self.pending.items.ensureUnusedCapacity(allocator, 1);
+        const range_budget = applicationCryptoRangeBudget(bytes_len);
+        try self.pending.ensureUnusedCapacity(allocator, range_budget + 1);
+        try self.acked.ensureUnusedCapacity(allocator, range_budget);
     }
 
     fn appendReserved(self: *CryptoTx, bytes: []const u8) void {
@@ -329,6 +360,10 @@ const CryptoTx = struct {
         });
     }
 };
+
+fn applicationCryptoRangeBudget(bytes_len: usize) usize {
+    return (bytes_len + min_application_crypto_payload - 1) / min_application_crypto_payload + 8;
+}
 
 /// Driver-owned transmit buffer for one stream: bytes the application handed
 /// to `writeStream` that are unsent or unacked. `base` is the stream offset
@@ -1109,7 +1144,13 @@ pub const Connection = struct {
             };
             // If the level's keys are already discarded the buffer is gone.
             if (tx.data.items.len > 0) {
-                if (tx.liveRange(range)) |live| tx.pending.insert(self.allocator, live) catch {};
+                if (tx.liveRange(range)) |live| {
+                    if (record.space == .application) {
+                        tx.pending.insertAssumeCapacity(live);
+                    } else {
+                        tx.pending.insert(self.allocator, live) catch {};
+                    }
+                }
             }
         }
         for (record.streams[0..record.stream_count]) |sr| {
@@ -1271,6 +1312,8 @@ pub const Connection = struct {
         limits: tls_core.session.Limits,
     ) tls_handshake.HandshakeError!tls_core.session.ServerRecoverableState {
         if (self.state_ != .established or self.role != .server) return error.InvalidHandshakeState;
+        limits.validate() catch return error.IllegalParameter;
+        if (params.opaque_ticket.len == 0 or params.opaque_ticket.len > limits.max_ticket_len) return error.TicketTooLarge;
         const emit_params: tls_core.new_session_ticket.EmitParams = .{
             .ticket_lifetime = params.ticket_lifetime,
             .ticket_age_add = params.ticket_age_add,
@@ -1890,13 +1933,21 @@ pub const Connection = struct {
                 range = tx.liveRange(range) orelse continue;
                 if (record.crypto) |existing| {
                     if (existing.end != range.start) {
-                        tx.pending.insert(self.allocator, range) catch {};
+                        if (space == .application) {
+                            tx.pending.insertAssumeCapacity(range);
+                        } else {
+                            tx.pending.insert(self.allocator, range) catch {};
+                        }
                         break;
                     }
                 }
                 const data = tx.slice(range);
                 const n = frame.encodeCrypto(range.start, data, plain[plain_len..plain_budget]) catch {
-                    tx.pending.insert(self.allocator, range) catch {};
+                    if (space == .application) {
+                        tx.pending.insertAssumeCapacity(range);
+                    } else {
+                        tx.pending.insert(self.allocator, range) catch {};
+                    }
                     break;
                 };
                 plain_len += n;
@@ -2266,10 +2317,8 @@ test "application CRYPTO transmit ignores late duplicate ACKs and compacts later
     var tx = CryptoTx{};
     defer tx.deinit(allocator);
 
-    try tx.reserveAppend(allocator, 8, max_application_crypto_outstanding);
-    tx.appendReserved("ticket-1");
-    try tx.reserveAppend(allocator, 8, max_application_crypto_outstanding);
-    tx.appendReserved("ticket-2");
+    try tx.reserveAppend(allocator, 16, max_application_crypto_outstanding);
+    tx.appendReserved("ticket-1ticket-2");
 
     tx.markAcked(allocator, .{ .start = 0, .end = 8 });
     tx.markAcked(allocator, .{ .start = 0, .end = 8 });
@@ -2292,6 +2341,23 @@ test "application CRYPTO transmit clamps lost duplicate ranges below base" {
 
     const live = tx.liveRange(.{ .start = 0, .end = 16 }) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(Range{ .start = 8, .end = 16 }, live);
+}
+
+test "application CRYPTO transmit allocates exact storage and frees after ACK" {
+    const allocator = testing.allocator;
+    var tx = CryptoTx{};
+    defer tx.deinit(allocator);
+
+    try tx.reserveAppend(allocator, 12, max_application_crypto_outstanding);
+    tx.appendReserved("small-ticket");
+    try testing.expectEqual(@as(usize, 12), tx.data.capacity);
+    try testing.expect(tx.data.capacity < max_application_crypto_outstanding);
+
+    tx.markAcked(allocator, .{ .start = 0, .end = 12 });
+    try testing.expectEqual(@as(usize, 0), tx.data.items.len);
+    try testing.expectEqual(@as(usize, 0), tx.data.capacity);
+    try testing.expect(tx.pending.isEmpty());
+    try testing.expect(tx.acked.isEmpty());
 }
 
 const TestPair = struct {
@@ -2628,6 +2694,28 @@ test "driver: application CRYPTO ticket budget refuses one-over before queueing"
         .issued_at_unix_ms = 10,
     }, tls_core.session.Limits.default));
     try testing.expectEqual(max_application_crypto_outstanding, pair.server.crypto_tx[2].data.items.len);
+}
+
+test "driver: ticket model limit refusal happens before CRYPTO allocation" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const too_large = try allocator.alloc(u8, tls_core.session.Limits.default.max_ticket_len + 1);
+    defer allocator.free(too_large);
+    @memset(too_large, 0x5a);
+
+    try testing.expectError(error.TicketTooLarge, pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = too_large,
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default));
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.items.len);
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.capacity);
+    try testing.expect(pair.server.crypto_tx[2].pending.isEmpty());
 }
 
 test "driver: local close reaches the peer and both sides drain" {

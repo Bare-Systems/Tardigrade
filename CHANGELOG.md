@@ -4,6 +4,8 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-20
+
 ### Features
 - **Native macOS release archives (#463)** — the release workflow now builds
   and publishes native Intel (`tardigrade-darwin-x86_64.tar.gz`) and Apple

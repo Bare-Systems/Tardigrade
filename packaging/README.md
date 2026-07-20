@@ -10,12 +10,12 @@ versus what is a local-build-only tool.
 | Format | Status | Notes |
 | --- | --- | --- |
 | Linux release archives (`.tar.gz`, x86_64/aarch64) | **Supported, published** | Built and attached to every GitHub release by `.github/workflows/release.yml`, alongside `install.sh`, `tardigrade-checksums.txt`, and per-arch SPDX SBOMs. |
-| macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Planned, not published** | CI builds and tests Tardigrade on `macos-14`, but the release workflow's build matrix only packages Linux. `install.sh` and the Homebrew formula already expect `tardigrade-darwin-*.tar.gz` assets that do not yet exist. |
+| macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Supported, published** | Built natively on `macos-15-intel` (x86_64) and `macos-15` (arm64) runners by the same release workflow, and attached to every GitHub release with per-arch SPDX SBOMs, dependency inventories, checksum entries, and provenance attestations. Requires `brew install openssl@3` on the host at runtime — see the Homebrew section below. |
 | DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder (`packaging/deb/build.sh`). Smoke-tested on every PR/push via the `packaging-smoke` CI job (`scripts/test-deb-package.sh`). |
 | RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Smoke-tested via `scripts/test-rpm-package.sh`. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and exercised end-to-end by both the DEB and RPM smoke tests. |
-| launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | Ships as a template for macOS host-native installs; there is no macOS packaging pipeline or smoke test exercising it. |
-| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present, tap not published, macOS blocked** | The `on_linux` blocks can resolve once real release checksums are filled in; the `on_macos` blocks cannot resolve until macOS archives are published (see above). No `Bare-Systems/homebrew-tap` repo exists yet. |
+| launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | Ships as a template for macOS host-native installs; the release workflow now publishes native Darwin archives, but nothing installs or smoke-tests this plist yet. |
+| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present, tap not published** | The Darwin archives referenced by the `on_macos` blocks now resolve to real release assets; the formula's checksum placeholders and tap publication/automation remain tracked separately (#466). No `Bare-Systems/homebrew-tap` repo exists yet. |
 | Docker / OCI image | **Not implemented** | No `Dockerfile` or container-publishing workflow exists in this repository. |
 
 ## Quick install (recommended)
@@ -26,7 +26,9 @@ Use the official install script which downloads the correct prebuilt binary and 
 curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
 ```
 
-This currently only resolves for Linux (`x86_64`/`aarch64`); see "Current status" above.
+This resolves for Linux (`x86_64`/`aarch64`) and macOS (`x86_64`/`arm64`); see
+"Current status" above. On macOS, install the runtime OpenSSL dependency
+first: `brew install openssl@3`.
 
 ## DEB (Debian / Ubuntu)
 
@@ -159,10 +161,11 @@ sudo systemctl reload tardigrade   # or: restart, if reload is insufficient
 
 ## Homebrew (macOS and Linux)
 
-The `on_macos` blocks in this formula cannot resolve today: the release
-workflow does not build or publish `tardigrade-darwin-*.tar.gz` archives (see
-"Current status" above). The `on_linux` blocks reference archives that are
-published, so a Linux install can work once real checksums are filled in.
+The Darwin URLs referenced by the `on_macos` blocks now resolve, since the
+release workflow builds and publishes `tardigrade-darwin-x86_64.tar.gz` and
+`tardigrade-darwin-arm64.tar.gz` (see "Current status" above). The formula's
+`sha256` placeholders and publishing the formula to a Homebrew tap remain
+tracked separately in #466 and are out of scope here.
 
 The formula at `packaging/homebrew/tardigrade.rb` can be installed locally:
 
@@ -193,7 +196,7 @@ Pre-built service files for host-native installs:
 | File | Purpose |
 |---|---|
 | [`systemd/tardigrade.service`](systemd/tardigrade.service) | systemd service unit (Linux) |
-| [`launchd/io.baresystems.tardigrade.plist`](launchd/io.baresystems.tardigrade.plist) | launchd plist (macOS) — unverified, no macOS packaging pipeline exists yet |
+| [`launchd/io.baresystems.tardigrade.plist`](launchd/io.baresystems.tardigrade.plist) | launchd plist (macOS) — unverified; the release workflow now publishes native Darwin archives, but nothing installs or smoke-tests this plist yet |
 
 ## Related docs
 

@@ -25,10 +25,13 @@ Use this checklist before tagging and distributing a Tardigrade release.
 - [ ] Run `./scripts/test-deb-package.sh` on a Linux host with Docker
 - [ ] Run `./scripts/test-rpm-package.sh` on a Linux host with Docker
 - [ ] Verify release packaging paths and checksums, including the published
-      `.deb`/`.rpm` assets
+      `.deb`/`.rpm` assets and the Linux (`tardigrade-linux-x86_64.tar.gz`,
+      `tardigrade-linux-aarch64.tar.gz`) and Darwin
+      (`tardigrade-darwin-x86_64.tar.gz`, `tardigrade-darwin-arm64.tar.gz`)
+      `.tar.gz` archives
 - [ ] Note in the release that Homebrew and launchd are not published release
-      assets; the Linux `.tar.gz` archives, `.deb`/`.rpm` packages, `install.sh`,
-      and checksums are
+      assets; the Linux and Darwin `.tar.gz` archives, `.deb`/`.rpm` packages,
+      `install.sh`, and checksums are
 - [ ] Confirm changelog entries for operator-visible changes are complete
 
 ## Branch Hygiene

@@ -74,17 +74,17 @@ The fastest way to install the latest release is the official install script:
 curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
 ```
 
-The installer downloads the matching Linux release archive (`x86_64` or
-`aarch64`), verifies it against `tardigrade-checksums.txt`, and installs the
-`tardi` binary (with a `tardigrade` compatibility alias) into
-`$HOME/.local/bin` by default. Published archives currently cover Linux
-only; macOS is not yet built or published by the release workflow (see
-[packaging/README.md](packaging/README.md#current-status) for exact status).
+The installer downloads the matching release archive for Linux (`x86_64` or
+`aarch64`) or macOS (`x86_64` or `arm64`), verifies it against
+`tardigrade-checksums.txt`, and installs the `tardi` binary (with a
+`tardigrade` compatibility alias) into `$HOME/.local/bin` by default. See
+[packaging/README.md](packaging/README.md#current-status) for exact status.
 
 Published release binaries use the default "general" TLS profile, which
 links OpenSSL at runtime — installing via this script or the raw archive
 requires OpenSSL 1.1/3.x already present on the target host, the same
-runtime dependency the DEB/RPM packages declare explicitly.
+runtime dependency the DEB/RPM packages declare explicitly. On macOS, install
+it with Homebrew first: `brew install openssl@3`.
 
 Other install paths:
 

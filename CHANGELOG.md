@@ -5,6 +5,14 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Native macOS release archives (#463)** — the release workflow now builds
+  and publishes native Intel (`tardigrade-darwin-x86_64.tar.gz`) and Apple
+  Silicon (`tardigrade-darwin-arm64.tar.gz`) archives, each with its own
+  SPDX SBOM, dependency inventory, checksum entry, and build-provenance
+  attestation, using the same default `general` TLS profile and pipeline
+  already used for Linux. macOS archives require `brew install openssl@3`
+  on the host at runtime. Homebrew tap publishing and formula checksum
+  automation remain tracked separately (#466).
 - **Fixed-profile Bare Systems appliance TLS credential provider (#392, epic
   #391)** — appliance-profile builds (`-Dtls-profile=appliance`) now load
   exactly one provisioned Ed25519 identity through a strict provisioning

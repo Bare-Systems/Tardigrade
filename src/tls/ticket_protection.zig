@@ -572,6 +572,15 @@ pub const ReloadableKeyRing = struct {
     fn record(self: *ReloadableKeyRing, event: Event) void {
         if (self.observer) |observer| observer.record(event);
     }
+
+    pub fn format(
+        _: ReloadableKeyRing,
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        _: anytype,
+    ) !void {
+        @compileError("ticket keyrings must not be formatted or logged");
+    }
 };
 
 fn validateEncryptionWindows(keys: []const KeyRecord) SnapshotError!void {
@@ -968,6 +977,12 @@ test "AEAD id mapping is stable and not enum ordinal dependent" {
     try testing.expectEqual(provider.Aead.aes_256_gcm, try decodeAeadId(2));
     try testing.expectEqual(provider.Aead.chacha20_poly1305, try decodeAeadId(3));
     try testing.expectError(error.UnsupportedAeadId, decodeAeadId(0));
+}
+
+test "secret-bearing ticket protection types expose no ordinary formatting path" {
+    try testing.expect(@hasDecl(KeyRecord, "format"));
+    try testing.expect(@hasDecl(Snapshot, "format"));
+    try testing.expect(@hasDecl(ReloadableKeyRing, "format"));
 }
 
 test "parseEnvelope validates public structure without allocation" {

@@ -267,6 +267,7 @@ pub const Tls13Backend = struct {
             },
             .setCidBindingFn = setCidBinding,
             .peerCidBindingFn = peerCidBinding,
+            .setPostHandshakeAllocatorFn = setPostHandshakeAllocator,
             .emitNewSessionTicketFn = emitNewSessionTicket,
         };
     }
@@ -304,6 +305,16 @@ pub const Tls13Backend = struct {
     fn peerCidBinding(ptr: *anyopaque) config.CidBinding {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
         return self.peer_cid_binding;
+    }
+
+    fn setPostHandshakeAllocator(ptr: *anyopaque, allocator: std.mem.Allocator) HandshakeError!void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        if (self.engine.role != .client) return;
+        if (self.allocator) |existing| {
+            if (existing.ptr == allocator.ptr and existing.vtable == allocator.vtable) return;
+        }
+        self.allocator = allocator;
+        self.engine.setPostHandshakeAllocator(allocator) catch |err| return mapError(err);
     }
 
     fn emitNewSessionTicket(

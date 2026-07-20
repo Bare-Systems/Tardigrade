@@ -69,6 +69,7 @@ pub const TlsBackend = struct {
     /// in-memory test backend leaves them null.
     setCidBindingFn: ?*const fn (ptr: *anyopaque, binding: config.CidBinding) void = null,
     peerCidBindingFn: ?*const fn (ptr: *anyopaque) config.CidBinding = null,
+    setPostHandshakeAllocatorFn: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) HandshakeError!void = null,
     emitNewSessionTicketFn: ?*const fn (
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -92,6 +93,10 @@ pub const TlsBackend = struct {
     pub fn peerCidBinding(self: TlsBackend) config.CidBinding {
         if (self.peerCidBindingFn) |get| return get(self.transport.ptr);
         return .{};
+    }
+
+    pub fn setPostHandshakeAllocator(self: TlsBackend, allocator: std.mem.Allocator) HandshakeError!void {
+        if (self.setPostHandshakeAllocatorFn) |set| try set(self.transport.ptr, allocator);
     }
 
     pub fn emitNewSessionTicket(

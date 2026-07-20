@@ -63,6 +63,9 @@ pub const HandshakeError = error{
     SecretExportFailed,
     /// A local caller attempted an invalid handshake lifecycle transition.
     InvalidHandshakeState,
+    /// A ticket identity exceeded the caller-configured resumable-session
+    /// model bound even though it may still fit the absolute RFC wire range.
+    TicketTooLarge,
     /// This side cannot authenticate itself for the negotiated parameters: no
     /// local credential is available, or none is compatible with the peer's
     /// offered signature algorithms. A *local* configuration/selection failure,
@@ -130,7 +133,9 @@ test "syntax, semantic, and ordering failures are distinct cases" {
     const malformed: HandshakeError = error.MalformedHandshake;
     const illegal: HandshakeError = error.IllegalParameter;
     const unexpected: HandshakeError = error.UnexpectedHandshakeMessage;
+    const ticket_too_large: HandshakeError = error.TicketTooLarge;
     try std.testing.expect(malformed != illegal);
     try std.testing.expect(malformed != unexpected);
     try std.testing.expect(illegal != unexpected);
+    try std.testing.expect(ticket_too_large != malformed);
 }

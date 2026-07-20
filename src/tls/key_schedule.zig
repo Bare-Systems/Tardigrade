@@ -78,17 +78,50 @@ pub const KeySchedule = struct {
         handshake_complete_transcript_hash: []const u8,
         out: []u8,
     ) Error!void {
-        if (handshake_complete_transcript_hash.len != hash_len or out.len != hash_len)
+        return deriveResumptionMasterSecret(.sha256, &self.master_secret, handshake_complete_transcript_hash, out);
+    }
+
+    pub fn deriveResumptionMasterSecret(
+        hash: provider.Hash,
+        master_secret: []const u8,
+        handshake_complete_transcript_hash: []const u8,
+        out: []u8,
+    ) Error!void {
+        const expected_len = hash.digestLength();
+        if (master_secret.len != expected_len or
+            handshake_complete_transcript_hash.len != expected_len or
+            out.len != expected_len)
             return error.InvalidSecretLength;
-        var secret = tls.hkdfExpandLabel(
-            HkdfSha256,
-            self.master_secret,
-            "res master",
-            handshake_complete_transcript_hash,
-            hash_len,
-        );
-        defer crypto.secureZero(u8, &secret);
-        @memcpy(out, &secret);
+        switch (hash) {
+            .sha256 => {
+                var secret: [Sha256.digest_length]u8 = undefined;
+                @memcpy(&secret, master_secret);
+                defer crypto.secureZero(u8, &secret);
+                var expanded = tls.hkdfExpandLabel(
+                    HkdfSha256,
+                    secret,
+                    "res master",
+                    handshake_complete_transcript_hash,
+                    Sha256.digest_length,
+                );
+                defer crypto.secureZero(u8, &expanded);
+                @memcpy(out, &expanded);
+            },
+            .sha384 => {
+                var secret: [HmacSha384.mac_length]u8 = undefined;
+                @memcpy(&secret, master_secret);
+                defer crypto.secureZero(u8, &secret);
+                var expanded = tls.hkdfExpandLabel(
+                    HkdfSha384,
+                    secret,
+                    "res master",
+                    handshake_complete_transcript_hash,
+                    HmacSha384.mac_length,
+                );
+                defer crypto.secureZero(u8, &expanded);
+                @memcpy(out, &expanded);
+            },
+        }
     }
 
     pub fn resumptionPsk(
@@ -212,6 +245,16 @@ test "resumption PSK supports SHA-384 length and rejects inconsistent lengths" {
     var short_out: [hash_len - 1]u8 = undefined;
     try std.testing.expectError(error.InvalidSecretLength, KeySchedule.resumptionPsk(.sha256, &rms384, "nonce", &short_out));
     try std.testing.expectError(error.InvalidSecretLength, KeySchedule.resumptionPsk(.sha384, rms384[0..hash_len], "nonce", &out384));
+}
+
+test "generic resumption master secret derivation supports SHA-384" {
+    const master_secret = [_]u8{0x11} ** provider.Hash.sha384.digestLength();
+    const transcript_hash = [_]u8{0x22} ** provider.Hash.sha384.digestLength();
+    var out: [provider.Hash.sha384.digestLength()]u8 = undefined;
+    defer crypto.secureZero(u8, &out);
+    try KeySchedule.deriveResumptionMasterSecret(.sha384, &master_secret, &transcript_hash, &out);
+    try std.testing.expectEqualSlices(u8, &hexBytes("4f9d68ff762f5b886f275d162b90c268db5ccc65c4e0b8fc810030429a070f8e9f12b641b209e15ae210b1153a68fc42"), &out);
+    try std.testing.expectError(error.InvalidSecretLength, KeySchedule.deriveResumptionMasterSecret(.sha384, master_secret[0..hash_len], &transcript_hash, &out));
 }
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {

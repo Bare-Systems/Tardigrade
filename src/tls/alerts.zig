@@ -41,6 +41,7 @@ pub fn fromHandshakeError(err: events.HandshakeError) AlertDescription {
         error.UnsupportedCertificate => .unsupported_certificate,
         error.SecretExportFailed => .internal_error,
         error.InvalidHandshakeState => .internal_error,
+        error.TicketTooLarge => .internal_error,
         error.AlpnMismatch => .no_application_protocol,
         // This side could not produce an acceptable credential/signature for
         // the negotiated parameters (RFC 8446 §4.4.2.2).

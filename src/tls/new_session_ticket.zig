@@ -63,7 +63,7 @@ pub const BuildError =
 pub const BuildServerError =
     key_schedule.Error ||
     session.ResumableSessionCommon.InitError ||
-    error{InvalidLimits};
+    error{ InvalidLimits, TicketTooLarge };
 
 pub fn encodedLen(params: EmitParams) EncodeError!usize {
     try validateEmitParams(params);
@@ -117,16 +117,18 @@ pub fn decode(body: []const u8) DecodeError!Parsed {
     if (ticket.len == 0) return error.MalformedHandshake;
     if (ticket_lifetime > max_lifetime_seconds) return error.IllegalParameter;
 
-    const extensions = try r.slice(try r.readU16());
+    const extensions_len = try r.readU16();
+    if (extensions_len > max_extensions_wire_len) return error.MalformedHandshake;
+    const extensions = try r.slice(extensions_len);
     try r.expectEnd();
 
-    var guard = ExtensionGuard{};
     var ext_reader = Reader{ .bytes = extensions };
     var max_early_data_size: ?u32 = null;
     while (!ext_reader.atEnd()) {
+        const prefix_len = ext_reader.pos;
         const ext_type = try ext_reader.readU16();
         const ext_body = try ext_reader.slice(try ext_reader.readU16());
-        try guard.check(ext_type);
+        if (try extensionSeen(extensions[0..prefix_len], ext_type)) return error.IllegalParameter;
         if (ext_type == ext_early_data) {
             if (ext_body.len != 4) return error.MalformedHandshake;
             max_early_data_size = readIntU32(ext_body[0..4]);
@@ -198,6 +200,7 @@ pub fn buildServerRecoverableState(
 ) BuildServerError!session.ServerRecoverableState {
     try limits.validate();
     if (params.ticket_lifetime == 0) return error.InvalidLifetime;
+    if (params.ticket.len == 0 or params.ticket.len > limits.max_ticket_len) return error.TicketTooLarge;
     const hash = algorithms.transcriptHash(connection.cipher_suite);
     var psk: [session.max_psk_len]u8 = undefined;
     defer crypto.secureZero(u8, &psk);
@@ -282,19 +285,15 @@ const Reader = struct {
     }
 };
 
-const ExtensionGuard = struct {
-    ids: [64]u16 = undefined,
-    len: usize = 0,
-
-    fn check(self: *ExtensionGuard, ext_type: u16) DecodeError!void {
-        for (self.ids[0..self.len]) |seen| {
-            if (seen == ext_type) return error.IllegalParameter;
-        }
-        if (self.len == self.ids.len) return error.MalformedHandshake;
-        self.ids[self.len] = ext_type;
-        self.len += 1;
+fn extensionSeen(prefix: []const u8, target: u16) DecodeError!bool {
+    var r = Reader{ .bytes = prefix };
+    while (!r.atEnd()) {
+        const ext_type = try r.readU16();
+        _ = try r.slice(try r.readU16());
+        if (ext_type == target) return true;
     }
-};
+    return false;
+}
 
 fn readIntU16(bytes: []const u8) u16 {
     return std.mem.readInt(u16, bytes[0..2], .big);
@@ -395,6 +394,65 @@ test "NewSessionTicket decode rejects malformed and illegal inputs distinctly" {
     try std.testing.expectError(error.MalformedHandshake, decode(&malformed_early_data));
 }
 
+test "NewSessionTicket extension vector permits legal counts and rejects illegal length" {
+    const allocator = std.testing.allocator;
+    var many_extensions: std.ArrayList(u8) = .empty;
+    defer many_extensions.deinit(allocator);
+    try appendBaseTicketPrefix(&many_extensions, 1, 0, "", "x");
+    try many_extensions.appendSlice(allocator, &.{ 0, 0 });
+    const ext_len_pos = many_extensions.items.len - 2;
+    for (0..65) |i| {
+        try appendExtension(&many_extensions, @intCast(1000 + i), "");
+    }
+    std.mem.writeInt(u16, many_extensions.items[ext_len_pos..][0..2], @intCast(many_extensions.items.len - ext_len_pos - 2), .big);
+    const parsed_many = try decode(many_extensions.items);
+    try std.testing.expectEqualSlices(u8, "x", parsed_many.ticket);
+
+    var exact: std.ArrayList(u8) = .empty;
+    defer exact.deinit(allocator);
+    try appendBaseTicketPrefix(&exact, 1, 0, "", "x");
+    try exact.appendSlice(allocator, &.{ 0xff, 0xfe });
+    var written: usize = 0;
+    var ext_id: u16 = 1000;
+    while (written + 4 <= max_extensions_wire_len - 6) : ({
+        written += 4;
+        ext_id += 1;
+    }) {
+        try appendExtension(&exact, ext_id, "");
+    }
+    try appendExtension(&exact, ext_id, "\xaa\xbb");
+    written += 6;
+    try std.testing.expectEqual(max_extensions_wire_len, written);
+    const parsed_exact = try decode(exact.items);
+    try std.testing.expectEqualSlices(u8, "x", parsed_exact.ticket);
+
+    var illegal: std.ArrayList(u8) = .empty;
+    defer illegal.deinit(allocator);
+    try appendBaseTicketPrefix(&illegal, 1, 0, "", "x");
+    try illegal.appendSlice(allocator, &.{ 0xff, 0xff });
+    try illegal.appendNTimes(allocator, 0, std.math.maxInt(u16));
+    try std.testing.expectError(error.MalformedHandshake, decode(illegal.items));
+}
+
+test "NewSessionTicket duplicate known and unknown extensions are illegal" {
+    const allocator = std.testing.allocator;
+    var duplicate_known: std.ArrayList(u8) = .empty;
+    defer duplicate_known.deinit(allocator);
+    try appendBaseTicketPrefix(&duplicate_known, 1, 0, "", "x");
+    try duplicate_known.appendSlice(allocator, &.{ 0, 16 });
+    try appendExtension(&duplicate_known, ext_early_data, "\x00\x00\x00\x01");
+    try appendExtension(&duplicate_known, ext_early_data, "\x00\x00\x00\x02");
+    try std.testing.expectError(error.IllegalParameter, decode(duplicate_known.items));
+
+    var duplicate_unknown: std.ArrayList(u8) = .empty;
+    defer duplicate_unknown.deinit(allocator);
+    try appendBaseTicketPrefix(&duplicate_unknown, 1, 0, "", "x");
+    try duplicate_unknown.appendSlice(allocator, &.{ 0, 8 });
+    try appendExtension(&duplicate_unknown, 0x1234, "");
+    try appendExtension(&duplicate_unknown, 0x1234, "");
+    try std.testing.expectError(error.IllegalParameter, decode(duplicate_unknown.items));
+}
+
 test "NewSessionTicket encode validates bounds and output size" {
     var buf: [8]u8 = undefined;
     try std.testing.expectError(error.OutputTooSmall, encode(.{
@@ -417,6 +475,80 @@ test "NewSessionTicket encode validates bounds and output size" {
     }));
 }
 
+test "server recoverable state honors caller ticket limits" {
+    const context: ConnectionResumptionContext = .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("leaf"),
+    };
+    const rms = [_]u8{0x42} ** 32;
+
+    var default_over = [_]u8{0xa5} ** (session.Limits.default.max_ticket_len + 1);
+    try std.testing.expectError(error.TicketTooLarge, buildServerRecoverableState(
+        std.testing.allocator,
+        .{
+            .ticket_lifetime = 1,
+            .ticket_age_add = 0,
+            .ticket_nonce = "",
+            .ticket = &default_over,
+        },
+        context,
+        &rms,
+        1,
+        session.Limits.default,
+    ));
+
+    const custom_limits = session.Limits{ .max_ticket_len = default_over.len };
+    var custom_state = try buildServerRecoverableState(
+        std.testing.allocator,
+        .{
+            .ticket_lifetime = 1,
+            .ticket_age_add = 0,
+            .ticket_nonce = "",
+            .ticket = &default_over,
+        },
+        context,
+        &rms,
+        1,
+        custom_limits,
+    );
+    custom_state.deinit();
+
+    const max_ticket = try std.testing.allocator.alloc(u8, absolute_ticket_wire_max);
+    defer std.testing.allocator.free(max_ticket);
+    @memset(max_ticket, 0x5a);
+    var max_state = try buildServerRecoverableState(
+        std.testing.allocator,
+        .{
+            .ticket_lifetime = 1,
+            .ticket_age_add = 0,
+            .ticket_nonce = "",
+            .ticket = max_ticket,
+        },
+        context,
+        &rms,
+        1,
+        .{ .max_ticket_len = absolute_ticket_wire_max, .max_serialized_len = session.Limits.default.max_serialized_len },
+    );
+    max_state.deinit();
+
+    const one_over = try std.testing.allocator.alloc(u8, absolute_ticket_wire_max + 1);
+    defer std.testing.allocator.free(one_over);
+    @memset(one_over, 0x5b);
+    try std.testing.expectError(error.TicketTooLarge, buildServerRecoverableState(
+        std.testing.allocator,
+        .{
+            .ticket_lifetime = 1,
+            .ticket_age_add = 0,
+            .ticket_nonce = "",
+            .ticket = one_over,
+        },
+        context,
+        &rms,
+        1,
+        .{ .max_ticket_len = absolute_ticket_wire_max },
+    ));
+}
+
 test "lifetime zero parses but does not build cacheable client state" {
     const parsed = Parsed{
         .ticket_lifetime = 0,
@@ -437,4 +569,35 @@ test "lifetime zero parses but does not build cacheable client state" {
         session.Limits.default,
     );
     try std.testing.expectEqual(@as(?session.ClientTicketState, null), state);
+}
+
+fn appendBaseTicketPrefix(
+    list: *std.ArrayList(u8),
+    lifetime: u32,
+    age_add: u32,
+    nonce: []const u8,
+    ticket: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    var fixed: [4]u8 = undefined;
+    std.mem.writeInt(u32, &fixed, lifetime, .big);
+    try list.appendSlice(allocator, &fixed);
+    std.mem.writeInt(u32, &fixed, age_add, .big);
+    try list.appendSlice(allocator, &fixed);
+    try list.append(allocator, @intCast(nonce.len));
+    try list.appendSlice(allocator, nonce);
+    var len: [2]u8 = undefined;
+    std.mem.writeInt(u16, &len, @intCast(ticket.len), .big);
+    try list.appendSlice(allocator, &len);
+    try list.appendSlice(allocator, ticket);
+}
+
+fn appendExtension(list: *std.ArrayList(u8), ext_type: u16, payload: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var encoded: [2]u8 = undefined;
+    std.mem.writeInt(u16, &encoded, ext_type, .big);
+    try list.appendSlice(allocator, &encoded);
+    std.mem.writeInt(u16, &encoded, @intCast(payload.len), .big);
+    try list.appendSlice(allocator, &encoded);
+    try list.appendSlice(allocator, payload);
 }

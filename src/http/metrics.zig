@@ -1,6 +1,21 @@
 const std = @import("std");
 const compat = @import("../zig_compat.zig");
 const proxy_buffer_account = @import("proxy_buffer_account.zig");
+const encrypted_stream = @import("tls_core").encrypted_stream;
+
+pub const TlsBufferConnectionMetrics = struct {
+    active: bool = false,
+    backend: encrypted_stream.BackendKind = .openssl,
+    current: encrypted_stream.QueueBytes = .{},
+    counters: encrypted_stream.BufferCounters = .{},
+};
+
+const tls_backend_count = 2;
+const tls_queue_count = 4;
+const tls_direction_count = 2;
+
+const TlsQueue = enum { inbound_ciphertext, inbound_plaintext, outbound_ciphertext, handshake };
+const TlsDirection = enum { carrier_read, plaintext_write };
 
 /// Server-wide metrics counters.
 ///
@@ -43,6 +58,11 @@ pub const Metrics = struct {
     proxy_buffer_read_pauses_upstream: u64,
     proxy_buffer_read_resumes_downstream: u64,
     proxy_buffer_read_resumes_upstream: u64,
+    tls_buffered_bytes_current: [tls_backend_count][tls_queue_count]u64,
+    tls_buffer_pause_events: [tls_backend_count][tls_direction_count]u64,
+    tls_buffer_resume_events: [tls_backend_count][tls_direction_count]u64,
+    tls_buffer_limit_exceeded: [tls_backend_count][tls_queue_count]u64,
+    tls_buffer_stalled_drives: [tls_backend_count]u64,
     proxy_client_aborts: u64,
     proxy_upstream_aborts: u64,
     proxy_streaming_fallback_policy_disabled: u64,
@@ -163,6 +183,11 @@ pub const Metrics = struct {
             .proxy_buffer_read_pauses_upstream = 0,
             .proxy_buffer_read_resumes_downstream = 0,
             .proxy_buffer_read_resumes_upstream = 0,
+            .tls_buffered_bytes_current = zeroTlsQueueMatrix(),
+            .tls_buffer_pause_events = zeroTlsDirectionMatrix(),
+            .tls_buffer_resume_events = zeroTlsDirectionMatrix(),
+            .tls_buffer_limit_exceeded = zeroTlsQueueMatrix(),
+            .tls_buffer_stalled_drives = .{0} ** tls_backend_count,
             .proxy_client_aborts = 0,
             .proxy_upstream_aborts = 0,
             .proxy_streaming_fallback_policy_disabled = 0,
@@ -425,6 +450,67 @@ pub const Metrics = struct {
         } else if (std.mem.eql(u8, side, "upstream")) {
             self.proxy_buffer_read_resumes_upstream += 1;
         }
+    }
+
+    pub fn observeTlsBufferSnapshot(
+        self: *Metrics,
+        state: *TlsBufferConnectionMetrics,
+        backend: encrypted_stream.BackendKind,
+        snapshot: encrypted_stream.BufferSnapshot,
+    ) void {
+        if (state.active) self.releaseTlsCurrentBytes(state.backend, state.current);
+        self.recordTlsCurrentBytes(backend, snapshot.current);
+        if (state.active and state.backend == backend) {
+            self.recordTlsCounterDeltas(backend, state.counters, snapshot.counters);
+        } else {
+            self.recordTlsCounterDeltas(backend, .{}, snapshot.counters);
+        }
+        state.* = .{
+            .active = true,
+            .backend = backend,
+            .current = snapshot.current,
+            .counters = snapshot.counters,
+        };
+    }
+
+    pub fn releaseTlsBufferSnapshot(self: *Metrics, state: *TlsBufferConnectionMetrics) void {
+        if (!state.active) return;
+        self.releaseTlsCurrentBytes(state.backend, state.current);
+        state.* = .{};
+    }
+
+    fn recordTlsCurrentBytes(self: *Metrics, backend: encrypted_stream.BackendKind, current: encrypted_stream.QueueBytes) void {
+        const backend_idx = tlsBackendIndex(backend);
+        self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_ciphertext)] += @intCast(current.inbound_ciphertext);
+        self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_plaintext)] += @intCast(current.inbound_plaintext);
+        self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.outbound_ciphertext)] += @intCast(current.outbound_ciphertext);
+        self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.handshake)] += @intCast(current.handshake);
+    }
+
+    fn releaseTlsCurrentBytes(self: *Metrics, backend: encrypted_stream.BackendKind, current: encrypted_stream.QueueBytes) void {
+        const backend_idx = tlsBackendIndex(backend);
+        subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_ciphertext)], current.inbound_ciphertext);
+        subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_plaintext)], current.inbound_plaintext);
+        subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.outbound_ciphertext)], current.outbound_ciphertext);
+        subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.handshake)], current.handshake);
+    }
+
+    fn recordTlsCounterDeltas(
+        self: *Metrics,
+        backend: encrypted_stream.BackendKind,
+        previous: encrypted_stream.BufferCounters,
+        next: encrypted_stream.BufferCounters,
+    ) void {
+        const backend_idx = tlsBackendIndex(backend);
+        self.tls_buffer_pause_events[backend_idx][tlsDirectionIndex(.carrier_read)] += monotonicDelta(previous.inbound_read_pauses, next.inbound_read_pauses);
+        self.tls_buffer_resume_events[backend_idx][tlsDirectionIndex(.carrier_read)] += monotonicDelta(previous.inbound_read_resumes, next.inbound_read_resumes);
+        self.tls_buffer_pause_events[backend_idx][tlsDirectionIndex(.plaintext_write)] += monotonicDelta(previous.plaintext_write_pauses, next.plaintext_write_pauses);
+        self.tls_buffer_resume_events[backend_idx][tlsDirectionIndex(.plaintext_write)] += monotonicDelta(previous.plaintext_write_resumes, next.plaintext_write_resumes);
+        self.tls_buffer_limit_exceeded[backend_idx][tlsQueueIndex(.inbound_ciphertext)] += monotonicDelta(previous.hard_limits.inbound_ciphertext, next.hard_limits.inbound_ciphertext);
+        self.tls_buffer_limit_exceeded[backend_idx][tlsQueueIndex(.inbound_plaintext)] += monotonicDelta(previous.hard_limits.inbound_plaintext, next.hard_limits.inbound_plaintext);
+        self.tls_buffer_limit_exceeded[backend_idx][tlsQueueIndex(.outbound_ciphertext)] += monotonicDelta(previous.hard_limits.outbound_ciphertext, next.hard_limits.outbound_ciphertext);
+        self.tls_buffer_limit_exceeded[backend_idx][tlsQueueIndex(.handshake)] += monotonicDelta(previous.hard_limits.handshake, next.hard_limits.handshake);
+        self.tls_buffer_stalled_drives[backend_idx] += monotonicDelta(previous.stalled_drives, next.stalled_drives);
     }
 
     pub fn recordProxyClientAbort(self: *Metrics) void {
@@ -703,6 +789,8 @@ pub const Metrics = struct {
             self.proxy_buffer_limit_exceeded_upstream_to_downstream_stream,
         });
 
+        try self.appendTlsBufferPrometheus(&out);
+
         try out.print(
             \\# HELP tardigrade_proxy_client_aborts_total Total proxied transfers aborted by downstream clients
             \\# TYPE tardigrade_proxy_client_aborts_total counter
@@ -934,6 +1022,76 @@ pub const Metrics = struct {
         return out.toOwnedSlice();
     }
 
+    fn appendTlsBufferPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_buffered_bytes_current Current TLS-owned or adapter-measurable bytes by backend and queue
+            \\# TYPE tardigrade_tls_buffered_bytes_current gauge
+            \\
+        );
+        inline for (.{ encrypted_stream.BackendKind.openssl, encrypted_stream.BackendKind.pure_zig_record }) |backend| {
+            inline for (.{ TlsQueue.inbound_ciphertext, TlsQueue.inbound_plaintext, TlsQueue.outbound_ciphertext, TlsQueue.handshake }) |queue| {
+                try out.print("tardigrade_tls_buffered_bytes_current{{backend=\"{s}\",queue=\"{s}\"}} {d}\n", .{
+                    tlsBackendLabel(backend),
+                    tlsQueueLabel(queue),
+                    self.tls_buffered_bytes_current[tlsBackendIndex(backend)][tlsQueueIndex(queue)],
+                });
+            }
+        }
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_buffer_pause_events_total TLS buffer pause transitions by backend and direction
+            \\# TYPE tardigrade_tls_buffer_pause_events_total counter
+            \\
+        );
+        inline for (.{ encrypted_stream.BackendKind.openssl, encrypted_stream.BackendKind.pure_zig_record }) |backend| {
+            inline for (.{ TlsDirection.carrier_read, TlsDirection.plaintext_write }) |direction| {
+                try out.print("tardigrade_tls_buffer_pause_events_total{{backend=\"{s}\",direction=\"{s}\"}} {d}\n", .{
+                    tlsBackendLabel(backend),
+                    tlsDirectionLabel(direction),
+                    self.tls_buffer_pause_events[tlsBackendIndex(backend)][tlsDirectionIndex(direction)],
+                });
+            }
+        }
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_buffer_resume_events_total TLS buffer resume transitions by backend and direction
+            \\# TYPE tardigrade_tls_buffer_resume_events_total counter
+            \\
+        );
+        inline for (.{ encrypted_stream.BackendKind.openssl, encrypted_stream.BackendKind.pure_zig_record }) |backend| {
+            inline for (.{ TlsDirection.carrier_read, TlsDirection.plaintext_write }) |direction| {
+                try out.print("tardigrade_tls_buffer_resume_events_total{{backend=\"{s}\",direction=\"{s}\"}} {d}\n", .{
+                    tlsBackendLabel(backend),
+                    tlsDirectionLabel(direction),
+                    self.tls_buffer_resume_events[tlsBackendIndex(backend)][tlsDirectionIndex(direction)],
+                });
+            }
+        }
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_buffer_limit_exceeded_total TLS buffer hard-limit exceedance events by backend and queue
+            \\# TYPE tardigrade_tls_buffer_limit_exceeded_total counter
+            \\
+        );
+        inline for (.{ encrypted_stream.BackendKind.openssl, encrypted_stream.BackendKind.pure_zig_record }) |backend| {
+            inline for (.{ TlsQueue.inbound_ciphertext, TlsQueue.inbound_plaintext, TlsQueue.outbound_ciphertext, TlsQueue.handshake }) |queue| {
+                try out.print("tardigrade_tls_buffer_limit_exceeded_total{{backend=\"{s}\",queue=\"{s}\"}} {d}\n", .{
+                    tlsBackendLabel(backend),
+                    tlsQueueLabel(queue),
+                    self.tls_buffer_limit_exceeded[tlsBackendIndex(backend)][tlsQueueIndex(queue)],
+                });
+            }
+        }
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_buffer_stalled_drives_total TLS drive calls that made no progress while backpressured
+            \\# TYPE tardigrade_tls_buffer_stalled_drives_total counter
+            \\
+        );
+        inline for (.{ encrypted_stream.BackendKind.openssl, encrypted_stream.BackendKind.pure_zig_record }) |backend| {
+            try out.print("tardigrade_tls_buffer_stalled_drives_total{{backend=\"{s}\"}} {d}\n", .{
+                tlsBackendLabel(backend),
+                self.tls_buffer_stalled_drives[tlsBackendIndex(backend)],
+            });
+        }
+    }
+
     /// Format metrics as a JSON string.
     /// Caller owns the returned memory.
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
@@ -1002,6 +1160,69 @@ pub const Metrics = struct {
         return out.toOwnedSlice();
     }
 };
+
+fn zeroTlsQueueMatrix() [tls_backend_count][tls_queue_count]u64 {
+    return .{.{0} ** tls_queue_count} ** tls_backend_count;
+}
+
+fn zeroTlsDirectionMatrix() [tls_backend_count][tls_direction_count]u64 {
+    return .{.{0} ** tls_direction_count} ** tls_backend_count;
+}
+
+fn tlsBackendIndex(backend: encrypted_stream.BackendKind) usize {
+    return switch (backend) {
+        .openssl => 0,
+        .pure_zig_record => 1,
+    };
+}
+
+fn tlsQueueIndex(queue: TlsQueue) usize {
+    return switch (queue) {
+        .inbound_ciphertext => 0,
+        .inbound_plaintext => 1,
+        .outbound_ciphertext => 2,
+        .handshake => 3,
+    };
+}
+
+fn tlsDirectionIndex(direction: TlsDirection) usize {
+    return switch (direction) {
+        .carrier_read => 0,
+        .plaintext_write => 1,
+    };
+}
+
+fn tlsBackendLabel(backend: encrypted_stream.BackendKind) []const u8 {
+    return switch (backend) {
+        .openssl => "openssl",
+        .pure_zig_record => "pure_zig_record",
+    };
+}
+
+fn tlsQueueLabel(queue: TlsQueue) []const u8 {
+    return switch (queue) {
+        .inbound_ciphertext => "inbound_ciphertext",
+        .inbound_plaintext => "inbound_plaintext",
+        .outbound_ciphertext => "outbound_ciphertext",
+        .handshake => "handshake",
+    };
+}
+
+fn tlsDirectionLabel(direction: TlsDirection) []const u8 {
+    return switch (direction) {
+        .carrier_read => "carrier_read",
+        .plaintext_write => "plaintext_write",
+    };
+}
+
+fn monotonicDelta(previous: u64, next: u64) u64 {
+    return if (next >= previous) next - previous else next;
+}
+
+fn subtractGauge(slot: *u64, amount: usize) void {
+    const value: u64 = @intCast(amount);
+    slot.* = if (value >= slot.*) 0 else slot.* - value;
+}
 
 // Tests
 
@@ -1099,6 +1320,44 @@ test "Metrics proxy buffer release reports accounting underflow" {
     m.recordProxyBufferedRequest(8, 0);
     try std.testing.expectError(error.BufferAccountingUnderflow, m.releaseProxyBufferedBytes(9));
     try std.testing.expectEqual(@as(u64, 8), m.proxy_buffered_bytes_current);
+}
+
+test "Metrics TLS buffer observation applies current bytes and counter deltas once" {
+    var m = Metrics.init();
+    var state = TlsBufferConnectionMetrics{};
+    const backend = encrypted_stream.BackendKind.pure_zig_record;
+    const backend_idx = tlsBackendIndex(backend);
+
+    const snapshot = encrypted_stream.BufferSnapshot{
+        .current = .{
+            .inbound_ciphertext = 11,
+            .inbound_plaintext = 7,
+            .outbound_ciphertext = 13,
+            .handshake = 3,
+        },
+        .counters = .{
+            .inbound_read_pauses = 1,
+            .inbound_read_resumes = 1,
+            .plaintext_write_pauses = 2,
+            .plaintext_write_resumes = 1,
+            .hard_limits = .{ .outbound_ciphertext = 1 },
+            .stalled_drives = 4,
+        },
+    };
+
+    m.observeTlsBufferSnapshot(&state, backend, snapshot);
+    m.observeTlsBufferSnapshot(&state, backend, snapshot);
+
+    try std.testing.expectEqual(@as(u64, 11), m.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_ciphertext)]);
+    try std.testing.expectEqual(@as(u64, 13), m.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.outbound_ciphertext)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_buffer_pause_events[backend_idx][tlsDirectionIndex(.carrier_read)]);
+    try std.testing.expectEqual(@as(u64, 2), m.tls_buffer_pause_events[backend_idx][tlsDirectionIndex(.plaintext_write)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_buffer_limit_exceeded[backend_idx][tlsQueueIndex(.outbound_ciphertext)]);
+    try std.testing.expectEqual(@as(u64, 4), m.tls_buffer_stalled_drives[backend_idx]);
+
+    m.releaseTlsBufferSnapshot(&state);
+    try std.testing.expectEqual(@as(u64, 0), m.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_ciphertext)]);
+    try std.testing.expectEqual(@as(u64, 0), m.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.outbound_ciphertext)]);
 }
 
 test "recordErrorCode counts only the canonical overload label" {

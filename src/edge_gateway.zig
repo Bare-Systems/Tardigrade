@@ -114,6 +114,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE,
         .max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes,
         .proxy_buffer_limits = cfg.proxy_buffer_limits,
+        .tls_buffer_limits = cfg.tls_buffer_limits,
         .upstream_rr_index = 0,
         .upstream_backup_rr_index = 0,
         .lb_random_state = 0x9e3779b97f4a7c15 ^ @as(u64, @intCast(http.event_loop.monotonicMs())),
@@ -1008,11 +1009,12 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             return;
         }
         const tls_protocol_policy = gprotocol_policy.listenerPolicyFromConfig(cfg);
-        const native = http.native_tls_connection.NativeTlsConnection.create(
+        const native = http.native_tls_connection.NativeTlsConnection.createWithOptions(
             ctx.state.allocator,
             client_fd,
             tls_protocol_policy,
             native_provider,
+            .{ .buffer_limits = cfg.tls_buffer_limits },
         ) catch |err| {
             ctx.state.logger.warn(null, "native tls connection setup failed: {}", .{err});
             return;
@@ -1033,6 +1035,8 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             .release_config_fn = activeReleaseConfig,
             .close_ctx = ctx.state,
             .close_fn = activeConnectionCloseHook,
+            .metrics = &ctx.state.metrics,
+            .metrics_mutex = &ctx.state.metrics_mutex,
             .owned_ip = if (owned_connection_ip) |ip| @constCast(ip) else null,
             .allocator = ctx.state.allocator,
             .config_generation = cfg_lease.version.generation,
@@ -1251,12 +1255,20 @@ fn reapActiveConnections(
 
 fn rearmActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection, requested: http.event_loop.Interest) void {
     const fd = managed.fd;
+    if (managed.encryptedWaitFor(requested)) |wait| switch (wait) {
+        .ready_now => {
+            advanceActiveConnection(ctx, managed);
+            return;
+        },
+        .socket, .stalled => {},
+    };
     const interest = managed.updateInterestFor(requested);
     _ = ctx.active.rearm(managed) catch |err| {
         ctx.state.logger.warn(null, "active connection rearm failed: {}", .{err});
         managed.deinit();
         return;
     };
+    if (!interest.read and !interest.write) return;
     ctx.event_loop.add(fd, interest) catch |err| {
         ctx.state.logger.warn(null, "active connection event registration failed: {}", .{err});
         if (ctx.active.checkout(fd)) |taken| {
@@ -1456,8 +1468,11 @@ const WaitingEncryptedHttpConnection = struct {
 
     fn waitFor(self: *WaitingEncryptedHttpConnection, requested: http.event_loop.Interest, timeout_ms: u32) !void {
         const readiness = self.inner.readiness();
-        var interest = http.downstream_connection.combinedInterest(requested, readiness);
-        if (!interest.read and !interest.write) interest = requested;
+        const interest = switch (http.downstream_connection.encryptedWaitForInterest(readiness, requested)) {
+            .ready_now => return,
+            .socket => |socket_interest| socket_interest,
+            .stalled => return error.WouldBlock,
+        };
 
         var events: i16 = std.posix.POLL.ERR | std.posix.POLL.HUP;
         if (interest.read) events |= std.posix.POLL.IN;

@@ -136,6 +136,10 @@ fn keyKindForScheme(scheme: credentials.SignatureScheme) sni_provider.KeyKind {
 }
 
 pub const NativeTlsConnection = struct {
+    pub const Options = struct {
+        buffer_limits: encrypted_stream.BufferLimits = encrypted_stream.BufferLimits.defaults(),
+    };
+
     allocator: std.mem.Allocator,
     fd: std.posix.fd_t,
     backend: *tls_backend.Tls13Backend,
@@ -151,7 +155,18 @@ pub const NativeTlsConnection = struct {
         policy: ListenerProtocolPolicy,
         provider: credentials.CredentialProvider,
     ) !*NativeTlsConnection {
+        return createWithOptions(allocator, fd, policy, provider, .{});
+    }
+
+    pub fn createWithOptions(
+        allocator: std.mem.Allocator,
+        fd: std.posix.fd_t,
+        policy: ListenerProtocolPolicy,
+        provider: credentials.CredentialProvider,
+        options: Options,
+    ) !*NativeTlsConnection {
         if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
+        try options.buffer_limits.validate();
         try setNonBlocking(fd);
         const handshake_entropy = try production_crypto.freshHandshakeEntropy();
 
@@ -181,12 +196,13 @@ pub const NativeTlsConnection = struct {
             .policy = policy,
         };
         self.crypto_provider_state = production_crypto.Provider.init(self.entropy_source.entropy());
-        record.* = encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
+        record.* = try encrypted_stream.PureZigRecordStream.initWithCarrierBackendAndLimits(
             .server,
             self.crypto_provider_state.cryptoProvider(),
             .tls_aes_128_gcm_sha256,
             self.socketCarrier(),
             backend.backend(),
+            options.buffer_limits,
         );
         backend_owned_by_record = true;
         return self;
@@ -401,6 +417,28 @@ test "native TLS owner heap-stabilizes backend record and owns fd close" {
     conn.destroy();
 
     try std.testing.expectError(error.SocketWriteFailed, writeFd(original_fd, "x"));
+}
+
+test "native TLS createWithOptions applies validated buffer limits" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    var limits = encrypted_stream.BufferLimits.defaults();
+    limits.outbound_ciphertext.high = limits.outbound_ciphertext.low + 16;
+    const conn = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .buffer_limits = limits },
+    );
+    defer conn.destroy();
+
+    const snapshot = conn.stream().bufferSnapshot();
+    try std.testing.expect(snapshot.limits_enforced);
+    try std.testing.expectEqual(limits.outbound_ciphertext.high, snapshot.limits.?.outbound_ciphertext.high);
 }
 
 test "native TLS negotiated protocol is unavailable before application data opens" {

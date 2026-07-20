@@ -5,17 +5,21 @@
 //! both derive handshake/application traffic secrets through this shared core.
 
 const std = @import("std");
+const provider = @import("crypto").provider;
 
 const crypto = std.crypto;
 const tls = crypto.tls;
 const Sha256 = crypto.hash.sha2.Sha256;
+const HmacSha384 = crypto.auth.hmac.sha2.HmacSha384;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
+const HkdfSha384 = crypto.kdf.hkdf.Hkdf(HmacSha384);
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const X25519 = crypto.dh.X25519;
 
 pub const TranscriptHash = Sha256;
 pub const hash_len = Sha256.digest_length;
 pub const shared_secret_len = X25519.shared_length;
+pub const Error = error{InvalidSecretLength};
 
 const empty_transcript_hash: [hash_len]u8 = blk: {
     @setEvalBranchQuota(100_000);
@@ -67,6 +71,53 @@ pub const KeySchedule = struct {
             .client = tls.hkdfExpandLabel(HkdfSha256, self.master_secret, "c ap traffic", &finished_transcript_hash, hash_len),
             .server = tls.hkdfExpandLabel(HkdfSha256, self.master_secret, "s ap traffic", &finished_transcript_hash, hash_len),
         };
+    }
+
+    pub fn resumptionMasterSecret(
+        self: *const KeySchedule,
+        handshake_complete_transcript_hash: []const u8,
+        out: []u8,
+    ) Error!void {
+        if (handshake_complete_transcript_hash.len != hash_len or out.len != hash_len)
+            return error.InvalidSecretLength;
+        var secret = tls.hkdfExpandLabel(
+            HkdfSha256,
+            self.master_secret,
+            "res master",
+            handshake_complete_transcript_hash,
+            hash_len,
+        );
+        defer crypto.secureZero(u8, &secret);
+        @memcpy(out, &secret);
+    }
+
+    pub fn resumptionPsk(
+        hash: provider.Hash,
+        resumption_master_secret: []const u8,
+        ticket_nonce: []const u8,
+        out: []u8,
+    ) Error!void {
+        const expected_len = hash.digestLength();
+        if (resumption_master_secret.len != expected_len or out.len != expected_len)
+            return error.InvalidSecretLength;
+        switch (hash) {
+            .sha256 => {
+                var secret: [Sha256.digest_length]u8 = undefined;
+                @memcpy(&secret, resumption_master_secret);
+                defer crypto.secureZero(u8, &secret);
+                var expanded = tls.hkdfExpandLabel(HkdfSha256, secret, "resumption", ticket_nonce, Sha256.digest_length);
+                defer crypto.secureZero(u8, &expanded);
+                @memcpy(out, &expanded);
+            },
+            .sha384 => {
+                var secret: [HmacSha384.mac_length]u8 = undefined;
+                @memcpy(&secret, resumption_master_secret);
+                defer crypto.secureZero(u8, &secret);
+                var expanded = tls.hkdfExpandLabel(HkdfSha384, secret, "resumption", ticket_nonce, HmacSha384.mac_length);
+                defer crypto.secureZero(u8, &expanded);
+                @memcpy(out, &expanded);
+            },
+        }
     }
 
     pub fn finishedKey(traffic_secret: *const [hash_len]u8) [hash_len]u8 {
@@ -126,6 +177,41 @@ test "application traffic secret storage has explicit cleanup" {
     try std.testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&app), 0));
     app.wipe();
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&app), 0));
+}
+
+test "resumption master secret and PSK derivation are deterministic" {
+    const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+    const hello_hash = hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
+    var schedule = KeySchedule.init(&shared, hello_hash);
+    defer schedule.wipe();
+
+    const complete_hash = hexBytes("209145a96ee8e5751f3b7e74e573c01c384cff1b902e8ae503d6d3469c698d1c");
+    var rms: [hash_len]u8 = undefined;
+    defer crypto.secureZero(u8, &rms);
+    try schedule.resumptionMasterSecret(&complete_hash, &rms);
+    try std.testing.expectEqualSlices(u8, &hexBytes("9089b75df5e8d1720f8383601331c07ce14c8b8dbe4ded1511ce84c55ca2396c"), &rms);
+
+    var psk_empty: [hash_len]u8 = undefined;
+    var psk_nonce: [hash_len]u8 = undefined;
+    defer crypto.secureZero(u8, &psk_empty);
+    defer crypto.secureZero(u8, &psk_nonce);
+    try KeySchedule.resumptionPsk(.sha256, &rms, "", &psk_empty);
+    try KeySchedule.resumptionPsk(.sha256, &rms, "\x01", &psk_nonce);
+    try std.testing.expectEqualSlices(u8, &hexBytes("c1392efd98f6932d62f5ccd42c724230871638e8ad0ac9ce9b2af89f5f919fed"), &psk_empty);
+    try std.testing.expectEqualSlices(u8, &hexBytes("54d2811b66ec2ad537c626f21da4d6ed48c5aed25e2fd708e3f17cd08cb71077"), &psk_nonce);
+    try std.testing.expect(!std.mem.eql(u8, &psk_empty, &psk_nonce));
+}
+
+test "resumption PSK supports SHA-384 length and rejects inconsistent lengths" {
+    const rms384 = [_]u8{0x42} ** provider.Hash.sha384.digestLength();
+    var out384: [provider.Hash.sha384.digestLength()]u8 = undefined;
+    defer crypto.secureZero(u8, &out384);
+    try KeySchedule.resumptionPsk(.sha384, &rms384, "nonce", &out384);
+    try std.testing.expectEqualSlices(u8, &hexBytes("e72237478501a59682cd8580d7e2a526847e1e7049a83c3c0f7ef3dc3a950f3d88fb87be1d1e9d2cf94f038cb7b05033"), &out384);
+
+    var short_out: [hash_len - 1]u8 = undefined;
+    try std.testing.expectError(error.InvalidSecretLength, KeySchedule.resumptionPsk(.sha256, &rms384, "nonce", &short_out));
+    try std.testing.expectError(error.InvalidSecretLength, KeySchedule.resumptionPsk(.sha384, rms384[0..hash_len], "nonce", &out384));
 }
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {

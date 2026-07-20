@@ -2758,6 +2758,128 @@ test "driver: server NewSessionTicket uses application CRYPTO retransmission and
     try testing.expectEqualStrings("after", buf[0..request.len]);
 }
 
+test "driver: maximum NewSessionTicket survives real loss reordering PTO and ACK cleanup" {
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        retained: tls_core.session.ClientTicketState = .{},
+        count: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+            self.count += 1;
+        }
+    };
+
+    const allocator = testing.allocator;
+    const limits = tls_core.session.Limits{
+        .max_ticket_len = tls_core.session.absolute_ticket_wire_max,
+        .max_serialized_len = 128 * 1024,
+    };
+    const opaque_ticket = try allocator.alloc(u8, tls_core.session.absolute_ticket_wire_max);
+    defer allocator.free(opaque_ticket);
+    for (opaque_ticket, 0..) |*byte, index| byte.* = @intCast(index % 251);
+
+    var capture = Capture{ .allocator = allocator };
+    defer capture.retained.deinit();
+    var pair = try TestPair.initWithTicketConsumer(allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var server_state = try pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 0x11223344,
+        .ticket_nonce = "\x01\x02",
+        .opaque_ticket = opaque_ticket,
+        .issued_at_unix_ms = 10,
+    }, limits);
+    defer server_state.deinit();
+    try testing.expect(pair.server.crypto_tx[2].data.items.len > max_datagram_size);
+
+    var datagrams = std.ArrayList([]u8).empty;
+    defer {
+        for (datagrams.items) |copy| allocator.free(copy);
+        datagrams.deinit(allocator);
+    }
+    var buf: [max_datagram_size]u8 = undefined;
+    while (pair.server.pollTransmit(&buf, pair.now_us)) |datagram| {
+        const copy = try allocator.dupe(u8, datagram);
+        errdefer allocator.free(copy);
+        try datagrams.append(allocator, copy);
+        pair.now_us += 500;
+    }
+    try testing.expect(datagrams.items.len > 5);
+
+    var index = datagrams.items.len;
+    while (index > 0) {
+        index -= 1;
+        if (index == 1 or index == 3) continue;
+        try pair.client.ingest(datagrams.items[index], pair.now_us);
+        pair.now_us += 500;
+    }
+
+    while (pair.client.pollTransmit(&buf, pair.now_us)) |ack| {
+        try pair.server.ingest(ack, pair.now_us);
+        pair.now_us += 500;
+    }
+    if (pair.server.metrics.packets_lost == 0) {
+        if (pair.server.nextTimeoutUs()) |deadline| pair.now_us = @max(pair.now_us + 1, deadline);
+        pair.server.onTimeout(pair.now_us);
+    }
+    try testing.expect(pair.server.metrics.packets_lost > 0 or pair.server.metrics.pto_count_total > 0);
+
+    var rounds: usize = 0;
+    while (rounds < 400 and capture.count == 0) : (rounds += 1) {
+        try pair.pump();
+        if (capture.count != 0) break;
+        if (pair.server.nextTimeoutUs()) |deadline| {
+            pair.now_us = @max(pair.now_us + 1, deadline);
+            pair.server.onTimeout(pair.now_us);
+        }
+        if (pair.client.nextTimeoutUs()) |deadline| {
+            pair.now_us = @max(pair.now_us + 1, deadline);
+            pair.client.onTimeout(pair.now_us);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), capture.count);
+    try testing.expectEqualSlices(u8, opaque_ticket, capture.retained.ticket.slice());
+    try testing.expectEqualSlices(u8, "\x01\x02", capture.retained.ticket_nonce.slice());
+    try testing.expectEqualSlices(u8, server_state.common.resumption_psk.slice(), capture.retained.common.resumption_psk.slice());
+
+    rounds = 0;
+    while (rounds < 200 and pair.server.crypto_tx[2].data.capacity > 0) : (rounds += 1) {
+        if (pair.client.nextTimeoutUs()) |deadline| {
+            pair.now_us = @max(pair.now_us + 1, deadline);
+            pair.client.onTimeout(pair.now_us);
+        }
+        try pair.pump();
+        if (pair.server.nextTimeoutUs()) |deadline| {
+            pair.now_us = @max(pair.now_us + 1, deadline);
+            pair.server.onTimeout(pair.now_us);
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.items.len);
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.capacity);
+    try testing.expect(pair.server.crypto_tx[2].pending.isEmpty());
+    try testing.expect(pair.server.crypto_tx[2].acked.isEmpty());
+
+    const stream_id = try pair.client.openStream(.bidi);
+    try testing.expectEqual(@as(usize, 5), try pair.client.writeStream(stream_id, "after", true));
+    try pair.pump();
+    try testing.expectEqual(@as(?StreamId, stream_id), pair.server.acceptStream());
+    var stream_buf: [16]u8 = undefined;
+    const request = try pair.server.readStream(stream_id, &stream_buf);
+    try testing.expectEqualStrings("after", stream_buf[0..request.len]);
+}
+
 test "driver: server emits two outstanding tickets in order before ACK" {
     const Capture = struct {
         count: usize = 0,

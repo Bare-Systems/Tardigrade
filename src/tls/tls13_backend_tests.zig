@@ -1070,6 +1070,130 @@ test "record stream drops valid ticket with no consumer and remains usable" {
     try std.testing.expectEqualStrings("afterdrop", app_buf[0..try h.server.stream().read(&app_buf)]);
 }
 
+test "record stream ticket callback clone survives callback return" {
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        retained: session.ClientTicketState = .{},
+        count: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+            self.count += 1;
+        }
+    };
+
+    const h = try SocketHarness.create(.{ .client_chunk = 1024, .server_chunk = 1024 });
+    defer h.destroy();
+    var capture = Capture{ .allocator = std.testing.allocator };
+    defer capture.retained.deinit();
+    try h.client_engine.setSessionTicketConsumer(std.testing.allocator, session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try h.server_engine.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 0x11223344,
+        .ticket_nonce = "\x01\x02",
+        .opaque_ticket = "clone-ticket",
+        .max_early_data_size = 32,
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default);
+    defer server_state.deinit();
+    const ticket_event = sink.items[0].handshake_bytes;
+    try h.server.applyEvent(.{ .handshake_bytes = .{ .epoch = ticket_event.epoch, .data = ticket_event.data } });
+
+    var rounds: usize = 0;
+    while (rounds < 1000 and capture.count == 0) : (rounds += 1) {
+        _ = try h.server.stream().drive();
+        _ = try h.client.stream().drive();
+    }
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualSlices(u8, "clone-ticket", capture.retained.ticket.slice());
+    try std.testing.expectEqualSlices(u8, "\x01\x02", capture.retained.ticket_nonce.slice());
+    try std.testing.expectEqual(@as(u32, 0x11223344), capture.retained.ticket_age_add);
+    try std.testing.expectEqual(@as(i64, 10), capture.retained.received_at_unix_ms);
+    try std.testing.expectEqual(@as(u32, 60), capture.retained.common.lifetime_seconds);
+    try std.testing.expectEqual(session.EarlyDataPolicy{ .early_data_capable = 32 }, capture.retained.common.early_data);
+    try std.testing.expectEqualSlices(u8, server_state.common.resumption_psk.slice(), capture.retained.common.resumption_psk.slice());
+    try std.testing.expect(capture.retained.common.application_protocol != null);
+    try std.testing.expectEqualSlices(u8, "h2", capture.retained.common.application_protocol.?.slice());
+}
+
+test "record stream ticket callback clone refusal is nonfatal" {
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        storage_refused: bool = false,
+        callbacks: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            var retained: session.ClientTicketState = .{};
+            ticket.cloneInto(self.allocator, &retained) catch {
+                self.storage_refused = true;
+                self.callbacks += 1;
+                return;
+            };
+            retained.deinit();
+            self.callbacks += 1;
+        }
+    };
+
+    const h = try SocketHarness.create(.{ .client_chunk = 1024, .server_chunk = 1024 });
+    defer h.destroy();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var capture = Capture{ .allocator = failing.allocator() };
+    try h.client_engine.setSessionTicketConsumer(std.testing.allocator, session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try h.server_engine.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "refuse-clone",
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default);
+    defer server_state.deinit();
+    const ticket_event = sink.items[0].handshake_bytes;
+    try h.server.applyEvent(.{ .handshake_bytes = .{ .epoch = ticket_event.epoch, .data = ticket_event.data } });
+
+    var rounds: usize = 0;
+    while (rounds < 1000 and capture.callbacks == 0) : (rounds += 1) {
+        _ = try h.server.stream().drive();
+        _ = try h.client.stream().drive();
+    }
+    try std.testing.expect(capture.storage_refused);
+    try std.testing.expectEqual(@as(usize, 1), capture.callbacks);
+
+    try std.testing.expectEqual(@as(usize, 8), try h.client.stream().write("still-ok"));
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.server.readiness().can_read_plaintext;
+        }
+    }.done);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("still-ok", buf[0..try h.server.stream().read(&buf)]);
+}
+
 test "pure-Zig HTTPS HTTP/1.1 bytes enter existing parser through EncryptedStream adapter" {
     const h = try SocketHarness.create(.{
         .client_chunk = 3,

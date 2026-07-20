@@ -2978,6 +2978,54 @@ test "server ticket output failure is atomic and retryable" {
     try std.testing.expectEqual(@as(usize, 1), full_sink.len);
 }
 
+test "server ticket emission allocation failures leave transcript and sink clean" {
+    var saw_injected_failure = false;
+    var saw_success = false;
+
+    for (0..16) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var server = Tls13Backend.initServer(
+            .{ .hello_random = [_]u8{0x63} ** 32, .key_share_seed = [_]u8{0x64} ** 32 },
+            try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+            .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        );
+        server.core.handshake_lifecycle = .complete;
+        try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
+        var sink = EventSink{};
+        const before = server.core.transcriptHash();
+
+        var state = server.emitNewSessionTicket(failing.allocator(), &sink, .{
+            .ticket_lifetime = 60,
+            .ticket_age_add = 1,
+            .ticket_nonce = "\x01",
+            .opaque_ticket = "ticket",
+            .max_early_data_size = 32,
+            .issued_at_unix_ms = 10,
+        }, session.Limits.default) catch |err| {
+            if (!failing.has_induced_failure) return err;
+            saw_injected_failure = true;
+            try std.testing.expectEqual(error.CredentialProviderFailed, err);
+            try std.testing.expectEqualSlices(u8, &before, &server.core.transcriptHash());
+            try std.testing.expectEqual(@as(usize, 0), sink.len);
+            sink.deinit();
+            server.deinit();
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            continue;
+        };
+        saw_success = true;
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 1), sink.len);
+        state.deinit();
+        sink.deinit();
+        server.deinit();
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
+
+    try std.testing.expect(saw_injected_failure);
+    try std.testing.expect(saw_success);
+}
+
 test "large emitted ticket is delivered once after fragmented application receives" {
     const Capture = struct {
         count: usize = 0,

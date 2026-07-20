@@ -458,12 +458,15 @@ test "NewSessionTicket duplicate known and unknown extensions are illegal" {
 
 test "NewSessionTicket encode validates bounds and output size" {
     var buf: [8]u8 = undefined;
+    @memset(&buf, 0xa5);
+    const before = buf;
     try std.testing.expectError(error.OutputTooSmall, encode(.{
         .ticket_lifetime = 1,
         .ticket_age_add = 0,
         .ticket_nonce = "",
         .ticket = "ticket",
     }, &buf));
+    try std.testing.expectEqualSlices(u8, &before, &buf);
     try std.testing.expectError(error.IllegalParameter, encodedLen(.{
         .ticket_lifetime = max_lifetime_seconds + 1,
         .ticket_age_add = 0,
@@ -476,6 +479,107 @@ test "NewSessionTicket encode validates bounds and output size" {
         .ticket_nonce = "",
         .ticket = "",
     }));
+}
+
+test "NewSessionTicket decode rejects every truncated fixture prefix" {
+    var storage: [128]u8 = undefined;
+    const fixture = try encode(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 0x11223344,
+        .ticket_nonce = "\x01\x02",
+        .ticket = "opaque-ticket",
+        .max_early_data_size = 32,
+    }, &storage);
+
+    for (0..fixture.len) |cut| {
+        try std.testing.expectError(error.MalformedHandshake, decode(fixture[0..cut]));
+    }
+    const parsed = try decode(fixture);
+    try std.testing.expectEqual(@as(u32, 60), parsed.ticket_lifetime);
+}
+
+test "NewSessionTicket length field mutation matrix" {
+    const allocator = std.testing.allocator;
+
+    const nonce_255 = try allocator.alloc(u8, 255);
+    defer allocator.free(nonce_255);
+    @memset(nonce_255, 0x01);
+    var nonce_buf: [512]u8 = undefined;
+    const nonce_exact = try encode(.{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = nonce_255, .ticket = "x" }, &nonce_buf);
+    try std.testing.expectEqual(@as(usize, 255), (try decode(nonce_exact)).ticket_nonce.len);
+    const nonce_256 = try allocator.alloc(u8, 256);
+    defer allocator.free(nonce_256);
+    try std.testing.expectError(error.IllegalParameter, encodedLen(.{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = nonce_256, .ticket = "x" }));
+
+    const default_ticket = try allocator.alloc(u8, session.Limits.default.max_ticket_len);
+    defer allocator.free(default_ticket);
+    @memset(default_ticket, 0x02);
+    const absolute_ticket = try allocator.alloc(u8, absolute_ticket_wire_max);
+    defer allocator.free(absolute_ticket);
+    @memset(absolute_ticket, 0x03);
+    const default_buf = try allocator.alloc(u8, try encodedLen(.{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = default_ticket }));
+    defer allocator.free(default_buf);
+    try std.testing.expectEqual(default_ticket.len, (try decode(try encode(.{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = default_ticket }, default_buf))).ticket.len);
+    const absolute_buf = try allocator.alloc(u8, try encodedLen(.{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = absolute_ticket }));
+    defer allocator.free(absolute_buf);
+    try std.testing.expectEqual(absolute_ticket.len, (try decode(try encode(.{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = absolute_ticket }, absolute_buf))).ticket.len);
+    const over_ticket = try allocator.alloc(u8, absolute_ticket_wire_max + 1);
+    defer allocator.free(over_ticket);
+    try std.testing.expectError(error.IllegalParameter, encodedLen(.{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = over_ticket }));
+
+    var empty_ticket = std.ArrayList(u8).empty;
+    defer empty_ticket.deinit(allocator);
+    try appendBaseTicketPrefix(&empty_ticket, 1, 0, "", "");
+    try empty_ticket.appendSlice(allocator, &.{ 0, 0 });
+    try std.testing.expectError(error.MalformedHandshake, decode(empty_ticket.items));
+    var trailing = std.ArrayList(u8).empty;
+    defer trailing.deinit(allocator);
+    try appendBaseTicketPrefix(&trailing, 1, 0, "", "x");
+    try trailing.appendSlice(allocator, &.{ 0, 0, 0xaa });
+    try std.testing.expectError(error.MalformedHandshake, decode(trailing.items));
+
+    var ext_zero = std.ArrayList(u8).empty;
+    defer ext_zero.deinit(allocator);
+    try appendBaseTicketPrefix(&ext_zero, 1, 0, "", "x");
+    try ext_zero.appendSlice(allocator, &.{ 0, 0 });
+    try std.testing.expectEqualSlices(u8, "x", (try decode(ext_zero.items)).ticket);
+    var ext_short = std.ArrayList(u8).empty;
+    defer ext_short.deinit(allocator);
+    try appendBaseTicketPrefix(&ext_short, 1, 0, "", "x");
+    try ext_short.appendSlice(allocator, &.{ 0, 3, 0, 42, 0 });
+    try std.testing.expectError(error.MalformedHandshake, decode(ext_short.items));
+    var ext_over_declared = std.ArrayList(u8).empty;
+    defer ext_over_declared.deinit(allocator);
+    try appendBaseTicketPrefix(&ext_over_declared, 1, 0, "", "x");
+    try ext_over_declared.appendSlice(allocator, &.{ 0, 9 });
+    try appendExtension(&ext_over_declared, ext_early_data, "\x00\x00\x00\x20");
+    try std.testing.expectError(error.MalformedHandshake, decode(ext_over_declared.items));
+
+    inline for (.{ 0, 3, 5 }) |bad_len| {
+        var early = std.ArrayList(u8).empty;
+        defer early.deinit(allocator);
+        try appendBaseTicketPrefix(&early, 1, 0, "", "x");
+        var ext_len: [2]u8 = undefined;
+        std.mem.writeInt(u16, &ext_len, 4 + bad_len, .big);
+        try early.appendSlice(allocator, &ext_len);
+        var payload = [_]u8{0} ** 5;
+        try appendExtension(&early, ext_early_data, payload[0..bad_len]);
+        try std.testing.expectError(error.MalformedHandshake, decode(early.items));
+    }
+    var early_ok = std.ArrayList(u8).empty;
+    defer early_ok.deinit(allocator);
+    try appendBaseTicketPrefix(&early_ok, 1, 0, "", "x");
+    try early_ok.appendSlice(allocator, &.{ 0, 8 });
+    try appendExtension(&early_ok, ext_early_data, "\x00\x00\x00\x20");
+    try std.testing.expectEqual(@as(?u32, 32), (try decode(early_ok.items)).max_early_data_size);
+
+    var lifetime_ok = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 'x', 0, 0 };
+    std.mem.writeInt(u32, lifetime_ok[0..4], max_lifetime_seconds, .big);
+    try std.testing.expectEqual(max_lifetime_seconds, (try decode(&lifetime_ok)).ticket_lifetime);
+    std.mem.writeInt(u32, lifetime_ok[0..4], max_lifetime_seconds + 1, .big);
+    try std.testing.expectError(error.IllegalParameter, decode(&lifetime_ok));
+    std.mem.writeInt(u32, lifetime_ok[0..4], 0, .big);
+    try std.testing.expectEqual(@as(u32, 0), (try decode(&lifetime_ok)).ticket_lifetime);
 }
 
 test "server recoverable state honors caller ticket limits" {
@@ -641,6 +745,97 @@ test "client ticket state derives distinct PSKs for distinct nonces" {
     )).?;
     defer second.deinit();
     try std.testing.expect(!std.mem.eql(u8, first.common.resumption_psk.slice(), second.common.resumption_psk.slice()));
+}
+
+test "ticket owned state builders and clone are allocation-failure clean" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseClientTicketBuild, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseServerTicketBuild, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseClientTicketClone, .{});
+}
+
+fn allocationSweepContext() ConnectionResumptionContext {
+    return .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .server_name = "example.com",
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("leaf"),
+        .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = "transport-compat" },
+        .application_compat = .{ .format_id = 2, .format_version = 1, .bytes = "application-compat" },
+    };
+}
+
+fn exerciseClientTicketBuild(allocator: std.mem.Allocator) !void {
+    const rms = [_]u8{0x42} ** 32;
+    var state = (try buildClientTicketState(
+        allocator,
+        .{
+            .ticket_lifetime = 60,
+            .ticket_age_add = 0x11223344,
+            .ticket_nonce = "\x01\x02",
+            .ticket = "client-owned-ticket",
+            .max_early_data_size = 32,
+        },
+        allocationSweepContext(),
+        &rms,
+        1234,
+        session.Limits.default,
+    )).?;
+    defer state.deinit();
+    try std.testing.expectEqualSlices(u8, "client-owned-ticket", state.ticket.slice());
+    try std.testing.expectEqualSlices(u8, "\x01\x02", state.ticket_nonce.slice());
+    try std.testing.expectEqualStrings("example.com", state.common.server_name.?.slice());
+    try std.testing.expectEqualStrings("h2", state.common.application_protocol.?.slice());
+    try std.testing.expect(state.common.transport_compat != null);
+    try std.testing.expect(state.common.application_compat != null);
+}
+
+fn exerciseServerTicketBuild(allocator: std.mem.Allocator) !void {
+    const rms = [_]u8{0x42} ** 32;
+    var state = try buildServerRecoverableState(
+        allocator,
+        .{
+            .ticket_lifetime = 60,
+            .ticket_age_add = 0x11223344,
+            .ticket_nonce = "\x01\x02",
+            .ticket = "server-owned-ticket",
+            .max_early_data_size = 32,
+        },
+        allocationSweepContext(),
+        &rms,
+        1234,
+        session.Limits.default,
+    );
+    defer state.deinit();
+    try std.testing.expectEqualStrings("example.com", state.common.server_name.?.slice());
+    try std.testing.expectEqualStrings("h2", state.common.application_protocol.?.slice());
+    try std.testing.expect(state.common.transport_compat != null);
+    try std.testing.expect(state.common.application_compat != null);
+}
+
+fn exerciseClientTicketClone(allocator: std.mem.Allocator) !void {
+    const rms = [_]u8{0x42} ** 32;
+    var source = (try buildClientTicketState(
+        std.testing.allocator,
+        .{
+            .ticket_lifetime = 60,
+            .ticket_age_add = 0x11223344,
+            .ticket_nonce = "\x01\x02",
+            .ticket = "clone-owned-ticket",
+            .max_early_data_size = 32,
+        },
+        allocationSweepContext(),
+        &rms,
+        1234,
+        session.Limits.default,
+    )).?;
+    defer source.deinit();
+
+    var clone: session.ClientTicketState = .{};
+    try source.cloneInto(allocator, &clone);
+    defer clone.deinit();
+    try std.testing.expectEqualSlices(u8, source.ticket.slice(), clone.ticket.slice());
+    try std.testing.expectEqualSlices(u8, source.ticket_nonce.slice(), clone.ticket_nonce.slice());
+    try std.testing.expectEqualSlices(u8, source.common.resumption_psk.slice(), clone.common.resumption_psk.slice());
 }
 
 fn appendBaseTicketPrefix(

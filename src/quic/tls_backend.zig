@@ -402,6 +402,11 @@ test "QUIC adapter owns CID binding round trip" {
     try std.testing.expectEqualDeep(local, peer);
 }
 
+test "QUIC TLS backend does not embed maximum ticket storage" {
+    try std.testing.expect(@sizeOf(Tls13Backend) < 128 * 1024);
+    try std.testing.expect(@sizeOf(Tls13Backend) < tls_core.tls13_transport.max_new_session_ticket_message_len);
+}
+
 test "QUIC adapter teardown wipes private scratch, parameters, and shared engine ownership" {
     const entropy = Entropy{ .hello_random = [_]u8{0x31} ** 32, .key_share_seed = [_]u8{0x32} ** 32 };
     var backend = Tls13Backend.initServer(
@@ -527,6 +532,73 @@ test "QUIC handshake owner tears down shared and adapter storage on success" {
     harness.deinit();
     try expectQuicBackendWiped(&harness.client_backend);
     try expectQuicBackendWiped(&harness.server_backend);
+}
+
+test "QUIC TLS backend delivers large post-handshake tickets through application CRYPTO chunks" {
+    const Capture = struct {
+        count: usize = 0,
+        psk: [hash_len]u8 = undefined,
+        ticket_len: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            @memcpy(&self.psk, ticket.common.resumption_psk.slice());
+            self.ticket_len = ticket.ticket.slice().len;
+        }
+    };
+
+    var harness = try RealHandshakeHarness.init();
+    defer harness.deinit();
+    var capture = Capture{};
+    const limits = tls_core.session.Limits{ .max_ticket_len = 20 * 1024, .max_serialized_len = 32 * 1024 };
+    try harness.client_backend.engine.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    try harness.wire();
+    try harness.run();
+
+    const opaque_ticket = try std.testing.allocator.alloc(u8, 20 * 1024);
+    defer std.testing.allocator.free(opaque_ticket);
+    @memset(opaque_ticket, 0xa5);
+
+    var shared_sink = RecordSink{};
+    defer shared_sink.deinit();
+    var server_state = try harness.server_backend.engine.emitNewSessionTicket(std.testing.allocator, &shared_sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = opaque_ticket,
+        .issued_at_unix_ms = 10,
+    }, limits);
+    defer server_state.deinit();
+    try std.testing.expect(shared_sink.items[0].handshake_bytes.data.len > 16 * 1024);
+
+    var quic_sink = EventSink{};
+    defer quic_sink.deinit();
+    try translate(&shared_sink, &quic_sink);
+    try std.testing.expectEqual(@as(usize, 1), quic_sink.len);
+    try harness.server_adapter.queueHandshakeOutput(
+        quic_sink.items[0].handshake_bytes.epoch,
+        quic_sink.items[0].handshake_bytes.data,
+    );
+
+    var chunks: usize = 0;
+    var buf: [4096]u8 = undefined;
+    while (try harness.server.pollOutput(.application, &buf)) |out| {
+        chunks += 1;
+        try harness.client.onCrypto(.application, out.offset, out.bytes);
+    }
+    try std.testing.expect(chunks > 1);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(opaque_ticket.len, capture.ticket_len);
+    try std.testing.expectEqualSlices(u8, server_state.common.resumption_psk.slice(), &capture.psk);
 }
 
 fn quicSniConfig(patterns: []const []const u8, chain: []const []const u8) tls_core.sni_provider.CredentialBundleConfig {

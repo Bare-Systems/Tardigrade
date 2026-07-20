@@ -178,7 +178,35 @@ pub const Bridge = struct {
     }
 
     pub fn sealHandshake(self: *Bridge, epoch: events.EncryptionEpoch, bytes: []const u8, out: []u8) Error![]const u8 {
-        return self.sealProtected(epoch, .handshake, bytes, out);
+        if (bytes.len <= record_codec.max_plaintext_fragment_len) {
+            return self.sealProtected(epoch, .handshake, bytes, out);
+        }
+        return switch (epoch) {
+            .initial => blk: {
+                if (self.initial_discarded) return error.UnsupportedRecordEpoch;
+                const needed = plaintextHandshakeRecordLen(bytes.len);
+                if (out.len < needed) return error.RecordBufferOverflow;
+                var in_pos: usize = 0;
+                var out_pos: usize = 0;
+                while (in_pos < bytes.len) {
+                    const take = @min(record_codec.max_plaintext_fragment_len, bytes.len - in_pos);
+                    const record = try record_codec.encodePlaintextRecord(.handshake, bytes[in_pos..][0..take], out[out_pos..]);
+                    in_pos += take;
+                    out_pos += record.len;
+                }
+                break :blk out[0..out_pos];
+            },
+            .handshake => blk: {
+                const write = self.writeHandshake() orelse return error.MissingWriteKeys;
+                break :blk try sealHandshakeFragments(write, bytes, out);
+            },
+            .application => blk: {
+                if (!self.handshake_complete) return error.HandshakeNotComplete;
+                const write = self.writeApplication() orelse return error.MissingWriteKeys;
+                break :blk try sealHandshakeFragments(write, bytes, out);
+            },
+            .zero_rtt => error.UnsupportedRecordEpoch,
+        };
     }
 
     pub fn sealProtected(
@@ -326,6 +354,38 @@ fn clearWrite(slot: *?record_protection.WriteState) void {
     slot.* = null;
 }
 
+fn plaintextHandshakeRecordLen(bytes_len: usize) usize {
+    const chunks = (bytes_len + record_codec.max_plaintext_fragment_len - 1) / record_codec.max_plaintext_fragment_len;
+    return bytes_len + chunks * record_codec.header_len;
+}
+
+fn protectedHandshakeRecordLen(write: *const record_protection.WriteState, bytes_len: usize) usize {
+    const chunks = (bytes_len + record_codec.max_plaintext_fragment_len - 1) / record_codec.max_plaintext_fragment_len;
+    return bytes_len + chunks * (record_codec.header_len + 1 + write.keys.profile.aead.tagLength());
+}
+
+fn sealHandshakeFragments(
+    write: *record_protection.WriteState,
+    bytes: []const u8,
+    out: []u8,
+) Error![]const u8 {
+    if (write.exhausted) return error.SequenceExhausted;
+    const chunks = (bytes.len + record_codec.max_plaintext_fragment_len - 1) / record_codec.max_plaintext_fragment_len;
+    if (chunks > 0 and chunks - 1 > std.math.maxInt(u64) - write.sequence) return error.SequenceExhausted;
+    const needed = protectedHandshakeRecordLen(write, bytes.len);
+    if (out.len < needed) return error.RecordBufferOverflow;
+
+    var in_pos: usize = 0;
+    var out_pos: usize = 0;
+    while (in_pos < bytes.len) {
+        const take = @min(record_codec.max_plaintext_fragment_len, bytes.len - in_pos);
+        const record = try write.seal(.handshake, bytes[in_pos..][0..take], 0, out[out_pos..]);
+        in_pos += take;
+        out_pos += record.len;
+    }
+    return out[0..out_pos];
+}
+
 fn parseSingleRecord(mode: record_codec.RecordMode, bytes: []const u8) Error!record_codec.Record {
     if (bytes.len < record_codec.header_len) return error.TruncatedRecord;
     const header = try record_codec.parseHeader(bytes[0..record_codec.header_len], mode, .strict);
@@ -428,6 +488,52 @@ test "record epoch bridge drives event loopback across plaintext, handshake, app
     try testing.expectEqualStrings("new session ticket", opened_post_handshake.inner.content);
     try testing.expectEqual(@as(u64, 1), server.write_application.?.sequence);
     try testing.expectEqual(@as(u64, 1), client.read_application.?.sequence);
+}
+
+test "record epoch bridge fragments large post-handshake messages into multiple records" {
+    const cp = testProvider();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+
+    const hs = secret(0x71);
+    const app = secret(0x72);
+    try server.installTrafficSecret(.handshake, .read, &hs);
+    try server.installTrafficSecret(.handshake, .write, &hs);
+    try server.installTrafficSecret(.application, .read, &app);
+    try server.installTrafficSecret(.application, .write, &app);
+    try server.discardEpoch(.initial);
+    try server.discardEpoch(.handshake);
+    try server.markHandshakeComplete();
+
+    try client.installTrafficSecret(.handshake, .read, &hs);
+    try client.installTrafficSecret(.handshake, .write, &hs);
+    try client.installTrafficSecret(.application, .read, &app);
+    try client.installTrafficSecret(.application, .write, &app);
+    try client.discardEpoch(.initial);
+    try client.discardEpoch(.handshake);
+    try client.markHandshakeComplete();
+
+    const payload = [_]u8{0xa5} ** (record_codec.max_plaintext_fragment_len + 33);
+    var protected: [record_codec.max_ciphertext_record_len * 3]u8 = undefined;
+    const records = try server.sealHandshake(.application, &payload, &protected);
+
+    var parser = record_codec.Parser.init(.ciphertext);
+    var sink = record_codec.RecordSink(4, record_codec.max_ciphertext_fragment_len * 4){};
+    try parser.feed(records, &sink);
+    try testing.expectEqual(@as(usize, 2), sink.len);
+
+    var opened_buf: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    var reassembled: [payload.len]u8 = undefined;
+    var offset: usize = 0;
+    for (sink.items[0..sink.len]) |record| {
+        const opened = try client.openHandshake(.application, record, &opened_buf);
+        @memcpy(reassembled[offset..][0..opened.inner.content.len], opened.inner.content);
+        offset += opened.inner.content.len;
+    }
+    try testing.expectEqual(payload.len, offset);
+    try testing.expectEqualSlices(u8, &payload, &reassembled);
 }
 
 test "record epoch bridge rejects early, duplicate, missing, and unsupported transitions" {

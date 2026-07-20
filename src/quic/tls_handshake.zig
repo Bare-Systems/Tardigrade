@@ -47,7 +47,7 @@ const TransportContract = tls_core.transport.ContractWithOptions(
     EncryptionLevel,
     HandshakeError,
     16,
-    16 * 1024,
+    tls_core.tls13_transport.max_event_bytes,
     error.HandshakeBufferOverflow,
 );
 

@@ -63,7 +63,7 @@ pub const BuildError =
 pub const BuildServerError =
     key_schedule.Error ||
     session.ResumableSessionCommon.InitError ||
-    error{ InvalidLimits, TicketTooLarge };
+    error{ InvalidLimits, TicketTooLarge, IllegalParameter };
 
 pub fn encodedLen(params: EmitParams) EncodeError!usize {
     try validateEmitParams(params);
@@ -123,12 +123,12 @@ pub fn decode(body: []const u8) DecodeError!Parsed {
     try r.expectEnd();
 
     var ext_reader = Reader{ .bytes = extensions };
+    var seen_extensions = ExtensionSeenSet{};
     var max_early_data_size: ?u32 = null;
     while (!ext_reader.atEnd()) {
-        const prefix_len = ext_reader.pos;
         const ext_type = try ext_reader.readU16();
         const ext_body = try ext_reader.slice(try ext_reader.readU16());
-        if (try extensionSeen(extensions[0..prefix_len], ext_type)) return error.IllegalParameter;
+        if (seen_extensions.mark(ext_type)) return error.IllegalParameter;
         if (ext_type == ext_early_data) {
             if (ext_body.len != 4) return error.MalformedHandshake;
             max_early_data_size = readIntU32(ext_body[0..4]);
@@ -199,6 +199,7 @@ pub fn buildServerRecoverableState(
     limits: session.Limits,
 ) BuildServerError!session.ServerRecoverableState {
     try limits.validate();
+    validateEmitParams(params) catch return error.IllegalParameter;
     if (params.ticket_lifetime == 0) return error.InvalidLifetime;
     if (params.ticket.len == 0 or params.ticket.len > limits.max_ticket_len) return error.TicketTooLarge;
     const hash = algorithms.transcriptHash(connection.cipher_suite);
@@ -285,15 +286,17 @@ const Reader = struct {
     }
 };
 
-fn extensionSeen(prefix: []const u8, target: u16) DecodeError!bool {
-    var r = Reader{ .bytes = prefix };
-    while (!r.atEnd()) {
-        const ext_type = try r.readU16();
-        _ = try r.slice(try r.readU16());
-        if (ext_type == target) return true;
+const ExtensionSeenSet = struct {
+    bits: [std.math.maxInt(u16) / 8 + 1]u8 = [_]u8{0} ** (std.math.maxInt(u16) / 8 + 1),
+
+    fn mark(self: *ExtensionSeenSet, ext_type: u16) bool {
+        const index: usize = @intCast(ext_type / 8);
+        const mask: u8 = @as(u8, 1) << @intCast(ext_type % 8);
+        const duplicate = (self.bits[index] & mask) != 0;
+        self.bits[index] |= mask;
+        return duplicate;
     }
-    return false;
-}
+};
 
 fn readIntU16(bytes: []const u8) u16 {
     return std.mem.readInt(u16, bytes[0..2], .big);
@@ -534,7 +537,7 @@ test "server recoverable state honors caller ticket limits" {
     const one_over = try std.testing.allocator.alloc(u8, absolute_ticket_wire_max + 1);
     defer std.testing.allocator.free(one_over);
     @memset(one_over, 0x5b);
-    try std.testing.expectError(error.TicketTooLarge, buildServerRecoverableState(
+    try std.testing.expectError(error.IllegalParameter, buildServerRecoverableState(
         std.testing.allocator,
         .{
             .ticket_lifetime = 1,
@@ -546,6 +549,36 @@ test "server recoverable state honors caller ticket limits" {
         &rms,
         1,
         .{ .max_ticket_len = absolute_ticket_wire_max },
+    ));
+
+    var nonce_255 = [_]u8{0x01} ** 255;
+    var nonce_256 = [_]u8{0x02} ** 256;
+    var nonce_state = try buildServerRecoverableState(
+        std.testing.allocator,
+        .{
+            .ticket_lifetime = 1,
+            .ticket_age_add = 0,
+            .ticket_nonce = &nonce_255,
+            .ticket = "ticket",
+        },
+        context,
+        &rms,
+        1,
+        session.Limits.default,
+    );
+    nonce_state.deinit();
+    try std.testing.expectError(error.IllegalParameter, buildServerRecoverableState(
+        std.testing.allocator,
+        .{
+            .ticket_lifetime = 1,
+            .ticket_age_add = 0,
+            .ticket_nonce = &nonce_256,
+            .ticket = "ticket",
+        },
+        context,
+        &rms,
+        1,
+        session.Limits.default,
     ));
 }
 
@@ -569,6 +602,45 @@ test "lifetime zero parses but does not build cacheable client state" {
         session.Limits.default,
     );
     try std.testing.expectEqual(@as(?session.ClientTicketState, null), state);
+}
+
+test "client ticket state derives distinct PSKs for distinct nonces" {
+    const context: ConnectionResumptionContext = .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("leaf"),
+    };
+    const rms = [_]u8{0x42} ** 32;
+    var first = (try buildClientTicketState(
+        std.testing.allocator,
+        .{
+            .ticket_lifetime = 60,
+            .ticket_age_add = 0,
+            .ticket_nonce = "\x01",
+            .ticket = "ticket-1",
+            .max_early_data_size = null,
+        },
+        context,
+        &rms,
+        10,
+        session.Limits.default,
+    )).?;
+    defer first.deinit();
+    var second = (try buildClientTicketState(
+        std.testing.allocator,
+        .{
+            .ticket_lifetime = 60,
+            .ticket_age_add = 0,
+            .ticket_nonce = "\x02",
+            .ticket = "ticket-2",
+            .max_early_data_size = null,
+        },
+        context,
+        &rms,
+        10,
+        session.Limits.default,
+    )).?;
+    defer second.deinit();
+    try std.testing.expect(!std.mem.eql(u8, first.common.resumption_psk.slice(), second.common.resumption_psk.slice()));
 }
 
 fn appendBaseTicketPrefix(

@@ -19,6 +19,7 @@ const http_request = @import("http_request");
 const record_codec = tls_core.record_codec;
 const events = tls_core.events;
 const credentials = tls_core.credentials;
+const session = tls_core.session;
 const sni_provider = tls_core.sni_provider;
 
 fn clientEntropy() tls_backend.Entropy {
@@ -411,6 +412,75 @@ test "direct shared driver preserves derivation, sequence, discard, and teardown
     try expectDirectSinkWiped(&harness.server_driver, server_used);
     try std.testing.expect(std.mem.allEqual(u8, &harness.client_backend.entropy.key_share_seed, 0));
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&harness.server_backend.identity), 0));
+}
+
+test "direct record handshake delivers large post-handshake ticket once" {
+    const Capture = struct {
+        count: usize = 0,
+        psk: [tls_backend.hash_len]u8 = undefined,
+        ticket_len: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            @memcpy(&self.psk, ticket.common.resumption_psk.slice());
+            self.ticket_len = ticket.ticket.slice().len;
+        }
+    };
+
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    var capture = Capture{};
+    const limits = session.Limits{ .max_ticket_len = 20 * 1024, .max_serialized_len = 32 * 1024 };
+    try harness.client_backend.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    try harness.run();
+
+    const opaque_ticket = try std.testing.allocator.alloc(u8, 20 * 1024);
+    defer std.testing.allocator.free(opaque_ticket);
+    @memset(opaque_ticket, 0xa5);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try harness.server_backend.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = opaque_ticket,
+        .issued_at_unix_ms = 10,
+    }, limits);
+    defer server_state.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+
+    const ticket_event = sink.items[0].handshake_bytes;
+    try std.testing.expect(ticket_event.data.len > record_codec.max_plaintext_fragment_len);
+    var protected: [record_codec.max_ciphertext_record_len * 3]u8 = undefined;
+    const records = (try harness.server_bridge.applyEvent(.{ .handshake_bytes = .{
+        .epoch = ticket_event.epoch,
+        .data = ticket_event.data,
+    } }, &protected)).?;
+
+    var parser = record_codec.Parser.init(.ciphertext);
+    var record_sink = record_codec.RecordSink(4, record_codec.max_ciphertext_fragment_len * 4){};
+    try parser.feed(records, &record_sink);
+    try std.testing.expect(record_sink.len > 1);
+
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    for (record_sink.items[0..record_sink.len]) |record| {
+        const opened = try harness.client_bridge.openHandshake(.application, record, &plaintext);
+        const next = try harness.client_driver.receive(.application, opened.inner.content);
+        try std.testing.expectEqual(@as(usize, 0), next.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(opaque_ticket.len, capture.ticket_len);
+    try std.testing.expectEqualSlices(u8, server_state.common.resumption_psk.slice(), &capture.psk);
 }
 
 test "direct shared driver cleanup wipes secrets after record authentication failure" {

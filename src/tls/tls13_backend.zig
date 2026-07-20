@@ -51,6 +51,73 @@ pub const max_message_len = 8 * 1024;
 /// Largest framed post-handshake NewSessionTicket message: a 65535-byte opaque
 /// ticket identity plus its handshake header and small fixed/vector fields.
 pub const max_new_session_ticket_message_len = tls13_transport.max_new_session_ticket_message_len;
+const handshake_header_len = 4;
+
+const PostHandshakeInput = struct {
+    allocator: ?std.mem.Allocator = null,
+    header: [handshake_header_len]u8 = undefined,
+    header_len: usize = 0,
+    buf: []u8 = &.{},
+    len: usize = 0,
+
+    fn setAllocator(self: *PostHandshakeInput, allocator: std.mem.Allocator) void {
+        self.allocator = allocator;
+    }
+
+    fn deinit(self: *PostHandshakeInput) void {
+        if (self.buf.len > 0) {
+            crypto.secureZero(u8, self.buf);
+            self.allocator.?.free(self.buf);
+        }
+        if (self.header_len > 0) crypto.secureZero(u8, self.header[0..self.header_len]);
+        self.* = .{};
+    }
+
+    fn append(self: *PostHandshakeInput, bytes: []const u8) HandshakeError!usize {
+        if (self.buf.len > 0 and self.len == self.buf.len) return 0;
+        var rest = bytes;
+        const original_len = bytes.len;
+        while (rest.len > 0) {
+            if (self.buf.len == 0) {
+                if (self.header_len < handshake_header_len) {
+                    const take = @min(handshake_header_len - self.header_len, rest.len);
+                    @memcpy(self.header[self.header_len..][0..take], rest[0..take]);
+                    self.header_len += take;
+                    rest = rest[take..];
+                    if (self.header_len < handshake_header_len) return original_len - rest.len;
+                }
+                const body_len: usize = @intCast(std.mem.readInt(u24, self.header[1..4], .big));
+                const frame_len = handshake_header_len + body_len;
+                if (frame_len > max_new_session_ticket_message_len) return error.HandshakeBufferOverflow;
+                const allocator = self.allocator orelse return error.InvalidHandshakeState;
+                self.buf = allocator.alloc(u8, frame_len) catch return error.CredentialProviderFailed;
+                @memcpy(self.buf[0..handshake_header_len], &self.header);
+                self.len = handshake_header_len;
+                crypto.secureZero(u8, &self.header);
+                self.header_len = 0;
+            }
+            const take = @min(self.buf.len - self.len, rest.len);
+            @memcpy(self.buf[self.len..][0..take], rest[0..take]);
+            self.len += take;
+            rest = rest[take..];
+            if (self.len == self.buf.len) break;
+        }
+        return original_len - rest.len;
+    }
+
+    fn peek(self: *PostHandshakeInput) tls_handshake_codec.Error!?tls_handshake_codec.Message {
+        if (self.buf.len == 0 or self.len < self.buf.len) return null;
+        return try tls_handshake_codec.decode(self.buf[0..self.len]);
+    }
+
+    fn discard(self: *PostHandshakeInput, len: usize) tls_handshake_codec.Error!void {
+        if (self.buf.len == 0 or len != self.buf.len) return error.MalformedHandshake;
+        crypto.secureZero(u8, self.buf);
+        self.allocator.?.free(self.buf);
+        self.buf = &.{};
+        self.len = 0;
+    }
+};
 pub const max_certificate_len = 2048;
 /// The Certificate handshake message's fixed framing overhead, counted in the
 /// flight-size preflight so a chain cannot pass validation and then overflow the
@@ -415,14 +482,12 @@ pub const Tls13Backend = struct {
     /// own flight is sent).
     expected_client_verify: [hash_len]u8 = undefined,
     /// Reassembled-but-unparsed handshake bytes per transport epoch; a message
-    /// may arrive split across TLS records or QUIC CRYPTO frames. The
-    /// application-level
-    /// buffer exists because post-handshake messages (NewSessionTicket) may be
-    /// fragmented across application-epoch transport chunks like any other
-    /// handshake message.
+    /// may arrive split across TLS records or QUIC CRYPTO frames.
     initial_input: tls_handshake_codec.Reassembler(max_message_len + 4) = .{},
     handshake_input: tls_handshake_codec.Reassembler(max_message_len + 4) = .{},
-    application_input: tls_handshake_codec.Reassembler(max_new_session_ticket_message_len) = .{},
+    /// Post-handshake messages can be much larger than main-handshake flights,
+    /// so their storage is allocated lazily after the declared length is known.
+    application_input: PostHandshakeInput = .{},
     /// The peer's reassembled certificate chain (immutable DER, surfaced to the
     /// verifier as views). `entries` index into `peer_chain`.
     peer_chain: [max_peer_chain_bytes]u8 = undefined,
@@ -607,11 +672,17 @@ pub const Tls13Backend = struct {
     ) HandshakeError!void {
         if (self.role != .client) return error.InvalidHandshakeState;
         limits.validate() catch return error.InvalidTransportProfile;
+        self.application_input.setAllocator(allocator);
         self.session_ticket_consumer = .{
             .allocator = allocator,
             .limits = limits,
             .consumer = consumer,
         };
+    }
+
+    pub fn setPostHandshakeAllocator(self: *Tls13Backend, allocator: std.mem.Allocator) HandshakeError!void {
+        if (self.role != .client) return error.InvalidHandshakeState;
+        self.application_input.setAllocator(allocator);
     }
 
     pub fn backend(self: *Tls13Backend) TlsBackend {
@@ -729,10 +800,9 @@ pub const Tls13Backend = struct {
         self.peer_transport_extension_pending = false;
         crypto.secureZero(u8, std.mem.asBytes(&self.initial_input));
         crypto.secureZero(u8, std.mem.asBytes(&self.handshake_input));
-        crypto.secureZero(u8, std.mem.asBytes(&self.application_input));
+        self.application_input.deinit();
         self.initial_input = .{};
         self.handshake_input = .{};
-        self.application_input = .{};
         crypto.secureZero(u8, std.mem.asBytes(&self.core));
         self.core = tls_handshake_codec.Core.init(self.role);
         self.core.handshake_lifecycle = .failed;
@@ -777,9 +847,8 @@ pub const Tls13Backend = struct {
             .zero_rtt => return error.UnexpectedTransportEpoch,
             .application => {
                 if (self.core.handshake_lifecycle != .complete) return error.UnexpectedTransportEpoch;
-                self.application_input.append(bytes) catch |err| return mapCoreError(err);
                 if (self.pending_op != null) return;
-                return self.drainInput(&self.application_input, level, sink);
+                return self.receivePostHandshake(bytes, sink);
             },
             .initial, .handshake => {},
         }
@@ -803,6 +872,17 @@ pub const Tls13Backend = struct {
         // handshake before the verdict resolves.
         if (self.pending_op != null) return;
         try self.drainInput(input, level, sink);
+    }
+
+    fn receivePostHandshake(self: *Tls13Backend, bytes: []const u8, sink: *EventSink) HandshakeError!void {
+        var rest = bytes;
+        while (rest.len > 0) {
+            const consumed = try self.application_input.append(rest);
+            rest = rest[consumed..];
+            try self.drainInput(&self.application_input, .application, sink);
+            if (consumed == 0) break;
+            if (self.pending_op != null) break;
+        }
     }
 
     /// Consume whole handshake messages from a reassembly buffer, dispatching
@@ -939,7 +1019,7 @@ pub const Tls13Backend = struct {
             self.resumption_master_secret.slice(),
             received_at,
             configured.limits,
-        ) catch return;
+        ) catch |err| return mapTicketBuildClientError(err);
         if (state) |*ticket| {
             defer ticket.deinit();
             configured.consumer.onTicketFn(configured.consumer.ctx, ticket);
@@ -2365,6 +2445,8 @@ pub const Tls13Backend = struct {
         };
         const body_len = new_session_ticket.encodedLen(emit_params) catch |err| return mapTicketEncodeError(err);
         if (body_len > max_new_session_ticket_message_len - 4) return error.TransportBufferOverflow;
+        const message_len = handshake_header_len + body_len;
+        if (message_len > EventSink.max_bytes) return error.TransportBufferOverflow;
 
         var state = new_session_ticket.buildServerRecoverableState(
             allocator,
@@ -2376,14 +2458,17 @@ pub const Tls13Backend = struct {
         ) catch |err| return mapTicketBuildServerError(err);
         errdefer state.deinit();
 
-        var buf: [max_new_session_ticket_message_len]u8 = undefined;
-        defer crypto.secureZero(u8, &buf);
-        var w = Writer{ .buf = &buf };
+        const buf = allocator.alloc(u8, message_len) catch return error.CredentialProviderFailed;
+        defer {
+            crypto.secureZero(u8, buf);
+            allocator.free(buf);
+        }
+        var w = Writer{ .buf = buf };
         try w.u8_(@intFromEnum(MessageType.new_session_ticket));
-        const message_len = try w.reserve(3);
+        const body_len_index = try w.reserve(3);
         const body = new_session_ticket.encode(emit_params, buf[w.len..]) catch |err| return mapTicketEncodeError(err);
         w.len += body.len;
-        w.patch(3, message_len);
+        w.patch(3, body_len_index);
         const message = buf[0..w.len];
         try sink.emitCrypto(.application, message);
         self.core.transcript.update(message);
@@ -2415,6 +2500,7 @@ fn mapTicketEncodeError(err: new_session_ticket.EncodeError) HandshakeError {
 
 fn mapTicketBuildServerError(err: new_session_ticket.BuildServerError) HandshakeError {
     return switch (err) {
+        error.IllegalParameter => error.IllegalParameter,
         error.InvalidSecretLength => error.SecretExportFailed,
         error.TicketTooLarge => error.TicketTooLarge,
         error.InvalidLimits => error.InvalidTransportProfile,
@@ -2427,6 +2513,27 @@ fn mapTicketBuildServerError(err: new_session_ticket.BuildServerError) Handshake
         error.InvalidLifetime,
         error.InvalidEarlyDataPolicy,
         error.CompatSnapshotTooLarge,
+        => error.InvalidTransportProfile,
+    };
+}
+
+fn mapTicketBuildClientError(err: new_session_ticket.BuildError) HandshakeError!void {
+    return switch (err) {
+        error.OutOfMemory,
+        error.TicketTooLarge,
+        error.CompatSnapshotTooLarge,
+        => {},
+        error.InvalidSecretLength,
+        error.InvalidPskLength,
+        => error.SecretExportFailed,
+        error.InvalidLimits,
+        error.InvalidDnsName,
+        error.EmptyServerName,
+        error.AlpnProtocolTooLarge,
+        error.EmptyApplicationProtocol,
+        error.NonceTooLarge,
+        error.InvalidLifetime,
+        error.InvalidEarlyDataPolicy,
         => error.InvalidTransportProfile,
     };
 }
@@ -2512,6 +2619,11 @@ fn buildMaxNewSessionTicketMessage(allocator: std.mem.Allocator) ![]u8 {
 /// Deterministic local server identity fixture — see `credentials.testdata`.
 /// Re-exported here so existing callers and tests keep their spelling.
 pub const testdata = credentials.testdata;
+
+test "TLS-owned backend does not embed maximum ticket storage" {
+    try std.testing.expect(@sizeOf(Tls13Backend) < 64 * 1024);
+    try std.testing.expect(@sizeOf(Tls13Backend) + EventSink.max_bytes < max_new_session_ticket_message_len);
+}
 
 test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
     var backend = Tls13Backend.initClient(
@@ -2717,6 +2829,38 @@ test "client NewSessionTicket callback receives owned state and lifetime zero is
     try std.testing.expectEqual(@as(usize, 1), capture.count);
 }
 
+test "client parses and drops NewSessionTicket when no consumer is configured" {
+    var backend = Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0x45} ** 32, .key_share_seed = [_]u8{0x46} ** 32 },
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+    );
+    defer backend.deinit();
+    backend.core.handshake_lifecycle = .complete;
+    try backend.setPostHandshakeAllocator(std.testing.allocator);
+
+    var body_buf: [128]u8 = undefined;
+    const body = try new_session_ticket.encode(.{
+        .ticket_lifetime = 120,
+        .ticket_age_add = 0,
+        .ticket_nonce = "\x01",
+        .ticket = "drop-me",
+    }, &body_buf);
+    var msg_buf: [132]u8 = undefined;
+    var w = Writer{ .buf = &msg_buf };
+    try w.u8_(@intFromEnum(MessageType.new_session_ticket));
+    const body_len = try w.reserve(3);
+    try w.bytes(body);
+    w.patch(3, body_len);
+    const message = w.written();
+    var sink = EventSink{};
+    defer sink.deinit();
+    try backend.backend().receive(.application, message[0..5], &sink);
+    try backend.backend().receive(.application, message[5..], &sink);
+    try std.testing.expectEqual(@as(usize, 0), backend.application_input.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.application_input.buf.len);
+}
+
 test "server explicitly emits NewSessionTicket and returns recoverable state" {
     var server = Tls13Backend.initServer(
         .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x52} ** 32 },
@@ -2873,6 +3017,7 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
     );
     defer client.deinit();
     client.core.handshake_lifecycle = .complete;
+    try client.setPostHandshakeAllocator(std.testing.allocator);
 
     const max_message = try buildMaxNewSessionTicketMessage(std.testing.allocator);
     defer std.testing.allocator.free(max_message);
@@ -2890,9 +3035,12 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
     );
     defer over_client.deinit();
     over_client.core.handshake_lifecycle = .complete;
+    try over_client.setPostHandshakeAllocator(std.testing.allocator);
     const over = try std.testing.allocator.alloc(u8, max_new_session_ticket_message_len + 1);
     defer std.testing.allocator.free(over);
     @memset(over, 0);
+    over[0] = @intFromEnum(MessageType.new_session_ticket);
+    std.mem.writeInt(u24, over[1..4], max_new_session_ticket_message_len - 3, .big);
     try std.testing.expectError(error.HandshakeBufferOverflow, over_client.backend().receive(.application, over, &sink));
 }
 

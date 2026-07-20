@@ -20,12 +20,16 @@ pub const Error = events.HandshakeError || messages.ReadError || messages.WriteE
 pub const max_new_session_ticket_message_len =
     4 + 4 + 4 + 1 + session.max_ticket_nonce_len + 2 + session.absolute_ticket_wire_max + 2 + (std.math.maxInt(u16) - 1);
 
+/// The shared engine event sink stays small enough to embed in transport
+/// wrappers while still allowing tickets that cross a single TLS record.
+pub const max_event_bytes = 32 * 1024;
+
 pub const Contract = transport.ContractWithOptions(
     void,
     events.EncryptionEpoch,
     Error,
     16,
-    max_new_session_ticket_message_len,
+    max_event_bytes,
     error.TransportBufferOverflow,
 );
 pub const Backend = Contract.Backend;

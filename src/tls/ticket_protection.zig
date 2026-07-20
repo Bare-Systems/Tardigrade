@@ -19,12 +19,13 @@ pub const fixed_header_len = 36;
 pub const tag_len = provider.aead_tag_len;
 pub const envelope_overhead = fixed_header_len + tag_len;
 pub const max_keys = 16;
-pub const max_lease_history = max_keys * 4;
 
 const aad_prefix = "tardigrade/tls-ticket/v1\x00";
+const key_fingerprint_domain = "tardigrade/tls-ticket/key-fingerprint/v1\x00";
 
 pub const KeyId = [key_id_len]u8;
 const TicketKeySecret = secrets.FixedSecret(provider.max_aead_key_len);
+const KeyFingerprint = [32]u8;
 
 pub const ParseError = error{
     MalformedEnvelope,
@@ -394,7 +395,7 @@ const LeaseHighWater = struct {
     end_exclusive: u64,
     has_lease: bool,
     aead: provider.Aead,
-    key: TicketKeySecret,
+    key_fingerprint: KeyFingerprint,
 
     fn init(record: *const KeyRecord) LeaseHighWater {
         return .{
@@ -403,12 +404,8 @@ const LeaseHighWater = struct {
             .end_exclusive = if (record.nonce_lease) |*value| value.currentEnd() else 0,
             .has_lease = record.nonce_lease != null,
             .aead = record.aead,
-            .key = record.key.copy(),
+            .key_fingerprint = fingerprintKey(record.aead, record.key.slice()),
         };
-    }
-
-    fn deinit(self: *LeaseHighWater) void {
-        self.key.deinit();
     }
 };
 
@@ -417,8 +414,7 @@ pub const ReloadableKeyRing = struct {
     mutex: SpinMutex = .{},
     current: ?*Snapshot = null,
     next_generation: u64 = 1,
-    ledger: [max_lease_history]LeaseHighWater = undefined,
-    ledger_len: usize = 0,
+    ledger: std.ArrayList(LeaseHighWater) = .empty,
     observer: ?Observer = null,
 
     pub fn init(allocator: std.mem.Allocator) ReloadableKeyRing {
@@ -429,11 +425,12 @@ pub const ReloadableKeyRing = struct {
         self.mutex.lock();
         const retired = self.current;
         self.current = null;
-        const ledger_len = self.ledger_len;
-        self.ledger_len = 0;
+        const ledger = self.ledger;
+        self.ledger = .empty;
         self.mutex.unlock();
         if (retired) |snapshot| snapshot.release();
-        for (self.ledger[0..ledger_len]) |*entry| entry.deinit();
+        var mutable_ledger = ledger;
+        mutable_ledger.deinit(self.allocator);
     }
 
     pub fn buildSnapshot(self: *ReloadableKeyRing, configs: []const KeyConfig, caps: provider.Capabilities) SnapshotError!*Snapshot {
@@ -504,18 +501,20 @@ pub const ReloadableKeyRing = struct {
     }
 
     fn validateReplacementLocked(self: *ReloadableKeyRing, replacement: *Snapshot) SnapshotError!void {
+        var new_ledger_entries: usize = 0;
         for (replacement.keys, 0..) |*key, i| {
             for (replacement.keys[0..i]) |*prior| {
                 if (prior.aead == key.aead and prior.key.eql(&key.key)) return error.DuplicateKeyId;
             }
 
+            const key_fingerprint = fingerprintKey(key.aead, key.key.slice());
             if (self.findLedger(&key.id)) |entry| {
-                if (entry.aead != key.aead or !entry.key.eql(&key.key)) return error.DuplicateKeyId;
+                if (entry.aead != key.aead or !std.mem.eql(u8, &entry.key_fingerprint, &key_fingerprint)) return error.DuplicateKeyId;
             } else {
-                for (self.ledger[0..self.ledger_len]) |*entry| {
-                    if (entry.aead == key.aead and entry.key.eql(&key.key)) return error.DuplicateKeyId;
+                for (self.ledger.items) |*entry| {
+                    if (entry.aead == key.aead and std.mem.eql(u8, &entry.key_fingerprint, &key_fingerprint)) return error.DuplicateKeyId;
                 }
-                if (self.ledger_len >= self.ledger.len) return error.TooManyKeys;
+                new_ledger_entries += 1;
             }
 
             if (key.nonce_lease) |*lease| {
@@ -541,30 +540,30 @@ pub const ReloadableKeyRing = struct {
                 }
             }
         }
+        self.ledger.ensureUnusedCapacity(self.allocator, new_ledger_entries) catch return error.OutOfMemory;
     }
 
     fn updateLedgerLocked(self: *ReloadableKeyRing, snapshot: *Snapshot) void {
         for (snapshot.keys) |*key| {
             if (self.findLedgerIndex(&key.id)) |idx| {
                 if (key.nonce_lease) |*lease| {
-                    self.ledger[idx].has_lease = true;
-                    self.ledger[idx].prefix = lease.prefix;
-                    self.ledger[idx].end_exclusive = @max(self.ledger[idx].end_exclusive, lease.currentEnd());
+                    self.ledger.items[idx].has_lease = true;
+                    self.ledger.items[idx].prefix = lease.prefix;
+                    self.ledger.items[idx].end_exclusive = @max(self.ledger.items[idx].end_exclusive, lease.currentEnd());
                 }
-            } else if (self.ledger_len < self.ledger.len) {
-                self.ledger[self.ledger_len] = LeaseHighWater.init(key);
-                self.ledger_len += 1;
+            } else {
+                self.ledger.appendAssumeCapacity(LeaseHighWater.init(key));
             }
         }
     }
 
     fn findLedger(self: *const ReloadableKeyRing, key_id: *const KeyId) ?*const LeaseHighWater {
-        if (self.findLedgerIndex(key_id)) |idx| return &self.ledger[idx];
+        if (self.findLedgerIndex(key_id)) |idx| return &self.ledger.items[idx];
         return null;
     }
 
     fn findLedgerIndex(self: *const ReloadableKeyRing, key_id: *const KeyId) ?usize {
-        for (self.ledger[0..self.ledger_len], 0..) |entry, i| {
+        for (self.ledger.items, 0..) |entry, i| {
             if (std.mem.eql(u8, &entry.key_id, key_id)) return i;
         }
         return null;
@@ -597,9 +596,11 @@ pub const Protector = struct {
         self: *const Protector,
         state: *const session.ServerRecoverableState,
     ) SealError!usize {
+        self.limits.validate() catch return error.InvalidInternalState;
         const plaintext_len = session.serverEncodedLenWithLimits(state, self.limits) catch |err| switch (err) {
             error.StateTooLarge => return error.SerializedStateTooLarge,
-            error.InvalidLimits, error.TooManyFields, error.FieldTooLarge, error.InvalidState => return error.SerializedStateTooLarge,
+            error.InvalidLimits => return error.InvalidInternalState,
+            error.TooManyFields, error.FieldTooLarge, error.InvalidState => return error.SerializedStateTooLarge,
             error.BufferTooSmall => unreachable,
         };
         return checkedProtectedLen(plaintext_len, self.limits);
@@ -785,6 +786,19 @@ fn ticketExpiresWithinKey(state: *const session.ServerRecoverableState, key_decr
     const expires: i128 = @as(i128, state.common.issued_at_unix_ms) +
         @as(i128, state.common.lifetime_seconds) * 1000;
     return expires <= @as(i128, key_decrypt_until_unix_ms);
+}
+
+fn fingerprintKey(aead: provider.Aead, key: []const u8) KeyFingerprint {
+    var out: KeyFingerprint = undefined;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(key_fingerprint_domain);
+    hasher.update(&[_]u8{encodeAeadId(aead)});
+    var len_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &len_bytes, @intCast(key.len), .big);
+    hasher.update(&len_bytes);
+    hasher.update(key);
+    hasher.final(&out);
+    return out;
 }
 
 fn writeHeader(out: []u8, aead: provider.Aead, key_id: *const KeyId, nonce: *const [provider.aead_nonce_len]u8) void {
@@ -1109,6 +1123,76 @@ test "nonce ledger rejects same key under a different id" {
 
     const changed_id = sampleKeyConfig(keyId(15), .aes_128_gcm, .{ .prefix = .{ 8, 8, 8, 8 }, .start = 0, .end_exclusive = 10 });
     try testing.expectError(error.DuplicateKeyId, keyring.install(try keyring.buildSnapshot(&.{changed_id}, testCapabilities())));
+}
+
+test "nonce ledger does not retain full retired key bytes after final snapshot release" {
+    var backing = [_]u8{0xcc} ** 16384;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const allocator = fba.allocator();
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+
+    const retired_key = [_]u8{0x55} ** 16;
+    const active = KeyConfig{
+        .id = keyId(17),
+        .aead = .aes_128_gcm,
+        .key_bytes = &retired_key,
+        .not_before_unix_ms = 1_000,
+        .encrypt_until_unix_ms = 5_000,
+        .decrypt_until_unix_ms = 20_000,
+        .nonce_lease = .{ .prefix = .{ 1, 7, 0, 0 }, .start = 0, .end_exclusive = 10 },
+    };
+    try keyring.install(try keyring.buildSnapshot(&.{active}, testCapabilities()));
+
+    const retained = keyring.acquireCurrent().?;
+    const replacement = sampleKeyConfigWithByte(keyId(18), .aes_128_gcm, .{ .prefix = .{ 1, 8, 0, 0 }, .start = 0, .end_exclusive = 10 }, 0x13);
+    try keyring.install(try keyring.buildSnapshot(&.{replacement}, testCapabilities()));
+    retained.release();
+
+    try testing.expect(std.mem.indexOf(u8, &backing, &retired_key) == null);
+    try testing.expectEqual(@as(usize, 2), keyring.ledger.items.len);
+}
+
+test "nonce ledger supports more than fixed live-snapshot rotations" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+
+    var key_storage: [70][16]u8 = undefined;
+    for (&key_storage, 0..) |*bytes, i| {
+        @memset(bytes, @intCast(i + 1));
+        const config = KeyConfig{
+            .id = keyId(@intCast(i + 40)),
+            .aead = .aes_128_gcm,
+            .key_bytes = bytes,
+            .not_before_unix_ms = 1_000,
+            .encrypt_until_unix_ms = 5_000,
+            .decrypt_until_unix_ms = 20_000,
+            .nonce_lease = .{ .prefix = .{ 2, 0, 0, @intCast(i) }, .start = 0, .end_exclusive = 10 },
+        };
+        try keyring.install(try keyring.buildSnapshot(&.{config}, testCapabilities()));
+    }
+    try testing.expectEqual(@as(usize, 70), keyring.ledger.items.len);
+}
+
+test "invalid issuance limits fail before reserving a nonce" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const config = sampleKeyConfig(keyId(19), .aes_128_gcm, .{ .prefix = .{ 1, 9, 0, 0 }, .start = 0, .end_exclusive = 3 });
+    try keyring.install(try keyring.buildSnapshot(&.{config}, testCapabilities()));
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    protector.limits.max_fields = 0;
+    try testing.expectError(error.InvalidInternalState, protector.protectedLen(&state));
+    var ticket_buf = [_]u8{0} ** 512;
+    try testing.expectError(error.InvalidInternalState, protector.seal(allocator, &state, 2_000, &ticket_buf));
+
+    protector.limits = session.Limits.default;
+    const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, ticket[24..36]);
 }
 
 test "resolve treats invalid limits and decode allocation failure as local errors" {

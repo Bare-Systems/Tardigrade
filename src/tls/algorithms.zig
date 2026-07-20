@@ -5,6 +5,8 @@
 //! particular transport or provider.
 
 const std = @import("std");
+const crypto = @import("crypto");
+const crypto_provider = crypto.provider;
 
 pub const ProtocolVersion = enum(u16) {
     tls13 = 0x0304,
@@ -17,6 +19,18 @@ pub const CipherSuite = enum(u16) {
     tls_aes_256_gcm_sha384 = 0x1302,
     tls_chacha20_poly1305_sha256 = 0x1303,
 };
+
+/// The canonical transcript/HKDF hash for a cipher suite, expressed as the
+/// existing provider-neutral `crypto.provider.Hash` identity (not a second
+/// TLS-local hash vocabulary). Callers must derive this from the cipher
+/// suite rather than persisting or selecting a hash independently, so the
+/// two can never disagree.
+pub fn transcriptHash(suite: CipherSuite) crypto_provider.Hash {
+    return switch (suite) {
+        .tls_aes_128_gcm_sha256, .tls_chacha20_poly1305_sha256 => .sha256,
+        .tls_aes_256_gcm_sha384 => .sha384,
+    };
+}
 
 pub const NamedGroup = enum(u16) {
     x25519 = 0x001d,
@@ -64,4 +78,13 @@ test "registry exposes current TLS identifiers" {
     try std.testing.expectEqual(@as(u16, 0x001d), @intFromEnum(NamedGroup.x25519));
     try std.testing.expectEqual(@as(u16, 0x0807), @intFromEnum(SignatureScheme.ed25519));
     try std.testing.expect(alpn.h3.eql(.{ .bytes = "h3" }));
+}
+
+test "transcriptHash derives the correct provider Hash and digest length per suite" {
+    try std.testing.expectEqual(crypto_provider.Hash.sha256, transcriptHash(.tls_aes_128_gcm_sha256));
+    try std.testing.expectEqual(crypto_provider.Hash.sha256, transcriptHash(.tls_chacha20_poly1305_sha256));
+    try std.testing.expectEqual(crypto_provider.Hash.sha384, transcriptHash(.tls_aes_256_gcm_sha384));
+
+    try std.testing.expectEqual(@as(usize, 32), transcriptHash(.tls_aes_128_gcm_sha256).digestLength());
+    try std.testing.expectEqual(@as(usize, 48), transcriptHash(.tls_aes_256_gcm_sha384).digestLength());
 }

@@ -18,6 +18,31 @@ pub const CipherSuite = enum(u16) {
     tls_chacha20_poly1305_sha256 = 0x1303,
 };
 
+/// Transcript/HKDF hash identifiers a `CipherSuite` can bind to. Callers must
+/// derive this from the cipher suite (`transcriptHash`) rather than
+/// persisting or selecting it independently, so the two can never disagree.
+pub const TranscriptHash = enum {
+    sha256,
+    sha384,
+
+    pub fn digestLen(self: TranscriptHash) usize {
+        return switch (self) {
+            .sha256 => std.crypto.hash.sha2.Sha256.digest_length,
+            .sha384 => std.crypto.hash.sha2.Sha384.digest_length,
+        };
+    }
+};
+
+/// The canonical transcript/HKDF hash for a cipher suite. This is the single
+/// source of truth other modules (key schedule, resumable-session model)
+/// must use instead of maintaining their own suite-to-hash switch.
+pub fn transcriptHash(suite: CipherSuite) TranscriptHash {
+    return switch (suite) {
+        .tls_aes_128_gcm_sha256, .tls_chacha20_poly1305_sha256 => .sha256,
+        .tls_aes_256_gcm_sha384 => .sha384,
+    };
+}
+
 pub const NamedGroup = enum(u16) {
     x25519 = 0x001d,
     secp256r1 = 0x0017,
@@ -64,4 +89,13 @@ test "registry exposes current TLS identifiers" {
     try std.testing.expectEqual(@as(u16, 0x001d), @intFromEnum(NamedGroup.x25519));
     try std.testing.expectEqual(@as(u16, 0x0807), @intFromEnum(SignatureScheme.ed25519));
     try std.testing.expect(alpn.h3.eql(.{ .bytes = "h3" }));
+}
+
+test "transcriptHash derives the correct hash and digest length per suite" {
+    try std.testing.expectEqual(TranscriptHash.sha256, transcriptHash(.tls_aes_128_gcm_sha256));
+    try std.testing.expectEqual(TranscriptHash.sha256, transcriptHash(.tls_chacha20_poly1305_sha256));
+    try std.testing.expectEqual(TranscriptHash.sha384, transcriptHash(.tls_aes_256_gcm_sha384));
+
+    try std.testing.expectEqual(@as(usize, 32), TranscriptHash.sha256.digestLen());
+    try std.testing.expectEqual(@as(usize, 48), TranscriptHash.sha384.digestLen());
 }

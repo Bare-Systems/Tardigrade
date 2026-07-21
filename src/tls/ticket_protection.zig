@@ -447,17 +447,6 @@ pub const ReloadableKeyRing = struct {
             self.record(.{ .snapshot_rejected = snapshotReason(err) });
             return err;
         };
-        errdefer replacement.release();
-
-        self.mutex.lock();
-        if (self.next_generation == std.math.maxInt(u64)) {
-            self.mutex.unlock();
-            self.record(.{ .snapshot_rejected = .generation_overflow });
-            return error.GenerationOverflow;
-        }
-        replacement.generation = self.next_generation;
-        self.next_generation += 1;
-        self.mutex.unlock();
         return replacement;
     }
 
@@ -477,7 +466,7 @@ pub const ReloadableKeyRing = struct {
                 replacement.release();
                 return;
             }
-            if (replacement.generation <= current.generation) {
+            if (replacement.generation != 0 and replacement.generation <= current.generation) {
                 self.mutex.unlock();
                 replacement.release();
                 self.record(.{ .snapshot_rejected = .stale_generation });
@@ -497,6 +486,16 @@ pub const ReloadableKeyRing = struct {
             self.record(.{ .snapshot_rejected = snapshotReason(err) });
             return err;
         };
+        if (replacement.generation == 0) {
+            if (self.next_generation == std.math.maxInt(u64)) {
+                self.mutex.unlock();
+                replacement.release();
+                self.record(.{ .snapshot_rejected = .generation_overflow });
+                return error.GenerationOverflow;
+            }
+            replacement.generation = self.next_generation;
+            self.next_generation += 1;
+        }
 
         const retired = self.current;
         const installed_generation = replacement.generation;
@@ -695,8 +694,7 @@ pub const Protector = struct {
             return error.OutOfMemory;
         };
         defer {
-            secrets.secureZero(plaintext);
-            allocator.free(plaintext);
+            zeroAndFree(allocator, plaintext);
         }
 
         const encoded = session.encodeServer(state, self.limits, plaintext) catch |err| switch (err) {
@@ -787,8 +785,7 @@ pub const Protector = struct {
 
         const plaintext = allocator.alloc(u8, parsed.ciphertext.len) catch return error.OutOfMemory;
         defer {
-            secrets.secureZero(plaintext);
-            allocator.free(plaintext);
+            zeroAndFree(allocator, plaintext);
         }
 
         var aad: [aad_prefix.len + fixed_header_len]u8 = undefined;
@@ -863,6 +860,15 @@ fn checkedProtectedLen(plaintext_len: usize, limits: session.Limits) SealError!u
     if (total > limits.max_ticket_len) return error.TicketTooLarge;
     if (total > session.absolute_ticket_wire_max) return error.TicketTooLarge;
     return total;
+}
+
+fn zeroAndFree(allocator: std.mem.Allocator, buffer: []u8) void {
+    for (buffer) |*byte| {
+        const volatile_byte: *volatile u8 = @ptrCast(byte);
+        volatile_byte.* = 0;
+    }
+    for (buffer) |byte| std.debug.assert(byte == 0);
+    allocator.rawFree(buffer, .fromByteUnits(@alignOf(u8)), @returnAddress());
 }
 
 fn ticketExpiresWithinKey(state: *const session.ServerRecoverableState, key_decrypt_until_unix_ms: i64) bool {
@@ -1163,6 +1169,69 @@ const ConcurrentSealTask = struct {
     }
 };
 
+const ZeroCheckingAllocator = struct {
+    child: std.mem.Allocator,
+    free_count: usize = 0,
+
+    fn init(child: std.mem.Allocator) ZeroCheckingAllocator {
+        return .{ .child = child };
+    }
+
+    fn allocator(self: *ZeroCheckingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ZeroCheckingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ZeroCheckingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *ZeroCheckingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ZeroCheckingAllocator = @ptrCast(@alignCast(ctx));
+        for (memory) |byte| {
+            if (byte != 0) @panic("secret-bearing allocation was not zeroized before free");
+        }
+        self.free_count += 1;
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+};
+
+fn buildAuthenticatedEnvelope(
+    out: []u8,
+    aead: provider.Aead,
+    key_id: KeyId,
+    key: []const u8,
+    nonce: [provider.aead_nonce_len]u8,
+    plaintext: []const u8,
+) ![]const u8 {
+    const protected_len = envelope_overhead + plaintext.len;
+    if (out.len < protected_len) return error.BufferTooSmall;
+    writeHeader(out[0..fixed_header_len], aead, &key_id, &nonce);
+    var aad: [aad_prefix.len + fixed_header_len]u8 = undefined;
+    buildAad(out[0..fixed_header_len], &aad);
+    const ciphertext = out[fixed_header_len .. fixed_header_len + plaintext.len];
+    const tag = out[fixed_header_len + plaintext.len .. protected_len];
+    try testProvider().aeadSeal(aead, key, &nonce, &aad, plaintext, ciphertext, tag);
+    return out[0..protected_len];
+}
+
 test "AEAD id mapping is stable and not enum ordinal dependent" {
     try testing.expectEqual(@as(u8, 1), encodeAeadId(.aes_128_gcm));
     try testing.expectEqual(@as(u8, 2), encodeAeadId(.aes_256_gcm));
@@ -1341,6 +1410,48 @@ test "decrypt windows are enforced at exact boundaries" {
     try expectResolveFalseUnchanged(&protector, allocator, ticket, 20_000);
 }
 
+test "authenticated session state rejections are distinct from key-window misses" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    try installSingleKey(&keyring, keyId(39), .aes_128_gcm, .{ .prefix = .{ 3, 9, 0, 0 }, .start = 0, .end_exclusive = 8 }, 0x11);
+
+    var observer = TestObserver{};
+    defer observer.deinit(allocator);
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default, .observer = observer.observer() };
+    var ticket_buf = [_]u8{0} ** 512;
+
+    var future_state = try sampleServerState(allocator);
+    defer future_state.deinit();
+    future_state.common.issued_at_unix_ms = 3_000;
+    const future_ticket = try protector.seal(allocator, &future_state, 2_000, &ticket_buf);
+    observer.reset();
+    try expectResolveFalseUnchanged(&protector, allocator, future_ticket, 2_000);
+    try observer.expectOnly(.{ .resolve_rejected = .not_yet_valid });
+
+    var expired_state = try sampleServerState(allocator);
+    defer expired_state.deinit();
+    expired_state.common.issued_at_unix_ms = 1_000;
+    expired_state.common.lifetime_seconds = 1;
+    const expired_ticket = try protector.seal(allocator, &expired_state, 1_500, &ticket_buf);
+    observer.reset();
+    try expectResolveFalseUnchanged(&protector, allocator, expired_ticket, 2_000);
+    try observer.expectOnly(.{ .resolve_rejected = .expired });
+
+    var invalid_buf = [_]u8{0} ** 128;
+    const invalid_ticket = try buildAuthenticatedEnvelope(
+        &invalid_buf,
+        .aes_128_gcm,
+        keyId(39),
+        testKeyBytes(.aes_128_gcm, 0x11),
+        [_]u8{ 3, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 99 },
+        "not a session record",
+    );
+    observer.reset();
+    try expectResolveFalseUnchanged(&protector, allocator, invalid_ticket, 2_000);
+    try observer.expectOnly(.{ .resolve_rejected = .invalid_plaintext });
+}
+
 test "ticket identity size boundaries reject malformed envelopes" {
     const allocator = testing.allocator;
     var keyring = ReloadableKeyRing.init(allocator);
@@ -1430,6 +1541,28 @@ test "replacement snapshot rejects overlapping nonce lease and accepts adjacent 
 
     const changed_prefix = sampleKeyConfig(keyId(3), .aes_128_gcm, .{ .prefix = .{ 2, 1, 1, 1 }, .start = 20, .end_exclusive = 30 });
     try testing.expectError(error.OverlappingNonceLease, keyring.install(try keyring.buildSnapshot(&.{changed_prefix}, testCapabilities())));
+}
+
+test "failed install leaves generation current and ledger unchanged" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const first = sampleKeyConfig(keyId(38), .aes_128_gcm, .{ .prefix = .{ 3, 8, 0, 0 }, .start = 0, .end_exclusive = 10 });
+    try keyring.install(try keyring.buildSnapshot(&.{first}, testCapabilities()));
+
+    const before_generation = keyring.next_generation;
+    const before_current = keyring.current.?;
+    const before_ledger_len = keyring.ledger.items.len;
+    const overlap = sampleKeyConfig(keyId(38), .aes_128_gcm, .{ .prefix = .{ 3, 8, 0, 0 }, .start = 9, .end_exclusive = 20 });
+    try testing.expectError(error.OverlappingNonceLease, keyring.install(try keyring.buildSnapshot(&.{overlap}, testCapabilities())));
+    try testing.expectEqual(before_generation, keyring.next_generation);
+    try testing.expectEqual(before_current, keyring.current.?);
+    try testing.expectEqual(before_ledger_len, keyring.ledger.items.len);
+
+    const adjacent = sampleKeyConfig(keyId(38), .aes_128_gcm, .{ .prefix = .{ 3, 8, 0, 0 }, .start = 10, .end_exclusive = 20 });
+    try keyring.install(try keyring.buildSnapshot(&.{adjacent}, testCapabilities()));
+    try testing.expectEqual(before_generation, keyring.current.?.generation);
+    try testing.expectEqual(before_generation + 1, keyring.next_generation);
 }
 
 test "failed snapshot build leaves publication state unchanged" {
@@ -1772,6 +1905,36 @@ test "allocation failures leave nonce and recovered state unchanged" {
     try testing.expectError(error.OutOfMemory, protector.resolve(decode_failing.allocator(), ticket, 2_000, &out));
     try testing.expectEqual(@as(u32, 0), out.ticket_age_add);
     try testing.expectEqual(@as(usize, 0), out.common.resumption_psk.len);
+}
+
+test "seal and invalid-plaintext resolve zeroize plaintext before free" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    try installSingleKey(&keyring, keyId(40), .aes_128_gcm, .{ .prefix = .{ 4, 0, 0, 0 }, .start = 0, .end_exclusive = 3 }, 0x11);
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var ticket_buf = [_]u8{0} ** 512;
+    var seal_zero = ZeroCheckingAllocator.init(allocator);
+    _ = try protector.seal(seal_zero.allocator(), &state, 2_000, &ticket_buf);
+    try testing.expectEqual(@as(usize, 1), seal_zero.free_count);
+
+    var invalid_buf = [_]u8{0} ** 128;
+    const invalid_ticket = try buildAuthenticatedEnvelope(
+        &invalid_buf,
+        .aes_128_gcm,
+        keyId(40),
+        testKeyBytes(.aes_128_gcm, 0x11),
+        [_]u8{ 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 99 },
+        "not a session record",
+    );
+    var out: session.ServerRecoverableState = .{};
+    defer out.deinit();
+    var resolve_zero = ZeroCheckingAllocator.init(allocator);
+    try testing.expect(!try protector.resolve(resolve_zero.allocator(), invalid_ticket, 2_000, &out));
+    try testing.expectEqual(@as(usize, 1), resolve_zero.free_count);
 }
 
 test "resolve treats invalid limits and decode allocation failure as local errors" {

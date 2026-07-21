@@ -499,14 +499,16 @@ pub const ReloadableKeyRing = struct {
         };
 
         const retired = self.current;
+        const installed_generation = replacement.generation;
+        const retired_key_count = if (retired) |snapshot| retiredKeyCount(snapshot, replacement) else 0;
         self.current = replacement;
         self.next_generation = @max(self.next_generation, replacement.generation + 1);
         self.updateLedgerLocked(replacement);
         self.mutex.unlock();
 
-        self.record(.{ .snapshot_installed = replacement.generation });
+        self.record(.{ .snapshot_installed = installed_generation });
         if (retired) |snapshot| {
-            self.recordRetiredKeys(snapshot, replacement);
+            for (0..retired_key_count) |_| self.record(.{ .key_retired = snapshot.generation });
             snapshot.release();
         }
     }
@@ -592,10 +594,12 @@ pub const ReloadableKeyRing = struct {
         if (self.observer) |observer| observer.record(event);
     }
 
-    fn recordRetiredKeys(self: *ReloadableKeyRing, retired: *const Snapshot, replacement: *const Snapshot) void {
+    fn retiredKeyCount(retired: *const Snapshot, replacement: *const Snapshot) usize {
+        var count: usize = 0;
         for (retired.keys) |*old_key| {
-            if (replacement.findKeyConst(&old_key.id) == null) self.record(.{ .key_retired = retired.generation });
+            if (replacement.findKeyConst(&old_key.id) == null) count += 1;
         }
+        return count;
     }
 
     pub fn format(
@@ -1074,6 +1078,91 @@ const TestObserver = struct {
     }
 };
 
+const ReentrantDeinitObserver = struct {
+    keyring: *ReloadableKeyRing,
+    deinit_on_install: bool = true,
+    installed_events: usize = 0,
+    retired_events: usize = 0,
+
+    fn observer(self: *ReentrantDeinitObserver) Observer {
+        return .{ .ctx = self, .recordFn = record };
+    }
+
+    fn record(ctx: *anyopaque, event: Event) void {
+        const self: *ReentrantDeinitObserver = @ptrCast(@alignCast(ctx));
+        switch (event) {
+            .snapshot_installed => {
+                self.installed_events += 1;
+                if (self.deinit_on_install) {
+                    self.deinit_on_install = false;
+                    self.keyring.deinit();
+                }
+            },
+            .key_retired => self.retired_events += 1,
+            else => {},
+        }
+    }
+};
+
+fn installSingleKey(
+    keyring: *ReloadableKeyRing,
+    id: KeyId,
+    aead: provider.Aead,
+    lease: NonceLeaseConfig,
+    byte: u8,
+) !void {
+    const config = sampleKeyConfigWithByte(id, aead, lease, byte);
+    try keyring.install(try keyring.buildSnapshot(&.{config}, testCapabilities()));
+}
+
+fn expectResolveFalseUnchanged(
+    protector: *Protector,
+    allocator: std.mem.Allocator,
+    identity: []const u8,
+    now_unix_ms: i64,
+) !void {
+    var out: session.ServerRecoverableState = .{};
+    defer out.deinit();
+    try testing.expect(!try protector.resolve(allocator, identity, now_unix_ms, &out));
+    try testing.expectEqual(@as(u32, 0), out.ticket_age_add);
+    try testing.expectEqual(@as(usize, 0), out.common.resumption_psk.len);
+}
+
+fn expectRoundTrip(
+    protector: *Protector,
+    allocator: std.mem.Allocator,
+    state: *const session.ServerRecoverableState,
+    ticket: []const u8,
+    now_unix_ms: i64,
+) !void {
+    var recovered: session.ServerRecoverableState = .{};
+    defer recovered.deinit();
+    try testing.expect(try protector.resolve(allocator, ticket, now_unix_ms, &recovered));
+    try testing.expectEqual(state.ticket_age_add, recovered.ticket_age_add);
+    try testing.expectEqual(state.common.lifetime_seconds, recovered.common.lifetime_seconds);
+    try testing.expectEqualSlices(u8, state.common.resumption_psk.slice(), recovered.common.resumption_psk.slice());
+}
+
+const ConcurrentSealTask = struct {
+    protector: *Protector,
+    state: *const session.ServerRecoverableState,
+    start: *std.atomic.Value(bool),
+    successes: *std.atomic.Value(usize),
+    failures: *std.atomic.Value(usize),
+    nonces: *[32][provider.aead_nonce_len]u8,
+
+    fn run(self: *ConcurrentSealTask) void {
+        while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+        var ticket_buf = [_]u8{0} ** 512;
+        const ticket = self.protector.seal(testing.allocator, self.state, 2_000, &ticket_buf) catch {
+            _ = self.failures.fetchAdd(1, .monotonic);
+            return;
+        };
+        const slot = self.successes.fetchAdd(1, .monotonic);
+        if (slot < self.nonces.len) @memcpy(&self.nonces[slot], ticket[24..36]);
+    }
+};
+
 test "AEAD id mapping is stable and not enum ordinal dependent" {
     try testing.expectEqual(@as(u8, 1), encodeAeadId(.aes_128_gcm));
     try testing.expectEqual(@as(u8, 2), encodeAeadId(.aes_256_gcm));
@@ -1156,6 +1245,160 @@ test "seal and resolve round trip and authenticate header fields" {
     try testing.expect(!try protector.resolve(allocator, ticket, 2_000, &untouched));
 }
 
+test "all supported AEADs seal and resolve" {
+    const allocator = testing.allocator;
+    const cases = [_]struct {
+        aead: provider.Aead,
+        key_byte: u8,
+        prefix: [4]u8,
+    }{
+        .{ .aead = .aes_128_gcm, .key_byte = 0x11, .prefix = .{ 3, 1, 0, 0 } },
+        .{ .aead = .aes_256_gcm, .key_byte = 0x22, .prefix = .{ 3, 2, 0, 0 } },
+        .{ .aead = .chacha20_poly1305, .key_byte = 0x33, .prefix = .{ 3, 3, 0, 0 } },
+    };
+
+    for (cases, 0..) |case, i| {
+        var keyring = ReloadableKeyRing.init(allocator);
+        defer keyring.deinit();
+        try installSingleKey(&keyring, keyId(@intCast(30 + i)), case.aead, .{ .prefix = case.prefix, .start = 0, .end_exclusive = 3 }, case.key_byte);
+
+        var state = try sampleServerState(allocator);
+        defer state.deinit();
+        var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+        var ticket_buf = [_]u8{0} ** 512;
+        const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+        try testing.expectEqual(case.aead, (try parseEnvelope(ticket, session.Limits.default)).aead);
+        try expectRoundTrip(&protector, allocator, &state, ticket, 2_000);
+    }
+}
+
+test "deterministic envelope fixture stays stable" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    try installSingleKey(&keyring, keyId(31), .aes_128_gcm, .{ .prefix = .{ 3, 1, 0, 1 }, .start = 7, .end_exclusive = 8 }, 0x11);
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var ticket_buf = [_]u8{0} ** 512;
+    const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+    const expected = [_]u8{
+        0x54, 0x44, 0x54, 0x4B, 0x01, 0x01, 0x00, 0x00, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F,
+        0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x03, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x07, 0x66, 0x7F, 0x02, 0x37, 0x11, 0xE4, 0xF3, 0x9C, 0xF8, 0x63, 0x20, 0xB4,
+        0xEA, 0x5C, 0xE7, 0xAC, 0xEF, 0xFC, 0xB6, 0x6D, 0x78, 0xA8, 0xDC, 0x56, 0x81, 0x50, 0x21, 0x6E,
+        0x51, 0xB8, 0x54, 0xA5, 0x0D, 0x64, 0x75, 0x9A, 0x5A, 0x3A, 0x90, 0x88, 0x65, 0x6B, 0xEB, 0xAC,
+        0x49, 0x78, 0x2F, 0x6A, 0xE1, 0xD9, 0x78, 0xF2, 0x70, 0x7D, 0xB7, 0x9C, 0x28, 0x45, 0xD5, 0x94,
+        0xEB, 0x57, 0x24, 0x63, 0x18, 0xDB, 0x52, 0x48, 0xD1, 0x07, 0x0E, 0x53, 0x44, 0xE3, 0xA6, 0x74,
+        0x11, 0xC9, 0xCF, 0x11, 0x31, 0x52, 0x06, 0xC8, 0x8D, 0x41, 0x37, 0xB6, 0xC0, 0x22, 0x72, 0x8D,
+        0x80, 0x7D, 0xCE, 0x34, 0x30, 0x26, 0x12, 0x91, 0x0C, 0x23, 0x8F, 0xAA, 0xAB, 0x23, 0x8B, 0xEF,
+        0x80, 0x65, 0x4F, 0xCD, 0x12, 0x20, 0x02, 0xB6, 0xF1, 0x3B, 0x75, 0xFC, 0x87, 0x7C, 0xF4, 0x4B,
+        0xF7, 0x9E, 0x2E, 0x69, 0x68, 0x1B, 0xF5, 0x20, 0x0C, 0x57, 0xA2, 0xC5, 0x94, 0x17, 0x53, 0x1D,
+        0x48, 0xE9, 0x2B, 0x3A, 0xE0, 0xE6, 0x3A, 0x2F, 0xAF, 0x1D, 0xB7, 0xD8, 0x8E, 0xAC, 0x6B, 0xE0,
+        0x6B, 0x08, 0x15, 0xE1, 0xB6, 0xED, 0x57, 0x04, 0x8A, 0x76, 0xD9, 0x3D, 0xCE, 0xB2, 0x18, 0x05,
+        0x37, 0x5C, 0x7B, 0x25,
+    };
+    try testing.expectEqualSlices(u8, &expected, ticket);
+}
+
+test "ticket identity tampering is unusable and leaves output untouched" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    try installSingleKey(&keyring, keyId(32), .aes_128_gcm, .{ .prefix = .{ 3, 2, 0, 0 }, .start = 0, .end_exclusive = 12 }, 0x11);
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var ticket_buf = [_]u8{0} ** 512;
+    const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+
+    const positions = [_]usize{ 0, 4, 5, 6, 8, 24, fixed_header_len, ticket.len - 1 };
+    for (positions) |pos| {
+        var mutated = ticket_buf;
+        mutated[pos] ^= 0x01;
+        try expectResolveFalseUnchanged(&protector, allocator, mutated[0..ticket.len], 2_000);
+    }
+}
+
+test "decrypt windows are enforced at exact boundaries" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    try installSingleKey(&keyring, keyId(33), .aes_128_gcm, .{ .prefix = .{ 3, 3, 0, 0 }, .start = 0, .end_exclusive = 3 }, 0x11);
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var ticket_buf = [_]u8{0} ** 512;
+    const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+
+    try expectResolveFalseUnchanged(&protector, allocator, ticket, 999);
+    try expectRoundTrip(&protector, allocator, &state, ticket, 1_000);
+    try expectRoundTrip(&protector, allocator, &state, ticket, 4_999);
+    try expectRoundTrip(&protector, allocator, &state, ticket, 5_000);
+    try expectResolveFalseUnchanged(&protector, allocator, ticket, 20_000);
+}
+
+test "ticket identity size boundaries reject malformed envelopes" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    try installSingleKey(&keyring, keyId(34), .aes_128_gcm, .{ .prefix = .{ 3, 4, 0, 0 }, .start = 0, .end_exclusive = 3 }, 0x11);
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var ticket_buf = [_]u8{0} ** 512;
+    const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+    try expectResolveFalseUnchanged(&protector, allocator, ticket[0 .. ticket.len - 1], 2_000);
+
+    var min_identity = [_]u8{0} ** (fixed_header_len + 1 + tag_len);
+    writeHeader(min_identity[0..fixed_header_len], .aes_128_gcm, &keyId(34), &([_]u8{0} ** provider.aead_nonce_len));
+    try expectResolveFalseUnchanged(&protector, allocator, &min_identity, 2_000);
+
+    var trailing = [_]u8{0} ** 513;
+    @memcpy(trailing[0..ticket.len], ticket);
+    trailing[ticket.len] = 0;
+    try expectResolveFalseUnchanged(&protector, allocator, trailing[0 .. ticket.len + 1], 2_000);
+
+    var limits = session.Limits.default;
+    limits.max_ticket_len = ticket.len - 1;
+    try testing.expectError(error.EnvelopeTooLarge, parseEnvelope(ticket, limits));
+}
+
+test "concurrent sealing reserves unique nonces over one lease" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    try installSingleKey(&keyring, keyId(35), .aes_128_gcm, .{ .prefix = .{ 3, 5, 0, 0 }, .start = 0, .end_exclusive = 32 }, 0x11);
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var start = std.atomic.Value(bool).init(false);
+    var successes = std.atomic.Value(usize).init(0);
+    var failures = std.atomic.Value(usize).init(0);
+    var nonces: [32][provider.aead_nonce_len]u8 = undefined;
+    var tasks: [40]ConcurrentSealTask = undefined;
+    var threads: [40]std.Thread = undefined;
+
+    for (&tasks, 0..) |*task, i| {
+        task.* = .{ .protector = &protector, .state = &state, .start = &start, .successes = &successes, .failures = &failures, .nonces = &nonces };
+        threads[i] = try std.Thread.spawn(.{}, ConcurrentSealTask.run, .{task});
+    }
+    start.store(true, .release);
+    for (&threads) |thread| thread.join();
+
+    try testing.expectEqual(@as(usize, 32), successes.load(.monotonic));
+    try testing.expectEqual(@as(usize, 8), failures.load(.monotonic));
+    for (nonces[0..], 0..) |nonce, i| {
+        try testing.expectEqualSlices(u8, &[_]u8{ 3, 5, 0, 0 }, nonce[0..4]);
+        for (nonces[0..i]) |prior| try testing.expect(!std.mem.eql(u8, &nonce, &prior));
+    }
+}
+
 test "nonce lease exhaustion fails closed without wraparound" {
     const allocator = testing.allocator;
     var keyring = ReloadableKeyRing.init(allocator);
@@ -1234,6 +1477,34 @@ test "install consumes acquired current snapshot reference" {
 
     keyring.deinit();
     try testing.expectEqual(@as(usize, 1), deinit_count.load(.monotonic));
+}
+
+test "install observer callbacks do not dereference snapshots after reentrant deinit" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    const first = sampleKeyConfig(keyId(26), .aes_128_gcm, .{ .prefix = .{ 2, 6, 0, 0 }, .start = 0, .end_exclusive = 10 });
+    try keyring.install(try keyring.buildSnapshot(&.{first}, testCapabilities()));
+
+    var old_deinit_count = std.atomic.Value(usize).init(0);
+    keyring.current.?.deinit_count = &old_deinit_count;
+    var observer = ReentrantDeinitObserver{ .keyring = &keyring, .deinit_on_install = false };
+    keyring.observer = observer.observer();
+
+    const replacement_a = sampleKeyConfigWithByte(keyId(27), .aes_128_gcm, .{ .prefix = .{ 2, 7, 0, 0 }, .start = 0, .end_exclusive = 10 }, 0x13);
+    try keyring.install(try keyring.buildSnapshot(&.{replacement_a}, testCapabilities()));
+    try testing.expectEqual(@as(usize, 1), observer.retired_events);
+
+    var replacement_deinit_count = std.atomic.Value(usize).init(0);
+    keyring.current.?.deinit_count = &replacement_deinit_count;
+    observer.deinit_on_install = true;
+    const replacement_b = sampleKeyConfigWithByte(keyId(28), .aes_128_gcm, .{ .prefix = .{ 2, 8, 0, 0 }, .start = 0, .end_exclusive = 10 }, 0x22);
+    try keyring.install(try keyring.buildSnapshot(&.{replacement_b}, testCapabilities()));
+
+    try testing.expectEqual(@as(usize, 2), observer.installed_events);
+    try testing.expectEqual(@as(usize, 2), observer.retired_events);
+    try testing.expectEqual(@as(usize, 1), old_deinit_count.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), replacement_deinit_count.load(.monotonic));
+    keyring.deinit();
 }
 
 test "ambiguous encryption windows are rejected before publication" {
@@ -1318,6 +1589,24 @@ test "nonce ledger does not retain full retired key bytes after final snapshot r
 
     try testing.expect(std.mem.indexOf(u8, &backing, &retired_key) == null);
     try testing.expectEqual(@as(usize, 2), keyring.ledger.items.len);
+}
+
+test "retained old snapshot delays final key wipe across replacement" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const first = sampleKeyConfig(keyId(29), .aes_128_gcm, .{ .prefix = .{ 2, 9, 0, 0 }, .start = 0, .end_exclusive = 10 });
+    try keyring.install(try keyring.buildSnapshot(&.{first}, testCapabilities()));
+    const retained = keyring.acquireCurrent().?;
+    var deinit_count = std.atomic.Value(usize).init(0);
+    retained.deinit_count = &deinit_count;
+
+    const replacement = sampleKeyConfigWithByte(keyId(36), .aes_128_gcm, .{ .prefix = .{ 3, 6, 0, 0 }, .start = 0, .end_exclusive = 10 }, 0x13);
+    try keyring.install(try keyring.buildSnapshot(&.{replacement}, testCapabilities()));
+    try testing.expectEqual(@as(usize, 0), deinit_count.load(.monotonic));
+
+    retained.release();
+    try testing.expectEqual(@as(usize, 1), deinit_count.load(.monotonic));
 }
 
 test "nonce ledger supports more than fixed live-snapshot rotations" {
@@ -1454,6 +1743,35 @@ test "resolve observer records one terminal event for false and error paths" {
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     try testing.expectError(error.OutOfMemory, protector.resolve(failing.allocator(), ticket, 2_000, &out));
     try observer.expectOnly(.{ .resolve_rejected = .out_of_memory });
+}
+
+test "allocation failures leave nonce and recovered state unchanged" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    try installSingleKey(&keyring, keyId(37), .aes_128_gcm, .{ .prefix = .{ 3, 7, 0, 0 }, .start = 0, .end_exclusive = 3 }, 0x11);
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var ticket_buf = [_]u8{0} ** 512;
+
+    var seal_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, protector.seal(seal_failing.allocator(), &state, 2_000, &ticket_buf));
+    const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 3, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, ticket[24..36]);
+
+    var out: session.ServerRecoverableState = .{};
+    defer out.deinit();
+    var plaintext_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, protector.resolve(plaintext_failing.allocator(), ticket, 2_000, &out));
+    try testing.expectEqual(@as(u32, 0), out.ticket_age_add);
+    try testing.expectEqual(@as(usize, 0), out.common.resumption_psk.len);
+
+    var decode_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try testing.expectError(error.OutOfMemory, protector.resolve(decode_failing.allocator(), ticket, 2_000, &out));
+    try testing.expectEqual(@as(u32, 0), out.ticket_age_add);
+    try testing.expectEqual(@as(usize, 0), out.common.resumption_psk.len);
 }
 
 test "resolve treats invalid limits and decode allocation failure as local errors" {

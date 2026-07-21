@@ -95,6 +95,7 @@ pub const ResolveRejectReason = enum {
     not_yet_valid,
     expired,
     invalid_internal_state,
+    out_of_memory,
 };
 
 pub const SnapshotRejectReason = enum {
@@ -380,6 +381,13 @@ pub const Snapshot = struct {
         return null;
     }
 
+    fn findKeyConst(self: *const Snapshot, key_id: *const KeyId) ?*const KeyRecord {
+        for (self.keys) |*key| {
+            if (std.mem.eql(u8, &key.id, key_id)) return key;
+        }
+        return null;
+    }
+
     pub fn format(
         _: Snapshot,
         comptime _: []const u8,
@@ -435,28 +443,38 @@ pub const ReloadableKeyRing = struct {
     }
 
     pub fn buildSnapshot(self: *ReloadableKeyRing, configs: []const KeyConfig, caps: provider.Capabilities) SnapshotError!*Snapshot {
+        const replacement = Snapshot.build(self.allocator, configs, 0, caps) catch |err| {
+            self.record(.{ .snapshot_rejected = snapshotReason(err) });
+            return err;
+        };
+        errdefer replacement.release();
+
         self.mutex.lock();
         if (self.next_generation == std.math.maxInt(u64)) {
             self.mutex.unlock();
+            self.record(.{ .snapshot_rejected = .generation_overflow });
             return error.GenerationOverflow;
         }
-        const generation = self.next_generation;
+        replacement.generation = self.next_generation;
         self.next_generation += 1;
         self.mutex.unlock();
-        return Snapshot.build(self.allocator, configs, generation, caps);
+        return replacement;
     }
 
+    /// Consumes `replacement` on every successful and rejected install path.
     pub fn install(self: *ReloadableKeyRing, replacement: *Snapshot) SnapshotError!void {
         self.mutex.lock();
         if (self.current) |current| {
             if (current == replacement) {
                 if (replacement.generation == std.math.maxInt(u64)) {
                     self.mutex.unlock();
+                    replacement.release();
                     self.record(.{ .snapshot_rejected = .generation_overflow });
                     return error.GenerationOverflow;
                 }
                 self.next_generation = @max(self.next_generation, replacement.generation + 1);
                 self.mutex.unlock();
+                replacement.release();
                 return;
             }
             if (replacement.generation <= current.generation) {
@@ -488,7 +506,7 @@ pub const ReloadableKeyRing = struct {
 
         self.record(.{ .snapshot_installed = replacement.generation });
         if (retired) |snapshot| {
-            self.record(.{ .key_retired = snapshot.generation });
+            self.recordRetiredKeys(snapshot, replacement);
             snapshot.release();
         }
     }
@@ -574,6 +592,12 @@ pub const ReloadableKeyRing = struct {
         if (self.observer) |observer| observer.record(event);
     }
 
+    fn recordRetiredKeys(self: *ReloadableKeyRing, retired: *const Snapshot, replacement: *const Snapshot) void {
+        for (retired.keys) |*old_key| {
+            if (replacement.findKeyConst(&old_key.id) == null) self.record(.{ .key_retired = retired.generation });
+        }
+    }
+
     pub fn format(
         _: ReloadableKeyRing,
         comptime _: []const u8,
@@ -610,7 +634,8 @@ pub const Protector = struct {
         const plaintext_len = session.serverEncodedLenWithLimits(state, self.limits) catch |err| switch (err) {
             error.StateTooLarge => return error.SerializedStateTooLarge,
             error.InvalidLimits => return error.InvalidInternalState,
-            error.TooManyFields, error.FieldTooLarge, error.InvalidState => return error.SerializedStateTooLarge,
+            error.InvalidState => return error.InvalidInternalState,
+            error.TooManyFields, error.FieldTooLarge => return error.SerializedStateTooLarge,
             error.BufferTooSmall => unreachable,
         };
         return checkedProtectedLen(plaintext_len, self.limits);
@@ -623,36 +648,46 @@ pub const Protector = struct {
         now_unix_ms: i64,
         out: []u8,
     ) SealError![]const u8 {
+        const sealed = self.sealInner(allocator, state, now_unix_ms, out) catch |err| {
+            if (err == error.NonceLeaseExhausted) self.record(.nonce_lease_exhausted);
+            self.record(.{ .seal_rejected = sealReason(err) });
+            return err;
+        };
+        self.record(.seal_succeeded);
+        return sealed;
+    }
+
+    fn sealInner(
+        self: *Protector,
+        allocator: std.mem.Allocator,
+        state: *const session.ServerRecoverableState,
+        now_unix_ms: i64,
+        out: []u8,
+    ) SealError![]const u8 {
         const snapshot = self.keyring.acquireCurrent() orelse {
-            self.record(.{ .seal_rejected = .no_active_encryption_key });
             return error.NoActiveEncryptionKey;
         };
         defer snapshot.release();
 
         const key = snapshot.activeEncryptionKey(now_unix_ms) catch |err| {
-            self.record(.{ .seal_rejected = sealReason(err) });
             return err;
         };
 
         if (!self.provider.capabilities().supportsAead(key.aead)) {
-            self.record(.{ .seal_rejected = .unsupported_capability });
             return error.UnsupportedCapability;
         }
 
         if (!ticketExpiresWithinKey(state, key.decrypt_until_unix_ms)) {
-            self.record(.{ .seal_rejected = .ticket_outlives_key });
             return error.TicketOutlivesKey;
         }
 
         const protected_len = try self.protectedLen(state);
         if (out.len < protected_len) {
-            self.record(.{ .seal_rejected = .output_too_small });
             return error.OutputTooSmall;
         }
 
         const plaintext_len = protected_len - envelope_overhead;
         const plaintext = allocator.alloc(u8, plaintext_len) catch {
-            self.record(.{ .seal_rejected = .out_of_memory });
             return error.OutOfMemory;
         };
         defer {
@@ -667,14 +702,9 @@ pub const Protector = struct {
         std.debug.assert(encoded.len == plaintext_len);
 
         const lease = &(key.nonce_lease orelse {
-            self.record(.{ .seal_rejected = .no_active_encryption_key });
             return error.NoActiveEncryptionKey;
         });
-        const nonce = lease.reserve() catch |err| {
-            self.record(.nonce_lease_exhausted);
-            self.record(.{ .seal_rejected = .nonce_lease_exhausted });
-            return err;
-        };
+        const nonce = try lease.reserve();
 
         writeHeader(out[0..fixed_header_len], key.aead, &key.id, &nonce);
         var aad: [aad_prefix.len + fixed_header_len]u8 = undefined;
@@ -686,7 +716,6 @@ pub const Protector = struct {
             error.InvalidInput => return error.InvalidInternalState,
         };
 
-        self.record(.seal_succeeded);
         return out[0..protected_len];
     }
 
@@ -697,35 +726,57 @@ pub const Protector = struct {
         now_unix_ms: i64,
         out: *session.ServerRecoverableState,
     ) ResolveError!bool {
+        const outcome = self.resolveInner(allocator, identity, now_unix_ms, out) catch |err| {
+            self.record(.{ .resolve_rejected = resolveErrorReason(err) });
+            return err;
+        };
+        switch (outcome) {
+            .accepted => {
+                self.record(.resolve_succeeded);
+                return true;
+            },
+            .rejected => |reason| {
+                self.record(.{ .resolve_rejected = reason });
+                return false;
+            },
+        }
+    }
+
+    const ResolveOutcome = union(enum) {
+        accepted,
+        rejected: ResolveRejectReason,
+    };
+
+    fn resolveInner(
+        self: *Protector,
+        allocator: std.mem.Allocator,
+        identity: []const u8,
+        now_unix_ms: i64,
+        out: *session.ServerRecoverableState,
+    ) ResolveError!ResolveOutcome {
         self.limits.validate() catch return error.InvalidInternalState;
         const parsed = parseEnvelope(identity, self.limits) catch |err| {
-            self.record(.{ .resolve_rejected = parseReason(err) });
-            return false;
+            return .{ .rejected = parseReason(err) };
         };
 
         const snapshot = self.keyring.acquireCurrent() orelse {
-            self.record(.{ .resolve_rejected = .unknown_key });
-            return false;
+            return .{ .rejected = .unknown_key };
         };
         defer snapshot.release();
 
         const key = snapshot.findKey(&parsed.key_id) orelse {
-            self.record(.{ .resolve_rejected = .unknown_key });
-            return false;
+            return .{ .rejected = .unknown_key };
         };
         if (key.aead != parsed.aead) {
-            self.record(.{ .resolve_rejected = .authentication_failed });
-            return false;
+            return .{ .rejected = .authentication_failed };
         }
         switch (key.decryptWindowAt(now_unix_ms)) {
             .future => {
-                self.record(.{ .resolve_rejected = .future_key });
-                return false;
+                return .{ .rejected = .future_key };
             },
             .active, .retained => {},
             .retired => {
-                self.record(.{ .resolve_rejected = .retired_key });
-                return false;
+                return .{ .rejected = .retired_key };
             },
         }
         if (!self.provider.capabilities().supportsAead(key.aead)) return error.UnsupportedCapability;
@@ -740,8 +791,7 @@ pub const Protector = struct {
         buildAad(parsed.header, &aad);
         self.provider.aeadOpen(key.aead, key.key.slice(), &parsed.nonce, &aad, parsed.ciphertext, parsed.tag, plaintext) catch |err| switch (err) {
             error.AuthenticationFailed => {
-                self.record(.{ .resolve_rejected = .authentication_failed });
-                return false;
+                return .{ .rejected = .authentication_failed };
             },
             error.UnsupportedCapability => return error.UnsupportedCapability,
             error.InvalidInput => return error.InvalidInternalState,
@@ -751,8 +801,7 @@ pub const Protector = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidLimits => return error.InvalidInternalState,
             else => {
-                self.record(.{ .resolve_rejected = .invalid_plaintext });
-                return false;
+                return .{ .rejected = .invalid_plaintext };
             },
         };
         defer decoded.deinit();
@@ -760,22 +809,18 @@ pub const Protector = struct {
         var recovered = switch (decoded) {
             .server => |*server_state| server_state,
             .client => {
-                self.record(.{ .resolve_rejected = .invalid_plaintext });
-                return false;
+                return .{ .rejected = .invalid_plaintext };
             },
         };
         if (recovered.common.isNotYetValid(now_unix_ms)) {
-            self.record(.{ .resolve_rejected = .not_yet_valid });
-            return false;
+            return .{ .rejected = .not_yet_valid };
         }
         if (recovered.common.isExpired(now_unix_ms)) {
-            self.record(.{ .resolve_rejected = .expired });
-            return false;
+            return .{ .rejected = .expired };
         }
 
         out.moveFrom(recovered);
-        self.record(.resolve_succeeded);
-        return true;
+        return .accepted;
     }
 
     fn record(self: *Protector, event: Event) void {
@@ -825,6 +870,7 @@ fn ticketExpiresWithinKey(state: *const session.ServerRecoverableState, key_decr
 fn fingerprintKey(aead: provider.Aead, key: []const u8) KeyFingerprint {
     var out: KeyFingerprint = undefined;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    defer secrets.secureZero(std.mem.asBytes(&hasher));
     hasher.update(key_fingerprint_domain);
     hasher.update(&[_]u8{encodeAeadId(aead)});
     var len_bytes: [2]u8 = undefined;
@@ -873,6 +919,14 @@ fn sealReason(err: SealError) SealRejectReason {
         error.SerializedStateTooLarge => .serialized_state_too_large,
         error.TicketTooLarge => .ticket_too_large,
         error.OutputTooSmall => .output_too_small,
+        error.UnsupportedCapability => .unsupported_capability,
+        error.InvalidInternalState => .invalid_internal_state,
+        error.OutOfMemory => .out_of_memory,
+    };
+}
+
+fn resolveErrorReason(err: ResolveError) ResolveRejectReason {
+    return switch (err) {
         error.UnsupportedCapability => .unsupported_capability,
         error.InvalidInternalState => .invalid_internal_state,
         error.OutOfMemory => .out_of_memory,
@@ -994,6 +1048,32 @@ fn sampleServerState(allocator: std.mem.Allocator) !session.ServerRecoverableSta
     return state;
 }
 
+const TestObserver = struct {
+    events: std.ArrayList(Event) = .empty,
+
+    fn deinit(self: *TestObserver, allocator: std.mem.Allocator) void {
+        self.events.deinit(allocator);
+    }
+
+    fn observer(self: *TestObserver) Observer {
+        return .{ .ctx = self, .recordFn = record };
+    }
+
+    fn record(ctx: *anyopaque, event: Event) void {
+        const self: *TestObserver = @ptrCast(@alignCast(ctx));
+        self.events.append(testing.allocator, event) catch @panic("test observer allocation failed");
+    }
+
+    fn expectOnly(self: *const TestObserver, expected: Event) !void {
+        try testing.expectEqual(@as(usize, 1), self.events.items.len);
+        try testing.expectEqualDeep(expected, self.events.items[0]);
+    }
+
+    fn reset(self: *TestObserver) void {
+        self.events.clearRetainingCapacity();
+    }
+};
+
 test "AEAD id mapping is stable and not enum ordinal dependent" {
     try testing.expectEqual(@as(u8, 1), encodeAeadId(.aes_128_gcm));
     try testing.expectEqual(@as(u8, 2), encodeAeadId(.aes_256_gcm));
@@ -1107,6 +1187,53 @@ test "replacement snapshot rejects overlapping nonce lease and accepts adjacent 
 
     const changed_prefix = sampleKeyConfig(keyId(3), .aes_128_gcm, .{ .prefix = .{ 2, 1, 1, 1 }, .start = 20, .end_exclusive = 30 });
     try testing.expectError(error.OverlappingNonceLease, keyring.install(try keyring.buildSnapshot(&.{changed_prefix}, testCapabilities())));
+}
+
+test "failed snapshot build leaves publication state unchanged" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    var observer = TestObserver{};
+    defer observer.deinit(allocator);
+    keyring.observer = observer.observer();
+    defer keyring.deinit();
+
+    const first = sampleKeyConfig(keyId(21), .aes_128_gcm, .{ .prefix = .{ 2, 1, 0, 0 }, .start = 0, .end_exclusive = 10 });
+    try keyring.install(try keyring.buildSnapshot(&.{first}, testCapabilities()));
+    observer.reset();
+
+    const before_generation = keyring.next_generation;
+    const before_current = keyring.current.?;
+    const before_ledger_len = keyring.ledger.items.len;
+    try testing.expectError(error.TooManyKeys, keyring.buildSnapshot(&.{}, testCapabilities()));
+    try testing.expectEqual(before_generation, keyring.next_generation);
+    try testing.expectEqual(before_current, keyring.current.?);
+    try testing.expectEqual(before_ledger_len, keyring.ledger.items.len);
+    try observer.expectOnly(.{ .snapshot_rejected = .too_many_keys });
+
+    observer.reset();
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    keyring.allocator = failing.allocator();
+    try testing.expectError(error.OutOfMemory, keyring.buildSnapshot(&.{first}, testCapabilities()));
+    keyring.allocator = allocator;
+    try testing.expectEqual(before_generation, keyring.next_generation);
+    try testing.expectEqual(before_current, keyring.current.?);
+    try testing.expectEqual(before_ledger_len, keyring.ledger.items.len);
+    try observer.expectOnly(.{ .snapshot_rejected = .out_of_memory });
+}
+
+test "install consumes acquired current snapshot reference" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    const first = sampleKeyConfig(keyId(22), .aes_128_gcm, .{ .prefix = .{ 2, 2, 0, 0 }, .start = 0, .end_exclusive = 10 });
+    try keyring.install(try keyring.buildSnapshot(&.{first}, testCapabilities()));
+
+    var deinit_count = std.atomic.Value(usize).init(0);
+    const current = keyring.acquireCurrent().?;
+    current.deinit_count = &deinit_count;
+    try keyring.install(current);
+
+    keyring.deinit();
+    try testing.expectEqual(@as(usize, 1), deinit_count.load(.monotonic));
 }
 
 test "ambiguous encryption windows are rejected before publication" {
@@ -1233,6 +1360,100 @@ test "invalid issuance limits fail before reserving a nonce" {
     protector.limits = session.Limits.default;
     const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
     try testing.expectEqualSlices(u8, &[_]u8{ 1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, ticket[24..36]);
+}
+
+test "semantically invalid state is local corruption and leaves nonce available" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const config = sampleKeyConfig(keyId(23), .aes_128_gcm, .{ .prefix = .{ 2, 3, 0, 0 }, .start = 0, .end_exclusive = 3 });
+    try keyring.install(try keyring.buildSnapshot(&.{config}, testCapabilities()));
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    state.common.lifetime_seconds = 0;
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var ticket_buf = [_]u8{0} ** 512;
+
+    try testing.expectError(error.InvalidInternalState, protector.protectedLen(&state));
+    try testing.expectError(error.InvalidInternalState, protector.seal(allocator, &state, 2_000, &ticket_buf));
+
+    state.common.lifetime_seconds = 10;
+    const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, ticket[24..36]);
+}
+
+test "seal observer records one terminal event per typed result" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    var observer = TestObserver{};
+    defer observer.deinit(allocator);
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default, .observer = observer.observer() };
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var ticket_buf = [_]u8{0} ** 512;
+
+    try testing.expectError(error.NoActiveEncryptionKey, protector.seal(allocator, &state, 2_000, &ticket_buf));
+    try observer.expectOnly(.{ .seal_rejected = .no_active_encryption_key });
+    observer.reset();
+
+    const config = sampleKeyConfig(keyId(24), .aes_128_gcm, .{ .prefix = .{ 2, 4, 0, 0 }, .start = 0, .end_exclusive = 1 });
+    try keyring.install(try keyring.buildSnapshot(&.{config}, testCapabilities()));
+    state.common.lifetime_seconds = 0;
+    try testing.expectError(error.InvalidInternalState, protector.seal(allocator, &state, 2_000, &ticket_buf));
+    try observer.expectOnly(.{ .seal_rejected = .invalid_internal_state });
+    observer.reset();
+
+    state.common.lifetime_seconds = 10;
+    try testing.expectError(error.OutputTooSmall, protector.seal(allocator, &state, 2_000, ticket_buf[0..8]));
+    try observer.expectOnly(.{ .seal_rejected = .output_too_small });
+    observer.reset();
+
+    _ = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+    try observer.expectOnly(.seal_succeeded);
+    observer.reset();
+
+    try testing.expectError(error.NonceLeaseExhausted, protector.seal(allocator, &state, 2_000, &ticket_buf));
+    try testing.expectEqual(@as(usize, 2), observer.events.items.len);
+    try testing.expectEqualDeep(Event.nonce_lease_exhausted, observer.events.items[0]);
+    try testing.expectEqualDeep(Event{ .seal_rejected = .nonce_lease_exhausted }, observer.events.items[1]);
+}
+
+test "resolve observer records one terminal event for false and error paths" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const config = sampleKeyConfig(keyId(25), .aes_128_gcm, .{ .prefix = .{ 2, 5, 0, 0 }, .start = 0, .end_exclusive = 3 });
+    try keyring.install(try keyring.buildSnapshot(&.{config}, testCapabilities()));
+
+    var observer = TestObserver{};
+    defer observer.deinit(allocator);
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default, .observer = observer.observer() };
+    var out: session.ServerRecoverableState = .{};
+    defer out.deinit();
+
+    try testing.expect(!try protector.resolve(allocator, "not-a-ticket", 2_000, &out));
+    try observer.expectOnly(.{ .resolve_rejected = .malformed_envelope });
+    observer.reset();
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var ticket_buf = [_]u8{0} ** 512;
+    const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+    observer.reset();
+
+    var invalid_limits = session.Limits.default;
+    invalid_limits.max_fields = 0;
+    protector.limits = invalid_limits;
+    try testing.expectError(error.InvalidInternalState, protector.resolve(allocator, ticket, 2_000, &out));
+    try observer.expectOnly(.{ .resolve_rejected = .invalid_internal_state });
+    observer.reset();
+
+    protector.limits = session.Limits.default;
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, protector.resolve(failing.allocator(), ticket, 2_000, &out));
+    try observer.expectOnly(.{ .resolve_rejected = .out_of_memory });
 }
 
 test "resolve treats invalid limits and decode allocation failure as local errors" {

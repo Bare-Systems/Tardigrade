@@ -38,6 +38,7 @@ pub const ClientHelloOffers = struct {
     supported_groups_len: usize = 0,
     key_shares: [max_offers]KeyShareOffer = undefined,
     key_shares_len: usize = 0,
+    key_share_seen: bool = false,
     signature_schemes: [max_offers]algorithms.SignatureScheme = undefined,
     signature_schemes_len: usize = 0,
     raw_signature_schemes: [max_offers]u16 = undefined,
@@ -136,9 +137,14 @@ pub const HelloSelection = struct {
     version: algorithms.ProtocolVersion,
     cipher_suite: algorithms.CipherSuite,
     named_group: algorithms.NamedGroup,
-    key_share: []const u8,
+    key_share: KeyShareDecision,
     alpn: ?algorithms.ProtocolName,
     server_name: ?[]const u8,
+};
+
+pub const KeyShareDecision = union(enum) {
+    use: KeyShareOffer,
+    retry: algorithms.NamedGroup,
 };
 
 pub fn parseClientHello(body: []const u8) Error!ClientHelloOffers {
@@ -210,7 +216,10 @@ pub fn negotiateServer(policy: policy_mod.Policy, offers: *const ClientHelloOffe
         .version = hello.version,
         .cipher_suite = hello.cipher_suite,
         .named_group = hello.named_group,
-        .key_share = hello.key_share,
+        .key_share = switch (hello.key_share) {
+            .use => |share| share.key_exchange,
+            .retry => return error.MissingKeyShare,
+        },
         .signature_scheme = signature_scheme,
         .alpn = hello.alpn orelse return error.NoMutualAlpn,
         .server_name = hello.server_name,
@@ -225,7 +234,12 @@ pub fn negotiateServerHello(policy: policy_mod.Policy, offers: *const ClientHell
         return error.NoMutualCipherSuite;
     const named_group = pickEnum(algorithms.NamedGroup, policy.named_groups, offers.supported_groups[0..offers.supported_groups_len]) orelse
         return error.NoMutualNamedGroup;
-    const key_share = offers.keyShareFor(named_group) orelse return error.MissingKeyShare;
+    const key_share: KeyShareDecision = if (offers.keyShareFor(named_group)) |share|
+        .{ .use = .{ .group = named_group, .key_exchange = share } }
+    else if (offers.key_share_seen)
+        .{ .retry = named_group }
+    else
+        return error.MissingExtension;
     const alpn = pickAlpn(policy.alpn_protocols, offers.alpn_protocols[0..offers.alpn_protocols_len]) orelse blk: {
         if (offers.alpn_protocols_len == 0 and policy.allow_absent_alpn) break :blk null;
         return error.NoMutualAlpn;
@@ -312,6 +326,7 @@ fn parseSignatureAlgorithms(bytes: []const u8, offers: *ClientHelloOffers) Error
 }
 
 fn parseKeyShares(bytes: []const u8, offers: *ClientHelloOffers) Error!void {
+    offers.key_share_seen = true;
     var r = messages.Reader{ .bytes = bytes };
     var shares = messages.Reader{ .bytes = try r.slice(try r.u16_()) };
     try r.expectEnd();
@@ -506,6 +521,30 @@ test "ClientHello parser feeds policy negotiation with ALPN and SNI offers" {
     try testing.expect(selected.alpn.eql(algorithms.alpn.h2));
     try testing.expectEqualStrings("example.test", selected.server_name.?);
     try testing.expectEqualStrings("share", selected.key_share);
+}
+
+test "server hello negotiation returns retry when selected group lacks a share" {
+    var offers = ClientHelloOffers{};
+    try offers.appendVersion(.tls13);
+    try offers.appendCipherSuite(.tls_aes_128_gcm_sha256);
+    try offers.appendSupportedGroup(.x25519);
+    offers.key_share_seen = true;
+
+    const selected = try negotiateServerHello(policy_mod.Policy.recordHttp1Only(true), &offers);
+    try testing.expectEqual(algorithms.NamedGroup.x25519, selected.named_group);
+    switch (selected.key_share) {
+        .retry => |group| try testing.expectEqual(algorithms.NamedGroup.x25519, group),
+        .use => return error.TestExpectedEqual,
+    }
+}
+
+test "server hello negotiation requires key_share extension before retry is possible" {
+    var offers = ClientHelloOffers{};
+    try offers.appendVersion(.tls13);
+    try offers.appendCipherSuite(.tls_aes_128_gcm_sha256);
+    try offers.appendSupportedGroup(.x25519);
+
+    try testing.expectError(error.MissingExtension, negotiateServerHello(policy_mod.Policy.recordHttp1Only(true), &offers));
 }
 
 fn clientHelloWithServerNameExtension(buf: []u8, server_name_payload: []const u8) ![]const u8 {

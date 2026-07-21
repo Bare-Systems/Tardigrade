@@ -5,6 +5,7 @@ pub const dns_name = @import("dns_name.zig");
 pub const engine = @import("engine.zig");
 pub const encrypted_stream = @import("encrypted_stream.zig");
 pub const handshake = @import("handshake.zig");
+pub const hello_retry = @import("hello_retry.zig");
 pub const state = @import("state.zig");
 pub const events = @import("events.zig");
 pub const algorithms = @import("algorithms.zig");

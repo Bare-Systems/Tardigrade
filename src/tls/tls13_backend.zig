@@ -856,9 +856,17 @@ pub const Tls13Backend = struct {
     /// previously-initialized, live value — never `undefined`), returning
     /// its selected identity index. A one-shot accessor for #365/#366:
     /// returns `null` (leaving `out` untouched) when no PSK has been
-    /// selected on this connection, or once already taken.
+    /// selected on this connection, once already taken, or — critically —
+    /// before the resumed handshake has actually `handshake_committed`.
+    ///
+    /// The binder succeeding only proves the *client* authenticated; the
+    /// server's own handshake is not authenticated until the client's
+    /// Finished verifies (`onClientFinished`). Handing ownership of this
+    /// secret-bearing session out any earlier would let a caller retain it
+    /// past a subsequent bad-Finished failure — `clearFailedHandshakeState`
+    /// can only wipe state the backend still owns.
     pub fn takeSelectedServerPsk(self: *Tls13Backend, out: *session.ServerRecoverableState) ?u16 {
-        if (!self.selected_server_psk_present) return null;
+        if (!self.handshake_committed or !self.selected_server_psk_present) return null;
         out.moveFrom(&self.selected_server_psk.state);
         self.selected_server_psk_present = false;
         const index = self.selected_server_psk.index;

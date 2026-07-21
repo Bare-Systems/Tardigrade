@@ -3236,6 +3236,56 @@ test "handshake-phase failure wipes PSK offer state before ServerHello even arri
     try std.testing.expect(client.client_psk_offers.isEmpty());
 }
 
+/// Completes a PSK-resumed server handshake driven by `driveServerSelection`
+/// by feeding it the correct client Finished — computed from the server's
+/// own (symmetric) key schedule, since there is no real client driver in
+/// these server-only tests.
+fn feedValidClientFinished(server: *tls_backend.Tls13Backend) !void {
+    const schedule = server.schedule.?;
+    var client_verify = tls_backend.KeySchedule.verifyData(&schedule.client_handshake_traffic, server.core.transcriptHash());
+    defer std.crypto.secureZero(u8, &client_verify);
+    var finished_buf: [4 + tls_backend.hash_len]u8 = undefined;
+    const finished = try tls_core.messages.encode(.finished, &client_verify, &finished_buf);
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().receive(.handshake, finished, &sink);
+}
+
+test "takeSelectedServerPsk returns null before the client Finished commits the handshake" {
+    // Regression coverage: the binder succeeding only proves the *client*
+    // authenticated — the server's own handshake is not committed until
+    // the client's Finished verifies. Handing the accepted session out any
+    // earlier would let a caller retain it past a subsequent bad-Finished
+    // failure, which `clearFailedHandshakeState` can then no longer reach.
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    const psk = [_]u8{0x88} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "not-yet-committed" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{.{ .identity = "not-yet-committed", .binder_psk = &psk }} } });
+    try std.testing.expect(server.core.psk_authenticated);
+    try std.testing.expect(server.selected_server_psk_present);
+
+    var taken: session.ServerRecoverableState = .{};
+    try std.testing.expectEqual(@as(?u16, null), server.takeSelectedServerPsk(&taken));
+    // Left untouched: still present, still retrievable once actually committed.
+    try std.testing.expect(server.selected_server_psk_present);
+
+    try feedValidClientFinished(&server);
+    try std.testing.expectEqual(.complete, server.core.handshake_lifecycle);
+    var taken_after: session.ServerRecoverableState = .{};
+    defer taken_after.deinit();
+    try std.testing.expect(server.takeSelectedServerPsk(&taken_after) != null);
+}
+
 test "the accepted server session survives PSK selection with its early-data and metadata intact" {
     var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
     defer server.deinit();
@@ -3262,8 +3312,10 @@ test "the accepted server session survives PSK selection with its early-data and
     });
 
     try driveServerSelection(&server, .{ .psk = .{ .items = &.{.{ .identity = "early-data-ticket", .binder_psk = &psk }} } });
+    try feedValidClientFinished(&server);
 
     try std.testing.expect(server.core.psk_authenticated);
+    try std.testing.expectEqual(.complete, server.core.handshake_lifecycle);
     var taken: session.ServerRecoverableState = .{};
     const index = server.takeSelectedServerPsk(&taken).?;
     defer taken.deinit();
@@ -3356,16 +3408,26 @@ test "a compatible candidate with a wrong binder is fatal and never probes a lat
         .resolveFn = CountingResolver.resolve,
     });
 
-    try std.testing.expectError(error.DecryptError, driveServerSelection(&server, .{
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    const events_before_client_hello = sink.len;
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{
         .psk = .{
             .items = &.{
                 .{ .identity = "ticket-a", .binder_psk = &wrong_psk }, // resolvable and compatible, wrong binder
                 .{ .identity = "ticket-b", .binder_psk = &psk }, // would otherwise succeed; must never be tried
             },
         },
-    }));
+    });
+    try std.testing.expectError(error.DecryptError, server.backend().receive(.initial, hello, &sink));
 
     try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    // No ServerHello, secret, or any other event was emitted for the
+    // failed selection: the fatal binder mismatch is caught before
+    // anything is written to the wire.
+    try std.testing.expectEqual(events_before_client_hello, sink.len);
 }
 
 /// A hand-written `CredentialProvider` whose second chain entry is

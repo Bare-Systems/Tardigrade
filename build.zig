@@ -297,6 +297,44 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_crypto_tests.step);
     test_step.dependOn(&run_crypto_secret_tests.step);
 
+    // Bounded session-resumption cache (#364). Deliberately its own module
+    // rather than wired into `tls_core_mod`/`root.zig` yet: issue #364's
+    // canonical plan defers the public `pre_shared_key.ServerPskResolver`
+    // amendment and the `TDSH`/`TDTK` composite adapter until sibling PR
+    // #478 (#363's stateless protector) merges, matching how #478 itself
+    // ships `ticket_protection.zig` unwired from `root.zig` in the
+    // meantime. `session_cache.zig` still needs `session.zig` /
+    // `pre_shared_key.zig` (relative imports, recompiled into this
+    // module) plus the shared `crypto` provider import.
+    const session_cache_mod = b.createModule(.{
+        .root_source_file = b.path("src/tls/session_cache.zig"),
+        .target = target,
+        .optimize = optimize,
+        // Pulls in `zig_compat.Mutex` (std.Io.Mutex-backed, not a spin lock)
+        // for the cache's own thread safety, same as `http/buffer_pool.zig`.
+        .link_libc = true,
+    });
+    session_cache_mod.addImport("crypto", crypto_mod);
+    session_cache_mod.addImport("zig_compat", compat_mod);
+    const session_cache_tests = b.addTest(.{ .root_module = session_cache_mod });
+    const run_session_cache_tests = b.addRunArtifact(session_cache_tests);
+    const session_cache_step = b.step("test-session-cache", "Run bounded session-resumption cache unit tests (#364)");
+    session_cache_step.dependOn(&run_session_cache_tests.step);
+    test_step.dependOn(&run_session_cache_tests.step);
+
+    const session_cache_persistence_mod = b.createModule(.{
+        .root_source_file = b.path("src/tls/session_cache_persistence.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    session_cache_persistence_mod.addImport("crypto", crypto_mod);
+    session_cache_persistence_mod.addImport("zig_compat", compat_mod);
+    const session_cache_persistence_tests = b.addTest(.{ .root_module = session_cache_persistence_mod });
+    const run_session_cache_persistence_tests = b.addRunArtifact(session_cache_persistence_tests);
+    session_cache_step.dependOn(&run_session_cache_persistence_tests.step);
+    test_step.dependOn(&run_session_cache_persistence_tests.step);
+
     // Deterministic crypto vector harness (#373): provider-neutral test
     // vectors, TLS 1.3 key schedule values, QUIC packet-protection material,
     // and explicit negative coverage for deferred capabilities.

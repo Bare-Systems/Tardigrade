@@ -562,7 +562,7 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
     resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
 
     const Resolver = struct {
-        state: session.ServerRecoverableState,
+        state: *session.ServerRecoverableState,
         resolve_calls: usize = 0,
 
         fn now(_: *anyopaque) i64 {
@@ -576,8 +576,11 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
             return true;
         }
     };
-    var resolver_state: Resolver = .{ .state = server_state };
-    defer resolver_state.state.deinit();
+    // `state` is a pointer, not a copy: `server_state` (below, an
+    // allocator-backed value with e.g. a non-null `transport_compat`) must
+    // not be shallow-copied, or its owned storage would be deinitialized
+    // twice — once here, once by `server_state`'s own `defer` above.
+    var resolver_state: Resolver = .{ .state = &server_state };
     resumed.server_backend.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = Resolver.now,
@@ -601,6 +604,126 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
     const request = try resumed.client_bridge.sealApplicationData("resumed request", &protected2);
     const opened_request = try resumed.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext2);
     try std.testing.expectEqualStrings("resumed request", opened_request.inner.content);
+}
+
+test "PSK round trip resumes over the extension (QUIC-style) profile with asymmetric client/server transport payloads" {
+    // Regression coverage: `ticketEligibleToOffer` used to compare the
+    // ticket's stored *server* transport snapshot against this client's own
+    // *local* outbound extension — the wrong direction, which would
+    // silently filter out every ticket whenever the two peers' transport
+    // payloads differ. `DirectHarness.initExtension()` deliberately uses
+    // different client/server payloads, so this both proves the ticket is
+    // still offered at all and completes a genuine QUIC-carrier-shaped
+    // (extension-profile) resumption, not only the record harness.
+    var harness = DirectHarness.initExtension();
+    defer harness.deinit();
+
+    const TicketCapture = struct {
+        ticket: session.ClientTicketState = .{},
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(std.testing.allocator, &self.ticket) catch unreachable;
+        }
+    };
+    var capture = TicketCapture{};
+    defer capture.ticket.deinit();
+    const limits = session.Limits.default;
+    try harness.client_backend.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = TicketCapture.now,
+        .onTicketFn = TicketCapture.onTicket,
+    });
+    try harness.run();
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try harness.server_backend.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "extension-profile-ticket",
+        .issued_at_unix_ms = 1000,
+    }, limits);
+    defer server_state.deinit();
+
+    const ticket_event = sink.items[0].handshake_bytes;
+    var protected: [record_codec.max_ciphertext_record_len * 2]u8 = undefined;
+    const records = (try harness.server_bridge.applyEvent(.{ .handshake_bytes = .{
+        .epoch = ticket_event.epoch,
+        .data = ticket_event.data,
+    } }, &protected)).?;
+    var parser = record_codec.Parser.init(.ciphertext);
+    var record_sink = record_codec.RecordSink(8, record_codec.max_ciphertext_fragment_len * 8){};
+    try parser.feed(records, &record_sink);
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    for (record_sink.items[0..record_sink.len]) |record| {
+        const opened = try harness.client_bridge.openHandshake(.application, record, &plaintext);
+        _ = try harness.client_driver.receive(.application, opened.inner.content);
+    }
+    try std.testing.expect(capture.ticket.ticket.slice().len > 0);
+    // The stored ticket carries the *server's* transport payload, not the
+    // client's — this is exactly the value the (fixed) client-side
+    // eligibility check must no longer compare against its own local one.
+    try std.testing.expectEqualStrings("server transport parameters", capture.ticket.common.transport_compat.?.slice());
+
+    var resumed = DirectHarness.initExtension();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&capture.ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+    };
+    resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    const Resolver = struct {
+        state: *session.ServerRecoverableState,
+        resolve_calls: usize = 0,
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+        fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.resolve_calls += 1;
+            if (!std.mem.eql(u8, identity, "extension-profile-ticket")) return false;
+            self.state.cloneInto(std.testing.allocator, out) catch return error.ResolverFailed;
+            return true;
+        }
+    };
+    // Pointer, not a copy — see the identical note in the record-profile
+    // round-trip test above: `server_state` owns allocator-backed storage
+    // (this ticket has a non-null `transport_compat`), and shallow-copying
+    // it here would double-free that storage.
+    var resolver_state: Resolver = .{ .state = &server_state };
+    resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = Resolver.now,
+        .resolveFn = Resolver.resolve,
+    });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    // The ticket was actually offered and resolved (not silently filtered
+    // out by the wrong-direction transport-compat comparison).
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.resolve_calls);
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+
+    var protected2: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext2: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try resumed.client_bridge.sealApplicationData("resumed over quic-style transport", &protected2);
+    const opened_request = try resumed.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext2);
+    try std.testing.expectEqualStrings("resumed over quic-style transport", opened_request.inner.content);
 }
 
 test "PSK round trip falls back to a full handshake when the resolver has no match" {
@@ -2996,6 +3119,96 @@ test "a compatible candidate with a wrong binder is fatal and never probes a lat
     }));
 
     try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+}
+
+/// A hand-written `CredentialProvider` whose second chain entry is
+/// malformed (empty, or larger than `max_certificate_len`) — for proving
+/// `inspectSelectedServerCredential` validates every entry, not only the
+/// leaf, before PSK selection ever runs.
+const MalformedTailProvider = struct {
+    entries: [2][]const u8,
+    release_count: usize = 0,
+
+    fn provider(self: *MalformedTailProvider) credentials.CredentialProvider {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable = credentials.CredentialProvider.VTable{ .select = select };
+
+    fn select(ctx: *anyopaque, selection: *const credentials.SelectionContext) credentials.SelectError!credentials.Progress(credentials.SelectedCredential) {
+        _ = selection;
+        return .{ .complete = .{ .handle = ctx, .scheme = .ed25519, .vtable = &cred_vtable } };
+    }
+
+    const cred_vtable = credentials.SelectedCredential.VTable{ .chain = chainFn, .sign = signFn, .release = releaseFn };
+
+    fn chainFn(handle: *anyopaque) credentials.CertificateChain {
+        const self: *MalformedTailProvider = @ptrCast(@alignCast(handle));
+        return .{ .entries = &self.entries };
+    }
+    fn signFn(handle: *anyopaque, scheme: credentials.SignatureScheme, input: []const u8, out: []u8) credentials.SignError!credentials.Progress(usize) {
+        _ = handle;
+        _ = scheme;
+        _ = input;
+        _ = out;
+        // Never reached: chain validation must fail before any signing is
+        // attempted, on both the PSK and full-handshake paths.
+        return error.SigningProviderFailure;
+    }
+    fn releaseFn(handle: *anyopaque) void {
+        const self: *MalformedTailProvider = @ptrCast(@alignCast(handle));
+        self.release_count += 1;
+    }
+};
+
+test "a malformed non-leaf chain entry is rejected before PSK resolver/binder work, even though the leaf is valid" {
+    var mock = MalformedTailProvider{ .entries = .{ tls_backend.testdata.certificate_der, "" } }; // entry 1: empty
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    const psk = [_]u8{0x99} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "leaf-ok-tail-bad" };
+    server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try std.testing.expectError(error.CredentialProviderFailed, driveServerSelection(&server, .{
+        .psk = .{ .items = &.{.{ .identity = "leaf-ok-tail-bad", .binder_psk = &psk }} },
+    }));
+
+    try std.testing.expectEqual(tls_backend.CredentialFailure.malformed_credential_chain, server.credentialFailure().?);
+    // The resolver/binder path was never reached at all.
+    try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+}
+
+test "an oversized non-leaf chain entry is rejected before PSK resolver/binder work" {
+    const oversized = [_]u8{0} ** (tls_backend.max_certificate_len + 1);
+    var mock = MalformedTailProvider{ .entries = .{ tls_backend.testdata.certificate_der, &oversized } };
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    const psk = [_]u8{0xaa} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "leaf-ok-tail-oversized" };
+    server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try std.testing.expectError(error.CredentialProviderFailed, driveServerSelection(&server, .{
+        .psk = .{ .items = &.{.{ .identity = "leaf-ok-tail-oversized", .binder_psk = &psk }} },
+    }));
+
+    try std.testing.expectEqual(tls_backend.CredentialFailure.malformed_credential_chain, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
 }
 
 test "a ticket bound to a different server certificate falls back to a full handshake" {

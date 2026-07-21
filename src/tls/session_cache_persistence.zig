@@ -450,29 +450,39 @@ pub fn loadClientCache(
     const plaintext = protector.open(sealed, plaintext_buf) catch return .protection_failed;
 
     var entries = decodeClientSnapshotAlloc(cache.allocator, limits, cache.limits.max_entries, max_plaintext_bytes, plaintext) catch |err| return mapDecodeError(err);
+    // `restoreClones` unconditionally consumes (deinitializes) every item
+    // passed to it, regardless of outcome (see its doc comment); this flag
+    // only guards the case where `entries` was decoded but never reaches
+    // that call (e.g. `ClientSessionCache.init` below fails).
+    var entries_consumed = false;
     defer {
-        for (entries.items) |*p| p.deinit();
+        if (!entries_consumed) for (entries.items) |*p| p.deinit();
         entries.deinit(cache.allocator);
     }
 
+    // `restoreClones` already restores into its own internal temporary
+    // cache and adopts it only on full success (see its doc comment), so
+    // `temp` here is genuinely atomic even though it is itself the target
+    // of that call.
     var temp = session_cache.ClientSessionCache.init(cache.allocator, cache.limits) catch return .corrupted;
     defer temp.deinit();
+    entries_consumed = true;
     temp.restoreClones(entries.items, now_unix_ms) catch return .allocation_failed;
 
     cache.mutex.lock();
     defer cache.mutex.unlock();
-    for (cache.entries.items) |*e| e.ticket.deinit();
-    cache.entries.deinit(cache.allocator);
-    cache.entries = temp.entries;
-    cache.total_bytes = temp.total_bytes;
-    cache.next_insertion_sequence = temp.next_insertion_sequence;
-    cache.next_lru_sequence = temp.next_lru_sequence;
-    cache.next_entry_id = temp.next_entry_id;
-    temp.entries = .empty;
-    temp.total_bytes = 0;
+    cache.adoptFromLocked(&temp);
     return .loaded;
 }
 
+/// Saves every live, non-expired server entry. The persistence token guard
+/// (`beginPersistenceOperation`/`endPersistenceOperation`) is held for the
+/// entire function body, including backend I/O: this both refuses to
+/// overlap with a concurrent load/save on the same cache (closing the
+/// two-saves-interleave-and-resurrect-a-consumed-ticket race) and refuses
+/// any *new* single-use lease acquisition for the duration (closing the
+/// select-then-save-then-commit race — see `resolveLease`'s `.busy`
+/// outcome).
 pub fn saveServerCache(
     cache: *session_cache.StatefulServerCache,
     limits: session.Limits,
@@ -480,6 +490,9 @@ pub fn saveServerCache(
     backend: Backend,
     now_unix_ms: i64,
 ) SaveResult {
+    const token = cache.beginPersistenceOperation() catch return .cache_busy;
+    defer cache.endPersistenceOperation(token);
+
     var snapshot = cache.cloneLiveForPersistence(cache.allocator, now_unix_ms) catch |err| return switch (err) {
         error.OutOfMemory => .allocation_failed,
         error.CacheBusy => .cache_busy,
@@ -487,7 +500,6 @@ pub fn saveServerCache(
     defer {
         for (snapshot.items) |*p| p.deinit();
         snapshot.deinit(cache.allocator);
-        cache.endPersistenceSnapshot();
     }
 
     const plaintext = encodeServerSnapshotAlloc(cache.allocator, snapshot.items, limits) catch return .allocation_failed;
@@ -508,6 +520,11 @@ pub fn saveServerCache(
     return .saved;
 }
 
+/// Loads and swaps in a persisted snapshot. Like `saveServerCache`, the
+/// persistence token guard is held for the entire function body — see that
+/// function's doc comment for why (load must not overlap a concurrent save
+/// or load on the same cache, and must not race a new single-use lease
+/// acquisition).
 pub fn loadServerCache(
     cache: *session_cache.StatefulServerCache,
     limits: session.Limits,
@@ -515,6 +532,9 @@ pub fn loadServerCache(
     backend: Backend,
     now_unix_ms: i64,
 ) LoadResult {
+    const token = cache.beginPersistenceOperation() catch return .cache_busy;
+    defer cache.endPersistenceOperation(token);
+
     const sealed = (backend.load(cache.allocator) catch return .backend_failed) orelse return .absent;
     defer {
         secrets.secureZero(sealed);
@@ -532,13 +552,18 @@ pub fn loadServerCache(
     const plaintext = protector.open(sealed, plaintext_buf) catch return .protection_failed;
 
     var entries = decodeServerSnapshotAlloc(cache.allocator, limits, cache.limits.max_entries, max_plaintext_bytes, plaintext) catch |err| return mapDecodeError(err);
+    // `restoreEntries` unconditionally consumes (deinitializes) every item
+    // passed to it, regardless of outcome; this flag only guards the case
+    // where `entries` was decoded but never reaches that call.
+    var entries_consumed = false;
     defer {
-        for (entries.items) |*p| p.deinit();
+        if (!entries_consumed) for (entries.items) |*p| p.deinit();
         entries.deinit(cache.allocator);
     }
 
     var temp = session_cache.StatefulServerCache.init(cache.allocator, cache.limits, cache.random) catch return .corrupted;
     defer temp.deinit();
+    entries_consumed = true;
     temp.restoreEntries(entries.items, now_unix_ms) catch |err| return switch (err) {
         error.OutOfMemory => .allocation_failed,
         error.DuplicateHandle => .corrupted,
@@ -869,7 +894,7 @@ test "saveClientCache and loadClientCache round trip through an in-memory backen
     var cache = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
     defer cache.deinit();
     var t1 = try testClient(testing.allocator, "round-trip-ticket", "example.test");
-    _ = cache.storeClone(&t1, 0, .single_use);
+    _ = cache.storeClone(&t1, 0, .reusable);
     t1.deinit();
 
     var backend = MemoryBackend{ .allocator = testing.allocator };
@@ -1055,36 +1080,58 @@ test "saveServerCache and loadServerCache round trip and preserve the handle" {
     try testing.expect(hit == .hit);
 }
 
-test "saveServerCache closes the resolve-then-consume race: a new lease cannot start mid-save" {
+test "persistence token guard closes the resolve-then-consume race and rejects overlap" {
     var cache = try session_cache.StatefulServerCache.init(testing.allocator, session_cache.Limits.stateful_server_default, session_cache.system_random_source);
     defer cache.deinit();
     var s1 = try testServerState(testing.allocator, "example.test");
     var handle: [session_cache.stateful_identity_len]u8 = undefined;
     _ = cache.insertMove(&s1, 0, .single_use, &handle);
 
-    var snapshot = try cache.cloneLiveForPersistence(testing.allocator, 1);
-    defer {
-        for (snapshot.items) |*p| p.deinit();
-        snapshot.deinit(testing.allocator);
-        cache.endPersistenceSnapshot();
-    }
+    const token = try cache.beginPersistenceOperation();
 
-    // While the snapshot guard is held (as it would be for the whole
-    // duration of `saveServerCache`'s encode/seal/backend-save), a new
+    // While the guard is held (as it would be for the whole duration of
+    // `saveServerCache`'s clone/encode/seal/backend-save), a new
     // single-use resolution must be refused rather than allowed to
-    // resolve-and-commit a ticket that the in-flight snapshot has already
-    // captured as still-live.
+    // resolve-and-commit a ticket that an in-flight snapshot may already
+    // have captured as still-live.
     const during_save = cache.resolveLease(&handle, 1);
     try testing.expect(during_save == .busy);
 
-    // Once the guard ends (snapshot durably saved or abandoned), the
-    // ticket resolves normally again. `endPersistenceSnapshot` is
-    // idempotent, so calling it here and again via the outer `defer` above
-    // is safe.
-    cache.endPersistenceSnapshot();
+    // A second operation (another save, or a load) must not be able to
+    // start while the first is in flight.
+    try testing.expectError(error.CacheBusy, cache.beginPersistenceOperation());
+    var backend = MemoryBackend{ .allocator = testing.allocator };
+    defer backend.deinit();
+    try testing.expectEqual(SaveResult.cache_busy, saveServerCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
+    try testing.expectEqual(LoadResult.cache_busy, loadServerCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
+
+    // Ending a *different* (already-superseded) token must not clear this
+    // operation's guard.
+    cache.endPersistenceOperation(token +% 1);
+    try testing.expect(cache.resolveLease(&handle, 1) == .busy);
+
+    // Ending the correct token releases the guard; the ticket resolves
+    // normally again, and consuming it here is never later "restored" by
+    // the operation that was blocked above (it already failed/returned,
+    // rather than being retried with stale data).
+    cache.endPersistenceOperation(token);
     var after_save = cache.resolveLease(&handle, 1);
     defer after_save.deinit();
     try testing.expect(after_save == .hit);
+    switch (after_save) {
+        .hit => |*h| h.lease.commit(),
+        else => unreachable,
+    }
+
+    try testing.expectEqual(SaveResult.saved, saveServerCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 2));
+    var restored = try session_cache.StatefulServerCache.init(testing.allocator, session_cache.Limits.stateful_server_default, session_cache.system_random_source);
+    defer restored.deinit();
+    try testing.expectEqual(LoadResult.loaded, loadServerCache(&restored, session.Limits.default, passthrough_protector, backend.interface(), 2));
+    // The single-use ticket was committed (consumed) before the save that
+    // actually completed; it must not come back after a reload.
+    var after_reload = restored.resolveLease(&handle, 2);
+    defer after_reload.deinit();
+    try testing.expect(after_reload == .miss);
 }
 
 test "loadServerCache derives its size ceiling from the target cache's own limits, not a fixed constant" {

@@ -18,9 +18,17 @@
 //!     decode/limit/expiry validation has fully succeeded.
 //!
 //! A persistence failure (protection, backend, or malformed/oversized/
-//! unsupported-version data) never invalidates the live in-memory cache and
-//! never propagates as a TLS-connection-affecting error — every entry point
-//! here returns a plain `SaveResult` / `LoadResult`.
+//! unsupported-version/trailing-data snapshot) never invalidates the live
+//! in-memory cache and never propagates as a TLS-connection-affecting
+//! error — every entry point here returns a plain `SaveResult` / `LoadResult`.
+//!
+//! Decoding is bounded *before* it allocates anything sized by attacker- or
+//! corruption-controlled input: the declared record count is checked
+//! against the target cache's own entry limit (and a hard ceiling) before
+//! any capacity is reserved, the plaintext itself is checked against a
+//! fixed byte ceiling before parsing starts, and a snapshot with any
+//! trailing bytes after its declared records is rejected rather than
+//! silently accepted.
 
 const std = @import("std");
 const crypto = @import("crypto");
@@ -33,25 +41,43 @@ pub const snapshot_magic = [4]u8{ 'T', 'D', 'P', 'S' };
 pub const snapshot_version: u8 = 1;
 const header_len: usize = 4 + 1 + 1 + 4;
 
+/// Hard ceiling on total plaintext snapshot size, checked before any
+/// header/record parsing begins. Generous relative to the cache byte
+/// budgets (`Limits.hard_max_total_bytes`) so a legitimate snapshot never
+/// approaches it, while still bounding a corrupted or malicious buffer.
+pub const hard_max_snapshot_bytes: usize = 16 * 1024 * 1024;
+
 pub const SnapshotKind = enum(u8) { client = 1, server = 2 };
 
 pub const SnapshotEncodeError = session.EncodeError || error{OutOfMemory};
 pub const SnapshotDecodeError = error{
     OutOfMemory,
+    SnapshotTooLarge,
     Truncated,
+    TrailingData,
     BadMagic,
     UnsupportedVersion,
     UnsupportedKind,
+    TooManyRecords,
     MalformedLength,
+    InvalidHandle,
     DecodeFailed,
 };
 
 // -----------------------------------------------------------------------
 // Snapshot framing: `magic(4) | version(1) | kind(1) | count(4) | records`.
 //
-// Client record: `usage(1) | len(4) | session.encodeClient bytes(len)`.
-// Server record: `usage(1) | handle(40) | len(4) | session.encodeServer
-// bytes(len)`.
+// Client record:
+//   `usage(1) | insertion_sequence(8) | lru_sequence(8) | len(4) |
+//    session.encodeClient bytes(len)`.
+// Server record:
+//   `usage(1) | handle(40) | lru_sequence(8) | len(4) |
+//    session.encodeServer bytes(len)`.
+//
+// Persisting `insertion_sequence`/`lru_sequence` explicitly (rather than
+// relying on physical record order) lets restore reproduce the exact
+// pre-save offer order and eviction order, since the live caches reorder
+// their backing storage on every `swapRemove`-based removal.
 // -----------------------------------------------------------------------
 
 fn writeHeader(out: []u8, kind: SnapshotKind, count: u32) void {
@@ -68,6 +94,7 @@ const Header = struct {
 };
 
 fn readHeader(bytes: []const u8) SnapshotDecodeError!Header {
+    if (bytes.len > hard_max_snapshot_bytes) return error.SnapshotTooLarge;
     if (bytes.len < header_len) return error.Truncated;
     if (!std.mem.eql(u8, bytes[0..4], &snapshot_magic)) return error.BadMagic;
     if (bytes[4] != snapshot_version) return error.UnsupportedVersion;
@@ -87,7 +114,7 @@ pub fn encodeClientSnapshotAlloc(
     var total: usize = header_len;
     for (entries) |*e| {
         const encoded_len = try session.clientEncodedLenWithLimits(&e.ticket, limits);
-        total += 1 + 4 + encoded_len;
+        total += 1 + 8 + 8 + 4 + encoded_len;
     }
 
     const buf = try allocator.alloc(u8, total);
@@ -101,6 +128,10 @@ pub fn encodeClientSnapshotAlloc(
     for (entries) |*e| {
         buf[pos] = @intFromEnum(e.usage);
         pos += 1;
+        std.mem.writeInt(u64, buf[pos..][0..8], e.insertion_sequence, .big);
+        pos += 8;
+        std.mem.writeInt(u64, buf[pos..][0..8], e.lru_sequence, .big);
+        pos += 8;
         const encoded_len = try session.clientEncodedLenWithLimits(&e.ticket, limits);
         std.mem.writeInt(u32, buf[pos..][0..4], @intCast(encoded_len), .big);
         pos += 4;
@@ -122,7 +153,7 @@ pub fn encodeServerSnapshotAlloc(
     var total: usize = header_len;
     for (entries) |*e| {
         const encoded_len = try session.serverEncodedLenWithLimits(&e.state, limits);
-        total += 1 + session_cache.stateful_identity_len + 4 + encoded_len;
+        total += 1 + session_cache.stateful_identity_len + 8 + 4 + encoded_len;
     }
 
     const buf = try allocator.alloc(u8, total);
@@ -138,6 +169,8 @@ pub fn encodeServerSnapshotAlloc(
         pos += 1;
         @memcpy(buf[pos .. pos + session_cache.stateful_identity_len], &e.handle);
         pos += session_cache.stateful_identity_len;
+        std.mem.writeInt(u64, buf[pos..][0..8], e.lru_sequence, .big);
+        pos += 8;
         const encoded_len = try session.serverEncodedLenWithLimits(&e.state, limits);
         std.mem.writeInt(u32, buf[pos..][0..4], @intCast(encoded_len), .big);
         pos += 4;
@@ -148,13 +181,19 @@ pub fn encodeServerSnapshotAlloc(
     return buf;
 }
 
+/// `max_entries` bounds `header.count` *before* any capacity is reserved
+/// for the decoded list, so a corrupted/hostile snapshot claiming an
+/// enormous count fails immediately rather than attempting a huge
+/// allocation. It is typically the target cache's own `Limits.max_entries`.
 pub fn decodeClientSnapshotAlloc(
     allocator: std.mem.Allocator,
     limits: session.Limits,
+    max_entries: usize,
     bytes: []const u8,
 ) SnapshotDecodeError!std.ArrayListUnmanaged(session_cache.PersistedClientEntry) {
     const header = try readHeader(bytes);
     if (header.kind != .client) return error.UnsupportedKind;
+    if (header.count > max_entries or header.count > session_cache.hard_max_entries) return error.TooManyRecords;
 
     var out: std.ArrayListUnmanaged(session_cache.PersistedClientEntry) = .empty;
     errdefer {
@@ -166,33 +205,43 @@ pub fn decodeClientSnapshotAlloc(
     var rest = header.body;
     var i: u32 = 0;
     while (i < header.count) : (i += 1) {
-        if (rest.len < 1 + 4) return error.Truncated;
+        if (rest.len < 1 + 8 + 8 + 4) return error.Truncated;
         const usage = std.enums.fromInt(session_cache.UsagePolicy, rest[0]) orelse return error.MalformedLength;
-        const len = std.mem.readInt(u32, rest[1..5], .big);
-        rest = rest[5..];
+        const insertion_sequence = std.mem.readInt(u64, rest[1..9], .big);
+        const lru_sequence = std.mem.readInt(u64, rest[9..17], .big);
+        const len = std.mem.readInt(u32, rest[17..21], .big);
+        rest = rest[21..];
         if (rest.len < len) return error.Truncated;
         const record_bytes = rest[0..len];
         rest = rest[len..];
 
         var decoded = session.decode(allocator, limits, record_bytes) catch return error.DecodeFailed;
         switch (decoded) {
-            .client => |c| out.appendAssumeCapacity(.{ .ticket = c, .usage = usage }),
+            .client => |c| out.appendAssumeCapacity(.{
+                .ticket = c,
+                .usage = usage,
+                .insertion_sequence = insertion_sequence,
+                .lru_sequence = lru_sequence,
+            }),
             .server => {
                 decoded.deinit();
                 return error.UnsupportedKind;
             },
         }
     }
+    if (rest.len != 0) return error.TrailingData;
     return out;
 }
 
 pub fn decodeServerSnapshotAlloc(
     allocator: std.mem.Allocator,
     limits: session.Limits,
+    max_entries: usize,
     bytes: []const u8,
 ) SnapshotDecodeError!std.ArrayListUnmanaged(session_cache.PersistedServerEntry) {
     const header = try readHeader(bytes);
     if (header.kind != .server) return error.UnsupportedKind;
+    if (header.count > max_entries or header.count > session_cache.hard_max_entries) return error.TooManyRecords;
 
     var out: std.ArrayListUnmanaged(session_cache.PersistedServerEntry) = .empty;
     errdefer {
@@ -204,26 +253,31 @@ pub fn decodeServerSnapshotAlloc(
     var rest = header.body;
     var i: u32 = 0;
     while (i < header.count) : (i += 1) {
-        if (rest.len < 1 + session_cache.stateful_identity_len + 4) return error.Truncated;
+        const fixed_len = 1 + session_cache.stateful_identity_len + 8 + 4;
+        if (rest.len < fixed_len) return error.Truncated;
         const usage = std.enums.fromInt(session_cache.UsagePolicy, rest[0]) orelse return error.MalformedLength;
         var handle: [session_cache.stateful_identity_len]u8 = undefined;
         @memcpy(&handle, rest[1 .. 1 + session_cache.stateful_identity_len]);
-        const len_offset = 1 + session_cache.stateful_identity_len;
+        if (!session_cache.isValidStatefulHandleShape(&handle)) return error.InvalidHandle;
+        const lru_offset = 1 + session_cache.stateful_identity_len;
+        const lru_sequence = std.mem.readInt(u64, rest[lru_offset..][0..8], .big);
+        const len_offset = lru_offset + 8;
         const len = std.mem.readInt(u32, rest[len_offset..][0..4], .big);
-        rest = rest[len_offset + 4 ..];
+        rest = rest[fixed_len..];
         if (rest.len < len) return error.Truncated;
         const record_bytes = rest[0..len];
         rest = rest[len..];
 
         var decoded = session.decode(allocator, limits, record_bytes) catch return error.DecodeFailed;
         switch (decoded) {
-            .server => |s| out.appendAssumeCapacity(.{ .handle = handle, .usage = usage, .state = s }),
+            .server => |s| out.appendAssumeCapacity(.{ .handle = handle, .usage = usage, .state = s, .lru_sequence = lru_sequence }),
             .client => {
                 decoded.deinit();
                 return error.UnsupportedKind;
             },
         }
     }
+    if (rest.len != 0) return error.TrailingData;
     return out;
 }
 
@@ -278,11 +332,12 @@ pub const Backend = struct {
 // Save/load orchestration
 // -----------------------------------------------------------------------
 
-pub const SaveResult = enum { saved, allocation_failed, protection_failed, backend_failed };
+pub const SaveResult = enum { saved, allocation_failed, cache_busy, protection_failed, backend_failed };
 pub const LoadResult = enum {
     loaded,
     absent,
     allocation_failed,
+    cache_busy,
     protection_failed,
     corrupted,
     unsupported_version,
@@ -293,7 +348,16 @@ fn mapDecodeError(err: SnapshotDecodeError) LoadResult {
     return switch (err) {
         error.OutOfMemory => .allocation_failed,
         error.UnsupportedVersion => .unsupported_version,
-        error.Truncated, error.BadMagic, error.UnsupportedKind, error.MalformedLength, error.DecodeFailed => .corrupted,
+        error.SnapshotTooLarge,
+        error.Truncated,
+        error.TrailingData,
+        error.BadMagic,
+        error.UnsupportedKind,
+        error.TooManyRecords,
+        error.MalformedLength,
+        error.InvalidHandle,
+        error.DecodeFailed,
+        => .corrupted,
     };
 }
 
@@ -356,7 +420,7 @@ pub fn loadClientCache(
     }
     const plaintext = protector.open(sealed, plaintext_buf) catch return .protection_failed;
 
-    var entries = decodeClientSnapshotAlloc(cache.allocator, limits, plaintext) catch |err| return mapDecodeError(err);
+    var entries = decodeClientSnapshotAlloc(cache.allocator, limits, cache.limits.max_entries, plaintext) catch |err| return mapDecodeError(err);
     defer {
         for (entries.items) |*p| p.deinit();
         entries.deinit(cache.allocator);
@@ -364,7 +428,7 @@ pub fn loadClientCache(
 
     var temp = session_cache.ClientSessionCache.init(cache.allocator, cache.limits) catch return .corrupted;
     defer temp.deinit();
-    temp.restoreClones(entries.items, now_unix_ms);
+    temp.restoreClones(entries.items, now_unix_ms) catch return .allocation_failed;
 
     cache.mutex.lock();
     defer cache.mutex.unlock();
@@ -372,7 +436,8 @@ pub fn loadClientCache(
     cache.entries.deinit(cache.allocator);
     cache.entries = temp.entries;
     cache.total_bytes = temp.total_bytes;
-    cache.next_sequence = temp.next_sequence;
+    cache.next_insertion_sequence = temp.next_insertion_sequence;
+    cache.next_lru_sequence = temp.next_lru_sequence;
     cache.next_entry_id = temp.next_entry_id;
     temp.entries = .empty;
     temp.total_bytes = 0;
@@ -386,7 +451,10 @@ pub fn saveServerCache(
     backend: Backend,
     now_unix_ms: i64,
 ) SaveResult {
-    var snapshot = cache.cloneLiveForPersistence(cache.allocator, now_unix_ms) catch return .allocation_failed;
+    var snapshot = cache.cloneLiveForPersistence(cache.allocator, now_unix_ms) catch |err| return switch (err) {
+        error.OutOfMemory => .allocation_failed,
+        error.CacheBusy => .cache_busy,
+    };
     defer {
         for (snapshot.items) |*p| p.deinit();
         snapshot.deinit(cache.allocator);
@@ -431,7 +499,7 @@ pub fn loadServerCache(
     }
     const plaintext = protector.open(sealed, plaintext_buf) catch return .protection_failed;
 
-    var entries = decodeServerSnapshotAlloc(cache.allocator, limits, plaintext) catch |err| return mapDecodeError(err);
+    var entries = decodeServerSnapshotAlloc(cache.allocator, limits, cache.limits.max_entries, plaintext) catch |err| return mapDecodeError(err);
     defer {
         for (entries.items) |*p| p.deinit();
         entries.deinit(cache.allocator);
@@ -439,20 +507,42 @@ pub fn loadServerCache(
 
     var temp = session_cache.StatefulServerCache.init(cache.allocator, cache.limits, cache.random) catch return .corrupted;
     defer temp.deinit();
-    temp.restoreEntries(entries.items, now_unix_ms);
+    temp.restoreEntries(entries.items, now_unix_ms) catch return .allocation_failed;
 
     cache.mutex.lock();
     defer cache.mutex.unlock();
-    for (cache.entries.items) |*e| {
+
+    // Re-check the *live* cache for outstanding leases immediately before
+    // swapping it out: a lease acquired after `cloneLiveForPersistence`'s
+    // own check (which only guards the snapshot side, taken during save)
+    // must not be silently invalidated by a concurrent reload.
+    var it = cache.entries.valueIterator();
+    while (it.next()) |e| {
+        if (e.usage == .single_use and e.active_lease_epoch != null) return .cache_busy;
+    }
+
+    var old_it = cache.entries.valueIterator();
+    while (old_it.next()) |e| {
         e.state.deinit();
         secrets.secureZero(&e.handle);
     }
     cache.entries.deinit(cache.allocator);
+    cache.handle_index.deinit(cache.allocator);
+    var old_bucket_it = cache.origin_index.valueIterator();
+    while (old_bucket_it.next()) |b| b.deinit(cache.allocator);
+    cache.origin_index.deinit(cache.allocator);
+
     cache.entries = temp.entries;
+    cache.handle_index = temp.handle_index;
+    cache.origin_index = temp.origin_index;
     cache.total_bytes = temp.total_bytes;
-    cache.next_sequence = temp.next_sequence;
-    cache.next_generation = temp.next_generation;
+    cache.next_entry_id = temp.next_entry_id;
+    cache.next_lru_sequence = temp.next_lru_sequence;
+    cache.next_lease_epoch = temp.next_lease_epoch;
+
     temp.entries = .empty;
+    temp.handle_index = .empty;
+    temp.origin_index = .empty;
     temp.total_bytes = 0;
     return .loaded;
 }
@@ -572,9 +662,9 @@ fn testServerState(allocator: std.mem.Allocator, sni: []const u8) !session.Serve
     return state;
 }
 
-test "client snapshot round trips through encode/decode" {
+test "client snapshot round trips through encode/decode, including order metadata" {
     const t1 = try testClient(testing.allocator, "persist-ticket-1", "example.test");
-    var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = t1, .usage = .single_use }};
+    var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = t1, .usage = .single_use, .insertion_sequence = 7, .lru_sequence = 3 }};
     defer for (&entries) |*e| e.deinit();
 
     const bytes = try encodeClientSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
@@ -583,21 +673,26 @@ test "client snapshot round trips through encode/decode" {
         testing.allocator.free(bytes);
     }
 
-    var decoded = try decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, bytes);
+    var decoded = try decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bytes);
     defer {
         for (decoded.items) |*p| p.deinit();
         decoded.deinit(testing.allocator);
     }
     try testing.expectEqual(@as(usize, 1), decoded.items.len);
     try testing.expectEqual(session_cache.UsagePolicy.single_use, decoded.items[0].usage);
+    try testing.expectEqual(@as(u64, 7), decoded.items[0].insertion_sequence);
+    try testing.expectEqual(@as(u64, 3), decoded.items[0].lru_sequence);
     try testing.expectEqualStrings("persist-ticket-1", decoded.items[0].ticket.ticket.slice());
 }
 
-test "server snapshot preserves the exact handle" {
+test "server snapshot preserves the exact handle and LRU sequence" {
     const s1 = try testServerState(testing.allocator, "example.test");
     var handle: [session_cache.stateful_identity_len]u8 = undefined;
     @memset(&handle, 0xAB);
-    var entries = [_]session_cache.PersistedServerEntry{.{ .handle = handle, .usage = .reusable, .state = s1 }};
+    @memcpy(handle[0..4], "TDSH");
+    std.mem.writeInt(u16, handle[4..6], 1, .big);
+    std.mem.writeInt(u16, handle[6..8], 0, .big);
+    var entries = [_]session_cache.PersistedServerEntry{.{ .handle = handle, .usage = .reusable, .state = s1, .lru_sequence = 42 }};
     defer for (&entries) |*e| e.deinit();
 
     const bytes = try encodeServerSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
@@ -605,13 +700,14 @@ test "server snapshot preserves the exact handle" {
         secrets.secureZero(bytes);
         testing.allocator.free(bytes);
     }
-    var decoded = try decodeServerSnapshotAlloc(testing.allocator, session.Limits.default, bytes);
+    var decoded = try decodeServerSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bytes);
     defer {
         for (decoded.items) |*p| p.deinit();
         decoded.deinit(testing.allocator);
     }
     try testing.expectEqual(@as(usize, 1), decoded.items.len);
     try testing.expect(std.mem.eql(u8, &handle, &decoded.items[0].handle));
+    try testing.expectEqual(@as(u64, 42), decoded.items[0].lru_sequence);
 }
 
 test "decode rejects truncated, bad-magic, and unsupported-version snapshots" {
@@ -624,24 +720,24 @@ test "decode rejects truncated, bad-magic, and unsupported-version snapshots" {
         testing.allocator.free(bytes);
     }
 
-    try testing.expectError(error.Truncated, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, bytes[0..5]));
+    try testing.expectError(error.Truncated, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bytes[0..5]));
 
-    var bad_magic = try testing.allocator.dupe(u8, bytes);
+    const bad_magic = try testing.allocator.dupe(u8, bytes);
     defer testing.allocator.free(bad_magic);
     bad_magic[0] = 'X';
-    try testing.expectError(error.BadMagic, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, bad_magic));
+    try testing.expectError(error.BadMagic, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bad_magic));
 
-    var bad_version = try testing.allocator.dupe(u8, bytes);
+    const bad_version = try testing.allocator.dupe(u8, bytes);
     defer testing.allocator.free(bad_version);
     bad_version[4] = 99;
-    try testing.expectError(error.UnsupportedVersion, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, bad_version));
+    try testing.expectError(error.UnsupportedVersion, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bad_version));
 
     const truncated_record = try testing.allocator.dupe(u8, bytes[0 .. bytes.len - 1]);
     defer testing.allocator.free(truncated_record);
-    try testing.expectError(error.Truncated, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, truncated_record));
+    try testing.expectError(error.Truncated, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, truncated_record));
 }
 
-test "decode rejects a client snapshot presented as a server snapshot" {
+test "decode rejects a declared record count over the target cache's entry limit before allocating" {
     const t1 = try testClient(testing.allocator, "t", "example.test");
     var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = t1, .usage = .reusable }};
     defer for (&entries) |*e| e.deinit();
@@ -650,25 +746,75 @@ test "decode rejects a client snapshot presented as a server snapshot" {
         secrets.secureZero(bytes);
         testing.allocator.free(bytes);
     }
-    try testing.expectError(error.UnsupportedKind, decodeServerSnapshotAlloc(testing.allocator, session.Limits.default, bytes));
+
+    // A single real record, but a corrupted count claiming ~4 billion.
+    const bombed = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(bombed);
+    std.mem.writeInt(u32, bombed[6..10], 0xFFFF_FFF0, .big);
+    try testing.expectError(error.TooManyRecords, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, 8, bombed));
 }
 
-test "saveClientCache and loadClientCache round trip through an in-memory backend" {
+test "decode rejects trailing bytes after the declared record count, even with a zero count" {
+    var zero_count: [header_len + 4]u8 = undefined;
+    writeHeader(&zero_count, .client, 0);
+    @memset(zero_count[header_len..], 0xAA);
+    try testing.expectError(error.TrailingData, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, &zero_count));
+
+    const t1 = try testClient(testing.allocator, "t", "example.test");
+    var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = t1, .usage = .reusable }};
+    defer for (&entries) |*e| e.deinit();
+    const bytes = try encodeClientSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
+    defer {
+        secrets.secureZero(bytes);
+        testing.allocator.free(bytes);
+    }
+    var with_trailer = try testing.allocator.alloc(u8, bytes.len + 3);
+    defer testing.allocator.free(with_trailer);
+    @memcpy(with_trailer[0..bytes.len], bytes);
+    @memset(with_trailer[bytes.len..], 0x99);
+    try testing.expectError(error.TrailingData, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, with_trailer));
+}
+
+test "decode rejects a server handle with a non-zero reserved field or wrong magic/version" {
+    const s1 = try testServerState(testing.allocator, "example.test");
+    var handle: [session_cache.stateful_identity_len]u8 = undefined;
+    @memcpy(handle[0..4], "TDSH");
+    std.mem.writeInt(u16, handle[4..6], 1, .big);
+    std.mem.writeInt(u16, handle[6..8], 1, .big); // non-zero reserved
+    var entries = [_]session_cache.PersistedServerEntry{.{ .handle = handle, .usage = .reusable, .state = s1 }};
+    defer for (&entries) |*e| e.deinit();
+    const bytes = try encodeServerSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
+    defer {
+        secrets.secureZero(bytes);
+        testing.allocator.free(bytes);
+    }
+    try testing.expectError(error.InvalidHandle, decodeServerSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bytes));
+}
+
+test "decode rejects a plaintext buffer over the hard snapshot size ceiling before parsing" {
+    const oversized = try testing.allocator.alloc(u8, hard_max_snapshot_bytes + 1);
+    defer testing.allocator.free(oversized);
+    // Header/magic left as zeroed garbage: the size gate must reject this
+    // before `readHeader` ever inspects the magic/version/count fields.
+    try testing.expectError(
+        error.SnapshotTooLarge,
+        decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, oversized),
+    );
+}
+
+test "client cache and server cache both refuse a corrupted payload without touching the live cache" {
     var cache = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
     defer cache.deinit();
-    var t1 = try testClient(testing.allocator, "round-trip-ticket", "example.test");
-    _ = cache.storeClone(&t1, 0, .single_use);
+    var t1 = try testClient(testing.allocator, "still-here", "example.test");
+    _ = cache.storeClone(&t1, 0, .reusable);
     t1.deinit();
 
     var backend = MemoryBackend{ .allocator = testing.allocator };
     defer backend.deinit();
+    backend.bytes = try testing.allocator.dupe(u8, "not a valid snapshot at all");
 
-    try testing.expectEqual(SaveResult.saved, saveClientCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
-
-    var restored = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
-    defer restored.deinit();
-    try testing.expectEqual(LoadResult.loaded, loadClientCache(&restored, session.Limits.default, passthrough_protector, backend.interface(), 2));
-    try testing.expectEqual(@as(usize, 1), restored.count());
+    try testing.expectEqual(LoadResult.corrupted, loadClientCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
+    try testing.expectEqual(@as(usize, 1), cache.count());
 }
 
 test "loadClientCache reports absent without touching the live cache" {
@@ -695,19 +841,22 @@ test "loadClientCache backend failure leaves the live cache untouched" {
     try testing.expectEqual(@as(usize, 1), cache.count());
 }
 
-test "loadClientCache corrupted payload leaves the live cache untouched" {
+test "saveClientCache and loadClientCache round trip through an in-memory backend" {
     var cache = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
     defer cache.deinit();
-    var t1 = try testClient(testing.allocator, "still-here", "example.test");
-    _ = cache.storeClone(&t1, 0, .reusable);
+    var t1 = try testClient(testing.allocator, "round-trip-ticket", "example.test");
+    _ = cache.storeClone(&t1, 0, .single_use);
     t1.deinit();
 
     var backend = MemoryBackend{ .allocator = testing.allocator };
     defer backend.deinit();
-    backend.bytes = try testing.allocator.dupe(u8, "not a valid snapshot at all");
 
-    try testing.expectEqual(LoadResult.corrupted, loadClientCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
-    try testing.expectEqual(@as(usize, 1), cache.count());
+    try testing.expectEqual(SaveResult.saved, saveClientCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
+
+    var restored = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
+    defer restored.deinit();
+    try testing.expectEqual(LoadResult.loaded, loadClientCache(&restored, session.Limits.default, passthrough_protector, backend.interface(), 2));
+    try testing.expectEqual(@as(usize, 1), restored.count());
 }
 
 test "loadClientCache discards expired entries and enforces current limits on reload" {
@@ -728,6 +877,53 @@ test "loadClientCache discards expired entries and enforces current limits on re
     try testing.expectEqual(@as(usize, 0), restored.count());
 }
 
+test "saveServerCache refuses a leased single-use entry and succeeds once it is committed" {
+    var cache = try session_cache.StatefulServerCache.init(testing.allocator, session_cache.Limits.stateful_server_default, session_cache.system_random_source);
+    defer cache.deinit();
+    var s1 = try testServerState(testing.allocator, "example.test");
+    var handle: [session_cache.stateful_identity_len]u8 = undefined;
+    _ = cache.insertMove(&s1, 0, .single_use, &handle);
+
+    var backend = MemoryBackend{ .allocator = testing.allocator };
+    defer backend.deinit();
+
+    var leased = cache.resolveLease(&handle, 1);
+    try testing.expectEqual(SaveResult.cache_busy, saveServerCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
+    try testing.expect(backend.bytes == null);
+
+    switch (leased) {
+        .hit => |*h| h.lease.commit(),
+        else => try testing.expect(false),
+    }
+    leased.deinit();
+
+    try testing.expectEqual(SaveResult.saved, saveServerCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 2));
+}
+
+test "loadServerCache refuses to replace a live cache with an outstanding lease" {
+    var cache = try session_cache.StatefulServerCache.init(testing.allocator, session_cache.Limits.stateful_server_default, session_cache.system_random_source);
+    defer cache.deinit();
+    var s1 = try testServerState(testing.allocator, "example.test");
+    var handle: [session_cache.stateful_identity_len]u8 = undefined;
+    _ = cache.insertMove(&s1, 0, .single_use, &handle);
+
+    var backend = MemoryBackend{ .allocator = testing.allocator };
+    defer backend.deinit();
+    backend.bytes = try encodeServerSnapshotAlloc(testing.allocator, &.{}, session.Limits.default);
+    var header_buf = backend.bytes.?;
+    writeHeader(header_buf[0..header_len], .server, 0);
+
+    var leased = cache.resolveLease(&handle, 1);
+    try testing.expectEqual(LoadResult.cache_busy, loadServerCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 2));
+    try testing.expectEqual(@as(usize, 1), cache.count());
+
+    switch (leased) {
+        .hit => |*h| h.lease.release(),
+        else => try testing.expect(false),
+    }
+    leased.deinit();
+}
+
 test "saveServerCache and loadServerCache round trip and preserve the handle" {
     var cache = try session_cache.StatefulServerCache.init(testing.allocator, session_cache.Limits.stateful_server_default, session_cache.system_random_source);
     defer cache.deinit();
@@ -743,14 +939,44 @@ test "saveServerCache and loadServerCache round trip and preserve the handle" {
     defer restored.deinit();
     try testing.expectEqual(LoadResult.loaded, loadServerCache(&restored, session.Limits.default, passthrough_protector, backend.interface(), 2));
 
-    var hit = restored.lookupLease(&handle, .{
-        .cipher_suite = .tls_aes_128_gcm_sha256,
-        .server_name = "example.test",
-        .application_protocol = "h3",
-        .auth_binding = session.AuthBinding.fromLeafCertificateDer("leaf-der"),
-    }, 2);
+    var hit = restored.resolveLease(&handle, 2);
     defer hit.deinit();
     try testing.expect(hit == .hit);
+}
+
+test "restore allocation failure aborts the load atomically, leaving the live cache untouched" {
+    var backing: [16384]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+
+    var cache = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    var t1 = try testClient(testing.allocator, "still-here", "example.test");
+    _ = cache.storeClone(&t1, 0, .reusable);
+    t1.deinit();
+
+    var to_persist = try testClient(testing.allocator, "incoming", "example.test");
+    var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = to_persist, .usage = .reusable }};
+    const bytes = try encodeClientSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
+    defer {
+        secrets.secureZero(bytes);
+        testing.allocator.free(bytes);
+    }
+    to_persist.deinit();
+
+    var backend = MemoryBackend{ .allocator = fba.allocator() };
+    backend.bytes = try fba.allocator().dupe(u8, bytes);
+
+    var failing = std.testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = 0 });
+    var failing_cache = session_cache.ClientSessionCache{ .allocator = failing.allocator(), .limits = session_cache.Limits.client_default };
+    defer failing_cache.entries.deinit(fba.allocator());
+    const result = loadClientCache(&failing_cache, session.Limits.default, passthrough_protector, backend.interface(), 1);
+    // Whichever step the injected allocation failure surfaces at, the load
+    // must never report `.loaded` and must never populate the cache.
+    try testing.expect(result != .loaded);
+    try testing.expectEqual(@as(usize, 0), failing_cache.entries.items.len);
+
+    // The unrelated live `cache` must be untouched regardless.
+    try testing.expectEqual(@as(usize, 1), cache.count());
 }
 
 test "protection failure during save and load is reported without corrupting state" {

@@ -876,6 +876,9 @@ pub const MockCredentialProvider = struct {
     last_server_name_buf: [256]u8 = undefined,
     last_server_name_len: usize = 0,
     last_server_name_present: bool = false,
+    last_application_protocol_buf: [255]u8 = undefined,
+    last_application_protocol_len: usize = 0,
+    last_application_protocol_present: bool = false,
     last_offered_scheme_count: usize = 0,
     last_role: ?Role = null,
 
@@ -891,6 +894,10 @@ pub const MockCredentialProvider = struct {
     /// mock's lifetime), or null when the last selection carried no SNI.
     pub fn lastServerName(self: *const MockCredentialProvider) ?[]const u8 {
         return if (self.last_server_name_present) self.last_server_name_buf[0..self.last_server_name_len] else null;
+    }
+
+    pub fn lastApplicationProtocol(self: *const MockCredentialProvider) ?[]const u8 {
+        return if (self.last_application_protocol_present) self.last_application_protocol_buf[0..self.last_application_protocol_len] else null;
     }
 
     pub fn selectedCredential(self: *MockCredentialProvider) SelectedCredential {
@@ -915,6 +922,15 @@ pub const MockCredentialProvider = struct {
         } else {
             self.last_server_name_present = false;
             self.last_server_name_len = 0;
+        }
+        if (selection.application_protocol) |protocol| {
+            const n = @min(protocol.len, self.last_application_protocol_buf.len);
+            @memcpy(self.last_application_protocol_buf[0..n], protocol[0..n]);
+            self.last_application_protocol_len = n;
+            self.last_application_protocol_present = true;
+        } else {
+            self.last_application_protocol_present = false;
+            self.last_application_protocol_len = 0;
         }
         self.last_offered_scheme_count = selection.peer_signature_schemes.len;
         if (self.force_select_error) |err| return err;
@@ -1028,6 +1044,9 @@ pub const MockVerifier = struct {
     last_server_name_buf: [256]u8 = undefined,
     last_server_name_len: usize = 0,
     last_server_name_present: bool = false,
+    last_application_protocol_buf: [255]u8 = undefined,
+    last_application_protocol_len: usize = 0,
+    last_application_protocol_present: bool = false,
     /// Async modelling: return `pending`, resolving to `result` after
     /// `pending_polls` polls.
     async_mode: bool = false,
@@ -1049,6 +1068,10 @@ pub const MockVerifier = struct {
         return if (self.last_server_name_present) self.last_server_name_buf[0..self.last_server_name_len] else null;
     }
 
+    pub fn lastApplicationProtocol(self: *const MockVerifier) ?[]const u8 {
+        return if (self.last_application_protocol_present) self.last_application_protocol_buf[0..self.last_application_protocol_len] else null;
+    }
+
     const vtable = PeerVerifier.VTable{ .verify = verify };
 
     fn verify(ctx: *anyopaque, context: *const VerificationContext) VerifyError!Progress(Verdict) {
@@ -1065,6 +1088,15 @@ pub const MockVerifier = struct {
         } else {
             self.last_server_name_present = false;
             self.last_server_name_len = 0;
+        }
+        if (context.application_protocol) |protocol| {
+            const n = @min(protocol.len, self.last_application_protocol_buf.len);
+            @memcpy(self.last_application_protocol_buf[0..n], protocol[0..n]);
+            self.last_application_protocol_len = n;
+            self.last_application_protocol_present = true;
+        } else {
+            self.last_application_protocol_present = false;
+            self.last_application_protocol_len = 0;
         }
         if (self.async_mode) {
             self.remaining_polls = self.pending_polls;

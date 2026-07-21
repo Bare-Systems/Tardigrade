@@ -57,23 +57,21 @@ pub const ListenerProtocolPolicy = struct {
         return "";
     }
 
-    pub fn nativeAlpnPolicy(self: ListenerProtocolPolicy) tls.tls13_backend.AlpnPolicy {
+    pub fn nativeTlsPolicy(self: ListenerProtocolPolicy) tls.policy.Policy {
         if (self.http2_enabled and self.http1_enabled) {
-            return .{
-                .protocols = &.{ "h2", "http/1.1" },
-                .allow_absent = self.allow_http1_without_alpn,
-            };
+            var policy = tls.policy.Policy.recordDefault();
+            policy.allow_absent_alpn = self.allow_http1_without_alpn;
+            return policy;
         }
         if (self.http2_enabled) {
-            return .{ .protocols = &.{"h2"} };
+            return tls.policy.Policy.recordH2Only();
         }
         if (!self.http1_enabled) {
-            return .{ .protocols = &.{}, .allow_absent = false };
+            var policy = tls.policy.Policy.recordDefault();
+            policy.alpn_protocols = &.{};
+            return policy;
         }
-        return .{
-            .protocols = &.{"http/1.1"},
-            .allow_absent = self.allow_http1_without_alpn,
-        };
+        return tls.policy.Policy.recordHttp1Only(self.allow_http1_without_alpn);
     }
 };
 

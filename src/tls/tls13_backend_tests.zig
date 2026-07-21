@@ -55,6 +55,14 @@ fn serverProvider() crypto.provider.CryptoProvider {
     return State.provider_state.cryptoProvider();
 }
 
+fn recordPolicyForNames(names: []const []const u8, allow_absent_alpn: bool) tls_core.policy.Policy {
+    if (names.len == 1 and std.mem.eql(u8, names[0], "h2")) return tls_core.policy.Policy.recordH2Only();
+    if (names.len == 1 and std.mem.eql(u8, names[0], "http/1.1")) return tls_core.policy.Policy.recordHttp1Only(allow_absent_alpn);
+    var policy = tls_core.policy.Policy.recordDefault();
+    policy.allow_absent_alpn = allow_absent_alpn;
+    return policy;
+}
+
 // ==========================================================================
 // Direct transport-neutral driver coverage. This keeps key derivation,
 // record sequencing, epoch discard, and teardown assertions at the engine
@@ -289,15 +297,15 @@ const DirectHarness = struct {
 
     fn init() DirectHarness {
         return initProfiles(
-            .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
-            .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+            .record,
+            .record,
         );
     }
 
     fn initExtension() DirectHarness {
         return initProfiles(
-            .{ .extension = .{ .alpn = "h3", .extension_type = 57, .local = "client transport parameters" } },
-            .{ .extension = .{ .alpn = "h3", .extension_type = 57, .local = "server transport parameters" } },
+            .{ .extension = .{ .extension_type = 57, .local = "client transport parameters" } },
+            .{ .extension = .{ .extension_type = 57, .local = "server transport parameters" } },
         );
     }
 
@@ -1241,16 +1249,16 @@ const SocketHarness = struct {
 
         self.client_alpn_protocols = .{opts.client_alpn};
         self.server_alpn_protocols = .{opts.server_alpn};
-        const client_record_profile = tls_backend.TransportProfile{ .record = .{ .alpn = .{ .protocols = &self.client_alpn_protocols } } };
-        const server_record_profile = tls_backend.TransportProfile{ .record = .{ .alpn = .{ .protocols = &self.server_alpn_protocols } } };
+        const client_config = tls_backend.recordConfig(recordPolicyForNames(&self.client_alpn_protocols, false));
+        const server_config = tls_backend.recordConfig(recordPolicyForNames(&self.server_alpn_protocols, false));
         self.client_engine = if (opts.client_verifier) |verifier|
-            tls_backend.Tls13Backend.initClientWithVerifier(clientEntropy(), verifier, client_record_profile, opts.client_options)
+            tls_backend.Tls13Backend.initClientWithVerifierConfigured(clientEntropy(), verifier, client_config, opts.client_options)
         else
-            tls_backend.Tls13Backend.initClient(clientEntropy(), opts.client_trust, client_record_profile);
+            tls_backend.Tls13Backend.initClientConfigured(clientEntropy(), opts.client_trust, client_config, .{});
         self.server_engine = if (opts.server_provider) |provider|
-            tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider, server_record_profile)
+            tls_backend.Tls13Backend.initServerWithProviderConfigured(serverEntropy(), provider, server_config)
         else
-            tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), server_record_profile);
+            tls_backend.Tls13Backend.initServerConfigured(serverEntropy(), fixtureIdentity(), server_config);
         if (opts.client_post_handshake_allocator) |post_allocator| {
             try self.client_engine.setPostHandshakeAllocator(post_allocator);
         }
@@ -1840,11 +1848,11 @@ test "record engine pins selected SNI generation across provider reload" {
     var client = tls_backend.Tls13Backend.initClientWithVerifier(
         clientEntropy(),
         verifier.verifier(),
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        .record,
         .{ .server_name = "pin.example.test", .policy = .{ .require_peer_authentication = true } },
     );
     defer client.deinit();
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider.provider(), .record);
     defer server.deinit();
     var client_sink = DirectSink{};
     defer client_sink.deinit();
@@ -1960,7 +1968,7 @@ test "unknown SNI fails before emitting ServerHello" {
     const config = sniIdentityConfig(&.{"known.example.test"}, chain[0..], true);
     try provider.reload(&.{config}, .{ .unknown_sni_policy = .fail_handshake });
 
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider.provider(), .record);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -1982,7 +1990,7 @@ test "record stream SNI provider fails exact incompatible signature without wild
     };
     try provider.reload(&configs, .{});
 
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider.provider(), .record);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -2211,6 +2219,7 @@ const ClientHelloOptions = struct {
     include_signature_algorithms: bool = true,
     sig_schemes: []const u16 = &.{ 0x0807, 0x0403 },
     alpn_protocols: ?[]const []const u8 = &.{"h2"},
+    duplicate_supported_versions: bool = false,
     /// The opaque transport extension (e.g. QUIC transport parameters) to
     /// offer, for driving an extension-profile (#392 HTTP/3) server through
     /// selection the same way a real QUIC client would.
@@ -2266,6 +2275,12 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
     try w.u16_(3);
     try w.u8_(2);
     try w.u16_(0x0304);
+    if (opts.duplicate_supported_versions) {
+        try w.u16_(43);
+        try w.u16_(3);
+        try w.u8_(2);
+        try w.u16_(0x0304);
+    }
     // supported_groups
     try w.u16_(10);
     try w.u16_(4);
@@ -2447,10 +2462,10 @@ fn driveServerSelection(server: *tls_backend.Tls13Backend, opts: ClientHelloOpti
 }
 
 test "record ALPN policy uses server preference across a dual offer" {
-    var server = tls_backend.Tls13Backend.initServer(
+    var server = tls_backend.Tls13Backend.initServerConfigured(
         serverEntropy(),
         fixtureIdentity(),
-        .{ .record = .{ .alpn = .{ .protocols = &.{ "h2", "http/1.1" } } } },
+        tls_backend.recordConfig(tls_core.policy.Policy.recordDefault()),
     );
     defer server.deinit();
 
@@ -2459,31 +2474,49 @@ test "record ALPN policy uses server preference across a dual offer" {
 }
 
 test "record ALPN policy permits absent extension only when configured" {
-    var fallback = tls_backend.Tls13Backend.initServer(
+    var fallback = tls_backend.Tls13Backend.initServerConfigured(
         serverEntropy(),
         fixtureIdentity(),
-        .{ .record = .{ .alpn = .{ .protocols = &.{"http/1.1"}, .allow_absent = true } } },
+        tls_backend.recordConfig(tls_core.policy.Policy.recordHttp1Only(true)),
     );
     defer fallback.deinit();
 
     try driveServerSelection(&fallback, .{ .alpn_protocols = null });
     try std.testing.expect(fallback.selectedAlpn() == null);
 
-    var strict = tls_backend.Tls13Backend.initServer(
+    var strict = tls_backend.Tls13Backend.initServerConfigured(
         serverEntropy(),
         fixtureIdentity(),
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("http/1.1") } },
+        tls_backend.recordConfig(tls_core.policy.Policy.recordHttp1Only(false)),
     );
     defer strict.deinit();
 
     try std.testing.expectError(error.AlpnMismatch, driveServerSelection(&strict, .{ .alpn_protocols = null }));
 }
 
+test "record ALPN fallback rejects present empty extension as malformed" {
+    var fallback = tls_backend.Tls13Backend.initServerConfigured(
+        serverEntropy(),
+        fixtureIdentity(),
+        tls_backend.recordConfig(tls_core.policy.Policy.recordHttp1Only(true)),
+    );
+    defer fallback.deinit();
+
+    try std.testing.expectError(error.MalformedHandshake, driveServerSelection(&fallback, .{ .alpn_protocols = &.{} }));
+}
+
+test "duplicate ClientHello extension maps to illegal_parameter" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    try expectServerReceiveError(&server, .{ .duplicate_supported_versions = true }, error.IllegalParameter);
+}
+
 test "record ALPN policy rejects no-overlap and malformed vectors" {
     var no_overlap = tls_backend.Tls13Backend.initServer(
         serverEntropy(),
         fixtureIdentity(),
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        .record,
     );
     defer no_overlap.deinit();
 
@@ -2492,7 +2525,7 @@ test "record ALPN policy rejects no-overlap and malformed vectors" {
     var h2_only_absent = tls_backend.Tls13Backend.initServer(
         serverEntropy(),
         fixtureIdentity(),
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        .record,
     );
     defer h2_only_absent.deinit();
 
@@ -2501,7 +2534,7 @@ test "record ALPN policy rejects no-overlap and malformed vectors" {
     var malformed = tls_backend.Tls13Backend.initServer(
         serverEntropy(),
         fixtureIdentity(),
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        .record,
     );
     defer malformed.deinit();
 
@@ -2510,7 +2543,7 @@ test "record ALPN policy rejects no-overlap and malformed vectors" {
 
 test "exact SNI reaches credential selection through a mock provider" {
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .record);
     defer server.deinit();
 
     try driveServerSelection(&server, .{ .sni = "exact.example.test" });
@@ -2524,7 +2557,7 @@ test "exact SNI reaches credential selection through a mock provider" {
 
 test "absent SNI reaches selection deterministically as null" {
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .record);
     defer server.deinit();
 
     try driveServerSelection(&server, .{ .sni = null });
@@ -2535,14 +2568,14 @@ test "absent SNI reaches selection deterministically as null" {
 test "selection sees the peer's offered schemes and picks a compatible credential" {
     // Fixed Ed25519 identity; the peer offers ECDSA first then Ed25519. The
     // fixed provider still binds, proving order-independent compatibility.
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     try driveServerSelection(&server, .{ .sig_schemes = &.{ 0x0403, 0x0807 } });
     try std.testing.expect(server.credentialFailure() == null);
 }
 
 test "no compatible signature algorithm fails with handshake_failure attribution" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -2561,7 +2594,7 @@ test "no compatible signature algorithm fails with handshake_failure attribution
 test "no credential available fails deterministically and preserves the failure" {
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.force_select_error = error.NoCredentialAvailable;
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .record);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -2580,7 +2613,7 @@ test "no credential available fails deterministically and preserves the failure"
 test "an empty local credential chain is rejected before signing" {
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.empty_chain = true;
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .record);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -2596,7 +2629,7 @@ test "an empty local credential chain is rejected before signing" {
 test "a signing provider failure maps to internal_error and releases the handle" {
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.force_sign_error = error.SigningProviderFailure;
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .record);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -2612,7 +2645,7 @@ test "a signing provider failure maps to internal_error and releases the handle"
 test "an over-length reported signature is caught as a provider contract violation" {
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.force_sign_len = 4096; // far beyond the engine's bounded scratch
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .record);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -2688,21 +2721,42 @@ test "a bad CertificateVerify signature fails proof of possession at the client"
     try std.testing.expectEqual(tls_backend.CredentialFailure.certificate_verify_invalid, h.client_engine.credentialFailure().?);
 }
 
-test "CertificateVerify with a supported but incompatible certificate key is decrypt_error" {
+test "server rejects provider-selected signature scheme incompatible with leaf key before flight" {
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.scheme_override = .ecdsa_secp256r1_sha256;
-    var verifier = credentials.MockVerifier.init(.accepted);
-    const h = try SocketHarness.create(.{ .server_provider = mock.provider(), .client_verifier = verifier.verifier() });
-    defer h.destroy();
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .record);
+    defer server.deinit();
 
-    const failures = driveUntilBothErrors(h);
-    try std.testing.expectEqual(@as(?anyerror, error.DecryptError), failures.client);
-    try std.testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), failures.server);
-    try std.testing.expectEqual(tls_backend.CredentialFailure.certificate_verify_invalid, h.client_engine.credentialFailure().?);
-    try std.testing.expectEqual(
-        tls_core.alerts.AlertDescription.decrypt_error,
-        h.client_engine.credentialFailure().?.alert(),
-    );
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try std.testing.expectError(error.CredentialProviderFailed, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_callback_behavior, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .initial));
+}
+
+test "async server selection rejects signature scheme incompatible with leaf key before flight" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.scheme_override = .ecdsa_secp256r1_sha256;
+    mock.async_select = true;
+    mock.pending_polls = 0;
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .record);
+    defer server.deinit();
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try server.backend().receive(.initial, hello, &sink);
+    try std.testing.expect(server.authPending());
+    try std.testing.expectError(error.CredentialProviderFailed, server.resumeAuth(&sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_callback_behavior, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .initial));
 }
 
 fn malformedEd25519PublicKeyCertificate(out: *[tls_backend.testdata.certificate_der.len]u8) []const u8 {
@@ -2768,7 +2822,7 @@ test "provider and verifier mocks under allocation failure clean up" {
 // --------------------------------------------------------------------------
 
 fn serverWithProvider(mock: *credentials.MockCredentialProvider) tls_backend.Tls13Backend {
-    return tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    return tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .record);
 }
 
 fn expectServerReceiveError(server: *tls_backend.Tls13Backend, opts: ClientHelloOptions, want: anyerror) !void {
@@ -2811,7 +2865,7 @@ test "a compatible signature scheme past the legacy cap is still selected" {
     var schemes: [18]u16 = undefined;
     for (0..17) |i| schemes[i] = @intCast(0xfe00 + i);
     schemes[17] = 0x0807; // ed25519
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     try driveServerSelection(&server, .{ .sig_schemes = &schemes });
     try std.testing.expect(server.credentialFailure() == null);
@@ -2820,19 +2874,19 @@ test "a compatible signature scheme past the legacy cap is still selected" {
 test "a signature_algorithms offer larger than the bound fails closed" {
     var schemes: [80]u16 = undefined;
     for (0..80) |i| schemes[i] = @intCast(0xfe00 + i);
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     try expectServerReceiveError(&server, .{ .sig_schemes = &schemes }, error.MalformedHandshake);
 }
 
 test "an empty signature_algorithms list is a peer-attributed malformed ClientHello" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     try expectServerReceiveError(&server, .{ .sig_schemes = &.{} }, error.MalformedHandshake);
 }
 
 test "an absent signature_algorithms extension maps to missing_extension" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     try expectServerReceiveError(&server, .{ .include_signature_algorithms = false }, error.MissingExtension);
 }
@@ -2840,7 +2894,7 @@ test "an absent signature_algorithms extension maps to missing_extension" {
 test "malformed SNI is rejected rather than collapsed into the default path" {
     // Empty host_name.
     {
-        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
         defer server.deinit();
         // ServerNameList<len=3>{ name_type=0, host_name<len=0> }
         const empty_host = [_]u8{ 0x00, 0x03, 0x00, 0x00, 0x00 };
@@ -2848,7 +2902,7 @@ test "malformed SNI is rejected rather than collapsed into the default path" {
     }
     // Duplicate host_name entries (RFC 6066 forbids a repeated name_type).
     {
-        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
         defer server.deinit();
         // ServerNameList<len=8>{ {0,"a"}, {0,"b"} }
         const dup = [_]u8{ 0x00, 0x08, 0x00, 0x00, 0x01, 'a', 0x00, 0x00, 0x01, 'b' };
@@ -2858,7 +2912,7 @@ test "malformed SNI is rejected rather than collapsed into the default path" {
     // not silently treated as "no host_name present" and routed to the default
     // credential.
     {
-        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
         defer server.deinit();
         const empty_list = [_]u8{ 0x00, 0x00 }; // ServerNameList<len=0>{}
         try expectServerReceiveError(&server, .{ .sni_raw = &empty_list }, error.IllegalParameter);
@@ -3224,7 +3278,7 @@ test "a transport-extension type colliding with a TLS-owned PSK extension is rej
         var client = tls_backend.Tls13Backend.initClient(
             clientEntropy(),
             .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-            .{ .extension = .{ .alpn = "h3", .extension_type = colliding_type, .local = "x" } },
+            .{ .extension = .{ .extension_type = colliding_type, .local = "x" } },
         );
         defer client.deinit();
         var sink = DirectSink{};
@@ -3237,7 +3291,7 @@ test "a transport-extension type colliding with a TLS-owned PSK extension is rej
         var server = tls_backend.Tls13Backend.initServer(
             serverEntropy(),
             fixtureIdentity(),
-            .{ .extension = .{ .alpn = "h3", .extension_type = colliding_type, .local = "y" } },
+            .{ .extension = .{ .extension_type = colliding_type, .local = "y" } },
         );
         defer server.deinit();
         var server_sink = DirectSink{};
@@ -3248,7 +3302,7 @@ test "a transport-extension type colliding with a TLS-owned PSK extension is rej
 }
 
 test "setApplicationCompat copies the caller's bytes instead of borrowing them" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     var scratch: [4]u8 = .{ 'o', 'l', 'd', '!' };
@@ -3267,7 +3321,7 @@ test "setApplicationCompat accepts a snapshot larger than the transport-extensio
     // transport-extension bound, silently rejecting an application
     // snapshot the shared session model itself allows up to 1024 bytes by
     // default (`session.Limits.default.max_application_compat_len`).
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     var large: [session.Limits.default.max_application_compat_len]u8 = undefined;
@@ -3282,7 +3336,7 @@ test "PSK setters reject being called after start, leaving prior configuration u
     var client = tls_backend.Tls13Backend.initClient(
         clientEntropy(),
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        .record,
     );
     defer client.deinit();
     var sink = DirectSink{};
@@ -3323,7 +3377,7 @@ test "PSK setters reject being called after start, leaving prior configuration u
 
     try std.testing.expectError(error.InvalidHandshakeState, client.setApplicationCompat(.{ .format_id = 1, .format_version = 1, .bytes = "x" }));
 
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     var server_sink = DirectSink{};
     defer server_sink.deinit();
@@ -3339,7 +3393,7 @@ test "handshake-phase failure wipes PSK offer state before ServerHello even arri
     var client = tls_backend.Tls13Backend.initClient(
         clientEntropy(),
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        .record,
     );
     defer client.deinit();
 
@@ -3408,7 +3462,7 @@ test "client selects a later (non-zero) identity when the server names it" {
     var client = tls_backend.Tls13Backend.initClient(
         clientEntropy(),
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        .record,
     );
     defer client.deinit();
 
@@ -3445,7 +3499,7 @@ test "client rejects a selected_identity equal to or beyond the emitted offer co
         var client = tls_backend.Tls13Backend.initClient(
             clientEntropy(),
             .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-            .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+            .record,
         );
         defer client.deinit();
 
@@ -3478,7 +3532,7 @@ test "client rejects a forged selected_identity when no PSK was ever offered" {
     var client = tls_backend.Tls13Backend.initClient(
         clientEntropy(),
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        .record,
     );
     defer client.deinit();
     try std.testing.expect(client.client_psk_offers.isEmpty());
@@ -3516,7 +3570,7 @@ test "a PSK-selected ServerHello with inconsistent suite/version/key-share is re
         var client = tls_backend.Tls13Backend.initClient(
             clientEntropy(),
             .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-            .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+            .record,
         );
         defer client.deinit();
 
@@ -3551,7 +3605,7 @@ test "a rejected ServerHello observably zeroes the client's offered PSK bytes, n
     var client = tls_backend.Tls13Backend.initClient(
         clientEntropy(),
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        .record,
     );
     defer client.deinit();
 
@@ -3647,7 +3701,7 @@ test "takeSelectedServerPsk returns null before the client Finished commits the 
     // the client's Finished verifies. Handing the accepted session out any
     // earlier would let a caller retain it past a subsequent bad-Finished
     // failure, which `clearFailedHandshakeState` can then no longer reach.
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0x88} ** tls_backend.hash_len;
@@ -3684,7 +3738,7 @@ test "backend teardown observably zeroes the key schedule and selected PSK sessi
     // schedule — exactly the state selection leaves behind (see
     // `takeSelectedServerPsk returns null before the client Finished
     // commits the handshake`, above).
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
 
     const psk = [_]u8{0xcc} ** tls_backend.hash_len;
     var stored_state = pskStoredState(&psk);
@@ -3769,7 +3823,7 @@ test "takePskAgeSkew reports the exact signed observation and is one-shot" {
         .{ .apparent_age_ms = 1_000_000, .actual_elapsed_ms = 10, .expected_skew_ms = 999_990 }, // large skew, still 1-RTT
     };
     for (cases) |case| {
-        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
         defer server.deinit();
 
         const psk = [_]u8{0x88} ** tls_backend.hash_len;
@@ -3805,7 +3859,7 @@ test "takePskAgeSkew reports the exact signed observation and is one-shot" {
 }
 
 test "a rejected or fallback candidate publishes no age-skew observation" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0x99} ** tls_backend.hash_len;
@@ -3829,7 +3883,7 @@ test "a rejected or fallback candidate publishes no age-skew observation" {
 }
 
 test "the accepted server session survives PSK selection with its early-data and metadata intact" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0x66} ** tls_backend.hash_len;
@@ -3876,7 +3930,7 @@ test "a bad client Finished after PSK selection clears the accepted session and 
     // The old `clearFailedHandshakeState` guard (`core.handshake_lifecycle
     // == .complete`) would therefore see `.complete` and skip cleanup
     // entirely on exactly this path.
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0x77} ** tls_backend.hash_len;
@@ -3964,7 +4018,7 @@ fn exerciseResolverCloneThroughBackend(
     stored: *session.ServerRecoverableState,
     psk: *const [tls_backend.hash_len]u8,
 ) !void {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     try server.setApplicationCompat(.{ .format_id = 2, .format_version = 1, .bytes = "application-snapshot" });
 
@@ -4022,7 +4076,7 @@ test "resolver candidate cloning is proven correct across every allocation-failu
 }
 
 test "resolver identity-resolution attempts are bounded to eight even when a ninth would succeed" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0x44} ** tls_backend.hash_len;
@@ -4048,7 +4102,7 @@ test "resolver identity-resolution attempts are bounded to eight even when a nin
 }
 
 test "resolver identity-resolution attempts stop at exactly eight when all eight are unusable" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0x55} ** tls_backend.hash_len;
@@ -4072,7 +4126,7 @@ test "resolver identity-resolution attempts stop at exactly eight when all eight
 }
 
 test "a resolver operational failure is fatal and distinct from an ordinary miss" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const FailingResolver = struct {
@@ -4104,7 +4158,7 @@ test "a resolver operational failure is fatal and distinct from an ordinary miss
 }
 
 test "a resolver that partially populates its output before failing leaves no residue" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const PartialResolver = struct {
@@ -4150,7 +4204,7 @@ test "a resolver that partially populates its output before failing leaves no re
 }
 
 test "server selects the first compatible identity: unknown first, valid second" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0x11} ** tls_backend.hash_len;
@@ -4174,7 +4228,7 @@ test "server selects the first compatible identity: unknown first, valid second"
 }
 
 test "a compatible candidate with a wrong binder is fatal and never probes a later identity" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0x22} ** tls_backend.hash_len;
@@ -4252,7 +4306,7 @@ test "a bad binder wipes the resolver's cloned candidate, including its compat b
     const clone_allocator = fba.allocator();
     const end_index_before_selection = fba.end_index;
 
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const marker = "candidate-compat-blob-marker";
@@ -4345,7 +4399,7 @@ const MalformedTailProvider = struct {
 
 test "a malformed non-leaf chain entry is rejected before PSK resolver/binder work, even though the leaf is valid" {
     var mock = MalformedTailProvider{ .entries = .{ tls_backend.testdata.certificate_der, "" } }; // entry 1: empty
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0x99} ** tls_backend.hash_len;
@@ -4371,7 +4425,7 @@ test "a malformed non-leaf chain entry is rejected before PSK resolver/binder wo
 test "an oversized non-leaf chain entry is rejected before PSK resolver/binder work" {
     const oversized = [_]u8{0} ** (tls_backend.max_certificate_len + 1);
     var mock = MalformedTailProvider{ .entries = .{ tls_backend.testdata.certificate_der, &oversized } };
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0xaa} ** tls_backend.hash_len;
@@ -4394,7 +4448,7 @@ test "an oversized non-leaf chain entry is rejected before PSK resolver/binder w
 }
 
 test "a ticket bound to a different server certificate falls back to a full handshake" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0x44} ** tls_backend.hash_len;
@@ -4420,7 +4474,7 @@ test "a ticket bound to a different server certificate falls back to a full hand
 }
 
 test "PSK offered without psk_key_exchange_modes is a missing_extension failure" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     const psk = [_]u8{0x55} ** tls_backend.hash_len;
     try std.testing.expectError(error.MissingExtension, driveServerSelection(&server, .{ .psk = .{
@@ -4429,8 +4483,32 @@ test "PSK offered without psk_key_exchange_modes is a missing_extension failure"
     } }));
 }
 
+test "PSK identity and binder count mismatch is illegal_parameter" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    var raw_ext_data: [2 + (2 + 6 + 4) + 2 + 2 * (1 + tls_backend.hash_len)]u8 = undefined;
+    var w = HsWriter{ .buf = &raw_ext_data };
+    const identities_len = try w.reserve(2);
+    try w.u16_(6);
+    try w.bytes("ticket");
+    try w.bytes(&.{ 0, 0, 0, 0 });
+    w.patch(2, identities_len);
+    const binders_len = try w.reserve(2);
+    inline for (0..2) |_| {
+        try w.u8_(tls_backend.hash_len);
+        try w.bytes(&([_]u8{0xaa} ** tls_backend.hash_len));
+    }
+    w.patch(2, binders_len);
+
+    try std.testing.expectError(error.IllegalParameter, driveServerSelection(&server, .{ .psk = .{
+        .items = &.{},
+        .raw_ext_data = w.written(),
+    } }));
+}
+
 test "an SNI mismatch falls back to a full handshake instead of rejecting the connection" {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
 
     const psk = [_]u8{0x66} ** tls_backend.hash_len;
@@ -4586,7 +4664,7 @@ test "resumeAuth is a safe no-op before any suspend and after completion" {
 /// cooperating fixed-identity server backend, so the client's peer verifier is
 /// exercised. Leaves the client parked if its verifier went async.
 fn driveClientThroughCertificateVerify(client: *tls_backend.Tls13Backend, client_sink: *DirectSink) !void {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     var server_sink = DirectSink{};
     defer server_sink.deinit();
@@ -4614,7 +4692,7 @@ test "an async peer verification suspends the client and resumes to acceptance" 
     var verifier = credentials.MockVerifier.init(.accepted);
     verifier.async_mode = true;
     verifier.pending_polls = 2;
-    var client = tls_backend.Tls13Backend.initClientWithVerifier(clientEntropy(), verifier.verifier(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } }, .{ .server_name = "tardigrade.test" });
+    var client = tls_backend.Tls13Backend.initClientWithVerifier(clientEntropy(), verifier.verifier(), .record, .{ .server_name = "tardigrade.test" });
     defer client.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -4636,7 +4714,7 @@ test "a cancelled async peer verification cancels and releases the operation onc
     var verifier = credentials.MockVerifier.init(.accepted);
     verifier.async_mode = true;
     verifier.pending_polls = 5;
-    var client = tls_backend.Tls13Backend.initClientWithVerifier(clientEntropy(), verifier.verifier(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } }, .{});
+    var client = tls_backend.Tls13Backend.initClientWithVerifier(clientEntropy(), verifier.verifier(), .record, .{});
     var sink = DirectSink{};
     try driveClientThroughCertificateVerify(&client, &sink);
     try std.testing.expect(client.authPending());
@@ -4649,9 +4727,9 @@ test "a cancelled async peer verification cancels and releases the operation onc
 
 test "a client rejects trailing handshake bytes after the server Finished" {
     var verifier = credentials.MockVerifier.init(.accepted);
-    var client = tls_backend.Tls13Backend.initClientWithVerifier(clientEntropy(), verifier.verifier(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } }, .{});
+    var client = tls_backend.Tls13Backend.initClientWithVerifier(clientEntropy(), verifier.verifier(), .record, .{});
     defer client.deinit();
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     var client_sink = DirectSink{};
     defer client_sink.deinit();
@@ -4679,9 +4757,9 @@ test "a client rejects trailing handshake bytes after the server Finished" {
 }
 
 test "a server rejects trailing handshake bytes after the client Finished" {
-    var client = tls_backend.Tls13Backend.initClient(clientEntropy(), .{ .pinned_certificate = tls_backend.testdata.certificate_der }, .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var client = tls_backend.Tls13Backend.initClient(clientEntropy(), .{ .pinned_certificate = tls_backend.testdata.certificate_der }, .record);
     defer client.deinit();
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     defer server.deinit();
     var client_sink = DirectSink{};
     defer client_sink.deinit();
@@ -4714,7 +4792,7 @@ fn clientWithLocalCredential(provider: credentials.CredentialProvider) tls_backe
     var client = tls_backend.Tls13Backend.initClient(
         clientEntropy(),
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        .record,
     );
     client.setLocalCredentialProvider(provider);
     return client;
@@ -4776,10 +4854,88 @@ fn deliverClientFlightToServer(
     }
 }
 
+test "absent ALPN reaches server selector and client verifier as null" {
+    var provider = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var verifier = credentials.MockVerifier.init(.accepted);
+    var client_policy = tls_core.policy.Policy.recordHttp1Only(true);
+    client_policy.alpn_protocols = &.{};
+    var client = tls_backend.Tls13Backend.initClientWithVerifierConfigured(
+        clientEntropy(),
+        verifier.verifier(),
+        tls_backend.recordConfig(client_policy),
+        .{},
+    );
+    defer client.deinit();
+    var server = tls_backend.Tls13Backend.initServerWithProviderConfigured(
+        serverEntropy(),
+        provider.provider(),
+        tls_backend.recordConfig(tls_core.policy.Policy.recordHttp1Only(true)),
+    );
+    defer server.deinit();
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+    try std.testing.expectEqual(@as(usize, 1), provider.select_count);
+    try std.testing.expectEqual(@as(usize, 1), verifier.verify_count);
+    try std.testing.expect(provider.lastApplicationProtocol() == null);
+    try std.testing.expect(verifier.lastApplicationProtocol() == null);
+}
+
 fn serverRequestingClientAuth(mode: tls_backend.ClientAuthMode, verifier: credentials.PeerVerifier) tls_backend.Tls13Backend {
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
     server.requestClientAuthentication(mode, verifier);
     return server;
+}
+
+test "client rejects selected signature scheme incompatible with leaf key before Certificate flight" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.scheme_override = .ecdsa_secp256r1_sha256;
+    var client = clientWithLocalCredential(mock.provider());
+    defer client.deinit();
+    var verifier = credentials.MockVerifier.init(.accepted);
+    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    defer server.deinit();
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try std.testing.expectError(error.CredentialProviderFailed, deliverServerFlightToClient(&client, &server, &client_sink, &server_sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_callback_behavior, client.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.sign_count);
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&client_sink, .handshake));
+}
+
+test "async client selection rejects signature scheme incompatible with leaf key before Certificate flight" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.scheme_override = .ecdsa_secp256r1_sha256;
+    mock.async_select = true;
+    mock.pending_polls = 0;
+    var client = clientWithLocalCredential(mock.provider());
+    defer client.deinit();
+    var verifier = credentials.MockVerifier.init(.accepted);
+    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    defer server.deinit();
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+    try std.testing.expect(client.authPending());
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&client_sink, .handshake));
+    try std.testing.expectError(error.CredentialProviderFailed, client.resumeAuth(&client_sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_callback_behavior, client.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.sign_count);
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&client_sink, .handshake));
 }
 
 test "async client credential selection suspends the client flight and resumes to mutual completion" {
@@ -5064,7 +5220,7 @@ test "an invalid configured server name is rejected at start rather than emitted
         var client = tls_backend.Tls13Backend.initClientWithVerifier(
             clientEntropy(),
             verifier.verifier(),
-            .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+            .record,
             .{ .server_name = name },
         );
         defer client.deinit();
@@ -5087,10 +5243,20 @@ test "a ClientHello combining maximum ALPN, SNI, and transport extension seriali
     const max_alpn = [_]u8{'a'} ** 255;
     const max_sni = [_]u8{'s'} ** 256;
     var max_transport_ext = [_]u8{0xab} ** tls_backend.max_transport_extension_len;
-    var client = tls_backend.Tls13Backend.initClient(
+    const max_alpn_protocols = [_]tls_core.algorithms.ProtocolName{.{ .bytes = &max_alpn }};
+    const max_alpn_policy = tls_core.policy.Policy.fromCapabilities(
+        .quic,
+        tls_backend.native_capabilities,
+        &max_alpn_protocols,
+    );
+    var client = tls_backend.Tls13Backend.initClientConfigured(
         clientEntropy(),
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-        .{ .extension = .{ .alpn = &max_alpn, .extension_type = 57, .local = &max_transport_ext } },
+        .{
+            .policy = max_alpn_policy,
+            .transport = .{ .extension = .{ .extension_type = 57, .local = &max_transport_ext } },
+        },
+        .{},
     );
     client.server_name_len = max_sni.len;
     @memcpy(client.server_name[0..max_sni.len], &max_sni);
@@ -5415,7 +5581,7 @@ test "the server flight preflight rejects a chain that fits entries but overflow
     // Four 2043-byte entries sum to exactly max_message_len once each entry's
     // 5-byte framing is added, but the Certificate message header pushes it over.
     var big = BigChainProvider{ .entry_len = 2043, .entry_count = 4 };
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), big.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), big.provider(), .record);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -5432,7 +5598,7 @@ test "the client flight preflight rejects a chain that overflows with the messag
     var client = tls_backend.Tls13Backend.initClient(
         clientEntropy(),
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        .record,
     );
     client.setLocalCredentialProvider(big.provider());
     defer client.deinit();
@@ -5488,7 +5654,8 @@ const BigChainSigningProvider = struct {
     const cred_vtable = credentials.SelectedCredential.VTable{ .chain = chain, .sign = sign, .release = release };
     fn chain(handle: *anyopaque) credentials.CertificateChain {
         const self: *BigChainSigningProvider = @ptrCast(@alignCast(handle));
-        for (0..self.entry_count) |i| self.entries[i] = self.storage[0..self.entry_len];
+        if (self.entry_count > 0) self.entries[0] = self.identity.certificate_der;
+        for (1..self.entry_count) |i| self.entries[i] = self.storage[0..self.entry_len];
         return .{ .entries = self.entries[0..self.entry_count] };
     }
     fn sign(handle: *anyopaque, _: credentials.SignatureScheme, input: []const u8, out: []u8) credentials.SignError!credentials.Progress(usize) {
@@ -5518,7 +5685,7 @@ test "a chain at appliance's flight-size boundary serializes through the real re
     try std.testing.expect(entry_len <= tls_backend.max_certificate_len);
 
     var big = BigChainSigningProvider.init(entry_len, entry_count);
-    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), big.provider(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), big.provider(), .record);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -5545,7 +5712,7 @@ test "a chain at appliance's flight-size boundary serializes through the real HT
     var server = tls_backend.Tls13Backend.initServerWithProvider(
         serverEntropy(),
         big.provider(),
-        .{ .extension = .{ .alpn = "h3", .extension_type = 57, .local = &local_transport_params } },
+        .{ .extension = .{ .extension_type = 57, .local = &local_transport_params } },
     );
     defer server.deinit();
     var sink = DirectSink{};

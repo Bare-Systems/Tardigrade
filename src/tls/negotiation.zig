@@ -9,6 +9,8 @@ const policy_mod = @import("policy.zig");
 pub const Error = messages.Error || error{
     MalformedExtension,
     MissingSupportedVersions,
+    MissingExtension,
+    IllegalParameter,
     UnsupportedProtocolVersion,
     MissingCipherSuites,
     NoMutualCipherSuite,
@@ -38,6 +40,8 @@ pub const ClientHelloOffers = struct {
     key_shares_len: usize = 0,
     signature_schemes: [max_offers]algorithms.SignatureScheme = undefined,
     signature_schemes_len: usize = 0,
+    raw_signature_schemes: [max_offers]u16 = undefined,
+    raw_signature_schemes_len: usize = 0,
     alpn_protocols: [max_offers]algorithms.ProtocolName = undefined,
     alpn_protocols_len: usize = 0,
     server_name: ?[]const u8 = null,
@@ -72,6 +76,12 @@ pub const ClientHelloOffers = struct {
         self.signature_schemes_len += 1;
     }
 
+    fn appendRawSignatureScheme(self: *ClientHelloOffers, value: u16) Error!void {
+        if (self.raw_signature_schemes_len == self.raw_signature_schemes.len) return error.OfferVectorTooLarge;
+        self.raw_signature_schemes[self.raw_signature_schemes_len] = value;
+        self.raw_signature_schemes_len += 1;
+    }
+
     fn appendAlpn(self: *ClientHelloOffers, value: algorithms.ProtocolName) Error!void {
         if (self.alpn_protocols_len == self.alpn_protocols.len) return error.OfferVectorTooLarge;
         self.alpn_protocols[self.alpn_protocols_len] = value;
@@ -100,12 +110,47 @@ pub const Selection = struct {
     server_name: ?[]const u8,
 };
 
+pub const ExtensionObservation = struct {
+    id: u16,
+    data: []const u8,
+    data_offset_in_body: usize,
+    is_last: bool,
+};
+
+pub const ExtensionObserver = struct {
+    ctx: *anyopaque,
+    observeFn: *const fn (*anyopaque, ExtensionObservation) Error!void,
+
+    fn observe(self: ExtensionObserver, observation: ExtensionObservation) Error!void {
+        return self.observeFn(self.ctx, observation);
+    }
+};
+
+pub const ParsedClientHello = struct {
+    offers: ClientHelloOffers,
+    legacy_session_id: []const u8,
+    offered_null_compression: bool,
+};
+
+pub const HelloSelection = struct {
+    version: algorithms.ProtocolVersion,
+    cipher_suite: algorithms.CipherSuite,
+    named_group: algorithms.NamedGroup,
+    key_share: []const u8,
+    alpn: ?algorithms.ProtocolName,
+    server_name: ?[]const u8,
+};
+
 pub fn parseClientHello(body: []const u8) Error!ClientHelloOffers {
+    return (try parseClientHelloObserved(body, null)).offers;
+}
+
+pub fn parseClientHelloObserved(body: []const u8, observer: ?ExtensionObserver) Error!ParsedClientHello {
     var offers = ClientHelloOffers{};
     var r = messages.Reader{ .bytes = body };
     if (try r.u16_() != algorithms.legacy_version) return error.MalformedHandshake;
     _ = try r.slice(32);
-    _ = try r.slice(try r.u8_());
+    const legacy_session_id = try r.slice(try r.u8_());
 
     var cipher_reader = messages.Reader{ .bytes = try r.slice(try r.u16_()) };
     if (cipher_reader.remaining() == 0 or cipher_reader.remaining() % 2 != 0) return error.MissingCipherSuites;
@@ -122,11 +167,24 @@ pub fn parseClientHello(body: []const u8) Error!ClientHelloOffers {
     }
     if (!has_null_compression) return error.MalformedHandshake;
 
-    var extensions = messages.ExtensionIterator.init(try r.slice(try r.u16_()));
+    const extensions_bytes = try r.slice(try r.u16_());
+    var extensions = messages.ExtensionIterator.init(extensions_bytes);
+    var saw_supported_versions = false;
     try r.expectEnd();
     while (try extensions.next()) |extension| {
+        if (observer) |obs| {
+            try obs.observe(.{
+                .id = extension.id,
+                .data = extension.data,
+                .data_offset_in_body = @intFromPtr(extension.data.ptr) - @intFromPtr(body.ptr),
+                .is_last = extensions.reader.remaining() == 0,
+            });
+        }
         switch (algorithms.fromInt(algorithms.ExtensionType, extension.id) orelse continue) {
-            .supported_versions => try parseSupportedVersions(extension.data, &offers),
+            .supported_versions => {
+                saw_supported_versions = true;
+                try parseSupportedVersions(extension.data, &offers);
+            },
             .supported_groups => try parseSupportedGroups(extension.data, &offers),
             .signature_algorithms => try parseSignatureAlgorithms(extension.data, &offers),
             .key_share => try parseKeyShares(extension.data, &offers),
@@ -135,28 +193,48 @@ pub fn parseClientHello(body: []const u8) Error!ClientHelloOffers {
             else => {},
         }
     }
-    if (offers.versions_len == 0) return error.MissingSupportedVersions;
-    return offers;
+    if (!saw_supported_versions) return error.MissingSupportedVersions;
+    if (offers.versions_len == 0) return error.UnsupportedProtocolVersion;
+    return .{
+        .offers = offers,
+        .legacy_session_id = legacy_session_id,
+        .offered_null_compression = has_null_compression,
+    };
 }
 
 pub fn negotiateServer(policy: policy_mod.Policy, offers: *const ClientHelloOffers) Error!Selection {
-    if (!offers.containsVersion(.tls13)) return error.UnsupportedProtocolVersion;
+    const hello = try negotiateServerHello(policy, offers);
+    const signature_scheme = pickEnum(algorithms.SignatureScheme, policy.signature_schemes, offers.signature_schemes[0..offers.signature_schemes_len]) orelse
+        return error.NoMutualSignatureScheme;
+    return .{
+        .version = hello.version,
+        .cipher_suite = hello.cipher_suite,
+        .named_group = hello.named_group,
+        .key_share = hello.key_share,
+        .signature_scheme = signature_scheme,
+        .alpn = hello.alpn orelse return error.NoMutualAlpn,
+        .server_name = hello.server_name,
+    };
+}
+
+pub fn negotiateServerHello(policy: policy_mod.Policy, offers: *const ClientHelloOffers) Error!HelloSelection {
+    const version = pickEnum(algorithms.ProtocolVersion, policy.protocol_versions, offers.versions[0..offers.versions_len]) orelse
+        return error.UnsupportedProtocolVersion;
     if (policy.require_sni and offers.server_name == null) return error.MissingServerName;
     const cipher_suite = pickEnum(algorithms.CipherSuite, policy.cipher_suites, offers.cipher_suites[0..offers.cipher_suites_len]) orelse
         return error.NoMutualCipherSuite;
     const named_group = pickEnum(algorithms.NamedGroup, policy.named_groups, offers.supported_groups[0..offers.supported_groups_len]) orelse
         return error.NoMutualNamedGroup;
     const key_share = offers.keyShareFor(named_group) orelse return error.MissingKeyShare;
-    const signature_scheme = pickEnum(algorithms.SignatureScheme, policy.signature_schemes, offers.signature_schemes[0..offers.signature_schemes_len]) orelse
-        return error.NoMutualSignatureScheme;
-    const alpn = pickAlpn(policy.alpn_protocols, offers.alpn_protocols[0..offers.alpn_protocols_len]) orelse
+    const alpn = pickAlpn(policy.alpn_protocols, offers.alpn_protocols[0..offers.alpn_protocols_len]) orelse blk: {
+        if (offers.alpn_protocols_len == 0 and policy.allow_absent_alpn) break :blk null;
         return error.NoMutualAlpn;
+    };
     return .{
-        .version = .tls13,
+        .version = version,
         .cipher_suite = cipher_suite,
         .named_group = named_group,
         .key_share = key_share,
-        .signature_scheme = signature_scheme,
         .alpn = alpn,
         .server_name = offers.server_name,
     };
@@ -166,14 +244,33 @@ pub const ServerSelection = struct {
     version: algorithms.ProtocolVersion,
     cipher_suite: algorithms.CipherSuite,
     named_group: algorithms.NamedGroup,
-    alpn: algorithms.ProtocolName,
+    alpn: ?algorithms.ProtocolName,
 };
 
-pub fn validateServerSelection(policy: policy_mod.Policy, selection: ServerSelection) Error!void {
-    if (selection.version != .tls13) return error.UnsupportedProtocolVersion;
+pub fn validateServerHelloTuple(policy: policy_mod.Policy, selection: ServerSelection) Error!void {
+    if (!containsEnum(algorithms.ProtocolVersion, policy.protocol_versions, selection.version)) return error.UnsupportedProtocolVersion;
     if (!containsEnum(algorithms.CipherSuite, policy.cipher_suites, selection.cipher_suite)) return error.NoMutualCipherSuite;
     if (!containsEnum(algorithms.NamedGroup, policy.named_groups, selection.named_group)) return error.NoMutualNamedGroup;
-    if (!containsAlpn(policy.alpn_protocols, selection.alpn)) return error.NoMutualAlpn;
+}
+
+pub fn validateServerSelection(policy: policy_mod.Policy, selection: ServerSelection) Error!void {
+    try validateServerHelloTuple(policy, selection);
+    if (selection.alpn) |alpn| {
+        if (!containsAlpn(policy.alpn_protocols, alpn)) return error.NoMutualAlpn;
+    } else if (!policy.allow_absent_alpn) return error.NoMutualAlpn;
+}
+
+pub fn validateCredentialSignature(
+    policy: policy_mod.Policy,
+    peer_raw_offers: []const u16,
+    selected: algorithms.SignatureScheme,
+) Error!void {
+    if (!containsEnum(algorithms.SignatureScheme, policy.signature_schemes, selected)) return error.NoMutualSignatureScheme;
+    const selected_raw = @intFromEnum(selected);
+    for (peer_raw_offers) |raw| {
+        if (raw == selected_raw) return;
+    }
+    return error.NoMutualSignatureScheme;
 }
 
 fn parseSupportedVersions(bytes: []const u8, offers: *ClientHelloOffers) Error!void {
@@ -206,7 +303,9 @@ fn parseSignatureAlgorithms(bytes: []const u8, offers: *ClientHelloOffers) Error
     try r.expectEnd();
     if (algorithms_reader.remaining() == 0 or algorithms_reader.remaining() % 2 != 0) return error.MalformedExtension;
     while (algorithms_reader.remaining() > 0) {
-        if (algorithms.fromInt(algorithms.SignatureScheme, try algorithms_reader.u16_())) |scheme| {
+        const raw = try algorithms_reader.u16_();
+        try offers.appendRawSignatureScheme(raw);
+        if (algorithms.fromInt(algorithms.SignatureScheme, raw)) |scheme| {
             try offers.appendSignatureScheme(scheme);
         }
     }
@@ -228,15 +327,15 @@ fn parseKeyShares(bytes: []const u8, offers: *ClientHelloOffers) Error!void {
 fn parseServerName(bytes: []const u8, offers: *ClientHelloOffers) Error!void {
     var r = messages.Reader{ .bytes = bytes };
     const list_len = try r.u16_();
-    if (list_len == 0) return error.MalformedExtension;
+    if (list_len == 0) return error.IllegalParameter;
     var names = messages.Reader{ .bytes = try r.slice(list_len) };
     try r.expectEnd();
     while (names.remaining() > 0) {
         const name_type = try names.u8_();
         const name = try names.slice(try names.u16_());
         if (name_type == 0) {
-            if (offers.server_name != null) return error.MalformedExtension;
-            dns_name.validateHostName(name) catch return error.MalformedExtension;
+            if (offers.server_name != null) return error.IllegalParameter;
+            dns_name.validateHostName(name) catch return error.IllegalParameter;
             offers.server_name = name;
         }
     }
@@ -246,6 +345,7 @@ fn parseAlpn(bytes: []const u8, offers: *ClientHelloOffers) Error!void {
     var r = messages.Reader{ .bytes = bytes };
     var protocols = messages.Reader{ .bytes = try r.slice(try r.u16_()) };
     try r.expectEnd();
+    if (protocols.remaining() == 0) return error.MalformedExtension;
     while (protocols.remaining() > 0) {
         const name = try protocols.slice(try protocols.u8_());
         if (name.len == 0) return error.MalformedExtension;
@@ -454,7 +554,7 @@ test "ClientHello parser rejects empty SNI ServerNameList" {
     var body: [192]u8 = undefined;
     const empty_server_name_list = [_]u8{ 0, 0 };
     const hello = try clientHelloWithServerNameExtension(&body, &empty_server_name_list);
-    try testing.expectError(error.MalformedExtension, parseClientHello(hello));
+    try testing.expectError(error.IllegalParameter, parseClientHello(hello));
 }
 
 test "ClientHello parser rejects duplicate SNI host_name entries" {
@@ -470,7 +570,7 @@ test "ClientHello parser rejects duplicate SNI host_name entries" {
 
     var body: [256]u8 = undefined;
     const hello = try clientHelloWithServerNameExtension(&body, sni.written());
-    try testing.expectError(error.MalformedExtension, parseClientHello(hello));
+    try testing.expectError(error.IllegalParameter, parseClientHello(hello));
 }
 
 test "recognized offer vectors allow general-purpose client sizes" {
@@ -481,6 +581,74 @@ test "recognized offer vectors allow general-purpose client sizes" {
     }
     try testing.expectEqual(@as(usize, max_offers), offers.signature_schemes_len);
     try testing.expectError(error.OfferVectorTooLarge, offers.appendSignatureScheme(.ed25519));
+}
+
+test "unknown signature schemes are preserved in raw offer order" {
+    var body: [192]u8 = undefined;
+    var w = messages.Writer{ .buf = &body };
+    try w.u16_(algorithms.legacy_version);
+    try w.bytes(&([_]u8{0} ** 32));
+    try w.u8_(0);
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(algorithms.CipherSuite.tls_aes_128_gcm_sha256));
+    try w.u8_(1);
+    try w.u8_(0);
+    const extensions_len = try w.reserve(2);
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.supported_versions));
+    try w.u16_(3);
+    try w.u8_(2);
+    try w.u16_(@intFromEnum(algorithms.ProtocolVersion.tls13));
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.signature_algorithms));
+    try w.u16_(6);
+    try w.u16_(4);
+    try w.u16_(0xeeee);
+    try w.u16_(@intFromEnum(algorithms.SignatureScheme.ed25519));
+    w.patch(2, extensions_len);
+
+    const offers = try parseClientHello(w.written());
+    try testing.expectEqual(@as(usize, 2), offers.raw_signature_schemes_len);
+    try testing.expectEqual(@as(u16, 0xeeee), offers.raw_signature_schemes[0]);
+    try testing.expectEqual(@intFromEnum(algorithms.SignatureScheme.ed25519), offers.raw_signature_schemes[1]);
+    try testing.expectEqual(@as(usize, 1), offers.signature_schemes_len);
+    try testing.expectEqual(algorithms.SignatureScheme.ed25519, offers.signature_schemes[0]);
+}
+
+test "hello negotiation permits absent ALPN only when policy allows it" {
+    var offers = ClientHelloOffers{};
+    try offers.appendVersion(.tls13);
+    try offers.appendCipherSuite(.tls_aes_128_gcm_sha256);
+    try offers.appendSupportedGroup(.x25519);
+    try offers.appendKeyShare(.{ .group = .x25519, .key_exchange = "share" });
+
+    var policy = policy_mod.Policy.recordHttp1Only(true);
+    const selected = try negotiateServerHello(policy, &offers);
+    try testing.expect(selected.alpn == null);
+
+    policy.allow_absent_alpn = false;
+    try testing.expectError(error.NoMutualAlpn, negotiateServerHello(policy, &offers));
+}
+
+test "ClientHello parser rejects present ALPN extension with empty protocol list" {
+    var body: [128]u8 = undefined;
+    var w = messages.Writer{ .buf = &body };
+    try w.u16_(algorithms.legacy_version);
+    try w.bytes(&([_]u8{0} ** 32));
+    try w.u8_(0);
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(algorithms.CipherSuite.tls_aes_128_gcm_sha256));
+    try w.u8_(1);
+    try w.u8_(0);
+    const extensions_len = try w.reserve(2);
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.supported_versions));
+    try w.u16_(3);
+    try w.u8_(2);
+    try w.u16_(@intFromEnum(algorithms.ProtocolVersion.tls13));
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.application_layer_protocol_negotiation));
+    try w.u16_(2);
+    try w.u16_(0);
+    w.patch(2, extensions_len);
+
+    try testing.expectError(error.MalformedExtension, parseClientHello(w.written()));
 }
 
 test "negotiation reports no-overlap failures without logging offer contents" {

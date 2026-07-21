@@ -2454,10 +2454,10 @@ const PureZigTlsClient = struct {
         try setNonBlockingFd(self.stream.handle);
 
         self.crypto_provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
-        self.backend = tls_core.tls13_backend.Tls13Backend.initClientWithOptions(
+        self.backend = tls_core.tls13_backend.Tls13Backend.initClientConfigured(
             try tls_core.production_crypto.freshHandshakeEntropy(),
             .insecure_no_verification,
-            .{ .record = .{ .alpn = alpnPolicy(alpn) } },
+            tls_core.tls13_backend.recordConfig(alpnPolicy(alpn)),
             .{ .server_name = server_name },
         );
         self.record = try tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
@@ -2489,10 +2489,10 @@ const PureZigTlsClient = struct {
         try setNonBlockingFd(self.stream.handle);
 
         self.crypto_provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
-        self.backend = tls_core.tls13_backend.Tls13Backend.initClientWithOptions(
+        self.backend = tls_core.tls13_backend.Tls13Backend.initClientConfigured(
             try tls_core.production_crypto.freshHandshakeEntropy(),
             .insecure_no_verification,
-            .{ .record = .{ .alpn = alpnPolicy(alpn) } },
+            tls_core.tls13_backend.recordConfig(alpnPolicy(alpn)),
             .{ .server_name = server_name },
         );
         self.record = try tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
@@ -2671,11 +2671,17 @@ const PureZigTlsClient = struct {
     }
 };
 
-fn alpnPolicy(alpn: []const u8) tls_core.tls13_backend.AlpnPolicy {
-    if (std.mem.eql(u8, alpn, "h2")) return tls_core.tls13_backend.recordAlpnPolicy("h2");
-    if (std.mem.eql(u8, alpn, "http/1.1")) return tls_core.tls13_backend.recordAlpnPolicy("http/1.1");
-    if (std.mem.eql(u8, alpn, "tardigrade-test")) return tls_core.tls13_backend.recordAlpnPolicy("tardigrade-test");
-    return .{ .protocols = &.{} };
+const tardigrade_test_alpns = [_]tls_core.algorithms.ProtocolName{.{ .bytes = "tardigrade-test" }};
+
+fn alpnPolicy(alpn: []const u8) tls_core.policy.Policy {
+    if (std.mem.eql(u8, alpn, "h2")) return tls_core.policy.Policy.recordH2Only();
+    if (std.mem.eql(u8, alpn, "http/1.1")) return tls_core.policy.Policy.recordHttp1Only(false);
+    if (std.mem.eql(u8, alpn, "tardigrade-test")) {
+        return tls_core.policy.Policy.fromCapabilities(.record, tls_core.tls13_backend.native_capabilities, &tardigrade_test_alpns);
+    }
+    var policy = tls_core.policy.Policy.recordDefault();
+    policy.alpn_protocols = &.{};
+    return policy;
 }
 
 const Http2WireFrame = struct {

@@ -926,14 +926,20 @@ test "persistence round trip preserves LRU eviction order across swapRemove-scra
     t2.deinit();
 
     // A lookup touch refreshes lru_sequence for all returned entries (sorted
-    // newest-insertion-first: t2 then t1).  After the touch:
-    //   t2: lru_sequence=2   t1: lru_sequence=3  (t1 becomes LRU-freshest)
+    // newest-insertion-first: t2 then t1).  The eviction helpers evict the
+    // entry with the *smallest* lru_sequence, so a higher value means
+    // "more recently used" / "protected from eviction".  After the touch:
+    //   t2: lru_sequence=2 (smallest → oldest / eviction candidate)
+    //   t1: lru_sequence=3 (largest  → freshest / protected)
     var touch = cache.lookupOffers(testCandidate("example.test"), 2);
     touch.deinit();
 
-    // Storing t3 under a per-origin cap of 2 evicts t2 (oldest LRU=2) via
+    // Storing t3 under a per-origin cap of 2 evicts t2 (smallest lru=2) via
     // swapRemove, which scrambles the physical backing array so t3 now sits
     // where t2 used to be.  t1 stays but its array index may have changed.
+    // t3 receives the next fresh lru_sequence from the store path:
+    //   t1: lru_sequence=3 (protected by touch)
+    //   t3: lru_sequence=4 (assigned at store time — newer than t1)
     var t3 = try testClient(testing.allocator, "t3", "example.test");
     try testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&t3, 2, .reusable));
     t3.deinit();
@@ -962,9 +968,10 @@ test "persistence round trip preserves LRU eviction order across swapRemove-scra
     try testing.expectEqualStrings("t1", offers_rest.hit.constSlice()[1].ticket.slice());
 
     // Next-eviction behavior: under capacity pressure, inserting a new entry
-    // from a different origin ("other.test") must evict the globally-oldest
-    // LRU entry — t1 (lru=3) rather than t3 (lru=4) — in both the original
-    // and restored caches.  Both outcomes must match.
+    // from a different origin ("other.test") triggers global LRU eviction.
+    // The eviction helper removes the entry with the smallest lru_sequence:
+    // t1 (lru=3) is evicted before t3 (lru=4) — in both the original and the
+    // restored cache.  Both outcomes must agree.
     var t4_orig = try testClient(testing.allocator, "t4", "other.test");
     try testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&t4_orig, 4, .reusable));
     t4_orig.deinit();

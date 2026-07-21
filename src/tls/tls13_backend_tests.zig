@@ -559,7 +559,7 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
             return 2000;
         }
     };
-    resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
 
     const Resolver = struct {
         state: *session.ServerRecoverableState,
@@ -581,7 +581,7 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
     // not be shallow-copied, or its owned storage would be deinitialized
     // twice — once here, once by `server_state`'s own `defer` above.
     var resolver_state: Resolver = .{ .state = &server_state };
-    resumed.server_backend.setServerPskResolver(.{
+    try resumed.server_backend.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = Resolver.now,
         .resolveFn = Resolver.resolve,
@@ -682,7 +682,7 @@ test "PSK round trip resumes over the extension (QUIC-style) profile with asymme
             return 2000;
         }
     };
-    resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
 
     const Resolver = struct {
         state: *session.ServerRecoverableState,
@@ -703,7 +703,7 @@ test "PSK round trip resumes over the extension (QUIC-style) profile with asymme
     // (this ticket has a non-null `transport_compat`), and shallow-copying
     // it here would double-free that storage.
     var resolver_state: Resolver = .{ .state = &server_state };
-    resumed.server_backend.setServerPskResolver(.{
+    try resumed.server_backend.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = Resolver.now,
         .resolveFn = Resolver.resolve,
@@ -754,7 +754,7 @@ test "PSK round trip falls back to a full handshake when the resolver has no mat
             return 0;
         }
     };
-    harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+    try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
 
     const NoMatchResolver = struct {
         fn now(_: *anyopaque) i64 {
@@ -764,7 +764,7 @@ test "PSK round trip falls back to a full handshake when the resolver has no mat
             return false;
         }
     };
-    harness.server_backend.setServerPskResolver(.{
+    try harness.server_backend.setServerPskResolver(.{
         .ctx = undefined,
         .nowUnixMsFn = NoMatchResolver.now,
         .resolveFn = NoMatchResolver.resolve,
@@ -837,12 +837,12 @@ test "an ineligible offered ticket is filtered without desyncing the wire index 
             return 10_000; // well past the expired ticket's 1-second lifetime
         }
     };
-    harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+    try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
 
     var stored_state = pskStoredState(&psk);
     defer stored_state.deinit();
     var resolver_state = CountingResolver{ .state = &stored_state, .identity = "valid-ticket" };
-    harness.server_backend.setServerPskResolver(.{
+    try harness.server_backend.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
@@ -889,12 +889,12 @@ test "handshake-time client authentication forces a full handshake even when a P
             return 0;
         }
     };
-    harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+    try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
 
     var stored_state = pskStoredState(&psk);
     defer stored_state.deinit();
     var resolver_state = CountingResolver{ .state = &stored_state, .identity = "client-auth-ticket" };
-    harness.server_backend.setServerPskResolver(.{
+    try harness.server_backend.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
@@ -3008,7 +3008,7 @@ test "async credential selection resumes PSK selection identically to the synchr
     var stored_state = pskStoredState(&psk);
     defer stored_state.deinit();
     var resolver_state = CountingResolver{ .state = &stored_state, .identity = "async-ticket" };
-    server.setServerPskResolver(.{
+    try server.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
@@ -3050,7 +3050,7 @@ test "async credential selection failure clears the captured PSK offer" {
     var stored_state = pskStoredState(&psk);
     defer stored_state.deinit();
     var resolver_state = CountingResolver{ .state = &stored_state, .identity = "async-ticket" };
-    server.setServerPskResolver(.{
+    try server.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
@@ -3112,6 +3112,80 @@ test "setApplicationCompat copies the caller's bytes instead of borrowing them" 
     try std.testing.expectEqualStrings("old!", stored.bytes);
 }
 
+test "setApplicationCompat accepts a snapshot larger than the transport-extension bound" {
+    // Regression coverage: the owned storage used to be capped at
+    // `max_transport_extension_len` (512), an unrelated QUIC/H3
+    // transport-extension bound, silently rejecting an application
+    // snapshot the shared session model itself allows up to 1024 bytes by
+    // default (`session.Limits.default.max_application_compat_len`).
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    var large: [session.Limits.default.max_application_compat_len]u8 = undefined;
+    @memset(&large, 0x5a);
+    try server.setApplicationCompat(.{ .format_id = 1, .format_version = 1, .bytes = &large });
+    const stored = server.ownedApplicationCompat().?;
+    try std.testing.expectEqual(large.len, stored.bytes.len);
+    try std.testing.expect(std.mem.allEqual(u8, stored.bytes, 0x5a));
+}
+
+test "PSK setters reject being called after start, leaving prior configuration unchanged" {
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+    );
+    defer client.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+
+    const psk = [_]u8{0x22} ** tls_backend.hash_len;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var ticket: session.ClientTicketState = .{};
+    try ticket.init(std.testing.allocator, session.Limits.default, &common, .{
+        .ticket = "late-offer",
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 0;
+        }
+    };
+    try std.testing.expectError(
+        error.InvalidHandshakeState,
+        client.setClientPskOffers(&offers, &clock_dummy, Clock.now),
+    );
+    // The rejected call took no ownership: the caller's offer is untouched.
+    try std.testing.expectEqual(@as(usize, 1), offers.len);
+    offers.deinit();
+
+    try std.testing.expectError(error.InvalidHandshakeState, client.setApplicationCompat(.{ .format_id = 1, .format_version = 1, .bytes = "x" }));
+
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+    try server.backend().start(.server, {}, &server_sink);
+    try std.testing.expectError(error.InvalidHandshakeState, server.setServerPskResolver(.{
+        .ctx = undefined,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    }));
+}
+
 test "handshake-phase failure wipes PSK offer state before ServerHello even arrives" {
     var client = tls_backend.Tls13Backend.initClient(
         clientEntropy(),
@@ -3144,7 +3218,7 @@ test "handshake-phase failure wipes PSK offer state before ServerHello even arri
             return 0;
         }
     };
-    client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+    try client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
 
     var sink = DirectSink{};
     defer sink.deinit();
@@ -3181,7 +3255,7 @@ test "the accepted server session survives PSK selection with its early-data and
     stored_state.init(&common, 0);
     defer stored_state.deinit();
     var resolver_state = CountingResolver{ .state = &stored_state, .identity = "early-data-ticket" };
-    server.setServerPskResolver(.{
+    try server.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
@@ -3201,6 +3275,48 @@ test "the accepted server session survives PSK selection with its early-data and
     try std.testing.expectEqual(@as(?u16, null), server.takeSelectedServerPsk(&second));
 }
 
+test "a bad client Finished after PSK selection clears the accepted session and secret state" {
+    // Regression coverage: `Core.acceptReceived` marks the server's
+    // handshake lifecycle `.complete` as soon as a Finished message's
+    // *ordering* is accepted — before this backend has verified its MAC.
+    // The old `clearFailedHandshakeState` guard (`core.handshake_lifecycle
+    // == .complete`) would therefore see `.complete` and skip cleanup
+    // entirely on exactly this path.
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    const psk = [_]u8{0x77} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "bad-finished-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{.{ .identity = "bad-finished-ticket", .binder_psk = &psk }} } });
+    try std.testing.expect(server.core.psk_authenticated);
+    try std.testing.expect(server.selected_server_psk_present);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var bad_finished_buf: [4 + tls_backend.hash_len]u8 = undefined;
+    const bad_finished = try tls_core.messages.encode(.finished, &([_]u8{0xaa} ** tls_backend.hash_len), &bad_finished_buf);
+    try std.testing.expectError(error.DecryptError, server.backend().receive(.handshake, bad_finished, &sink));
+
+    // Core's own lifecycle already (incorrectly, from this backend's
+    // perspective) reads `.complete` at this point — the actual assertion
+    // is that the backend's cleanup corrects it and wipes everything.
+    try std.testing.expectEqual(.failed, server.core.handshake_lifecycle);
+    try std.testing.expect(!server.core.psk_authenticated);
+    try std.testing.expect(server.schedule == null);
+    try std.testing.expectEqual(@as(usize, 0), server.resumption_master_secret.slice().len);
+    var taken: session.ServerRecoverableState = .{};
+    try std.testing.expectEqual(@as(?u16, null), server.takeSelectedServerPsk(&taken));
+    try std.testing.expectEqual(@as(?pre_shared_key.AgeSkew, null), server.takePskAgeSkew());
+}
+
 test "server selects the first compatible identity: unknown first, valid second" {
     var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
     defer server.deinit();
@@ -3209,7 +3325,7 @@ test "server selects the first compatible identity: unknown first, valid second"
     var stored_state = pskStoredState(&psk);
     defer stored_state.deinit();
     var resolver_state = CountingResolver{ .state = &stored_state, .identity = "known-ticket" };
-    server.setServerPskResolver(.{
+    try server.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
@@ -3234,7 +3350,7 @@ test "a compatible candidate with a wrong binder is fatal and never probes a lat
     var stored_state = pskStoredState(&psk);
     defer stored_state.deinit();
     var resolver_state = CountingResolver{ .state = &stored_state, .identity = "ticket-a" };
-    server.setServerPskResolver(.{
+    try server.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
@@ -3301,7 +3417,7 @@ test "a malformed non-leaf chain entry is rejected before PSK resolver/binder wo
     var stored_state = pskStoredState(&psk);
     defer stored_state.deinit();
     var resolver_state = CountingResolver{ .state = &stored_state, .identity = "leaf-ok-tail-bad" };
-    server.setServerPskResolver(.{
+    try server.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
@@ -3327,7 +3443,7 @@ test "an oversized non-leaf chain entry is rejected before PSK resolver/binder w
     var stored_state = pskStoredState(&psk);
     defer stored_state.deinit();
     var resolver_state = CountingResolver{ .state = &stored_state, .identity = "leaf-ok-tail-oversized" };
-    server.setServerPskResolver(.{
+    try server.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
@@ -3350,7 +3466,7 @@ test "a ticket bound to a different server certificate falls back to a full hand
     var stored_state = pskStoredStateWithBinding(&psk, session.AuthBinding.fromLeafCertificateDer("a different certificate entirely"));
     defer stored_state.deinit();
     var resolver_state = CountingResolver{ .state = &stored_state, .identity = "rotated-ticket" };
-    server.setServerPskResolver(.{
+    try server.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
@@ -3397,7 +3513,7 @@ test "an SNI mismatch falls back to a full handshake instead of rejecting the co
     stored_state.init(&common, 0);
     defer stored_state.deinit();
     var resolver_state = CountingResolver{ .state = &stored_state, .identity = "sni-ticket" };
-    server.setServerPskResolver(.{
+    try server.setServerPskResolver(.{
         .ctx = &resolver_state,
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,

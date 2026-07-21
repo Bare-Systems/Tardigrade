@@ -2489,6 +2489,35 @@ test "stateful server bounded handle-generation collisions return a typed failur
     try testing.expectEqualStrings("other.test", second.common.server_name.?.slice());
 }
 
+test "expired server entries in other origins never permanently block max_origins, and cleanup() removes them" {
+    var limits = Limits.stateful_server_default;
+    limits.max_origins = 1;
+    var cache = try StatefulServerCache.init(testing.allocator, limits, system_random_source);
+    defer cache.deinit();
+
+    // Store a server entry for a.test with a very short lifetime (10 ms).
+    var s1 = try testServerState(testing.allocator, "a.test", 0, 10);
+    var h1: [stateful_identity_len]u8 = undefined;
+    _ = cache.insertMove(&s1, 0, .reusable, &h1);
+    try testing.expectEqual(@as(usize, 1), cache.count());
+
+    // `a.test`'s only entry is now expired, but nothing has looked it up
+    // yet. A fresh origin must still be storable: `insertLocked`'s own
+    // global expiry purge must not need a prior lookup to clear it out.
+    var s2 = try testServerState(testing.allocator, "b.test", 0, 1000);
+    var h2: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&s2, 1_000_000, .reusable, &h2));
+    try testing.expectEqual(@as(usize, 1), cache.count());
+
+    // `cleanup` works as an explicit periodic maintenance entry point: it
+    // skips actively leased single-use entries and returns the evicted count.
+    var s3 = try testServerState(testing.allocator, "c.test", 0, 10);
+    var h3: [stateful_identity_len]u8 = undefined;
+    _ = cache.insertMove(&s3, 1_000_000, .reusable, &h3);
+    const removed = cache.cleanup(2_000_000);
+    try testing.expectEqual(@as(usize, 1), removed);
+}
+
 test "stateful server enforces per-origin and global capacity with deterministic eviction and consistent indexes" {
     var limits = Limits.stateful_server_default;
     limits.max_entries_per_origin = 2;

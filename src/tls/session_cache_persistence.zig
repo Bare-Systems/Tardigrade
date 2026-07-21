@@ -282,6 +282,9 @@ pub fn decodeServerSnapshotAlloc(
         const usage = std.enums.fromInt(session_cache.UsagePolicy, rest[0]) orelse return error.MalformedLength;
         var handle: [session_cache.stateful_identity_len]u8 = undefined;
         @memcpy(&handle, rest[1 .. 1 + session_cache.stateful_identity_len]);
+        // Zero the bearer-secret handle bytes on every exit from this
+        // iteration — success or error — so they never linger on the stack.
+        defer secrets.secureZero(&handle);
         if (!session_cache.isValidStatefulHandleShape(&handle)) return error.InvalidHandle;
         const lru_offset = 1 + session_cache.stateful_identity_len;
         const lru_sequence = std.mem.readInt(u64, rest[lru_offset..][0..8], .big);
@@ -695,6 +698,15 @@ fn testServerState(allocator: std.mem.Allocator, sni: []const u8) !session.Serve
     return state;
 }
 
+fn testCandidate(sni: []const u8) session.CandidateContext {
+    return .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .server_name = sni,
+        .application_protocol = "h3",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("leaf-der"),
+    };
+}
+
 test "client snapshot round trips through encode/decode, including order metadata" {
     const t1 = try testClient(testing.allocator, "persist-ticket-1", "example.test");
     var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = t1, .usage = .single_use, .insertion_sequence = 7, .lru_sequence = 3 }};
@@ -890,6 +902,92 @@ test "saveClientCache and loadClientCache round trip through an in-memory backen
     defer restored.deinit();
     try testing.expectEqual(LoadResult.loaded, loadClientCache(&restored, session.Limits.default, passthrough_protector, backend.interface(), 2));
     try testing.expectEqual(@as(usize, 1), restored.count());
+}
+
+test "persistence round trip preserves LRU eviction order across swapRemove-scrambled storage" {
+    // Regression for the swapRemove-scrambles-array-order concern: persisting
+    // `insertion_sequence` and `lru_sequence` explicitly in the snapshot
+    // (rather than relying on physical array order) must survive even when
+    // an eviction triggered by a store has reordered the backing store
+    // before the snapshot was taken.
+    var limits = session_cache.Limits.client_default;
+    limits.max_entries_per_origin = 2;
+    limits.max_entries = 2;
+    var cache = try session_cache.ClientSessionCache.init(testing.allocator, limits);
+    defer cache.deinit();
+
+    // t1: insertion_sequence=0, lru_sequence=0.
+    var t1 = try testClient(testing.allocator, "t1", "example.test");
+    _ = cache.storeClone(&t1, 0, .reusable);
+    t1.deinit();
+    // t2: insertion_sequence=1, lru_sequence=1.
+    var t2 = try testClient(testing.allocator, "t2", "example.test");
+    _ = cache.storeClone(&t2, 1, .reusable);
+    t2.deinit();
+
+    // A lookup touch refreshes lru_sequence for all returned entries (sorted
+    // newest-insertion-first: t2 then t1).  The eviction helpers evict the
+    // entry with the *smallest* lru_sequence, so a higher value means
+    // "more recently used" / "protected from eviction".  After the touch:
+    //   t2: lru_sequence=2 (smallest → oldest / eviction candidate)
+    //   t1: lru_sequence=3 (largest  → freshest / protected)
+    var touch = cache.lookupOffers(testCandidate("example.test"), 2);
+    touch.deinit();
+
+    // Storing t3 under a per-origin cap of 2 evicts t2 (smallest lru=2) via
+    // swapRemove, which scrambles the physical backing array so t3 now sits
+    // where t2 used to be.  t1 stays but its array index may have changed.
+    // t3 receives the next fresh lru_sequence from the store path:
+    //   t1: lru_sequence=3 (protected by touch)
+    //   t3: lru_sequence=4 (assigned at store time — newer than t1)
+    var t3 = try testClient(testing.allocator, "t3", "example.test");
+    try testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&t3, 2, .reusable));
+    t3.deinit();
+    try testing.expectEqual(@as(usize, 2), cache.count());
+
+    var backend = MemoryBackend{ .allocator = testing.allocator };
+    defer backend.deinit();
+    try testing.expectEqual(SaveResult.saved, saveClientCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 3));
+
+    var restored = try session_cache.ClientSessionCache.init(testing.allocator, limits);
+    defer restored.deinit();
+    try testing.expectEqual(LoadResult.loaded, loadClientCache(&restored, session.Limits.default, passthrough_protector, backend.interface(), 3));
+    try testing.expectEqual(@as(usize, 2), restored.count());
+
+    // Offer order must survive the round trip: newest insertion_sequence
+    // first → [t3(ins=2), t1(ins=0)].
+    var offers_orig = cache.lookupOffers(testCandidate("example.test"), 3);
+    defer offers_orig.deinit();
+    var offers_rest = restored.lookupOffers(testCandidate("example.test"), 3);
+    defer offers_rest.deinit();
+    try testing.expectEqual(offers_orig.hit.len, offers_rest.hit.len);
+    for (offers_orig.hit.constSlice(), offers_rest.hit.constSlice()) |*b, *a| {
+        try testing.expectEqualStrings(b.ticket.slice(), a.ticket.slice());
+    }
+    try testing.expectEqualStrings("t3", offers_rest.hit.constSlice()[0].ticket.slice());
+    try testing.expectEqualStrings("t1", offers_rest.hit.constSlice()[1].ticket.slice());
+
+    // Next-eviction behavior: under capacity pressure, inserting a new entry
+    // from a different origin ("other.test") triggers global LRU eviction.
+    // The eviction helper removes the entry with the smallest lru_sequence:
+    // t1 (lru=3) is evicted before t3 (lru=4) — in both the original and the
+    // restored cache.  Both outcomes must agree.
+    var t4_orig = try testClient(testing.allocator, "t4", "other.test");
+    try testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&t4_orig, 4, .reusable));
+    t4_orig.deinit();
+    var t4_rest = try testClient(testing.allocator, "t4", "other.test");
+    try testing.expectEqual(session_cache.StoreResult.stored, restored.storeClone(&t4_rest, 4, .reusable));
+    t4_rest.deinit();
+
+    // Both caches must have evicted the same entry (t1 from example.test).
+    var after_orig = cache.lookupOffers(testCandidate("example.test"), 4);
+    defer after_orig.deinit();
+    var after_rest = restored.lookupOffers(testCandidate("example.test"), 4);
+    defer after_rest.deinit();
+    try testing.expectEqual(after_orig.hit.len, after_rest.hit.len);
+    for (after_orig.hit.constSlice(), after_rest.hit.constSlice()) |*b, *a| {
+        try testing.expectEqualStrings(b.ticket.slice(), a.ticket.slice());
+    }
 }
 
 test "loadClientCache discards expired entries and enforces current limits on reload" {

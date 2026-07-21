@@ -22,6 +22,7 @@ pub const record_epoch_bridge = @import("record_epoch_bridge.zig");
 pub const record_protection = @import("record_protection.zig");
 pub const session = @import("session.zig");
 pub const sni_provider = @import("sni_provider.zig");
+pub const ticket_protection = @import("ticket_protection.zig");
 pub const transcript = @import("transcript.zig");
 pub const transport = @import("transport.zig");
 pub const tls13_backend = @import("tls13_backend.zig");

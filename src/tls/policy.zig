@@ -6,14 +6,18 @@ const algorithms = @import("algorithms.zig");
 pub const CipherSuite = algorithms.CipherSuite;
 pub const NamedGroup = algorithms.NamedGroup;
 pub const SignatureScheme = algorithms.SignatureScheme;
+pub const ProtocolVersion = algorithms.ProtocolVersion;
 pub const ProtocolName = algorithms.ProtocolName;
 
+const default_protocol_versions = [_]ProtocolVersion{.tls13};
 const default_cipher_suites = [_]CipherSuite{.tls_aes_128_gcm_sha256};
 const default_named_groups = [_]NamedGroup{.x25519};
-const default_signature_schemes = [_]SignatureScheme{ .ecdsa_secp256r1_sha256, .ed25519 };
+const default_signature_schemes = [_]SignatureScheme{ .ed25519, .ecdsa_secp256r1_sha256 };
 const ed25519_signature_schemes = [_]SignatureScheme{.ed25519};
 const ecdsa_p256_signature_schemes = [_]SignatureScheme{.ecdsa_secp256r1_sha256};
 const quic_alpns = [_]ProtocolName{algorithms.alpn.h3};
+const record_h2_alpns = [_]ProtocolName{algorithms.alpn.h2};
+const record_http1_alpns = [_]ProtocolName{algorithms.alpn.http_1_1};
 const record_alpns = [_]ProtocolName{ algorithms.alpn.h2, algorithms.alpn.http_1_1 };
 
 pub const Error = error{UnsupportedIdentitySignature};
@@ -24,6 +28,7 @@ pub const IdentityKey = enum {
 };
 
 pub const Capabilities = struct {
+    protocol_versions: []const ProtocolVersion = &default_protocol_versions,
     cipher_suites: []const CipherSuite = &default_cipher_suites,
     named_groups: []const NamedGroup = &default_named_groups,
     signature_schemes: []const SignatureScheme = &default_signature_schemes,
@@ -31,15 +36,18 @@ pub const Capabilities = struct {
 
 pub const Policy = struct {
     transport_mode: state.TransportMode,
+    protocol_versions: []const ProtocolVersion = &default_protocol_versions,
     cipher_suites: []const CipherSuite,
     named_groups: []const NamedGroup,
     signature_schemes: []const SignatureScheme,
     alpn_protocols: []const ProtocolName,
     require_sni: bool = false,
+    allow_absent_alpn: bool = false,
 
     pub fn quicDefault() Policy {
         return .{
             .transport_mode = .quic,
+            .protocol_versions = &default_protocol_versions,
             .cipher_suites = &default_cipher_suites,
             .named_groups = &default_named_groups,
             .signature_schemes = &default_signature_schemes,
@@ -50,6 +58,7 @@ pub const Policy = struct {
     pub fn recordDefault() Policy {
         return .{
             .transport_mode = .record,
+            .protocol_versions = &default_protocol_versions,
             .cipher_suites = &default_cipher_suites,
             .named_groups = &default_named_groups,
             .signature_schemes = &default_signature_schemes,
@@ -57,9 +66,33 @@ pub const Policy = struct {
         };
     }
 
+    pub fn recordH2Only() Policy {
+        return .{
+            .transport_mode = .record,
+            .protocol_versions = &default_protocol_versions,
+            .cipher_suites = &default_cipher_suites,
+            .named_groups = &default_named_groups,
+            .signature_schemes = &default_signature_schemes,
+            .alpn_protocols = &record_h2_alpns,
+        };
+    }
+
+    pub fn recordHttp1Only(allow_absent_alpn: bool) Policy {
+        return .{
+            .transport_mode = .record,
+            .protocol_versions = &default_protocol_versions,
+            .cipher_suites = &default_cipher_suites,
+            .named_groups = &default_named_groups,
+            .signature_schemes = &default_signature_schemes,
+            .alpn_protocols = &record_http1_alpns,
+            .allow_absent_alpn = allow_absent_alpn,
+        };
+    }
+
     pub fn fromCapabilities(transport_mode: state.TransportMode, capabilities: Capabilities, alpn_protocols: []const ProtocolName) Policy {
         return .{
             .transport_mode = transport_mode,
+            .protocol_versions = capabilities.protocol_versions,
             .cipher_suites = capabilities.cipher_suites,
             .named_groups = capabilities.named_groups,
             .signature_schemes = capabilities.signature_schemes,
@@ -74,11 +107,39 @@ pub const Policy = struct {
         }
         return .{
             .transport_mode = transport_mode,
+            .protocol_versions = capabilities.protocol_versions,
             .cipher_suites = capabilities.cipher_suites,
             .named_groups = capabilities.named_groups,
             .signature_schemes = identity_schemes,
             .alpn_protocols = alpn_protocols,
         };
+    }
+
+    pub fn containsProtocolVersion(self: Policy, version: ProtocolVersion) bool {
+        return containsEnum(ProtocolVersion, self.protocol_versions, version);
+    }
+
+    pub fn containsCipherSuite(self: Policy, cipher_suite: CipherSuite) bool {
+        return containsEnum(CipherSuite, self.cipher_suites, cipher_suite);
+    }
+
+    pub fn containsNamedGroup(self: Policy, group: NamedGroup) bool {
+        return containsEnum(NamedGroup, self.named_groups, group);
+    }
+
+    pub fn containsSignatureScheme(self: Policy, scheme: SignatureScheme) bool {
+        return containsEnum(SignatureScheme, self.signature_schemes, scheme);
+    }
+
+    pub fn containsAlpn(self: Policy, name: []const u8) bool {
+        for (self.alpn_protocols) |protocol| {
+            if (protocol.eql(.{ .bytes = name })) return true;
+        }
+        return false;
+    }
+
+    pub fn firstAlpn(self: Policy) []const u8 {
+        return if (self.alpn_protocols.len > 0) self.alpn_protocols[0].bytes else "";
     }
 };
 
@@ -90,10 +151,25 @@ pub fn signatureSchemesForIdentity(identity_key: IdentityKey) []const SignatureS
 }
 
 fn containsSignature(schemes: []const SignatureScheme, needle: SignatureScheme) bool {
-    for (schemes) |scheme| {
-        if (scheme == needle) return true;
+    return containsEnum(SignatureScheme, schemes, needle);
+}
+
+fn containsEnum(comptime T: type, values: []const T, needle: T) bool {
+    for (values) |value| {
+        if (value == needle) return true;
     }
     return false;
+}
+
+pub fn alpnFromBytes(bytes: []const u8) ProtocolName {
+    return .{ .bytes = bytes };
+}
+
+pub fn alpnListFromByteNames(out: []ProtocolName, names: []const []const u8) []const ProtocolName {
+    for (names, 0..) |name, i| {
+        out[i] = .{ .bytes = name };
+    }
+    return out[0..names.len];
 }
 
 test "default policies keep QUIC and record ALPN choices separate" {

@@ -21,6 +21,8 @@ const dns_name = @import("dns_name.zig");
 const events = @import("events.zig");
 const credentials = @import("credentials.zig");
 const tls_algorithms = @import("algorithms.zig");
+const tls_negotiation = @import("negotiation.zig");
+const tls_policy = @import("policy.zig");
 const crypto_pkg = @import("crypto");
 const tls_handshake_codec = @import("handshake.zig");
 const tls_key_schedule = @import("key_schedule.zig");
@@ -155,8 +157,8 @@ pub const max_signature_len = 256;
 ///     2-byte extensions-vector length = 6 bytes.
 ///   - The ALPN extension at its legal maximum: 2-byte extension type +
 ///     2-byte extension length + 2-byte protocol-list length + 1-byte
-///     protocol length + up to 255 protocol bytes (`AlpnPolicy.validate`'s
-///     own `name.len > std.math.maxInt(u8)` bound) = 262 bytes.
+///     protocol length + up to 255 protocol bytes (`Policy`'s ALPN validation
+///     bound) = 262 bytes.
 ///   - The opaque transport extension (QUIC/H3 profile only; record mode
 ///     carries none): 2-byte type + 2-byte length + `max_transport_extension_len`
 ///     payload = 516 bytes.
@@ -176,49 +178,47 @@ fn checkedAdd(a: usize, b: usize) HandshakeError!usize {
     return std.math.add(usize, a, b) catch return error.InvalidTransportProfile;
 }
 
-const tls13_version: u16 = 0x0304;
-const legacy_version: u16 = 0x0303;
-const cipher_tls_aes_128_gcm_sha256: u16 = 0x1301;
-const group_x25519: u16 = 0x001d;
-const sigalg_ed25519: u16 = 0x0807;
-const sigalg_ecdsa_secp256r1_sha256: u16 = 0x0403;
+const tls13_version: u16 = @intFromEnum(tls_algorithms.ProtocolVersion.tls13);
+const legacy_version: u16 = tls_algorithms.legacy_version;
+const cipher_tls_aes_128_gcm_sha256: u16 = @intFromEnum(tls_algorithms.CipherSuite.tls_aes_128_gcm_sha256);
+const group_x25519: u16 = @intFromEnum(tls_algorithms.NamedGroup.x25519);
+const sigalg_ed25519: u16 = @intFromEnum(tls_algorithms.SignatureScheme.ed25519);
+const sigalg_ecdsa_secp256r1_sha256: u16 = @intFromEnum(tls_algorithms.SignatureScheme.ecdsa_secp256r1_sha256);
 
-const ext_server_name: u16 = 0;
-const ext_supported_groups: u16 = 10;
-const ext_signature_algorithms: u16 = 13;
-const ext_alpn: u16 = 16;
-const ext_supported_versions: u16 = 43;
-const ext_key_share: u16 = 51;
+const ext_server_name: u16 = @intFromEnum(tls_algorithms.ExtensionType.server_name);
+const ext_supported_groups: u16 = @intFromEnum(tls_algorithms.ExtensionType.supported_groups);
+const ext_signature_algorithms: u16 = @intFromEnum(tls_algorithms.ExtensionType.signature_algorithms);
+const ext_alpn: u16 = @intFromEnum(tls_algorithms.ExtensionType.application_layer_protocol_negotiation);
+const ext_supported_versions: u16 = @intFromEnum(tls_algorithms.ExtensionType.supported_versions);
+const ext_key_share: u16 = @intFromEnum(tls_algorithms.ExtensionType.key_share);
 pub const max_transport_extension_len = 512;
 
-pub const AlpnPolicy = struct {
-    protocols: []const []const u8,
-    allow_absent: bool = false,
+const native_protocol_versions = [_]tls_algorithms.ProtocolVersion{.tls13};
+const native_cipher_suites = [_]tls_algorithms.CipherSuite{.tls_aes_128_gcm_sha256};
+const native_named_groups = [_]tls_algorithms.NamedGroup{.x25519};
+const native_signature_schemes = [_]tls_algorithms.SignatureScheme{ .ed25519, .ecdsa_secp256r1_sha256 };
 
-    pub fn validate(self: AlpnPolicy) HandshakeError!void {
-        if (self.protocols.len == 0 and !self.allow_absent) return error.InvalidTransportProfile;
-        var total: usize = 0;
-        for (self.protocols, 0..) |name, i| {
-            if (name.len == 0 or name.len > std.math.maxInt(u8)) return error.InvalidTransportProfile;
-            total = std.math.add(usize, total, 1 + name.len) catch return error.InvalidTransportProfile;
-            if (total > std.math.maxInt(u16)) return error.InvalidTransportProfile;
-            if (total + 6 > max_message_len) return error.InvalidTransportProfile;
-            for (self.protocols[0..i]) |prior| {
-                if (std.mem.eql(u8, prior, name)) return error.InvalidTransportProfile;
-            }
-        }
-    }
-
-    pub fn contains(self: AlpnPolicy, name: []const u8) bool {
-        for (self.protocols) |protocol| {
-            if (std.mem.eql(u8, protocol, name)) return true;
-        }
-        return false;
-    }
+pub const native_capabilities = tls_policy.Capabilities{
+    .protocol_versions = &native_protocol_versions,
+    .cipher_suites = &native_cipher_suites,
+    .named_groups = &native_named_groups,
+    .signature_schemes = &native_signature_schemes,
 };
 
-pub fn recordAlpnPolicy(comptime protocol: []const u8) AlpnPolicy {
-    return .{ .protocols = &.{protocol} };
+pub const BackendConfig = struct {
+    policy: tls_policy.Policy,
+    transport: TransportProfile,
+};
+
+pub fn recordConfig(policy: tls_policy.Policy) BackendConfig {
+    return .{ .policy = policy, .transport = .record };
+}
+
+fn defaultConfigForTransport(transport: TransportProfile) BackendConfig {
+    return switch (transport) {
+        .record => recordConfig(tls_policy.Policy.recordH2Only()),
+        .extension => .{ .policy = tls_policy.Policy.quicDefault(), .transport = transport },
+    };
 }
 
 /// Transport differences are explicit production configuration, never a
@@ -226,93 +226,15 @@ pub fn recordAlpnPolicy(comptime protocol: []const u8) AlpnPolicy {
 /// opaque; the owning transport adapter is responsible for its codec and
 /// policy. Record mode carries no transport-specific extension.
 pub const TransportProfile = union(enum) {
-    record: RecordOptions,
+    record,
     extension: ExtensionOptions,
 
-    pub const RecordOptions = struct {
-        alpn: AlpnPolicy,
-    };
-
     pub const ExtensionOptions = struct {
-        alpn: []const u8,
         extension_type: u16,
         /// Borrowed from the transport adapter. It must remain valid until the
         /// local ClientHello or EncryptedExtensions flight has been emitted.
         local: []const u8,
     };
-
-    fn firstConfiguredAlpn(self: TransportProfile) []const u8 {
-        return switch (self) {
-            .record => |options| if (options.alpn.protocols.len > 0) options.alpn.protocols[0] else "",
-            .extension => |options| options.alpn,
-        };
-    }
-
-    fn allowAbsentAlpn(self: TransportProfile) bool {
-        return switch (self) {
-            .record => |options| options.alpn.allow_absent,
-            .extension => false,
-        };
-    }
-
-    fn containsAlpn(self: TransportProfile, name: []const u8) bool {
-        return switch (self) {
-            .record => |options| options.alpn.contains(name),
-            .extension => |options| std.mem.eql(u8, options.alpn, name),
-        };
-    }
-
-    fn alpnPreference(self: TransportProfile, name: []const u8) ?usize {
-        return switch (self) {
-            .record => |options| blk: {
-                for (options.alpn.protocols, 0..) |protocol, index| {
-                    if (std.mem.eql(u8, protocol, name)) break :blk index;
-                }
-                break :blk null;
-            },
-            .extension => |options| if (std.mem.eql(u8, options.alpn, name)) 0 else null,
-        };
-    }
-
-    fn writeAlpnOffer(self: TransportProfile, w: *Writer) HandshakeError!void {
-        switch (self) {
-            .record => |options| {
-                if (options.alpn.protocols.len == 0) return;
-                try w.u16_(ext_alpn);
-                const alpn_ext_len = try w.reserve(2);
-                const alpn_list_len = try w.reserve(2);
-                for (options.alpn.protocols) |protocol| {
-                    try w.u8_(@intCast(protocol.len));
-                    try w.bytes(protocol);
-                }
-                w.patch(2, alpn_list_len);
-                w.patch(2, alpn_ext_len);
-            },
-            .extension => |options| {
-                try w.u16_(ext_alpn);
-                const alpn_ext_len = try w.reserve(2);
-                const alpn_list_len = try w.reserve(2);
-                try w.u8_(@intCast(options.alpn.len));
-                try w.bytes(options.alpn);
-                w.patch(2, alpn_list_len);
-                w.patch(2, alpn_ext_len);
-            },
-        }
-    }
-
-    fn alpnOfferEncodedLen(self: TransportProfile) HandshakeError!usize {
-        return switch (self) {
-            .record => |options| blk: {
-                if (options.alpn.protocols.len == 0) break :blk 0;
-                var list_len: usize = 0;
-                for (options.alpn.protocols) |protocol| {
-                    list_len = try checkedAdd(list_len, 1 + protocol.len);
-                }
-                break :blk try checkedAdd(6, list_len);
-            },
-            .extension => |options| try checkedAdd(7, options.alpn.len),
-        };
-    }
 
     fn extensionType(self: TransportProfile) ?u16 {
         return switch (self) {
@@ -329,14 +251,11 @@ pub const TransportProfile = union(enum) {
     }
 
     fn validate(self: TransportProfile) HandshakeError!void {
-        switch (self) {
-            .record => |options| try options.alpn.validate(),
-            .extension => |options| if (options.alpn.len == 0 or options.alpn.len > std.math.maxInt(u8)) return error.InvalidTransportProfile,
-        }
         if (self == .extension) {
             const options = self.extension;
             if (options.local.len > max_transport_extension_len) return error.InvalidTransportProfile;
             switch (options.extension_type) {
+                ext_server_name,
                 ext_supported_groups,
                 ext_signature_algorithms,
                 ext_alpn,
@@ -439,6 +358,7 @@ pub const Entropy = struct {
 pub const Tls13Backend = struct {
     role: Role,
     profile: TransportProfile,
+    policy: tls_policy.Policy,
     entropy: Entropy,
     identity: Identity = undefined,
     identity_present: bool = false,
@@ -484,6 +404,9 @@ pub const Tls13Backend = struct {
     selected_alpn: [255]u8 = undefined,
     selected_alpn_len: usize = 0,
     selected_alpn_present: bool = false,
+    negotiated_version: tls_algorithms.ProtocolVersion = .tls13,
+    negotiated_cipher_suite: tls_algorithms.CipherSuite = .tls_aes_128_gcm_sha256,
+    negotiated_named_group: tls_algorithms.NamedGroup = .x25519,
     peer_transport_extension: [max_transport_extension_len]u8 = undefined,
     peer_transport_extension_len: usize = 0,
     peer_transport_extension_pending: bool = false,
@@ -681,15 +604,14 @@ pub const Tls13Backend = struct {
     /// Allocation-free. The returned backend owns its copied entropy until
     /// `deinit`, which securely clears all private material.
     pub fn initClient(entropy: Entropy, trust: Trust, profile: TransportProfile) Tls13Backend {
-        return initClientWithOptions(entropy, trust, profile, .{});
+        return initClientConfigured(entropy, trust, defaultConfigForTransport(profile), .{});
     }
 
-    /// Client construction with the built-in fixed trust policy plus explicit
-    /// client options such as intended SNI.
-    pub fn initClientWithOptions(entropy: Entropy, trust: Trust, profile: TransportProfile, options: ClientOptions) Tls13Backend {
+    pub fn initClientConfigured(entropy: Entropy, trust: Trust, config: BackendConfig, options: ClientOptions) Tls13Backend {
         var self: Tls13Backend = .{
             .role = .client,
-            .profile = profile,
+            .profile = config.transport,
+            .policy = config.policy,
             .entropy = entropy,
             .trust = trust,
             .auth_policy = policyFromTrust(trust),
@@ -697,6 +619,12 @@ pub const Tls13Backend = struct {
         };
         self.applyClientOptions(options);
         return self;
+    }
+
+    /// Client construction with the built-in fixed trust policy plus explicit
+    /// client options such as intended SNI.
+    pub fn initClientWithOptions(entropy: Entropy, trust: Trust, profile: TransportProfile, options: ClientOptions) Tls13Backend {
+        return initClientConfigured(entropy, trust, defaultConfigForTransport(profile), options);
     }
 
     fn applyClientOptions(self: *Tls13Backend, options: ClientOptions) void {
@@ -718,9 +646,14 @@ pub const Tls13Backend = struct {
     /// is served to the engine through the production `CredentialProvider`
     /// contract, identical to an external provider.
     pub fn initServer(entropy: Entropy, identity: Identity, profile: TransportProfile) Tls13Backend {
+        return initServerConfigured(entropy, identity, defaultConfigForTransport(profile));
+    }
+
+    pub fn initServerConfigured(entropy: Entropy, identity: Identity, config: BackendConfig) Tls13Backend {
         return .{
             .role = .server,
-            .profile = profile,
+            .profile = config.transport,
+            .policy = config.policy,
             .entropy = entropy,
             .identity = identity,
             .identity_present = true,
@@ -732,9 +665,14 @@ pub const Tls13Backend = struct {
     /// selector, external/asynchronous signer, ...). The provider's storage
     /// must outlive the handshake. No fixed identity is held.
     pub fn initServerWithProvider(entropy: Entropy, provider: CredentialProvider, profile: TransportProfile) Tls13Backend {
+        return initServerWithProviderConfigured(entropy, provider, defaultConfigForTransport(profile));
+    }
+
+    pub fn initServerWithProviderConfigured(entropy: Entropy, provider: CredentialProvider, config: BackendConfig) Tls13Backend {
         return .{
             .role = .server,
-            .profile = profile,
+            .profile = config.transport,
+            .policy = config.policy,
             .entropy = entropy,
             .external_provider = provider,
             .core = tls_handshake_codec.Core.init(.server),
@@ -747,9 +685,14 @@ pub const Tls13Backend = struct {
     /// passed to the verifier for hostname verification) and the explicit
     /// policy — the verifier never inherits the insecure trust default.
     pub fn initClientWithVerifier(entropy: Entropy, verifier: PeerVerifier, profile: TransportProfile, options: ClientOptions) Tls13Backend {
+        return initClientWithVerifierConfigured(entropy, verifier, defaultConfigForTransport(profile), options);
+    }
+
+    pub fn initClientWithVerifierConfigured(entropy: Entropy, verifier: PeerVerifier, config: BackendConfig, options: ClientOptions) Tls13Backend {
         var self: Tls13Backend = .{
             .role = .client,
-            .profile = profile,
+            .profile = config.transport,
+            .policy = config.policy,
             .entropy = entropy,
             .external_verifier = verifier,
             .auth_policy = options.policy,
@@ -939,7 +882,7 @@ pub const Tls13Backend = struct {
     }
 
     pub fn alpn(self: *const Tls13Backend) []const u8 {
-        return self.profile.firstConfiguredAlpn();
+        return self.policy.firstAlpn();
     }
 
     fn setSelectedAlpn(self: *Tls13Backend, name: []const u8) void {
@@ -954,13 +897,20 @@ pub const Tls13Backend = struct {
         return if (self.selected_alpn_present) self.selected_alpn[0..self.selected_alpn_len] else null;
     }
 
-    fn selectedAlpnForAuth(self: *const Tls13Backend) []const u8 {
-        return self.selectedAlpn() orelse "";
+    fn negotiatedVersionCode(self: *const Tls13Backend) u16 {
+        return @intFromEnum(self.negotiated_version);
+    }
+
+    fn negotiatedCipherCode(self: *const Tls13Backend) u16 {
+        return @intFromEnum(self.negotiated_cipher_suite);
+    }
+
+    fn negotiatedGroupCode(self: *const Tls13Backend) u16 {
+        return @intFromEnum(self.negotiated_named_group);
     }
 
     pub fn setExtensionProfile(self: *Tls13Backend, extension_type: u16, local: []const u8) HandshakeError!void {
         const profile: TransportProfile = .{ .extension = .{
-            .alpn = self.profile.firstConfiguredAlpn(),
             .extension_type = extension_type,
             .local = local,
         } };
@@ -1037,6 +987,9 @@ pub const Tls13Backend = struct {
         crypto.secureZero(u8, &self.selected_alpn);
         self.selected_alpn_len = 0;
         self.selected_alpn_present = false;
+        self.negotiated_version = .tls13;
+        self.negotiated_cipher_suite = .tls_aes_128_gcm_sha256;
+        self.negotiated_named_group = .x25519;
         // `credential_failure` is intentionally *not* cleared: terminal cleanup
         // must preserve the underlying typed failure (#334). The external
         // provider/verifier vtables borrow caller storage; drop the references.
@@ -1135,6 +1088,7 @@ pub const Tls13Backend = struct {
         std.debug.assert(role == self.role);
         std.debug.assert(self.core.handshake_lifecycle == .idle);
         try self.profile.validate();
+        try self.validateNativePolicy();
         // A configured client server name that overflowed the bound is a caller
         // configuration error; fail closed before any lifecycle or transcript
         // advance rather than emitting SNI for a truncated (wrong) host.
@@ -1154,6 +1108,79 @@ pub const Tls13Backend = struct {
             },
             .server => {},
         }
+    }
+
+    fn validateNativePolicy(self: *const Tls13Backend) HandshakeError!void {
+        switch (self.policy.transport_mode) {
+            .record => if (self.profile != .record) return error.InvalidTransportProfile,
+            .quic => if (self.profile != .extension) return error.InvalidTransportProfile,
+        }
+        if (self.policy.protocol_versions.len == 0 or
+            self.policy.cipher_suites.len == 0 or
+            self.policy.named_groups.len == 0 or
+            self.policy.signature_schemes.len == 0)
+            return error.InvalidTransportProfile;
+
+        if (self.policy.protocol_versions.len > std.math.maxInt(u8) / 2) return error.InvalidTransportProfile;
+        if (self.policy.cipher_suites.len > std.math.maxInt(u16) / 2) return error.InvalidTransportProfile;
+        if (self.policy.named_groups.len > std.math.maxInt(u16) / 2) return error.InvalidTransportProfile;
+        if (self.policy.signature_schemes.len > std.math.maxInt(u16) / 2) return error.InvalidTransportProfile;
+
+        for (self.policy.protocol_versions, 0..) |version, i| {
+            if (version != .tls13) return error.InvalidTransportProfile;
+            if (containsEnum(tls_algorithms.ProtocolVersion, self.policy.protocol_versions[0..i], version)) return error.InvalidTransportProfile;
+        }
+        for (self.policy.cipher_suites, 0..) |cipher, i| {
+            if (cipher != .tls_aes_128_gcm_sha256) return error.InvalidTransportProfile;
+            if (containsEnum(tls_algorithms.CipherSuite, self.policy.cipher_suites[0..i], cipher)) return error.InvalidTransportProfile;
+        }
+        for (self.policy.named_groups, 0..) |group, i| {
+            if (group != .x25519) return error.InvalidTransportProfile;
+            if (containsEnum(tls_algorithms.NamedGroup, self.policy.named_groups[0..i], group)) return error.InvalidTransportProfile;
+        }
+        for (self.policy.signature_schemes, 0..) |scheme, i| {
+            switch (scheme) {
+                .ed25519, .ecdsa_secp256r1_sha256 => {},
+                else => return error.InvalidTransportProfile,
+            }
+            if (containsEnum(tls_algorithms.SignatureScheme, self.policy.signature_schemes[0..i], scheme)) return error.InvalidTransportProfile;
+        }
+        if (self.policy.alpn_protocols.len == 0 and !self.policy.allow_absent_alpn) return error.InvalidTransportProfile;
+        var alpn_total: usize = 0;
+        for (self.policy.alpn_protocols, 0..) |protocol, i| {
+            const name = protocol.bytes;
+            if (name.len == 0 or name.len > std.math.maxInt(u8)) return error.InvalidTransportProfile;
+            alpn_total = checkedAdd(alpn_total, 1 + name.len) catch return error.InvalidTransportProfile;
+            if (alpn_total > std.math.maxInt(u16) or alpn_total + 6 > max_message_len) return error.InvalidTransportProfile;
+            for (self.policy.alpn_protocols[0..i]) |prior| {
+                if (prior.eql(protocol)) return error.InvalidTransportProfile;
+            }
+        }
+        _ = try self.maxServerFlightPreflightLen();
+    }
+
+    fn containsEnum(comptime T: type, haystack: []const T, needle: T) bool {
+        for (haystack) |item| {
+            if (item == needle) return true;
+        }
+        return false;
+    }
+
+    fn maxServerFlightPreflightLen(self: *const Tls13Backend) HandshakeError!usize {
+        var len: usize = 0;
+        len = try checkedAdd(len, 1 + 3 + 2); // EncryptedExtensions header + extension vector length
+        if (self.policy.alpn_protocols.len > 0) {
+            len = try checkedAdd(len, try self.policyAlpnOfferEncodedLen());
+        }
+        if (self.profile.localExtension()) |payload| {
+            len = try checkedAdd(len, 2 + 2 + payload.len);
+        }
+        if (self.client_auth != .disabled) {
+            len = try checkedAdd(len, 1 + 3 + 1 + 2); // CertificateRequest header, empty context, extensions vector
+            len = try checkedAdd(len, 2 + 2 + 2 + 2 * self.policy.signature_schemes.len);
+        }
+        if (len > max_message_len) return error.InvalidTransportProfile;
+        return len;
     }
 
     fn receiveImpl(ptr: *anyopaque, level: EncryptionLevel, bytes: []const u8, sink: *EventSink) HandshakeError!void {
@@ -1287,6 +1314,34 @@ pub const Tls13Backend = struct {
         };
     }
 
+    fn mapNegotiationError(err: tls_negotiation.Error) HandshakeError {
+        return switch (err) {
+            error.MalformedHandshake,
+            error.MalformedExtension,
+            error.MissingCipherSuites,
+            error.OfferVectorTooLarge,
+            error.TooManyExtensions,
+            => error.MalformedHandshake,
+            error.HandshakeBufferOverflow => error.HandshakeBufferOverflow,
+            error.MissingSupportedVersions,
+            error.MissingExtension,
+            => error.MissingExtension,
+            error.UnsupportedProtocolVersion,
+            error.NoMutualCipherSuite,
+            error.NoMutualNamedGroup,
+            error.MissingKeyShare,
+            error.NoMutualSignatureScheme,
+            error.IllegalParameter,
+            error.DuplicateExtension,
+            => error.IllegalParameter,
+            error.NoMutualAlpn => error.AlpnMismatch,
+            error.MissingServerName => error.MissingExtension,
+            error.IncompleteHandshake,
+            error.MessageTooLarge,
+            => error.MalformedHandshake,
+        };
+    }
+
     fn onMessage(
         self: *Tls13Backend,
         message: tls_handshake_codec.Message,
@@ -1380,27 +1435,34 @@ pub const Tls13Backend = struct {
         try w.u16_(legacy_version);
         try w.bytes(&self.entropy.hello_random);
         try w.u8_(0); // legacy_session_id: this profile does not use compatibility mode
-        try w.u16_(2); // cipher_suites
-        try w.u16_(cipher_tls_aes_128_gcm_sha256);
+        try w.u16_(@intCast(2 * self.policy.cipher_suites.len)); // cipher_suites
+        for (self.policy.cipher_suites) |cipher_suite| {
+            try w.u16_(@intFromEnum(cipher_suite));
+        }
         try w.u8_(1); // legacy_compression_methods
         try w.u8_(0);
 
         const extensions_len = try w.reserve(2);
         try w.u16_(ext_supported_versions);
-        try w.u16_(3);
-        try w.u8_(2);
-        try w.u16_(tls13_version);
+        try w.u16_(@intCast(1 + 2 * self.policy.protocol_versions.len));
+        try w.u8_(@intCast(2 * self.policy.protocol_versions.len));
+        for (self.policy.protocol_versions) |version| {
+            try w.u16_(@intFromEnum(version));
+        }
 
         try w.u16_(ext_supported_groups);
-        try w.u16_(4);
-        try w.u16_(2);
-        try w.u16_(group_x25519);
+        try w.u16_(@intCast(2 + 2 * self.policy.named_groups.len));
+        try w.u16_(@intCast(2 * self.policy.named_groups.len));
+        for (self.policy.named_groups) |group| {
+            try w.u16_(@intFromEnum(group));
+        }
 
         try w.u16_(ext_signature_algorithms);
-        try w.u16_(6);
-        try w.u16_(4);
-        try w.u16_(sigalg_ed25519);
-        try w.u16_(sigalg_ecdsa_secp256r1_sha256);
+        try w.u16_(@intCast(2 + 2 * self.policy.signature_schemes.len));
+        try w.u16_(@intCast(2 * self.policy.signature_schemes.len));
+        for (self.policy.signature_schemes) |scheme| {
+            try w.u16_(@intFromEnum(scheme));
+        }
 
         try w.u16_(ext_key_share);
         try w.u16_(2 + 2 + 2 + X25519.public_length);
@@ -1409,7 +1471,7 @@ pub const Tls13Backend = struct {
         try w.u16_(X25519.public_length);
         try w.bytes(&key_pair.public_key);
 
-        try self.profile.writeAlpnOffer(&w);
+        try self.writePolicyAlpnOffer(&w);
 
         // server_name (RFC 6066): the configured intended host, so the server
         // can select on SNI and the same value reaches this side's verifier.
@@ -1552,14 +1614,14 @@ pub const Tls13Backend = struct {
     fn ticketEligibleToOffer(self: *const Tls13Backend, ticket: *const session.ClientTicketState, now_ms: i64) bool {
         const common = &ticket.common;
         if (common.isExpired(now_ms) or common.isNotYetValid(now_ms)) return false;
-        if (common.cipher_suite != .tls_aes_128_gcm_sha256) return false;
+        if (!self.policy.containsCipherSuite(common.cipher_suite)) return false;
         if (common.resumption_psk.slice().len != hash_len) return false;
         if (common.server_name) |*stored| {
             const intended = self.serverNameSlice() orelse return false;
             if (!stored.eqlIgnoreCase(intended)) return false;
         } else if (self.serverNameSlice() != null) return false;
         if (common.application_protocol) |*stored| {
-            if (!self.profile.containsAlpn(stored.slice())) return false;
+            if (!self.policy.containsAlpn(stored.slice())) return false;
         }
         // `common.transport_compat` is the *server's* transport snapshot
         // (stamped via `peerTransportCompat()` at issuance, from the
@@ -1594,14 +1656,14 @@ pub const Tls13Backend = struct {
         len = try checkedAdd(len, 2); // legacy_version
         len = try checkedAdd(len, 32); // random
         len = try checkedAdd(len, 1); // legacy_session_id
-        len = try checkedAdd(len, 2 + 2); // cipher_suites vector + one suite
+        len = try checkedAdd(len, 2 + 2 * self.policy.cipher_suites.len); // cipher_suites vector
         len = try checkedAdd(len, 1 + 1); // compression_methods vector + null
         len = try checkedAdd(len, 2); // extensions vector length
-        len = try checkedAdd(len, 2 + 2 + 3); // supported_versions
-        len = try checkedAdd(len, 2 + 2 + 4); // supported_groups
-        len = try checkedAdd(len, 2 + 2 + 6); // signature_algorithms
+        len = try checkedAdd(len, 2 + 2 + 1 + 2 * self.policy.protocol_versions.len); // supported_versions
+        len = try checkedAdd(len, 2 + 2 + 2 + 2 * self.policy.named_groups.len); // supported_groups
+        len = try checkedAdd(len, 2 + 2 + 2 + 2 * self.policy.signature_schemes.len); // signature_algorithms
         len = try checkedAdd(len, 2 + 2 + 2 + 2 + 2 + X25519.public_length); // key_share
-        len = try checkedAdd(len, try self.profile.alpnOfferEncodedLen());
+        len = try checkedAdd(len, try self.policyAlpnOfferEncodedLen());
         if (self.serverNameSlice()) |name| {
             len = try checkedAdd(len, 2 + 2 + 2 + 1 + 2 + name.len);
         }
@@ -1610,6 +1672,28 @@ pub const Tls13Backend = struct {
             len = try checkedAdd(len, 2 + 2 + payload.len);
         }
         return len;
+    }
+
+    fn writePolicyAlpnOffer(self: *const Tls13Backend, w: *Writer) HandshakeError!void {
+        if (self.policy.alpn_protocols.len == 0) return;
+        try w.u16_(ext_alpn);
+        const alpn_ext_len = try w.reserve(2);
+        const alpn_list_len = try w.reserve(2);
+        for (self.policy.alpn_protocols) |protocol| {
+            try w.u8_(@intCast(protocol.bytes.len));
+            try w.bytes(protocol.bytes);
+        }
+        w.patch(2, alpn_list_len);
+        w.patch(2, alpn_ext_len);
+    }
+
+    fn policyAlpnOfferEncodedLen(self: *const Tls13Backend) HandshakeError!usize {
+        if (self.policy.alpn_protocols.len == 0) return 0;
+        var list_len: usize = 0;
+        for (self.policy.alpn_protocols) |protocol| {
+            list_len = try checkedAdd(list_len, 1 + protocol.bytes.len);
+        }
+        return try checkedAdd(6, list_len);
     }
 
     fn onServerHello(self: *Tls13Backend, body: []const u8, sink: *EventSink) HandshakeError!void {
@@ -1628,10 +1712,11 @@ pub const Tls13Backend = struct {
         if (std.mem.eql(u8, random, &hello_retry_request_random)) return error.IllegalParameter;
         const session_id_len = try r.u8_();
         _ = try r.slice(session_id_len);
-        if (try r.u16_() != cipher_tls_aes_128_gcm_sha256) return error.IllegalParameter;
+        const selected_cipher = tls_algorithms.fromInt(tls_algorithms.CipherSuite, try r.u16_()) orelse return error.IllegalParameter;
         if (try r.u8_() != 0) return error.IllegalParameter;
 
-        var selected_version: ?u16 = null;
+        var selected_version: ?tls_algorithms.ProtocolVersion = null;
+        var selected_group: ?tls_algorithms.NamedGroup = null;
         var peer_share: ?[X25519.public_length]u8 = null;
         var selected_identity: ?u16 = null;
         var guard = ExtensionGuard{};
@@ -1642,11 +1727,15 @@ pub const Tls13Backend = struct {
             try guard.check(ext_id);
             var ext = Reader{ .bytes = try extensions.slice(try extensions.u16_()) };
             switch (ext_id) {
-                ext_supported_versions => selected_version = try ext.u16_(),
+                ext_supported_versions => {
+                    selected_version = tls_algorithms.fromInt(tls_algorithms.ProtocolVersion, try ext.u16_()) orelse return error.IllegalParameter;
+                    try ext.expectEnd();
+                },
                 ext_key_share => {
-                    if (try ext.u16_() != group_x25519) return error.IllegalParameter;
+                    const group = tls_algorithms.fromInt(tls_algorithms.NamedGroup, try ext.u16_()) orelse return error.IllegalParameter;
                     if (try ext.u16_() != X25519.public_length) return error.IllegalParameter;
                     peer_share = (try ext.slice(X25519.public_length))[0..X25519.public_length].*;
+                    selected_group = group;
                     try ext.expectEnd();
                 },
                 pre_shared_key.ext_pre_shared_key => {
@@ -1656,7 +1745,18 @@ pub const Tls13Backend = struct {
                 else => {},
             }
         }
-        if (selected_version != tls13_version) return error.IllegalParameter;
+        const protocol_version = selected_version orelse return error.MissingExtension;
+        const named_group = selected_group orelse return error.MalformedHandshake;
+        tls_negotiation.validateServerHelloTuple(self.policy, .{
+            .version = protocol_version,
+            .cipher_suite = selected_cipher,
+            .named_group = named_group,
+            .alpn = null,
+        }) catch |err| return mapNegotiationError(err);
+        if (selected_cipher != .tls_aes_128_gcm_sha256 or named_group != .x25519 or protocol_version != .tls13) return error.IllegalParameter;
+        self.negotiated_version = protocol_version;
+        self.negotiated_cipher_suite = selected_cipher;
+        self.negotiated_named_group = named_group;
         const share = peer_share orelse return error.MalformedHandshake;
 
         // A low-order/identity peer share is a well-formed 32-byte field with an
@@ -1733,7 +1833,7 @@ pub const Tls13Backend = struct {
                     const name = try list.slice(name_len);
                     // The server selects exactly one protocol (RFC 7301 §3.1).
                     try list.expectEnd();
-                    if (!self.profile.containsAlpn(name)) return error.AlpnMismatch;
+                    if (!self.policy.containsAlpn(name)) return error.AlpnMismatch;
                     self.setSelectedAlpn(name);
                     alpn_seen = true;
                     try sink.emitAlpn(name);
@@ -1748,7 +1848,13 @@ pub const Tls13Backend = struct {
                 },
             }
         }
-        if (!alpn_seen and !self.profile.allowAbsentAlpn()) return error.AlpnMismatch;
+        if (!alpn_seen and !self.policy.allow_absent_alpn) return error.AlpnMismatch;
+        tls_negotiation.validateServerSelection(self.policy, .{
+            .version = self.negotiated_version,
+            .cipher_suite = self.negotiated_cipher_suite,
+            .named_group = self.negotiated_named_group,
+            .alpn = if (self.selectedAlpn()) |protocol| .{ .bytes = protocol } else null,
+        }) catch |err| return mapNegotiationError(err);
         if (self.profile.extensionType() != null and !transport_extension_seen) return error.MissingTransportExtension;
 
         // #362: a PSK-resumed connection has no Certificate message from
@@ -1902,9 +2008,9 @@ pub const Tls13Backend = struct {
             .role = .server,
             .server_name = self.serverNameSlice(),
             .peer_signature_schemes = self.peer_sig_schemes[0..self.peer_sig_scheme_count],
-            .negotiated_version = tls13_version,
-            .cipher_suite = cipher_tls_aes_128_gcm_sha256,
-            .application_protocol = self.selectedAlpnForAuth(),
+            .negotiated_version = self.negotiatedVersionCode(),
+            .cipher_suite = self.negotiatedCipherCode(),
+            .application_protocol = self.selectedAlpn(),
             .auth_policy = self.auth_policy,
         };
     }
@@ -1953,9 +2059,9 @@ pub const Tls13Backend = struct {
             .role = self.role,
             .server_name = self.serverNameSlice(),
             .chain = self.peerChainView(&views),
-            .negotiated_version = tls13_version,
-            .cipher_suite = cipher_tls_aes_128_gcm_sha256,
-            .application_protocol = self.selectedAlpnForAuth(),
+            .negotiated_version = self.negotiatedVersionCode(),
+            .cipher_suite = self.negotiatedCipherCode(),
+            .application_protocol = self.selectedAlpn(),
             .auth_policy = self.auth_policy,
         };
         // The verifier may resolve synchronously or return a pending operation
@@ -2001,15 +2107,16 @@ pub const Tls13Backend = struct {
         unoffered_algorithm,
     };
 
-    fn locallyOfferedSignatureAlgorithm(algorithm: u16) bool {
-        return algorithm == sigalg_ed25519 or algorithm == sigalg_ecdsa_secp256r1_sha256;
+    fn locallyOfferedSignatureAlgorithm(self: *const Tls13Backend, algorithm: u16) bool {
+        const scheme = tls_algorithms.fromInt(tls_algorithms.SignatureScheme, algorithm) orelse return false;
+        return self.policy.containsSignatureScheme(scheme);
     }
 
     /// Verify the CertificateVerify signature against the peer leaf's public
     /// key: proof that the peer holds the private key for the presented
     /// certificate. This is not a trust decision — that is the verifier's job.
     fn checkProofOfPossession(self: *const Tls13Backend, algorithm: u16, signature: []const u8, content: []const u8) ProofResult {
-        if (!locallyOfferedSignatureAlgorithm(algorithm)) return .unoffered_algorithm;
+        if (!self.locallyOfferedSignatureAlgorithm(algorithm)) return .unoffered_algorithm;
         if (self.peer_chain_count == 0) return .invalid_certificate;
         const e = self.peer_chain_entries[0];
         const leaf = self.peer_chain[e.start..][0..e.len];
@@ -2109,9 +2216,9 @@ pub const Tls13Backend = struct {
             .role = .client,
             .server_name = self.serverNameSlice(),
             .peer_signature_schemes = self.peer_sig_schemes[0..self.peer_sig_scheme_count],
-            .negotiated_version = tls13_version,
-            .cipher_suite = cipher_tls_aes_128_gcm_sha256,
-            .application_protocol = self.selectedAlpnForAuth(),
+            .negotiated_version = self.negotiatedVersionCode(),
+            .cipher_suite = self.negotiatedCipherCode(),
+            .application_protocol = self.selectedAlpn(),
             .auth_policy = self.auth_policy,
         };
     }
@@ -2125,7 +2232,7 @@ pub const Tls13Backend = struct {
     fn beginClientAuthFlight(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
         self.core.beginClientCertificateFlight();
         const provider = self.external_provider orelse
-            return self.emitClientCertificate(null, sink);
+            return self.emitClientCertificate(null, certificate_message_overhead, sink);
         var selection = self.clientSelectionContext();
         // A provider that deterministically has no usable credential is not a
         // failure: TLS 1.3 requires the client to answer a CertificateRequest
@@ -2135,7 +2242,7 @@ pub const Tls13Backend = struct {
         const progress = provider.selectCredential(&selection) catch |err| switch (err) {
             error.NoCredentialAvailable,
             error.NoCompatibleSignatureAlgorithm,
-            => return self.emitClientCertificate(null, sink),
+            => return self.emitClientCertificate(null, certificate_message_overhead, sink),
             else => return self.failCredential(credentials.classifySelectError(err)),
         };
         switch (progress) {
@@ -2149,13 +2256,9 @@ pub const Tls13Backend = struct {
     fn emitSelectedClientCertificate(self: *Tls13Backend, credential: credentials.SelectedCredential, sink: *EventSink) HandshakeError!void {
         var owned = true;
         errdefer if (owned) credential.release();
-        // The provider must return a scheme the server actually offered, else
-        // the CertificateVerify would carry an unadvertised algorithm.
-        const selection = self.clientSelectionContext();
-        if (!selection.offersScheme(credential.scheme))
-            return self.failCredential(.invalid_callback_behavior);
+        const credential_info = try self.inspectSelectedCredential(credential);
         owned = false; // ownership passes to emitClientCertificate
-        return self.emitClientCertificate(credential, sink);
+        return self.emitClientCertificate(credential, credential_info.certificate_message_len, sink);
     }
 
     /// Emit the client Certificate (the credential's validated chain, or an
@@ -2163,34 +2266,15 @@ pub const Tls13Backend = struct {
     /// synchronously, or by parking a pending signer (`client_sign`). Owns the
     /// credential handle and releases it exactly once on any failure before
     /// ownership passes on.
-    fn emitClientCertificate(self: *Tls13Backend, credential: ?credentials.SelectedCredential, sink: *EventSink) HandshakeError!void {
+    fn emitClientCertificate(
+        self: *Tls13Backend,
+        credential: ?credentials.SelectedCredential,
+        certificate_message_len: usize,
+        sink: *EventSink,
+    ) HandshakeError!void {
         var owned = credential != null;
         errdefer if (owned) if (credential) |c| c.release();
-
-        // Validate the credential's chain and its exact encoded size up front,
-        // before any transcript mutation (`recordSent`) or output emission, so a
-        // credential that cannot be serialized within bounds fails closed rather
-        // than being partially recorded or emitted.
-        if (credential) |c| {
-            const chain = c.certificateChain();
-            if (chain.count() == 0 or chain.count() > credentials.max_chain_entries)
-                return self.failCredential(.malformed_credential_chain);
-            // The Certificate message's own framing must be counted too:
-            // 1-byte type + 3-byte length + 1-byte request context + 3-byte
-            // CertificateList length. Omitting it lets a chain that fits the
-            // entry sum overflow the writer after the message header is added.
-            var encoded_len: usize = certificate_message_overhead;
-            for (chain.entries) |entry| {
-                if (entry.len == 0 or entry.len > max_certificate_len)
-                    return self.failCredential(.malformed_credential_chain);
-                // CertificateEntry overhead: 3-byte cert_data length + 2-byte
-                // extensions length.
-                encoded_len = std.math.add(usize, encoded_len, entry.len + 5) catch
-                    return self.failCredential(.malformed_credential_chain);
-                if (encoded_len > max_message_len)
-                    return self.failCredential(.malformed_credential_chain);
-            }
-        }
+        if (certificate_message_len > max_message_len) return self.failCredential(.malformed_credential_chain);
 
         var buf: [max_message_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
@@ -2276,23 +2360,6 @@ pub const Tls13Backend = struct {
 
     fn onClientHello(self: *Tls13Backend, raw: []const u8, sink: *EventSink) HandshakeError!void {
         const body = raw[handshake_header_len..];
-        var r = Reader{ .bytes = body };
-        if (try r.u16_() != legacy_version) return error.IllegalParameter;
-        _ = try r.slice(32); // client random (already covered by the transcript)
-        const session_id = try r.slice(try r.u8_());
-
-        var offers_cipher = false;
-        var ciphers = Reader{ .bytes = try r.slice(try r.u16_()) };
-        while (ciphers.remaining() > 0) {
-            if (try ciphers.u16_() == cipher_tls_aes_128_gcm_sha256) offers_cipher = true;
-        }
-        var offers_null_compression = false;
-        var compressions = Reader{ .bytes = try r.slice(try r.u8_()) };
-        while (compressions.remaining() > 0) {
-            if (try compressions.u8_() == 0) offers_null_compression = true;
-        }
-        if (!offers_cipher or !offers_null_compression) return error.MalformedHandshake;
-
         // A server needs a credential source: the fixed identity or an external
         // provider. Which signature scheme is usable is decided later by
         // credential selection against the peer's advertised algorithms.
@@ -2300,149 +2367,81 @@ pub const Tls13Backend = struct {
         self.peer_sig_scheme_count = 0;
         self.server_name_present = false;
         self.server_name_len = 0;
-        var offers_tls13 = false;
-        var offers_x25519_group = false;
-        var saw_signature_algorithms = false;
-        var peer_share: ?[X25519.public_length]u8 = null;
-        var alpn_offered = false;
-        var selected_alpn: ?[]const u8 = null;
-        var selected_alpn_preference: usize = std.math.maxInt(usize);
-        var transport_params: ?[]const u8 = null;
-        var psk_modes_seen = false;
-        var psk_dhe_ke_offered = false;
-        var psk_ext: ?struct { offset: usize, len: usize } = null;
 
-        var guard = ExtensionGuard{};
-        var extensions = Reader{ .bytes = try r.slice(try r.u16_()) };
-        try r.expectEnd();
-        while (extensions.remaining() > 0) {
-            const ext_id = try extensions.u16_();
-            try guard.check(ext_id);
-            var ext = Reader{ .bytes = try extensions.slice(try extensions.u16_()) };
-            switch (ext_id) {
-                ext_supported_versions => {
-                    var versions = Reader{ .bytes = try ext.slice(try ext.u8_()) };
-                    while (versions.remaining() > 0) {
-                        if (try versions.u16_() == tls13_version) offers_tls13 = true;
-                    }
-                },
-                ext_supported_groups => {
-                    var groups = Reader{ .bytes = try ext.slice(try ext.u16_()) };
-                    while (groups.remaining() > 0) {
-                        if (try groups.u16_() == group_x25519) offers_x25519_group = true;
-                    }
-                },
-                ext_signature_algorithms => {
-                    saw_signature_algorithms = true;
-                    var algorithms = Reader{ .bytes = try ext.slice(try ext.u16_()) };
-                    // Preserve the peer's *complete* offer in order — truncating
-                    // it would silently turn a compatible scheme in a high slot
-                    // into a false local "no compatible credential". If the offer
-                    // is larger than our bounded vector, fail rather than lie to
-                    // the selector about what the peer supports.
-                    while (algorithms.remaining() > 0) {
-                        const scheme = try algorithms.u16_();
-                        if (self.peer_sig_scheme_count >= self.peer_sig_schemes.len) return error.MalformedHandshake;
-                        self.peer_sig_schemes[self.peer_sig_scheme_count] = scheme;
-                        self.peer_sig_scheme_count += 1;
-                    }
-                    try ext.expectEnd();
-                },
-                ext_server_name => {
-                    // RFC 6066 §3: ServerNameList<1..>, each { name_type, name<..> }.
-                    // Distinguish absent (no extension / no host_name) from valid
-                    // and from malformed: an empty, over-bound, or duplicated
-                    // host_name is rejected deterministically rather than being
-                    // collapsed into the default-certificate path, so a selector
-                    // never serves the default cert for an invalid SNI.
-                    const list_len = try ext.u16_();
-                    // RFC 6066 §3: ServerNameList<1..2^16-1> — an empty list is
-                    // malformed, not "no host_name present"; accepting it would
-                    // silently route to the default credential exactly like the
-                    // metadata-collapse behavior this parser otherwise rejects.
-                    if (list_len == 0) return error.IllegalParameter;
-                    var names = Reader{ .bytes = try ext.slice(list_len) };
-                    while (names.remaining() > 0) {
-                        const name_type = try names.u8_();
-                        const name = try names.slice(try names.u16_());
-                        if (name_type != 0) continue; // only host_name is defined
-                        // RFC 6066: a given name_type must appear at most once.
-                        if (self.server_name_present) return error.IllegalParameter;
-                        if (name.len == 0 or name.len > self.server_name.len) return error.IllegalParameter;
-                        dns_name.validateHostName(name) catch return error.IllegalParameter;
-                        @memcpy(self.server_name[0..name.len], name);
-                        self.server_name_len = name.len;
-                        self.server_name_present = true;
-                    }
-                    try ext.expectEnd();
-                },
-                ext_key_share => {
-                    var shares = Reader{ .bytes = try ext.slice(try ext.u16_()) };
-                    while (shares.remaining() > 0) {
-                        const group = try shares.u16_();
-                        const share = try shares.slice(try shares.u16_());
-                        if (group == group_x25519 and share.len == X25519.public_length) {
-                            peer_share = share[0..X25519.public_length].*;
-                        }
-                    }
-                },
-                ext_alpn => {
-                    const list_len = try ext.u16_();
-                    if (list_len == 0) return error.MalformedHandshake;
-                    var list = Reader{ .bytes = try ext.slice(list_len) };
-                    try ext.expectEnd();
-                    while (list.remaining() > 0) {
-                        const name_len = try list.u8_();
-                        if (name_len == 0) return error.MalformedHandshake;
-                        const name = try list.slice(name_len);
-                        alpn_offered = true;
-                        if (self.profile.alpnPreference(name)) |preference| {
-                            if (preference >= selected_alpn_preference) continue;
-                            selected_alpn = name;
-                            selected_alpn_preference = preference;
-                        }
-                    }
-                    try list.expectEnd();
-                },
-                pre_shared_key.ext_psk_key_exchange_modes => {
-                    psk_dhe_ke_offered = pre_shared_key.hasMode(ext.bytes, .psk_dhe_ke) catch |err| return mapPskReadError(err);
-                    psk_modes_seen = true;
-                },
-                pre_shared_key.ext_pre_shared_key => {
-                    // RFC 8446 §4.2.11: pre_shared_key must be the last
-                    // ClientHello extension. `extensions` has already
-                    // consumed this entry's bytes above, so "nothing left"
-                    // here means it truly was last.
-                    if (extensions.remaining() != 0) return error.IllegalParameter;
-                    _ = pre_shared_key.OfferedPsks.parse(ext.bytes) catch |err| return mapPskReadError(err);
-                    psk_ext = .{ .offset = @intFromPtr(ext.bytes.ptr) - @intFromPtr(raw.ptr), .len = ext.bytes.len };
-                },
-                else => {
-                    if (self.profile.extensionType()) |expected_type| {
-                        if (expected_type == ext_id) transport_params = ext.bytes;
-                    }
-                },
+        const ClientHelloObserver = struct {
+            transport_extension_type: ?u16,
+            transport_params: ?[]const u8 = null,
+            psk_modes_seen: bool = false,
+            psk_dhe_ke_offered: bool = false,
+            psk_ext: ?struct { body_offset: usize, len: usize } = null,
+
+            fn observe(ctx: *anyopaque, observation: tls_negotiation.ExtensionObservation) tls_negotiation.Error!void {
+                const self_obs: *@This() = @ptrCast(@alignCast(ctx));
+                switch (observation.id) {
+                    pre_shared_key.ext_psk_key_exchange_modes => {
+                        self_obs.psk_dhe_ke_offered = pre_shared_key.hasMode(observation.data, .psk_dhe_ke) catch
+                            return error.MalformedExtension;
+                        self_obs.psk_modes_seen = true;
+                    },
+                    pre_shared_key.ext_pre_shared_key => {
+                        if (!observation.is_last) return error.IllegalParameter;
+                        _ = pre_shared_key.OfferedPsks.parse(observation.data) catch |err| switch (err) {
+                            error.CountMismatch => return error.IllegalParameter,
+                            else => return error.MalformedExtension,
+                        };
+                        self_obs.psk_ext = .{
+                            .body_offset = observation.data_offset_in_body,
+                            .len = observation.data.len,
+                        };
+                    },
+                    else => if (self_obs.transport_extension_type) |expected_type| {
+                        if (expected_type == observation.id) self_obs.transport_params = observation.data;
+                    },
+                }
             }
-        }
-        if (!offers_tls13 or !offers_x25519_group) return error.MalformedHandshake;
-        if (psk_ext != null and !psk_modes_seen) return error.MissingExtension;
+        };
+
+        var observer = ClientHelloObserver{ .transport_extension_type = self.profile.extensionType() };
+        const parsed = tls_negotiation.parseClientHelloObserved(body, .{
+            .ctx = &observer,
+            .observeFn = ClientHelloObserver.observe,
+        }) catch |err| return mapNegotiationError(err);
+        const offers = parsed.offers;
+        const hello_selection = tls_negotiation.negotiateServerHello(self.policy, &offers) catch |err| return mapNegotiationError(err);
+        if (observer.psk_ext != null and !observer.psk_modes_seen) return error.MissingExtension;
         // signature_algorithms is required whenever the server authenticates
         // with a certificate (RFC 8446 §9.2). A missing or empty list is a
         // malformed/missing required *peer* extension — attribute it to the
         // peer (decode_error), not to local credential configuration.
-        if (!saw_signature_algorithms) return error.MissingExtension;
-        if (self.peer_sig_scheme_count == 0) return error.MalformedHandshake;
-        const client_share = peer_share orelse return error.MalformedHandshake;
+        if (offers.raw_signature_schemes_len == 0) return error.MissingExtension;
+        if (offers.raw_signature_schemes_len > self.peer_sig_schemes.len) return error.MalformedHandshake;
+        @memcpy(self.peer_sig_schemes[0..offers.raw_signature_schemes_len], offers.raw_signature_schemes[0..offers.raw_signature_schemes_len]);
+        self.peer_sig_scheme_count = offers.raw_signature_schemes_len;
+        if (hello_selection.key_share.len != X25519.public_length) return error.MalformedHandshake;
+        const client_share = hello_selection.key_share[0..X25519.public_length].*;
+        if (hello_selection.cipher_suite != .tls_aes_128_gcm_sha256 or
+            hello_selection.named_group != .x25519 or
+            hello_selection.version != .tls13)
+            return error.IllegalParameter;
+        self.negotiated_version = hello_selection.version;
+        self.negotiated_cipher_suite = hello_selection.cipher_suite;
+        self.negotiated_named_group = hello_selection.named_group;
 
-        if (selected_alpn) |protocol| {
-            self.setSelectedAlpn(protocol);
-        } else if (alpn_offered or !self.profile.allowAbsentAlpn()) {
+        if (hello_selection.alpn) |protocol| {
+            self.setSelectedAlpn(protocol.bytes);
+        } else if (!self.policy.allow_absent_alpn) {
             self.core.handshake_lifecycle = .failed;
             return error.AlpnMismatch;
         }
         if (self.profile.extensionType() != null) {
-            const extension = transport_params orelse return error.MissingTransportExtension;
+            const extension = observer.transport_params orelse return error.MissingTransportExtension;
             try self.capturePeerTransportExtension(extension);
+        }
+        if (hello_selection.server_name) |name| {
+            if (name.len > self.server_name.len) return error.IllegalParameter;
+            @memcpy(self.server_name[0..name.len], name);
+            self.server_name_len = name.len;
+            self.server_name_present = true;
         }
 
         // #362: the PSK-bearing ClientHello is captured only once every
@@ -2452,16 +2451,16 @@ pub const Tls13Backend = struct {
         // can never leave a captured bearer ticket identity sitting in
         // `client_hello_psk` past this call.
         self.clearClientHelloPsk();
-        if (psk_ext) |info| {
+        if (observer.psk_ext) |info| {
             var capture: ClientHelloPskCapture = .{};
             if (raw.len > capture.message.len) return error.MalformedHandshake;
             @memcpy(capture.message[0..raw.len], raw);
             capture.message_len = raw.len;
-            capture.ext_data_offset = info.offset;
+            capture.ext_data_offset = handshake_header_len + info.body_offset;
             capture.ext_data_len = info.len;
             self.client_hello_psk = capture;
             self.offered_psk_modes_seen = true;
-            self.offered_psk_dhe_ke = psk_dhe_ke_offered;
+            self.offered_psk_dhe_ke = observer.psk_dhe_ke_offered;
         }
         // Covers every synchronous failure from here on (a bad session_id,
         // a synchronous credential-selection failure); a no-op once
@@ -2470,7 +2469,7 @@ pub const Tls13Backend = struct {
         // — the capture must survive for the async resume.
         errdefer self.clearClientHelloPsk();
 
-        try self.beginServerSelection(session_id, client_share, sink);
+        try self.beginServerSelection(parsed.legacy_session_id, client_share, sink);
     }
 
     fn beginServerSelection(
@@ -2561,15 +2560,15 @@ pub const Tls13Backend = struct {
         try hello.bytes(&self.entropy.hello_random);
         try hello.u8_(@intCast(session_id.len)); // echo legacy_session_id
         try hello.bytes(session_id);
-        try hello.u16_(cipher_tls_aes_128_gcm_sha256);
+        try hello.u16_(self.negotiatedCipherCode());
         try hello.u8_(0);
         const hello_extensions = try hello.reserve(2);
         try hello.u16_(ext_supported_versions);
         try hello.u16_(2);
-        try hello.u16_(tls13_version);
+        try hello.u16_(self.negotiatedVersionCode());
         try hello.u16_(ext_key_share);
         try hello.u16_(2 + 2 + X25519.public_length);
-        try hello.u16_(group_x25519);
+        try hello.u16_(self.negotiatedGroupCode());
         try hello.u16_(X25519.public_length);
         try hello.bytes(&key_pair.public_key);
         if (psk_selected) |sel| {
@@ -2646,7 +2645,7 @@ pub const Tls13Backend = struct {
             if (!found) continue;
 
             const candidate_ctx: session.CandidateContext = .{
-                .cipher_suite = .tls_aes_128_gcm_sha256,
+                .cipher_suite = self.negotiated_cipher_suite,
                 .server_name = self.serverNameSlice(),
                 .application_protocol = self.selectedAlpn(),
                 .auth_binding = current_binding,
@@ -2801,10 +2800,11 @@ pub const Tls13Backend = struct {
             try w.u8_(0); // certificate_request_context<0..255>: empty
             const cr_exts = try w.reserve(2);
             try w.u16_(ext_signature_algorithms);
-            try w.u16_(2 + 2 * 2); // extension_data length
-            try w.u16_(2 * 2); // supported_signature_algorithms list length
-            try w.u16_(sigalg_ed25519);
-            try w.u16_(sigalg_ecdsa_secp256r1_sha256);
+            try w.u16_(@intCast(2 + 2 * self.policy.signature_schemes.len)); // extension_data length
+            try w.u16_(@intCast(2 * self.policy.signature_schemes.len)); // supported_signature_algorithms list length
+            for (self.policy.signature_schemes) |scheme| {
+                try w.u16_(@intFromEnum(scheme));
+            }
             w.patch(2, cr_exts);
             w.patch(3, cr_len);
             certificate_request = buf[cr_start..w.len];
@@ -3040,7 +3040,7 @@ pub const Tls13Backend = struct {
                 .credential => |c| return self.emitSelectedClientCertificate(c, sink),
                 // A selector that resolved to "no credential" declines with an
                 // empty Certificate, exactly like the synchronous path.
-                .no_credential => return self.emitClientCertificate(null, sink),
+                .no_credential => return self.emitClientCertificate(null, certificate_message_overhead, sink),
                 else => {
                     releaseCompletionCredentials(completion, null);
                     return self.failCredential(.invalid_callback_behavior);
@@ -3190,7 +3190,7 @@ pub const Tls13Backend = struct {
 
     fn resumptionContext(self: *const Tls13Backend) new_session_ticket.ConnectionResumptionContext {
         return .{
-            .cipher_suite = tls_algorithms.CipherSuite.tls_aes_128_gcm_sha256,
+            .cipher_suite = self.negotiated_cipher_suite,
             .server_name = if (self.server_name_present) self.server_name[0..self.server_name_len] else null,
             .application_protocol = self.selectedAlpn(),
             .auth_binding = self.effectiveAuthBinding(),
@@ -3224,6 +3224,14 @@ pub const Tls13Backend = struct {
         return self.connection_auth_binding orelse self.peerAuthBinding();
     }
 
+    pub const SelectedCredentialInfo = struct {
+        /// The exact encoded Certificate message length this chain would
+        /// produce (`certificate_message_overhead` + each entry's
+        /// `certificate_entry_overhead`-framed size) — reused by
+        /// flight emission preflight instead of recomputing it.
+        certificate_message_len: usize,
+    };
+
     /// Server (#362): validates the credential selection already performed
     /// for this ClientHello — the same checks `emitServerAuthFlight` applies
     /// before signing — and returns the binding for the server's *own*
@@ -3233,13 +3241,57 @@ pub const Tls13Backend = struct {
     /// peer chain.
     pub const SelectedServerCredentialInfo = struct {
         binding: session.AuthBinding,
-        /// The exact encoded Certificate message length this chain would
-        /// produce (`certificate_message_overhead` + each entry's
-        /// `certificate_entry_overhead`-framed size) — reused by
-        /// `emitServerAuthFlight`'s own flight-size preflight instead of
-        /// recomputing it.
         certificate_message_len: usize,
     };
+
+    fn leafSupportsSignatureScheme(der: []const u8, scheme: credentials.SignatureScheme) HandshakeError!bool {
+        const parsed = (Certificate{ .buffer = der, .index = 0 }).parse() catch
+            return error.MalformedHandshake;
+        return switch (scheme) {
+            .ed25519 => parsed.pub_key_algo == .curveEd25519,
+            .ecdsa_secp256r1_sha256 => switch (parsed.pub_key_algo) {
+                .X9_62_id_ecPublicKey => |curve| curve == .X9_62_prime256v1,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    /// Complete local-provider contract validation for a selected credential,
+    /// shared by server authentication and handshake-time client authentication.
+    /// This runs before transcript mutation or output emission so callback
+    /// violations fail locally without sending a Certificate flight.
+    fn inspectSelectedCredential(
+        self: *Tls13Backend,
+        credential: credentials.SelectedCredential,
+    ) HandshakeError!SelectedCredentialInfo {
+        const selected = tls_algorithms.fromInt(tls_algorithms.SignatureScheme, credential.scheme.code()) orelse
+            return self.failCredential(.invalid_callback_behavior);
+        tls_negotiation.validateCredentialSignature(
+            self.policy,
+            self.peer_sig_schemes[0..self.peer_sig_scheme_count],
+            selected,
+        ) catch return self.failCredential(.invalid_callback_behavior);
+
+        const chain = credential.certificateChain();
+        if (chain.count() == 0 or chain.count() > credentials.max_chain_entries)
+            return self.failCredential(.malformed_credential_chain);
+        if (!(leafSupportsSignatureScheme(chain.entries[0], credential.scheme) catch
+            return self.failCredential(.malformed_credential_chain)))
+            return self.failCredential(.invalid_callback_behavior);
+
+        var certificate_message_len: usize = certificate_message_overhead;
+        for (chain.entries) |entry| {
+            if (entry.len == 0 or entry.len > max_certificate_len)
+                return self.failCredential(.malformed_credential_chain);
+            certificate_message_len = std.math.add(usize, certificate_message_len, entry.len + certificate_entry_overhead) catch
+                return self.failCredential(.malformed_credential_chain);
+            if (certificate_message_len > max_message_len)
+                return self.failCredential(.malformed_credential_chain);
+        }
+
+        return .{ .certificate_message_len = certificate_message_len };
+    }
 
     /// Complete validation of the credential selection already performed
     /// for this ClientHello — every chain entry, not just the leaf, and the
@@ -3252,26 +3304,11 @@ pub const Tls13Backend = struct {
         self: *Tls13Backend,
         credential: credentials.SelectedCredential,
     ) HandshakeError!SelectedServerCredentialInfo {
-        const selection = self.serverSelectionContext();
-        if (!selection.offersScheme(credential.scheme))
-            return self.failCredential(.invalid_callback_behavior);
+        const credential_info = try self.inspectSelectedCredential(credential);
         const chain = credential.certificateChain();
-        if (chain.count() == 0 or chain.count() > credentials.max_chain_entries)
-            return self.failCredential(.malformed_credential_chain);
-
-        var certificate_message_len: usize = certificate_message_overhead;
-        for (chain.entries) |entry| {
-            if (entry.len == 0 or entry.len > max_certificate_len)
-                return self.failCredential(.malformed_credential_chain);
-            certificate_message_len = std.math.add(usize, certificate_message_len, entry.len + certificate_entry_overhead) catch
-                return self.failCredential(.malformed_credential_chain);
-            if (certificate_message_len > max_message_len)
-                return self.failCredential(.malformed_credential_chain);
-        }
-
         return .{
             .binding = session.AuthBinding.fromLeafCertificateDer(chain.entries[0]),
-            .certificate_message_len = certificate_message_len,
+            .certificate_message_len = credential_info.certificate_message_len,
         };
     }
 
@@ -3519,7 +3556,7 @@ test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
     var backend = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x41} ** 32, .key_share_seed = [_]u8{0x42} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     backend.core.transcript.update("transcript-adjacent state");
     @memset(&backend.expected_client_verify, 0xa5);
@@ -3541,17 +3578,21 @@ test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
 
 test "transport profile validation fails before lifecycle or transcript advance" {
     const entropy = Entropy{ .hello_random = [_]u8{0x41} ** 32, .key_share_seed = [_]u8{0x42} ** 32 };
-    const invalid_alpn_policies = [_]AlpnPolicy{
-        .{ .protocols = &.{""} },
-        .{ .protocols = &.{&([_]u8{'a'} ** 256)} },
-        .{ .protocols = &.{ "h2", "h2" } },
-        .{ .protocols = &.{} },
+    const oversized_alpn = [_]u8{'a'} ** 256;
+    const invalid_alpn_sets = [_][]const tls_algorithms.ProtocolName{
+        &.{.{ .bytes = "" }},
+        &.{.{ .bytes = &oversized_alpn }},
+        &.{ .{ .bytes = "h2" }, .{ .bytes = "h2" } },
+        &.{},
     };
-    for (invalid_alpn_policies) |alpn_policy| {
-        var backend = Tls13Backend.initClient(
+    for (invalid_alpn_sets) |alpns| {
+        var policy = tls_policy.Policy.recordH2Only();
+        policy.alpn_protocols = alpns;
+        var backend = Tls13Backend.initClientConfigured(
             entropy,
             .{ .pinned_certificate = testdata.certificate_der },
-            .{ .record = .{ .alpn = alpn_policy } },
+            recordConfig(policy),
+            .{},
         );
         var sink = EventSink{};
         defer sink.deinit();
@@ -3570,7 +3611,19 @@ test "transport profile validation fails before lifecycle or transcript advance"
         name[0] = @intCast(i);
         names[i] = name[0..];
     }
-    try std.testing.expectError(error.InvalidTransportProfile, (AlpnPolicy{ .protocols = &names }).validate());
+    var too_large_policy = tls_policy.Policy.recordDefault();
+    var too_large_alpns: [names.len]tls_algorithms.ProtocolName = undefined;
+    for (names, 0..) |name, i| too_large_alpns[i] = .{ .bytes = name };
+    too_large_policy.alpn_protocols = &too_large_alpns;
+    var too_large_backend = Tls13Backend.initClientConfigured(
+        entropy,
+        .{ .pinned_certificate = testdata.certificate_der },
+        recordConfig(too_large_policy),
+        .{},
+    );
+    var too_large_sink = EventSink{};
+    defer too_large_sink.deinit();
+    try std.testing.expectError(error.InvalidTransportProfile, too_large_backend.backend().start(.client, {}, &too_large_sink));
 
     var near_storage: [32][255]u8 = undefined;
     var near_names: [32][]const u8 = undefined;
@@ -3582,11 +3635,15 @@ test "transport profile validation fails before lifecycle or transcript advance"
     @memset(near_storage[31][0..], 'b');
     near_storage[31][0] = 'z';
     near_names[31] = near_storage[31][0..139];
-    try (AlpnPolicy{ .protocols = &near_names }).validate();
-    var near_backend = Tls13Backend.initClient(
+    var near_policy = tls_policy.Policy.recordDefault();
+    var near_alpns: [near_names.len]tls_algorithms.ProtocolName = undefined;
+    for (near_names, 0..) |name, i| near_alpns[i] = .{ .bytes = name };
+    near_policy.alpn_protocols = &near_alpns;
+    var near_backend = Tls13Backend.initClientConfigured(
         entropy,
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .record = .{ .alpn = .{ .protocols = &near_names } } },
+        recordConfig(near_policy),
+        .{},
     );
     var near_sink = EventSink{};
     defer near_sink.deinit();
@@ -3599,7 +3656,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
     var extension_backend = Tls13Backend.initClient(
         entropy,
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .extension = .{ .alpn = "h3", .extension_type = 57, .local = &oversized } },
+        .{ .extension = .{ .extension_type = 57, .local = &oversized } },
     );
     var extension_sink = EventSink{};
     defer extension_sink.deinit();
@@ -3612,7 +3669,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
     var collision_backend = Tls13Backend.initClient(
         entropy,
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .extension = .{ .alpn = "h3", .extension_type = ext_supported_versions, .local = "valid" } },
+        .{ .extension = .{ .extension_type = ext_supported_versions, .local = "valid" } },
     );
     var collision_sink = EventSink{};
     defer collision_sink.deinit();
@@ -3626,7 +3683,7 @@ test "client rejects malformed encrypted extensions ALPN framing" {
     var backend = Tls13Backend.initClient(
         Entropy{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x52} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     defer backend.deinit();
 
@@ -3684,7 +3741,7 @@ test "client NewSessionTicket callback receives owned state and lifetime zero is
     var backend = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x41} ** 32, .key_share_seed = [_]u8{0x42} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     defer backend.deinit();
     try backend.setSessionTicketConsumer(std.testing.allocator, session.Limits.default, .{
@@ -3723,7 +3780,7 @@ test "client parses and drops NewSessionTicket when no consumer is configured" {
     var backend = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x45} ** 32, .key_share_seed = [_]u8{0x46} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     defer backend.deinit();
     try backend.setPostHandshakeAllocator(std.testing.allocator);
@@ -3778,7 +3835,7 @@ test "server explicitly emits NewSessionTicket and returns recoverable state" {
     var server = Tls13Backend.initServer(
         .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x52} ** 32 },
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     defer server.deinit();
 
@@ -3821,7 +3878,7 @@ test "server ticket output failure is atomic and retryable" {
     var server = Tls13Backend.initServer(
         .{ .hello_random = [_]u8{0x61} ** 32, .key_share_seed = [_]u8{0x62} ** 32 },
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     defer server.deinit();
     server.core.handshake_lifecycle = .complete;
@@ -3861,7 +3918,7 @@ test "server ticket emission allocation failures leave transcript and sink clean
         var server = Tls13Backend.initServer(
             .{ .hello_random = [_]u8{0x63} ** 32, .key_share_seed = [_]u8{0x64} ** 32 },
             try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
-            .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+            .record,
         );
         server.core.handshake_lifecycle = .complete;
         try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
@@ -3926,7 +3983,7 @@ test "large emitted ticket is delivered once after fragmented application receiv
     var server = Tls13Backend.initServer(
         .{ .hello_random = [_]u8{0x71} ** 32, .key_share_seed = [_]u8{0x72} ** 32 },
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     defer server.deinit();
     server.core.handshake_lifecycle = .complete;
@@ -3935,7 +3992,7 @@ test "large emitted ticket is delivered once after fragmented application receiv
     var client = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x73} ** 32, .key_share_seed = [_]u8{0x74} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     defer client.deinit();
     var capture = Capture{};
@@ -3974,7 +4031,7 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
     var client = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x81} ** 32, .key_share_seed = [_]u8{0x82} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     defer client.deinit();
     try client.setPostHandshakeAllocator(std.testing.allocator);
@@ -3992,7 +4049,7 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
     var over_client = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x83} ** 32, .key_share_seed = [_]u8{0x84} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     defer over_client.deinit();
     try over_client.setPostHandshakeAllocator(std.testing.allocator);
@@ -4009,7 +4066,7 @@ test "client cannot emit NewSessionTicket" {
     var client = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x91} ** 32, .key_share_seed = [_]u8{0x92} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     defer client.deinit();
     client.core.handshake_lifecycle = .complete;
@@ -4030,7 +4087,7 @@ test "abandoned backend teardown wipes ephemeral and server identity storage" {
     var client = Tls13Backend.initClient(
         entropy,
         .{ .pinned_certificate = testdata.certificate_der },
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     var sink = EventSink{};
     defer sink.deinit();
@@ -4044,7 +4101,7 @@ test "abandoned backend teardown wipes ephemeral and server identity storage" {
     var server = Tls13Backend.initServer(
         entropy,
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
-        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        .record,
     );
     server.deinit();
     try std.testing.expect(!server.identity_present);

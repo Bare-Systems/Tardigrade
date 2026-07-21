@@ -2841,10 +2841,10 @@ const GatewayPendingNative = struct {
             .native = native,
         };
         self.client_provider = tls_core.production_crypto.Provider.init(self.client_entropy_source.entropy());
-        self.client_backend = tls_core.tls13_backend.Tls13Backend.initClientWithOptions(
+        self.client_backend = tls_core.tls13_backend.Tls13Backend.initClientConfigured(
             .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
             .{ .pinned_certificate = tls_core.tls13_backend.testdata.certificate_der },
-            .{ .record = .{ .alpn = tls_core.tls13_backend.recordAlpnPolicy("h2") } },
+            tls_core.tls13_backend.recordConfig(tls_core.policy.Policy.recordH2Only()),
             .{ .server_name = "tardigrade.test" },
         );
         self.client_carrier = .{ .fd = fds[1] };

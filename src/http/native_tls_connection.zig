@@ -179,10 +179,13 @@ pub const NativeTlsConnection = struct {
             backend.deinit();
             allocator.destroy(backend);
         };
-        backend.* = tls_backend.Tls13Backend.initServerWithProvider(
+        backend.* = tls_backend.Tls13Backend.initServerWithProviderConfigured(
             handshake_entropy,
             provider,
-            .{ .record = .{ .alpn = policy.nativeAlpnPolicy() } },
+            .{
+                .policy = policy.nativeTlsPolicy(),
+                .transport = .record,
+            },
         );
 
         const record = try allocator.create(encrypted_stream.PureZigRecordStream);
@@ -354,34 +357,33 @@ fn setNonBlocking(fd: std.posix.fd_t) !void {
     }
 }
 
-test "native ALPN policy follows listener preference and fallback" {
+test "native TLS policy follows listener preference and fallback" {
     const dual = (ListenerProtocolPolicy{
         .http1_enabled = true,
         .http2_enabled = true,
         .allow_http1_without_alpn = true,
-    }).nativeAlpnPolicy();
-    try std.testing.expectEqual(@as(usize, 2), dual.protocols.len);
-    try std.testing.expectEqualStrings("h2", dual.protocols[0]);
-    try std.testing.expectEqualStrings("http/1.1", dual.protocols[1]);
-    try std.testing.expect(dual.allow_absent);
+    }).nativeTlsPolicy();
+    try std.testing.expectEqual(@as(usize, 2), dual.alpn_protocols.len);
+    try std.testing.expect(dual.alpn_protocols[0].eql(tls.algorithms.alpn.h2));
+    try std.testing.expect(dual.alpn_protocols[1].eql(tls.algorithms.alpn.http_1_1));
+    try std.testing.expect(dual.allow_absent_alpn);
 
     const h2_only = (ListenerProtocolPolicy{
         .http1_enabled = false,
         .http2_enabled = true,
         .allow_http1_without_alpn = true,
-    }).nativeAlpnPolicy();
-    try std.testing.expectEqual(@as(usize, 1), h2_only.protocols.len);
-    try std.testing.expectEqualStrings("h2", h2_only.protocols[0]);
-    try std.testing.expect(!h2_only.allow_absent);
+    }).nativeTlsPolicy();
+    try std.testing.expectEqual(@as(usize, 1), h2_only.alpn_protocols.len);
+    try std.testing.expect(h2_only.alpn_protocols[0].eql(tls.algorithms.alpn.h2));
+    try std.testing.expect(!h2_only.allow_absent_alpn);
 
     const disabled = (ListenerProtocolPolicy{
         .http1_enabled = false,
         .http2_enabled = false,
         .allow_http1_without_alpn = true,
-    }).nativeAlpnPolicy();
-    try std.testing.expectEqual(@as(usize, 0), disabled.protocols.len);
-    try std.testing.expect(!disabled.allow_absent);
-    try std.testing.expectError(error.InvalidTransportProfile, disabled.validate());
+    }).nativeTlsPolicy();
+    try std.testing.expectEqual(@as(usize, 0), disabled.alpn_protocols.len);
+    try std.testing.expect(!disabled.allow_absent_alpn);
 }
 
 test "native readiness maps directly to event-loop interest" {

@@ -29,7 +29,7 @@ pub const max_message_len = shared.max_message_len;
 pub const max_certificate_len = shared.max_certificate_len;
 pub const testdata = shared.testdata;
 
-const ext_quic_transport_parameters: u16 = 57;
+const ext_quic_transport_parameters: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.quic_transport_parameters);
 const tp_max_idle_timeout: u64 = 0x01;
 const tp_max_udp_payload_size: u64 = 0x03;
 const tp_initial_max_data: u64 = 0x04;
@@ -206,11 +206,13 @@ pub const Tls13Backend = struct {
     }
 
     pub fn initClientWithOptions(entropy: Entropy, trust: Trust, options: ClientOptions) Tls13Backend {
-        return .{ .engine = shared.Tls13Backend.initClientWithOptions(entropy, trust, .{ .extension = .{
-            .alpn = "h3",
-            .extension_type = ext_quic_transport_parameters,
-            .local = "",
-        } }, options) };
+        return .{ .engine = shared.Tls13Backend.initClientConfigured(entropy, trust, .{
+            .policy = tls_core.policy.Policy.quicDefault(),
+            .transport = .{ .extension = .{
+                .extension_type = ext_quic_transport_parameters,
+                .local = "",
+            } },
+        }, options) };
     }
 
     pub fn initClientWithAllocator(allocator: std.mem.Allocator, entropy: Entropy, trust: Trust) HandshakeError!Tls13Backend {
@@ -225,11 +227,13 @@ pub const Tls13Backend = struct {
     }
 
     pub fn initServer(entropy: Entropy, identity: Identity) Tls13Backend {
-        return .{ .engine = shared.Tls13Backend.initServer(entropy, identity, .{ .extension = .{
-            .alpn = "h3",
-            .extension_type = ext_quic_transport_parameters,
-            .local = "",
-        } }) };
+        return .{ .engine = shared.Tls13Backend.initServerConfigured(entropy, identity, .{
+            .policy = tls_core.policy.Policy.quicDefault(),
+            .transport = .{ .extension = .{
+                .extension_type = ext_quic_transport_parameters,
+                .local = "",
+            } },
+        }) };
     }
 
     pub fn initServerWithAllocator(allocator: std.mem.Allocator, entropy: Entropy, identity: Identity) Tls13Backend {
@@ -239,11 +243,13 @@ pub const Tls13Backend = struct {
     }
 
     pub fn initServerWithProvider(entropy: Entropy, provider: CredentialProvider) Tls13Backend {
-        return .{ .engine = shared.Tls13Backend.initServerWithProvider(entropy, provider, .{ .extension = .{
-            .alpn = "h3",
-            .extension_type = ext_quic_transport_parameters,
-            .local = "",
-        } }) };
+        return .{ .engine = shared.Tls13Backend.initServerWithProviderConfigured(entropy, provider, .{
+            .policy = tls_core.policy.Policy.quicDefault(),
+            .transport = .{ .extension = .{
+                .extension_type = ext_quic_transport_parameters,
+                .local = "",
+            } },
+        }) };
     }
 
     pub fn initServerWithAllocatorAndProvider(allocator: std.mem.Allocator, entropy: Entropy, provider: CredentialProvider) Tls13Backend {
@@ -336,7 +342,6 @@ pub const Tls13Backend = struct {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
         const encoded = try encodeTransportParametersBound(params, self.cid_binding, &self.local_transport_parameters);
         self.engine.profile = .{ .extension = .{
-            .alpn = self.alpn,
             .extension_type = ext_quic_transport_parameters,
             .local = encoded,
         } };
@@ -748,9 +753,9 @@ test "QUIC handshake uses the shared reloadable SNI provider" {
 test "QUIC handshake owner tears down shared and adapter storage on failure" {
     var harness = try RealHandshakeHarness.init();
     defer harness.deinit();
-    harness.server_backend.alpn = "h2";
+    harness.client_backend.engine.trust = .{ .pinned_certificate = "not the server certificate" };
     try harness.wire();
-    try std.testing.expectError(error.AlpnMismatch, harness.run());
+    try std.testing.expectError(error.CertificateInvalid, harness.run());
     harness.deinit();
     try expectQuicBackendWiped(&harness.client_backend);
     try expectQuicBackendWiped(&harness.server_backend);

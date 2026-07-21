@@ -342,6 +342,12 @@ pub const TransportProfile = union(enum) {
                 ext_alpn,
                 ext_supported_versions,
                 ext_key_share,
+                // #362: reserve the TLS-owned PSK extension IDs too — a
+                // caller configuring a transport extension with either of
+                // these types would otherwise collide with (and be
+                // misparsed as) the PSK negotiation extensions.
+                pre_shared_key.ext_pre_shared_key,
+                pre_shared_key.ext_psk_key_exchange_modes,
                 => return error.InvalidTransportProfile,
                 else => {},
             }
@@ -534,6 +540,13 @@ pub const Tls13Backend = struct {
     /// fatal, or teardown).
     selected_client_psk: session.ClientTicketState = .{},
     selected_client_psk_present: bool = false,
+    /// Server (#362): the accepted session a successful PSK selection moved
+    /// into ownership — see `SelectedServerPsk`. Available to the caller
+    /// via `takeSelectedServerPsk` once the resumed handshake completes;
+    /// wiped on every fallback/error/teardown path along with the rest of
+    /// this connection's PSK state.
+    selected_server_psk: SelectedServerPsk = .{},
+    selected_server_psk_present: bool = false,
     /// Server (#362): the configured stateful/stateless identity resolver.
     /// `null` means this server never offers PSK resumption.
     psk_resolver: ?pre_shared_key.ServerPskResolver = null,
@@ -551,9 +564,16 @@ pub const Tls13Backend = struct {
     /// #362/#365 seam: the application-layer compatibility snapshot this
     /// connection is configured with, compared against a candidate PSK's
     /// stored `application_compat` (server) and used to recheck an offered
-    /// ticket (client). `null` means this connection has none configured —
-    /// symmetric with a ticket that also has none.
-    application_compat: ?new_session_ticket.CompatBlob = null,
+    /// ticket (client) — and, symmetrically, stamped into any ticket this
+    /// connection itself issues/receives. Copied into owned, bounded
+    /// storage by `setApplicationCompat` (not borrowed): it is read again
+    /// during *post-handshake* ticket issuance/ingestion, well past when a
+    /// merely-handshake-scoped borrow would be safe to assume live.
+    application_compat_format_id: u16 = 0,
+    application_compat_format_version: u16 = 0,
+    application_compat_bytes: [max_transport_extension_len]u8 = undefined,
+    application_compat_len: usize = 0,
+    application_compat_present: bool = false,
     /// #362: the most recent successful PSK selection's ticket-age skew
     /// observation (apparent vs. actual elapsed time since issuance), taken
     /// exactly once by `takePskAgeSkew`. Informational only — skew alone
@@ -564,6 +584,21 @@ pub const Tls13Backend = struct {
     const Slice = struct { start: usize, len: usize };
     const PendingStage = enum { server_select, server_sign, client_select, client_sign, peer_verify };
     const PskSelected = struct { index: usize, psk: [hash_len]u8 };
+
+    /// Server (#362): the accepted `ServerRecoverableState` a successful PSK
+    /// selection moves into backend ownership — not only the derived PSK
+    /// bytes — so #365/#366 can consume the authenticated selection
+    /// (early-data policy, compatibility metadata, ...) without resolving
+    /// the bearer identity a second time.
+    const SelectedServerPsk = struct {
+        index: u16 = 0,
+        state: session.ServerRecoverableState = .{},
+
+        fn deinit(self: *SelectedServerPsk) void {
+            self.state.deinit();
+            self.index = 0;
+        }
+    };
 
     /// Reassembler capacity is `max_message_len + 4` (see `initial_input`),
     /// so the capture buffer matches that bound exactly.
@@ -754,10 +789,36 @@ pub const Tls13Backend = struct {
     /// #362/#365: configure this connection's application-layer
     /// compatibility snapshot (e.g. HTTP/3 settings), compared against a
     /// candidate PSK's stored value on the server and used to recheck an
-    /// offered ticket on the client. `blob.bytes` must outlive the
-    /// handshake. Must be called before `start`.
-    pub fn setApplicationCompat(self: *Tls13Backend, blob: ?new_session_ticket.CompatBlob) void {
-        self.application_compat = blob;
+    /// offered ticket on the client. Copies `blob.bytes` into owned,
+    /// bounded storage — the caller's slice need not outlive this call —
+    /// because this value is read again during post-handshake ticket
+    /// issuance/ingestion, not only during the handshake itself. Must be
+    /// called before `start`.
+    pub fn setApplicationCompat(self: *Tls13Backend, blob: ?new_session_ticket.CompatBlob) HandshakeError!void {
+        if (blob) |b| {
+            if (b.bytes.len > self.application_compat_bytes.len) return error.TransportBufferOverflow;
+            self.application_compat_format_id = b.format_id;
+            self.application_compat_format_version = b.format_version;
+            @memcpy(self.application_compat_bytes[0..b.bytes.len], b.bytes);
+            self.application_compat_len = b.bytes.len;
+            self.application_compat_present = true;
+        } else {
+            self.application_compat_present = false;
+            self.application_compat_len = 0;
+        }
+    }
+
+    /// The owned `application_compat` snapshot configured via
+    /// `setApplicationCompat`, in the wire-neutral `CompatBlob` shape both
+    /// `resumptionContext()` (ticket issuance/ingestion) and
+    /// `candidateApplicationCompat()` (PSK compatibility evaluation) need.
+    pub fn ownedApplicationCompat(self: *const Tls13Backend) ?new_session_ticket.CompatBlob {
+        if (!self.application_compat_present) return null;
+        return .{
+            .format_id = self.application_compat_format_id,
+            .format_version = self.application_compat_format_version,
+            .bytes = self.application_compat_bytes[0..self.application_compat_len],
+        };
     }
 
     /// #362: takes (clears) the most recent successful PSK selection's
@@ -765,6 +826,21 @@ pub const Tls13Backend = struct {
     pub fn takePskAgeSkew(self: *Tls13Backend) ?pre_shared_key.AgeSkew {
         defer self.last_psk_age_skew = null;
         return self.last_psk_age_skew;
+    }
+
+    /// Server (#362): moves the session accepted by the most recent
+    /// successful PSK selection into `out` (which must be zero-valued or a
+    /// previously-initialized, live value — never `undefined`), returning
+    /// its selected identity index. A one-shot accessor for #365/#366:
+    /// returns `null` (leaving `out` untouched) when no PSK has been
+    /// selected on this connection, or once already taken.
+    pub fn takeSelectedServerPsk(self: *Tls13Backend, out: *session.ServerRecoverableState) ?u16 {
+        if (!self.selected_server_psk_present) return null;
+        out.moveFrom(&self.selected_server_psk.state);
+        self.selected_server_psk_present = false;
+        const index = self.selected_server_psk.index;
+        self.selected_server_psk.index = 0;
+        return index;
     }
 
     pub fn setSessionTicketConsumer(
@@ -893,10 +969,14 @@ pub const Tls13Backend = struct {
         self.psk_now_fn = null;
         self.psk_resolver = null;
         self.connection_auth_binding = null;
-        self.application_compat = null;
+        crypto.secureZero(u8, &self.application_compat_bytes);
+        self.application_compat_present = false;
+        self.application_compat_len = 0;
         self.last_psk_age_skew = null;
         self.selected_client_psk.deinit();
         self.selected_client_psk_present = false;
+        self.selected_server_psk.deinit();
+        self.selected_server_psk_present = false;
         self.clearClientHelloPsk();
         crypto.secureZero(u8, &self.expected_client_verify);
         self.wipeEphemeral();
@@ -957,8 +1037,39 @@ pub const Tls13Backend = struct {
         self.offered_psk_dhe_ke = false;
     }
 
+    /// #362: wipes owned PSK *negotiation* state on any handshake-phase
+    /// failure — installed via `errdefer` at the `receiveImpl`/`resumeAuth`
+    /// call boundary (not only inside the individual message handlers), so
+    /// a terminal failure that occurs before or between handler dispatch
+    /// (message-order rejection, wrong transport epoch, a malformed frame,
+    /// an async operation's own failure) cannot leave this state resident
+    /// in a backend that will not be torn down until some later, unrelated
+    /// `deinit()`.
+    ///
+    /// Deliberately a no-op once the handshake has actually completed:
+    /// `selected_server_psk` and `last_psk_age_skew` are meant to outlive a
+    /// *successful* handshake, for #365/#366 to consume via their one-shot
+    /// accessors — an unrelated post-handshake failure (a malformed
+    /// `NewSessionTicket`, say) must not destroy them before the caller has
+    /// had a chance to read them. A failure *during* the handshake, by
+    /// contrast, means the connection never actually succeeded, so there is
+    /// nothing legitimate left to preserve.
+    fn clearPskHandshakeState(self: *Tls13Backend) void {
+        if (self.core.handshake_lifecycle == .complete) return;
+        self.client_psk_offers.deinit();
+        self.selected_client_psk.deinit();
+        self.selected_client_psk_present = false;
+        self.selected_server_psk.deinit();
+        self.selected_server_psk_present = false;
+        self.last_psk_age_skew = null;
+        self.clearClientHelloPsk();
+        if (self.schedule) |*schedule| schedule.wipe();
+        self.schedule = null;
+    }
+
     fn startImpl(ptr: *anyopaque, role: Role, _: void, sink: *EventSink) HandshakeError!void {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        errdefer self.clearPskHandshakeState();
         // The driver's role comes from Handshake.initClient/initServer and must
         // match how this backend was constructed; a mismatch is a wiring bug.
         std.debug.assert(role == self.role);
@@ -987,6 +1098,13 @@ pub const Tls13Backend = struct {
 
     fn receiveImpl(ptr: *anyopaque, level: EncryptionLevel, bytes: []const u8, sink: *EventSink) HandshakeError!void {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        // Covers every terminal failure below — including those raised by
+        // `drainInput` itself (message ordering, transport epoch, framing)
+        // before any per-message handler ever runs — not only the ones the
+        // individual handlers already guard locally. See
+        // `clearPskHandshakeState` for why this is a no-op once the
+        // handshake has completed.
+        errdefer self.clearPskHandshakeState();
         switch (level) {
             .zero_rtt => return error.UnexpectedTransportEpoch,
             .application => {
@@ -1401,11 +1519,12 @@ pub const Tls13Backend = struct {
         return true;
     }
 
-    /// The application-compatibility candidate view of `self.application_compat`
-    /// (see `setApplicationCompat`), for both the client's eligibility
-    /// recheck and the server's candidate compatibility evaluation.
+    /// The application-compatibility candidate view of the owned
+    /// `application_compat` snapshot (see `setApplicationCompat`), for both
+    /// the client's eligibility recheck and the server's candidate
+    /// compatibility evaluation.
     fn candidateApplicationCompat(self: *const Tls13Backend) ?session.CandidateCompat {
-        const blob = self.application_compat orelse return null;
+        const blob = self.ownedApplicationCompat() orelse return null;
         return .{ .format_id = blob.format_id, .format_version = blob.format_version, .bytes = blob.bytes };
     }
 
@@ -1506,6 +1625,7 @@ pub const Tls13Backend = struct {
             const psk_slice = self.selected_client_psk.common.resumption_psk.slice();
             if (psk_slice.len != hash_len) return error.IllegalParameter;
             var buf: [hash_len]u8 = undefined;
+            defer crypto.secureZero(u8, &buf);
             @memcpy(&buf, psk_slice);
             psk_secret = buf;
         } else {
@@ -2490,6 +2610,13 @@ pub const Tls13Backend = struct {
                 candidate_state.ticket_age_add,
                 elapsedMillis(now, candidate_state.common.issued_at_unix_ms),
             );
+            // Move the accepted session into backend ownership instead of
+            // letting the loop-scoped `defer candidate_state.deinit()`
+            // above destroy it — `moveFrom` zero-values `candidate_state`
+            // first, so that deferred deinit becomes a safe no-op.
+            self.selected_server_psk.state.moveFrom(&candidate_state);
+            self.selected_server_psk.index = @intCast(attempts);
+            self.selected_server_psk_present = true;
             return .{ .index = attempts, .psk = psk_buf };
         }
         return null;
@@ -2748,6 +2875,11 @@ pub const Tls13Backend = struct {
     /// suspended, recording no handshake message twice; when it fails the typed
     /// failure is latched.
     pub fn resumeAuth(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
+        // A no-op when nothing is parked or the operation is still pending
+        // (both ordinary, non-error returns below); fires on the operation's
+        // own failure and on any terminal error from resuming into
+        // `dispatchResume`/`drainInput`.
+        errdefer self.clearPskHandshakeState();
         const op = self.pending_op orelse return;
         const stage = self.pending_stage;
         var completion: credentials.Completion = undefined;
@@ -2997,7 +3129,7 @@ pub const Tls13Backend = struct {
             .application_protocol = self.selectedAlpn(),
             .auth_binding = self.effectiveAuthBinding(),
             .transport_compat = self.peerTransportCompat(),
-            .application_compat = self.application_compat,
+            .application_compat = self.ownedApplicationCompat(),
         };
     }
 

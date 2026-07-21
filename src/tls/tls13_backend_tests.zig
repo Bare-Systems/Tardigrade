@@ -3070,6 +3070,137 @@ test "async credential selection failure clears the captured PSK offer" {
     try std.testing.expect(server.client_hello_psk == null);
 }
 
+test "a transport-extension type colliding with a TLS-owned PSK extension is rejected at start" {
+    inline for (.{ pre_shared_key.ext_pre_shared_key, pre_shared_key.ext_psk_key_exchange_modes }) |colliding_type| {
+        var client = tls_backend.Tls13Backend.initClient(
+            clientEntropy(),
+            .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+            .{ .extension = .{ .alpn = "h3", .extension_type = colliding_type, .local = "x" } },
+        );
+        defer client.deinit();
+        var sink = DirectSink{};
+        defer sink.deinit();
+        try std.testing.expectError(error.InvalidTransportProfile, client.backend().start(.client, {}, &sink));
+        try std.testing.expectEqual(.idle, client.core.handshake_lifecycle);
+        try std.testing.expectEqual(@as(usize, 0), sink.len);
+        try std.testing.expect(!client.key_pair_present);
+
+        var server = tls_backend.Tls13Backend.initServer(
+            serverEntropy(),
+            fixtureIdentity(),
+            .{ .extension = .{ .alpn = "h3", .extension_type = colliding_type, .local = "y" } },
+        );
+        defer server.deinit();
+        var server_sink = DirectSink{};
+        defer server_sink.deinit();
+        try std.testing.expectError(error.InvalidTransportProfile, server.backend().start(.server, {}, &server_sink));
+        try std.testing.expectEqual(.idle, server.core.handshake_lifecycle);
+    }
+}
+
+test "setApplicationCompat copies the caller's bytes instead of borrowing them" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    var scratch: [4]u8 = .{ 'o', 'l', 'd', '!' };
+    try server.setApplicationCompat(.{ .format_id = 7, .format_version = 1, .bytes = &scratch });
+    // The caller is free to mutate/reuse its own buffer immediately after
+    // the call returns — the stored value must not observe this.
+    @memset(&scratch, 'X');
+
+    const stored = server.ownedApplicationCompat().?;
+    try std.testing.expectEqualStrings("old!", stored.bytes);
+}
+
+test "handshake-phase failure wipes PSK offer state before ServerHello even arrives" {
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+    );
+    defer client.deinit();
+
+    const psk = [_]u8{0x11} ** tls_backend.hash_len;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var ticket: session.ClientTicketState = .{};
+    try ticket.init(std.testing.allocator, session.Limits.default, &common, .{
+        .ticket = "offer",
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 0;
+        }
+    };
+    client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    try std.testing.expect(!client.client_psk_offers.isEmpty());
+
+    // A Finished message at the initial epoch (ServerHello was expected) is
+    // a wrong-transport-epoch rejection raised by `drainInput` itself,
+    // before `core.acceptReceived` or any per-message handler — including
+    // the handler-local `errdefer` inside `onServerHello` — ever runs.
+    var buf: [8]u8 = undefined;
+    const finished = try tls_core.messages.encode(.finished, "", &buf);
+    try std.testing.expectError(error.UnexpectedTransportEpoch, client.backend().receive(.initial, finished, &sink));
+
+    try std.testing.expect(client.client_psk_offers.isEmpty());
+}
+
+test "the accepted server session survives PSK selection with its early-data and metadata intact" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    const psk = [_]u8{0x66} ** tls_backend.hash_len;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+        .early_data = .{ .early_data_capable = 12345 },
+    });
+    var stored_state: session.ServerRecoverableState = .{};
+    stored_state.init(&common, 0);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "early-data-ticket" };
+    server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{.{ .identity = "early-data-ticket", .binder_psk = &psk }} } });
+
+    try std.testing.expect(server.core.psk_authenticated);
+    var taken: session.ServerRecoverableState = .{};
+    const index = server.takeSelectedServerPsk(&taken).?;
+    defer taken.deinit();
+    try std.testing.expectEqual(@as(u16, 0), index);
+    try std.testing.expectEqual(@as(u32, 12345), taken.common.early_data.maxEarlyData());
+    try std.testing.expectEqualStrings("h2", taken.common.application_protocol.?.slice());
+    // One-shot: a second take returns null and leaves `out` untouched.
+    var second: session.ServerRecoverableState = .{};
+    try std.testing.expectEqual(@as(?u16, null), server.takeSelectedServerPsk(&second));
+}
+
 test "server selects the first compatible identity: unknown first, valid second" {
     var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
     defer server.deinit();

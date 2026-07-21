@@ -2515,7 +2515,7 @@ test "expired server entries in other origins never permanently block max_origin
     var h3: [stateful_identity_len]u8 = undefined;
     _ = cache.insertMove(&s3, 1_000_000, .reusable, &h3);
     const removed = cache.cleanup(2_000_000);
-    try testing.expect(removed >= 1);
+    try testing.expectEqual(@as(usize, 1), removed);
 }
 
 test "stateful server enforces per-origin and global capacity with deterministic eviction and consistent indexes" {

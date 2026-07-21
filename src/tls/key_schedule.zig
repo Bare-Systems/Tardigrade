@@ -42,8 +42,40 @@ pub const KeySchedule = struct {
     server_handshake_traffic: [hash_len]u8,
 
     pub fn init(shared: *const [shared_secret_len]u8, hello_transcript_hash: [hash_len]u8) KeySchedule {
+        return initFromEarlySecret(&derived_early_secret, shared, hello_transcript_hash);
+    }
+
+    /// PSK-resumed (`psk_dhe_ke`) handshake: the same key-schedule chain as
+    /// `init`, but starting from a real early secret derived from the
+    /// resumption PSK (RFC 8446 §7.1) instead of the comptime all-zero-PSK
+    /// early secret `init` uses. `psk` must already be exactly `hash_len`
+    /// bytes (the SHA-256 resumption PSK produced by
+    /// `resumptionPsk`/`KeySchedule.resumptionPsk`, matching this module's
+    /// concrete SHA-256 schedule). X25519 key share remains mandatory in
+    /// this profile, so `shared` is still the ECDHE shared secret.
+    pub fn initWithPsk(
+        psk: *const [hash_len]u8,
+        shared: *const [shared_secret_len]u8,
+        hello_transcript_hash: [hash_len]u8,
+    ) KeySchedule {
+        var early_secret = HkdfSha256.extract("", psk);
+        defer crypto.secureZero(u8, &early_secret);
+        var derived_early = tls.hkdfExpandLabel(HkdfSha256, early_secret, "derived", &empty_transcript_hash, hash_len);
+        defer crypto.secureZero(u8, &derived_early);
+        return initFromEarlySecret(&derived_early, shared, hello_transcript_hash);
+    }
+
+    /// Shared continuation from a "derived" early secret (RFC 8446 §7.1)
+    /// into the handshake/master secrets and handshake traffic secrets. Used
+    /// by both the zero-PSK (`init`) and real-PSK (`initWithPsk`) entry
+    /// points, which differ only in how `derived_early_secret` was produced.
+    fn initFromEarlySecret(
+        derived_early: *const [hash_len]u8,
+        shared: *const [shared_secret_len]u8,
+        hello_transcript_hash: [hash_len]u8,
+    ) KeySchedule {
         const zeros = [_]u8{0} ** hash_len;
-        var handshake_secret = HkdfSha256.extract(&derived_early_secret, shared);
+        var handshake_secret = HkdfSha256.extract(derived_early, shared);
         defer crypto.secureZero(u8, &handshake_secret);
         var derived_handshake = tls.hkdfExpandLabel(HkdfSha256, handshake_secret, "derived", &empty_transcript_hash, hash_len);
         defer crypto.secureZero(u8, &derived_handshake);
@@ -212,6 +244,24 @@ test "application traffic secret storage has explicit cleanup" {
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&app), 0));
 }
 
+test "KeySchedule.wipe zeroizes every derived secret" {
+    // Deliberately a plain (non-optional) local, wiped in place and
+    // inspected directly — unlike a backend-owned `?KeySchedule` that gets
+    // set to `null` right after wiping, there is no subsequent
+    // optional-invalidation step here whose own debug-safety poisoning
+    // could be mistaken for (or mask the absence of) this `wipe()` call's
+    // effect. That makes this the reliable place to prove the zeroing
+    // itself; backend-level tests should only assert that `schedule`
+    // becomes `null`, not re-inspect the bytes afterward.
+    const shared = [_]u8{0x77} ** shared_secret_len;
+    const transcript = [_]u8{0x88} ** hash_len;
+    var schedule = KeySchedule.init(&shared, transcript);
+    const bytes = std.mem.asBytes(&schedule);
+    try std.testing.expect(!std.mem.allEqual(u8, bytes, 0));
+    schedule.wipe();
+    try std.testing.expect(std.mem.allEqual(u8, bytes, 0));
+}
+
 test "resumption master secret and PSK derivation are deterministic" {
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
     const hello_hash = hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
@@ -255,6 +305,66 @@ test "generic resumption master secret derivation supports SHA-384" {
     try KeySchedule.deriveResumptionMasterSecret(.sha384, &master_secret, &transcript_hash, &out);
     try std.testing.expectEqualSlices(u8, &hexBytes("4f9d68ff762f5b886f275d162b90c268db5ccc65c4e0b8fc810030429a070f8e9f12b641b209e15ae210b1153a68fc42"), &out);
     try std.testing.expectError(error.InvalidSecretLength, KeySchedule.deriveResumptionMasterSecret(.sha384, master_secret[0..hash_len], &transcript_hash, &out));
+}
+
+test "initWithPsk diverges from the zero-PSK schedule and is deterministic" {
+    const shared = [_]u8{0x42} ** shared_secret_len;
+    const transcript = [_]u8{0x24} ** hash_len;
+    const psk = [_]u8{0x99} ** hash_len;
+
+    var zero_psk_schedule = KeySchedule.init(&shared, transcript);
+    defer zero_psk_schedule.wipe();
+    var psk_schedule = KeySchedule.initWithPsk(&psk, &shared, transcript);
+    defer psk_schedule.wipe();
+    var psk_schedule_again = KeySchedule.initWithPsk(&psk, &shared, transcript);
+    defer psk_schedule_again.wipe();
+
+    try std.testing.expect(!std.mem.eql(u8, &zero_psk_schedule.handshake_secret, &psk_schedule.handshake_secret));
+    try std.testing.expect(!std.mem.eql(u8, &zero_psk_schedule.master_secret, &psk_schedule.master_secret));
+    try std.testing.expectEqualSlices(u8, &psk_schedule.handshake_secret, &psk_schedule_again.handshake_secret);
+    try std.testing.expectEqualSlices(u8, &psk_schedule.master_secret, &psk_schedule_again.master_secret);
+    try std.testing.expect(!std.mem.eql(u8, &psk_schedule.client_handshake_traffic, &psk_schedule.server_handshake_traffic));
+
+    var app = psk_schedule.applicationSecrets(transcript);
+    defer app.wipe();
+    try std.testing.expect(!std.mem.eql(u8, &app.client, &app.server));
+}
+
+test "initWithPsk matches independently computed secrets" {
+    // Checked-in literals for the same inputs as "initWithPsk diverges from
+    // the zero-PSK schedule and is deterministic" above (psk=0x99*32,
+    // shared=0x42*32, transcript=0x24*32), computed independently of this
+    // module rather than by re-deriving with the same helpers under test.
+    const shared = [_]u8{0x42} ** shared_secret_len;
+    const transcript = [_]u8{0x24} ** hash_len;
+    const psk = [_]u8{0x99} ** hash_len;
+
+    var schedule = KeySchedule.initWithPsk(&psk, &shared, transcript);
+    defer schedule.wipe();
+
+    try std.testing.expectEqualSlices(u8, &hexBytes("ab0803d6203c8feddfe8adc74f986c9d89b817b3d4132fc55c866a3522d9ff49"), &schedule.handshake_secret);
+    try std.testing.expectEqualSlices(u8, &hexBytes("e92139285417b6a9a54a7a9153f4b6dcce44b99cdc0937b83dfea5c79805c920"), &schedule.client_handshake_traffic);
+    try std.testing.expectEqualSlices(u8, &hexBytes("739483d9d6a9508c73b4656de22fedd85a2a8d00e9a6ca1449d8cba678c94baf"), &schedule.server_handshake_traffic);
+    try std.testing.expectEqualSlices(u8, &hexBytes("abe96cce65361235f3126971c67760888b79d4c1724a6cb1e15f6d2ae128ff44"), &schedule.master_secret);
+
+    var app = schedule.applicationSecrets(transcript);
+    defer app.wipe();
+    try std.testing.expectEqualSlices(u8, &hexBytes("d1ba0b1be9862f1bd4c3bcc0d53b5a98c6a4951c4bad19243051237bc735031c"), &app.client);
+    try std.testing.expectEqualSlices(u8, &hexBytes("c7428c93109f1b656dcbf0971e5d1bad9c2d38b79420038b7e165a17c7f61fa1"), &app.server);
+}
+
+test "a different resumption PSK produces a different PSK-resumed schedule" {
+    const shared = [_]u8{0x11} ** shared_secret_len;
+    const transcript = [_]u8{0x22} ** hash_len;
+    const psk_a = [_]u8{0xaa} ** hash_len;
+    const psk_b = [_]u8{0xbb} ** hash_len;
+
+    var schedule_a = KeySchedule.initWithPsk(&psk_a, &shared, transcript);
+    defer schedule_a.wipe();
+    var schedule_b = KeySchedule.initWithPsk(&psk_b, &shared, transcript);
+    defer schedule_b.wipe();
+
+    try std.testing.expect(!std.mem.eql(u8, &schedule_a.master_secret, &schedule_b.master_secret));
 }
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {

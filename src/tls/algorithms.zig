@@ -50,7 +50,9 @@ pub const ExtensionType = enum(u16) {
     supported_groups = 10,
     signature_algorithms = 13,
     application_layer_protocol_negotiation = 16,
+    pre_shared_key = 41,
     supported_versions = 43,
+    psk_key_exchange_modes = 45,
     key_share = 51,
     quic_transport_parameters = 57,
 };

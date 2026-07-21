@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const crypto = @import("crypto");
+const pre_shared_key = @import("pre_shared_key.zig");
 const session = @import("session.zig");
 
 const provider = crypto.provider;
@@ -782,6 +783,30 @@ pub const Protector = struct {
     }
 };
 
+pub const ServerPskResolverAdapter = struct {
+    protector: *Protector,
+    allocator: std.mem.Allocator,
+    now_unix_ms: i64,
+
+    pub fn resolver(self: *ServerPskResolverAdapter) pre_shared_key.ServerPskResolver {
+        return .{
+            .ctx = self,
+            .nowUnixMsFn = nowUnixMs,
+            .resolveFn = resolve,
+        };
+    }
+
+    fn nowUnixMs(ctx: *anyopaque) i64 {
+        const self: *ServerPskResolverAdapter = @ptrCast(@alignCast(ctx));
+        return self.now_unix_ms;
+    }
+
+    fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        const self: *ServerPskResolverAdapter = @ptrCast(@alignCast(ctx));
+        return self.protector.resolve(self.allocator, identity, self.now_unix_ms, out) catch return error.ResolverFailed;
+    }
+};
+
 fn checkedProtectedLen(plaintext_len: usize, limits: session.Limits) SealError!usize {
     if (plaintext_len > limits.max_serialized_len) return error.SerializedStateTooLarge;
     const protected_len = std.math.add(usize, fixed_header_len, plaintext_len) catch return error.TicketTooLarge;
@@ -1235,6 +1260,44 @@ test "resolve treats invalid limits and decode allocation failure as local error
     try testing.expectError(error.OutOfMemory, protector.resolve(failing.allocator(), ticket, 2_000, &out));
     try testing.expectEqual(@as(u32, 0), out.ticket_age_add);
     try testing.expectEqual(@as(usize, 0), out.common.resumption_psk.len);
+}
+
+test "ServerPskResolver adapter uses one captured time for now and recovery" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const config = sampleKeyConfig(keyId(20), .aes_128_gcm, .{ .prefix = .{ 2, 0, 2, 0 }, .start = 0, .end_exclusive = 3 });
+    try keyring.install(try keyring.buildSnapshot(&.{config}, testCapabilities()));
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var ticket_buf = [_]u8{0} ** 512;
+    const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+
+    var adapter = ServerPskResolverAdapter{
+        .protector = &protector,
+        .allocator = allocator,
+        .now_unix_ms = 2_000,
+    };
+    const resolver = adapter.resolver();
+    try testing.expectEqual(@as(i64, 2_000), resolver.nowUnixMs());
+
+    var out: session.ServerRecoverableState = .{};
+    defer out.deinit();
+    try testing.expect(try resolver.resolve(ticket, &out));
+    try testing.expectEqual(state.ticket_age_add, out.ticket_age_add);
+    try testing.expectEqualSlices(u8, state.common.resumption_psk.slice(), out.common.resumption_psk.slice());
+
+    var miss: session.ServerRecoverableState = .{};
+    defer miss.deinit();
+    try testing.expect(!try resolver.resolve("not-a-ticket", &miss));
+    try testing.expectEqual(@as(usize, 0), miss.common.resumption_psk.len);
+
+    adapter.now_unix_ms = 20_000;
+    var expired: session.ServerRecoverableState = .{};
+    defer expired.deinit();
+    try testing.expect(!try resolver.resolve(ticket, &expired));
 }
 
 test "key windows and ticket lifetime are enforced" {

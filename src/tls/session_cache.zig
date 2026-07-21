@@ -25,11 +25,20 @@
 //! Per issue #364's canonical plan, this module intentionally does not yet
 //! adapt `StatefulServerCache` to the public `pre_shared_key.ServerPskResolver`
 //! contract, does not add the `TDSH`/`TDTK` composite adapter, and does not
-//! touch `root.zig` — those land once #363 (the sibling `TDTK` stateless
-//! protector) merges and the two-phase issuance / resolver-lease predecessor
-//! amendments described in issue #364 are made. The lease/commit/release
-//! shape defined here already matches what that future resolver adapter will
-//! need, so wiring it up should not require reshaping this module.
+//! touch `root.zig` — those land once the two-phase issuance / resolver-lease
+//! predecessor amendments described in issue #364 are made. The
+//! lease/commit/release shape defined here already matches what that future
+//! resolver adapter will need, so wiring it up should not require reshaping
+//! this module.
+//!
+//! Sequence counters (`insertion_sequence`, `lru_sequence`, `entry_id`,
+//! `lease_epoch`) are plain wrapping `u64` counters, never renumbered:
+//! renumbering would require physically reordering backing storage while
+//! other code may be holding array indices/pointers into it, which is a
+//! correctness hazard for a marginal (and, at `u64` widths, practically
+//! unreachable) benefit. Wrapping after `2^64` assignments is accepted as
+//! out of scope, matching the existing `entry_id`-style counters elsewhere
+//! in this codebase.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -131,6 +140,9 @@ pub const CacheEvent = enum {
     lookup_miss,
     lookup_expired,
     lookup_incompatible,
+    /// A single-use resolution was refused because a persistence snapshot
+    /// is currently in progress (see `StatefulServerCache.resolveLease`).
+    lookup_busy,
 };
 
 /// Non-secret observer seam. Implementations must not log or format cache
@@ -338,6 +350,15 @@ pub const ClientSessionCache = struct {
     next_insertion_sequence: u64 = 0,
     next_lru_sequence: u64 = 0,
     next_entry_id: u64 = 0,
+    /// Set for the duration of `cloneLiveForPersistence`; while set,
+    /// `consumeSingleUse` refuses to consume anything, closing the race
+    /// where a ticket is selected/consumed after being cloned into a
+    /// snapshot but before that snapshot reaches durable storage (which
+    /// would otherwise let a restart resurrect an already-consumed
+    /// ticket). Save/load calls on one cache are expected to be serialized
+    /// by the caller; this guards a single in-flight snapshot, not
+    /// concurrent snapshots of the same cache racing each other.
+    persistence_in_progress: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) error{InvalidLimits}!ClientSessionCache {
         try limits.validate();
@@ -436,10 +457,15 @@ pub const ClientSessionCache = struct {
     ) StoreResult {
         self.purgeExpiredAllLocked(now_unix_ms, evicted);
 
-        for (self.entries.items) |*e| {
+        var dup_idx: ?usize = null;
+        for (self.entries.items, 0..) |*e, i| {
             if (!std.mem.eql(u8, &e.origin, &origin)) continue;
             if (!e.ticket.ticket.eql(&cloned.ticket)) continue;
+            dup_idx = i;
+            break;
+        }
 
+        if (dup_idx) |i| {
             // Preflight the replacement fully before touching the old
             // entry: a repeated ticket identity with a larger encoded
             // payload must not be able to exceed either limit, and a
@@ -447,15 +473,24 @@ pub const ClientSessionCache = struct {
             // intact.
             const replacement_bytes = clientAccountedBytes(cloned);
             if (replacement_bytes > self.limits.max_entry_bytes) return .rejected_capacity;
-            const projected = self.total_bytes - e.bytes + replacement_bytes;
+            const projected = self.total_bytes - self.entries.items[i].bytes + replacement_bytes;
             if (projected > self.limits.max_total_bytes) return .rejected_capacity;
 
+            // Compute both sequence numbers *before* mutating the entry:
+            // these are plain wrapping counters (see module doc) and never
+            // reorder `entries.items`, so `i` stays valid across them, but
+            // keeping the increments and the field writes separated makes
+            // that invariant easy to audit rather than incidental.
+            const new_insertion_seq = self.nextInsertionSequence();
+            const new_lru_seq = self.nextLruSequence();
+
+            const e = &self.entries.items[i];
             var old = e.ticket;
             e.ticket = .{};
             e.ticket.moveFrom(cloned);
             e.usage = usage;
-            e.insertion_sequence = self.nextInsertionSequence();
-            e.lru_sequence = self.nextLruSequence();
+            e.insertion_sequence = new_insertion_seq;
+            e.lru_sequence = new_lru_seq;
             e.bytes = replacement_bytes;
             self.total_bytes = projected;
             old.deinit();
@@ -558,6 +593,9 @@ pub const ClientSessionCache = struct {
             std.mem.sort(Candidate, buf[0..n], {}, Candidate.moreRecent);
             const take = @min(n, pre_shared_key.max_offered_identities);
 
+            // `nextLruSequence` is a plain wrapping increment (see module
+            // doc): it never reorders `entries.items`, so the physical
+            // `idx` captured above stays valid across every call here.
             var touched: [pre_shared_key.max_offered_identities]usize = undefined;
             var touched_len: usize = 0;
             for (buf[0..take]) |c| {
@@ -579,15 +617,9 @@ pub const ClientSessionCache = struct {
 
             if (storage_failed) {
                 offers.deinit();
-            } else if (touched_len > 0) {
-                // Reserve a contiguous block of fresh LRU sequence values
-                // up front so a rare overflow-driven renumber (which
-                // physically reorders `entries.items`) cannot happen
-                // between capturing `touched[i]` and using it below.
-                self.reserveLruSequenceBatch(touched_len);
+            } else {
                 for (touched[0..touched_len]) |idx| {
-                    self.entries.items[idx].lru_sequence = self.next_lru_sequence;
-                    self.next_lru_sequence += 1;
+                    self.entries.items[idx].lru_sequence = self.nextLruSequence();
                 }
             }
         }
@@ -615,14 +647,20 @@ pub const ClientSessionCache = struct {
 
     /// Removes and wipes the single-use entry matching `ticket_identity`
     /// within `origin` once the server-selected offer has been consumed.
-    /// Reusable entries are left untouched. This is the cache-side half of
-    /// client single-use commit; wiring the resolved offer index back from
-    /// the TLS 1.3 backend is deferred to #365 per issue #364's canonical
-    /// plan (`storeClone`/`lookupOffers` already ship the reusable path plus
-    /// this consumption primitive).
-    pub fn consumeSingleUse(self: *ClientSessionCache, origin: OriginDigest, ticket_identity: []const u8) void {
+    /// Reusable entries are left untouched. Returns `false` (without
+    /// consuming anything) both when no matching entry is found and while
+    /// a persistence snapshot is in progress (see `persistence_in_progress`)
+    /// — the latter closes a race where a ticket consumed after being
+    /// cloned into a snapshot, but before that snapshot reaches durable
+    /// storage, would otherwise let a restart resurrect it.
+    ///
+    /// This is the cache-side half of client single-use commit; wiring the
+    /// resolved offer index back from the TLS 1.3 backend is deferred to
+    /// #365 per issue #364's canonical plan.
+    pub fn consumeSingleUse(self: *ClientSessionCache, origin: OriginDigest, ticket_identity: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.persistence_in_progress) return false;
         var i: usize = 0;
         while (i < self.entries.items.len) : (i += 1) {
             const e = &self.entries.items[i];
@@ -632,38 +670,63 @@ pub const ClientSessionCache = struct {
             var removed = self.entries.swapRemove(i);
             self.total_bytes -= removed.bytes;
             removed.ticket.deinit();
-            return;
+            return true;
         }
+        return false;
     }
 
     /// Deep-clones every non-expired entry for a persistence save,
-    /// including its exact insertion/LRU order. Must be called outside any
-    /// persistence I/O; the returned clones are fully owned by the caller.
+    /// including its exact insertion/LRU order. Sets
+    /// `persistence_in_progress` for the duration of the *whole* save
+    /// (through `endPersistenceSnapshot`, which the caller must invoke once
+    /// the snapshot has been durably written or the save has failed) so
+    /// `consumeSingleUse` cannot race a concurrent snapshot.
     pub fn cloneLiveForPersistence(
         self: *ClientSessionCache,
         allocator: std.mem.Allocator,
         now_unix_ms: i64,
     ) error{OutOfMemory}!std.ArrayListUnmanaged(PersistedClientEntry) {
         self.mutex.lock();
-        defer self.mutex.unlock();
+        self.persistence_in_progress = true;
 
         var out: std.ArrayListUnmanaged(PersistedClientEntry) = .empty;
-        errdefer {
+        var failed = false;
+        out.ensureTotalCapacityPrecise(allocator, self.entries.items.len) catch {
+            failed = true;
+        };
+        if (!failed) {
+            for (self.entries.items) |*e| {
+                if (e.ticket.common.isExpired(now_unix_ms)) continue;
+                var clone: PersistedClientEntry = .{
+                    .usage = e.usage,
+                    .insertion_sequence = e.insertion_sequence,
+                    .lru_sequence = e.lru_sequence,
+                };
+                e.ticket.cloneInto(allocator, &clone.ticket) catch {
+                    failed = true;
+                    break;
+                };
+                out.appendAssumeCapacity(clone);
+            }
+        }
+        self.mutex.unlock();
+
+        if (failed) {
             for (out.items) |*p| p.deinit();
             out.deinit(allocator);
-        }
-        try out.ensureTotalCapacityPrecise(allocator, self.entries.items.len);
-        for (self.entries.items) |*e| {
-            if (e.ticket.common.isExpired(now_unix_ms)) continue;
-            var clone: PersistedClientEntry = .{
-                .usage = e.usage,
-                .insertion_sequence = e.insertion_sequence,
-                .lru_sequence = e.lru_sequence,
-            };
-            try e.ticket.cloneInto(allocator, &clone.ticket);
-            out.appendAssumeCapacity(clone);
+            self.endPersistenceSnapshot();
+            return error.OutOfMemory;
         }
         return out;
+    }
+
+    /// Clears `persistence_in_progress`. Must be called exactly once after
+    /// `cloneLiveForPersistence` succeeds, once the snapshot it returned is
+    /// either durably saved or abandoned.
+    pub fn endPersistenceSnapshot(self: *ClientSessionCache) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.persistence_in_progress = false;
     }
 
     pub const RestoreError = error{OutOfMemory};
@@ -672,29 +735,28 @@ pub const ClientSessionCache = struct {
     /// discarding expired ones, while preserving each entry's original
     /// `insertion_sequence`/`lru_sequence` exactly (unlike `storeClone`,
     /// which always assigns fresh values) so post-reload offer order and
-    /// eviction order match the pre-save cache. Each item is consumed
-    /// (moved out and either stored or wiped) regardless of outcome.
+    /// eviction order match the pre-save cache. Duplicate `(origin,
+    /// ticket-identity)` records — which a corrupted or hostile snapshot
+    /// could contain even though the live store never produces them — are
+    /// resolved deterministically: only the record with the largest
+    /// `insertion_sequence` (ties broken by later array position) survives,
+    /// matching the live store's own replace-on-duplicate rule.
     ///
-    /// This is fallible and atomic per call: any allocation failure aborts
-    /// immediately with `error.OutOfMemory` (still consuming every
-    /// remaining item so nothing leaks), and the caller must not treat a
-    /// partially-restored cache as successful. A record that is merely
+    /// Every item is consumed (deinitialized) regardless of outcome. This
+    /// is fallible and atomic per call: any allocation failure aborts
+    /// immediately with `error.OutOfMemory`, and the caller must not treat
+    /// a partially-restored cache as successful. A record that is merely
     /// rejected for ordinary capacity reasons (e.g. the current limits are
     /// tighter than when the snapshot was taken) is *not* an error — that
     /// entry is deterministically dropped and restoration continues; this
     /// is an explicit truncation policy, not a silent failure.
     pub fn restoreClones(self: *ClientSessionCache, items: []PersistedClientEntry, now_unix_ms: i64) RestoreError!void {
-        const Ctx = struct {
-            fn lessThan(_: void, a: PersistedClientEntry, b: PersistedClientEntry) bool {
-                return a.insertion_sequence < b.insertion_sequence;
-            }
-        };
-        std.mem.sort(PersistedClientEntry, items, {}, Ctx.lessThan);
+        defer for (items) |*item| item.deinit();
 
-        var failure: RestoreError!void = {};
+        markDuplicateClientRecords(items);
+
         for (items) |*item| {
-            defer item.deinit();
-            if (failure) |_| {} else |_| continue;
+            if (item.ticket.ticket.len == 0) continue; // dropped as a duplicate loser
             if (item.ticket.common.isExpired(now_unix_ms)) continue;
 
             const origin = originDigestFromCommon(&item.ticket.common);
@@ -702,12 +764,8 @@ pub const ClientSessionCache = struct {
             self.mutex.lock();
             const result = self.restoreLocked(&item.ticket, origin, item.usage, item.insertion_sequence, item.lru_sequence, now_unix_ms, &evicted);
             self.mutex.unlock();
-            switch (result) {
-                .storage_failed => failure = error.OutOfMemory,
-                else => {},
-            }
+            if (result == .storage_failed) return error.OutOfMemory;
         }
-        return failure;
     }
 
     fn restoreLocked(
@@ -756,8 +814,8 @@ pub const ClientSessionCache = struct {
         self.entries.appendAssumeCapacity(entry);
         self.total_bytes += new_bytes;
 
-        if (insertion_sequence >= self.next_insertion_sequence) self.next_insertion_sequence = insertion_sequence + 1;
-        if (lru_sequence >= self.next_lru_sequence) self.next_lru_sequence = lru_sequence + 1;
+        if (insertion_sequence >= self.next_insertion_sequence) self.next_insertion_sequence = insertion_sequence +% 1;
+        if (lru_sequence >= self.next_lru_sequence) self.next_lru_sequence = lru_sequence +% 1;
         return .stored;
     }
 
@@ -821,26 +879,15 @@ pub const ClientSessionCache = struct {
     }
 
     fn nextInsertionSequence(self: *ClientSessionCache) u64 {
-        if (self.next_insertion_sequence == std.math.maxInt(u64)) self.renumberInsertionSequences();
         const s = self.next_insertion_sequence;
-        self.next_insertion_sequence += 1;
+        self.next_insertion_sequence +%= 1;
         return s;
     }
 
     fn nextLruSequence(self: *ClientSessionCache) u64 {
-        self.reserveLruSequenceBatch(1);
         const s = self.next_lru_sequence;
-        self.next_lru_sequence += 1;
+        self.next_lru_sequence +%= 1;
         return s;
-    }
-
-    /// Ensures `count` consecutive `next_lru_sequence` values can be handed
-    /// out without wrapping, renumbering first if necessary. Renumbering
-    /// physically reorders `entries.items` (via sort), so callers that hold
-    /// array indices across multiple sequence assignments must reserve the
-    /// whole batch up front rather than calling `nextLruSequence` per index.
-    fn reserveLruSequenceBatch(self: *ClientSessionCache, needed_count: u64) void {
-        if (self.next_lru_sequence > std.math.maxInt(u64) - needed_count) self.renumberLruSequences();
     }
 
     fn nextEntryId(self: *ClientSessionCache) u64 {
@@ -848,29 +895,33 @@ pub const ClientSessionCache = struct {
         self.next_entry_id +%= 1;
         return id;
     }
-
-    fn renumberInsertionSequences(self: *ClientSessionCache) void {
-        const Ctx = struct {
-            fn lessThan(_: void, a: ClientEntry, b: ClientEntry) bool {
-                return a.insertion_sequence < b.insertion_sequence;
-            }
-        };
-        std.mem.sort(ClientEntry, self.entries.items, {}, Ctx.lessThan);
-        for (self.entries.items, 0..) |*e, i| e.insertion_sequence = @intCast(i);
-        self.next_insertion_sequence = self.entries.items.len;
-    }
-
-    fn renumberLruSequences(self: *ClientSessionCache) void {
-        const Ctx = struct {
-            fn lessThan(_: void, a: ClientEntry, b: ClientEntry) bool {
-                return a.lru_sequence < b.lru_sequence;
-            }
-        };
-        std.mem.sort(ClientEntry, self.entries.items, {}, Ctx.lessThan);
-        for (self.entries.items, 0..) |*e, i| e.lru_sequence = @intCast(i);
-        self.next_lru_sequence = self.entries.items.len;
-    }
 };
+
+/// Keeps, for each duplicate `(origin, ticket-identity)` pair, only the
+/// record with the largest `insertion_sequence` (ties broken by later
+/// array position); losers are deinitialized in place (their `ticket.len`
+/// becomes `0`, which `restoreClones` uses as a "already dropped" marker —
+/// a real ticket can never have length `0`, so this is unambiguous).
+fn markDuplicateClientRecords(items: []PersistedClientEntry) void {
+    var i: usize = 0;
+    while (i < items.len) : (i += 1) {
+        if (items[i].ticket.ticket.len == 0) continue;
+        const origin_i = originDigestFromCommon(&items[i].ticket.common);
+        var j = i + 1;
+        while (j < items.len) : (j += 1) {
+            if (items[j].ticket.ticket.len == 0) continue;
+            const origin_j = originDigestFromCommon(&items[j].ticket.common);
+            if (!std.mem.eql(u8, &origin_i, &origin_j)) continue;
+            if (!items[i].ticket.ticket.eql(&items[j].ticket.ticket)) continue;
+            if (items[i].insertion_sequence <= items[j].insertion_sequence) {
+                items[i].deinit();
+                break;
+            } else {
+                items[j].deinit();
+            }
+        }
+    }
+}
 
 // -----------------------------------------------------------------------
 // Stateful server cache
@@ -972,9 +1023,10 @@ pub const PersistedServerEntry = struct {
 /// *this specific acquisition* — a fresh epoch is assigned every time a
 /// single-use entry transitions from resolvable to pinned, so a stale token
 /// from an earlier acquisition can never commit or release a later,
-/// unrelated one of the same entry (unlike identifying only the entry,
-/// which does not change across a release-then-re-lease cycle). Reusable
-/// leases carry `single_use = false` and are a no-op everywhere.
+/// unrelated one of the same entry. Reusable leases carry
+/// `single_use = false`; `commit` still touches their recency (see
+/// `StatefulServerCache.commitLease`), but `release` is a no-op for them
+/// since they are never pinned.
 ///
 /// `deinit` releases the lease if it is still outstanding, so a caller that
 /// forgets to explicitly `commit`/`release` (e.g. an early-return error
@@ -987,11 +1039,15 @@ pub const ServerLease = struct {
     single_use: bool,
     active: bool = true,
 
+    /// Call after the shared #362 path has verified compatibility and the
+    /// binder for this resolution: for a single-use entry this consumes
+    /// it; for a reusable entry this only refreshes its LRU recency
+    /// (recency is deliberately updated here, on confirmed use, rather
+    /// than on the earlier `resolveLease` call).
     pub fn commit(self: *ServerLease) void {
         if (!self.active) return;
         self.active = false;
-        if (!self.single_use) return;
-        self.cache.commitLease(self.entry_id, self.lease_epoch);
+        self.cache.commitLease(self.entry_id, self.lease_epoch, self.single_use);
     }
 
     pub fn release(self: *ServerLease) void {
@@ -1010,6 +1066,10 @@ pub const ResolveLeaseResult = union(enum) {
     hit: struct { state: session.ServerRecoverableState, lease: ServerLease },
     miss,
     expired,
+    /// A single-use identity is otherwise resolvable, but a persistence
+    /// snapshot is currently in progress (see `persistence_in_progress`):
+    /// refused rather than risk a just-persisted-then-consumed ticket.
+    busy,
     storage_failed,
 
     pub fn deinit(self: *ResolveLeaseResult) void {
@@ -1050,6 +1110,11 @@ pub const StatefulServerCache = struct {
     next_entry_id: u64 = 1,
     next_lru_sequence: u64 = 0,
     next_lease_epoch: u64 = 1,
+    /// See `ClientSessionCache.persistence_in_progress`: set for the whole
+    /// duration of a save (through `endPersistenceSnapshot`), during which
+    /// new single-use leases are refused (`.busy`) rather than risk a
+    /// just-persisted-then-consumed ticket being resurrected on reload.
+    persistence_in_progress: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits, random: RandomSource) error{InvalidLimits}!StatefulServerCache {
         try limits.validate();
@@ -1128,7 +1193,7 @@ pub const StatefulServerCache = struct {
             defer self.mutex.unlock();
             result = blk: {
                 self.generateHandleLocked(&handle) catch break :blk .rejected_handle_generation_failed;
-                break :blk self.insertLocked(state, handle, origin, usage, now_unix_ms, bytes, self.reserveFreshLruSequenceLocked(), &evicted);
+                break :blk self.insertLocked(state, handle, origin, usage, now_unix_ms, bytes, self.nextLruSequenceLocked(), &evicted);
             };
         }
 
@@ -1144,6 +1209,37 @@ pub const StatefulServerCache = struct {
             .replaced => unreachable,
         });
         return result;
+    }
+
+    /// Whether `bytes` could possibly fit without evicting any currently
+    /// leased entry — a pure, non-mutating preflight. Leased entries are
+    /// never eviction candidates, so if the cache could never get under
+    /// its count/byte/per-origin limits using only *unleased* entries as
+    /// victims, the insert must be rejected before anything is mutated
+    /// (rather than evicting some unleased entries and only then
+    /// discovering the rest are leased).
+    fn canFitLocked(self: *StatefulServerCache, origin: OriginDigest, new_bytes: usize) bool {
+        var leased_count: usize = 0;
+        var leased_bytes: usize = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.active_lease_epoch != null) {
+                leased_count += 1;
+                leased_bytes += kv.value_ptr.bytes;
+            }
+        }
+        if (leased_count >= self.limits.max_entries) return false;
+        if (leased_bytes + new_bytes > self.limits.max_total_bytes) return false;
+
+        if (self.origin_index.get(origin)) |bucket| {
+            var origin_leased: usize = 0;
+            for (bucket.items) |id| {
+                const e = self.entries.getPtr(id) orelse continue;
+                if (e.active_lease_epoch != null) origin_leased += 1;
+            }
+            if (origin_leased >= self.limits.max_entries_per_origin) return false;
+        }
+        return true;
     }
 
     /// `lru_sequence` is supplied by the caller (rather than always
@@ -1163,40 +1259,47 @@ pub const StatefulServerCache = struct {
         self.purgeExpiredAllLocked(now_unix_ms, evicted);
         if (self.handle_index.contains(handle)) return .rejected_capacity;
 
-        const existing_bucket_len: usize = if (self.origin_index.get(origin)) |b| b.items.len else 0;
-        if (existing_bucket_len == 0 and self.origin_index.count() >= self.limits.max_origins) {
+        const is_new_origin = !self.origin_index.contains(origin);
+        if (is_new_origin and self.origin_index.count() >= self.limits.max_origins) {
             return .rejected_capacity;
         }
+        if (!self.canFitLocked(origin, bytes)) return .rejected_capacity;
 
         self.entries.ensureUnusedCapacity(self.allocator, 1) catch return .storage_failed;
         self.handle_index.ensureUnusedCapacity(self.allocator, 1) catch return .storage_failed;
-        self.origin_index.ensureUnusedCapacity(self.allocator, 1) catch return .storage_failed;
-        var bucket_ptr = self.origin_index.getPtr(origin);
-        if (bucket_ptr == null) {
-            self.origin_index.putAssumeCapacityNoClobber(origin, .empty);
-            bucket_ptr = self.origin_index.getPtr(origin).?;
-        }
-        bucket_ptr.?.ensureUnusedCapacity(self.allocator, 1) catch return .storage_failed;
 
-        while (bucket_ptr.?.items.len >= self.limits.max_entries_per_origin) {
-            if (!self.evictOldestUnleasedInBucket(bucket_ptr.?)) return .rejected_capacity;
+        // Evict purely by origin/handle lookup each call (never by a
+        // pointer/index retained across mutations): `removeEntryLocked`
+        // can delete or rehash the origin's bucket entirely (e.g. when it
+        // empties out), which would invalidate any pointer held across it.
+        while (self.originBucketLen(origin) >= self.limits.max_entries_per_origin) {
+            if (!self.evictOldestUnleasedInOrigin(origin)) return .rejected_capacity;
             evicted.* += 1;
         }
         while (self.entries.count() >= self.limits.max_entries or
             self.total_bytes + bytes > self.limits.max_total_bytes)
         {
-            if (self.entries.count() == 0) return .rejected_capacity;
             if (!self.evictOldestUnleasedGlobal()) return .rejected_capacity;
             evicted.* += 1;
-            // Global eviction may have removed this very origin's bucket
-            // (if the globally-oldest entry belonged to it and it emptied
-            // out); re-resolve the pointer defensively before reusing it.
-            bucket_ptr = self.origin_index.getPtr(origin);
-            if (bucket_ptr == null) {
-                self.origin_index.putAssumeCapacityNoClobber(origin, .empty);
-                bucket_ptr = self.origin_index.getPtr(origin).?;
-            }
         }
+
+        // Only now — after every eviction that could possibly touch
+        // `origin`'s bucket has already happened — resolve (or create) the
+        // bucket we're about to append to and reserve its capacity.
+        self.origin_index.ensureUnusedCapacity(self.allocator, 1) catch return .storage_failed;
+        var created_new_bucket = false;
+        var bucket_ptr = self.origin_index.getPtr(origin);
+        if (bucket_ptr == null) {
+            self.origin_index.putAssumeCapacityNoClobber(origin, .empty);
+            bucket_ptr = self.origin_index.getPtr(origin).?;
+            created_new_bucket = true;
+        }
+        bucket_ptr.?.ensureUnusedCapacity(self.allocator, 1) catch {
+            // Do not leave a phantom empty origin behind: it would
+            // permanently consume a `max_origins` slot for nothing.
+            if (created_new_bucket) _ = self.origin_index.remove(origin);
+            return .storage_failed;
+        };
 
         const entry_id = self.next_entry_id;
         self.next_entry_id +%= 1;
@@ -1206,7 +1309,7 @@ pub const StatefulServerCache = struct {
         self.handle_index.putAssumeCapacity(handle, entry_id);
         bucket_ptr.?.appendAssumeCapacity(entry_id);
         self.total_bytes += bytes;
-        if (lru_sequence >= self.next_lru_sequence) self.next_lru_sequence = lru_sequence + 1;
+        if (lru_sequence >= self.next_lru_sequence) self.next_lru_sequence = lru_sequence +% 1;
         return .stored;
     }
 
@@ -1214,9 +1317,12 @@ pub const StatefulServerCache = struct {
     /// any compatibility policy: the caller (the shared #362/#365 path)
     /// evaluates `session.evaluateCompatibility` on the returned state and
     /// then commits or releases the lease. A single-use entry already
-    /// leased by a concurrent resolution reports `.miss`, never a second
-    /// hit. The observer is notified only after the cache mutex has been
-    /// released, so a re-entrant observer cannot deadlock.
+    /// leased by a concurrent resolution, or one that would require a
+    /// *new* lease while a persistence snapshot is in progress, reports a
+    /// miss-shaped outcome rather than a hit (`.miss` / `.busy`
+    /// respectively) — never a second hit. The observer is notified only
+    /// after the cache mutex has been released, so a re-entrant observer
+    /// cannot deadlock.
     pub fn resolveLease(self: *StatefulServerCache, identity: []const u8, now_unix_ms: i64) ResolveLeaseResult {
         if (!isValidStatefulHandleShape(identity)) {
             self.observer.notify(.lookup_miss);
@@ -1233,9 +1339,14 @@ pub const StatefulServerCache = struct {
             const entry_id = self.handle_index.get(key) orelse break :blk .miss;
             const e = self.entries.getPtr(entry_id).?;
 
-            if (e.usage == .single_use and e.active_lease_epoch != null) {
+            const single_use = e.usage == .single_use;
+            if (single_use and e.active_lease_epoch != null) {
                 event = .lookup_miss;
                 break :blk .miss;
+            }
+            if (single_use and self.persistence_in_progress) {
+                event = .lookup_busy;
+                break :blk .busy;
             }
 
             if (e.state.common.isExpired(now_unix_ms)) {
@@ -1250,7 +1361,6 @@ pub const StatefulServerCache = struct {
                 break :blk .storage_failed;
             };
 
-            const single_use = e.usage == .single_use;
             var epoch: u64 = 0;
             if (single_use) {
                 epoch = self.next_lease_epoch;
@@ -1270,15 +1380,23 @@ pub const StatefulServerCache = struct {
     }
 
     /// Consumes a single-use entry after binder success, before any
-    /// PSK-selected ServerHello byte is emitted. No-op if `lease_epoch`
+    /// PSK-selected ServerHello byte is emitted; no-op if `lease_epoch`
     /// does not match the entry's current epoch (already committed,
-    /// released and re-leased by someone else, or removed/evicted).
-    fn commitLease(self: *StatefulServerCache, entry_id: u64, lease_epoch: u64) void {
+    /// released and re-leased by someone else, or removed/evicted). For a
+    /// reusable entry, refreshes its LRU recency instead of removing it —
+    /// recency is updated here (on confirmed, binder-verified use) rather
+    /// than at `resolveLease` time, so a session that keeps being
+    /// successfully resumed stays protected from eviction.
+    fn commitLease(self: *StatefulServerCache, entry_id: u64, lease_epoch: u64, single_use: bool) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const e = self.entries.getPtr(entry_id) orelse return;
-        if (e.active_lease_epoch != lease_epoch) return;
-        self.removeEntryLocked(entry_id);
+        if (single_use) {
+            if (e.active_lease_epoch != lease_epoch) return;
+            self.removeEntryLocked(entry_id);
+        } else {
+            e.lru_sequence = self.nextLruSequenceLocked();
+        }
     }
 
     /// Releases a pinned single-use entry (incompatibility, bad binder, or
@@ -1296,34 +1414,61 @@ pub const StatefulServerCache = struct {
 
     /// Deep-clones every non-expired entry for a persistence save,
     /// including its exact `lru_sequence`. Refuses with `error.CacheBusy`
-    /// if any single-use entry is currently leased: a snapshot taken while
-    /// a handshake might still commit that same ticket could otherwise
-    /// resurrect an already-consumed session after a restart. Must be
-    /// called outside any persistence I/O.
+    /// if any single-use entry is currently leased. Sets
+    /// `persistence_in_progress` for the duration of the *whole* save
+    /// (through `endPersistenceSnapshot`), during which `resolveLease`
+    /// refuses to hand out any *new* single-use lease — together these
+    /// close the race where a ticket is resolved and committed after being
+    /// cloned into a snapshot but before that snapshot reaches durable
+    /// storage, which would otherwise let a restart resurrect an
+    /// already-consumed ticket.
     pub fn cloneLiveForPersistence(
         self: *StatefulServerCache,
         allocator: std.mem.Allocator,
         now_unix_ms: i64,
     ) PersistenceError!std.ArrayListUnmanaged(PersistedServerEntry) {
         self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.hasOutstandingLeaseLocked()) return error.CacheBusy;
+        if (self.hasOutstandingLeaseLocked()) {
+            self.mutex.unlock();
+            return error.CacheBusy;
+        }
+        self.persistence_in_progress = true;
 
         var out: std.ArrayListUnmanaged(PersistedServerEntry) = .empty;
-        errdefer {
+        var failed = false;
+        out.ensureTotalCapacityPrecise(allocator, self.entries.count()) catch {
+            failed = true;
+        };
+        if (!failed) {
+            var it = self.entries.valueIterator();
+            while (it.next()) |e| {
+                if (e.state.common.isExpired(now_unix_ms)) continue;
+                var clone: PersistedServerEntry = .{ .handle = e.handle, .usage = e.usage, .lru_sequence = e.lru_sequence };
+                e.state.cloneInto(allocator, &clone.state) catch {
+                    failed = true;
+                    break;
+                };
+                out.appendAssumeCapacity(clone);
+            }
+        }
+        self.mutex.unlock();
+
+        if (failed) {
             for (out.items) |*p| p.deinit();
             out.deinit(allocator);
-        }
-        try out.ensureTotalCapacityPrecise(allocator, self.entries.count());
-        var it = self.entries.valueIterator();
-        while (it.next()) |e| {
-            if (e.state.common.isExpired(now_unix_ms)) continue;
-            var clone: PersistedServerEntry = .{ .handle = e.handle, .usage = e.usage, .lru_sequence = e.lru_sequence };
-            try e.state.cloneInto(allocator, &clone.state);
-            out.appendAssumeCapacity(clone);
+            self.endPersistenceSnapshot();
+            return error.OutOfMemory;
         }
         return out;
+    }
+
+    /// Clears `persistence_in_progress`. Must be called exactly once after
+    /// `cloneLiveForPersistence` succeeds, once the snapshot it returned is
+    /// either durably saved or abandoned.
+    pub fn endPersistenceSnapshot(self: *StatefulServerCache) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.persistence_in_progress = false;
     }
 
     /// Whether any single-use entry currently has an outstanding lease.
@@ -1344,28 +1489,28 @@ pub const StatefulServerCache = struct {
         return false;
     }
 
-    pub const RestoreError = error{OutOfMemory};
+    pub const RestoreError = error{ OutOfMemory, DuplicateHandle };
 
     /// Restores previously-persisted entries, preserving each entry's
     /// original `lru_sequence`, enforcing current limits, discarding
     /// expired entries, and rejecting any with a malformed handle shape.
-    /// Fallible and atomic per call: an allocation failure aborts
-    /// immediately with `error.OutOfMemory` (still consuming every
-    /// remaining item). An ordinary capacity/duplicate-handle rejection for
-    /// an individual record is an explicit, documented truncation, not an
+    /// Two different states sharing one bearer handle is an unambiguous
+    /// sign of a corrupted snapshot (never produced by the live store, which
+    /// generates handles unpredictably and checks for collisions): the
+    /// *whole* restore is rejected with `error.DuplicateHandle` rather than
+    /// silently keeping whichever record happens to be processed first.
+    ///
+    /// Every item is consumed regardless of outcome. Otherwise fallible and
+    /// atomic per call: an allocation failure aborts immediately with
+    /// `error.OutOfMemory`. An ordinary capacity rejection for an
+    /// individual record is an explicit, documented truncation, not an
     /// error — see `ClientSessionCache.restoreClones`.
     pub fn restoreEntries(self: *StatefulServerCache, items: []PersistedServerEntry, now_unix_ms: i64) RestoreError!void {
-        const Ctx = struct {
-            fn lessThan(_: void, a: PersistedServerEntry, b: PersistedServerEntry) bool {
-                return a.lru_sequence < b.lru_sequence;
-            }
-        };
-        std.mem.sort(PersistedServerEntry, items, {}, Ctx.lessThan);
+        defer for (items) |*item| item.deinit();
 
-        var failure: RestoreError!void = {};
+        if (hasDuplicateServerHandle(items)) return error.DuplicateHandle;
+
         for (items) |*item| {
-            defer item.deinit();
-            if (failure) |_| {} else |_| continue;
             if (item.state.common.isExpired(now_unix_ms)) continue;
             if (!isValidStatefulHandleShape(&item.handle)) continue;
 
@@ -1375,12 +1520,49 @@ pub const StatefulServerCache = struct {
             self.mutex.lock();
             const result = self.insertLocked(&item.state, item.handle, origin, item.usage, now_unix_ms, bytes, item.lru_sequence, &evicted);
             self.mutex.unlock();
-            switch (result) {
-                .storage_failed => failure = error.OutOfMemory,
-                else => {},
+            if (result == .storage_failed) return error.OutOfMemory;
+        }
+    }
+
+    fn generateHandleLocked(self: *StatefulServerCache, out: *[stateful_identity_len]u8) HandleError!void {
+        var attempt: usize = 0;
+        while (attempt < max_handle_generation_attempts) : (attempt += 1) {
+            var candidate: [stateful_identity_len]u8 = undefined;
+            @memcpy(candidate[0..4], &stateful_magic);
+            std.mem.writeInt(u16, candidate[4..6], stateful_version, .big);
+            std.mem.writeInt(u16, candidate[6..8], 0, .big);
+            self.random.fill(candidate[8..stateful_identity_len]) catch return error.HandleGenerationFailed;
+            if (!self.handle_index.contains(candidate)) {
+                out.* = candidate;
+                return;
             }
         }
-        return failure;
+        return error.HandleGenerationFailed;
+    }
+
+    fn purgeExpiredAllLocked(self: *StatefulServerCache, now_unix_ms: i64, evicted: *usize) void {
+        // Allocation-free by construction (repeated single-pass scans)
+        // rather than collecting stale ids into a temporary list: an
+        // allocation failure here must never silently leave expired
+        // entries behind (they could then permanently block capacity).
+        while (true) {
+            var found: ?u64 = null;
+            var it = self.entries.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.active_lease_epoch != null) continue;
+                if (kv.value_ptr.state.common.isExpired(now_unix_ms)) {
+                    found = kv.key_ptr.*;
+                    break;
+                }
+            }
+            const id = found orelse break;
+            self.removeEntryLocked(id);
+            evicted.* += 1;
+        }
+    }
+
+    fn originBucketLen(self: *StatefulServerCache, origin: OriginDigest) usize {
+        return if (self.origin_index.get(origin)) |b| b.items.len else 0;
     }
 
     /// Removes and wipes a stored entry by its stable `entry_id`,
@@ -1409,40 +1591,13 @@ pub const StatefulServerCache = struct {
         secrets.secureZero(&entry.handle);
     }
 
-    fn generateHandleLocked(self: *StatefulServerCache, out: *[stateful_identity_len]u8) HandleError!void {
-        var attempt: usize = 0;
-        while (attempt < max_handle_generation_attempts) : (attempt += 1) {
-            var candidate: [stateful_identity_len]u8 = undefined;
-            @memcpy(candidate[0..4], &stateful_magic);
-            std.mem.writeInt(u16, candidate[4..6], stateful_version, .big);
-            std.mem.writeInt(u16, candidate[6..8], 0, .big);
-            self.random.fill(candidate[8..stateful_identity_len]) catch return error.HandleGenerationFailed;
-            if (!self.handle_index.contains(candidate)) {
-                out.* = candidate;
-                return;
-            }
-        }
-        return error.HandleGenerationFailed;
-    }
-
-    fn purgeExpiredAllLocked(self: *StatefulServerCache, now_unix_ms: i64, evicted: *usize) void {
-        var stale: std.ArrayListUnmanaged(u64) = .empty;
-        defer stale.deinit(self.allocator);
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            const e = kv.value_ptr;
-            if (e.active_lease_epoch != null) continue;
-            if (e.state.common.isExpired(now_unix_ms)) {
-                stale.append(self.allocator, kv.key_ptr.*) catch continue;
-            }
-        }
-        for (stale.items) |id| {
-            self.removeEntryLocked(id);
-            evicted.* += 1;
-        }
-    }
-
-    fn evictOldestUnleasedInBucket(self: *StatefulServerCache, bucket: *OriginBucket) bool {
+    /// Finds and evicts the globally-oldest (by `lru_sequence`) unleased
+    /// entry within `origin`'s bucket. Re-fetches the bucket internally on
+    /// every call rather than accepting a caller-held pointer: eviction can
+    /// delete/rehash the bucket, so no pointer to it may survive across a
+    /// mutation.
+    fn evictOldestUnleasedInOrigin(self: *StatefulServerCache, origin: OriginDigest) bool {
+        const bucket = self.origin_index.getPtr(origin) orelse return false;
         var best_id: ?u64 = null;
         var best_seq: u64 = undefined;
         for (bucket.items) |id| {
@@ -1475,36 +1630,23 @@ pub const StatefulServerCache = struct {
         return true;
     }
 
-    /// Reserves and returns a fresh LRU sequence value, renumbering first
-    /// if the counter is about to wrap. Must be called before
-    /// `insertLocked` under the same critical section (see `insertMove`).
-    fn reserveFreshLruSequenceLocked(self: *StatefulServerCache) u64 {
-        if (self.next_lru_sequence == std.math.maxInt(u64)) self.renumberLruSequencesLocked();
+    fn nextLruSequenceLocked(self: *StatefulServerCache) u64 {
         const s = self.next_lru_sequence;
-        self.next_lru_sequence += 1;
+        self.next_lru_sequence +%= 1;
         return s;
     }
-
-    fn renumberLruSequencesLocked(self: *StatefulServerCache) void {
-        const Pair = struct { id: u64, seq: u64 };
-        var pairs: std.ArrayListUnmanaged(Pair) = .empty;
-        defer pairs.deinit(self.allocator);
-        pairs.ensureTotalCapacityPrecise(self.allocator, self.entries.count()) catch return;
-        var it = self.entries.iterator();
-        while (it.next()) |kv| pairs.appendAssumeCapacity(.{ .id = kv.key_ptr.*, .seq = kv.value_ptr.lru_sequence });
-
-        const Ctx = struct {
-            fn lessThan(_: void, a: Pair, b: Pair) bool {
-                return a.seq < b.seq;
-            }
-        };
-        std.mem.sort(Pair, pairs.items, {}, Ctx.lessThan);
-        for (pairs.items, 0..) |p, i| {
-            if (self.entries.getPtr(p.id)) |e| e.lru_sequence = @intCast(i);
-        }
-        self.next_lru_sequence = pairs.items.len;
-    }
 };
+
+fn hasDuplicateServerHandle(items: []const PersistedServerEntry) bool {
+    var i: usize = 0;
+    while (i < items.len) : (i += 1) {
+        var j = i + 1;
+        while (j < items.len) : (j += 1) {
+            if (std.mem.eql(u8, &items[i].handle, &items[j].handle)) return true;
+        }
+    }
+    return false;
+}
 
 // -----------------------------------------------------------------------
 // Tests
@@ -1561,14 +1703,6 @@ fn fixedFill(bytes: []const u8) RandomSource {
             @memcpy(buf, src[0..buf.len]);
         }
     }.fill };
-}
-
-/// Asserts `session.evaluateCompatibility` accepts `state` against
-/// `candidate`, simulating the shared #362 path that will sit between
-/// `resolveLease` and `commit`/`release` once wired up.
-fn expectEligible(state: *const session.ServerRecoverableState, candidate: session.CandidateContext, now_unix_ms: i64) !void {
-    const decision = session.evaluateCompatibility(&state.common, candidate, now_unix_ms);
-    try testing.expectEqual(session.ResumeEligibility.eligible, decision.resumption);
 }
 
 test "origin digest ignores ticket identity but distinguishes SNI/ALPN/auth" {
@@ -1903,11 +2037,26 @@ test "client cache single-use consumption removes only the matching entry" {
     t2.deinit();
 
     const origin = originDigestFromCandidate(testCandidate("example.test"));
-    cache.consumeSingleUse(origin, "single");
+    try testing.expect(cache.consumeSingleUse(origin, "single"));
     try testing.expectEqual(@as(usize, 1), cache.count());
     var result = cache.lookupOffers(testCandidate("example.test"), 2);
     defer result.deinit();
     try testing.expectEqualStrings("reusable", result.hit.constSlice()[0].ticket.slice());
+}
+
+test "consumeSingleUse refuses to consume while a persistence snapshot is in progress" {
+    var cache = try ClientSessionCache.init(testing.allocator, Limits.client_default);
+    defer cache.deinit();
+    var t1 = try testClient(testing.allocator, "single", "example.test", 0, 1000, 0);
+    _ = cache.storeClone(&t1, 0, .single_use);
+    t1.deinit();
+
+    cache.persistence_in_progress = true;
+    const origin = originDigestFromCandidate(testCandidate("example.test"));
+    try testing.expect(!cache.consumeSingleUse(origin, "single"));
+    try testing.expectEqual(@as(usize, 1), cache.count());
+    cache.persistence_in_progress = false;
+    try testing.expect(cache.consumeSingleUse(origin, "single"));
 }
 
 test "client cache allocation failure during storeClone leaves the cache unchanged" {
@@ -1946,17 +2095,15 @@ test "client cache zeroizes ticket bytes on eviction and deinit" {
     try testing.expect(std.mem.indexOf(u8, &backing, "zeroize-me-please") == null);
 }
 
-test "client cache sequence renumbering preserves relative order" {
+test "client cache sequence counters wrap safely near u64 max without corrupting order" {
     var cache = try ClientSessionCache.init(testing.allocator, Limits.client_default);
     defer cache.deinit();
-    cache.next_insertion_sequence = std.math.maxInt(u64) - 1;
-    cache.next_lru_sequence = std.math.maxInt(u64) - 1;
+    cache.next_insertion_sequence = std.math.maxInt(u64);
+    cache.next_lru_sequence = std.math.maxInt(u64);
 
     var t1 = try testClient(testing.allocator, "t1", "example.test", 0, 1000, 0);
     _ = cache.storeClone(&t1, 0, .reusable);
     t1.deinit();
-    // This store forces a renumber (both counters started at max - 1, so
-    // the second store's sequence assignment hits the max case for each).
     var t2 = try testClient(testing.allocator, "t2", "example.test", 0, 1000, 1);
     _ = cache.storeClone(&t2, 1, .reusable);
     t2.deinit();
@@ -1964,8 +2111,6 @@ test "client cache sequence renumbering preserves relative order" {
     var result = cache.lookupOffers(testCandidate("example.test"), 2);
     defer result.deinit();
     try testing.expectEqual(@as(usize, 2), result.hit.len);
-    try testing.expectEqualStrings("t2", result.hit.constSlice()[0].ticket.slice());
-    try testing.expectEqualStrings("t1", result.hit.constSlice()[1].ticket.slice());
 }
 
 test "restoreClones preserves persisted insertion/LRU order rather than reassigning by array position" {
@@ -1982,8 +2127,7 @@ test "restoreClones preserves persisted insertion/LRU order rather than reassign
     t3.deinit();
 
     // Touch t1 so its LRU recency (but not its insertion order) becomes
-    // newest, then physically scramble array order via a swapRemove-driven
-    // eviction unrelated to these three (a different, tiny origin cap).
+    // newest.
     var touch = cache.lookupOffers(testCandidate("example.test"), 3);
     touch.deinit();
 
@@ -2006,6 +2150,30 @@ test "restoreClones preserves persisted insertion/LRU order rather than reassign
     for (before.hit.constSlice(), after.hit.constSlice()) |*b, *a| {
         try testing.expectEqualStrings(b.ticket.slice(), a.ticket.slice());
     }
+}
+
+test "restoreClones deduplicates repeated (origin, ticket) records, keeping the newest" {
+    const older = try testClient(testing.allocator, "dup", "example.test", 0, 1000, 0);
+    const newer = try testClient(testing.allocator, "dup", "example.test", 0, 1000, 0);
+    var items = [_]PersistedClientEntry{
+        .{ .ticket = older, .usage = .reusable, .insertion_sequence = 3, .lru_sequence = 3 },
+        .{ .ticket = newer, .usage = .single_use, .insertion_sequence = 9, .lru_sequence = 9 },
+    };
+
+    var cache = try ClientSessionCache.init(testing.allocator, Limits.client_default);
+    defer cache.deinit();
+    try cache.restoreClones(&items, 1);
+    try testing.expectEqual(@as(usize, 1), cache.count());
+
+    var result = cache.lookupOffers(testCandidate("example.test"), 1);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.hit.len);
+    try testing.expectEqualStrings("dup", result.hit.constSlice()[0].ticket.slice());
+
+    // The surviving record is the newer one (single_use): consuming it via
+    // the single-use path must succeed.
+    const origin = originDigestFromCandidate(testCandidate("example.test"));
+    try testing.expect(cache.consumeSingleUse(origin, "dup"));
 }
 
 test "restoreClones aborts atomically on allocation failure without touching the live cache" {
@@ -2120,6 +2288,41 @@ test "stateful server cache issues distinct TDSH handles and resolves a reusable
     try testing.expect(result2 == .hit);
 }
 
+test "stateful server commit refreshes LRU recency for a reusable entry" {
+    var limits = Limits.stateful_server_default;
+    limits.max_entries = 2;
+    var cache = try StatefulServerCache.init(testing.allocator, limits, system_random_source);
+    defer cache.deinit();
+
+    var s1 = try testServerState(testing.allocator, "a.test", 0, 1000);
+    var h1: [stateful_identity_len]u8 = undefined;
+    _ = cache.insertMove(&s1, 0, .reusable, &h1);
+    var s2 = try testServerState(testing.allocator, "b.test", 0, 1000);
+    var h2: [stateful_identity_len]u8 = undefined;
+    _ = cache.insertMove(&s2, 1, .reusable, &h2);
+
+    // Resolve+commit the older entry (h1) so its recency refreshes.
+    var result = cache.resolveLease(&h1, 2);
+    switch (result) {
+        .hit => |*h| h.lease.commit(),
+        else => try testing.expect(false),
+    }
+    result.deinit();
+
+    // Insert a third entry under a capacity of 2: without the commit-time
+    // recency refresh, h1 (inserted first) would be evicted; with it, h2
+    // (never touched since insertion) is the true LRU victim instead.
+    var s3 = try testServerState(testing.allocator, "c.test", 0, 1000);
+    var h3: [stateful_identity_len]u8 = undefined;
+    _ = cache.insertMove(&s3, 3, .reusable, &h3);
+
+    var still_h1 = cache.resolveLease(&h1, 4);
+    defer still_h1.deinit();
+    try testing.expect(still_h1 == .hit);
+    const gone_h2 = cache.resolveLease(&h2, 4);
+    try testing.expect(gone_h2 == .miss);
+}
+
 test "stateful server single-use entry is pinned during resolution and consumed on commit" {
     var cache = try StatefulServerCache.init(testing.allocator, Limits.stateful_server_default, system_random_source);
     defer cache.deinit();
@@ -2183,13 +2386,7 @@ test "a stale lease token cannot commit or release a later, unrelated resolution
 
     // A's stale token must not be able to commit B's active lease...
     a_lease.commit();
-    var still_there = cache.resolveLease(&handle, 10);
-    // B still holds its own lease, so a concurrent resolve reports miss —
-    // that alone proves A's stale commit did not delete the entry (a
-    // deleted entry would report `.miss` for a *different* reason, so also
-    // assert the entry count directly).
     try testing.expectEqual(@as(usize, 1), cache.count());
-    if (still_there == .hit) still_there.deinit();
 
     // ...nor release it back to resolvable out from under B.
     a_lease.release();
@@ -2257,6 +2454,24 @@ test "stateful server rejects unknown, malformed, and expired identities without
     try testing.expectEqual(@as(usize, 0), cache.count());
 }
 
+test "resolveLease refuses a new single-use lease while a persistence snapshot is in progress" {
+    var cache = try StatefulServerCache.init(testing.allocator, Limits.stateful_server_default, system_random_source);
+    defer cache.deinit();
+    var state = try testServerState(testing.allocator, "example.test", 0, 1000);
+    var handle: [stateful_identity_len]u8 = undefined;
+    _ = cache.insertMove(&state, 0, .single_use, &handle);
+
+    cache.persistence_in_progress = true;
+    const busy = cache.resolveLease(&handle, 1);
+    try testing.expect(busy == .busy);
+    try testing.expectEqual(@as(usize, 1), cache.count());
+
+    cache.persistence_in_progress = false;
+    var hit = cache.resolveLease(&handle, 1);
+    defer hit.deinit();
+    try testing.expect(hit == .hit);
+}
+
 test "stateful server bounded handle-generation collisions return a typed failure" {
     const fixed = [_]u8{0xAA} ** 32;
     var cache = try StatefulServerCache.init(testing.allocator, Limits.stateful_server_default, fixedFill(&fixed));
@@ -2274,7 +2489,7 @@ test "stateful server bounded handle-generation collisions return a typed failur
     try testing.expectEqualStrings("other.test", second.common.server_name.?.slice());
 }
 
-test "stateful server enforces per-origin and global capacity with deterministic eviction and O(1)-shaped indexes" {
+test "stateful server enforces per-origin and global capacity with deterministic eviction and consistent indexes" {
     var limits = Limits.stateful_server_default;
     limits.max_entries_per_origin = 2;
     limits.max_entries = 3;
@@ -2303,6 +2518,32 @@ test "stateful server enforces per-origin and global capacity with deterministic
     try testing.expect(!cache.handle_index.contains(h[0]));
 }
 
+test "per-origin eviction at capacity 1 does not leave a dangling bucket pointer (regression)" {
+    var limits = Limits.stateful_server_default;
+    limits.max_entries_per_origin = 1;
+    var cache = try StatefulServerCache.init(testing.allocator, limits, system_random_source);
+    defer cache.deinit();
+
+    var s1 = try testServerState(testing.allocator, "a.test", 0, 1000);
+    var h1: [stateful_identity_len]u8 = undefined;
+    _ = cache.insertMove(&s1, 0, .reusable, &h1);
+
+    // Inserting a second entry for the same origin evicts the only bucket
+    // member, which removes and deinitializes the (now-empty) bucket from
+    // `origin_index` mid-insert. The insert must still complete correctly
+    // with all indexes consistent rather than using a stale bucket pointer.
+    var s2 = try testServerState(testing.allocator, "a.test", 0, 1000);
+    var h2: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&s2, 1, .reusable, &h2));
+    try testing.expectEqual(@as(usize, 1), cache.count());
+    try testing.expect(!cache.handle_index.contains(h1));
+    try testing.expect(cache.handle_index.contains(h2));
+
+    var hit = cache.resolveLease(&h2, 2);
+    defer hit.deinit();
+    try testing.expect(hit == .hit);
+}
+
 test "stateful server leased single-use entries are never eviction candidates" {
     var limits = Limits.stateful_server_default;
     limits.max_entries = 1;
@@ -2319,8 +2560,10 @@ test "stateful server leased single-use entries are never eviction candidates" {
     var s2 = try testServerState(testing.allocator, "b.test", 0, 1000);
     defer s2.deinit();
     var h2: [stateful_identity_len]u8 = undefined;
-    // No unleased entry to evict, and capacity is exactly 1: rejected.
+    // No unleased entry to evict, and capacity is exactly 1: rejected
+    // *without* first evicting anything (canFitLocked's preflight).
     try testing.expectEqual(StoreResult.rejected_capacity, cache.insertMove(&s2, 1, .reusable, &h2));
+    try testing.expectEqual(@as(usize, 1), cache.count());
 
     switch (leased) {
         .hit => |*h| h.lease.release(),
@@ -2415,8 +2658,29 @@ test "cloneLiveForPersistence refuses to snapshot a currently-leased single-use 
     defer {
         for (snapshot.items) |*p| p.deinit();
         snapshot.deinit(testing.allocator);
+        cache.endPersistenceSnapshot();
     }
     try testing.expectEqual(@as(usize, 0), snapshot.items.len);
+}
+
+test "restoreEntries rejects duplicate handles as a corrupted snapshot" {
+    const s1 = try testServerState(testing.allocator, "a.test", 0, 1000);
+    const s2 = try testServerState(testing.allocator, "b.test", 0, 1000);
+    var handle: [stateful_identity_len]u8 = undefined;
+    @memcpy(handle[0..4], "TDSH");
+    std.mem.writeInt(u16, handle[4..6], 1, .big);
+    std.mem.writeInt(u16, handle[6..8], 0, .big);
+    @memset(handle[8..], 0xAB);
+
+    var items = [_]PersistedServerEntry{
+        .{ .handle = handle, .usage = .reusable, .state = s1 },
+        .{ .handle = handle, .usage = .reusable, .state = s2 },
+    };
+
+    var cache = try StatefulServerCache.init(testing.allocator, Limits.stateful_server_default, system_random_source);
+    defer cache.deinit();
+    try testing.expectError(error.DuplicateHandle, cache.restoreEntries(&items, 1));
+    try testing.expectEqual(@as(usize, 0), cache.count());
 }
 
 test "client and server persistence snapshots round trip through clone/restore" {
@@ -2430,6 +2694,7 @@ test "client and server persistence snapshots round trip through clone/restore" 
     defer {
         for (snapshot.items) |*p| p.deinit();
         snapshot.deinit(testing.allocator);
+        cache.endPersistenceSnapshot();
     }
     try testing.expectEqual(@as(usize, 1), snapshot.items.len);
     try testing.expectEqual(UsagePolicy.single_use, snapshot.items[0].usage);
@@ -2449,6 +2714,7 @@ test "client and server persistence snapshots round trip through clone/restore" 
     defer {
         for (server_snapshot.items) |*p| p.deinit();
         server_snapshot.deinit(testing.allocator);
+        server_cache.endPersistenceSnapshot();
     }
     try testing.expectEqual(@as(usize, 1), server_snapshot.items.len);
     try testing.expect(std.mem.eql(u8, &server_snapshot.items[0].handle, &handle));
@@ -2460,4 +2726,9 @@ test "client and server persistence snapshots round trip through clone/restore" 
     var hit = restored_server.resolveLease(&handle, 2);
     defer hit.deinit();
     try testing.expect(hit == .hit);
+}
+
+fn expectEligible(state: *const session.ServerRecoverableState, candidate: session.CandidateContext, now_unix_ms: i64) !void {
+    const decision = session.evaluateCompatibility(&state.common, candidate, now_unix_ms);
+    try testing.expectEqual(session.ResumeEligibility.eligible, decision.resumption);
 }

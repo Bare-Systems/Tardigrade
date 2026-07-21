@@ -41,15 +41,35 @@ pub const snapshot_magic = [4]u8{ 'T', 'D', 'P', 'S' };
 pub const snapshot_version: u8 = 1;
 const header_len: usize = 4 + 1 + 1 + 4;
 
-/// Hard ceiling on total plaintext snapshot size, checked before any
-/// header/record parsing begins. Generous relative to the cache byte
-/// budgets (`Limits.hard_max_total_bytes`) so a legitimate snapshot never
-/// approaches it, while still bounding a corrupted or malicious buffer.
-pub const hard_max_snapshot_bytes: usize = 16 * 1024 * 1024;
+/// Fallback ceiling used only when no cache-specific bound is available
+/// (i.e. calling the encode/decode helpers directly rather than through
+/// `saveClientCache`/`loadClientCache`/`saveServerCache`/`loadServerCache`,
+/// which derive a bound from the target cache's own `Limits` — see
+/// `maxPlaintextBytesFor`). A fixed ceiling here must never be smaller than
+/// a legitimate cache's own configured limits allow, or a perfectly valid
+/// snapshot could be rejected as oversized after a successful save.
+pub const fallback_max_snapshot_bytes: usize = 16 * 1024 * 1024;
+
+/// Conservative fixed per-record framing overhead (usage/handle/sequence/
+/// length fields) used only to size the plaintext ceiling; the real
+/// per-record framing cost is well under this.
+const per_record_overhead_bytes: usize = 64;
+
+/// Derives the plaintext size ceiling from a target cache's own limits:
+/// its configured total-byte budget plus a fixed overhead per possible
+/// entry, checked with saturating arithmetic (a bound derived this way is
+/// only ever used as a ceiling for rejection, never to size an allocation
+/// directly, so saturating to `maxInt(usize)` on the extreme/unrealistic
+/// end just makes the check permissive rather than unsafe).
+pub fn maxPlaintextBytesFor(limits: session_cache.Limits) usize {
+    const per_entry_overhead = std.math.mul(usize, limits.max_entries, per_record_overhead_bytes) catch return std.math.maxInt(usize);
+    const body = std.math.add(usize, limits.max_total_bytes, per_entry_overhead) catch return std.math.maxInt(usize);
+    return std.math.add(usize, header_len, body) catch return std.math.maxInt(usize);
+}
 
 pub const SnapshotKind = enum(u8) { client = 1, server = 2 };
 
-pub const SnapshotEncodeError = session.EncodeError || error{OutOfMemory};
+pub const SnapshotEncodeError = session.EncodeError || error{ OutOfMemory, Overflow };
 pub const SnapshotDecodeError = error{
     OutOfMemory,
     SnapshotTooLarge,
@@ -93,8 +113,8 @@ const Header = struct {
     body: []const u8,
 };
 
-fn readHeader(bytes: []const u8) SnapshotDecodeError!Header {
-    if (bytes.len > hard_max_snapshot_bytes) return error.SnapshotTooLarge;
+fn readHeader(bytes: []const u8, max_plaintext_bytes: usize) SnapshotDecodeError!Header {
+    if (bytes.len > max_plaintext_bytes) return error.SnapshotTooLarge;
     if (bytes.len < header_len) return error.Truncated;
     if (!std.mem.eql(u8, bytes[0..4], &snapshot_magic)) return error.BadMagic;
     if (bytes[4] != snapshot_version) return error.UnsupportedVersion;
@@ -114,7 +134,8 @@ pub fn encodeClientSnapshotAlloc(
     var total: usize = header_len;
     for (entries) |*e| {
         const encoded_len = try session.clientEncodedLenWithLimits(&e.ticket, limits);
-        total += 1 + 8 + 8 + 4 + encoded_len;
+        const record_len = std.math.add(usize, 1 + 8 + 8 + 4, encoded_len) catch return error.Overflow;
+        total = std.math.add(usize, total, record_len) catch return error.Overflow;
     }
 
     const buf = try allocator.alloc(u8, total);
@@ -153,7 +174,8 @@ pub fn encodeServerSnapshotAlloc(
     var total: usize = header_len;
     for (entries) |*e| {
         const encoded_len = try session.serverEncodedLenWithLimits(&e.state, limits);
-        total += 1 + session_cache.stateful_identity_len + 8 + 4 + encoded_len;
+        const record_len = std.math.add(usize, 1 + session_cache.stateful_identity_len + 8 + 4, encoded_len) catch return error.Overflow;
+        total = std.math.add(usize, total, record_len) catch return error.Overflow;
     }
 
     const buf = try allocator.alloc(u8, total);
@@ -189,9 +211,10 @@ pub fn decodeClientSnapshotAlloc(
     allocator: std.mem.Allocator,
     limits: session.Limits,
     max_entries: usize,
+    max_plaintext_bytes: usize,
     bytes: []const u8,
 ) SnapshotDecodeError!std.ArrayListUnmanaged(session_cache.PersistedClientEntry) {
-    const header = try readHeader(bytes);
+    const header = try readHeader(bytes, max_plaintext_bytes);
     if (header.kind != .client) return error.UnsupportedKind;
     if (header.count > max_entries or header.count > session_cache.hard_max_entries) return error.TooManyRecords;
 
@@ -237,9 +260,10 @@ pub fn decodeServerSnapshotAlloc(
     allocator: std.mem.Allocator,
     limits: session.Limits,
     max_entries: usize,
+    max_plaintext_bytes: usize,
     bytes: []const u8,
 ) SnapshotDecodeError!std.ArrayListUnmanaged(session_cache.PersistedServerEntry) {
-    const header = try readHeader(bytes);
+    const header = try readHeader(bytes, max_plaintext_bytes);
     if (header.kind != .server) return error.UnsupportedKind;
     if (header.count > max_entries or header.count > session_cache.hard_max_entries) return error.TooManyRecords;
 
@@ -375,6 +399,7 @@ pub fn saveClientCache(
     defer {
         for (snapshot.items) |*p| p.deinit();
         snapshot.deinit(cache.allocator);
+        cache.endPersistenceSnapshot();
     }
 
     const plaintext = encodeClientSnapshotAlloc(cache.allocator, snapshot.items, limits) catch return .allocation_failed;
@@ -412,7 +437,9 @@ pub fn loadClientCache(
         cache.allocator.free(sealed);
     }
 
+    const max_plaintext_bytes = maxPlaintextBytesFor(cache.limits);
     const plaintext_len = protector.openLen(sealed.len);
+    if (plaintext_len > max_plaintext_bytes) return .corrupted;
     const plaintext_buf = cache.allocator.alloc(u8, plaintext_len) catch return .allocation_failed;
     defer {
         secrets.secureZero(plaintext_buf);
@@ -420,7 +447,7 @@ pub fn loadClientCache(
     }
     const plaintext = protector.open(sealed, plaintext_buf) catch return .protection_failed;
 
-    var entries = decodeClientSnapshotAlloc(cache.allocator, limits, cache.limits.max_entries, plaintext) catch |err| return mapDecodeError(err);
+    var entries = decodeClientSnapshotAlloc(cache.allocator, limits, cache.limits.max_entries, max_plaintext_bytes, plaintext) catch |err| return mapDecodeError(err);
     defer {
         for (entries.items) |*p| p.deinit();
         entries.deinit(cache.allocator);
@@ -458,6 +485,7 @@ pub fn saveServerCache(
     defer {
         for (snapshot.items) |*p| p.deinit();
         snapshot.deinit(cache.allocator);
+        cache.endPersistenceSnapshot();
     }
 
     const plaintext = encodeServerSnapshotAlloc(cache.allocator, snapshot.items, limits) catch return .allocation_failed;
@@ -491,7 +519,9 @@ pub fn loadServerCache(
         cache.allocator.free(sealed);
     }
 
+    const max_plaintext_bytes = maxPlaintextBytesFor(cache.limits);
     const plaintext_len = protector.openLen(sealed.len);
+    if (plaintext_len > max_plaintext_bytes) return .corrupted;
     const plaintext_buf = cache.allocator.alloc(u8, plaintext_len) catch return .allocation_failed;
     defer {
         secrets.secureZero(plaintext_buf);
@@ -499,7 +529,7 @@ pub fn loadServerCache(
     }
     const plaintext = protector.open(sealed, plaintext_buf) catch return .protection_failed;
 
-    var entries = decodeServerSnapshotAlloc(cache.allocator, limits, cache.limits.max_entries, plaintext) catch |err| return mapDecodeError(err);
+    var entries = decodeServerSnapshotAlloc(cache.allocator, limits, cache.limits.max_entries, max_plaintext_bytes, plaintext) catch |err| return mapDecodeError(err);
     defer {
         for (entries.items) |*p| p.deinit();
         entries.deinit(cache.allocator);
@@ -507,7 +537,10 @@ pub fn loadServerCache(
 
     var temp = session_cache.StatefulServerCache.init(cache.allocator, cache.limits, cache.random) catch return .corrupted;
     defer temp.deinit();
-    temp.restoreEntries(entries.items, now_unix_ms) catch return .allocation_failed;
+    temp.restoreEntries(entries.items, now_unix_ms) catch |err| return switch (err) {
+        error.OutOfMemory => .allocation_failed,
+        error.DuplicateHandle => .corrupted,
+    };
 
     cache.mutex.lock();
     defer cache.mutex.unlock();
@@ -673,7 +706,7 @@ test "client snapshot round trips through encode/decode, including order metadat
         testing.allocator.free(bytes);
     }
 
-    var decoded = try decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bytes);
+    var decoded = try decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, bytes);
     defer {
         for (decoded.items) |*p| p.deinit();
         decoded.deinit(testing.allocator);
@@ -700,7 +733,7 @@ test "server snapshot preserves the exact handle and LRU sequence" {
         secrets.secureZero(bytes);
         testing.allocator.free(bytes);
     }
-    var decoded = try decodeServerSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bytes);
+    var decoded = try decodeServerSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, bytes);
     defer {
         for (decoded.items) |*p| p.deinit();
         decoded.deinit(testing.allocator);
@@ -720,21 +753,21 @@ test "decode rejects truncated, bad-magic, and unsupported-version snapshots" {
         testing.allocator.free(bytes);
     }
 
-    try testing.expectError(error.Truncated, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bytes[0..5]));
+    try testing.expectError(error.Truncated, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, bytes[0..5]));
 
     const bad_magic = try testing.allocator.dupe(u8, bytes);
     defer testing.allocator.free(bad_magic);
     bad_magic[0] = 'X';
-    try testing.expectError(error.BadMagic, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bad_magic));
+    try testing.expectError(error.BadMagic, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, bad_magic));
 
     const bad_version = try testing.allocator.dupe(u8, bytes);
     defer testing.allocator.free(bad_version);
     bad_version[4] = 99;
-    try testing.expectError(error.UnsupportedVersion, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bad_version));
+    try testing.expectError(error.UnsupportedVersion, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, bad_version));
 
     const truncated_record = try testing.allocator.dupe(u8, bytes[0 .. bytes.len - 1]);
     defer testing.allocator.free(truncated_record);
-    try testing.expectError(error.Truncated, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, truncated_record));
+    try testing.expectError(error.Truncated, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, truncated_record));
 }
 
 test "decode rejects a declared record count over the target cache's entry limit before allocating" {
@@ -751,14 +784,14 @@ test "decode rejects a declared record count over the target cache's entry limit
     const bombed = try testing.allocator.dupe(u8, bytes);
     defer testing.allocator.free(bombed);
     std.mem.writeInt(u32, bombed[6..10], 0xFFFF_FFF0, .big);
-    try testing.expectError(error.TooManyRecords, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, 8, bombed));
+    try testing.expectError(error.TooManyRecords, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, 8, fallback_max_snapshot_bytes, bombed));
 }
 
 test "decode rejects trailing bytes after the declared record count, even with a zero count" {
     var zero_count: [header_len + 4]u8 = undefined;
     writeHeader(&zero_count, .client, 0);
     @memset(zero_count[header_len..], 0xAA);
-    try testing.expectError(error.TrailingData, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, &zero_count));
+    try testing.expectError(error.TrailingData, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, &zero_count));
 
     const t1 = try testClient(testing.allocator, "t", "example.test");
     var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = t1, .usage = .reusable }};
@@ -772,7 +805,7 @@ test "decode rejects trailing bytes after the declared record count, even with a
     defer testing.allocator.free(with_trailer);
     @memcpy(with_trailer[0..bytes.len], bytes);
     @memset(with_trailer[bytes.len..], 0x99);
-    try testing.expectError(error.TrailingData, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, with_trailer));
+    try testing.expectError(error.TrailingData, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, with_trailer));
 }
 
 test "decode rejects a server handle with a non-zero reserved field or wrong magic/version" {
@@ -788,17 +821,17 @@ test "decode rejects a server handle with a non-zero reserved field or wrong mag
         secrets.secureZero(bytes);
         testing.allocator.free(bytes);
     }
-    try testing.expectError(error.InvalidHandle, decodeServerSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, bytes));
+    try testing.expectError(error.InvalidHandle, decodeServerSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, bytes));
 }
 
 test "decode rejects a plaintext buffer over the hard snapshot size ceiling before parsing" {
-    const oversized = try testing.allocator.alloc(u8, hard_max_snapshot_bytes + 1);
+    const oversized = try testing.allocator.alloc(u8, fallback_max_snapshot_bytes + 1);
     defer testing.allocator.free(oversized);
     // Header/magic left as zeroed garbage: the size gate must reject this
     // before `readHeader` ever inspects the magic/version/count fields.
     try testing.expectError(
         error.SnapshotTooLarge,
-        decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, oversized),
+        decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, oversized),
     );
 }
 
@@ -942,6 +975,113 @@ test "saveServerCache and loadServerCache round trip and preserve the handle" {
     var hit = restored.resolveLease(&handle, 2);
     defer hit.deinit();
     try testing.expect(hit == .hit);
+}
+
+test "saveServerCache closes the resolve-then-consume race: a new lease cannot start mid-save" {
+    var cache = try session_cache.StatefulServerCache.init(testing.allocator, session_cache.Limits.stateful_server_default, session_cache.system_random_source);
+    defer cache.deinit();
+    var s1 = try testServerState(testing.allocator, "example.test");
+    var handle: [session_cache.stateful_identity_len]u8 = undefined;
+    _ = cache.insertMove(&s1, 0, .single_use, &handle);
+
+    var snapshot = try cache.cloneLiveForPersistence(testing.allocator, 1);
+    defer {
+        for (snapshot.items) |*p| p.deinit();
+        snapshot.deinit(testing.allocator);
+        cache.endPersistenceSnapshot();
+    }
+
+    // While the snapshot guard is held (as it would be for the whole
+    // duration of `saveServerCache`'s encode/seal/backend-save), a new
+    // single-use resolution must be refused rather than allowed to
+    // resolve-and-commit a ticket that the in-flight snapshot has already
+    // captured as still-live.
+    const during_save = cache.resolveLease(&handle, 1);
+    try testing.expect(during_save == .busy);
+
+    // Once the guard ends (snapshot durably saved or abandoned), the
+    // ticket resolves normally again. `endPersistenceSnapshot` is
+    // idempotent, so calling it here and again via the outer `defer` above
+    // is safe.
+    cache.endPersistenceSnapshot();
+    var after_save = cache.resolveLease(&handle, 1);
+    defer after_save.deinit();
+    try testing.expect(after_save == .hit);
+}
+
+test "loadServerCache derives its size ceiling from the target cache's own limits, not a fixed constant" {
+    // The stateful default's `max_total_bytes` (32 MiB) is larger than the
+    // old fixed 16 MiB ceiling this module used to apply unconditionally;
+    // `maxPlaintextBytesFor` must reflect the cache's actual configured
+    // budget instead.
+    const derived = maxPlaintextBytesFor(session_cache.Limits.stateful_server_default);
+    try testing.expect(derived > fallback_max_snapshot_bytes);
+
+    // A tiny cache should get a correspondingly tiny ceiling, so an
+    // oversized (but well-formed) snapshot for *that* cache is rejected
+    // before allocating its plaintext buffer.
+    var tiny_limits = session_cache.Limits.stateful_server_default;
+    tiny_limits.max_total_bytes = 4096;
+    tiny_limits.max_entry_bytes = 4096;
+    tiny_limits.max_entries = 1;
+    const tiny_bound = maxPlaintextBytesFor(tiny_limits);
+    try testing.expect(tiny_bound < derived);
+
+    var cache = try session_cache.StatefulServerCache.init(testing.allocator, tiny_limits, session_cache.system_random_source);
+    defer cache.deinit();
+
+    const FakeOpenLenProtector = struct {
+        var dummy: u8 = 0;
+        var forced_open_len: usize = 0;
+        fn interface() Protector {
+            return .{ .ctx = @ptrCast(@constCast(&dummy)), .sealedLenFn = passthroughLen, .sealFn = passthroughSeal, .openLenFn = len, .openFn = passthroughOpen };
+        }
+        fn len(_: *anyopaque, _: usize) usize {
+            return forced_open_len;
+        }
+    };
+    FakeOpenLenProtector.forced_open_len = tiny_bound + 1;
+
+    var backend = MemoryBackend{ .allocator = testing.allocator };
+    defer backend.deinit();
+    backend.bytes = try testing.allocator.dupe(u8, "irrelevant, rejected before opening");
+
+    try testing.expectEqual(LoadResult.corrupted, loadServerCache(&cache, session.Limits.default, FakeOpenLenProtector.interface(), backend.interface(), 1));
+}
+
+test "restoreEntries duplicate-handle rejection propagates through loadServerCache as corrupted" {
+    var cache = try session_cache.StatefulServerCache.init(testing.allocator, session_cache.Limits.stateful_server_default, session_cache.system_random_source);
+    defer cache.deinit();
+    var s1 = try testServerState(testing.allocator, "still-here");
+    var handle: [session_cache.stateful_identity_len]u8 = undefined;
+    _ = cache.insertMove(&s1, 0, .reusable, &handle);
+
+    var dup_handle: [session_cache.stateful_identity_len]u8 = undefined;
+    @memcpy(dup_handle[0..4], "TDSH");
+    std.mem.writeInt(u16, dup_handle[4..6], 1, .big);
+    std.mem.writeInt(u16, dup_handle[6..8], 0, .big);
+    @memset(dup_handle[8..], 0xCD);
+
+    const sa = try testServerState(testing.allocator, "a.test");
+    const sb = try testServerState(testing.allocator, "b.test");
+    var dup_entries = [_]session_cache.PersistedServerEntry{
+        .{ .handle = dup_handle, .usage = .reusable, .state = sa },
+        .{ .handle = dup_handle, .usage = .reusable, .state = sb },
+    };
+    const bytes = try encodeServerSnapshotAlloc(testing.allocator, &dup_entries, session.Limits.default);
+    defer {
+        secrets.secureZero(bytes);
+        testing.allocator.free(bytes);
+    }
+    for (&dup_entries) |*e| e.deinit();
+
+    var backend = MemoryBackend{ .allocator = testing.allocator };
+    defer backend.deinit();
+    backend.bytes = try testing.allocator.dupe(u8, bytes);
+
+    try testing.expectEqual(LoadResult.corrupted, loadServerCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
+    // The live cache (unrelated to the corrupted snapshot) must be untouched.
+    try testing.expectEqual(@as(usize, 1), cache.count());
 }
 
 test "restore allocation failure aborts the load atomically, leaving the live cache untouched" {

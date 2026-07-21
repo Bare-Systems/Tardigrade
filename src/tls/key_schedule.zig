@@ -312,6 +312,29 @@ test "initWithPsk diverges from the zero-PSK schedule and is deterministic" {
     try std.testing.expect(!std.mem.eql(u8, &app.client, &app.server));
 }
 
+test "initWithPsk matches independently computed secrets" {
+    // Checked-in literals for the same inputs as "initWithPsk diverges from
+    // the zero-PSK schedule and is deterministic" above (psk=0x99*32,
+    // shared=0x42*32, transcript=0x24*32), computed independently of this
+    // module rather than by re-deriving with the same helpers under test.
+    const shared = [_]u8{0x42} ** shared_secret_len;
+    const transcript = [_]u8{0x24} ** hash_len;
+    const psk = [_]u8{0x99} ** hash_len;
+
+    var schedule = KeySchedule.initWithPsk(&psk, &shared, transcript);
+    defer schedule.wipe();
+
+    try std.testing.expectEqualSlices(u8, &hexBytes("ab0803d6203c8feddfe8adc74f986c9d89b817b3d4132fc55c866a3522d9ff49"), &schedule.handshake_secret);
+    try std.testing.expectEqualSlices(u8, &hexBytes("e92139285417b6a9a54a7a9153f4b6dcce44b99cdc0937b83dfea5c79805c920"), &schedule.client_handshake_traffic);
+    try std.testing.expectEqualSlices(u8, &hexBytes("739483d9d6a9508c73b4656de22fedd85a2a8d00e9a6ca1449d8cba678c94baf"), &schedule.server_handshake_traffic);
+    try std.testing.expectEqualSlices(u8, &hexBytes("abe96cce65361235f3126971c67760888b79d4c1724a6cb1e15f6d2ae128ff44"), &schedule.master_secret);
+
+    var app = schedule.applicationSecrets(transcript);
+    defer app.wipe();
+    try std.testing.expectEqualSlices(u8, &hexBytes("d1ba0b1be9862f1bd4c3bcc0d53b5a98c6a4951c4bad19243051237bc735031c"), &app.client);
+    try std.testing.expectEqualSlices(u8, &hexBytes("c7428c93109f1b656dcbf0971e5d1bad9c2d38b79420038b7e165a17c7f61fa1"), &app.server);
+}
+
 test "a different resumption PSK produces a different PSK-resumed schedule" {
     const shared = [_]u8{0x11} ** shared_secret_len;
     const transcript = [_]u8{0x22} ** hash_len;

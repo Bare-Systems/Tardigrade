@@ -239,12 +239,14 @@ pub fn writeOffer(w: *messages.Writer, items: []const OfferItem) WriteError!Clie
         if (item.identity.len > max_vector_len) return error.IdentityTooLarge;
         identities_total += 2 + item.identity.len + 4;
         if (identities_total > max_vector_len) return error.IdentitiesVectorTooLarge;
-        // This writer only ever produces the digest lengths the module's own
-        // binder derivation supports (32 for SHA-256, 48 for SHA-384), a
-        // stricter bound than the wire's general 32..255 `PskBinderEntry`
-        // range — and exactly what fits the fixed zero-placeholder buffer
-        // below.
-        if (item.digest_len < min_binder_len or item.digest_len > provider.max_digest_len)
+        // The full wire range (RFC 8446 §4.2.11: `PskBinderEntry<32..255>`),
+        // matching what `OfferedPsks.parse` accepts — this is a general
+        // wire codec, not specific to the two digest lengths this module's
+        // own binder derivation happens to support. A caller preparing an
+        // actual offer (see `tls13_backend.zig`) is the one that only ever
+        // constructs 32- or 48-byte entries; that is backend policy, not a
+        // codec-level restriction.
+        if (item.digest_len < min_binder_len or item.digest_len > max_binder_len)
             return error.InvalidBinderLength;
         binders_total += 1 + item.digest_len;
         if (binders_total > max_vector_len) return error.BindersVectorTooLarge;
@@ -274,7 +276,7 @@ pub fn writeOffer(w: *messages.Writer, items: []const OfferItem) WriteError!Clie
     for (items, 0..) |item, i| {
         const entry_len_idx = try w.reserve(1);
         const slot_offset = w.len;
-        const zeros = [_]u8{0} ** provider.max_digest_len;
+        const zeros = [_]u8{0} ** max_binder_len;
         try w.bytes(zeros[0..item.digest_len]);
         w.patch(1, entry_len_idx);
         result.slots[i] = .{ .offset = slot_offset, .len = item.digest_len };
@@ -562,17 +564,27 @@ test "writeOffer rejects illegal shapes without ever mutating the writer" {
         try testing.expectError(error.EmptyIdentity, writeOffer(&w, &items));
         try testing.expectEqual(@as(usize, 0), w.len);
     }
-    // Binder/digest length outside what this module can produce (32..48).
+    // Binder length boundary, over the full RFC 8446 wire range (32..255),
+    // matching `OfferedPsks.parse` exactly rather than this module's own
+    // narrower SHA-256/384 digest lengths: 31 rejected, 32/48/255 accepted,
+    // 256 unrepresentable on the wire and rejected.
     {
         var w = messages.Writer{ .buf = &buf };
-        const too_short = [_]OfferItem{.{ .identity = "id", .obfuscated_ticket_age = 0, .digest_len = min_binder_len - 1 }};
+        const too_short = [_]OfferItem{.{ .identity = "id", .obfuscated_ticket_age = 0, .digest_len = 31 }};
         try testing.expectError(error.InvalidBinderLength, writeOffer(&w, &too_short));
         try testing.expectEqual(@as(usize, 0), w.len);
 
-        var w2 = messages.Writer{ .buf = &buf };
-        const too_long = [_]OfferItem{.{ .identity = "id", .obfuscated_ticket_age = 0, .digest_len = provider.max_digest_len + 1 }};
-        try testing.expectError(error.InvalidBinderLength, writeOffer(&w2, &too_long));
-        try testing.expectEqual(@as(usize, 0), w2.len);
+        inline for (.{ 32, 48, 255 }) |ok_len| {
+            var w_ok = messages.Writer{ .buf = &buf };
+            const items = [_]OfferItem{.{ .identity = "id", .obfuscated_ticket_age = 0, .digest_len = ok_len }};
+            const offer = try writeOffer(&w_ok, &items);
+            try testing.expectEqual(@as(usize, ok_len), offer.slots[0].len);
+        }
+
+        var w_too_long = messages.Writer{ .buf = &buf };
+        const too_long = [_]OfferItem{.{ .identity = "id", .obfuscated_ticket_age = 0, .digest_len = 256 }};
+        try testing.expectError(error.InvalidBinderLength, writeOffer(&w_too_long, &too_long));
+        try testing.expectEqual(@as(usize, 0), w_too_long.len);
     }
     // Exact boundary values succeed: min/max supported digest length, and a
     // full eight-identity offer.
@@ -580,7 +592,7 @@ test "writeOffer rejects illegal shapes without ever mutating the writer" {
         var w = messages.Writer{ .buf = &buf };
         const items = [_]OfferItem{
             .{ .identity = "a", .obfuscated_ticket_age = 0, .digest_len = min_binder_len },
-            .{ .identity = "b", .obfuscated_ticket_age = 0, .digest_len = provider.max_digest_len },
+            .{ .identity = "b", .obfuscated_ticket_age = 0, .digest_len = max_binder_len },
         };
         _ = try writeOffer(&w, &items);
 
@@ -653,43 +665,37 @@ test "OfferedPsks.parse rejects truncated and oversized binder lengths" {
     }
 }
 
-test "resumption binder derivation matches independently computed HKDF chain (SHA-256)" {
-    // Vector reuses the SHA-256 RFC 8448-style resumption PSK from
-    // key_schedule.zig's own resumption test so binder derivation is
-    // checked against a value derived independently of this module.
-    const key_schedule = @import("key_schedule.zig");
+test "resumption binder derivation matches an independently computed SHA-256 binder" {
+    // Checked-in literal, computed independently of this module (Python
+    // hashlib/hmac against the same RFC 8446 §4.2.11.2/§7.1 label chain) —
+    // not derived with the same `std.crypto.tls.hkdfExpandLabel` helper the
+    // implementation under test uses, so this actually detects a wrong
+    // label, wrong empty-hash input, or wrong transcript hash rather than
+    // only cross-checking this module against itself.
     const psk = hexBytes("c1392efd98f6932d62f5ccd42c724230871638e8ad0ac9ce9b2af89f5f919fed");
     const client_hello_prefix = "pretend-truncated-clienthello-bytes";
+    const expected = hexBytes("de7c7afec445f9419e4f769b6ef8e6371e1f599405eff6ecc014499f234a008e");
 
     var binder: [32]u8 = undefined;
     try deriveBinder(.sha256, &psk, client_hello_prefix, &binder);
-
-    // Independently recompute the same chain inline to cross-check.
-    var empty_hash: [32]u8 = undefined;
-    Sha256.hash("", &empty_hash, .{});
-    var early_secret = HkdfSha256.extract("", &psk);
-    var binder_key = tls.hkdfExpandLabel(HkdfSha256, early_secret, "res binder", &empty_hash, 32);
-    var finished_key = tls.hkdfExpandLabel(HkdfSha256, binder_key, "finished", "", 32);
-    var transcript: [32]u8 = undefined;
-    Sha256.hash(client_hello_prefix, &transcript, .{});
-    var expected: [32]u8 = undefined;
-    HmacSha256.create(&expected, &transcript, &finished_key);
-    crypto.secureZero(u8, &early_secret);
-    crypto.secureZero(u8, &binder_key);
-    crypto.secureZero(u8, &finished_key);
-
     try testing.expectEqualSlices(u8, &expected, &binder);
+
     try testing.expect(try verifyBinder(.sha256, &psk, client_hello_prefix, &binder));
     try testing.expect(!try verifyBinder(.sha256, &psk, "different prefix bytes here", &binder));
-
-    _ = key_schedule;
 }
 
-test "resumption binder derivation supports SHA-384 and rejects mismatched PSK length" {
+test "resumption binder derivation matches an independently computed SHA-384 binder" {
+    // Checked-in literal, independently computed (see the SHA-256 test
+    // above); the module's own concrete SHA-384 code path is entirely
+    // separate from the SHA-256 one, so this is not redundant with it.
     const psk384 = [_]u8{0x77} ** 48;
+    const expected = hexBytes(
+        "138b767e68513f232636a0d2b2c53d7a923ff2c0d7879985d4ea916281c5134" ++
+            "d3bc2b1ae31178e736fe22f2d906cfdd3",
+    );
     var binder: [48]u8 = undefined;
     try deriveBinder(.sha384, &psk384, "prefix", &binder);
-    try testing.expect(!std.mem.allEqual(u8, &binder, 0));
+    try testing.expectEqualSlices(u8, &expected, &binder);
 
     var short_binder: [47]u8 = undefined;
     try testing.expectError(error.InvalidSecretLength, deriveBinder(.sha384, &psk384, "prefix", &short_binder));

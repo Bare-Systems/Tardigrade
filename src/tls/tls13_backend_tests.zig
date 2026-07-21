@@ -3241,7 +3241,7 @@ test "handshake-phase failure wipes PSK offer state before ServerHello even arri
 /// own (symmetric) key schedule, since there is no real client driver in
 /// these server-only tests.
 fn feedValidClientFinished(server: *tls_backend.Tls13Backend) !void {
-    const schedule = server.schedule.?;
+    const schedule = &server.schedule.?;
     var client_verify = tls_backend.KeySchedule.verifyData(&schedule.client_handshake_traffic, server.core.transcriptHash());
     defer std.crypto.secureZero(u8, &client_verify);
     var finished_buf: [4 + tls_backend.hash_len]u8 = undefined;

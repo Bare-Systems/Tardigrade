@@ -2360,15 +2360,25 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
     return buf[0..w.len];
 }
 
+/// Server key-share cases for the PSK-selected ServerHello consistency
+/// matrix (#362: "selected index/hash/key-share consistency is validated
+/// by the client").
+const ServerKeyShareCase = enum { valid, missing, wrong_group, wrong_length, low_order };
+
 const ServerHelloOptions = struct {
     session_id: []const u8 = &.{},
     key_share_seed: [X25519.seed_length]u8 = [_]u8{0x55} ** X25519.seed_length,
     selected_identity: ?u16 = null,
+    selected_version: u16 = 0x0304,
+    cipher_suite: u16 = 0x1301,
+    key_share: ServerKeyShareCase = .valid,
 };
 
-/// Build a minimal, well-formed TLS 1.3 ServerHello — for driving a
-/// client's `onServerHello` directly with a chosen `selected_identity`
-/// (#362 client-side consistency tests), independent of any real server.
+/// Build a minimal, well-formed (unless `opts` deliberately says
+/// otherwise) TLS 1.3 ServerHello — for driving a client's `onServerHello`
+/// directly with a chosen `selected_identity`, cipher suite, negotiated
+/// version, and key-share shape (#362 client-side consistency tests),
+/// independent of any real server.
 fn buildServerHello(buf: []u8, opts: ServerHelloOptions) ![]const u8 {
     const key_pair = try X25519.KeyPair.generateDeterministic(opts.key_share_seed);
     var w = HsWriter{ .buf = buf };
@@ -2378,17 +2388,44 @@ fn buildServerHello(buf: []u8, opts: ServerHelloOptions) ![]const u8 {
     try w.bytes(&([_]u8{0x51} ** 32)); // random
     try w.u8_(@intCast(opts.session_id.len));
     try w.bytes(opts.session_id);
-    try w.u16_(0x1301); // cipher_suite
+    try w.u16_(opts.cipher_suite);
     try w.u8_(0); // legacy_compression_method
     const extensions_len = try w.reserve(2);
     try w.u16_(43); // supported_versions
     try w.u16_(2);
-    try w.u16_(0x0304);
-    try w.u16_(51); // key_share
-    try w.u16_(2 + 2 + X25519.public_length);
-    try w.u16_(0x001d);
-    try w.u16_(X25519.public_length);
-    try w.bytes(&key_pair.public_key);
+    try w.u16_(opts.selected_version);
+    switch (opts.key_share) {
+        .missing => {},
+        .valid => {
+            try w.u16_(51);
+            try w.u16_(2 + 2 + X25519.public_length);
+            try w.u16_(0x001d); // x25519
+            try w.u16_(X25519.public_length);
+            try w.bytes(&key_pair.public_key);
+        },
+        .wrong_group => {
+            try w.u16_(51);
+            try w.u16_(2 + 2 + X25519.public_length);
+            try w.u16_(0x0017); // secp256r1, not x25519
+            try w.u16_(X25519.public_length);
+            try w.bytes(&key_pair.public_key);
+        },
+        .wrong_length => {
+            const short_len = X25519.public_length - 1;
+            try w.u16_(51);
+            try w.u16_(2 + 2 + short_len);
+            try w.u16_(0x001d);
+            try w.u16_(short_len);
+            try w.bytes(key_pair.public_key[0..short_len]);
+        },
+        .low_order => {
+            try w.u16_(51);
+            try w.u16_(2 + 2 + X25519.public_length);
+            try w.u16_(0x001d);
+            try w.u16_(X25519.public_length);
+            try w.bytes(&([_]u8{0} ** X25519.public_length)); // the identity point
+        },
+    }
     if (opts.selected_identity) |idx| {
         try w.u16_(pre_shared_key.ext_pre_shared_key);
         try w.u16_(2);
@@ -3122,6 +3159,48 @@ test "async credential selection failure clears the captured PSK offer" {
     try std.testing.expect(server.client_hello_psk == null);
 }
 
+test "async credential selection failure zeroes the captured ClientHello bytes, not just the pointer" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_select = true;
+    mock.pending_polls = 0;
+    mock.pending_fails = true;
+    var server = serverWithProvider(&mock);
+    defer server.deinit();
+
+    const psk = [_]u8{0x5a} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "async-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .psk = .{ .items = &.{.{ .identity = "async-ticket", .binder_psk = &psk }} } });
+    try server.backend().receive(.initial, hello, &sink);
+    try std.testing.expect(server.authPending());
+
+    // `client_hello_psk` is an embedded fixed-size buffer (no allocator
+    // involved), so its address is stable across the `= null` assignment
+    // below and directly re-inspectable afterward.
+    const capture = &server.client_hello_psk.?;
+    const message_memory = capture.message[0..capture.message_len];
+    try std.testing.expect(!std.mem.allEqual(u8, message_memory, 0));
+
+    try std.testing.expectError(error.CredentialProviderFailed, server.resumeAuth(&sink));
+    try std.testing.expect(server.client_hello_psk == null);
+    // Regression coverage: it is not enough to null the optional — the
+    // framed ClientHello bytes it pointed at must themselves be
+    // overwritten, or a scratch copy of the peer-supplied identity would
+    // linger in backend storage past this failed connection.
+    try std.testing.expect(std.mem.allEqual(u8, message_memory, 0));
+}
+
 test "a transport-extension type colliding with a TLS-owned PSK extension is rejected at start" {
     inline for (.{ pre_shared_key.ext_pre_shared_key, pre_shared_key.ext_psk_key_exchange_modes }) |colliding_type| {
         var client = tls_backend.Tls13Backend.initClient(
@@ -3397,6 +3476,136 @@ test "client rejects a forged selected_identity when no PSK was ever offered" {
     try std.testing.expect(!client.core.psk_authenticated);
 }
 
+test "a PSK-selected ServerHello with inconsistent suite/version/key-share is rejected and fully cleans up" {
+    const Case = struct { opts: ServerHelloOptions, expected: anyerror };
+    const cases = [_]Case{
+        // Wrong (unsupported) cipher suite — this profile only negotiates
+        // TLS_AES_128_GCM_SHA256.
+        .{ .opts = .{ .selected_identity = 0, .cipher_suite = 0x1302 }, .expected = error.IllegalParameter },
+        // Selected a non-TLS-1.3 version.
+        .{ .opts = .{ .selected_identity = 0, .selected_version = 0x0303 }, .expected = error.IllegalParameter },
+        // No key_share extension at all.
+        .{ .opts = .{ .selected_identity = 0, .key_share = .missing }, .expected = error.MalformedHandshake },
+        // key_share names a group other than x25519.
+        .{ .opts = .{ .selected_identity = 0, .key_share = .wrong_group }, .expected = error.IllegalParameter },
+        // key_share's declared length doesn't match x25519's fixed size.
+        .{ .opts = .{ .selected_identity = 0, .key_share = .wrong_length }, .expected = error.IllegalParameter },
+        // A well-formed but low-order/identity x25519 point.
+        .{ .opts = .{ .selected_identity = 0, .key_share = .low_order }, .expected = error.IllegalParameter },
+    };
+
+    for (cases) |case| {
+        var client = tls_backend.Tls13Backend.initClient(
+            clientEntropy(),
+            .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+            .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+        );
+        defer client.deinit();
+
+        const psk = [_]u8{0x44} ** tls_backend.hash_len;
+        var offers: pre_shared_key.ClientPskOfferSet = .{};
+        try pushTestTicket(&offers, &psk, "consistency-ticket");
+        var clock_dummy: u8 = 0;
+        const Clock = struct {
+            fn now(_: *anyopaque) i64 {
+                return 0;
+            }
+        };
+        try client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+        var sink = DirectSink{};
+        defer sink.deinit();
+        try client.backend().start(.client, {}, &sink);
+        try std.testing.expectEqual(@as(usize, 1), client.client_psk_offers.len);
+
+        var buf: [512]u8 = undefined;
+        const hello = try buildServerHello(&buf, case.opts);
+        try std.testing.expectError(case.expected, client.backend().receive(.initial, hello, &sink));
+
+        try std.testing.expect(client.client_psk_offers.isEmpty());
+        try std.testing.expect(!client.selected_client_psk_present);
+        try std.testing.expect(!client.core.psk_authenticated);
+        try std.testing.expect(client.schedule == null);
+    }
+}
+
+test "a rejected ServerHello observably zeroes the client's offered PSK bytes, not just the length" {
+    // `FixedBufferAllocator.free` is a no-op that never poisons its backing
+    // storage (unlike `std.testing.allocator`'s debug fill-on-free), so any
+    // zero bytes we observe here can only have come from this code's own
+    // explicit `secureZero` calls, not from allocator bookkeeping.
+    var backing = [_]u8{0xa5} ** 4096;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const allocator = fba.allocator();
+
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } },
+    );
+    defer client.deinit();
+
+    const psk = [_]u8{0x99} ** tls_backend.hash_len;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var ticket_state: session.ClientTicketState = .{};
+    try ticket_state.init(allocator, session.Limits.default, &common, .{
+        .ticket = "wipe-client-ticket",
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket_state);
+
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 0;
+        }
+    };
+    try client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    try std.testing.expectEqual(@as(usize, 1), client.client_psk_offers.len);
+
+    // Captured from the offer's *final* resting place inside the backend
+    // (after every intervening move), not the now-defunct local variable
+    // above: only this copy is the one `clearFailedHandshakeState` must
+    // reach.
+    const settled = &client.client_psk_offers.tickets[0];
+    const psk_memory = settled.common.resumption_psk.bytes[0..settled.common.resumption_psk.len];
+    const ticket_memory = settled.ticket.slice();
+    const nonce_memory = settled.ticket_nonce.bytes[0..settled.ticket_nonce.len];
+    try std.testing.expect(!std.mem.allEqual(u8, psk_memory, 0));
+    try std.testing.expectEqualStrings("wipe-client-ticket", ticket_memory);
+    try std.testing.expect(!std.mem.allEqual(u8, nonce_memory, 0));
+
+    var buf: [512]u8 = undefined;
+    const hello = try buildServerHello(&buf, .{ .selected_identity = 5 }); // beyond the single emitted offer
+    try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, hello, &sink));
+
+    try std.testing.expect(client.client_psk_offers.isEmpty());
+    // `resumption_psk`/`ticket_nonce` are embedded fixed-size arrays wiped
+    // in place by `secureZero`, so they are observably all-zero afterward.
+    // `ticket` is allocator-backed: Zig's `Allocator.free()` unconditionally
+    // `@memset`s freed memory to `undefined` (0xaa in this build) *after*
+    // our own `secureZero` runs, so an exact-zero check on it would fail
+    // for reasons unrelated to whether the secret was actually wiped —
+    // instead this proves the original ticket bytes no longer survive.
+    try std.testing.expect(std.mem.allEqual(u8, psk_memory, 0));
+    try std.testing.expect(!std.mem.eql(u8, ticket_memory, "wipe-client-ticket"));
+    try std.testing.expect(std.mem.allEqual(u8, nonce_memory, 0));
+}
+
 /// Completes a PSK-resumed server handshake driven by `driveServerSelection`
 /// by feeding it the correct client Finished — computed from the server's
 /// own (symmetric) key schedule, since there is no real client driver in
@@ -3445,6 +3654,46 @@ test "takeSelectedServerPsk returns null before the client Finished commits the 
     var taken_after: session.ServerRecoverableState = .{};
     defer taken_after.deinit();
     try std.testing.expect(server.takeSelectedServerPsk(&taken_after) != null);
+}
+
+test "backend teardown observably zeroes the key schedule and selected PSK session" {
+    // Deliberately stops short of feeding the client Finished: `finish()`
+    // already wipes `schedule` eagerly the moment the handshake actually
+    // completes (traffic secrets have been handed to the sink by then), so
+    // proving teardown-time zeroization needs a still-live, uncommitted
+    // schedule — exactly the state selection leaves behind (see
+    // `takeSelectedServerPsk returns null before the client Finished
+    // commits the handshake`, above).
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+
+    const psk = [_]u8{0xcc} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "teardown-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{.{ .identity = "teardown-ticket", .binder_psk = &psk }} } });
+    try std.testing.expect(server.core.psk_authenticated);
+    try std.testing.expect(server.selected_server_psk_present);
+
+    // Both `schedule` and `selected_server_psk.state` are embedded directly
+    // in the backend (no separate heap allocation), so their addresses stay
+    // valid across `deinit()` and the bytes are directly inspectable —
+    // unlike allocator-backed secrets, nothing here goes through
+    // `Allocator.free`'s unconditional undefined-fill.
+    const schedule_memory = std.mem.asBytes(&server.schedule.?);
+    const selected_psk_memory = server.selected_server_psk.state.common.resumption_psk.bytes[0..server.selected_server_psk.state.common.resumption_psk.len];
+    try std.testing.expect(!std.mem.allEqual(u8, schedule_memory, 0));
+    try std.testing.expect(!std.mem.allEqual(u8, selected_psk_memory, 0));
+
+    server.deinit();
+
+    try std.testing.expect(std.mem.allEqual(u8, schedule_memory, 0));
+    try std.testing.expect(std.mem.allEqual(u8, selected_psk_memory, 0));
 }
 
 fn pskStoredStateTimed(psk: []const u8, issued_at_unix_ms: i64, ticket_age_add: u32) session.ServerRecoverableState {
@@ -3658,27 +3907,64 @@ fn buildRawOfferedPsks(buf: []u8, count: usize) ![]const u8 {
     return w.written();
 }
 
-test "resolver candidate cloning under injected allocation failure leaves no partial or retained state" {
+const AllocFailResolver = struct {
+    state: *session.ServerRecoverableState,
+    allocator: std.mem.Allocator,
+    saw_oom: bool = false,
+    fn now(_: *anyopaque) i64 {
+        return 0;
+    }
+    fn resolve(ctx: *anyopaque, _: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.state.cloneInto(self.allocator, out) catch |err| {
+            self.saw_oom = (err == error.OutOfMemory);
+            return error.ResolverFailed;
+        };
+        return true;
+    }
+};
+
+/// Exercises exactly the allocation `selectPsk()` performs on the success
+/// path — the resolver's own `ServerRecoverableState.cloneInto` — through
+/// the real backend, for `std.testing.checkAllAllocationFailures`. Only an
+/// allocation failure the resolver itself observed is translated back into
+/// `error.OutOfMemory`; any other failure is a genuine test failure, not a
+/// silently accepted one.
+fn exerciseResolverCloneThroughBackend(
+    allocator: std.mem.Allocator,
+    stored: *session.ServerRecoverableState,
+    psk: *const [tls_backend.hash_len]u8,
+) !void {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+    try server.setApplicationCompat(.{ .format_id = 2, .format_version = 1, .bytes = "application-snapshot" });
+
+    var resolver_state = AllocFailResolver{ .state = stored, .allocator = allocator };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = AllocFailResolver.now,
+        .resolveFn = AllocFailResolver.resolve,
+    });
+
+    driveServerSelection(&server, .{ .psk = .{ .items = &.{
+        .{ .identity = "alloc-ticket", .binder_psk = psk },
+    } } }) catch |err| {
+        if (resolver_state.saw_oom and err == error.CredentialProviderFailed) return error.OutOfMemory;
+        return err;
+    };
+    try std.testing.expect(server.core.psk_authenticated);
+    try std.testing.expect(server.selected_server_psk_present);
+}
+
+test "resolver candidate cloning is proven correct across every allocation-failure point" {
     // `selectPsk()`'s only allocation on the success path is the
     // resolver's own `ServerRecoverableState.cloneInto` (the underlying
     // allocation primitives — `ResumableSessionCommon.init`/`cloneInto`,
     // `BoundedSecret`/`CompatSnapshot` — already have exhaustive
     // `checkAllAllocationFailures` coverage in session.zig; this proves
-    // the *backend* PSK path degrades cleanly, not silently, when that
-    // allocation fails partway through selection).
-    const AllocFailResolver = struct {
-        state: *session.ServerRecoverableState,
-        allocator: std.mem.Allocator,
-        fn now(_: *anyopaque) i64 {
-            return 0;
-        }
-        fn resolve(ctx: *anyopaque, _: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.state.cloneInto(self.allocator, out) catch return error.ResolverFailed;
-            return true;
-        }
-    };
-
+    // the *backend* PSK path degrades cleanly, not silently, at every one
+    // of those allocation points, and that a real success run exists once
+    // every allocation succeeds).
     var stored_common: session.ResumableSessionCommon = .{};
     try stored_common.init(std.testing.allocator, session.Limits.default, .{
         .cipher_suite = .tls_aes_128_gcm_sha256,
@@ -3697,34 +3983,13 @@ test "resolver candidate cloning under injected allocation failure leaves no par
     var stored_state: session.ServerRecoverableState = .{};
     stored_state.init(&stored_common, 0);
     defer stored_state.deinit();
-
     const psk = [_]u8{0xbb} ** tls_backend.hash_len;
-    var fail_index: usize = 0;
-    while (fail_index < 32) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
-        defer server.deinit();
-        try server.setApplicationCompat(.{ .format_id = 2, .format_version = 1, .bytes = "application-snapshot" });
-        var resolver_state = AllocFailResolver{ .state = &stored_state, .allocator = failing.allocator() };
-        try server.setServerPskResolver(.{
-            .ctx = &resolver_state,
-            .nowUnixMsFn = AllocFailResolver.now,
-            .resolveFn = AllocFailResolver.resolve,
-        });
 
-        if (driveServerSelection(&server, .{ .psk = .{ .items = &.{
-            .{ .identity = "alloc-ticket", .binder_psk = &psk },
-        } } })) |_| {
-            // Enough allocations succeeded that the clone (and the rest of
-            // the handshake) completed normally.
-            try std.testing.expect(server.core.psk_authenticated);
-        } else |_| {
-            // The clone's allocation failed: the backend must fail closed
-            // rather than retain any partial selected state.
-            try std.testing.expect(!server.selected_server_psk_present);
-            try std.testing.expect(!server.core.psk_authenticated);
-        }
-    }
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseResolverCloneThroughBackend,
+        .{ &stored_state, &psk },
+    );
 }
 
 test "resolver identity-resolution attempts are bounded to eight even when a ninth would succeed" {
@@ -3914,6 +4179,83 @@ test "a compatible candidate with a wrong binder is fatal and never probes a lat
     // failed selection: the fatal binder mismatch is caught before
     // anything is written to the wire.
     try std.testing.expectEqual(events_before_client_hello, sink.len);
+}
+
+const FbaCloningResolver = struct {
+    state: *session.ServerRecoverableState,
+    allocator: std.mem.Allocator,
+    identity: []const u8,
+
+    fn now(_: *anyopaque) i64 {
+        return 0;
+    }
+    fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (!std.mem.eql(u8, identity, self.identity)) return false;
+        // Deliberately clones through a *different* allocator than the one
+        // backing `self.state` itself, so the only writes ever made into
+        // `allocator`'s backing storage are the transient per-attempt
+        // candidate this resolver hands back to `selectPsk` — isolating
+        // exactly the allocation this test means to observe.
+        self.state.cloneInto(self.allocator, out) catch return error.ResolverFailed;
+        return true;
+    }
+};
+
+test "a bad binder wipes the resolver's cloned candidate, including its compat blob" {
+    // See the zeroization test above for why `FixedBufferAllocator` (whose
+    // `free` never poisons memory, unlike the generic `Allocator.free`
+    // front-end which always does) is the only way to observe this
+    // reliably: it isolates the candidate clone's allocations to a backing
+    // array we can scan directly, independent of whatever exact byte
+    // pattern `free()` itself leaves behind.
+    var backing = [_]u8{0xa5} ** 4096;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const clone_allocator = fba.allocator();
+
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
+    defer server.deinit();
+
+    const marker = "candidate-compat-blob-marker";
+    try server.setApplicationCompat(.{ .format_id = 3, .format_version = 1, .bytes = marker });
+
+    const psk = [_]u8{0x66} ** tls_backend.hash_len;
+    const wrong_psk = [_]u8{0x77} ** tls_backend.hash_len;
+    var common: session.ResumableSessionCommon = .{};
+    // Built with a plain allocator: this is the resolver's *source* record,
+    // never itself passed to `selectPsk` — only its clones (made through
+    // `clone_allocator` below) are, so this allocation must not alias the
+    // one under test.
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+        .application_compat = .{ .format_id = 3, .format_version = 1, .bytes = marker },
+    });
+    var stored_state: session.ServerRecoverableState = .{};
+    stored_state.init(&common, 0);
+    defer stored_state.deinit();
+
+    var resolver_state = FbaCloningResolver{ .state = &stored_state, .allocator = clone_allocator, .identity = "bad-binder-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = FbaCloningResolver.now,
+        .resolveFn = FbaCloningResolver.resolve,
+    });
+
+    try std.testing.expectError(error.DecryptError, driveServerSelection(&server, .{
+        .psk = .{ .items = &.{.{ .identity = "bad-binder-ticket", .binder_psk = &wrong_psk }} },
+    }));
+
+    try std.testing.expect(!server.core.psk_authenticated);
+    try std.testing.expect(!server.selected_server_psk_present);
+    // The clone's compat blob was the only thing ever written into
+    // `backing`; a lingering copy here would mean the failed candidate's
+    // `deinit()` was skipped somewhere on the bad-binder path.
+    try std.testing.expect(std.mem.indexOf(u8, &backing, marker) == null);
 }
 
 /// A hand-written `CredentialProvider` whose second chain entry is

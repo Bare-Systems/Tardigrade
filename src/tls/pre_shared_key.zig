@@ -733,6 +733,28 @@ test "OfferedPsks identity length boundaries: zero, one, max representable, trun
         try w.bytes(&[_]u8{ 0, 0 }); // age truncated to 2 bytes
         try testing.expectError(error.MalformedHandshake, OfferedPsks.parse(w.written()));
     }
+    // The maximum representable single-entry identity length: the
+    // enclosing identities_len field is itself a u16, so the largest a
+    // lone identity can be is 65535 - 2 (its own length prefix) - 4 (age).
+    {
+        const max_identity_len = std.math.maxInt(u16) - 2 - 4;
+        const total = 2 + (2 + max_identity_len + 4) + 2 + (1 + 32);
+        const buf = try testing.allocator.alloc(u8, total);
+        defer testing.allocator.free(buf);
+        var w = messages.Writer{ .buf = buf };
+        try w.u16_(@intCast(2 + max_identity_len + 4));
+        try w.u16_(@intCast(max_identity_len));
+        try w.bytes(&[_]u8{'x'} ** max_identity_len);
+        try w.bytes(&[_]u8{0} ** 4);
+        try w.u16_(33);
+        try w.u8_(32);
+        try w.bytes(&[_]u8{0} ** 32);
+        const offered = try OfferedPsks.parse(w.written());
+        try testing.expectEqual(@as(usize, 1), offered.count);
+        var it = offered.pairs();
+        const pair = (try it.next()).?;
+        try testing.expectEqual(max_identity_len, pair.identity.identity.len);
+    }
 }
 
 test "OfferedPsks vector-length boundaries: identities/binders zero, one-over, count mismatch" {

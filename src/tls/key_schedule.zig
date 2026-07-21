@@ -244,6 +244,24 @@ test "application traffic secret storage has explicit cleanup" {
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&app), 0));
 }
 
+test "KeySchedule.wipe zeroizes every derived secret" {
+    // Deliberately a plain (non-optional) local, wiped in place and
+    // inspected directly — unlike a backend-owned `?KeySchedule` that gets
+    // set to `null` right after wiping, there is no subsequent
+    // optional-invalidation step here whose own debug-safety poisoning
+    // could be mistaken for (or mask the absence of) this `wipe()` call's
+    // effect. That makes this the reliable place to prove the zeroing
+    // itself; backend-level tests should only assert that `schedule`
+    // becomes `null`, not re-inspect the bytes afterward.
+    const shared = [_]u8{0x77} ** shared_secret_len;
+    const transcript = [_]u8{0x88} ** hash_len;
+    var schedule = KeySchedule.init(&shared, transcript);
+    const bytes = std.mem.asBytes(&schedule);
+    try std.testing.expect(!std.mem.allEqual(u8, bytes, 0));
+    schedule.wipe();
+    try std.testing.expect(std.mem.allEqual(u8, bytes, 0));
+}
+
 test "resumption master secret and PSK derivation are deterministic" {
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
     const hello_hash = hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");

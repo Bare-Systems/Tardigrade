@@ -3185,29 +3185,38 @@ test "async credential selection failure zeroes the captured ClientHello bytes, 
     try server.backend().receive(.initial, hello, &sink);
     try std.testing.expect(server.authPending());
 
-    // `client_hello_psk` is an embedded fixed-size buffer (no allocator
-    // involved), so its address is stable across the `= null` assignment
-    // below and directly re-inspectable afterward.
-    const capture = &server.client_hello_psk.?;
-    const message_memory = capture.message[0..capture.message_len];
-    try std.testing.expect(!std.mem.allEqual(u8, message_memory, 0));
-    const original_message = try std.testing.allocator.dupe(u8, message_memory);
-    defer std.testing.allocator.free(original_message);
+    try std.testing.expect(server.client_hello_psk.?.message_len > 0);
 
     try std.testing.expectError(error.CredentialProviderFailed, server.resumeAuth(&sink));
-    try std.testing.expect(server.client_hello_psk == null);
     // Regression coverage: it is not enough to null the optional — the
     // framed ClientHello bytes it pointed at must themselves be
     // overwritten, or a scratch copy of the peer-supplied identity would
-    // linger in backend storage past this failed connection. Checked
-    // against the original content rather than exact zero: once an
-    // optional transitions to `null`, Zig's own debug-safety
-    // instrumentation is free to poison the now-inactive payload with
-    // something other than zero (observed to differ between the x86_64
-    // and aarch64 backends in this Zig version), so an exact-zero
-    // assertion here would depend on that instrumentation rather than on
-    // this code's own `secureZero` call.
-    try std.testing.expect(!std.mem.eql(u8, message_memory, original_message));
+    // linger in backend storage past this failed connection. This test
+    // deliberately does *not* capture a slice into `client_hello_psk.?`
+    // and re-read it after this line sets the field to `null`: that would
+    // be reading through a reference invalidated by the very assignment
+    // being tested, and whatever byte pattern showed up afterward would be
+    // Zig's own debug-safety instrumentation for an inactive optional
+    // (observed to differ between the x86_64 and aarch64 backends in this
+    // Zig version), not necessarily evidence of `ClientHelloPskCapture
+    // .wipe()` having run. That zeroing is proven directly, on a plain
+    // non-optional value, by `"ClientHelloPskCapture.wipe zeroizes the
+    // captured message"` below; this test only asserts the state
+    // transition it should trigger.
+    try std.testing.expect(server.client_hello_psk == null);
+}
+
+test "ClientHelloPskCapture.wipe zeroizes the captured message" {
+    var capture: tls_backend.Tls13Backend.ClientHelloPskCapture = .{};
+    @memset(capture.message[0..64], 0x5c);
+    capture.message_len = 64;
+    const bytes = capture.message[0..capture.message_len];
+    try std.testing.expect(!std.mem.allEqual(u8, bytes, 0));
+
+    capture.wipe();
+
+    try std.testing.expect(std.mem.allEqual(u8, bytes, 0));
+    try std.testing.expectEqual(@as(usize, 0), capture.message_len);
 }
 
 test "a transport-extension type colliding with a TLS-owned PSK extension is rejected at start" {
@@ -3539,14 +3548,6 @@ test "a PSK-selected ServerHello with inconsistent suite/version/key-share is re
 }
 
 test "a rejected ServerHello observably zeroes the client's offered PSK bytes, not just the length" {
-    // `FixedBufferAllocator.free` is a no-op that never poisons its backing
-    // storage (unlike `std.testing.allocator`'s debug fill-on-free), so any
-    // zero bytes we observe here can only have come from this code's own
-    // explicit `secureZero` calls, not from allocator bookkeeping.
-    var backing = [_]u8{0xa5} ** 4096;
-    var fba = std.heap.FixedBufferAllocator.init(&backing);
-    const allocator = fba.allocator();
-
     var client = tls_backend.Tls13Backend.initClient(
         clientEntropy(),
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
@@ -3556,7 +3557,7 @@ test "a rejected ServerHello observably zeroes the client's offered PSK bytes, n
 
     const psk = [_]u8{0x99} ** tls_backend.hash_len;
     var common: session.ResumableSessionCommon = .{};
-    try common.init(allocator, session.Limits.default, .{
+    try common.init(std.testing.allocator, session.Limits.default, .{
         .cipher_suite = .tls_aes_128_gcm_sha256,
         .resumption_psk = &psk,
         .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
@@ -3564,7 +3565,7 @@ test "a rejected ServerHello observably zeroes the client's offered PSK bytes, n
         .lifetime_seconds = 3600,
     });
     var ticket_state: session.ClientTicketState = .{};
-    try ticket_state.init(allocator, session.Limits.default, &common, .{
+    try ticket_state.init(std.testing.allocator, session.Limits.default, &common, .{
         .ticket = "wipe-client-ticket",
         .ticket_age_add = 0,
         .ticket_nonce = "n",
@@ -3603,16 +3604,26 @@ test "a rejected ServerHello observably zeroes the client's offered PSK bytes, n
     try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, hello, &sink));
 
     try std.testing.expect(client.client_psk_offers.isEmpty());
-    // `resumption_psk`/`ticket_nonce` are embedded fixed-size arrays wiped
-    // in place by `secureZero`, so they are observably all-zero afterward.
-    // `ticket` is allocator-backed: Zig's `Allocator.free()` unconditionally
-    // `@memset`s freed memory to `undefined` (0xaa in this build) *after*
-    // our own `secureZero` runs, so an exact-zero check on it would fail
-    // for reasons unrelated to whether the secret was actually wiped —
-    // instead this proves the original ticket bytes no longer survive.
+    // `resumption_psk`/`ticket_nonce` are embedded fixed-size arrays, never
+    // routed through an allocator or an optional-to-null transition, so
+    // `secureZero`'s effect is directly and reliably observable here.
     try std.testing.expect(std.mem.allEqual(u8, psk_memory, 0));
-    try std.testing.expect(!std.mem.eql(u8, ticket_memory, "wipe-client-ticket"));
     try std.testing.expect(std.mem.allEqual(u8, nonce_memory, 0));
+    // `ticket` (`BoundedSecret`) is allocator-backed: Zig's generic
+    // `Allocator.free()` front-end unconditionally `@memset`s freed memory
+    // to `undefined` *after* `BoundedSecret.deinit()`'s own `secureZero`
+    // runs, so re-inspecting `ticket_memory`'s bytes here would prove
+    // nothing about whether that `secureZero` call actually executed —
+    // the exact same undefined-fill would occur even if it were deleted.
+    // `BoundedSecret`'s own zero-before-free behavior is proven directly,
+    // without that interference, by `"bounded secret clears allocator
+    // backing storage before free"` in secrets.zig; what this test can
+    // reliably prove at the backend/type-integration boundary is that
+    // `deinit()` actually ran and released ownership — `.len` and
+    // `.bytes` are updated by this code's own explicit assignments, not
+    // by the allocator, so they are unaffected by that undefined-fill.
+    try std.testing.expectEqual(@as(usize, 0), settled.ticket.len);
+    try std.testing.expectEqual(@as(usize, 0), settled.ticket.bytes.len);
 }
 
 /// Completes a PSK-resumed server handshake driven by `driveServerSelection`
@@ -3688,33 +3699,30 @@ test "backend teardown observably zeroes the key schedule and selected PSK sessi
     try driveServerSelection(&server, .{ .psk = .{ .items = &.{.{ .identity = "teardown-ticket", .binder_psk = &psk }} } });
     try std.testing.expect(server.core.psk_authenticated);
     try std.testing.expect(server.selected_server_psk_present);
+    try std.testing.expect(server.schedule != null);
 
-    // Both `schedule` and `selected_server_psk.state` are embedded directly
-    // in the backend (no separate heap allocation), so their addresses stay
-    // valid across `deinit()` and the bytes are directly inspectable —
-    // unlike allocator-backed secrets, nothing here goes through
-    // `Allocator.free`'s unconditional undefined-fill.
-    const schedule_memory = std.mem.asBytes(&server.schedule.?);
+    // `selected_server_psk.state` is a plain (non-optional) field — never
+    // routed through a `?T = null` transition — so its address stays valid
+    // across `deinit()` and the bytes are directly, reliably inspectable
+    // for exact zero afterward.
     const selected_psk_memory = server.selected_server_psk.state.common.resumption_psk.bytes[0..server.selected_server_psk.state.common.resumption_psk.len];
-    try std.testing.expect(!std.mem.allEqual(u8, schedule_memory, 0));
     try std.testing.expect(!std.mem.allEqual(u8, selected_psk_memory, 0));
-    const original_schedule = try std.testing.allocator.dupe(u8, schedule_memory);
-    defer std.testing.allocator.free(original_schedule);
 
     server.deinit();
 
-    // `selected_server_psk.state` is a plain (non-optional) field — never
-    // routed through a `?T = null` transition — so it stays reliably
-    // exact-zero after `secureZero`. `schedule` (`?KeySchedule`) is
-    // checked against its original content rather than exact zero: once
-    // it transitions to `null`, Zig's debug-safety instrumentation is free
-    // to poison the now-inactive payload with something other than zero
-    // (observed to differ between the x86_64 and aarch64 backends in this
-    // Zig version), so an exact-zero assertion here would depend on that
-    // instrumentation rather than on `finish`'s/`deinit`'s own
-    // `secureZero` call.
-    try std.testing.expect(!std.mem.eql(u8, schedule_memory, original_schedule));
     try std.testing.expect(std.mem.allEqual(u8, selected_psk_memory, 0));
+    // `schedule` (`?KeySchedule`) is deliberately *not* re-inspected here:
+    // capturing a slice into `schedule.?`'s payload and reading it after
+    // `deinit()` sets `schedule = null` would be reading through a
+    // reference invalidated by that assignment — whatever byte pattern
+    // shows up afterward is Zig's own debug-safety instrumentation for an
+    // inactive optional (observed to differ between the x86_64 and
+    // aarch64 backends in this Zig version), not necessarily evidence of
+    // this code's `secureZero` call. `KeySchedule.wipe()`'s zeroing is
+    // proven directly, on a plain non-optional value, by `"KeySchedule.wipe
+    // zeroizes every derived secret"` in key_schedule.zig; what this test
+    // can reliably assert at the backend level is the state transition.
+    try std.testing.expect(server.schedule == null);
 }
 
 fn pskStoredStateTimed(psk: []const u8, issued_at_unix_ms: i64, ticket_age_add: u32) session.ServerRecoverableState {
@@ -4206,6 +4214,7 @@ const FbaCloningResolver = struct {
     state: *session.ServerRecoverableState,
     allocator: std.mem.Allocator,
     identity: []const u8,
+    calls: usize = 0,
 
     fn now(_: *anyopaque) i64 {
         return 0;
@@ -4213,6 +4222,7 @@ const FbaCloningResolver = struct {
     fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         if (!std.mem.eql(u8, identity, self.identity)) return false;
+        self.calls += 1;
         // Deliberately clones through a *different* allocator than the one
         // backing `self.state` itself, so the only writes ever made into
         // `allocator`'s backing storage are the transient per-attempt
@@ -4224,15 +4234,23 @@ const FbaCloningResolver = struct {
 };
 
 test "a bad binder wipes the resolver's cloned candidate, including its compat blob" {
-    // See the zeroization test above for why `FixedBufferAllocator` (whose
-    // `free` never poisons memory, unlike the generic `Allocator.free`
-    // front-end which always does) is the only way to observe this
-    // reliably: it isolates the candidate clone's allocations to a backing
-    // array we can scan directly, independent of whatever exact byte
-    // pattern `free()` itself leaves behind.
+    // Zig's generic `Allocator.free()` front-end unconditionally
+    // `@memset`s freed memory to `undefined`, for *any* backing allocator
+    // (including `FixedBufferAllocator`) — so scanning `backing` for the
+    // absence of a marker byte string proves nothing: that scan would
+    // "pass" even if the candidate's `deinit()` were never called, because
+    // any full alloc/free round-trip on this allocator poisons the same
+    // bytes regardless. What genuinely distinguishes "freed" from "leaked"
+    // here is `FixedBufferAllocator`'s own *bookkeeping* (`end_index`),
+    // which the `Allocator.free()` wrapper does not touch and which only
+    // advances/retreats through real (de)allocations of the clone's
+    // backing storage: a full round-trip back to the starting offset can
+    // only happen if every byte this resolver allocated for the failed
+    // candidate was also freed.
     var backing = [_]u8{0xa5} ** 4096;
     var fba = std.heap.FixedBufferAllocator.init(&backing);
     const clone_allocator = fba.allocator();
+    const end_index_before_selection = fba.end_index;
 
     var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = tls_backend.recordAlpnPolicy("h2") } });
     defer server.deinit();
@@ -4273,10 +4291,16 @@ test "a bad binder wipes the resolver's cloned candidate, including its compat b
 
     try std.testing.expect(!server.core.psk_authenticated);
     try std.testing.expect(!server.selected_server_psk_present);
-    // The clone's compat blob was the only thing ever written into
-    // `backing`; a lingering copy here would mean the failed candidate's
-    // `deinit()` was skipped somewhere on the bad-binder path.
-    try std.testing.expect(std.mem.indexOf(u8, &backing, marker) == null);
+    // The resolver really was invoked (and so really did clone a compat
+    // blob into `clone_allocator`, proving this exercised the allocator)...
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    // ...and by the time selection has failed, every byte it allocated for
+    // that candidate has been released back to the allocator: `end_index`
+    // returned exactly to its starting point. This can only happen if the
+    // candidate's `deinit()` (which frees the cloned compat blob) actually
+    // ran on the bad-binder path — a leaked candidate would leave
+    // `end_index` permanently advanced.
+    try std.testing.expectEqual(end_index_before_selection, fba.end_index);
 }
 
 /// A hand-written `CredentialProvider` whose second chain entry is

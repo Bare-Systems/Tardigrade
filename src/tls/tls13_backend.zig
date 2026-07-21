@@ -616,13 +616,26 @@ pub const Tls13Backend = struct {
 
     /// Reassembler capacity is `max_message_len + 4` (see `initial_input`),
     /// so the capture buffer matches that bound exactly.
-    const ClientHelloPskCapture = struct {
+    pub const ClientHelloPskCapture = struct {
         message: [max_message_len + handshake_header_len]u8 = undefined,
         message_len: usize = 0,
         /// Offset of the `pre_shared_key` extension's `extension_data`
         /// within `message`.
         ext_data_offset: usize = 0,
         ext_data_len: usize = 0,
+
+        /// Zeroizes the captured bytes in place. Exposed (`pub`) so its
+        /// zeroing behavior can be proven directly, on a plain value, in
+        /// isolation from the `?ClientHelloPskCapture = null` transition
+        /// `clearClientHelloPsk` performs right after calling this —
+        /// reading the backend's own field after that transition would
+        /// observe whatever Zig's debug-safety instrumentation does to an
+        /// invalidated optional's payload, not necessarily this method's
+        /// effect.
+        pub fn wipe(self: *ClientHelloPskCapture) void {
+            crypto.secureZero(u8, self.message[0..self.message_len]);
+            self.message_len = 0;
+        }
     };
 
     pub const SessionTicketConsumer = struct {
@@ -1062,7 +1075,7 @@ pub const Tls13Backend = struct {
     /// captured it.
     fn clearClientHelloPsk(self: *Tls13Backend) void {
         if (self.client_hello_psk) |*capture| {
-            crypto.secureZero(u8, capture.message[0..capture.message_len]);
+            capture.wipe();
         }
         self.client_hello_psk = null;
         self.offered_psk_modes_seen = false;

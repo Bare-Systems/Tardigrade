@@ -604,6 +604,236 @@ test "writeOffer rejects illegal shapes without ever mutating the writer" {
     }
 }
 
+test "a literal framed ClientHello proves the exact binder truncation boundary" {
+    // A hand-assembled, fully framed ClientHello (handshake header through a
+    // trailing `pre_shared_key` extension with one identity "abcd" and one
+    // 32-byte binder), constructed byte-by-byte from the RFC 8446 grammar
+    // rather than via this module's own writer — every enclosing length
+    // (message, extensions vector, `pre_shared_key` extension, identities
+    // vector) is already final, exactly as the wire requires before hashing.
+    // The embedded binder itself was computed independently (Python
+    // hashlib/hmac, not this module) over the expected truncated prefix.
+    const message = hexBytes(
+        "0100006503037777777777777777777777777777777777777777777777777777" ++
+            "77777777777700000213010100003a002b00030203040029002f000a00046162" ++
+            "6364112233440021208f6e79d089388cd1e7ca42e346e44ba217289f0450609a" ++
+            "9827c4ee59f16568e6",
+    );
+    // The `pre_shared_key` extension_data begins at a fixed, independently
+    // computed offset within `message` (4-byte header + fixed ClientHello
+    // fields + the `supported_versions` extension that precedes it).
+    const ext_data_offset = 58;
+    const ext_data = message[ext_data_offset..];
+
+    var offered = try OfferedPsks.parse(ext_data);
+    try testing.expectEqual(@as(usize, 1), offered.count);
+    // Exactly the offset of the *2-byte binders-vector length field* —
+    // not the binder payload two bytes later.
+    try testing.expectEqual(@as(usize, 12), offered.binder_vector_offset);
+
+    const truncated_len = ext_data_offset + offered.binder_vector_offset;
+    try testing.expectEqual(@as(usize, 70), truncated_len);
+    const prefix = message[0..truncated_len];
+    const expected_prefix = hexBytes(
+        "0100006503037777777777777777777777777777777777777777777777777777" ++
+            "77777777777700000213010100003a002b00030203040029002f000a00046162" ++
+            "636411223344",
+    );
+    try testing.expectEqualSlices(u8, &expected_prefix, prefix);
+
+    const psk = [_]u8{0xaa} ** 32;
+    const expected_binder = hexBytes("8f6e79d089388cd1e7ca42e346e44ba217289f0450609a9827c4ee59f16568e6");
+    var binder: [32]u8 = undefined;
+    try deriveBinder(.sha256, &psk, prefix, &binder);
+    try testing.expectEqualSlices(u8, &expected_binder, &binder);
+
+    // Confirm the embedded pair's identity/binder round-trip through the
+    // borrowed paired iterator too.
+    var it = offered.pairs();
+    const pair = (try it.next()).?;
+    try testing.expectEqualStrings("abcd", pair.identity.identity);
+    try testing.expectEqual(@as(u32, 0x11223344), pair.identity.obfuscated_ticket_age);
+    try testing.expectEqualSlices(u8, &expected_binder, pair.binder);
+    try testing.expectEqual(@as(?OfferedPsks.PairIterator.Pair, null), try it.next());
+
+    // The offset is exact, not "close enough": hashing two bytes further
+    // (as if the binders-vector length field were mistakenly included in
+    // the prefix) must *not* reproduce the same binder.
+    var wrong_binder: [32]u8 = undefined;
+    try deriveBinder(.sha256, &psk, message[0 .. truncated_len + 2], &wrong_binder);
+    try testing.expect(!std.mem.eql(u8, &expected_binder, &wrong_binder));
+}
+
+test "every strict prefix of a valid OfferedPsks fixture is rejected, none silently accepted" {
+    // The `pre_shared_key` extension_data from the literal ClientHello
+    // fixture above: identities_len(2) + one identity(10) + binders_len(2)
+    // + one 32-byte binder(33). Every vector is length-prefixed and spans
+    // the whole fixture, so there is no shorter prefix that could
+    // coincidentally look complete.
+    const ext_data = hexBytes(
+        "000a000461626364112233440021208f6e79d089388cd1e7ca42e346e44ba217" ++
+            "289f0450609a9827c4ee59f16568e6",
+    );
+    try testing.expectEqual(@as(usize, 47), ext_data.len);
+    _ = try OfferedPsks.parse(&ext_data); // the full fixture does parse
+
+    var cut: usize = 0;
+    while (cut < ext_data.len) : (cut += 1) {
+        if (OfferedPsks.parse(ext_data[0..cut])) |_| {
+            std.debug.print("unexpected successful parse at cut={d}\n", .{cut});
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "OfferedPsks identity length boundaries: zero, one, max representable, truncated" {
+    // identity length 0 is illegal regardless of what follows.
+    {
+        var buf: [64]u8 = undefined;
+        var w = messages.Writer{ .buf = &buf };
+        try w.u16_(6); // identities_len: 2(id_len)+0+4(age)
+        try w.u16_(0); // identity length 0
+        try w.bytes(&[_]u8{0} ** 4); // age
+        try w.u16_(33);
+        try w.u8_(32);
+        try w.bytes(&[_]u8{0} ** 32);
+        try testing.expectError(error.EmptyIdentity, OfferedPsks.parse(w.written()));
+    }
+    // identity length 1 (minimum non-empty) succeeds.
+    {
+        var buf: [64]u8 = undefined;
+        var w = messages.Writer{ .buf = &buf };
+        try w.u16_(7); // 2+1+4
+        try w.u16_(1);
+        try w.u8_('x');
+        try w.bytes(&[_]u8{0} ** 4);
+        try w.u16_(33);
+        try w.u8_(32);
+        try w.bytes(&[_]u8{0} ** 32);
+        const offered = try OfferedPsks.parse(w.written());
+        try testing.expectEqual(@as(usize, 1), offered.count);
+    }
+    // Declared identity length longer than the remaining identities-vector
+    // bytes (truncated identity) is a decode failure, not silently clamped.
+    {
+        var buf: [64]u8 = undefined;
+        var w = messages.Writer{ .buf = &buf };
+        try w.u16_(6); // claims 6, but only provides a 2-byte length + 2 bytes
+        try w.u16_(10); // identity claims length 10
+        try w.bytes(&[_]u8{ 'a', 'b' }); // only 2 bytes actually present
+        try testing.expectError(error.MalformedHandshake, OfferedPsks.parse(w.written()));
+    }
+    // Truncated obfuscated_ticket_age (identity present, age cut short).
+    {
+        var buf: [64]u8 = undefined;
+        var w = messages.Writer{ .buf = &buf };
+        try w.u16_(5); // 2(id_len)+1(id)+2(only 2 of 4 age bytes)
+        try w.u16_(1);
+        try w.u8_('x');
+        try w.bytes(&[_]u8{ 0, 0 }); // age truncated to 2 bytes
+        try testing.expectError(error.MalformedHandshake, OfferedPsks.parse(w.written()));
+    }
+}
+
+test "OfferedPsks vector-length boundaries: identities/binders zero, one-over, count mismatch" {
+    // identities_len = 0 is EmptyVector even with a well-formed binders
+    // vector following.
+    {
+        var buf: [64]u8 = undefined;
+        var w = messages.Writer{ .buf = &buf };
+        try w.u16_(0);
+        try w.u16_(33);
+        try w.u8_(32);
+        try w.bytes(&[_]u8{0} ** 32);
+        try testing.expectError(error.EmptyVector, OfferedPsks.parse(w.written()));
+    }
+    // binders_len = 0 is EmptyVector even with a well-formed identities
+    // vector preceding it.
+    {
+        var buf: [64]u8 = undefined;
+        var w = messages.Writer{ .buf = &buf };
+        try w.u16_(7);
+        try w.u16_(1);
+        try w.u8_('x');
+        try w.bytes(&[_]u8{0} ** 4);
+        try w.u16_(0);
+        try testing.expectError(error.EmptyVector, OfferedPsks.parse(w.written()));
+    }
+    // identities_len one byte short of what the single entry needs. Bytes
+    // after the truncation point are misinterpreted (this is a
+    // length-prefixed format, not self-delimiting), so the *specific*
+    // resulting error legitimately varies with the exact misalignment —
+    // this asserts only that decoding never silently succeeds.
+    {
+        var buf: [64]u8 = undefined;
+        var w = messages.Writer{ .buf = &buf };
+        try w.u16_(6); // needs 7 (2+1+4) for one entry; declares only 6
+        try w.u16_(1);
+        try w.u8_('x');
+        try w.bytes(&[_]u8{0} ** 4);
+        try w.u16_(33);
+        try w.u8_(32);
+        try w.bytes(&[_]u8{0} ** 32);
+        if (OfferedPsks.parse(w.written())) |_| {
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+    // Two identities, one binder: count mismatch.
+    {
+        var buf: [64]u8 = undefined;
+        var w = messages.Writer{ .buf = &buf };
+        try w.u16_(14); // two 7-byte entries
+        for (0..2) |_| {
+            try w.u16_(1);
+            try w.u8_('x');
+            try w.bytes(&[_]u8{0} ** 4);
+        }
+        try w.u16_(33);
+        try w.u8_(32);
+        try w.bytes(&[_]u8{0} ** 32);
+        try testing.expectError(error.CountMismatch, OfferedPsks.parse(w.written()));
+    }
+    // One identity, two binders: count mismatch the other direction.
+    {
+        var buf: [96]u8 = undefined;
+        var w = messages.Writer{ .buf = &buf };
+        try w.u16_(7);
+        try w.u16_(1);
+        try w.u8_('x');
+        try w.bytes(&[_]u8{0} ** 4);
+        try w.u16_(66); // two 33-byte binder entries
+        for (0..2) |_| {
+            try w.u8_(32);
+            try w.bytes(&[_]u8{0} ** 32);
+        }
+        try testing.expectError(error.CountMismatch, OfferedPsks.parse(w.written()));
+    }
+}
+
+test "psk_key_exchange_modes: duplicate-mode bytes, single non-psk_dhe_ke mode, and every truncation" {
+    // Duplicate mode bytes are wire-legal (the vector is just a byte list;
+    // this module reports whether a mode is *present*, not distinctness) —
+    // `hasMode` still correctly reports presence.
+    const dup = [_]u8{ 2, 1, 1 }; // len=2, [psk_dhe_ke, psk_dhe_ke]
+    try testing.expect(try hasMode(&dup, .psk_dhe_ke));
+    try testing.expect(!try hasMode(&dup, .psk_ke));
+
+    // A single psk_ke-only offer: psk_dhe_ke is correctly reported absent
+    // (the #362 profile only ever selects psk_dhe_ke, so the backend must
+    // treat this as "PSK not usable", not error).
+    var buf: [8]u8 = undefined;
+    var w = messages.Writer{ .buf = &buf };
+    try writeModes(&w, &.{.psk_ke});
+    try testing.expect(!try hasMode(w.written(), .psk_dhe_ke));
+
+    // Every strict prefix of a valid modes vector is rejected.
+    const valid = [_]u8{ 2, 0, 1 };
+    var cut: usize = 0;
+    while (cut < valid.len) : (cut += 1) {
+        try testing.expectError(error.MalformedHandshake, hasMode(valid[0..cut], .psk_dhe_ke));
+    }
+}
+
 test "OfferedPsks encode/decode round-trip via writeOffer and parse" {
     var buf: [512]u8 = undefined;
     var w = messages.Writer{ .buf = &buf };

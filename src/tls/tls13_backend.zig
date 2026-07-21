@@ -2629,7 +2629,7 @@ pub const Tls13Backend = struct {
             // error, and the success `return` below.
             defer candidate_state.deinit();
             const found = resolver.resolve(pair.identity.identity, &candidate_state) catch
-                return error.CredentialProviderFailed;
+                return self.failCredential(.provider_internal_failure);
             if (!found) continue;
 
             const candidate_ctx: session.CandidateContext = .{

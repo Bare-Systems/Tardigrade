@@ -261,6 +261,9 @@ pub const TransportProfile = union(enum) {
                 ext_alpn,
                 ext_supported_versions,
                 ext_key_share,
+                @intFromEnum(tls_algorithms.ExtensionType.padding),
+                @intFromEnum(tls_algorithms.ExtensionType.early_data),
+                @intFromEnum(tls_algorithms.ExtensionType.cookie),
                 // #362: reserve the TLS-owned PSK extension IDs too — a
                 // caller configuring a transport extension with either of
                 // these types would otherwise collide with (and be

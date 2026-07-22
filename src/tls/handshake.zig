@@ -143,6 +143,8 @@ pub const Core = struct {
         if (self.handshake_lifecycle != .running and self.handshake_lifecycle != .complete)
             return error.InvalidHandshakeState;
         const message = messages.decode(raw) catch return error.MalformedHandshake;
+        if (message.kind == .client_hello and self.retry_state == .hrr_sent)
+            return error.UnexpectedHandshakeMessage;
         if (message.kind == .new_session_ticket) {
             if (self.handshake_lifecycle != .complete or self.role != .client)
                 return error.UnexpectedHandshakeMessage;
@@ -211,6 +213,8 @@ pub const Core = struct {
     pub fn recordSent(self: *Core, raw: []const u8) Error!void {
         if (self.handshake_lifecycle != .running) return error.InvalidHandshakeState;
         const message = messages.decode(raw) catch return error.MalformedHandshake;
+        if (message.kind == .client_hello and self.retry_state == .hrr_received)
+            return error.UnexpectedHandshakeMessage;
         if (!self.validOutbound(message.kind)) return error.UnexpectedHandshakeMessage;
         self.transcript.update(message.raw);
         self.advanceAfterSend(message.kind);
@@ -220,6 +224,7 @@ pub const Core = struct {
         if (self.role != .client or
             self.handshake_lifecycle != .running or
             self.expected_inbound != .server_hello or
+            self.handshake_state != .client_hello or
             self.retry_state != .none)
             return error.UnexpectedHandshakeMessage;
         const message = messages.decode(raw) catch return error.MalformedHandshake;
@@ -348,7 +353,10 @@ pub const Core = struct {
         switch (self.role) {
             .client => switch (self.client_auth_outbound) {
                 .inactive => switch (kind) {
-                    .client_hello => self.expected_inbound = .server_hello,
+                    .client_hello => {
+                        self.handshake_state = .client_hello;
+                        self.expected_inbound = .server_hello;
+                    },
                     .finished => self.handshake_lifecycle = .complete,
                     else => {},
                 },
@@ -510,6 +518,42 @@ test "core rejects repeated HRR and ClientHello2 without retry state" {
     var fresh_server = Core.init(.server);
     try fresh_server.start();
     try std.testing.expectError(error.UnexpectedHandshakeMessage, fresh_server.acceptSecondClientHello(ch1));
+}
+
+test "core rejects HRR before ClientHello1 was recorded without rebinding transcript" {
+    var client = Core.init(.client);
+    try client.start();
+    const before = client.transcriptHash();
+
+    var bytes: [8]u8 = undefined;
+    const hrr = try messages.encode(.server_hello, "hrr", &bytes);
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, client.acceptHelloRetryRequest(hrr));
+    const after = client.transcriptHash();
+    try std.testing.expectEqualSlices(u8, &before, &after);
+    try std.testing.expectEqual(RetryState.none, client.retry_state);
+}
+
+test "core requires dedicated ClientHello2 transitions after HRR" {
+    var client = Core.init(.client);
+    var server = Core.init(.server);
+    try client.start();
+    try server.start();
+
+    var bytes: [16]u8 = undefined;
+    const ch1 = try messages.encode(.client_hello, "one", &bytes);
+    try client.recordSent(ch1);
+    _ = try server.acceptReceived(ch1);
+
+    const hrr = try messages.encode(.server_hello, "hrr", &bytes);
+    try server.recordHelloRetryRequest(hrr);
+    _ = try client.acceptHelloRetryRequest(hrr);
+
+    const ch2 = try messages.encode(.client_hello, "two", &bytes);
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, client.recordSent(ch2));
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, server.acceptReceived(ch2));
+
+    try client.recordSecondClientHello(ch2);
+    _ = try server.acceptSecondClientHello(ch2);
 }
 
 test "a duplicate CertificateRequest in the server flight is rejected" {

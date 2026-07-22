@@ -1,10 +1,12 @@
 //! TLS 1.3 HelloRetryRequest codec and validation helpers.
 
 const std = @import("std");
+const alerts = @import("alerts.zig");
 const algorithms = @import("algorithms.zig");
 const events = @import("events.zig");
 const messages = @import("messages.zig");
 const negotiation = @import("negotiation.zig");
+const pre_shared_key = @import("pre_shared_key.zig");
 
 pub const random = [32]u8{
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11,
@@ -58,7 +60,7 @@ pub fn decode(
     var selected_group: ?algorithms.NamedGroup = null;
     var cookie: ?[]const u8 = null;
 
-    while (try extensions.next()) |extension| {
+    while (try nextExtension(&extensions)) |extension| {
         const ext_type = algorithms.fromInt(algorithms.ExtensionType, extension.id) orelse
             return error.UnsupportedExtension;
         switch (ext_type) {
@@ -89,9 +91,19 @@ pub fn decode(
 
 pub fn encode(request: EncodeRequest, out: []u8) Error![]const u8 {
     if (request.selected_group == null and request.cookie == null) return error.IllegalParameter;
+    if (request.legacy_session_id_echo.len > 32) return error.IllegalParameter;
     if (request.cookie) |cookie| {
-        if (cookie.len == 0 or cookie.len > std.math.maxInt(u16)) return error.IllegalParameter;
+        if (cookie.len == 0 or cookie.len > std.math.maxInt(u16) - 2) return error.IllegalParameter;
     }
+    const encoded_body_len =
+        2 + random.len +
+        1 + request.legacy_session_id_echo.len +
+        2 + 1 +
+        2 +
+        4 + 2 +
+        (if (request.selected_group != null) @as(usize, 4 + 2) else 0) +
+        (if (request.cookie) |cookie| @as(usize, 4 + 2 + cookie.len) else 0);
+    if (encoded_body_len > 512 or encoded_body_len > messages.max_message_len) return error.IllegalParameter;
 
     var body: [512]u8 = undefined;
     var w = messages.Writer{ .buf = &body };
@@ -140,6 +152,8 @@ pub fn validateSecondClientHello(
 
     const first = try ClientHelloView.parse(first_message.body);
     const second = try ClientHelloView.parse(second_message.body);
+    try requirePskLast(first.extensions());
+    try requirePskLast(second.extensions());
 
     if (!std.mem.eql(u8, first.legacy_version, second.legacy_version) or
         !std.mem.eql(u8, first.random, second.random) or
@@ -183,7 +197,7 @@ const ClientHelloView = struct {
             .compression_methods = compression_methods,
         };
         var iter = messages.ExtensionIterator.init(extension_bytes);
-        while (try iter.next()) |extension| {
+        while (try nextExtension(&iter)) |extension| {
             if (view.extension_len == view.extension_storage.len) return error.MalformedHandshake;
             view.extension_storage[view.extension_len] = .{ .id = extension.id, .data = extension.data };
             view.extension_len += 1;
@@ -243,12 +257,15 @@ fn nextComparable(extensions: []const ExtensionView, start: usize, skip_cookie: 
 
 fn compareExtensionPayload(lhs: ExtensionView, rhs: ExtensionView, request: Request) Error!void {
     if (lhs.id == @intFromEnum(algorithms.ExtensionType.key_share)) {
-        const group = request.selected_group orelse return error.IllegalParameter;
-        try expectSingleKeyShare(group, rhs.data);
+        if (request.selected_group) |group| {
+            try expectSingleKeyShare(group, rhs.data);
+        } else if (!std.mem.eql(u8, lhs.data, rhs.data)) {
+            return error.IllegalParameter;
+        }
         return;
     }
     if (lhs.id == @intFromEnum(algorithms.ExtensionType.pre_shared_key)) {
-        if (!samePskIdentityVector(lhs.data, rhs.data)) return error.IllegalParameter;
+        try requireSamePskIdentityOrder(lhs.data, rhs.data);
         return;
     }
     if (!std.mem.eql(u8, lhs.data, rhs.data)) return error.IllegalParameter;
@@ -278,12 +295,38 @@ fn findExtension(extensions: []const ExtensionView, id: u16) ?ExtensionView {
     return null;
 }
 
-fn samePskIdentityVector(first: []const u8, second: []const u8) bool {
-    var first_reader = messages.Reader{ .bytes = first };
-    var second_reader = messages.Reader{ .bytes = second };
-    const first_identities = first_reader.slice(first_reader.u16_() catch return false) catch return false;
-    const second_identities = second_reader.slice(second_reader.u16_() catch return false) catch return false;
-    return std.mem.eql(u8, first_identities, second_identities);
+fn requirePskLast(extensions: []const ExtensionView) Error!void {
+    for (extensions, 0..) |extension, index| {
+        if (extension.id == @intFromEnum(algorithms.ExtensionType.pre_shared_key) and
+            index + 1 != extensions.len)
+            return error.IllegalParameter;
+    }
+}
+
+fn requireSamePskIdentityOrder(first: []const u8, second: []const u8) Error!void {
+    const first_psks = pre_shared_key.OfferedPsks.parse(first) catch return error.IllegalParameter;
+    const second_psks = pre_shared_key.OfferedPsks.parse(second) catch return error.IllegalParameter;
+    if (first_psks.count != second_psks.count) return error.IllegalParameter;
+
+    var first_pairs = first_psks.pairs();
+    var second_pairs = second_psks.pairs();
+    while (nextPskPair(&first_pairs)) |lhs| {
+        const rhs = nextPskPair(&second_pairs) orelse return error.IllegalParameter;
+        if (!std.mem.eql(u8, lhs.identity.identity, rhs.identity.identity))
+            return error.IllegalParameter;
+    }
+    if (nextPskPair(&second_pairs) != null) return error.IllegalParameter;
+}
+
+fn nextPskPair(iter: *pre_shared_key.OfferedPsks.PairIterator) ?pre_shared_key.OfferedPsks.PairIterator.Pair {
+    return iter.next() catch return null;
+}
+
+fn nextExtension(iter: *messages.ExtensionIterator) Error!?messages.Extension {
+    return iter.next() catch |err| switch (err) {
+        error.DuplicateExtension => return error.IllegalParameter,
+        else => return err,
+    };
 }
 
 fn decodeSelectedVersion(bytes: []const u8, original_offers: *const negotiation.ClientHelloOffers) Error!algorithms.ProtocolVersion {
@@ -388,6 +431,83 @@ test "rejects HRR that requests a group already shared in ClientHello1" {
     try testing.expectError(error.IllegalParameter, decode(message.body, "", &offers));
 }
 
+fn hrrWithDuplicateExtension(out: []u8, duplicate_id: u16) ![]const u8 {
+    var body: [256]u8 = undefined;
+    var w = messages.Writer{ .buf = &body };
+    try w.u16_(algorithms.legacy_version);
+    try w.bytes(&random);
+    try w.u8_(0);
+    try w.u16_(@intFromEnum(algorithms.CipherSuite.tls_aes_128_gcm_sha256));
+    try w.u8_(0);
+    const extensions_len = try w.reserve(2);
+    inline for (0..2) |_| {
+        try w.u16_(duplicate_id);
+        switch (duplicate_id) {
+            @intFromEnum(algorithms.ExtensionType.supported_versions) => {
+                try w.u16_(2);
+                try w.u16_(@intFromEnum(algorithms.ProtocolVersion.tls13));
+            },
+            @intFromEnum(algorithms.ExtensionType.key_share) => {
+                try w.u16_(2);
+                try w.u16_(@intFromEnum(algorithms.NamedGroup.x25519));
+            },
+            @intFromEnum(algorithms.ExtensionType.cookie) => {
+                try w.u16_(3);
+                try w.u16_(1);
+                try w.u8_(0xaa);
+            },
+            else => unreachable,
+        }
+    }
+    w.patch(2, extensions_len);
+    return messages.encode(.server_hello, w.written(), out);
+}
+
+test "duplicate HRR extensions map to illegal_parameter alert" {
+    var offers = try baseOffers();
+    inline for (.{
+        @intFromEnum(algorithms.ExtensionType.supported_versions),
+        @intFromEnum(algorithms.ExtensionType.key_share),
+        @intFromEnum(algorithms.ExtensionType.cookie),
+    }) |duplicate_id| {
+        var raw: [256]u8 = undefined;
+        const encoded = try hrrWithDuplicateExtension(&raw, duplicate_id);
+        const message = try messages.decode(encoded);
+        try testing.expectError(error.IllegalParameter, decode(message.body, "", &offers));
+        try testing.expectEqual(alerts.AlertDescription.illegal_parameter, alerts.fromHandshakeError(error.IllegalParameter));
+    }
+}
+
+test "HRR encoder validates session-id and cookie bounds before narrowing casts" {
+    var out: [768]u8 = undefined;
+    const sid32 = [_]u8{0xaa} ** 32;
+    _ = try encode(.{
+        .legacy_session_id_echo = &sid32,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+    }, &out);
+
+    const sid33 = [_]u8{0xbb} ** 33;
+    try testing.expectError(error.IllegalParameter, encode(.{
+        .legacy_session_id_echo = &sid33,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+    }, &out));
+
+    const max_cookie = [_]u8{0xcc} ** 460;
+    _ = try encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .cookie = &max_cookie,
+    }, &out);
+    const oversized_cookie = [_]u8{0xdd} ** 461;
+    try testing.expectError(error.IllegalParameter, encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .cookie = &oversized_cookie,
+    }, &out));
+}
+
 fn clientHello(
     out: []u8,
     random_byte: u8,
@@ -395,7 +515,68 @@ fn clientHello(
     cookie: ?[]const u8,
     extra_extension: ?ExtensionView,
 ) ![]const u8 {
+    return clientHelloWithShare(out, random_byte, key_share_group, "share", cookie, extra_extension);
+}
+
+fn clientHelloWithShare(
+    out: []u8,
+    random_byte: u8,
+    key_share_group: ?algorithms.NamedGroup,
+    key_share: []const u8,
+    cookie: ?[]const u8,
+    extra_extension: ?ExtensionView,
+) ![]const u8 {
     var body: [512]u8 = undefined;
+    var w = messages.Writer{ .buf = &body };
+    try w.u16_(algorithms.legacy_version);
+    try w.bytes(&([_]u8{random_byte} ** 32));
+    try w.u8_(3);
+    try w.bytes("sid");
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(algorithms.CipherSuite.tls_aes_128_gcm_sha256));
+    try w.u8_(1);
+    try w.u8_(0);
+    const extensions_len = try w.reserve(2);
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.supported_versions));
+    try w.u16_(3);
+    try w.u8_(2);
+    try w.u16_(@intFromEnum(algorithms.ProtocolVersion.tls13));
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.supported_groups));
+    try w.u16_(4);
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(algorithms.NamedGroup.x25519));
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.key_share));
+    const key_share_ext = try w.reserve(2);
+    const key_shares = try w.reserve(2);
+    if (key_share_group) |group| {
+        try w.u16_(@intFromEnum(group));
+        try w.u16_(@intCast(key_share.len));
+        try w.bytes(key_share);
+    }
+    w.patch(2, key_shares);
+    w.patch(2, key_share_ext);
+    if (cookie) |value| {
+        try w.u16_(@intFromEnum(algorithms.ExtensionType.cookie));
+        try w.u16_(@intCast(2 + value.len));
+        try w.u16_(@intCast(value.len));
+        try w.bytes(value);
+    }
+    if (extra_extension) |extension| {
+        try w.u16_(extension.id);
+        try w.u16_(@intCast(extension.data.len));
+        try w.bytes(extension.data);
+    }
+    w.patch(2, extensions_len);
+    return messages.encode(.client_hello, w.written(), out);
+}
+
+fn clientHelloWithExtensionList(
+    out: []u8,
+    random_byte: u8,
+    key_share_group: ?algorithms.NamedGroup,
+    extensions: []const ExtensionView,
+) ![]const u8 {
+    var body: [768]u8 = undefined;
     var w = messages.Writer{ .buf = &body };
     try w.u16_(algorithms.legacy_version);
     try w.bytes(&([_]u8{random_byte} ** 32));
@@ -424,19 +605,46 @@ fn clientHello(
     }
     w.patch(2, key_shares);
     w.patch(2, key_share_ext);
-    if (cookie) |value| {
-        try w.u16_(@intFromEnum(algorithms.ExtensionType.cookie));
-        try w.u16_(@intCast(2 + value.len));
-        try w.u16_(@intCast(value.len));
-        try w.bytes(value);
-    }
-    if (extra_extension) |extension| {
+    for (extensions) |extension| {
         try w.u16_(extension.id);
         try w.u16_(@intCast(extension.data.len));
         try w.bytes(extension.data);
     }
     w.patch(2, extensions_len);
     return messages.encode(.client_hello, w.written(), out);
+}
+
+fn pskExtension(
+    out: []u8,
+    identity_a: []const u8,
+    age_a: u32,
+    identity_b: ?[]const u8,
+    age_b: u32,
+    binder_byte: u8,
+) ![]const u8 {
+    var w = messages.Writer{ .buf = out };
+    const ids_len = try w.reserve(2);
+    try w.u16_(@intCast(identity_a.len));
+    try w.bytes(identity_a);
+    var age_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &age_bytes, age_a, .big);
+    try w.bytes(&age_bytes);
+    if (identity_b) |id| {
+        try w.u16_(@intCast(id.len));
+        try w.bytes(id);
+        std.mem.writeInt(u32, &age_bytes, age_b, .big);
+        try w.bytes(&age_bytes);
+    }
+    w.patch(2, ids_len);
+    const binders_len = try w.reserve(2);
+    try w.u8_(32);
+    try w.bytes(&([_]u8{binder_byte} ** 32));
+    if (identity_b != null) {
+        try w.u8_(32);
+        try w.bytes(&([_]u8{binder_byte +% 1} ** 32));
+    }
+    w.patch(2, binders_len);
+    return w.written();
 }
 
 test "ClientHello2 validator permits requested key share and cookie" {
@@ -471,4 +679,165 @@ test "ClientHello2 validator rejects changed random and cookie" {
         .selected_group = .x25519,
         .cookie = "cookie",
     }));
+}
+
+test "ClientHello2 validator normalizes duplicate extensions to illegal_parameter" {
+    var first_buf: [768]u8 = undefined;
+    var second_buf: [768]u8 = undefined;
+    const first = try clientHello(&first_buf, 0xaa, null, null, null);
+    const second = try clientHello(&second_buf, 0xaa, .x25519, null, .{
+        .id = @intFromEnum(algorithms.ExtensionType.supported_groups),
+        .data = &.{ 0, 2, 0, @intFromEnum(algorithms.NamedGroup.x25519) },
+    });
+    try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, second, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+        .cookie = null,
+    }));
+    try testing.expectEqual(alerts.AlertDescription.illegal_parameter, alerts.fromHandshakeError(error.IllegalParameter));
+}
+
+test "ClientHello2 validator accepts cookie-only HRR with unchanged key share" {
+    var first_buf: [768]u8 = undefined;
+    var second_buf: [768]u8 = undefined;
+    const first = try clientHello(&first_buf, 0xaa, .x25519, null, null);
+    const second = try clientHello(&second_buf, 0xaa, .x25519, "cookie", null);
+    try validateSecondClientHello(first, second, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = null,
+        .cookie = "cookie",
+    });
+
+    const changed_share = try clientHelloWithShare(&second_buf, 0xaa, .x25519, "other", "cookie", null);
+    try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, changed_share, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = null,
+        .cookie = "cookie",
+    }));
+}
+
+test "ClientHello2 validator enforces pre_shared_key final extension ordering" {
+    var psk_buf: [256]u8 = undefined;
+    const psk = try pskExtension(&psk_buf, "ticket-a", 1, null, 0, 0xaa);
+    const psk_ext = ExtensionView{ .id = @intFromEnum(algorithms.ExtensionType.pre_shared_key), .data = psk };
+    const cookie_ext = ExtensionView{ .id = @intFromEnum(algorithms.ExtensionType.cookie), .data = &.{ 0, 6, 'c', 'o', 'o', 'k', 'i', 'e' } };
+
+    var first_buf: [768]u8 = undefined;
+    var second_buf: [768]u8 = undefined;
+    const first = try clientHelloWithExtensionList(&first_buf, 0xaa, .x25519, &.{psk_ext});
+    const valid_second = try clientHelloWithExtensionList(&second_buf, 0xaa, .x25519, &.{ cookie_ext, psk_ext });
+    try validateSecondClientHello(first, valid_second, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = null,
+        .cookie = "cookie",
+    });
+
+    const invalid_second = try clientHelloWithExtensionList(&second_buf, 0xaa, .x25519, &.{ psk_ext, cookie_ext });
+    try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, invalid_second, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = null,
+        .cookie = "cookie",
+    }));
+}
+
+test "ClientHello2 validator compares PSK identities while allowing ages and binders" {
+    var psk_first_buf: [256]u8 = undefined;
+    var psk_second_buf: [256]u8 = undefined;
+    const psk_first = try pskExtension(&psk_first_buf, "ticket-a", 1, "ticket-b", 2, 0xaa);
+    const psk_second = try pskExtension(&psk_second_buf, "ticket-a", 99, "ticket-b", 100, 0xbb);
+
+    var first_buf: [768]u8 = undefined;
+    var second_buf: [768]u8 = undefined;
+    const first = try clientHelloWithExtensionList(&first_buf, 0xaa, .x25519, &.{
+        .{ .id = @intFromEnum(algorithms.ExtensionType.pre_shared_key), .data = psk_first },
+    });
+    const second = try clientHelloWithExtensionList(&second_buf, 0xaa, .x25519, &.{
+        .{ .id = @intFromEnum(algorithms.ExtensionType.cookie), .data = &.{ 0, 6, 'c', 'o', 'o', 'k', 'i', 'e' } },
+        .{ .id = @intFromEnum(algorithms.ExtensionType.pre_shared_key), .data = psk_second },
+    });
+    try validateSecondClientHello(first, second, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = null,
+        .cookie = "cookie",
+    });
+
+    const changed_identity = try pskExtension(&psk_second_buf, "ticket-x", 99, "ticket-b", 100, 0xbb);
+    const changed_second = try clientHelloWithExtensionList(&second_buf, 0xaa, .x25519, &.{
+        .{ .id = @intFromEnum(algorithms.ExtensionType.cookie), .data = &.{ 0, 6, 'c', 'o', 'o', 'k', 'i', 'e' } },
+        .{ .id = @intFromEnum(algorithms.ExtensionType.pre_shared_key), .data = changed_identity },
+    });
+    try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, changed_second, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = null,
+        .cookie = "cookie",
+    }));
+
+    const reordered = try pskExtension(&psk_second_buf, "ticket-b", 99, "ticket-a", 100, 0xbb);
+    const reordered_second = try clientHelloWithExtensionList(&second_buf, 0xaa, .x25519, &.{
+        .{ .id = @intFromEnum(algorithms.ExtensionType.cookie), .data = &.{ 0, 6, 'c', 'o', 'o', 'k', 'i', 'e' } },
+        .{ .id = @intFromEnum(algorithms.ExtensionType.pre_shared_key), .data = reordered },
+    });
+    try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, reordered_second, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = null,
+        .cookie = "cookie",
+    }));
+}
+
+test "ClientHello2 validator rejects malformed PSK binder vectors" {
+    var first_psk_buf: [256]u8 = undefined;
+    const psk_first = try pskExtension(&first_psk_buf, "ticket-a", 1, null, 0, 0xaa);
+
+    var malformed_buf: [64]u8 = undefined;
+    var w = messages.Writer{ .buf = &malformed_buf };
+    const ids_len = try w.reserve(2);
+    try w.u16_(8);
+    try w.bytes("ticket-a");
+    try w.bytes(&.{ 0, 0, 0, 1 });
+    w.patch(2, ids_len);
+    try w.u16_(1);
+    try w.u8_(31);
+    const malformed_binder = w.written();
+
+    var mismatch_buf: [128]u8 = undefined;
+    var mw = messages.Writer{ .buf = &mismatch_buf };
+    const mismatch_ids = try mw.reserve(2);
+    try mw.u16_(8);
+    try mw.bytes("ticket-a");
+    try mw.bytes(&.{ 0, 0, 0, 1 });
+    mw.patch(2, mismatch_ids);
+    const mismatch_binders = try mw.reserve(2);
+    try mw.u8_(32);
+    try mw.bytes(&([_]u8{0xaa} ** 32));
+    try mw.u8_(32);
+    try mw.bytes(&([_]u8{0xbb} ** 32));
+    mw.patch(2, mismatch_binders);
+    const count_mismatch = mw.written();
+
+    var first_buf: [768]u8 = undefined;
+    var second_buf: [768]u8 = undefined;
+    const first = try clientHelloWithExtensionList(&first_buf, 0xaa, .x25519, &.{
+        .{ .id = @intFromEnum(algorithms.ExtensionType.pre_shared_key), .data = psk_first },
+    });
+
+    inline for (.{ malformed_binder, count_mismatch }) |bad_psk| {
+        const second = try clientHelloWithExtensionList(&second_buf, 0xaa, .x25519, &.{
+            .{ .id = @intFromEnum(algorithms.ExtensionType.cookie), .data = &.{ 0, 6, 'c', 'o', 'o', 'k', 'i', 'e' } },
+            .{ .id = @intFromEnum(algorithms.ExtensionType.pre_shared_key), .data = bad_psk },
+        });
+        try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, second, .{
+            .selected_version = .tls13,
+            .cipher_suite = .tls_aes_128_gcm_sha256,
+            .selected_group = null,
+            .cookie = "cookie",
+        }));
+    }
 }

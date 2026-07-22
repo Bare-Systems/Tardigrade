@@ -5,6 +5,22 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **TLS 1.3 session-resumption runtime foundation (#365)** — adds a
+  mode-aware native resumption runtime for disabled, stateful, stateless, and
+  hybrid policy. The runtime owns only the services selected by the configured
+  mode, exposes client-ticket storage and server PSK resolver hooks, rejects
+  unsupported `single_use` client storage until the offer-lease lifecycle lands,
+  and initializes stateless ticket protection with a process-local ephemeral
+  AES-128-GCM key that remains usable for the process lifetime while replacing
+  old tickets on restart. Stateful `TDSH` handles and stateless `TDTK`
+  identities dispatch by prefix without cross-dispatching malformed or unknown
+  inputs; reusable stateful and stateless hits return no-op public leases, while
+  only single-use stateful hits cross the owned exactly-once
+  `StatefulServerCache -> ServerPskLease -> Tls13Backend` lease boundary.
+  Tests cover runtime mode/resource ownership, stateless entropy and provider
+  capability failures, key lifetime behavior beyond the ticket ceiling, backend
+  lease commit/release ordering before PSK-selected `ServerHello` emission, and
+  real single-use cache consumption or release after binder success/failure.
 - **Fixed-profile Bare Systems appliance TLS credential provider (#392, epic
   #391)** — appliance-profile builds (`-Dtls-profile=appliance`) now load
   exactly one provisioned Ed25519 identity through a strict provisioning

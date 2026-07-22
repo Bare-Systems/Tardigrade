@@ -3273,8 +3273,14 @@ test "ClientHelloPskCapture.wipe zeroizes the captured message" {
     try std.testing.expectEqual(@as(usize, 0), capture.message_len);
 }
 
-test "a transport-extension type colliding with a TLS-owned PSK extension is rejected at start" {
-    inline for (.{ pre_shared_key.ext_pre_shared_key, pre_shared_key.ext_psk_key_exchange_modes }) |colliding_type| {
+test "a transport-extension type colliding with a TLS-owned extension is rejected at start" {
+    inline for (.{
+        pre_shared_key.ext_pre_shared_key,
+        pre_shared_key.ext_psk_key_exchange_modes,
+        @intFromEnum(tls_core.algorithms.ExtensionType.padding),
+        @intFromEnum(tls_core.algorithms.ExtensionType.early_data),
+        @intFromEnum(tls_core.algorithms.ExtensionType.cookie),
+    }) |colliding_type| {
         var client = tls_backend.Tls13Backend.initClient(
             clientEntropy(),
             .{ .pinned_certificate = tls_backend.testdata.certificate_der },

@@ -261,6 +261,9 @@ pub const TransportProfile = union(enum) {
                 ext_alpn,
                 ext_supported_versions,
                 ext_key_share,
+                @intFromEnum(tls_algorithms.ExtensionType.padding),
+                @intFromEnum(tls_algorithms.ExtensionType.early_data),
+                @intFromEnum(tls_algorithms.ExtensionType.cookie),
                 // #362: reserve the TLS-owned PSK extension IDs too — a
                 // caller configuring a transport extension with either of
                 // these types would otherwise collide with (and be
@@ -1299,6 +1302,7 @@ pub const Tls13Backend = struct {
             error.IllegalParameter => error.IllegalParameter,
             error.UnexpectedHandshakeMessage => error.UnexpectedHandshakeMessage,
             error.MissingExtension => error.MissingExtension,
+            error.UnsupportedExtension => error.UnsupportedExtension,
             error.AlpnMismatch => error.AlpnMismatch,
             error.UnsupportedCertificate => error.UnsupportedCertificate,
             error.CertificateInvalid => error.CertificateInvalid,
@@ -2417,8 +2421,12 @@ pub const Tls13Backend = struct {
         if (offers.raw_signature_schemes_len > self.peer_sig_schemes.len) return error.MalformedHandshake;
         @memcpy(self.peer_sig_schemes[0..offers.raw_signature_schemes_len], offers.raw_signature_schemes[0..offers.raw_signature_schemes_len]);
         self.peer_sig_scheme_count = offers.raw_signature_schemes_len;
-        if (hello_selection.key_share.len != X25519.public_length) return error.MalformedHandshake;
-        const client_share = hello_selection.key_share[0..X25519.public_length].*;
+        const selected_key_share = switch (hello_selection.key_share) {
+            .use => |share| share.key_exchange,
+            .retry => return error.IllegalParameter,
+        };
+        if (selected_key_share.len != X25519.public_length) return error.MalformedHandshake;
+        const client_share = selected_key_share[0..X25519.public_length].*;
         if (hello_selection.cipher_suite != .tls_aes_128_gcm_sha256 or
             hello_selection.named_group != .x25519 or
             hello_selection.version != .tls13)

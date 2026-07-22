@@ -37,6 +37,7 @@ pub fn fromHandshakeError(err: events.HandshakeError) AlertDescription {
         error.IllegalParameter => .illegal_parameter,
         error.UnexpectedHandshakeMessage => .unexpected_message,
         error.MissingExtension => .missing_extension,
+        error.UnsupportedExtension => .unsupported_extension,
         error.CertificateInvalid => .bad_certificate,
         error.UnsupportedCertificate => .unsupported_certificate,
         error.SecretExportFailed => .internal_error,
@@ -81,6 +82,10 @@ test "unsupported peer certificate maps to unsupported_certificate" {
 
 test "missing required extension maps to missing_extension" {
     try testing.expectEqual(AlertDescription.missing_extension, fromHandshakeError(error.MissingExtension));
+}
+
+test "unsupported extension maps to unsupported_extension" {
+    try testing.expectEqual(AlertDescription.unsupported_extension, fromHandshakeError(error.UnsupportedExtension));
 }
 
 test "secret export failure maps to internal_error" {

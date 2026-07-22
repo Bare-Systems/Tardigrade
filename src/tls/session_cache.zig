@@ -126,10 +126,9 @@ pub const Limits = struct {
     }
 };
 
-/// Reusable vs single-use ticket/session semantics. See the module doc:
-/// the client cache formally rejects `.single_use` (reusable-only for this
-/// PR); the stateful server cache's lease/commit/release model fully
-/// implements it.
+/// Reusable vs single-use ticket/session semantics. Client and stateful
+/// server caches both implement `.single_use` through lease tokens that are
+/// completed exactly once by the TLS backend.
 pub const UsagePolicy = enum { reusable, single_use };
 
 /// Store/insert outcomes. Never an error union: a cache refusal or storage

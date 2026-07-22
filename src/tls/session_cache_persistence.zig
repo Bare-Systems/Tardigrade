@@ -1022,6 +1022,79 @@ test "loadClientCache discards expired entries and enforces current limits on re
     try testing.expectEqual(@as(usize, 0), restored.count());
 }
 
+test "client persistence is busy during outstanding single-use lease and does not resurrect consumed tickets" {
+    var cache = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    var t1 = try testClient(testing.allocator, "leased-ticket", "example.test");
+    try testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&t1, 0, .single_use));
+    t1.deinit();
+
+    var backend = MemoryBackend{ .allocator = testing.allocator };
+    defer backend.deinit();
+
+    var lease = cache.lookupOffers(testCandidate("example.test"), 1);
+    try testing.expect(lease == .hit);
+    try testing.expectEqual(SaveResult.cache_busy, saveClientCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
+    try testing.expectEqual(LoadResult.cache_busy, loadClientCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
+    try testing.expect(backend.bytes == null);
+
+    lease.hit.finish(.{ .selected = 0 });
+    lease.deinit();
+    try testing.expectEqual(@as(usize, 0), cache.count());
+
+    try testing.expectEqual(SaveResult.saved, saveClientCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 2));
+    var restored = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
+    defer restored.deinit();
+    try testing.expectEqual(LoadResult.loaded, loadClientCache(&restored, session.Limits.default, passthrough_protector, backend.interface(), 3));
+    try testing.expectEqual(@as(usize, 0), restored.count());
+}
+
+test "stale client lease completion after cache adoption cannot consume the replacement" {
+    var cache = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    var t1 = try testClient(testing.allocator, "old-generation", "example.test");
+    try testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&t1, 0, .single_use));
+    t1.deinit();
+
+    var lease = cache.lookupOffers(testCandidate("example.test"), 1);
+    try testing.expect(lease == .hit);
+    try testing.expectEqualStrings("old-generation", lease.hit.offers.constSlice()[0].ticket.slice());
+
+    const replacement = try testClient(testing.allocator, "replacement-generation", "example.test");
+    var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = replacement, .usage = .single_use, .insertion_sequence = 10, .lru_sequence = 10 }};
+    try cache.restoreClones(&entries, 2);
+
+    lease.hit.finish(.{ .selected = 0 });
+    lease.deinit();
+    try testing.expectEqual(@as(usize, 1), cache.count());
+
+    var after = cache.lookupOffers(testCandidate("example.test"), 3);
+    defer after.deinit();
+    try testing.expect(after == .hit);
+    try testing.expectEqual(@as(usize, 1), after.hit.offers.len);
+    try testing.expectEqualStrings("replacement-generation", after.hit.offers.constSlice()[0].ticket.slice());
+}
+
+test "client persistence allocation failure leaves cache contents unchanged" {
+    var cache = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    var t1 = try testClient(testing.allocator, "still-offered", "example.test");
+    try testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&t1, 0, .single_use));
+    t1.deinit();
+
+    var backing: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var failing = std.testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, cache.cloneLiveForPersistence(failing.allocator(), 1));
+    try testing.expectEqual(@as(usize, 1), cache.count());
+
+    var after = cache.lookupOffers(testCandidate("example.test"), 2);
+    defer after.deinit();
+    try testing.expect(after == .hit);
+    try testing.expectEqual(@as(usize, 1), after.hit.offers.len);
+    try testing.expectEqualStrings("still-offered", after.hit.offers.constSlice()[0].ticket.slice());
+}
+
 test "saveServerCache refuses a leased single-use entry and succeeds once it is committed" {
     var cache = try session_cache.StatefulServerCache.init(testing.allocator, session_cache.Limits.stateful_server_default, session_cache.system_random_source);
     defer cache.deinit();

@@ -1692,14 +1692,25 @@ pub const StatefulServerCache = struct {
             return null;
         }
 
-        while (origin_count >= self.limits.max_entries_per_origin) {
+        // Enforce every limit against the *combined* leased+unleased
+        // totals that will actually survive — leased entries occupy real
+        // count/byte/per-origin budget even though they can never be
+        // evicted. Comparing only the unleased totals here (as an
+        // earlier revision of this function did) let a mix of leased and
+        // unleased entries commit above every configured bound: leased
+        // entries alone not yet being at the limit doesn't mean there's
+        // room for *this* new entry once the still-live unleased entries
+        // are also counted.
+        while (origin_leased + origin_count >= self.limits.max_entries_per_origin) {
             const victim = self.findOldestUnleasedInOriginExcluding(origin, victims.items) orelse unreachable;
             try victims.append(self.allocator, victim);
             origin_count -= 1;
             global_count -= 1;
             global_bytes -= self.entries.get(victim).?.bytes;
         }
-        while (global_count >= self.limits.max_entries or global_bytes + new_bytes > self.limits.max_total_bytes) {
+        while (leased_count + global_count >= self.limits.max_entries or
+            leased_bytes + global_bytes + new_bytes > self.limits.max_total_bytes)
+        {
             const victim = self.findOldestUnleasedGlobalExcluding(victims.items) orelse unreachable;
             try victims.append(self.allocator, victim);
             global_count -= 1;
@@ -1712,15 +1723,10 @@ pub const StatefulServerCache = struct {
 
     /// Mutation order: no expiry purge and no LRU-sequence reservation
     /// happen until every fallible allocation this insert could possibly
-    /// need has already succeeded. Expired-but-not-yet-purged entries are
-    /// not evicted here unless capacity pressure actually requires
-    /// reclaiming space — `findOldestUnleasedInOriginExcluding`/
-    /// `findOldestUnleasedGlobalExcluding` simply *prefer* them as
-    /// eviction victims over genuinely live ones when a victim is needed,
-    /// which is enough to guarantee a rejected/failed insert never
-    /// purges an entry as a side effect (that entry remains exactly as it
-    /// was, to be reclaimed by the next `cleanup()` call, a future insert
-    /// that does need the space, or a lookup that re-checks expiry).
+    /// need has already succeeded — see `planInsertionLocked`'s doc
+    /// comment for how expired entries are folded into that plan while
+    /// still leaving a rejected/failed insert's state completely
+    /// unchanged.
     ///
     /// `lru_sequence` is `null` for a fresh insertion (a value is reserved
     /// — infallibly — only once the insert is guaranteed to commit) or a
@@ -2773,6 +2779,136 @@ test "reusable lease commit refreshes LRU recency without consuming the entry" {
     var evicted = cache.resolveLease(&h2, 3);
     defer evicted.deinit();
     try testing.expect(evicted == .miss);
+}
+
+test "planInsertionLocked enforces max_entries against leased+unleased combined" {
+    // Round-7 review regression: the eviction while-loops compared the
+    // configured limits against unleased-only totals, so a leased entry
+    // not yet at the limit by itself let the *combined* leased+unleased
+    // count silently exceed max_entries.
+    var limits = Limits.stateful_server_default;
+    limits.max_entries = 2;
+    var cache = try StatefulServerCache.init(testing.allocator, limits, system_random_source);
+    defer cache.deinit();
+
+    var sa = try makeServer(testing.allocator, "a.test");
+    var ha: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&sa, 0, .single_use, &ha));
+    var leased_a = cache.resolveLease(&ha, 1);
+    try testing.expect(leased_a == .hit);
+
+    var sb = try makeServer(testing.allocator, "b.test");
+    var hb: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&sb, 1, .reusable, &hb));
+
+    // With A pinned (never evictable) and B live, inserting C at
+    // max_entries = 2 must evict B — the only evictable entry — rather
+    // than growing the cache to 3 live entries.
+    var sc = try makeServer(testing.allocator, "c.test");
+    var hc: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&sc, 2, .reusable, &hc));
+
+    try testing.expectEqual(@as(usize, 2), cache.count());
+    var hit_b = cache.resolveLease(&hb, 2);
+    defer hit_b.deinit();
+    try testing.expect(hit_b == .miss);
+    var hit_c = cache.resolveLease(&hc, 2);
+    defer hit_c.deinit();
+    try testing.expect(hit_c == .hit);
+
+    switch (leased_a) {
+        .hit => |*h| h.lease.release(),
+        else => unreachable,
+    }
+    leased_a.deinit();
+    var still_a = cache.resolveLease(&ha, 2);
+    defer still_a.deinit();
+    try testing.expect(still_a == .hit);
+}
+
+test "planInsertionLocked enforces max_entries_per_origin against leased+unleased combined" {
+    var limits = Limits.stateful_server_default;
+    limits.max_entries_per_origin = 2;
+    var cache = try StatefulServerCache.init(testing.allocator, limits, system_random_source);
+    defer cache.deinit();
+
+    var sa = try makeServer(testing.allocator, "same.test");
+    var ha: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&sa, 0, .single_use, &ha));
+    var leased_a = cache.resolveLease(&ha, 1);
+    try testing.expect(leased_a == .hit);
+
+    var sb = try makeServer(testing.allocator, "same.test");
+    var hb: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&sb, 1, .reusable, &hb));
+
+    // Same origin for all three: A pinned, B live, cap of 2. Inserting C
+    // must evict B rather than growing the origin's bucket to 3.
+    var sc = try makeServer(testing.allocator, "same.test");
+    var hc: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&sc, 2, .reusable, &hc));
+
+    try testing.expectEqual(@as(usize, 2), cache.count());
+    var hit_b = cache.resolveLease(&hb, 2);
+    defer hit_b.deinit();
+    try testing.expect(hit_b == .miss);
+    var hit_c = cache.resolveLease(&hc, 2);
+    defer hit_c.deinit();
+    try testing.expect(hit_c == .hit);
+
+    switch (leased_a) {
+        .hit => |*h| h.lease.release(),
+        else => unreachable,
+    }
+    leased_a.deinit();
+}
+
+test "planInsertionLocked enforces max_total_bytes against leased+unleased combined" {
+    // Byte costs are measured dynamically (rather than hard-coded) so this
+    // test stays valid regardless of the exact accounting formula.
+    var scratch = try StatefulServerCache.init(testing.allocator, Limits.stateful_server_default, system_random_source);
+    defer scratch.deinit();
+    var probe = try makeServer(testing.allocator, "probe.test");
+    var hp: [stateful_identity_len]u8 = undefined;
+    _ = scratch.insertMove(&probe, 0, .reusable, &hp);
+    const one_entry_bytes = scratch.totalBytes();
+
+    var limits = Limits.stateful_server_default;
+    limits.max_entry_bytes = one_entry_bytes;
+    limits.max_total_bytes = one_entry_bytes * 2; // room for exactly two entries.
+    var cache = try StatefulServerCache.init(testing.allocator, limits, system_random_source);
+    defer cache.deinit();
+
+    var sa = try makeServer(testing.allocator, "a.test");
+    var ha: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&sa, 0, .single_use, &ha));
+    var leased_a = cache.resolveLease(&ha, 1);
+    try testing.expect(leased_a == .hit);
+
+    var sb = try makeServer(testing.allocator, "b.test");
+    var hb: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&sb, 1, .reusable, &hb));
+
+    // Cache now holds leased A + unleased B, exactly at the byte cap. A
+    // third entry must force B's eviction rather than silently exceeding
+    // max_total_bytes with A's pinned bytes plus two more live entries.
+    var sc = try makeServer(testing.allocator, "c.test");
+    var hc: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&sc, 2, .reusable, &hc));
+
+    try testing.expect(cache.totalBytes() <= limits.max_total_bytes);
+    var hit_b = cache.resolveLease(&hb, 2);
+    defer hit_b.deinit();
+    try testing.expect(hit_b == .miss);
+    var hit_c = cache.resolveLease(&hc, 2);
+    defer hit_c.deinit();
+    try testing.expect(hit_c == .hit);
+
+    switch (leased_a) {
+        .hit => |*h| h.lease.release(),
+        else => unreachable,
+    }
+    leased_a.deinit();
 }
 
 test "a reusable lease resolved before a reload cannot mutate an unrelated post-reload entry" {

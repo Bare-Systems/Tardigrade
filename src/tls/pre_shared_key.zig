@@ -541,11 +541,29 @@ pub const ServerPskLease = union(enum) {
     }
 };
 
+/// Allocation-free completion callback for resolver state that needs a
+/// binder-confirmed selection signal without transferring ownership through
+/// `ServerPskLease`. Reusable stateful cache hits use this to refresh LRU
+/// recency only after compatibility and binder verification succeed, while
+/// their public ownership lease remains `.noop`.
+pub const ServerPskSelectionHook = struct {
+    ctx: *anyopaque,
+    arg0: u64 = 0,
+    arg1: u64 = 0,
+    arg2: u64 = 0,
+    completeFn: *const fn (*anyopaque, u64, u64, u64) void,
+
+    pub fn complete(self: ServerPskSelectionHook) void {
+        self.completeFn(self.ctx, self.arg0, self.arg1, self.arg2);
+    }
+};
+
 pub const ServerPskResolveResult = union(enum) {
     miss,
     hit: struct {
         state: session.ServerRecoverableState,
         lease: ServerPskLease,
+        on_selected: ?ServerPskSelectionHook = null,
     },
 
     pub fn deinit(self: *ServerPskResolveResult) void {

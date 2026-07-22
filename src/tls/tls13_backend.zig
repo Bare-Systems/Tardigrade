@@ -2675,6 +2675,7 @@ pub const Tls13Backend = struct {
                 hit.state.ticket_age_add,
                 elapsedMillis(now, hit.state.common.issued_at_unix_ms),
             );
+            if (hit.on_selected) |hook| hook.complete();
             hit.lease.commit();
             self.selected_server_psk.state.moveFrom(&hit.state);
             self.selected_server_psk.index = @intCast(attempts);

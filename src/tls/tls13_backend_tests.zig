@@ -4514,6 +4514,105 @@ test "stateful single-use cache adapter releases handle after bad binder" {
     try std.testing.expect(after_failure == .hit);
 }
 
+test "stateful reusable cache adapter refreshes LRU only after selected binder success" {
+    var limits = session_cache.Limits.stateful_server_default;
+    limits.max_entries = 3;
+    var cache = try session_cache.StatefulServerCache.init(
+        std.testing.allocator,
+        limits,
+        session_cache.system_random_source,
+    );
+    defer cache.deinit();
+
+    const rejected_psk = [_]u8{0xa1} ** tls_backend.hash_len;
+    var rejected_state = pskStoredStateWithBinding(
+        &rejected_psk,
+        session.AuthBinding.fromLeafCertificateDer("different-leaf"),
+    );
+    var rejected_handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&rejected_state, 0, .reusable, &rejected_handle),
+    );
+
+    const selected_psk = [_]u8{0xa2} ** tls_backend.hash_len;
+    var selected_state = pskStoredState(&selected_psk);
+    var selected_handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&selected_state, 1, .reusable, &selected_handle),
+    );
+
+    const middle_psk = [_]u8{0xa3} ** tls_backend.hash_len;
+    var middle_state = pskStoredState(&middle_psk);
+    var middle_handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&middle_state, 2, .reusable, &middle_handle),
+    );
+
+    var adapter = session_cache.StatefulServerPskResolverAdapter{
+        .cache = &cache,
+        .allocator = std.testing.allocator,
+        .now_unix_ms = 0,
+    };
+
+    var reject_server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer reject_server.deinit();
+    try reject_server.setServerPskResolver(adapter.resolver());
+    try driveServerSelection(&reject_server, .{ .psk = .{ .items = &.{.{
+        .identity = &rejected_handle,
+        .binder_psk = &rejected_psk,
+    }} } });
+    try std.testing.expect(!reject_server.core.psk_authenticated);
+
+    var pressure_state = pskStoredState(&([_]u8{0xa4} ** tls_backend.hash_len));
+    var pressure_handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&pressure_state, 3, .reusable, &pressure_handle),
+    );
+    var rejected_after_pressure = cache.resolveLease(&rejected_handle, 3);
+    defer rejected_after_pressure.deinit();
+    try std.testing.expect(rejected_after_pressure == .miss);
+
+    var selected_after_reject = cache.resolveLease(&selected_handle, 3);
+    defer selected_after_reject.deinit();
+    try std.testing.expect(selected_after_reject == .hit);
+    var middle_after_reject = cache.resolveLease(&middle_handle, 3);
+    defer middle_after_reject.deinit();
+    try std.testing.expect(middle_after_reject == .hit);
+
+    var select_server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer select_server.deinit();
+    try select_server.setServerPskResolver(adapter.resolver());
+    try driveServerSelection(&select_server, .{ .psk = .{ .items = &.{.{
+        .identity = &selected_handle,
+        .binder_psk = &selected_psk,
+    }} } });
+    try std.testing.expect(select_server.core.psk_authenticated);
+
+    var second_pressure_state = pskStoredState(&([_]u8{0xa5} ** tls_backend.hash_len));
+    var second_pressure_handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&second_pressure_state, 4, .reusable, &second_pressure_handle),
+    );
+
+    var middle_after_success = cache.resolveLease(&middle_handle, 4);
+    defer middle_after_success.deinit();
+    try std.testing.expect(middle_after_success == .miss);
+    var selected_after_success = cache.resolveLease(&selected_handle, 4);
+    defer selected_after_success.deinit();
+    try std.testing.expect(selected_after_success == .hit);
+    var pressure_after_success = cache.resolveLease(&pressure_handle, 4);
+    defer pressure_after_success.deinit();
+    try std.testing.expect(pressure_after_success == .hit);
+    var second_pressure_after_success = cache.resolveLease(&second_pressure_handle, 4);
+    defer second_pressure_after_success.deinit();
+    try std.testing.expect(second_pressure_after_success == .hit);
+}
+
 const FbaCloningResolver = struct {
     state: *session.ServerRecoverableState,
     allocator: std.mem.Allocator,

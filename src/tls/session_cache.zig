@@ -1383,6 +1383,11 @@ const PublicServerLeaseBox = struct {
     }
 };
 
+fn completeReusableServerPsk(ctx: *anyopaque, cache_generation: u64, entry_id: u64, lease_epoch: u64) void {
+    const cache: *StatefulServerCache = @ptrCast(@alignCast(ctx));
+    cache.commitLease(cache_generation, entry_id, lease_epoch, false);
+}
+
 /// Public adapter from the stateful cache's internal lease model to the
 /// shared TLS backend resolver contract.
 pub const StatefulServerPskResolverAdapter = struct {
@@ -1425,6 +1430,13 @@ pub fn resolveStatefulServerPsk(
                 return .{ .hit = .{
                     .state = state,
                     .lease = pre_shared_key.ServerPskLease.initNoop(),
+                    .on_selected = .{
+                        .ctx = hit.lease.cache,
+                        .arg0 = hit.lease.cache_generation,
+                        .arg1 = hit.lease.entry_id,
+                        .arg2 = hit.lease.lease_epoch,
+                        .completeFn = completeReusableServerPsk,
+                    },
                 } };
             }
 
@@ -3211,6 +3223,7 @@ test "stateful public adapter returns noop lease for reusable hits without lease
     switch (result) {
         .hit => |*hit| {
             try testing.expectEqual(pre_shared_key.ServerPskLease.noop, hit.lease);
+            try testing.expect(hit.on_selected != null);
         },
         .miss => return error.TestExpectedEqual,
     }

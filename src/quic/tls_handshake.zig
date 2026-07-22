@@ -56,6 +56,8 @@ pub const EventSink = TransportContract.EventSink;
 pub const TlsTransportBackend = TransportContract.Backend;
 pub const CoreDriver = tls_core.engine.Driver(TransportContract);
 pub const EmitNewSessionTicketParams = tls_core.tls13_backend.Tls13Backend.EmitNewSessionTicketParams;
+pub const PrepareNewSessionTicketParams = tls_core.tls13_backend.Tls13Backend.PrepareNewSessionTicketParams;
+pub const PreparedNewSessionTicket = tls_core.tls13_backend.Tls13Backend.PreparedNewSessionTicket;
 
 /// Runtime interface to a concrete TLS 1.3 engine. The engine consumes and
 /// produces raw handshake bytes and reports keying material / negotiation
@@ -77,6 +79,27 @@ pub const TlsBackend = struct {
         params: EmitNewSessionTicketParams,
         limits: tls_core.session.Limits,
     ) HandshakeError!tls_core.session.ServerRecoverableState = null,
+    /// #488: install the process-shared server resolver before `start`. QUIC
+    /// mirrors the record-mode contract exactly — no duplicate PSK parsing,
+    /// binder verification, or key schedule lives here or in `Connection`.
+    setServerPskResolverFn: ?*const fn (
+        ptr: *anyopaque,
+        resolver: tls_core.pre_shared_key.ServerPskResolver,
+    ) HandshakeError!void = null,
+    prepareNewSessionTicketFn: ?*const fn (
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        params: PrepareNewSessionTicketParams,
+        limits: tls_core.session.Limits,
+    ) HandshakeError!PreparedNewSessionTicket = null,
+    emitPreparedNewSessionTicketFn: ?*const fn (
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        sink: *EventSink,
+        prepared: *const PreparedNewSessionTicket,
+        identity: []const u8,
+        limits: tls_core.session.Limits,
+    ) HandshakeError!void = null,
 
     fn start(self: TlsBackend, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {
         return self.transport.start(role, params, sink);
@@ -108,6 +131,36 @@ pub const TlsBackend = struct {
     ) HandshakeError!tls_core.session.ServerRecoverableState {
         const emit = self.emitNewSessionTicketFn orelse return error.InvalidHandshakeState;
         return emit(self.transport.ptr, allocator, sink, params, limits);
+    }
+
+    /// Must be called before `start`, matching the shared engine's own
+    /// precondition (#488): a backend without this hook (e.g. the in-memory
+    /// test backend) never offers or accepts PSK resumption.
+    pub fn setServerPskResolver(self: TlsBackend, resolver: tls_core.pre_shared_key.ServerPskResolver) HandshakeError!void {
+        const set = self.setServerPskResolverFn orelse return error.InvalidHandshakeState;
+        try set(self.transport.ptr, resolver);
+    }
+
+    pub fn prepareNewSessionTicket(
+        self: TlsBackend,
+        allocator: std.mem.Allocator,
+        params: PrepareNewSessionTicketParams,
+        limits: tls_core.session.Limits,
+    ) HandshakeError!PreparedNewSessionTicket {
+        const prepare = self.prepareNewSessionTicketFn orelse return error.InvalidHandshakeState;
+        return prepare(self.transport.ptr, allocator, params, limits);
+    }
+
+    pub fn emitPreparedNewSessionTicket(
+        self: TlsBackend,
+        allocator: std.mem.Allocator,
+        sink: *EventSink,
+        prepared: *const PreparedNewSessionTicket,
+        identity: []const u8,
+        limits: tls_core.session.Limits,
+    ) HandshakeError!void {
+        const emit = self.emitPreparedNewSessionTicketFn orelse return error.InvalidHandshakeState;
+        return emit(self.transport.ptr, allocator, sink, prepared, identity, limits);
     }
 
     pub fn deinit(self: TlsBackend) void {

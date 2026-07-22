@@ -603,7 +603,156 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
     try std.testing.expect(resumed.client_backend.core.psk_authenticated);
     try std.testing.expect(resumed.server_backend.core.psk_authenticated);
     // No certificate flight: the fixed server identity was never consumed.
-    try std.testing.expect(resumed.observed.certificate_state == null);
+    // `certificate_state` reports `.valid` anyway (#488) — a PSK-resumed
+    // handshake never sends Certificate, so the completion policy that
+    // requires a valid peer certificate for the client role would otherwise
+    // treat every resumed connection as fatally unauthenticated; the client
+    // instead inherits trust from the original full handshake that issued
+    // this ticket, confirmed here by the binder.
+    try std.testing.expectEqual(events.CertificateState.valid, resumed.observed.certificate_state.?);
+
+    // The resumed connection is genuinely usable: application data flows
+    // both ways under the PSK-derived keys.
+    var protected2: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext2: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try resumed.client_bridge.sealApplicationData("resumed request", &protected2);
+    const opened_request = try resumed.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext2);
+    try std.testing.expectEqualStrings("resumed request", opened_request.inner.content);
+}
+
+test "#488: resumption_runtime.Runtime drives a genuine end-to-end resumed handshake via two-phase issuance" {
+    const resumption_runtime = tls_core.resumption_runtime;
+
+    // Phase 1: a full handshake. The server issues a ticket through the new
+    // #488 two-phase API (prepare -> Runtime.createIdentity -> emit) instead
+    // of the single-phase `emitNewSessionTicket`, and the client captures the
+    // resulting ClientTicketState into its own process-shared runtime.
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+
+    var server_runtime = try resumption_runtime.Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 1000;
+            }
+        }.now },
+        serverProvider(),
+    );
+    defer server_runtime.deinit();
+
+    var client_runtime = try resumption_runtime.Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 2000;
+            }
+        }.now },
+        clientProvider(),
+    );
+    defer client_runtime.deinit();
+
+    const TicketCapture = struct {
+        runtime: *resumption_runtime.Runtime,
+        stored: session_cache.StoreResult = undefined,
+
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.stored = self.runtime.storeClientTicket(ticket);
+        }
+    };
+    var capture = TicketCapture{ .runtime = &client_runtime };
+    const limits = session.Limits.default;
+    try harness.client_backend.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = TicketCapture.now,
+        .onTicketFn = TicketCapture.onTicket,
+    });
+    try harness.run();
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var prepared = try harness.server_backend.prepareNewSessionTicket(std.testing.allocator, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 1000,
+    }, limits);
+    defer prepared.deinit();
+    var scratch: [256]u8 = undefined;
+    var identity = try server_runtime.createIdentity(&prepared.state, 1000, &scratch);
+    try std.testing.expect(identity == .stateful);
+    try harness.server_backend.emitPreparedNewSessionTicket(std.testing.allocator, &sink, &prepared, identity.slice(), limits);
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+
+    // Deliver the ticket to the client over the (encrypted) application
+    // channel, exactly as a real deployment would.
+    const ticket_event = sink.items[0].handshake_bytes;
+    var protected: [record_codec.max_ciphertext_record_len * 2]u8 = undefined;
+    const records = (try harness.server_bridge.applyEvent(.{ .handshake_bytes = .{
+        .epoch = ticket_event.epoch,
+        .data = ticket_event.data,
+    } }, &protected)).?;
+    var parser = record_codec.Parser.init(.ciphertext);
+    var record_sink = record_codec.RecordSink(8, record_codec.max_ciphertext_fragment_len * 8){};
+    try parser.feed(records, &record_sink);
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    for (record_sink.items[0..record_sink.len]) |record| {
+        const opened = try harness.client_bridge.openHandshake(.application, record, &plaintext);
+        _ = try harness.client_driver.receive(.application, opened.inner.content);
+    }
+    try std.testing.expectEqual(session_cache.StoreResult.stored, capture.stored);
+
+    // Phase 2: a fresh connection looks its offer up through the client
+    // runtime and the server resolves it through the *same* server runtime
+    // that issued it — proving the runtime's cache/resolver composition (not
+    // hand-rolled test stand-ins) drives a real abbreviated handshake.
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    const candidate: session.CandidateContext = .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .server_name = null,
+        // The `DirectHarness` backends negotiate ALPN `h2` by default even
+        // without an explicit policy override; the candidate must match the
+        // exact origin the ticket was actually issued under.
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+    };
+    var lookup = client_runtime.lookupClientOffers(candidate);
+    defer lookup.deinit();
+    try std.testing.expect(lookup == .hit);
+    try std.testing.expectEqual(@as(usize, 1), lookup.hit.offers.len);
+
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+    };
+    try resumed.client_backend.setClientPskOfferLease(&lookup.hit, &clock_dummy, ClientClock.now);
+    try resumed.server_backend.setServerPskResolver(server_runtime.serverResolver().?);
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+    // No certificate flight: this is a genuine PSK-abbreviated handshake, not
+    // merely a second successful full handshake. `certificate_state` reports
+    // `.valid` anyway (#488): the client inherits trust from the original
+    // full handshake that issued this ticket, confirmed here by the binder,
+    // since every transport completion policy otherwise requires a valid
+    // peer certificate for the client role.
+    try std.testing.expectEqual(events.CertificateState.valid, resumed.observed.certificate_state.?);
 
     // The resumed connection is genuinely usable: application data flows
     // both ways under the PSK-derived keys.

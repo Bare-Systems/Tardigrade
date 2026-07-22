@@ -128,6 +128,118 @@ pub const Runtime = struct {
         return .rejected_capacity;
     }
 
+    /// Safe upper bound on the wire length of an identity this runtime can
+    /// produce (stateful handle or stateless envelope), for callers that
+    /// need to size a scratch buffer before `createIdentity`. `0` while
+    /// disabled.
+    pub fn maxIdentityLen(self: *const Runtime) usize {
+        var max: usize = 0;
+        if (self.config.mode == .stateful or self.config.mode == .hybrid)
+            max = @max(max, session_cache.stateful_identity_len);
+        if (self.config.mode == .stateless or self.config.mode == .hybrid)
+            max = @max(max, @min(
+                self.config.session_limits.max_serialized_len + ticket_protection.envelope_overhead,
+                self.config.session_limits.max_ticket_len,
+            ));
+        return max;
+    }
+
+    pub const IdentityMode = enum { stateful, stateless };
+
+    /// The opaque bearer identity produced by `createIdentity`. `stateless`
+    /// borrows the caller-supplied `scratch` buffer passed to
+    /// `createIdentity`; `stateful` owns its bytes inline. Either way,
+    /// `slice()` stays valid exactly as long as the `Identity` value (and,
+    /// for `stateless`, its backing `scratch` buffer) does.
+    pub const Identity = union(IdentityMode) {
+        stateful: [session_cache.stateful_identity_len]u8,
+        stateless: struct { buf: []u8, len: usize },
+
+        pub fn slice(self: *const Identity) []const u8 {
+            return switch (self.*) {
+                .stateful => |*handle| handle[0..],
+                .stateless => |s| s.buf[0..s.len],
+            };
+        }
+    };
+
+    pub const CreateIdentityError = error{ StorageUnavailable, SealFailed };
+
+    /// Consumes `state` — the exact prepared `ServerRecoverableState` from
+    /// `Tls13Backend.prepareNewSessionTicket` — into this runtime's
+    /// configured issuance storage and returns the resulting bearer
+    /// identity. Stateful mode moves `state` into the server cache
+    /// (`state.*` becomes zero-valued on success, so the caller's later
+    /// unconditional `deinit` is then a no-op); stateless mode only reads
+    /// `state` to seal it into `scratch` and leaves it fully owned by the
+    /// caller either way. Hybrid prefers stateful issuance and falls back
+    /// to stateless only for ordinary stateful capacity/storage refusal —
+    /// never for a hard internal error.
+    ///
+    /// On any failure, `state.*` is left completely unchanged (never
+    /// partially consumed), and no identity is left resolvable: the caller
+    /// need not roll anything back.
+    pub fn createIdentity(
+        self: *Runtime,
+        state: *session.ServerRecoverableState,
+        now_unix_ms: i64,
+        scratch: []u8,
+    ) CreateIdentityError!Identity {
+        return switch (self.config.mode) {
+            .disabled => error.StorageUnavailable,
+            .stateful => self.createStatefulIdentity(state, now_unix_ms),
+            .stateless => self.createStatelessIdentity(state, now_unix_ms, scratch),
+            .hybrid => self.createStatefulIdentity(state, now_unix_ms) catch |err| switch (err) {
+                error.StorageUnavailable => self.createStatelessIdentity(state, now_unix_ms, scratch),
+                error.SealFailed => err,
+            },
+        };
+    }
+
+    fn createStatefulIdentity(
+        self: *Runtime,
+        state: *session.ServerRecoverableState,
+        now_unix_ms: i64,
+    ) CreateIdentityError!Identity {
+        const cache = if (self.server_cache) |*cache| cache else return error.StorageUnavailable;
+        var handle: [session_cache.stateful_identity_len]u8 = undefined;
+        const result = cache.insertMove(state, now_unix_ms, usagePolicy(self.config.usage), &handle);
+        return switch (result) {
+            .stored => .{ .stateful = handle },
+            .rejected_capacity, .storage_failed, .rejected_handle_generation_failed => error.StorageUnavailable,
+            .replaced, .rejected_unsupported_usage => unreachable,
+        };
+    }
+
+    fn createStatelessIdentity(
+        self: *Runtime,
+        state: *const session.ServerRecoverableState,
+        now_unix_ms: i64,
+        scratch: []u8,
+    ) CreateIdentityError!Identity {
+        const keyring = if (self.keyring) |*keyring| keyring else return error.StorageUnavailable;
+        var protector = ticket_protection.Protector{
+            .provider = self.provider,
+            .keyring = keyring,
+            .limits = self.config.session_limits,
+        };
+        const sealed = protector.seal(self.allocator, state, now_unix_ms, scratch) catch return error.SealFailed;
+        return .{ .stateless = .{ .buf = scratch, .len = sealed.len } };
+    }
+
+    /// Rolls back an identity `createIdentity` produced but that never
+    /// actually reached the peer (e.g. `NewSessionTicket` emission or
+    /// queueing failed afterward): revokes a stateful handle from storage
+    /// so it can never be offered back; a no-op for a stateless envelope
+    /// (nothing was stored — the caller's own `scratch`/message buffers are
+    /// the only copies, and wiping those remains the caller's concern).
+    pub fn rollbackIdentity(self: *Runtime, identity: *const Identity) void {
+        switch (identity.*) {
+            .stateful => |*handle| if (self.server_cache) |*cache| cache.revokeHandle(handle),
+            .stateless => {},
+        }
+    }
+
     fn resolverNow(ctx: *anyopaque) i64 {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         return self.nowUnixMs();
@@ -533,4 +645,153 @@ test "stateless runtime initialization fails without AES-128-GCM capability" {
         clock.clock(),
         unsupported.cryptoProvider(),
     ));
+}
+
+test "createIdentity stateful issues a resolvable handle and consumes state" {
+    var clock = TestClock{};
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateful },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    var state = try sampleServerState(std.testing.allocator, "createidentity.test");
+    var identity = try runtime.createIdentity(&state, clock.now_ms, &.{});
+    // Successful stateful issuance moves `state` away; the caller's later
+    // unconditional `deinit` must be a safe no-op rather than a double-free.
+    state.deinit();
+
+    const resolver = runtime.serverResolver().?;
+    var hit = try resolver.resolve(identity.slice());
+    defer hit.deinit();
+    try std.testing.expect(hit == .hit);
+    try std.testing.expectEqualStrings("createidentity.test", hit.hit.state.common.server_name.?.slice());
+}
+
+test "createIdentity stateless seals into caller scratch and does not consume state" {
+    var clock = TestClock{};
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    var state = try sampleServerState(std.testing.allocator, "stateless-identity.test");
+    defer state.deinit();
+    var scratch: [1024]u8 = undefined;
+    var identity = try runtime.createIdentity(&state, clock.now_ms, &scratch);
+
+    // Stateless issuance only reads `state` to seal it: it must remain
+    // fully owned (and independently deinit-able) by the caller.
+    try std.testing.expect(!std.mem.allEqual(u8, state.common.resumption_psk.slice(), 0));
+
+    const resolver = runtime.serverResolver().?;
+    var hit = try resolver.resolve(identity.slice());
+    defer hit.deinit();
+    try std.testing.expect(hit == .hit);
+}
+
+test "createIdentity hybrid falls back to stateless on ordinary stateful capacity refusal" {
+    var clock = TestClock{};
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .hybrid, .server_cache_limits = .{
+            .max_entries = 4,
+            .max_origins = 4,
+            .max_entries_per_origin = 4,
+            .max_entry_bytes = 1,
+            .max_total_bytes = 1024,
+        } },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    var state = try sampleServerState(std.testing.allocator, "hybrid-fallback.test");
+    defer state.deinit();
+    var scratch: [1024]u8 = undefined;
+    var identity = try runtime.createIdentity(&state, clock.now_ms, &scratch);
+    try std.testing.expect(identity == .stateless);
+
+    const resolver = runtime.serverResolver().?;
+    var hit = try resolver.resolve(identity.slice());
+    defer hit.deinit();
+    try std.testing.expect(hit == .hit);
+}
+
+test "rollbackIdentity revokes a stateful handle so it no longer resolves" {
+    var clock = TestClock{};
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateful },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    var state = try sampleServerState(std.testing.allocator, "rollback.test");
+    var identity = try runtime.createIdentity(&state, clock.now_ms, &.{});
+    state.deinit();
+
+    runtime.rollbackIdentity(&identity);
+
+    const resolver = runtime.serverResolver().?;
+    var miss = try resolver.resolve(identity.slice());
+    defer miss.deinit();
+    try std.testing.expect(miss == .miss);
+}
+
+test "rollbackIdentity is a no-op for a stateless envelope" {
+    var clock = TestClock{};
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    var state = try sampleServerState(std.testing.allocator, "stateless-rollback.test");
+    defer state.deinit();
+    var scratch: [1024]u8 = undefined;
+    var identity = try runtime.createIdentity(&state, clock.now_ms, &scratch);
+    runtime.rollbackIdentity(&identity);
+
+    // Stateless issuance never stored anything server-side, so the exact
+    // same envelope must still resolve after "rollback".
+    const resolver = runtime.serverResolver().?;
+    var hit = try resolver.resolve(identity.slice());
+    defer hit.deinit();
+    try std.testing.expect(hit == .hit);
+}
+
+test "createIdentity disabled runtime always reports storage unavailable" {
+    var clock = TestClock{};
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{},
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    var state = try sampleServerState(std.testing.allocator, "disabled.test");
+    defer state.deinit();
+    try std.testing.expectError(error.StorageUnavailable, runtime.createIdentity(&state, clock.now_ms, &.{}));
 }

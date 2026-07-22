@@ -275,6 +275,9 @@ pub const Tls13Backend = struct {
             .peerCidBindingFn = peerCidBinding,
             .setPostHandshakeAllocatorFn = setPostHandshakeAllocator,
             .emitNewSessionTicketFn = emitNewSessionTicket,
+            .setServerPskResolverFn = setServerPskResolverVtable,
+            .prepareNewSessionTicketFn = prepareNewSessionTicket,
+            .emitPreparedNewSessionTicketFn = emitPreparedNewSessionTicket,
         };
     }
 
@@ -336,6 +339,43 @@ pub const Tls13Backend = struct {
         errdefer state.deinit();
         try translate(self.allocator, &self.scratch, sink);
         return state;
+    }
+
+    /// #488: forwarding seam only — resolver selection, binder verification,
+    /// and the PSK+DHE key schedule all stay in the shared engine. Must be
+    /// called before the handshake starts (before `Connection.init`, which
+    /// arms the responder), matching the shared engine's own precondition.
+    pub fn setServerPskResolver(self: *Tls13Backend, resolver: tls_core.pre_shared_key.ServerPskResolver) HandshakeError!void {
+        self.engine.setServerPskResolver(resolver) catch |err| return mapError(err);
+    }
+
+    fn setServerPskResolverVtable(ptr: *anyopaque, resolver: tls_core.pre_shared_key.ServerPskResolver) HandshakeError!void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        try self.setServerPskResolver(resolver);
+    }
+
+    fn prepareNewSessionTicket(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        params: tls_handshake.PrepareNewSessionTicketParams,
+        limits: tls_core.session.Limits,
+    ) HandshakeError!tls_handshake.PreparedNewSessionTicket {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.engine.prepareNewSessionTicket(allocator, params, limits) catch |err| return mapError(err);
+    }
+
+    fn emitPreparedNewSessionTicket(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        sink: *EventSink,
+        prepared: *const tls_handshake.PreparedNewSessionTicket,
+        identity: []const u8,
+        limits: tls_core.session.Limits,
+    ) HandshakeError!void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        self.scratch.reset();
+        self.engine.emitPreparedNewSessionTicket(allocator, &self.scratch, prepared, identity, limits) catch |err| return mapError(err);
+        try translate(self.allocator, &self.scratch, sink);
     }
 
     fn start(ptr: *anyopaque, role: tls_handshake.Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {

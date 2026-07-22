@@ -253,6 +253,33 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var http3_runtime: ?http.http3_runtime.Runtime = null;
     var tls_terminator: ?http.tls_termination.TlsTerminator = null;
     var native_credentials: ?http.native_tls_connection.NativeCredentialStore = null;
+    // #488: one process-scoped native resumption runtime, shared by every
+    // native TCP connection and by the QUIC/H3 runtime — never by the
+    // OpenSSL terminator, which owns its own independent session cache
+    // (`tls_terminator`/`tls_session_*` above). Declared and deferred here,
+    // ahead of every borrower below, so its teardown runs last: after
+    // `http3_runtime`, the active/parked connection registries, and every
+    // dynamically accepted native connection have already torn down.
+    var native_resumption_entropy: tls_core.production_crypto.OsEntropy = .{};
+    var native_resumption_provider: tls_core.production_crypto.Provider = undefined;
+    var native_resumption_runtime: ?tls_core.resumption_runtime.Runtime = null;
+    if (edge_config.nativeResumptionMode(cfg) != .disabled) {
+        native_resumption_provider = tls_core.production_crypto.Provider.init(native_resumption_entropy.entropy());
+        native_resumption_runtime = tls_core.resumption_runtime.Runtime.init(
+            state_allocator,
+            .{
+                .mode = edge_config.nativeResumptionMode(cfg),
+                .ticket_lifetime_seconds = cfg.tls_native_resumption_ticket_lifetime_seconds,
+                .usage = edge_config.nativeResumptionTicketUsage(cfg),
+            },
+            .{ .ctx = undefined, .nowUnixMsFn = systemNowUnixMs },
+            native_resumption_provider.cryptoProvider(),
+        ) catch |err| blk: {
+            state.logger.warn(null, "native TLS/QUIC resumption runtime failed to initialize: {s}; continuing without native resumption", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+    defer if (native_resumption_runtime) |*rt| rt.deinit();
     var http3_dispatch_ctx = ghandlers.Http3DispatchContext{
         .config_store = &config_store,
         .cfg = cfg,
@@ -353,6 +380,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .listen_host = cfg.listen_host,
             .quic_port = cfg.quic_port,
             .credential_provider = h3_credential_provider,
+            .resumption_runtime = if (native_resumption_runtime) |*rt| rt else null,
             .tls_min_version = "1.3",
             .tls_max_version = "1.3",
             .enable_0rtt = cfg.http3_enable_0rtt,
@@ -390,6 +418,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .tls = if (tls_terminator) |*tls| tls else null,
         .native_credentials = if (native_credentials) |*store| store else null,
         .native_tls_provider = native_tls_provider,
+        .resumption_runtime = if (native_resumption_runtime) |*rt| rt else null,
         .session_pool = undefined,
         .event_loop = &event_loop,
         .active = undefined,
@@ -1050,7 +1079,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             client_fd,
             tls_protocol_policy,
             native_provider,
-            .{ .buffer_limits = cfg.tls_buffer_limits },
+            .{ .buffer_limits = cfg.tls_buffer_limits, .resumption_runtime = ctx.resumption_runtime },
         ) catch |err| {
             ctx.state.logger.warn(null, "native tls connection setup failed: {}", .{err});
             return;
@@ -1268,6 +1297,13 @@ fn activeConnectionCloseHook(raw_state: *anyopaque, fd: std.posix.fd_t) void {
 
 fn deadlineFromNow(now_ms: u64, timeout_ms: u32) u64 {
     return if (timeout_ms == 0) 0 else now_ms + @as(u64, timeout_ms);
+}
+
+/// Wall-clock source for the process-scoped native resumption runtime
+/// (#488): ticket lifetime/age bookkeeping needs real wall-clock time, not
+/// the monotonic clock the event loop otherwise uses.
+fn systemNowUnixMs(_: *anyopaque) i64 {
+    return compat.milliTimestamp();
 }
 
 fn reapActiveConnections(

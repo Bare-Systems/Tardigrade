@@ -190,18 +190,37 @@ pub fn buildClientTicketState(
     return state;
 }
 
-pub fn buildServerRecoverableState(
+/// Ticket-identity-free subset of `EmitParams` for #488's two-phase
+/// preparation: the opaque bearer identity (stateful handle or stateless
+/// envelope) is only known *after* `ServerRecoverableState` is derived
+/// (stateful issuance derives the handle from inserting the state itself;
+/// stateless issuance seals the state to produce it), so preparation cannot
+/// require it up front the way single-phase `buildServerRecoverableState`
+/// does.
+pub const PrepareParams = struct {
+    ticket_lifetime: u32,
+    ticket_age_add: u32,
+    ticket_nonce: []const u8,
+    max_early_data_size: ?u32 = null,
+};
+
+/// Derives the per-ticket PSK and builds the exact `ServerRecoverableState`
+/// a later stateful insertion or stateless seal will consume, without
+/// requiring the opaque bearer identity that only exists once one of those
+/// two issuance paths has run. Callers that already know the final identity
+/// should use `buildServerRecoverableState` instead.
+pub fn buildServerRecoverableStateNoIdentity(
     allocator: std.mem.Allocator,
-    params: EmitParams,
+    params: PrepareParams,
     connection: ConnectionResumptionContext,
     resumption_master_secret: []const u8,
     issued_at_unix_ms: i64,
     limits: session.Limits,
 ) BuildServerError!session.ServerRecoverableState {
     try limits.validate();
-    validateEmitParams(params) catch return error.IllegalParameter;
+    if (params.ticket_lifetime > max_lifetime_seconds) return error.IllegalParameter;
+    if (params.ticket_nonce.len > max_ticket_nonce_len) return error.IllegalParameter;
     if (params.ticket_lifetime == 0) return error.InvalidLifetime;
-    if (params.ticket.len == 0 or params.ticket.len > limits.max_ticket_len) return error.TicketTooLarge;
     const hash = algorithms.transcriptHash(connection.cipher_suite);
     var psk: [session.max_psk_len]u8 = undefined;
     defer crypto.secureZero(u8, &psk);
@@ -230,6 +249,24 @@ pub fn buildServerRecoverableState(
     var state: session.ServerRecoverableState = .{};
     state.init(&common, params.ticket_age_add);
     return state;
+}
+
+pub fn buildServerRecoverableState(
+    allocator: std.mem.Allocator,
+    params: EmitParams,
+    connection: ConnectionResumptionContext,
+    resumption_master_secret: []const u8,
+    issued_at_unix_ms: i64,
+    limits: session.Limits,
+) BuildServerError!session.ServerRecoverableState {
+    validateEmitParams(params) catch return error.IllegalParameter;
+    if (params.ticket.len == 0 or params.ticket.len > limits.max_ticket_len) return error.TicketTooLarge;
+    return buildServerRecoverableStateNoIdentity(allocator, .{
+        .ticket_lifetime = params.ticket_lifetime,
+        .ticket_age_add = params.ticket_age_add,
+        .ticket_nonce = params.ticket_nonce,
+        .max_early_data_size = params.max_early_data_size,
+    }, connection, resumption_master_secret, issued_at_unix_ms, limits);
 }
 
 fn earlyDataPolicy(max_early_data_size: ?u32) session.EarlyDataPolicy {

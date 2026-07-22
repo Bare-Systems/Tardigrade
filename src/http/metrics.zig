@@ -17,6 +17,20 @@ const tls_direction_count = 2;
 const TlsQueue = enum { inbound_ciphertext, inbound_plaintext, outbound_ciphertext, handshake };
 const TlsDirection = enum { carrier_read, plaintext_write };
 
+/// #488: native TLS/QUIC resumption metric labels. Every label here is a
+/// fixed, closed enum — never a raw ticket, PSK, identity, handle, SNI/ALPN
+/// value, certificate byte, key ID, ciphertext, decrypted state, filesystem
+/// path, or arbitrary error string.
+pub const ResumptionTransport = enum { record, quic };
+pub const ResumptionOutcome = enum { accepted, full_handshake, incompatible, miss, fatal };
+pub const ResumptionMode = enum { stateful, stateless, hybrid };
+pub const TicketResult = enum { success, rejected, failed };
+
+const resumption_transport_count = 2;
+const resumption_outcome_count = 5;
+const resumption_mode_count = 3;
+const ticket_result_count = 3;
+
 /// Server-wide metrics counters.
 ///
 /// Tracks request counts, status code distribution, and uptime.
@@ -145,6 +159,16 @@ pub const Metrics = struct {
     /// Total config hot-reloads rejected (load/validation/bookkeeping failure); the
     /// previous config stays active.
     reload_failure_total: u64,
+    /// #488: native TLS/QUIC resumption attempts by transport.
+    tls_resumption_attempt_total: [resumption_transport_count]u64,
+    /// #488: native resumption outcomes by transport and outcome.
+    tls_resumption_outcome_total: [resumption_transport_count][resumption_outcome_count]u64,
+    /// #488: server-side ticket issuance attempts by transport, mode, result.
+    tls_ticket_issue_total: [resumption_transport_count][resumption_mode_count][ticket_result_count]u64,
+    /// #488: client-side ticket storage attempts by result.
+    tls_ticket_store_total: [ticket_result_count]u64,
+    /// #488: server-side ticket resolution attempts by mode and result.
+    tls_ticket_resolve_total: [resumption_mode_count][ticket_result_count]u64,
     /// Total graceful-shutdown drains started.
     drain_total: u64,
     /// Total drains that hit the configured drain timeout before work finished.
@@ -251,6 +275,11 @@ pub const Metrics = struct {
             .reload_attempts_total = 0,
             .reload_success_total = 0,
             .reload_failure_total = 0,
+            .tls_resumption_attempt_total = .{0} ** resumption_transport_count,
+            .tls_resumption_outcome_total = .{.{0} ** resumption_outcome_count} ** resumption_transport_count,
+            .tls_ticket_issue_total = .{.{.{0} ** ticket_result_count} ** resumption_mode_count} ** resumption_transport_count,
+            .tls_ticket_store_total = .{0} ** ticket_result_count,
+            .tls_ticket_resolve_total = .{.{0} ** ticket_result_count} ** resumption_mode_count,
             .drain_total = 0,
             .drain_timeouts_total = 0,
             .drain_forced_closes_total = 0,
@@ -302,6 +331,32 @@ pub const Metrics = struct {
 
     pub fn recordHealthProbeRun(self: *Metrics) void {
         self.health_probe_runs += 1;
+    }
+
+    /// #488: record one native TLS/QUIC resumption attempt (a connection
+    /// where a PSK-bearing ClientHello was offered/resolved).
+    pub fn recordResumptionAttempt(self: *Metrics, transport: ResumptionTransport) void {
+        self.tls_resumption_attempt_total[resumptionTransportIndex(transport)] += 1;
+    }
+
+    /// #488: record the resolved outcome of a resumption attempt.
+    pub fn recordResumptionOutcome(self: *Metrics, transport: ResumptionTransport, outcome: ResumptionOutcome) void {
+        self.tls_resumption_outcome_total[resumptionTransportIndex(transport)][resumptionOutcomeIndex(outcome)] += 1;
+    }
+
+    /// #488: record a server-side post-handshake ticket issuance attempt.
+    pub fn recordTicketIssue(self: *Metrics, transport: ResumptionTransport, mode: ResumptionMode, result: TicketResult) void {
+        self.tls_ticket_issue_total[resumptionTransportIndex(transport)][resumptionModeIndex(mode)][ticketResultIndex(result)] += 1;
+    }
+
+    /// #488: record a client-side ticket storage attempt.
+    pub fn recordTicketStore(self: *Metrics, result: TicketResult) void {
+        self.tls_ticket_store_total[ticketResultIndex(result)] += 1;
+    }
+
+    /// #488: record a server-side ticket/handle resolution attempt.
+    pub fn recordTicketResolve(self: *Metrics, mode: ResumptionMode, result: TicketResult) void {
+        self.tls_ticket_resolve_total[resumptionModeIndex(mode)][ticketResultIndex(result)] += 1;
     }
 
     /// Record the start of a config hot-reload attempt.
@@ -790,6 +845,7 @@ pub const Metrics = struct {
         });
 
         try self.appendTlsBufferPrometheus(&out);
+        try self.appendResumptionPrometheus(&out);
 
         try out.print(
             \\# HELP tardigrade_proxy_client_aborts_total Total proxied transfers aborted by downstream clients
@@ -1092,6 +1148,83 @@ pub const Metrics = struct {
         }
     }
 
+    /// #488: native TLS/QUIC resumption and ticket counters. Every label
+    /// rendered here comes from a fixed, closed enum (`resumption*Label`/
+    /// `ticketResultLabel`) — never a raw secret or high-cardinality value.
+    fn appendResumptionPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_resumption_attempt_total Native TLS/QUIC resumption attempts by transport
+            \\# TYPE tardigrade_tls_resumption_attempt_total counter
+            \\
+        );
+        inline for (.{ ResumptionTransport.record, ResumptionTransport.quic }) |transport| {
+            try out.print("tardigrade_tls_resumption_attempt_total{{transport=\"{s}\"}} {d}\n", .{
+                resumptionTransportLabel(transport),
+                self.tls_resumption_attempt_total[resumptionTransportIndex(transport)],
+            });
+        }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_resumption_outcome_total Native TLS/QUIC resumption outcomes by transport and outcome
+            \\# TYPE tardigrade_tls_resumption_outcome_total counter
+            \\
+        );
+        inline for (.{ ResumptionTransport.record, ResumptionTransport.quic }) |transport| {
+            inline for (.{ ResumptionOutcome.accepted, ResumptionOutcome.full_handshake, ResumptionOutcome.incompatible, ResumptionOutcome.miss, ResumptionOutcome.fatal }) |outcome| {
+                try out.print("tardigrade_tls_resumption_outcome_total{{transport=\"{s}\",outcome=\"{s}\"}} {d}\n", .{
+                    resumptionTransportLabel(transport),
+                    resumptionOutcomeLabel(outcome),
+                    self.tls_resumption_outcome_total[resumptionTransportIndex(transport)][resumptionOutcomeIndex(outcome)],
+                });
+            }
+        }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_ticket_issue_total Server-side ticket issuance attempts by transport, mode, and result
+            \\# TYPE tardigrade_tls_ticket_issue_total counter
+            \\
+        );
+        inline for (.{ ResumptionTransport.record, ResumptionTransport.quic }) |transport| {
+            inline for (.{ ResumptionMode.stateful, ResumptionMode.stateless, ResumptionMode.hybrid }) |mode| {
+                inline for (.{ TicketResult.success, TicketResult.rejected, TicketResult.failed }) |result| {
+                    try out.print("tardigrade_tls_ticket_issue_total{{transport=\"{s}\",mode=\"{s}\",result=\"{s}\"}} {d}\n", .{
+                        resumptionTransportLabel(transport),
+                        resumptionModeLabel(mode),
+                        ticketResultLabel(result),
+                        self.tls_ticket_issue_total[resumptionTransportIndex(transport)][resumptionModeIndex(mode)][ticketResultIndex(result)],
+                    });
+                }
+            }
+        }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_ticket_store_total Client-side ticket storage attempts by result
+            \\# TYPE tardigrade_tls_ticket_store_total counter
+            \\
+        );
+        inline for (.{ TicketResult.success, TicketResult.rejected, TicketResult.failed }) |result| {
+            try out.print("tardigrade_tls_ticket_store_total{{result=\"{s}\"}} {d}\n", .{
+                ticketResultLabel(result),
+                self.tls_ticket_store_total[ticketResultIndex(result)],
+            });
+        }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_ticket_resolve_total Server-side ticket/handle resolution attempts by mode and result
+            \\# TYPE tardigrade_tls_ticket_resolve_total counter
+            \\
+        );
+        inline for (.{ ResumptionMode.stateful, ResumptionMode.stateless, ResumptionMode.hybrid }) |mode| {
+            inline for (.{ TicketResult.success, TicketResult.rejected, TicketResult.failed }) |result| {
+                try out.print("tardigrade_tls_ticket_resolve_total{{mode=\"{s}\",result=\"{s}\"}} {d}\n", .{
+                    resumptionModeLabel(mode),
+                    ticketResultLabel(result),
+                    self.tls_ticket_resolve_total[resumptionModeIndex(mode)][ticketResultIndex(result)],
+                });
+            }
+        }
+    }
+
     /// Format metrics as a JSON string.
     /// Caller owns the returned memory.
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
@@ -1212,6 +1345,72 @@ fn tlsDirectionLabel(direction: TlsDirection) []const u8 {
     return switch (direction) {
         .carrier_read => "carrier_read",
         .plaintext_write => "plaintext_write",
+    };
+}
+
+fn resumptionTransportIndex(transport: ResumptionTransport) usize {
+    return switch (transport) {
+        .record => 0,
+        .quic => 1,
+    };
+}
+
+fn resumptionOutcomeIndex(outcome: ResumptionOutcome) usize {
+    return switch (outcome) {
+        .accepted => 0,
+        .full_handshake => 1,
+        .incompatible => 2,
+        .miss => 3,
+        .fatal => 4,
+    };
+}
+
+fn resumptionModeIndex(mode: ResumptionMode) usize {
+    return switch (mode) {
+        .stateful => 0,
+        .stateless => 1,
+        .hybrid => 2,
+    };
+}
+
+fn ticketResultIndex(result: TicketResult) usize {
+    return switch (result) {
+        .success => 0,
+        .rejected => 1,
+        .failed => 2,
+    };
+}
+
+fn resumptionTransportLabel(transport: ResumptionTransport) []const u8 {
+    return switch (transport) {
+        .record => "record",
+        .quic => "quic",
+    };
+}
+
+fn resumptionOutcomeLabel(outcome: ResumptionOutcome) []const u8 {
+    return switch (outcome) {
+        .accepted => "accepted",
+        .full_handshake => "full_handshake",
+        .incompatible => "incompatible",
+        .miss => "miss",
+        .fatal => "fatal",
+    };
+}
+
+fn resumptionModeLabel(mode: ResumptionMode) []const u8 {
+    return switch (mode) {
+        .stateful => "stateful",
+        .stateless => "stateless",
+        .hybrid => "hybrid",
+    };
+}
+
+fn ticketResultLabel(result: TicketResult) []const u8 {
+    return switch (result) {
+        .success => "success",
+        .rejected => "rejected",
+        .failed => "failed",
     };
 }
 
@@ -1486,6 +1685,59 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_error_invalid_request_total") != null);
     try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_requests_total counter") != null);
     try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_uptime_seconds gauge") != null);
+}
+
+test "resumption and ticket counters default to zero and record by label (#488)" {
+    var m = Metrics.init();
+    try std.testing.expectEqual(@as(u64, 0), m.tls_resumption_attempt_total[resumptionTransportIndex(.record)]);
+    try std.testing.expectEqual(@as(u64, 0), m.tls_resumption_attempt_total[resumptionTransportIndex(.quic)]);
+
+    m.recordResumptionAttempt(.record);
+    m.recordResumptionAttempt(.record);
+    m.recordResumptionAttempt(.quic);
+    try std.testing.expectEqual(@as(u64, 2), m.tls_resumption_attempt_total[resumptionTransportIndex(.record)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_resumption_attempt_total[resumptionTransportIndex(.quic)]);
+
+    m.recordResumptionOutcome(.record, .accepted);
+    m.recordResumptionOutcome(.quic, .full_handshake);
+    m.recordResumptionOutcome(.quic, .fatal);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_resumption_outcome_total[resumptionTransportIndex(.record)][resumptionOutcomeIndex(.accepted)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_resumption_outcome_total[resumptionTransportIndex(.quic)][resumptionOutcomeIndex(.full_handshake)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_resumption_outcome_total[resumptionTransportIndex(.quic)][resumptionOutcomeIndex(.fatal)]);
+
+    m.recordTicketIssue(.record, .stateful, .success);
+    m.recordTicketIssue(.quic, .hybrid, .failed);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_ticket_issue_total[resumptionTransportIndex(.record)][resumptionModeIndex(.stateful)][ticketResultIndex(.success)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_ticket_issue_total[resumptionTransportIndex(.quic)][resumptionModeIndex(.hybrid)][ticketResultIndex(.failed)]);
+
+    m.recordTicketStore(.success);
+    m.recordTicketStore(.rejected);
+    m.recordTicketStore(.rejected);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_ticket_store_total[ticketResultIndex(.success)]);
+    try std.testing.expectEqual(@as(u64, 2), m.tls_ticket_store_total[ticketResultIndex(.rejected)]);
+
+    m.recordTicketResolve(.stateless, .success);
+    m.recordTicketResolve(.stateless, .failed);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_ticket_resolve_total[resumptionModeIndex(.stateless)][ticketResultIndex(.success)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_ticket_resolve_total[resumptionModeIndex(.stateless)][ticketResultIndex(.failed)]);
+}
+
+test "resumption and ticket counters appear in Prometheus output with closed-enum labels only (#488)" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+    m.recordResumptionAttempt(.quic);
+    m.recordResumptionOutcome(.quic, .accepted);
+    m.recordTicketIssue(.record, .stateful, .success);
+    m.recordTicketStore(.success);
+    m.recordTicketResolve(.hybrid, .success);
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_resumption_attempt_total{transport=\"quic\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_resumption_outcome_total{transport=\"quic\",outcome=\"accepted\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_ticket_issue_total{transport=\"record\",mode=\"stateful\",result=\"success\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_ticket_store_total{result=\"success\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_ticket_resolve_total{mode=\"hybrid\",result=\"success\"} 1") != null);
 }
 
 test "Metrics records proxy streaming fallback reasons" {

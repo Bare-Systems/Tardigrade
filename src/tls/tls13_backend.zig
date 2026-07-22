@@ -1871,6 +1871,18 @@ pub const Tls13Backend = struct {
         self.wipeEphemeral();
         if (psk_secret) |*psk| {
             self.core.enterPskAuthenticated();
+            // #488: a PSK-resumed handshake never sends a Certificate
+            // message (RFC 8446 SS4.2.11), so `certificate_state` would
+            // otherwise stay `.not_checked` forever — which every transport
+            // completion policy (record `completionPolicyError`, QUIC
+            // `Handshake.complete`) treats as a fatal `CertificateInvalid`
+            // for the client role. The resumed identity's trust is not
+            // reestablished here: it was already proven once, at the
+            // original full handshake that issued this ticket, and the
+            // binder just confirmed the client and server share that same
+            // ticket's PSK — so the client may treat the peer as
+            // equivalently authenticated without a fresh Certificate flight.
+            try sink.emitCertificate(.valid);
             self.schedule = KeySchedule.initWithPsk(psk, &shared, self.core.transcriptHash());
             crypto.secureZero(u8, psk);
         } else {
@@ -3395,39 +3407,110 @@ pub const Tls13Backend = struct {
         };
     }
 
-    pub fn emitNewSessionTicket(
+    /// #488 two-phase issuance, step 1: derives the RMS-bound PSK and the
+    /// exact `ServerRecoverableState` a stateful insertion or stateless seal
+    /// will consume, without requiring the opaque bearer identity that only
+    /// exists once one of those two issuance paths has actually run.
+    /// Runtime code must not rederive the PSK from this connection a second
+    /// time — call `emitPreparedNewSessionTicket` with the resulting
+    /// identity to finish issuance, then `prepared.deinit()` unconditionally.
+    pub const PreparedNewSessionTicket = struct {
+        state: session.ServerRecoverableState = .{},
+        ticket_lifetime: u32 = 0,
+        ticket_age_add: u32 = 0,
+        ticket_nonce_buf: [new_session_ticket.max_ticket_nonce_len]u8 = undefined,
+        ticket_nonce_len: u8 = 0,
+        max_early_data_size: ?u32 = null,
+
+        pub fn ticketNonce(self: *const PreparedNewSessionTicket) []const u8 {
+            return self.ticket_nonce_buf[0..self.ticket_nonce_len];
+        }
+
+        /// Safe to call unconditionally, including after a successful
+        /// `emitPreparedNewSessionTicket` whose stateful path already moved
+        /// `state` away (leaving it zero-valued and this a no-op).
+        pub fn deinit(self: *PreparedNewSessionTicket) void {
+            self.state.deinit();
+            crypto.secureZero(u8, &self.ticket_nonce_buf);
+            self.* = undefined;
+        }
+    };
+
+    pub const PrepareNewSessionTicketParams = struct {
+        ticket_lifetime: u32,
+        ticket_age_add: u32,
+        ticket_nonce: []const u8,
+        max_early_data_size: ?u32 = null,
+        issued_at_unix_ms: i64,
+    };
+
+    pub fn prepareNewSessionTicket(
         self: *Tls13Backend,
         allocator: std.mem.Allocator,
-        sink: *EventSink,
-        params: EmitNewSessionTicketParams,
+        params: PrepareNewSessionTicketParams,
         limits: session.Limits,
-    ) HandshakeError!session.ServerRecoverableState {
+    ) HandshakeError!PreparedNewSessionTicket {
         if (self.role != .server or self.core.handshake_lifecycle != .complete)
             return error.InvalidHandshakeState;
         if (self.resumption_master_secret.slice().len == 0)
             return error.InvalidHandshakeState;
         limits.validate() catch return error.InvalidTransportProfile;
+        if (params.ticket_nonce.len > new_session_ticket.max_ticket_nonce_len)
+            return error.IllegalParameter;
 
-        const emit_params: new_session_ticket.EmitParams = .{
-            .ticket_lifetime = params.ticket_lifetime,
-            .ticket_age_add = params.ticket_age_add,
-            .ticket_nonce = params.ticket_nonce,
-            .ticket = params.opaque_ticket,
-            .max_early_data_size = params.max_early_data_size,
-        };
-        const body_len = new_session_ticket.encodedLen(emit_params) catch |err| return mapTicketEncodeError(err);
-        if (body_len > max_new_session_ticket_message_len - 4) return error.TransportBufferOverflow;
-        const message_len = handshake_header_len + body_len;
-
-        var state = new_session_ticket.buildServerRecoverableState(
+        const state = new_session_ticket.buildServerRecoverableStateNoIdentity(
             allocator,
-            emit_params,
+            .{
+                .ticket_lifetime = params.ticket_lifetime,
+                .ticket_age_add = params.ticket_age_add,
+                .ticket_nonce = params.ticket_nonce,
+                .max_early_data_size = params.max_early_data_size,
+            },
             self.resumptionContext(),
             self.resumption_master_secret.slice(),
             params.issued_at_unix_ms,
             limits,
         ) catch |err| return mapTicketBuildServerError(err);
-        errdefer state.deinit();
+
+        var prepared: PreparedNewSessionTicket = .{
+            .state = state,
+            .ticket_lifetime = params.ticket_lifetime,
+            .ticket_age_add = params.ticket_age_add,
+            .max_early_data_size = params.max_early_data_size,
+        };
+        prepared.ticket_nonce_len = @intCast(params.ticket_nonce.len);
+        @memcpy(prepared.ticket_nonce_buf[0..prepared.ticket_nonce_len], params.ticket_nonce);
+        return prepared;
+    }
+
+    /// #488 two-phase issuance, step 2: encodes and emits the
+    /// `NewSessionTicket` message carrying `identity` — the exact bearer
+    /// identity (stateful handle or stateless envelope) produced from
+    /// `prepared.state` — through the existing application-epoch record
+    /// path. Does not consume or clear `prepared`; the caller still owns it
+    /// and must `deinit` it afterward regardless of outcome.
+    pub fn emitPreparedNewSessionTicket(
+        self: *Tls13Backend,
+        allocator: std.mem.Allocator,
+        sink: *EventSink,
+        prepared: *const PreparedNewSessionTicket,
+        identity: []const u8,
+        limits: session.Limits,
+    ) HandshakeError!void {
+        if (self.role != .server or self.core.handshake_lifecycle != .complete)
+            return error.InvalidHandshakeState;
+        if (identity.len == 0 or identity.len > limits.max_ticket_len) return error.TicketTooLarge;
+
+        const emit_params: new_session_ticket.EmitParams = .{
+            .ticket_lifetime = prepared.ticket_lifetime,
+            .ticket_age_add = prepared.ticket_age_add,
+            .ticket_nonce = prepared.ticketNonce(),
+            .ticket = identity,
+            .max_early_data_size = prepared.max_early_data_size,
+        };
+        const body_len = new_session_ticket.encodedLen(emit_params) catch |err| return mapTicketEncodeError(err);
+        if (body_len > max_new_session_ticket_message_len - 4) return error.TransportBufferOverflow;
+        const message_len = handshake_header_len + body_len;
 
         const buf = allocator.alloc(u8, message_len) catch return error.CredentialProviderFailed;
         errdefer {
@@ -3443,7 +3526,30 @@ pub const Tls13Backend = struct {
         const message = buf[0..w.len];
         try sink.emitOwnedCrypto(allocator, .application, message);
         self.core.transcript.update(message);
-        return state;
+    }
+
+    /// Single-phase issuance, retained for callers (and tests) that already
+    /// know the final bearer identity before deriving connection state.
+    /// New production issuance paths should prefer `prepareNewSessionTicket`
+    /// / `emitPreparedNewSessionTicket` (#488) so the identity can be
+    /// derived from the exact state this produces.
+    pub fn emitNewSessionTicket(
+        self: *Tls13Backend,
+        allocator: std.mem.Allocator,
+        sink: *EventSink,
+        params: EmitNewSessionTicketParams,
+        limits: session.Limits,
+    ) HandshakeError!session.ServerRecoverableState {
+        var prepared = try self.prepareNewSessionTicket(allocator, .{
+            .ticket_lifetime = params.ticket_lifetime,
+            .ticket_age_add = params.ticket_age_add,
+            .ticket_nonce = params.ticket_nonce,
+            .max_early_data_size = params.max_early_data_size,
+            .issued_at_unix_ms = params.issued_at_unix_ms,
+        }, limits);
+        errdefer prepared.deinit();
+        try self.emitPreparedNewSessionTicket(allocator, sink, &prepared, params.opaque_ticket, limits);
+        return prepared.state;
     }
 
     /// The handshake is over: the transport sink owns every exported live
@@ -3945,6 +4051,68 @@ test "server explicitly emits NewSessionTicket and returns recoverable state" {
     try std.testing.expectEqual(@as(u32, 60), state.common.lifetime_seconds);
     try std.testing.expectEqual(session.EarlyDataPolicy{ .early_data_capable = 32 }, state.common.early_data);
     try std.testing.expect(!std.mem.allEqual(u8, state.common.resumption_psk.slice(), 0));
+}
+
+test "prepare/emit two-phase ticket issuance matches single-phase wire output" {
+    var server = Tls13Backend.initServer(
+        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x52} ** 32 },
+        try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+        .record,
+    );
+    defer server.deinit();
+    server.core.handshake_lifecycle = .complete;
+    try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
+
+    var sink = EventSink{};
+    defer sink.deinit();
+    var prepared = try server.prepareNewSessionTicket(std.testing.allocator, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .max_early_data_size = 32,
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default);
+    defer prepared.deinit();
+
+    try std.testing.expect(!std.mem.allEqual(u8, prepared.state.common.resumption_psk.slice(), 0));
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+
+    try server.emitPreparedNewSessionTicket(std.testing.allocator, &sink, &prepared, "identity-bytes", session.Limits.default);
+
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+    const message = try tls_handshake_codec.decode(sink.items[0].handshake_bytes.data);
+    try std.testing.expectEqual(MessageType.new_session_ticket, message.kind);
+    const parsed = try new_session_ticket.decode(message.body);
+    try std.testing.expectEqual(@as(u32, 60), parsed.ticket_lifetime);
+    try std.testing.expectEqualSlices(u8, "identity-bytes", parsed.ticket);
+    try std.testing.expectEqual(@as(?u32, 32), parsed.max_early_data_size);
+}
+
+test "emitPreparedNewSessionTicket rejects an empty or oversized identity" {
+    var server = Tls13Backend.initServer(
+        .{ .hello_random = [_]u8{0x53} ** 32, .key_share_seed = [_]u8{0x54} ** 32 },
+        try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+        .record,
+    );
+    defer server.deinit();
+    server.core.handshake_lifecycle = .complete;
+    try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
+
+    var sink = EventSink{};
+    defer sink.deinit();
+    var prepared = try server.prepareNewSessionTicket(std.testing.allocator, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default);
+    defer prepared.deinit();
+
+    try std.testing.expectError(error.TicketTooLarge, server.emitPreparedNewSessionTicket(std.testing.allocator, &sink, &prepared, "", session.Limits.default));
+    var too_large: [session.Limits.default.max_ticket_len + 1]u8 = undefined;
+    @memset(&too_large, 0xa5);
+    try std.testing.expectError(error.TicketTooLarge, server.emitPreparedNewSessionTicket(std.testing.allocator, &sink, &prepared, &too_large, session.Limits.default));
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
 }
 
 test "server ticket output failure is atomic and retryable" {

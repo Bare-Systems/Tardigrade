@@ -53,6 +53,11 @@ pub const Config = struct {
     /// Borrowed local credential provider shared with the TCP TLS path. The
     /// owner must outlive this runtime and every QUIC connection it accepts.
     credential_provider: ?tls_core.credentials.CredentialProvider = null,
+    /// #488: borrowed process-shared native resumption runtime, shared with
+    /// the native TCP TLS path. `null` (the default) leaves resumption
+    /// fully disabled for QUIC/H3: no resolver is installed on any accepted
+    /// connection and no ticket is ever issued.
+    resumption_runtime: ?*tls_core.resumption_runtime.Runtime = null,
     tls_min_version: []const u8 = "1.3",
     tls_max_version: []const u8 = "1.3",
     enable_0rtt: bool = false,
@@ -115,6 +120,10 @@ const ConnEntry = struct {
     /// Monotonic microseconds when the connection was accepted; used to reap
     /// connections that never complete the handshake.
     accepted_at_us: u64,
+    /// Set exactly once this connection has attempted post-handshake ticket
+    /// issuance (successfully or not) — issuance is best-effort and must
+    /// never be retried on the same connection (#488).
+    ticket_issue_attempted: bool = false,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
         self.h3.deinit();
@@ -132,6 +141,7 @@ pub const Runtime = struct {
     request_handler: ?RequestHandler,
     request_handler_ctx: ?*anyopaque,
     credential_provider: ?tls_core.credentials.CredentialProvider,
+    resumption_runtime: ?*tls_core.resumption_runtime.Runtime,
     quic_config: quic.config.Config,
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
@@ -163,6 +173,7 @@ pub const Runtime = struct {
             .request_handler = cfg.request_handler,
             .request_handler_ctx = cfg.request_handler_ctx,
             .credential_provider = cfg.credential_provider,
+            .resumption_runtime = cfg.resumption_runtime,
             .quic_config = quicConfigFrom(cfg),
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
@@ -368,6 +379,7 @@ pub const Runtime = struct {
         if (!was_established and entry.conn.isEstablished()) {
             self.noteHandshakeComplete();
         }
+        self.maybeIssueSessionTicket(entry);
 
         var out: [2048]u8 = undefined;
         while (entry.conn.pollTransmit(&out, now)) |response_datagram| {
@@ -401,6 +413,17 @@ pub const Runtime = struct {
         compat.randomBytes(&entropy.hello_random);
         compat.randomBytes(&entropy.key_share_seed);
         backend.* = quic.tls_backend.Tls13Backend.initServerWithProvider(entropy, credential_provider);
+        // #488: install the same process-shared server resolver used by
+        // native TCP, before the handshake can start — `Connection.init`
+        // below arms the responder.
+        if (self.resumption_runtime) |runtime| {
+            if (runtime.serverResolver()) |resolver| {
+                backend.setServerPskResolver(resolver) catch {
+                    allocator.destroy(backend);
+                    return null;
+                };
+            }
+        }
 
         const conn = Connection.init(allocator, .{
             .role = .server,
@@ -550,6 +573,46 @@ pub const Runtime = struct {
         if (sent >= 0 and @as(usize, @intCast(sent)) == datagram.len) {
             self.notePacketOut(datagram.len);
         }
+    }
+
+    /// #488: best-effort, exactly-once post-handshake ticket issuance for
+    /// this connection. A failure here is swallowed rather than tearing
+    /// down an otherwise usable connection — never retried afterward.
+    fn maybeIssueSessionTicket(self: *Runtime, entry: *ConnEntry) void {
+        if (entry.ticket_issue_attempted) return;
+        const runtime = self.resumption_runtime orelse return;
+        if (!entry.conn.isEstablished()) return;
+        entry.ticket_issue_attempted = true;
+        self.issueSessionTicket(entry, runtime) catch {};
+    }
+
+    fn issueSessionTicket(self: *Runtime, entry: *ConnEntry, runtime: *tls_core.resumption_runtime.Runtime) !void {
+        const allocator = self.allocator;
+        const now_unix_ms = runtime.nowUnixMs();
+
+        var ticket_nonce: [8]u8 = undefined;
+        try runtime.provider.randomBytes(&ticket_nonce);
+        var age_add_bytes: [4]u8 = undefined;
+        try runtime.provider.randomBytes(&age_add_bytes);
+        const ticket_age_add = std.mem.readInt(u32, &age_add_bytes, .big);
+
+        const limits = runtime.config.session_limits;
+        var prepared = try entry.conn.prepareNewSessionTicket(allocator, .{
+            .ticket_lifetime = runtime.config.ticket_lifetime_seconds,
+            .ticket_age_add = ticket_age_add,
+            .ticket_nonce = &ticket_nonce,
+            .issued_at_unix_ms = now_unix_ms,
+        }, limits);
+        defer prepared.deinit();
+
+        const scratch = try allocator.alloc(u8, runtime.maxIdentityLen());
+        defer allocator.free(scratch);
+        var identity = try runtime.createIdentity(&prepared.state, now_unix_ms, scratch);
+
+        entry.conn.emitPreparedNewSessionTicket(&prepared, identity.slice(), limits) catch |err| {
+            runtime.rollbackIdentity(&identity);
+            return err;
+        };
     }
 
     fn noteConnectionAccepted(self: *Runtime) void {
@@ -839,6 +902,36 @@ test "runtime borrows the credential provider and owns no key material" {
     });
     try testing.expect(!unbootstrapped.snapshot().server_bootstrapped);
     unbootstrapped.deinit();
+}
+
+fn fixedNowUnixMsForTest(_: *anyopaque) i64 {
+    return 1000;
+}
+
+test "runtime borrows the resumption runtime and installs it per accepted connection" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-resumption-test");
+
+    var entropy = tls_core.production_crypto.OsEntropy{};
+    var provider_state = tls_core.production_crypto.Provider.init(entropy.entropy());
+    var resumption = try tls_core.resumption_runtime.Runtime.init(
+        testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = fixedNowUnixMsForTest },
+        provider_state.cryptoProvider(),
+    );
+    defer resumption.deinit();
+
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .resumption_runtime = &resumption,
+    });
+    defer runtime.deinit();
+
+    try testing.expectEqual(@as(?*tls_core.resumption_runtime.Runtime, &resumption), runtime.resumption_runtime);
 }
 
 test {

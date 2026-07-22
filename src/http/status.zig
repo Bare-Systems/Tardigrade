@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 
 /// HTTP Status Codes as defined in RFC 7231 and related RFCs
 pub const Status = enum(u16) {

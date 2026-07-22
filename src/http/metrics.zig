@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const proxy_buffer_account = @import("proxy_buffer_account.zig");
 const encrypted_stream = @import("tls_core").encrypted_stream;
 

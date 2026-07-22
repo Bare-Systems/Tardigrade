@@ -3,7 +3,7 @@
 //! enter the worker pool.
 
 const builtin = @import("builtin");
-const compat = @import("zig_compat.zig");
+const compat = @import("zig_compat");
 const std = @import("std");
 const http = @import("http.zig");
 const gc = @import("gateway_connection.zig");

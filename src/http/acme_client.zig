@@ -1,4 +1,4 @@
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 /// ACME (RFC 8555) client for automated TLS certificate issuance and renewal.
 ///
 /// Supports:

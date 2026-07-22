@@ -7,7 +7,7 @@
 /// Actual OTLP span export (configured via TARDIGRADE_OTEL_ENDPOINT) is a
 /// separate runtime concern; this module focuses on the wire protocol.
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 
 /// Parsed representation of a W3C `traceparent` header value.
 pub const TraceContext = struct {

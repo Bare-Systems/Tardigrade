@@ -4,7 +4,7 @@
 /// for the approval workflow. All operations that can fail are non-fatal callers
 /// log warnings and continue.
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 
 // ---------------------------------------------------------------------------
 // Public types

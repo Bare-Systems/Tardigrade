@@ -1,4 +1,4 @@
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const builtin = @import("builtin");
 const std = @import("std");
 

@@ -1,4 +1,4 @@
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const std = @import("std");
 const logger = @import("logger.zig");
 

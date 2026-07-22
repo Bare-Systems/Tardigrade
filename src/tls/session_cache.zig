@@ -34,14 +34,11 @@
 //!     handle ("TDSH" v1), owns `session.ServerRecoverableState`, and exposes
 //!     an internal lease/commit/release model for single-use consumption.
 //!
-//! Per issue #364's canonical plan, this module intentionally does not yet
-//! adapt `StatefulServerCache` to the public `pre_shared_key.ServerPskResolver`
-//! contract, does not add the `TDSH`/`TDTK` composite adapter, and does not
-//! touch `root.zig` — those land once the two-phase issuance / resolver-lease
-//! predecessor amendments described in issue #364 are made. The
-//! lease/commit/release shape defined here already matches what that future
-//! resolver adapter will need, so wiring it up should not require reshaping
-//! this module.
+//! The stateful server cache exposes its lease model through the public
+//! `pre_shared_key.ServerPskResolver` contract used by the shared backend:
+//! successful resolution returns owned state plus a live lease, compatibility
+//! and binder verification happen in `tls13_backend.zig`, and the lease is
+//! committed or released from that single protocol decision point.
 //!
 //! ## Sequence counters
 //!
@@ -83,6 +80,7 @@ const pre_shared_key = @import("pre_shared_key.zig");
 const zig_compat = @import("zig_compat");
 
 const secrets = crypto.secrets;
+const Mutex = zig_compat.Mutex;
 
 // -----------------------------------------------------------------------
 // Limits
@@ -416,7 +414,7 @@ pub const ClientSessionCache = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
     observer: Observer = .{},
-    mutex: zig_compat.Mutex = .{},
+    mutex: Mutex = .{},
     entries: std.ArrayListUnmanaged(*ClientEntry) = .empty,
     total_bytes: usize = 0,
     next_insertion_sequence: u64 = 0,
@@ -1363,6 +1361,108 @@ pub const ResolveLeaseResult = union(enum) {
     }
 };
 
+const PublicServerLeaseBox = struct {
+    allocator: std.mem.Allocator,
+    lease: ServerLease,
+
+    fn commit(ctx: *anyopaque) void {
+        const self: *PublicServerLeaseBox = @ptrCast(@alignCast(ctx));
+        self.lease.commit();
+    }
+
+    fn release(ctx: *anyopaque) void {
+        const self: *PublicServerLeaseBox = @ptrCast(@alignCast(ctx));
+        self.lease.release();
+    }
+
+    fn deinit(ctx: *anyopaque) void {
+        const self: *PublicServerLeaseBox = @ptrCast(@alignCast(ctx));
+        const allocator = self.allocator;
+        secrets.secureZero(std.mem.asBytes(self));
+        allocator.destroy(self);
+    }
+};
+
+fn completeReusableServerPsk(ctx: *anyopaque, cache_generation: u64, entry_id: u64, lease_epoch: u64) void {
+    const cache: *StatefulServerCache = @ptrCast(@alignCast(ctx));
+    cache.commitLease(cache_generation, entry_id, lease_epoch, false);
+}
+
+/// Public adapter from the stateful cache's internal lease model to the
+/// shared TLS backend resolver contract.
+pub const StatefulServerPskResolverAdapter = struct {
+    cache: *StatefulServerCache,
+    allocator: std.mem.Allocator,
+    now_unix_ms: i64,
+
+    pub fn resolver(self: *StatefulServerPskResolverAdapter) pre_shared_key.ServerPskResolver {
+        return .{
+            .ctx = self,
+            .nowUnixMsFn = nowUnixMs,
+            .resolveFn = resolve,
+        };
+    }
+
+    fn nowUnixMs(ctx: *anyopaque) i64 {
+        const self: *StatefulServerPskResolverAdapter = @ptrCast(@alignCast(ctx));
+        return self.now_unix_ms;
+    }
+
+    fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+        const self: *StatefulServerPskResolverAdapter = @ptrCast(@alignCast(ctx));
+        return resolveStatefulServerPsk(self.cache, self.allocator, identity, self.now_unix_ms);
+    }
+};
+
+pub fn resolveStatefulServerPsk(
+    cache: *StatefulServerCache,
+    allocator: std.mem.Allocator,
+    identity: []const u8,
+    now_unix_ms: i64,
+) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+    var result = cache.resolveLease(identity, now_unix_ms);
+    switch (result) {
+        .hit => |*hit| {
+            if (!hit.lease.single_use) {
+                var state: session.ServerRecoverableState = .{};
+                state.moveFrom(&hit.state);
+                return .{ .hit = .{
+                    .state = state,
+                    .lease = pre_shared_key.ServerPskLease.initNoop(),
+                    .on_selected = .{
+                        .ctx = hit.lease.cache,
+                        .arg0 = hit.lease.cache_generation,
+                        .arg1 = hit.lease.entry_id,
+                        .arg2 = hit.lease.lease_epoch,
+                        .completeFn = completeReusableServerPsk,
+                    },
+                } };
+            }
+
+            const box = allocator.create(PublicServerLeaseBox) catch {
+                result.deinit();
+                return error.ResolverFailed;
+            };
+            box.* = .{ .allocator = allocator, .lease = hit.lease };
+            hit.lease.active = false;
+
+            var state: session.ServerRecoverableState = .{};
+            state.moveFrom(&hit.state);
+            return .{ .hit = .{
+                .state = state,
+                .lease = pre_shared_key.ServerPskLease.initOwned(
+                    box,
+                    PublicServerLeaseBox.commit,
+                    PublicServerLeaseBox.release,
+                    PublicServerLeaseBox.deinit,
+                ),
+            } };
+        },
+        .miss, .expired, .busy => return .miss,
+        .storage_failed => return error.ResolverFailed,
+    }
+}
+
 const OriginBucket = std.ArrayListUnmanaged(u64);
 
 /// The exact set of entries an insertion will evict, computed as a pure,
@@ -1402,7 +1502,7 @@ pub const StatefulServerCache = struct {
     limits: Limits,
     random: RandomSource,
     observer: Observer = .{},
-    mutex: zig_compat.Mutex = .{},
+    mutex: Mutex = .{},
     entries: std.AutoHashMapUnmanaged(u64, *ServerEntry) = .empty,
     handle_index: std.AutoHashMapUnmanaged(HandleDigest, u64) = .empty,
     origin_index: std.AutoHashMapUnmanaged(OriginDigest, OriginBucket) = .empty,
@@ -3107,6 +3207,25 @@ test "stateful bearer handle is wiped from allocator backing memory on removal" 
     hit.deinit();
 
     try testing.expect(std.mem.indexOf(u8, &backing, &handle) == null);
+}
+
+test "stateful public adapter returns noop lease for reusable hits without lease-box allocation" {
+    var cache = try StatefulServerCache.init(testing.allocator, Limits.stateful_server_default, system_random_source);
+    defer cache.deinit();
+    var s1 = try makeServer(testing.allocator, "example.test");
+    var handle: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&s1, 0, .reusable, &handle));
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var result = try resolveStatefulServerPsk(&cache, failing.allocator(), &handle, 1);
+    defer result.deinit();
+    switch (result) {
+        .hit => |*hit| {
+            try testing.expectEqual(pre_shared_key.ServerPskLease.noop, hit.lease);
+            try testing.expect(hit.on_selected != null);
+        },
+        .miss => return error.TestExpectedEqual,
+    }
 }
 
 test "FailingAllocator sweep: client store under eviction pressure is atomic on allocation failure" {

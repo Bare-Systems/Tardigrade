@@ -1,4 +1,4 @@
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const std = @import("std");
 const headers_mod = @import("headers.zig");
 const Headers = headers_mod.Headers;

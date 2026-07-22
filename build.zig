@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     tls_core_mod.addImport("crypto_secrets", crypto_secrets_mod);
+    tls_core_mod.addImport("zig_compat", compat_mod);
 
     // Shared leaf modules. A Zig source file belongs to exactly one module,
     // so anything consumed by both the exe tree and the quic/http3 packages
@@ -119,6 +120,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     exe_mod.addImport("build_options", build_options.createModule());
+    exe_mod.addImport("zig_compat", compat_mod);
     exe_mod.addImport("quic_varint", quic_varint_mod);
     exe_mod.addImport("hpack_huffman", hpack_huffman_mod);
     exe_mod.addImport("stream_transport", stream_transport_mod);
@@ -162,6 +164,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     allocation_regression_mod.addImport("build_options", build_options.createModule());
+    allocation_regression_mod.addImport("zig_compat", compat_mod);
     allocation_regression_mod.addImport("quic_varint", quic_varint_mod);
     allocation_regression_mod.addImport("hpack_huffman", hpack_huffman_mod);
     allocation_regression_mod.addImport("stream_transport", stream_transport_mod);
@@ -297,15 +300,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_crypto_tests.step);
     test_step.dependOn(&run_crypto_secret_tests.step);
 
-    // Bounded session-resumption cache (#364). Deliberately its own module
-    // rather than wired into `tls_core_mod`/`root.zig` yet: issue #364's
-    // canonical plan defers the public `pre_shared_key.ServerPskResolver`
-    // amendment and the `TDSH`/`TDTK` composite adapter until sibling PR
-    // #478 (#363's stateless protector) merges, matching how #478 itself
-    // ships `ticket_protection.zig` unwired from `root.zig` in the
-    // meantime. `session_cache.zig` still needs `session.zig` /
-    // `pre_shared_key.zig` (relative imports, recompiled into this
-    // module) plus the shared `crypto` provider import.
+    // Bounded session-resumption cache (#364/#365). Kept as a standalone
+    // test target for focused cache/persistence coverage, while also exported
+    // through `tls_core` for the shared native resumption runtime.
     const session_cache_mod = b.createModule(.{
         .root_source_file = b.path("src/tls/session_cache.zig"),
         .target = target,

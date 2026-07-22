@@ -5,7 +5,7 @@
 //! chunk serialization, and JSON API error replies. It performs no upstream
 //! network I/O and no target URL resolution.
 
-const compat = @import("zig_compat.zig");
+const compat = @import("zig_compat");
 const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");

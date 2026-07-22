@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const session = @import("session.zig");
 
 pub const StoredSession = struct {

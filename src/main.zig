@@ -1,6 +1,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
-const compat = @import("zig_compat.zig");
+const compat = @import("zig_compat");
 const edge_config = @import("edge_config.zig");
 const edge_gateway = @import("edge_gateway.zig");
 const http = @import("http.zig");
@@ -1262,7 +1262,7 @@ fn startWorkerRecycleTimer(cfg: *const edge_config.EdgeConfig) void {
     const secs = cfg.worker_recycle_seconds;
     _ = std.Thread.spawn(.{}, struct {
         fn run(wait_secs: u32) void {
-            const compat2 = @import("zig_compat.zig");
+            const compat2 = @import("zig_compat");
             std.Io.sleep(compat2.io(), std.Io.Duration.fromSeconds(@intCast(wait_secs)), .awake) catch {}; // interrupt wakes are fine; recycle fires immediately on wake
             http.shutdown.requestShutdown();
         }

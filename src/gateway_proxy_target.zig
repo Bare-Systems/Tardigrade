@@ -5,7 +5,7 @@
 //! resolution, upstream host extraction, and Unix-socket endpoint detection.
 //! It performs no network I/O and no downstream response formatting.
 
-const compat = @import("zig_compat.zig");
+const compat = @import("zig_compat");
 const std = @import("std");
 const gph = @import("gateway_proxy_headers.zig");
 const gs = @import("gateway_state.zig");

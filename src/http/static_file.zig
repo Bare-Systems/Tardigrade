@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const autoindex = @import("autoindex.zig");
 const dates = @import("dates.zig");
 const etag = @import("etag.zig");

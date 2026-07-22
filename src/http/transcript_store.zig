@@ -1,6 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 
 pub const Entry = struct {
     ts_ms: i64,

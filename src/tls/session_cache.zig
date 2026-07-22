@@ -1418,6 +1418,16 @@ pub fn resolveStatefulServerPsk(
     var result = cache.resolveLease(identity, now_unix_ms);
     switch (result) {
         .hit => |*hit| {
+            if (!hit.lease.single_use) {
+                var state: session.ServerRecoverableState = .{};
+                state.moveFrom(&hit.state);
+                hit.lease.active = false;
+                return .{ .hit = .{
+                    .state = state,
+                    .lease = pre_shared_key.ServerPskLease.initNoop(),
+                } };
+            }
+
             const box = allocator.create(PublicServerLeaseBox) catch {
                 result.deinit();
                 return error.ResolverFailed;
@@ -3186,6 +3196,24 @@ test "stateful bearer handle is wiped from allocator backing memory on removal" 
     hit.deinit();
 
     try testing.expect(std.mem.indexOf(u8, &backing, &handle) == null);
+}
+
+test "stateful public adapter returns noop lease for reusable hits without lease-box allocation" {
+    var cache = try StatefulServerCache.init(testing.allocator, Limits.stateful_server_default, system_random_source);
+    defer cache.deinit();
+    var s1 = try makeServer(testing.allocator, "example.test");
+    var handle: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&s1, 0, .reusable, &handle));
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var result = try resolveStatefulServerPsk(&cache, failing.allocator(), &handle, 1);
+    defer result.deinit();
+    switch (result) {
+        .hit => |*hit| {
+            try testing.expectEqual(pre_shared_key.ServerPskLease.noop, hit.lease);
+        },
+        .miss => return error.TestExpectedEqual,
+    }
 }
 
 test "FailingAllocator sweep: client store under eviction pressure is atomic on allocation failure" {

@@ -306,7 +306,7 @@ test "stateful runtime resolves TDSH handles and misses TDTK/unknown prefixes" {
     var hit = try resolver.resolve(&handle);
     defer hit.deinit();
     try std.testing.expect(hit == .hit);
-    try std.testing.expect(hit.hit.lease == .owned);
+    try std.testing.expect(hit.hit.lease == .noop);
 
     var unknown = try resolver.resolve("not-a-ticket");
     defer unknown.deinit();

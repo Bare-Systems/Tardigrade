@@ -20,6 +20,7 @@ const record_codec = tls_core.record_codec;
 const events = tls_core.events;
 const credentials = tls_core.credentials;
 const session = tls_core.session;
+const session_cache = tls_core.session_cache;
 const sni_provider = tls_core.sni_provider;
 
 fn clientEntropy() tls_backend.Entropy {
@@ -4443,6 +4444,74 @@ test "resolver lease commits before PSK-selected ServerHello is emitted" {
     try std.testing.expectEqual(events_before_client_hello, selected_lease.committed_sink_len.?);
     try std.testing.expect(sink.len > events_before_client_hello);
     try std.testing.expect(server.core.psk_authenticated);
+}
+
+test "stateful single-use cache adapter commits selected handle and consumes it" {
+    var cache = try session_cache.StatefulServerCache.init(
+        std.testing.allocator,
+        session_cache.Limits.stateful_server_default,
+        session_cache.system_random_source,
+    );
+    defer cache.deinit();
+
+    const psk = [_]u8{0x95} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    var handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&stored_state, 0, .single_use, &handle),
+    );
+
+    var adapter = session_cache.StatefulServerPskResolverAdapter{
+        .cache = &cache,
+        .allocator = std.testing.allocator,
+        .now_unix_ms = 0,
+    };
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+    try server.setServerPskResolver(adapter.resolver());
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{.{ .identity = &handle, .binder_psk = &psk }} } });
+    try std.testing.expect(server.core.psk_authenticated);
+
+    var after_success = try session_cache.resolveStatefulServerPsk(&cache, std.testing.allocator, &handle, 0);
+    defer after_success.deinit();
+    try std.testing.expect(after_success == .miss);
+}
+
+test "stateful single-use cache adapter releases handle after bad binder" {
+    var cache = try session_cache.StatefulServerCache.init(
+        std.testing.allocator,
+        session_cache.Limits.stateful_server_default,
+        session_cache.system_random_source,
+    );
+    defer cache.deinit();
+
+    const psk = [_]u8{0x96} ** tls_backend.hash_len;
+    const wrong_psk = [_]u8{0x97} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    var handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&stored_state, 0, .single_use, &handle),
+    );
+
+    var adapter = session_cache.StatefulServerPskResolverAdapter{
+        .cache = &cache,
+        .allocator = std.testing.allocator,
+        .now_unix_ms = 0,
+    };
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+    try server.setServerPskResolver(adapter.resolver());
+
+    try std.testing.expectError(error.DecryptError, driveServerSelection(&server, .{ .psk = .{ .items = &.{
+        .{ .identity = &handle, .binder_psk = &wrong_psk },
+    } } }));
+
+    var after_failure = try session_cache.resolveStatefulServerPsk(&cache, std.testing.allocator, &handle, 0);
+    defer after_failure.deinit();
+    try std.testing.expect(after_failure == .hit);
 }
 
 const FbaCloningResolver = struct {

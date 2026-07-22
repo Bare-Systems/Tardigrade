@@ -847,9 +847,12 @@ pub const ServerPskResolverAdapter = struct {
         return self.now_unix_ms;
     }
 
-    fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+    fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
         const self: *ServerPskResolverAdapter = @ptrCast(@alignCast(ctx));
-        return self.protector.resolve(self.allocator, identity, self.now_unix_ms, out) catch return error.ResolverFailed;
+        var out: session.ServerRecoverableState = .{};
+        const found = self.protector.resolve(self.allocator, identity, self.now_unix_ms, &out) catch return error.ResolverFailed;
+        if (!found) return .miss;
+        return .{ .hit = .{ .state = out, .lease = pre_shared_key.ServerPskLease.noop() } };
     }
 };
 
@@ -1985,21 +1988,20 @@ test "ServerPskResolver adapter uses one captured time for now and recovery" {
     const resolver = adapter.resolver();
     try testing.expectEqual(@as(i64, 2_000), resolver.nowUnixMs());
 
-    var out: session.ServerRecoverableState = .{};
+    var out = try resolver.resolve(ticket);
     defer out.deinit();
-    try testing.expect(try resolver.resolve(ticket, &out));
-    try testing.expectEqual(state.ticket_age_add, out.ticket_age_add);
-    try testing.expectEqualSlices(u8, state.common.resumption_psk.slice(), out.common.resumption_psk.slice());
+    try testing.expect(out == .hit);
+    try testing.expectEqual(state.ticket_age_add, out.hit.state.ticket_age_add);
+    try testing.expectEqualSlices(u8, state.common.resumption_psk.slice(), out.hit.state.common.resumption_psk.slice());
 
-    var miss: session.ServerRecoverableState = .{};
+    var miss = try resolver.resolve("not-a-ticket");
     defer miss.deinit();
-    try testing.expect(!try resolver.resolve("not-a-ticket", &miss));
-    try testing.expectEqual(@as(usize, 0), miss.common.resumption_psk.len);
+    try testing.expect(miss == .miss);
 
     adapter.now_unix_ms = 20_000;
-    var expired: session.ServerRecoverableState = .{};
+    var expired = try resolver.resolve(ticket);
     defer expired.deinit();
-    try testing.expect(!try resolver.resolve(ticket, &expired));
+    try testing.expect(expired == .miss);
 }
 
 test "key windows and ticket lifetime are enforced" {

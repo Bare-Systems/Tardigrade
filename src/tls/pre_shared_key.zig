@@ -481,29 +481,83 @@ pub const ClientPskOfferSet = struct {
 
 pub const ResolveError = error{ResolverFailed};
 
-/// Provider-neutral identity resolver. `resolveFn` returns `true` with a
-/// completely owned, zero-valued-on-failure `out` when `identity` is a
-/// usable ticket/session identity; `false` (with `out` left untouched/zero)
-/// for any malformed, unknown, retired, or otherwise unusable identity —
-/// including a stateless envelope's own decode/authentication failures
-/// (#363), which are never distinguished from "unknown" at this contract.
+/// Provider-neutral, exactly-once server PSK lease. Stateful single-use
+/// providers pin cache entries until binder verification proves the identity
+/// was actually selected; reusable and stateless providers use `noop`.
+pub const ServerPskLease = struct {
+    ctx: ?*anyopaque = null,
+    commitFn: ?*const fn (*anyopaque) void = null,
+    releaseFn: ?*const fn (*anyopaque) void = null,
+    deinitFn: ?*const fn (*anyopaque) void = null,
+    active: bool = false,
+
+    pub fn noop() ServerPskLease {
+        return .{};
+    }
+
+    pub fn commit(self: *ServerPskLease) void {
+        if (!self.active) return;
+        self.active = false;
+        if (self.ctx) |ctx| {
+            if (self.commitFn) |f| f(ctx);
+            if (self.deinitFn) |f| f(ctx);
+        }
+        self.* = .{};
+    }
+
+    pub fn release(self: *ServerPskLease) void {
+        if (!self.active) return;
+        self.active = false;
+        if (self.ctx) |ctx| {
+            if (self.releaseFn) |f| f(ctx);
+            if (self.deinitFn) |f| f(ctx);
+        }
+        self.* = .{};
+    }
+
+    pub fn deinit(self: *ServerPskLease) void {
+        self.release();
+    }
+};
+
+pub const ServerPskResolveResult = union(enum) {
+    miss,
+    hit: struct {
+        state: session.ServerRecoverableState,
+        lease: ServerPskLease,
+    },
+
+    pub fn deinit(self: *ServerPskResolveResult) void {
+        switch (self.*) {
+            .hit => |*h| {
+                h.lease.deinit();
+                h.state.deinit();
+            },
+            .miss => {},
+        }
+    }
+};
+
+/// Provider-neutral identity resolver. `resolveFn` returns `.hit` with
+/// completely owned state plus a live lease when `identity` is usable, or
+/// `.miss` for malformed, unknown, retired, expired, or otherwise unusable
+/// identities — including stateless envelope decode/authentication failures.
 /// Operational failures (allocation, provider/configuration faults) are the
-/// typed `ResolveError`, never silently folded into an ordinary `false`.
+/// typed `ResolveError`, never silently folded into an ordinary miss.
 pub const ServerPskResolver = struct {
     ctx: *anyopaque,
     nowUnixMsFn: *const fn (*anyopaque) i64,
     resolveFn: *const fn (
         ctx: *anyopaque,
         identity: []const u8,
-        out: *session.ServerRecoverableState,
-    ) ResolveError!bool,
+    ) ResolveError!ServerPskResolveResult,
 
     pub fn nowUnixMs(self: ServerPskResolver) i64 {
         return self.nowUnixMsFn(self.ctx);
     }
 
-    pub fn resolve(self: ServerPskResolver, identity: []const u8, out: *session.ServerRecoverableState) ResolveError!bool {
-        return self.resolveFn(self.ctx, identity, out);
+    pub fn resolve(self: ServerPskResolver, identity: []const u8) ResolveError!ServerPskResolveResult {
+        return self.resolveFn(self.ctx, identity);
     }
 };
 

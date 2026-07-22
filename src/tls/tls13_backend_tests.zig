@@ -576,12 +576,11 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
         fn now(_: *anyopaque) i64 {
             return 2000;
         }
-        fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.resolve_calls += 1;
-            if (!std.mem.eql(u8, identity, "opaque-psk-ticket")) return false;
-            self.state.cloneInto(std.testing.allocator, out) catch return error.ResolverFailed;
-            return true;
+            if (!std.mem.eql(u8, identity, "opaque-psk-ticket")) return .miss;
+            return clonedResolveHit(self.state, std.testing.allocator);
         }
     };
     // `state` is a pointer, not a copy: `server_state` (below, an
@@ -698,12 +697,11 @@ test "PSK round trip resumes over the extension (QUIC-style) profile with asymme
         fn now(_: *anyopaque) i64 {
             return 2000;
         }
-        fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.resolve_calls += 1;
-            if (!std.mem.eql(u8, identity, "extension-profile-ticket")) return false;
-            self.state.cloneInto(std.testing.allocator, out) catch return error.ResolverFailed;
-            return true;
+            if (!std.mem.eql(u8, identity, "extension-profile-ticket")) return .miss;
+            return clonedResolveHit(self.state, std.testing.allocator);
         }
     };
     // Pointer, not a copy — see the identical note in the record-profile
@@ -768,8 +766,8 @@ test "PSK round trip falls back to a full handshake when the resolver has no mat
         fn now(_: *anyopaque) i64 {
             return 0;
         }
-        fn resolve(_: *anyopaque, _: []const u8, _: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
-            return false;
+        fn resolve(_: *anyopaque, _: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+            return .miss;
         }
     };
     try harness.server_backend.setServerPskResolver(.{
@@ -3123,6 +3121,15 @@ fn pskStoredStateWithBinding(psk: []const u8, auth_binding: session.AuthBinding)
     return state;
 }
 
+fn clonedResolveHit(
+    state: *session.ServerRecoverableState,
+    allocator: std.mem.Allocator,
+) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+    var out: session.ServerRecoverableState = .{};
+    state.cloneInto(allocator, &out) catch return error.ResolverFailed;
+    return .{ .hit = .{ .state = out, .lease = pre_shared_key.ServerPskLease.noop() } };
+}
+
 const CountingResolver = struct {
     state: *session.ServerRecoverableState,
     identity: []const u8,
@@ -3131,12 +3138,11 @@ const CountingResolver = struct {
     fn now(_: *anyopaque) i64 {
         return 0;
     }
-    fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+    fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         self.calls += 1;
-        if (!std.mem.eql(u8, identity, self.identity)) return false;
-        self.state.cloneInto(std.testing.allocator, out) catch return error.ResolverFailed;
-        return true;
+        if (!std.mem.eql(u8, identity, self.identity)) return .miss;
+        return clonedResolveHit(self.state, std.testing.allocator);
     }
 };
 
@@ -3810,12 +3816,11 @@ const TimedResolver = struct {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         return self.now_value;
     }
-    fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+    fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         self.calls += 1;
-        if (!std.mem.eql(u8, identity, self.identity)) return false;
-        self.state.cloneInto(std.testing.allocator, out) catch return error.ResolverFailed;
-        return true;
+        if (!std.mem.eql(u8, identity, self.identity)) return .miss;
+        return clonedResolveHit(self.state, std.testing.allocator);
     }
 };
 
@@ -4003,13 +4008,14 @@ const AllocFailResolver = struct {
     fn now(_: *anyopaque) i64 {
         return 0;
     }
-    fn resolve(ctx: *anyopaque, _: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+    fn resolve(ctx: *anyopaque, _: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        self.state.cloneInto(self.allocator, out) catch |err| {
+        var out: session.ServerRecoverableState = .{};
+        self.state.cloneInto(self.allocator, &out) catch |err| {
             self.saw_oom = (err == error.OutOfMemory);
             return error.ResolverFailed;
         };
-        return true;
+        return .{ .hit = .{ .state = out, .lease = pre_shared_key.ServerPskLease.noop() } };
     }
 };
 
@@ -4140,7 +4146,7 @@ test "a resolver operational failure is fatal and distinct from an ordinary miss
         fn now(_: *anyopaque) i64 {
             return 0;
         }
-        fn resolve(ctx: *anyopaque, _: []const u8, _: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        fn resolve(ctx: *anyopaque, _: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             return error.ResolverFailed;
@@ -4172,23 +4178,9 @@ test "a resolver that partially populates its output before failing leaves no re
         fn now(_: *anyopaque) i64 {
             return 0;
         }
-        fn resolve(ctx: *anyopaque, _: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        fn resolve(ctx: *anyopaque, _: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
-            // Contract violation: partially populate `out` (as if a
-            // stateless envelope had decrypted an identity binding but not
-            // yet finished validating it), then fail instead of returning
-            // `false`. The backend must not trust or leak this partial
-            // state.
-            var common: session.ResumableSessionCommon = .{};
-            common.init(std.testing.allocator, session.Limits.default, .{
-                .cipher_suite = .tls_aes_128_gcm_sha256,
-                .resumption_psk = &([_]u8{0x77} ** tls_backend.hash_len),
-                .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
-                .issued_at_unix_ms = 0,
-                .lifetime_seconds = 3600,
-            }) catch unreachable;
-            out.init(&common, 0);
             return error.ResolverFailed;
         }
     };
@@ -4279,17 +4271,16 @@ const FbaCloningResolver = struct {
     fn now(_: *anyopaque) i64 {
         return 0;
     }
-    fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+    fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (!std.mem.eql(u8, identity, self.identity)) return false;
+        if (!std.mem.eql(u8, identity, self.identity)) return .miss;
         self.calls += 1;
         // Deliberately clones through a *different* allocator than the one
         // backing `self.state` itself, so the only writes ever made into
         // `allocator`'s backing storage are the transient per-attempt
         // candidate this resolver hands back to `selectPsk` — isolating
         // exactly the allocation this test means to observe.
-        self.state.cloneInto(self.allocator, out) catch return error.ResolverFailed;
-        return true;
+        return clonedResolveHit(self.state, self.allocator);
     }
 };
 

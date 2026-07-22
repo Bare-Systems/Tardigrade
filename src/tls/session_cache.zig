@@ -421,9 +421,9 @@ pub const ClientSessionCache = struct {
         return .{ .allocator = allocator, .limits = limits };
     }
 
-    /// Requires quiescence: no concurrent callers and no outstanding borrows
-    /// (all cache returns are owned clones, so there is nothing else to
-    /// invalidate).
+    /// Requires quiescence: no concurrent callers and no outstanding client
+    /// offer leases. Reusable returns are clone-only, but single-use hits
+    /// carry callback tokens that must be finished before teardown.
     pub fn deinit(self: *ClientSessionCache) void {
         for (self.entries.items) |e| destroyClientEntry(self.allocator, e);
         self.entries.deinit(self.allocator);
@@ -1073,9 +1073,11 @@ pub const ClientSessionCache = struct {
     /// fully compatible with the atomicity guarantee: a rejected or
     /// later-failed insert leaves every expired entry exactly as it was.
     ///
-    /// There is no lease/pinning concept on the client side, so — unlike
-    /// the stateful server cache — every live entry is always a valid
-    /// eviction candidate once expired entries are accounted for.
+    /// Single-use client offers can pin live entries until the TLS backend
+    /// reports selected/not-selected/aborted. Pinned entries remain counted
+    /// against capacity and are never eviction candidates; only unpinned
+    /// live entries can be planned as victims once expired entries are
+    /// accounted for.
     fn planClientInsertionLocked(
         self: *ClientSessionCache,
         origin: OriginDigest,

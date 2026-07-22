@@ -350,6 +350,82 @@ jobs:
       - name: Smoke test RPM package
         run: ./scripts/test-rpm-package.sh
 
+  # ── Darwin release smoke ─────────────────────────────────────────────────────
+  # release.yml only runs after CI succeeds on main, so its macos-15-intel and
+  # macos-15 build-release rows are never exercised on a PR (#463). This job
+  # runs the same build/verify/audit/package/extract sequence on both native
+  # runner labels on every PR, so a Darwin regression is caught before merge
+  # rather than discovered on the next release.
+  darwin-release-smoke:
+    name: Darwin release smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            archive_name: tardigrade-darwin-x86_64
+            expected_arch: x86_64
+          - os: macos-15
+            archive_name: tardigrade-darwin-arm64
+            expected_arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies (macOS)
+        run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Print Zig version
+        run: zig version
+
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseFast -Dversion=0.0.0-ci-smoke
+
+      - name: Verify macOS binary architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          file zig-out/bin/tardi | grep -F "$EXPECTED_ARCH"
+
+      - name: Audit release binary linkage
+        run: |
+          ./scripts/audit-release-binary.sh \
+            --binary zig-out/bin/tardi \
+            --profile general \
+            --output "$RUNNER_TEMP/dependency-inventory-${{ matrix.archive_name }}.json"
+
+      - name: Package artifact
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          ./scripts/package-release-archive.sh \
+            --archive-name "$ARCHIVE_NAME" \
+            --binary zig-out/bin/tardi \
+            --staging-dir dist \
+            --output-dir "$RUNNER_TEMP/release-artifacts"
+
+      - name: Smoke test extracted archive
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          set -euo pipefail
+          extract_dir="$RUNNER_TEMP/extracted"
+          mkdir -p "$extract_dir"
+          tar -xzf "$RUNNER_TEMP/release-artifacts/$ARCHIVE_NAME.tar.gz" -C "$extract_dir"
+          test -x "$extract_dir/tardi"
+          test "$(readlink "$extract_dir/tardigrade")" = tardi
+          "$extract_dir/tardi" version
+
   # ── Performance smoke ────────────────────────────────────────────────────────
   # Shared-runner loopback benchmark with conservative floors and a 30s default
   # run per scenario. This is not a release benchmark; it exists only to catch

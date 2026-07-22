@@ -99,10 +99,18 @@ jobs:
             archive_name: tardigrade-linux-x86_64
             deb_arch: amd64
             rpm_arch: x86_64
+            linux_packages: true
           - os: ubuntu-24.04-arm
             archive_name: tardigrade-linux-aarch64
             deb_arch: arm64
             rpm_arch: aarch64
+            linux_packages: true
+          - os: macos-15-intel
+            archive_name: tardigrade-darwin-x86_64
+            linux_packages: false
+          - os: macos-15
+            archive_name: tardigrade-darwin-arm64
+            linux_packages: false
 
     steps:
       - name: Checkout
@@ -115,10 +123,16 @@ jobs:
           git diff --exit-code
           git diff --cached --exit-code
 
-      - name: Install dependencies
+      - name: Install dependencies (Linux)
+        if: matrix.linux_packages == true
         run: sudo apt-get install -y libssl-dev
 
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+
       - name: Install packaging prerequisites
+        if: matrix.linux_packages == true
         run: sudo apt-get install -y rpm
 
       - name: Install Zig
@@ -143,6 +157,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Source and configuration audit
+        if: matrix.linux_packages == true
         run: ./scripts/audit-dependencies.sh
 
       - name: Build release binary
@@ -158,6 +173,20 @@ jobs:
             --binary zig-out/bin/tardi \
             --profile general \
             --output "$INVENTORY_PATH"
+
+      - name: Verify macOS binary architecture
+        if: runner.os == 'macOS'
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          set -euo pipefail
+          case "$ARCHIVE_NAME" in
+            tardigrade-darwin-x86_64) expected=x86_64 ;;
+            tardigrade-darwin-arm64) expected=arm64 ;;
+            *) echo "unexpected Darwin archive name: $ARCHIVE_NAME" >&2; exit 1 ;;
+          esac
+          test "$(uname -m)" = "$expected"
+          file zig-out/bin/tardi | grep -F "$expected"
 
       - name: Package artifact
         env:
@@ -184,6 +213,7 @@ jobs:
           subject-path: ${{ steps.archive_artifacts.outputs.archive_path }}
 
       - name: Build DEB package
+        if: matrix.linux_packages == true
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
           DEB_ARCH: ${{ matrix.deb_arch }}
@@ -196,6 +226,7 @@ jobs:
             --output "$ARTIFACT_DIR"
 
       - name: Build RPM package
+        if: matrix.linux_packages == true
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
           RPM_ARCH: ${{ matrix.rpm_arch }}
@@ -232,6 +263,7 @@ jobs:
           retention-days: 14
 
       - name: Upload DEB artifact
+        if: matrix.linux_packages == true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: deb-${{ matrix.archive_name }}
@@ -240,6 +272,7 @@ jobs:
           retention-days: 1
 
       - name: Upload RPM artifact
+        if: matrix.linux_packages == true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rpm-${{ matrix.archive_name }}

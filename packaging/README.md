@@ -10,12 +10,12 @@ versus what is a local-build-only tool.
 | Format | Status | Notes |
 | --- | --- | --- |
 | Linux release archives (`.tar.gz`, x86_64/aarch64) | **Supported, published** | Built and attached to every GitHub release by `.github/workflows/release.yml`, alongside `install.sh`, `tardigrade-checksums.txt`, and per-arch SPDX SBOMs. |
-| macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Planned, not published** | CI builds and tests Tardigrade on `macos-14`, but the release workflow's build matrix only packages Linux. `install.sh` and the Homebrew formula already expect `tardigrade-darwin-*.tar.gz` assets that do not yet exist. |
+| macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Supported, published** | Built natively on `macos-15-intel` (x86_64) and `macos-15` (arm64) runners by the same release workflow, and attached to every GitHub release with per-arch SPDX SBOMs, dependency inventories, checksum entries, and provenance attestations. Requires `brew install openssl@3` on the host at runtime — see the Homebrew section below. |
 | DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder (`packaging/deb/build.sh`). Smoke-tested on every PR/push via the `packaging-smoke` CI job (`scripts/test-deb-package.sh`). |
 | RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Smoke-tested via `scripts/test-rpm-package.sh`. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and exercised end-to-end by both the DEB and RPM smoke tests. |
-| launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | Ships as a template for macOS host-native installs; there is no macOS packaging pipeline or smoke test exercising it. |
-| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present, tap not published, macOS blocked** | The `on_linux` blocks can resolve once real release checksums are filled in; the `on_macos` blocks cannot resolve until macOS archives are published (see above). No `Bare-Systems/homebrew-tap` repo exists yet. |
+| launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | Ships as a template for macOS host-native installs; the release workflow now publishes native Darwin archives, but nothing installs or smoke-tests this plist yet. |
+| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present, not installable** | The release workflow now produces archive filenames that match what the `on_macos` blocks expect (`tardigrade-darwin-x86_64.tar.gz`, `tardigrade-darwin-arm64.tar.gz`), but the checked-in formula's *generated URLs* remain invalid: `version "0.50"` constructs a `v0.50` release URL rather than `v0.5.0`, the `sha256` values are still `REPLACE_WITH_ACTUAL_SHA256_*` placeholders, and the formula does not declare a Homebrew `openssl@3` dependency (required at runtime by the `general`-profile binary). Fixing the version/checksums/dependency and publishing to a tap are tracked separately in #466. No `Bare-Systems/homebrew-tap` repo exists yet. |
 | Docker / OCI image | **Not implemented** | No `Dockerfile` or container-publishing workflow exists in this repository. |
 
 ## Quick install (recommended)
@@ -26,7 +26,9 @@ Use the official install script which downloads the correct prebuilt binary and 
 curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
 ```
 
-This currently only resolves for Linux (`x86_64`/`aarch64`); see "Current status" above.
+This resolves for Linux (`x86_64`/`aarch64`) and macOS (`x86_64`/`arm64`); see
+"Current status" above. On macOS, install the runtime OpenSSL dependency
+first: `brew install openssl@3`.
 
 ## DEB (Debian / Ubuntu)
 
@@ -159,12 +161,26 @@ sudo systemctl reload tardigrade   # or: restart, if reload is insufficient
 
 ## Homebrew (macOS and Linux)
 
-The `on_macos` blocks in this formula cannot resolve today: the release
-workflow does not build or publish `tardigrade-darwin-*.tar.gz` archives (see
-"Current status" above). The `on_linux` blocks reference archives that are
-published, so a Linux install can work once real checksums are filled in.
+The release workflow now builds and publishes `tardigrade-darwin-x86_64.tar.gz`
+and `tardigrade-darwin-arm64.tar.gz` — the exact archive filenames the
+`on_macos` blocks expect (see "Current status" above). That does **not**
+mean the formula's generated URLs resolve, though: the formula is
+**not installable yet**, because:
 
-The formula at `packaging/homebrew/tardigrade.rb` can be installed locally:
+- `version "0.50"` constructs the release URL `.../v0.50/...`, not
+  `.../v0.5.0/...` — it does not match this project's `vMAJOR.MINOR.PATCH`
+  tag format.
+- All four `sha256` values are still `REPLACE_WITH_ACTUAL_SHA256_*`
+  placeholders.
+- The formula does not declare a Homebrew `openssl@3` dependency, even
+  though the `general`-profile binary it installs links OpenSSL at runtime.
+
+Fixing the version string, filling in real checksums per release, declaring
+the `openssl@3` dependency, and publishing to a tap are all tracked
+separately in #466 and are out of scope for the archive pipeline itself.
+
+The formula at `packaging/homebrew/tardigrade.rb` can be installed locally
+once #466 lands:
 
 ```bash
 brew install --formula packaging/homebrew/tardigrade.rb
@@ -186,6 +202,26 @@ brew install tardigrade
 3. Replace the four `REPLACE_WITH_ACTUAL_SHA256_*` placeholders with the SHA-256 values from the checksums file.
 4. Commit and push the formula to the tap repo.
 
+## macOS Gatekeeper / unsigned binary note
+
+The Darwin archives are **not code-signed, hardened-runtime, or notarized**.
+`tardi`/`tardigrade` extracted from `tardigrade-darwin-x86_64.tar.gz` or
+`tardigrade-darwin-arm64.tar.gz` will carry a `com.apple.quarantine` extended
+attribute if downloaded through a browser (curl/`install.sh` downloads are
+not quarantined), and Gatekeeper will refuse to run a quarantined,
+unsigned binary by default. If you hit that, either download via
+`install.sh`/`curl` (recommended) or clear the attribute yourself after
+verifying the checksum:
+
+```bash
+xattr -d com.apple.quarantine ./tardi
+```
+
+This is a known, intentional distribution gap for the initial archives — see
+"Out of scope" in #463. Code signing, hardened runtime, and notarization are
+not yet implemented and would need a separate issue before Gatekeeper
+behavior can be part of the supported install contract.
+
 ## Service files
 
 Pre-built service files for host-native installs:
@@ -193,7 +229,7 @@ Pre-built service files for host-native installs:
 | File | Purpose |
 |---|---|
 | [`systemd/tardigrade.service`](systemd/tardigrade.service) | systemd service unit (Linux) |
-| [`launchd/io.baresystems.tardigrade.plist`](launchd/io.baresystems.tardigrade.plist) | launchd plist (macOS) — unverified, no macOS packaging pipeline exists yet |
+| [`launchd/io.baresystems.tardigrade.plist`](launchd/io.baresystems.tardigrade.plist) | launchd plist (macOS) — unverified; the release workflow now publishes native Darwin archives, but nothing installs or smoke-tests this plist yet |
 
 ## Related docs
 

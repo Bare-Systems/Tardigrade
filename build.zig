@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     tls_core_mod.addImport("crypto_secrets", crypto_secrets_mod);
+    tls_core_mod.addImport("zig_compat", compat_mod);
 
     // Shared leaf modules. A Zig source file belongs to exactly one module,
     // so anything consumed by both the exe tree and the quic/http3 packages
@@ -119,6 +120,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     exe_mod.addImport("build_options", build_options.createModule());
+    exe_mod.addImport("zig_compat", compat_mod);
     exe_mod.addImport("quic_varint", quic_varint_mod);
     exe_mod.addImport("hpack_huffman", hpack_huffman_mod);
     exe_mod.addImport("stream_transport", stream_transport_mod);
@@ -162,6 +164,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     allocation_regression_mod.addImport("build_options", build_options.createModule());
+    allocation_regression_mod.addImport("zig_compat", compat_mod);
     allocation_regression_mod.addImport("quic_varint", quic_varint_mod);
     allocation_regression_mod.addImport("hpack_huffman", hpack_huffman_mod);
     allocation_regression_mod.addImport("stream_transport", stream_transport_mod);

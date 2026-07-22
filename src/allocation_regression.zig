@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("zig_compat.zig");
+const compat = @import("zig_compat");
 const http = @import("http.zig");
 const gp = @import("gateway_proxy.zig");
 

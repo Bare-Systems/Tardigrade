@@ -3127,7 +3127,7 @@ fn clonedResolveHit(
 ) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
     var out: session.ServerRecoverableState = .{};
     state.cloneInto(allocator, &out) catch return error.ResolverFailed;
-    return .{ .hit = .{ .state = out, .lease = pre_shared_key.ServerPskLease.noop() } };
+    return .{ .hit = .{ .state = out, .lease = pre_shared_key.ServerPskLease.initNoop() } };
 }
 
 const CountingResolver = struct {
@@ -3143,6 +3143,64 @@ const CountingResolver = struct {
         self.calls += 1;
         if (!std.mem.eql(u8, identity, self.identity)) return .miss;
         return clonedResolveHit(self.state, std.testing.allocator);
+    }
+};
+
+const LeaseProbe = struct {
+    commit_count: usize = 0,
+    release_count: usize = 0,
+    deinit_count: usize = 0,
+    sink: ?*DirectSink = null,
+    committed_sink_len: ?usize = null,
+
+    fn lease(self: *LeaseProbe) pre_shared_key.ServerPskLease {
+        return pre_shared_key.ServerPskLease.initOwned(self, commit, release, deinitLease);
+    }
+
+    fn commit(ctx: *anyopaque) void {
+        const self: *LeaseProbe = @ptrCast(@alignCast(ctx));
+        self.commit_count += 1;
+        if (self.sink) |sink| self.committed_sink_len = sink.len;
+    }
+
+    fn release(ctx: *anyopaque) void {
+        const self: *LeaseProbe = @ptrCast(@alignCast(ctx));
+        self.release_count += 1;
+    }
+
+    fn deinitLease(ctx: *anyopaque) void {
+        const self: *LeaseProbe = @ptrCast(@alignCast(ctx));
+        self.deinit_count += 1;
+    }
+};
+
+const TwoIdentityLeaseResolver = struct {
+    first_identity: []const u8,
+    first_state: *session.ServerRecoverableState,
+    first_lease: *LeaseProbe,
+    second_identity: []const u8,
+    second_state: *session.ServerRecoverableState,
+    second_lease: *LeaseProbe,
+    calls: usize = 0,
+
+    fn now(_: *anyopaque) i64 {
+        return 0;
+    }
+
+    fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (std.mem.eql(u8, identity, self.first_identity)) {
+            var out: session.ServerRecoverableState = .{};
+            self.first_state.cloneInto(std.testing.allocator, &out) catch return error.ResolverFailed;
+            return .{ .hit = .{ .state = out, .lease = self.first_lease.lease() } };
+        }
+        if (std.mem.eql(u8, identity, self.second_identity)) {
+            var out: session.ServerRecoverableState = .{};
+            self.second_state.cloneInto(std.testing.allocator, &out) catch return error.ResolverFailed;
+            return .{ .hit = .{ .state = out, .lease = self.second_lease.lease() } };
+        }
+        return .miss;
     }
 };
 
@@ -4015,7 +4073,7 @@ const AllocFailResolver = struct {
             self.saw_oom = (err == error.OutOfMemory);
             return error.ResolverFailed;
         };
-        return .{ .hit = .{ .state = out, .lease = pre_shared_key.ServerPskLease.noop() } };
+        return .{ .hit = .{ .state = out, .lease = pre_shared_key.ServerPskLease.initNoop() } };
     }
 };
 
@@ -4260,6 +4318,131 @@ test "a compatible candidate with a wrong binder is fatal and never probes a lat
     // failed selection: the fatal binder mismatch is caught before
     // anything is written to the wire.
     try std.testing.expectEqual(events_before_client_hello, sink.len);
+}
+
+test "resolver lease releases incompatible candidate and commits later selected identity" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0x91} ** tls_backend.hash_len;
+    var incompatible_state = pskStoredStateWithBinding(&psk, session.AuthBinding.fromLeafCertificateDer("different-leaf"));
+    defer incompatible_state.deinit();
+    var compatible_state = pskStoredState(&psk);
+    defer compatible_state.deinit();
+    var incompatible_lease = LeaseProbe{};
+    var compatible_lease = LeaseProbe{};
+    var resolver_state = TwoIdentityLeaseResolver{
+        .first_identity = "incompatible-ticket",
+        .first_state = &incompatible_state,
+        .first_lease = &incompatible_lease,
+        .second_identity = "compatible-ticket",
+        .second_state = &compatible_state,
+        .second_lease = &compatible_lease,
+    };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = TwoIdentityLeaseResolver.now,
+        .resolveFn = TwoIdentityLeaseResolver.resolve,
+    });
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{
+        .{ .identity = "incompatible-ticket", .binder_psk = &psk },
+        .{ .identity = "compatible-ticket", .binder_psk = &psk },
+    } } });
+
+    try std.testing.expectEqual(@as(usize, 2), resolver_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), incompatible_lease.commit_count);
+    try std.testing.expectEqual(@as(usize, 1), incompatible_lease.release_count);
+    try std.testing.expectEqual(@as(usize, 1), incompatible_lease.deinit_count);
+    try std.testing.expectEqual(@as(usize, 1), compatible_lease.commit_count);
+    try std.testing.expectEqual(@as(usize, 0), compatible_lease.release_count);
+    try std.testing.expectEqual(@as(usize, 1), compatible_lease.deinit_count);
+    try std.testing.expect(server.core.psk_authenticated);
+}
+
+test "resolver lease releases bad-binder candidate before fatal failure and probes no later identity" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0x92} ** tls_backend.hash_len;
+    const wrong_psk = [_]u8{0x93} ** tls_backend.hash_len;
+    var first_state = pskStoredState(&psk);
+    defer first_state.deinit();
+    var second_state = pskStoredState(&psk);
+    defer second_state.deinit();
+    var first_lease = LeaseProbe{};
+    var second_lease = LeaseProbe{};
+    var resolver_state = TwoIdentityLeaseResolver{
+        .first_identity = "bad-binder-ticket",
+        .first_state = &first_state,
+        .first_lease = &first_lease,
+        .second_identity = "later-ticket",
+        .second_state = &second_state,
+        .second_lease = &second_lease,
+    };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = TwoIdentityLeaseResolver.now,
+        .resolveFn = TwoIdentityLeaseResolver.resolve,
+    });
+
+    try std.testing.expectError(error.DecryptError, driveServerSelection(&server, .{ .psk = .{ .items = &.{
+        .{ .identity = "bad-binder-ticket", .binder_psk = &wrong_psk },
+        .{ .identity = "later-ticket", .binder_psk = &psk },
+    } } }));
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), first_lease.commit_count);
+    try std.testing.expectEqual(@as(usize, 1), first_lease.release_count);
+    try std.testing.expectEqual(@as(usize, 1), first_lease.deinit_count);
+    try std.testing.expectEqual(@as(usize, 0), second_lease.commit_count);
+    try std.testing.expectEqual(@as(usize, 0), second_lease.release_count);
+    try std.testing.expectEqual(@as(usize, 0), second_lease.deinit_count);
+}
+
+test "resolver lease commits before PSK-selected ServerHello is emitted" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0x94} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var unused_state = pskStoredState(&psk);
+    defer unused_state.deinit();
+    var selected_lease = LeaseProbe{};
+    var unused_lease = LeaseProbe{};
+    var resolver_state = TwoIdentityLeaseResolver{
+        .first_identity = "selected-ticket",
+        .first_state = &stored_state,
+        .first_lease = &selected_lease,
+        .second_identity = "unused-ticket",
+        .second_state = &unused_state,
+        .second_lease = &unused_lease,
+    };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = TwoIdentityLeaseResolver.now,
+        .resolveFn = TwoIdentityLeaseResolver.resolve,
+    });
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    selected_lease.sink = &sink;
+    try server.backend().start(.server, {}, &sink);
+    const events_before_client_hello = sink.len;
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .psk = .{ .items = &.{
+        .{ .identity = "selected-ticket", .binder_psk = &psk },
+    } } });
+    try server.backend().receive(.initial, hello, &sink);
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expectEqual(@as(usize, 1), selected_lease.commit_count);
+    try std.testing.expectEqual(@as(usize, 0), selected_lease.release_count);
+    try std.testing.expectEqual(@as(usize, 1), selected_lease.deinit_count);
+    try std.testing.expectEqual(events_before_client_hello, selected_lease.committed_sink_len.?);
+    try std.testing.expect(sink.len > events_before_client_hello);
+    try std.testing.expect(server.core.psk_authenticated);
 }
 
 const FbaCloningResolver = struct {

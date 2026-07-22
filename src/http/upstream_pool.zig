@@ -16,7 +16,7 @@
 //! histogram, surfaced as per-upstream labelled Prometheus series.
 
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const tls_termination = @import("tls_backend.zig");
 
 pub const Config = struct {

@@ -1,6 +1,6 @@
 const std = @import("std");
 const tls_core = @import("tls_core");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const event_loop = @import("event_loop.zig");
 const metrics_mod = @import("metrics.zig");
 const native_tls_connection = @import("native_tls_connection.zig");

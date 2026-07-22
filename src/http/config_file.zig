@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 
 pub const Overrides = struct {
     map: std.StringHashMap([]const u8),

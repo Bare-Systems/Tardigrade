@@ -77,22 +77,10 @@ const builtin = @import("builtin");
 const crypto = @import("crypto");
 const session = @import("session.zig");
 const pre_shared_key = @import("pre_shared_key.zig");
+const zig_compat = @import("zig_compat");
 
 const secrets = crypto.secrets;
-
-const Mutex = struct {
-    locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    pub fn lock(self: *Mutex) void {
-        while (self.locked.swap(true, .acquire)) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    pub fn unlock(self: *Mutex) void {
-        self.locked.store(false, .release);
-    }
-};
+const Mutex = zig_compat.Mutex;
 
 // -----------------------------------------------------------------------
 // Limits
@@ -1441,13 +1429,12 @@ pub fn resolveStatefulServerPsk(
             state.moveFrom(&hit.state);
             return .{ .hit = .{
                 .state = state,
-                .lease = .{
-                    .ctx = box,
-                    .commitFn = PublicServerLeaseBox.commit,
-                    .releaseFn = PublicServerLeaseBox.release,
-                    .deinitFn = PublicServerLeaseBox.deinit,
-                    .active = true,
-                },
+                .lease = pre_shared_key.ServerPskLease.initOwned(
+                    box,
+                    PublicServerLeaseBox.commit,
+                    PublicServerLeaseBox.release,
+                    PublicServerLeaseBox.deinit,
+                ),
             } };
         },
         .miss, .expired, .busy => return .miss,

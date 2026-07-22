@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const Allocator = std.mem.Allocator;
 const Request = @import("request.zig").Request;
 const RequestLifecycle = @import("request_lifecycle.zig").RequestLifecycle;

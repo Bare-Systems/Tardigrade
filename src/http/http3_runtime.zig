@@ -17,7 +17,7 @@
 //! backend. Without a provider the QUIC listener stays unbootstrapped with a
 //! logged warning while TCP continues to serve.
 
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const std = @import("std");
 const http3_session = @import("http3_session.zig");
 const logger_mod = @import("logger.zig");

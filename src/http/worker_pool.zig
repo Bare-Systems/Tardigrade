@@ -21,7 +21,7 @@
 // replaced with non-blocking I/O throughout the connection handler.  If that
 // change is ever made, capture the expected throughput/latency delta first.
 
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const builtin = @import("builtin");
 const std = @import("std");
 

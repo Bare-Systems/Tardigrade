@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const Allocator = std.mem.Allocator;
 
 /// Token-bucket rate limiter keyed by a request descriptor.

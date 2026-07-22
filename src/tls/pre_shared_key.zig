@@ -483,36 +483,57 @@ pub const ResolveError = error{ResolverFailed};
 
 /// Provider-neutral, exactly-once server PSK lease. Stateful single-use
 /// providers pin cache entries until binder verification proves the identity
-/// was actually selected; reusable and stateless providers use `noop`.
-pub const ServerPskLease = struct {
-    ctx: ?*anyopaque = null,
-    commitFn: ?*const fn (*anyopaque) void = null,
-    releaseFn: ?*const fn (*anyopaque) void = null,
-    deinitFn: ?*const fn (*anyopaque) void = null,
-    active: bool = false,
+/// was actually selected; reusable and stateless providers use `.noop`.
+pub const ServerPskLease = union(enum) {
+    noop,
+    owned: Owned,
+    finished,
 
-    pub fn noop() ServerPskLease {
-        return .{};
+    const Owned = struct {
+        ctx: *anyopaque,
+        commitFn: *const fn (*anyopaque) void,
+        releaseFn: *const fn (*anyopaque) void,
+        deinitFn: *const fn (*anyopaque) void,
+    };
+
+    pub fn initNoop() ServerPskLease {
+        return .noop;
+    }
+
+    pub fn initOwned(
+        ctx: *anyopaque,
+        commitFn: *const fn (*anyopaque) void,
+        releaseFn: *const fn (*anyopaque) void,
+        deinitFn: *const fn (*anyopaque) void,
+    ) ServerPskLease {
+        return .{ .owned = .{
+            .ctx = ctx,
+            .commitFn = commitFn,
+            .releaseFn = releaseFn,
+            .deinitFn = deinitFn,
+        } };
     }
 
     pub fn commit(self: *ServerPskLease) void {
-        if (!self.active) return;
-        self.active = false;
-        if (self.ctx) |ctx| {
-            if (self.commitFn) |f| f(ctx);
-            if (self.deinitFn) |f| f(ctx);
+        switch (self.*) {
+            .owned => |owned_lease| {
+                self.* = .finished;
+                owned_lease.commitFn(owned_lease.ctx);
+                owned_lease.deinitFn(owned_lease.ctx);
+            },
+            .noop, .finished => self.* = .finished,
         }
-        self.* = .{};
     }
 
     pub fn release(self: *ServerPskLease) void {
-        if (!self.active) return;
-        self.active = false;
-        if (self.ctx) |ctx| {
-            if (self.releaseFn) |f| f(ctx);
-            if (self.deinitFn) |f| f(ctx);
+        switch (self.*) {
+            .owned => |owned_lease| {
+                self.* = .finished;
+                owned_lease.releaseFn(owned_lease.ctx);
+                owned_lease.deinitFn(owned_lease.ctx);
+            },
+            .noop, .finished => self.* = .finished,
         }
-        self.* = .{};
     }
 
     pub fn deinit(self: *ServerPskLease) void {
@@ -593,6 +614,55 @@ test "writeModes rejects empty and over-255 mode lists before touching the write
     const too_many = [_]PskKeyExchangeMode{.psk_ke} ** 256;
     try testing.expectError(error.TooManyModes, writeModes(&w, &too_many));
     try testing.expectEqual(@as(usize, 0), w.len);
+}
+
+test "ServerPskLease owned transitions are exactly once" {
+    const Ctx = struct {
+        commit_count: usize = 0,
+        release_count: usize = 0,
+        deinit_count: usize = 0,
+
+        fn commit(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.commit_count += 1;
+        }
+
+        fn release(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.release_count += 1;
+        }
+
+        fn deinitLease(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.deinit_count += 1;
+        }
+    };
+
+    var ctx = Ctx{};
+    var lease = ServerPskLease.initOwned(&ctx, Ctx.commit, Ctx.release, Ctx.deinitLease);
+    lease.commit();
+    lease.commit();
+    lease.release();
+    lease.deinit();
+    try testing.expectEqual(@as(usize, 1), ctx.commit_count);
+    try testing.expectEqual(@as(usize, 0), ctx.release_count);
+    try testing.expectEqual(@as(usize, 1), ctx.deinit_count);
+    try testing.expect(lease == .finished);
+
+    var ctx2 = Ctx{};
+    var lease2 = ServerPskLease.initOwned(&ctx2, Ctx.commit, Ctx.release, Ctx.deinitLease);
+    lease2.deinit();
+    lease2.release();
+    lease2.commit();
+    try testing.expectEqual(@as(usize, 0), ctx2.commit_count);
+    try testing.expectEqual(@as(usize, 1), ctx2.release_count);
+    try testing.expectEqual(@as(usize, 1), ctx2.deinit_count);
+    try testing.expect(lease2 == .finished);
+
+    var noop_lease = ServerPskLease.initNoop();
+    noop_lease.deinit();
+    noop_lease.commit();
+    try testing.expect(noop_lease == .finished);
 }
 
 test "writeOffer rejects illegal shapes without ever mutating the writer" {

@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Status = @import("status.zig").Status;

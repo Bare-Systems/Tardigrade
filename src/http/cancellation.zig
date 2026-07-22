@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 
 /// Why a request stopped before completion.
 pub const CancelReason = enum {

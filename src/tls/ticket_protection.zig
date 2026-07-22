@@ -852,7 +852,7 @@ pub const ServerPskResolverAdapter = struct {
         var out: session.ServerRecoverableState = .{};
         const found = self.protector.resolve(self.allocator, identity, self.now_unix_ms, &out) catch return error.ResolverFailed;
         if (!found) return .miss;
-        return .{ .hit = .{ .state = out, .lease = pre_shared_key.ServerPskLease.noop() } };
+        return .{ .hit = .{ .state = out, .lease = pre_shared_key.ServerPskLease.initNoop() } };
     }
 };
 

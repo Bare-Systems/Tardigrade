@@ -17,19 +17,10 @@
 //!
 //!   - `ClientSessionCache` — keyed by a canonical origin/compatibility
 //!     digest, retains deep-cloned `session.ClientTicketState`, and returns
-//!     an owned `pre_shared_key.ClientPskOfferSet` in deterministic order.
-//!     This first implementation is **explicitly reusable-only**:
-//!     `storeClone`/`restoreClones` reject/drop `.single_use` entries
-//!     (`.rejected_unsupported_usage`) rather than silently storing and
-//!     re-offering them as if they were reusable. Issue #364 permits this
-//!     fallback ("#364 should ship reusable client tickets plus the lease
-//!     API, with runtime commit wiring explicitly deferred") only paired
-//!     with an explicit contract; a client offer-lease API that actually
-//!     pins a selected single-use ticket between offer and commit — the
-//!     other half of that fallback — is deferred to #365, where it can be
-//!     designed alongside the real ClientHello-selection wiring instead of
-//!     racing a persistence snapshot against a guess at when "selected but
-//!     not yet committed" begins and ends.
+//!     an owned `pre_shared_key.ClientOfferLease` in deterministic order.
+//!     Reusable tickets remain clone-only. Single-use tickets are pinned
+//!     while in a live offer lease and are consumed only after the shared
+//!     TLS backend reports the server-selected PSK identity index.
 //!   - `StatefulServerCache` — keyed by a fixed-size unpredictable opaque
 //!     handle ("TDSH" v1), owns `session.ServerRecoverableState`, and exposes
 //!     an internal lease/commit/release model for single-use consumption.
@@ -154,9 +145,9 @@ pub const StoreResult = enum {
     /// Stateful-server-only: bounded CSPRNG handle-collision retries were
     /// exhausted.
     rejected_handle_generation_failed,
-    /// Client-cache-only: `.single_use` is not supported by this PR's
-    /// client cache (see module doc) — rejected explicitly rather than
-    /// silently stored and re-offered as if it were reusable.
+    /// Legacy/adapter-only result value retained for callers that still
+    /// surface unsupported usage from outside this cache. `ClientSessionCache`
+    /// itself accepts `.single_use`.
     rejected_unsupported_usage,
     /// Allocation failure. Distinguished from `rejected_capacity` (an
     /// ordinary policy decision) per the "typed results distinguish ...
@@ -345,6 +336,7 @@ const ClientEntry = struct {
     ticket: session.ClientTicketState = .{},
     origin: OriginDigest = [_]u8{0} ** origin_digest_len,
     usage: UsagePolicy = .reusable,
+    active_lease_epoch: ?u64 = null,
     /// Assigned once at store/replace time; drives the canonical offer
     /// order (newest insertion first). Never changed by a lookup.
     insertion_sequence: u64 = 0,
@@ -381,7 +373,7 @@ pub const PersistedClientEntry = struct {
 /// never surfaces as a partial `.hit` — it is always the distinct
 /// `.storage_failed` outcome instead.
 pub const ClientLookupResult = union(enum) {
-    hit: pre_shared_key.ClientPskOfferSet,
+    hit: pre_shared_key.ClientOfferLease,
     miss,
     expired,
     incompatible,
@@ -422,6 +414,10 @@ pub const ClientSessionCache = struct {
     next_insertion_sequence: u64 = 0,
     next_lru_sequence: u64 = 0,
     next_entry_id: u64 = 0,
+    next_lease_epoch: u64 = 1,
+    cache_generation: u64 = 0,
+    persistence_epoch: u64 = 0,
+    next_persistence_token: u64 = 1,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) error{InvalidLimits}!ClientSessionCache {
         try limits.validate();
@@ -450,6 +446,8 @@ pub const ClientSessionCache = struct {
         self.next_insertion_sequence = temp.next_insertion_sequence;
         self.next_lru_sequence = temp.next_lru_sequence;
         self.next_entry_id = temp.next_entry_id;
+        self.next_lease_epoch = temp.next_lease_epoch;
+        self.cache_generation +%= 1;
         temp.entries = .empty;
         temp.total_bytes = 0;
     }
@@ -491,19 +489,12 @@ pub const ClientSessionCache = struct {
     /// only borrowed for the callback's duration. Never fails the caller's
     /// TLS connection: every rejection is a plain `StoreResult`.
     ///
-    /// `usage == .single_use` is rejected outright (`.rejected_unsupported_usage`,
-    /// no clone is even attempted): see the module doc's reusable-only note.
     pub fn storeClone(
         self: *ClientSessionCache,
         ticket: *const session.ClientTicketState,
         now_unix_ms: i64,
         usage: UsagePolicy,
     ) StoreResult {
-        if (usage == .single_use) {
-            self.observer.notify(.rejected_unsupported_usage);
-            return .rejected_unsupported_usage;
-        }
-
         var cloned: session.ClientTicketState = .{};
         ticket.cloneInto(self.allocator, &cloned) catch {
             self.observer.notify(.storage_failed);
@@ -557,6 +548,7 @@ pub const ClientSessionCache = struct {
         }
 
         if (dup) |e| {
+            if (e.usage == .single_use and e.active_lease_epoch != null) return .rejected_capacity;
             // Preflight the replacement fully before touching the old
             // entry: a repeated ticket identity with a larger encoded
             // payload must not be able to exceed either limit, and a
@@ -655,11 +647,15 @@ pub const ClientSessionCache = struct {
         var clones: [pre_shared_key.max_offered_identities]session.ClientTicketState =
             [_]session.ClientTicketState{.{}} ** pre_shared_key.max_offered_identities;
         var clone_entry_ids: [pre_shared_key.max_offered_identities]u64 = undefined;
+        var clone_lease_epochs: [pre_shared_key.max_offered_identities]u64 = undefined;
+        var clone_single_use: [pre_shared_key.max_offered_identities]bool = undefined;
         var clone_count: usize = 0;
+        var lease_generation: u64 = 0;
 
         {
             self.mutex.lock();
             defer self.mutex.unlock();
+            lease_generation = self.cache_generation;
 
             var i: usize = 0;
             while (i < self.entries.items.len) {
@@ -668,11 +664,19 @@ pub const ClientSessionCache = struct {
                     i += 1;
                     continue;
                 }
-                if (e.ticket.common.isExpired(now_unix_ms)) {
+                if (e.ticket.common.isExpired(now_unix_ms) and e.active_lease_epoch == null) {
                     _ = self.entries.swapRemove(i);
                     self.total_bytes -= e.bytes;
                     destroyClientEntry(self.allocator, e);
                     had_expired_removal = true;
+                    continue;
+                }
+                if (e.usage == .single_use and e.active_lease_epoch != null) {
+                    i += 1;
+                    continue;
+                }
+                if (e.usage == .single_use and self.persistence_epoch != 0) {
+                    i += 1;
                     continue;
                 }
                 const decision = session.evaluateCompatibility(&e.ticket.common, candidate, now_unix_ms);
@@ -693,7 +697,9 @@ pub const ClientSessionCache = struct {
             // leaves the cache's eviction order completely unaffected.
             for (buf[0..take]) |c| {
                 const idx = self.findIndexByEntryId(c.entry_id) orelse continue;
-                self.entries.items[idx].ticket.cloneInto(self.allocator, &clones[clone_count]) catch {
+                const e = self.entries.items[idx];
+                if (e.usage == .single_use and e.active_lease_epoch != null) continue;
+                e.ticket.cloneInto(self.allocator, &clones[clone_count]) catch {
                     storage_failed = true;
                     break;
                 };
@@ -711,7 +717,14 @@ pub const ClientSessionCache = struct {
                 const first_seq = self.reserveLruSequenceBatchLocked(clone_count);
                 for (0..clone_count) |offset| {
                     const idx = self.findIndexByEntryId(clone_entry_ids[offset]) orelse continue;
-                    self.entries.items[idx].lru_sequence = first_seq + offset;
+                    const e = self.entries.items[idx];
+                    e.lru_sequence = first_seq + offset;
+                    if (e.usage == .single_use) {
+                        e.active_lease_epoch = self.next_lease_epoch;
+                        self.next_lease_epoch +%= 1;
+                    }
+                    clone_lease_epochs[offset] = e.active_lease_epoch orelse 0;
+                    clone_single_use[offset] = e.usage == .single_use;
                 }
             }
         }
@@ -722,16 +735,27 @@ pub const ClientSessionCache = struct {
             return .storage_failed;
         }
 
-        var offers: pre_shared_key.ClientPskOfferSet = .{};
+        var lease = pre_shared_key.ClientOfferLease{
+            .cache_ctx = self,
+            .cache_generation = lease_generation,
+            .finishFn = finishClientOfferLeasePins,
+            .dropFn = dropClientOfferLeasePin,
+            .active = clone_count > 0,
+        };
         for (0..clone_count) |i| {
             // Unreachable in practice: `clone_count` is bounded by `take`,
             // which is itself bounded by `max_offered_identities` — the
             // set's exact capacity.
-            offers.push(&clones[i]) catch unreachable;
+            lease.offers.push(&clones[i]) catch unreachable;
+            lease.tokens[i] = .{
+                .entry_id = clone_entry_ids[i],
+                .lease_epoch = clone_lease_epochs[i],
+                .single_use = clone_single_use[i],
+            };
         }
 
-        const result: ClientLookupResult = if (!offers.isEmpty())
-            .{ .hit = offers }
+        const result: ClientLookupResult = if (!lease.offers.isEmpty())
+            .{ .hit = lease }
         else if (had_expired_removal)
             .expired
         else if (had_incompatible)
@@ -749,6 +773,84 @@ pub const ClientSessionCache = struct {
         return result;
     }
 
+    fn finishClientOfferLeasePins(lease: *pre_shared_key.ClientOfferLease, outcome: pre_shared_key.ClientOfferOutcome) void {
+        const cache: *ClientSessionCache = @ptrCast(@alignCast(lease.cache_ctx.?));
+        const selected_index: ?usize = switch (outcome) {
+            .selected => |idx| idx,
+            .not_selected, .aborted => null,
+        };
+        for (0..lease.offers.len) |i| {
+            const token = lease.tokens[i];
+            if (!token.single_use) continue;
+            if (selected_index != null and selected_index.? == i) {
+                cache.commitClientOfferLease(lease.cache_generation, token.entry_id, token.lease_epoch);
+            } else {
+                cache.releaseClientOfferLease(lease.cache_generation, token.entry_id, token.lease_epoch);
+            }
+        }
+    }
+
+    fn dropClientOfferLeasePin(lease: *pre_shared_key.ClientOfferLease, index: usize) void {
+        const token = lease.tokens[index];
+        if (!token.single_use) return;
+        const cache: *ClientSessionCache = @ptrCast(@alignCast(lease.cache_ctx.?));
+        cache.releaseClientOfferLease(lease.cache_generation, token.entry_id, token.lease_epoch);
+    }
+
+    fn commitClientOfferLease(self: *ClientSessionCache, cache_generation: u64, entry_id: u64, lease_epoch: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (cache_generation != self.cache_generation) return;
+        const idx = self.findIndexByEntryId(entry_id) orelse return;
+        const e = self.entries.items[idx];
+        if (e.active_lease_epoch != lease_epoch) return;
+        _ = self.entries.swapRemove(idx);
+        self.total_bytes -= e.bytes;
+        destroyClientEntry(self.allocator, e);
+    }
+
+    fn releaseClientOfferLease(self: *ClientSessionCache, cache_generation: u64, entry_id: u64, lease_epoch: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (cache_generation != self.cache_generation) return;
+        const idx = self.findIndexByEntryId(entry_id) orelse return;
+        const e = self.entries.items[idx];
+        if (e.active_lease_epoch != lease_epoch) return;
+        e.active_lease_epoch = null;
+    }
+
+    pub const BusyError = error{CacheBusy};
+
+    pub fn beginPersistenceOperation(self: *ClientSessionCache) BusyError!u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.persistence_epoch != 0) return error.CacheBusy;
+        if (self.hasOutstandingLeaseLocked()) return error.CacheBusy;
+        const token = self.next_persistence_token;
+        self.next_persistence_token +%= 1;
+        self.persistence_epoch = token;
+        return token;
+    }
+
+    pub fn endPersistenceOperation(self: *ClientSessionCache, token: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.persistence_epoch == token) self.persistence_epoch = 0;
+    }
+
+    pub fn hasOutstandingLease(self: *ClientSessionCache) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.hasOutstandingLeaseLocked();
+    }
+
+    pub fn hasOutstandingLeaseLocked(self: *ClientSessionCache) bool {
+        for (self.entries.items) |e| {
+            if (e.usage == .single_use and e.active_lease_epoch != null) return true;
+        }
+        return false;
+    }
+
     /// Deep-clones every non-expired entry for a persistence save,
     /// including its exact insertion/LRU order. Must be called outside any
     /// persistence I/O; the returned clones are fully owned by the caller.
@@ -756,25 +858,39 @@ pub const ClientSessionCache = struct {
         self: *ClientSessionCache,
         allocator: std.mem.Allocator,
         now_unix_ms: i64,
-    ) error{OutOfMemory}!std.ArrayListUnmanaged(PersistedClientEntry) {
+    ) error{ OutOfMemory, CacheBusy }!std.ArrayListUnmanaged(PersistedClientEntry) {
         self.mutex.lock();
-        defer self.mutex.unlock();
+        if (self.hasOutstandingLeaseLocked()) {
+            self.mutex.unlock();
+            return error.CacheBusy;
+        }
 
         var out: std.ArrayListUnmanaged(PersistedClientEntry) = .empty;
-        errdefer {
+        var failed = false;
+        out.ensureTotalCapacityPrecise(allocator, self.entries.items.len) catch {
+            failed = true;
+        };
+        if (!failed) {
+            for (self.entries.items) |e| {
+                if (e.ticket.common.isExpired(now_unix_ms) and e.active_lease_epoch == null) continue;
+                var clone: PersistedClientEntry = .{
+                    .usage = e.usage,
+                    .insertion_sequence = e.insertion_sequence,
+                    .lru_sequence = e.lru_sequence,
+                };
+                e.ticket.cloneInto(allocator, &clone.ticket) catch {
+                    failed = true;
+                    break;
+                };
+                out.appendAssumeCapacity(clone);
+            }
+        }
+        self.mutex.unlock();
+
+        if (failed) {
             for (out.items) |*p| p.deinit();
             out.deinit(allocator);
-        }
-        try out.ensureTotalCapacityPrecise(allocator, self.entries.items.len);
-        for (self.entries.items) |e| {
-            if (e.ticket.common.isExpired(now_unix_ms)) continue;
-            var clone: PersistedClientEntry = .{
-                .usage = e.usage,
-                .insertion_sequence = e.insertion_sequence,
-                .lru_sequence = e.lru_sequence,
-            };
-            try e.ticket.cloneInto(allocator, &clone.ticket);
-            out.appendAssumeCapacity(clone);
+            return error.OutOfMemory;
         }
         return out;
     }
@@ -785,8 +901,7 @@ pub const ClientSessionCache = struct {
     /// discarding expired ones, while preserving each entry's original
     /// `insertion_sequence`/`lru_sequence` exactly (unlike `storeClone`,
     /// which always assigns fresh values) so post-reload offer order and
-    /// eviction order match the pre-save cache. `.single_use` records are
-    /// dropped (see the module doc's reusable-only note). Duplicate
+    /// eviction order match the pre-save cache. Duplicate
     /// `(origin, ticket-identity)` records — which a corrupted or hostile
     /// snapshot could contain even though the live store never produces
     /// them — are resolved deterministically: only the record with the
@@ -812,7 +927,6 @@ pub const ClientSessionCache = struct {
         defer temp.deinit();
 
         for (items) |*item| {
-            if (item.usage == .single_use) continue;
             if (item.ticket.ticket.len == 0) continue; // dropped as a duplicate loser
             if (item.ticket.common.isExpired(now_unix_ms)) continue;
 
@@ -887,7 +1001,7 @@ pub const ClientSessionCache = struct {
         var i: usize = 0;
         while (i < self.entries.items.len) {
             const e = self.entries.items[i];
-            if (e.ticket.common.isExpired(now_unix_ms)) {
+            if (e.ticket.common.isExpired(now_unix_ms) and e.active_lease_epoch == null) {
                 _ = self.entries.swapRemove(i);
                 self.total_bytes -= e.bytes;
                 destroyClientEntry(self.allocator, e);
@@ -906,9 +1020,9 @@ pub const ClientSessionCache = struct {
     fn countDistinctLiveOrigins(self: *ClientSessionCache, now_unix_ms: i64) usize {
         var n: usize = 0;
         outer: for (self.entries.items, 0..) |e, i| {
-            if (e.ticket.common.isExpired(now_unix_ms)) continue;
+            if (e.ticket.common.isExpired(now_unix_ms) and e.active_lease_epoch == null) continue;
             for (self.entries.items[0..i]) |prev| {
-                if (prev.ticket.common.isExpired(now_unix_ms)) continue;
+                if (prev.ticket.common.isExpired(now_unix_ms) and prev.active_lease_epoch == null) continue;
                 if (std.mem.eql(u8, &prev.origin, &e.origin)) continue :outer;
             }
             n += 1;
@@ -958,28 +1072,52 @@ pub const ClientSessionCache = struct {
         var global_count: usize = 0;
         var global_bytes: usize = 0;
         for (self.entries.items) |e| {
-            if (e.ticket.common.isExpired(now_unix_ms)) {
+            if (e.ticket.common.isExpired(now_unix_ms) and e.active_lease_epoch == null) {
                 try victims.append(self.allocator, e);
                 continue;
             }
+            if (e.active_lease_epoch != null) continue;
             global_count += 1;
             global_bytes += e.bytes;
             if (std.mem.eql(u8, &e.origin, &origin)) origin_count += 1;
         }
 
-        if (origin_count == 0 and self.countDistinctLiveOrigins(now_unix_ms) >= self.limits.max_origins) {
+        var leased_count: usize = 0;
+        var leased_bytes: usize = 0;
+        var origin_leased: usize = 0;
+        for (self.entries.items) |e| {
+            if (e.active_lease_epoch == null) continue;
+            leased_count += 1;
+            leased_bytes += e.bytes;
+            if (std.mem.eql(u8, &e.origin, &origin)) origin_leased += 1;
+        }
+
+        if (leased_count >= self.limits.max_entries) {
+            victims.deinit(self.allocator);
+            return null;
+        }
+        if (leased_bytes + new_bytes > self.limits.max_total_bytes) {
+            victims.deinit(self.allocator);
+            return null;
+        }
+        if (origin_leased >= self.limits.max_entries_per_origin) {
             victims.deinit(self.allocator);
             return null;
         }
 
-        while (origin_count >= self.limits.max_entries_per_origin) {
+        if (origin_count + origin_leased == 0 and self.countDistinctLiveOrigins(now_unix_ms) >= self.limits.max_origins) {
+            victims.deinit(self.allocator);
+            return null;
+        }
+
+        while (origin_leased + origin_count >= self.limits.max_entries_per_origin) {
             const victim = self.findOldestLiveInOriginExcluding(origin, victims.items) orelse unreachable;
             try victims.append(self.allocator, victim);
             origin_count -= 1;
             global_count -= 1;
             global_bytes -= victim.bytes;
         }
-        while (global_count >= self.limits.max_entries or global_bytes + new_bytes > self.limits.max_total_bytes) {
+        while (leased_count + global_count >= self.limits.max_entries or leased_bytes + global_bytes + new_bytes > self.limits.max_total_bytes) {
             const victim = self.findOldestLiveGlobalExcluding(victims.items) orelse unreachable;
             try victims.append(self.allocator, victim);
             global_count -= 1;
@@ -1019,6 +1157,7 @@ pub const ClientSessionCache = struct {
         for (self.entries.items) |e| {
             if (!std.mem.eql(u8, &e.origin, &origin)) continue;
             if (containsClientEntryPtr(excluding, e)) continue;
+            if (e.active_lease_epoch != null) continue;
             if (best == null or e.lru_sequence < best.?.lru_sequence) best = e;
         }
         return best;
@@ -1031,6 +1170,7 @@ pub const ClientSessionCache = struct {
         var best: ?*ClientEntry = null;
         for (self.entries.items) |e| {
             if (containsClientEntryPtr(excluding, e)) continue;
+            if (e.active_lease_epoch != null) continue;
             if (best == null or e.lru_sequence < best.?.lru_sequence) best = e;
         }
         return best;
@@ -1129,23 +1269,14 @@ pub const ClientSessionCache = struct {
 /// array position); losers are deinitialized in place (their `ticket.len`
 /// becomes `0`, which `restoreClones` uses as a "already dropped" marker —
 /// a real ticket can never have length `0`, so this is unambiguous).
-///
-/// `.single_use` records are excluded from this comparison entirely
-/// (neither eliminated nor able to eliminate another record here): they
-/// are unconditionally dropped later, in `restoreClones`'s own loop, by
-/// the reusable-only policy (see the module doc). Comparing them here
-/// would let an unsupported `.single_use` duplicate win against — and
-/// deinitialize — an otherwise-valid `.reusable` record with a smaller
-/// `insertion_sequence`, after which the winning `.single_use` record is
-/// *also* dropped by the reusable-only check, silently losing both.
 fn markDuplicateClientRecords(items: []PersistedClientEntry) void {
     var i: usize = 0;
     while (i < items.len) : (i += 1) {
-        if (items[i].usage == .single_use or items[i].ticket.ticket.len == 0) continue;
+        if (items[i].ticket.ticket.len == 0) continue;
         const origin_i = originDigestFromCommon(&items[i].ticket.common);
         var j = i + 1;
         while (j < items.len) : (j += 1) {
-            if (items[j].usage == .single_use or items[j].ticket.ticket.len == 0) continue;
+            if (items[j].ticket.ticket.len == 0) continue;
             const origin_j = originDigestFromCommon(&items[j].ticket.common);
             if (!std.mem.eql(u8, &origin_i, &origin_j)) continue;
             if (!items[i].ticket.ticket.eql(&items[j].ticket.ticket)) continue;
@@ -2333,9 +2464,9 @@ test "storeClone then lookupOffers returns a hit in newest-insertion-first order
     var result = cache.lookupOffers(testCandidate("example.test"), 2);
     defer result.deinit();
     try testing.expect(result == .hit);
-    try testing.expectEqual(@as(usize, 2), result.hit.len);
-    try testing.expectEqualStrings("t2", result.hit.constSlice()[0].ticket.slice());
-    try testing.expectEqualStrings("t1", result.hit.constSlice()[1].ticket.slice());
+    try testing.expectEqual(@as(usize, 2), result.hit.offers.len);
+    try testing.expectEqualStrings("t2", result.hit.offers.constSlice()[0].ticket.slice());
+    try testing.expectEqualStrings("t1", result.hit.offers.constSlice()[1].ticket.slice());
 }
 
 test "storeClone with a repeated ticket identity replaces rather than duplicates" {
@@ -2353,7 +2484,7 @@ test "storeClone with a repeated ticket identity replaces rather than duplicates
     try testing.expectEqual(@as(usize, 1), cache.count());
 }
 
-test "storeClone rejects single_use with rejected_unsupported_usage and never stores it" {
+test "storeClone accepts single_use and makes it available for lookup" {
     var events = std.ArrayListUnmanaged(CacheEvent).empty;
     defer events.deinit(testing.allocator);
     const Ctx = struct {
@@ -2369,9 +2500,98 @@ test "storeClone rejects single_use with rejected_unsupported_usage and never st
 
     var t1 = try makeClient(testing.allocator, "single-use-ticket", "example.test");
     defer t1.deinit();
-    try testing.expectEqual(StoreResult.rejected_unsupported_usage, cache.storeClone(&t1, 0, .single_use));
-    try testing.expectEqual(@as(usize, 0), cache.count());
-    try testing.expectEqual(CacheEvent.rejected_unsupported_usage, events.items[events.items.len - 1]);
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&t1, 0, .single_use));
+    try testing.expectEqual(@as(usize, 1), cache.count());
+    try testing.expectEqual(CacheEvent.stored, events.items[events.items.len - 1]);
+
+    var result = cache.lookupOffers(testCandidate("example.test"), 1);
+    defer result.deinit();
+    try testing.expect(result == .hit);
+    try testing.expectEqual(@as(usize, 1), result.hit.offers.len);
+    try testing.expectEqualStrings("single-use-ticket", result.hit.offers.constSlice()[0].ticket.slice());
+}
+
+test "single_use lookup pins entries until selected outcome consumes exactly one" {
+    var cache = try ClientSessionCache.init(testing.allocator, Limits.client_default);
+    defer cache.deinit();
+
+    var t1 = try makeClient(testing.allocator, "single-1", "example.test");
+    defer t1.deinit();
+    var t2 = try makeClient(testing.allocator, "single-2", "example.test");
+    defer t2.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&t1, 0, .single_use));
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&t2, 1, .single_use));
+
+    var lease = cache.lookupOffers(testCandidate("example.test"), 2);
+    try testing.expect(lease == .hit);
+    try testing.expectEqual(@as(usize, 2), lease.hit.offers.len);
+
+    var concurrent = cache.lookupOffers(testCandidate("example.test"), 2);
+    defer concurrent.deinit();
+    try testing.expect(concurrent == .miss);
+
+    lease.hit.finish(.{ .selected = 0 });
+    lease.deinit();
+    try testing.expectEqual(@as(usize, 1), cache.count());
+
+    var after = cache.lookupOffers(testCandidate("example.test"), 3);
+    defer after.deinit();
+    try testing.expect(after == .hit);
+    try testing.expectEqual(@as(usize, 1), after.hit.offers.len);
+    try testing.expectEqualStrings("single-1", after.hit.offers.constSlice()[0].ticket.slice());
+}
+
+test "single_use not_selected and aborted outcomes release without consuming" {
+    var cache = try ClientSessionCache.init(testing.allocator, Limits.client_default);
+    defer cache.deinit();
+
+    var t1 = try makeClient(testing.allocator, "not-selected", "example.test");
+    defer t1.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&t1, 0, .single_use));
+
+    var not_selected = cache.lookupOffers(testCandidate("example.test"), 1);
+    try testing.expect(not_selected == .hit);
+    not_selected.hit.finish(.not_selected);
+    not_selected.deinit();
+    try testing.expectEqual(@as(usize, 1), cache.count());
+
+    var aborted = cache.lookupOffers(testCandidate("example.test"), 2);
+    try testing.expect(aborted == .hit);
+    aborted.hit.finish(.aborted);
+    aborted.deinit();
+    try testing.expectEqual(@as(usize, 1), cache.count());
+}
+
+test "pinned single_use entries are not eviction or persistence candidates" {
+    var limits = Limits.client_default;
+    limits.max_entries_per_origin = 2;
+    var cache = try ClientSessionCache.init(testing.allocator, limits);
+    defer cache.deinit();
+
+    var pinned_ticket = try makeClient(testing.allocator, "pinned", "example.test");
+    defer pinned_ticket.deinit();
+    var evictable = try makeClient(testing.allocator, "evictable", "example.test");
+    defer evictable.deinit();
+    var replacement = try makeClient(testing.allocator, "replacement", "example.test");
+    defer replacement.deinit();
+
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&pinned_ticket, 0, .single_use));
+    var lease = cache.lookupOffers(testCandidate("example.test"), 1);
+    defer lease.deinit();
+    try testing.expect(lease == .hit);
+    try testing.expectError(error.CacheBusy, cache.beginPersistenceOperation());
+
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&evictable, 2, .reusable));
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&replacement, 3, .reusable));
+    try testing.expectEqual(@as(usize, 2), cache.count());
+
+    lease.hit.finish(.aborted);
+    var after = cache.lookupOffers(testCandidate("example.test"), 4);
+    defer after.deinit();
+    try testing.expect(after == .hit);
+    try testing.expectEqual(@as(usize, 2), after.hit.offers.len);
+    try testing.expectEqualStrings("replacement", after.hit.offers.constSlice()[0].ticket.slice());
+    try testing.expectEqualStrings("pinned", after.hit.offers.constSlice()[1].ticket.slice());
 }
 
 test "lookupOffers reports miss and expired distinctly" {
@@ -2421,8 +2641,8 @@ test "per-origin capacity evicts the least-recently-used entry first" {
 
     var result = cache.lookupOffers(testCandidate("example.test"), 4);
     defer result.deinit();
-    try testing.expectEqual(@as(usize, 2), result.hit.len);
-    for (result.hit.constSlice()) |*t| try testing.expect(!std.mem.eql(u8, t.ticket.slice(), "t2"));
+    try testing.expectEqual(@as(usize, 2), result.hit.offers.len);
+    for (result.hit.offers.constSlice()) |*t| try testing.expect(!std.mem.eql(u8, t.ticket.slice(), "t2"));
 }
 
 test "max_origins rejects a new origin once the distinct-origin cap is reached" {
@@ -2643,12 +2863,12 @@ test "client insertion-sequence renumbering preserves offer order across overflo
 
     var result = cache.lookupOffers(testCandidate("example.test"), 2);
     defer result.deinit();
-    try testing.expectEqual(@as(usize, 2), result.hit.len);
+    try testing.expectEqual(@as(usize, 2), result.hit.offers.len);
     // t2 was stored after (and therefore must remain newer than) t1, even
     // though its raw insertion sequence value renumbered down to a small
     // number.
-    try testing.expectEqualStrings("t2", result.hit.constSlice()[0].ticket.slice());
-    try testing.expectEqualStrings("t1", result.hit.constSlice()[1].ticket.slice());
+    try testing.expectEqualStrings("t2", result.hit.offers.constSlice()[0].ticket.slice());
+    try testing.expectEqualStrings("t1", result.hit.offers.constSlice()[1].ticket.slice());
 }
 
 test "server LRU renumbering at overflow preserves relative recency and next eviction victim" {
@@ -3344,13 +3564,7 @@ test "restoreClones deterministically resolves a duplicate origin/ticket-identit
     try testing.expectEqual(@as(u64, 9), cache.entries.items[0].insertion_sequence);
 }
 
-test "a single_use duplicate cannot eliminate a valid reusable record before being dropped itself" {
-    // Round-5 review #5b regression. `markDuplicateClientRecords` used to
-    // run before unsupported `.single_use` records were filtered out, so
-    // a newer `.single_use` duplicate could win the dedup comparison
-    // (deinitializing the older, otherwise-valid `.reusable` record) and
-    // then itself be dropped by the reusable-only policy — losing both
-    // records instead of keeping the valid one.
+test "single_use duplicate restore follows newest insertion metadata" {
     var cache = try ClientSessionCache.init(testing.allocator, Limits.client_default);
     defer cache.deinit();
 
@@ -3362,7 +3576,8 @@ test "a single_use duplicate cannot eliminate a valid reusable record before bei
 
     try cache.restoreClones(&items, 10);
     try testing.expectEqual(@as(usize, 1), cache.count());
-    try testing.expectEqual(@as(u64, 1), cache.entries.items[0].insertion_sequence);
+    try testing.expectEqual(UsagePolicy.single_use, cache.entries.items[0].usage);
+    try testing.expectEqual(@as(u64, 9), cache.entries.items[0].insertion_sequence);
 }
 
 test "restoreEntries aborts atomically on a mid-stream allocation failure, leaving the target untouched" {

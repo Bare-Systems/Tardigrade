@@ -398,7 +398,13 @@ pub fn saveClientCache(
     backend: Backend,
     now_unix_ms: i64,
 ) SaveResult {
-    var snapshot = cache.cloneLiveForPersistence(cache.allocator, now_unix_ms) catch return .allocation_failed;
+    const token = cache.beginPersistenceOperation() catch return .cache_busy;
+    defer cache.endPersistenceOperation(token);
+
+    var snapshot = cache.cloneLiveForPersistence(cache.allocator, now_unix_ms) catch |err| return switch (err) {
+        error.OutOfMemory => .allocation_failed,
+        error.CacheBusy => .cache_busy,
+    };
     defer {
         for (snapshot.items) |*p| p.deinit();
         snapshot.deinit(cache.allocator);
@@ -433,6 +439,9 @@ pub fn loadClientCache(
     backend: Backend,
     now_unix_ms: i64,
 ) LoadResult {
+    const token = cache.beginPersistenceOperation() catch return .cache_busy;
+    defer cache.endPersistenceOperation(token);
+
     const sealed = (backend.load(cache.allocator) catch return .backend_failed) orelse return .absent;
     defer {
         secrets.secureZero(sealed);
@@ -971,9 +980,9 @@ test "persistence round trip preserves LRU eviction order across swapRemove-scra
 
         var offers = restored_order.lookupOffers(testCandidate("example.test"), 3);
         defer offers.deinit();
-        try testing.expectEqual(@as(usize, 2), offers.hit.len);
-        try testing.expectEqualStrings("t3", offers.hit.constSlice()[0].ticket.slice());
-        try testing.expectEqualStrings("t1", offers.hit.constSlice()[1].ticket.slice());
+        try testing.expectEqual(@as(usize, 2), offers.hit.offers.len);
+        try testing.expectEqualStrings("t3", offers.hit.offers.constSlice()[0].ticket.slice());
+        try testing.expectEqualStrings("t1", offers.hit.offers.constSlice()[1].ticket.slice());
     }
 
     // Verification B: eviction order survives the round trip. A separate
@@ -991,8 +1000,8 @@ test "persistence round trip preserves LRU eviction order across swapRemove-scra
     // t3 (which was never touched after t1's `lru_sequence` was refreshed).
     var after = restored_evict.lookupOffers(testCandidate("example.test"), 4);
     defer after.deinit();
-    try testing.expectEqual(@as(usize, 1), after.hit.len);
-    try testing.expectEqualStrings("t3", after.hit.constSlice()[0].ticket.slice());
+    try testing.expectEqual(@as(usize, 1), after.hit.offers.len);
+    try testing.expectEqualStrings("t3", after.hit.offers.constSlice()[0].ticket.slice());
 }
 
 test "loadClientCache discards expired entries and enforces current limits on reload" {

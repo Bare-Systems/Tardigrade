@@ -790,11 +790,11 @@ test "PSK round trip falls back to a full handshake when the resolver has no mat
 test "an ineligible offered ticket is filtered without desyncing the wire index of a later valid one" {
     // Regression coverage: `sendClientHello` used to filter eligible
     // tickets while writing the wire offer, but `onServerHello` indexed
-    // the *original*, unfiltered `client_psk_offers` array. With an
+    // the original, unfiltered client offer array. With an
     // expired ticket first and a valid one second, the wire would contain
     // only the valid ticket at index 0, but the client would resolve
     // `selected_identity = 0` back to the expired ticket's PSK — a silent
-    // secret mismatch. `client_psk_offers` is now compacted to exactly the
+    // secret mismatch. Client offers are now compacted to exactly the
     // wire-emitted, wire-ordered subset before `core.start()`, so this
     // must complete cleanly with matching keys on both sides.
     var harness = DirectHarness.init();
@@ -3432,7 +3432,7 @@ test "handshake-phase failure wipes PSK offer state before ServerHello even arri
     var sink = DirectSink{};
     defer sink.deinit();
     try client.backend().start(.client, {}, &sink);
-    try std.testing.expect(!client.client_psk_offers.isEmpty());
+    try std.testing.expect(!client.client_offer_lease.offers.isEmpty());
 
     // A Finished message at the initial epoch (ServerHello was expected) is
     // a wrong-transport-epoch rejection raised by `drainInput` itself,
@@ -3442,7 +3442,7 @@ test "handshake-phase failure wipes PSK offer state before ServerHello even arri
     const finished = try tls_core.messages.encode(.finished, "", &buf);
     try std.testing.expectError(error.UnexpectedTransportEpoch, client.backend().receive(.initial, finished, &sink));
 
-    try std.testing.expect(client.client_psk_offers.isEmpty());
+    try std.testing.expect(client.client_offer_lease.offers.isEmpty());
 }
 
 fn pushTestTicket(offers: *pre_shared_key.ClientPskOfferSet, psk: []const u8, ticket: []const u8) !void {
@@ -3488,7 +3488,7 @@ test "client selects a later (non-zero) identity when the server names it" {
     var sink = DirectSink{};
     defer sink.deinit();
     try client.backend().start(.client, {}, &sink);
-    try std.testing.expectEqual(@as(usize, 2), client.client_psk_offers.len);
+    try std.testing.expectEqual(@as(usize, 2), client.client_offer_lease.offers.len);
 
     var buf: [512]u8 = undefined;
     const hello = try buildServerHello(&buf, .{ .selected_identity = 1 });
@@ -3523,12 +3523,12 @@ test "client rejects a selected_identity equal to or beyond the emitted offer co
         var sink = DirectSink{};
         defer sink.deinit();
         try client.backend().start(.client, {}, &sink);
-        try std.testing.expectEqual(@as(usize, 1), client.client_psk_offers.len); // one offer emitted, index 0 valid
+        try std.testing.expectEqual(@as(usize, 1), client.client_offer_lease.offers.len); // one offer emitted, index 0 valid
 
         var buf: [512]u8 = undefined;
         const hello = try buildServerHello(&buf, .{ .selected_identity = bad_index });
         try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, hello, &sink));
-        try std.testing.expect(client.client_psk_offers.isEmpty());
+        try std.testing.expect(client.client_offer_lease.offers.isEmpty());
         try std.testing.expect(!client.selected_client_psk_present);
         try std.testing.expect(!client.core.psk_authenticated);
     }
@@ -3541,12 +3541,12 @@ test "client rejects a forged selected_identity when no PSK was ever offered" {
         .record,
     );
     defer client.deinit();
-    try std.testing.expect(client.client_psk_offers.isEmpty());
+    try std.testing.expect(client.client_offer_lease.offers.isEmpty());
 
     var sink = DirectSink{};
     defer sink.deinit();
     try client.backend().start(.client, {}, &sink);
-    try std.testing.expect(client.client_psk_offers.isEmpty());
+    try std.testing.expect(client.client_offer_lease.offers.isEmpty());
 
     var buf: [512]u8 = undefined;
     const hello = try buildServerHello(&buf, .{ .selected_identity = 0 });
@@ -3594,13 +3594,13 @@ test "a PSK-selected ServerHello with inconsistent suite/version/key-share is re
         var sink = DirectSink{};
         defer sink.deinit();
         try client.backend().start(.client, {}, &sink);
-        try std.testing.expectEqual(@as(usize, 1), client.client_psk_offers.len);
+        try std.testing.expectEqual(@as(usize, 1), client.client_offer_lease.offers.len);
 
         var buf: [512]u8 = undefined;
         const hello = try buildServerHello(&buf, case.opts);
         try std.testing.expectError(case.expected, client.backend().receive(.initial, hello, &sink));
 
-        try std.testing.expect(client.client_psk_offers.isEmpty());
+        try std.testing.expect(client.client_offer_lease.offers.isEmpty());
         try std.testing.expect(!client.selected_client_psk_present);
         try std.testing.expect(!client.core.psk_authenticated);
         try std.testing.expect(client.schedule == null);
@@ -3645,13 +3645,13 @@ test "a rejected ServerHello observably zeroes the client's offered PSK bytes, n
     var sink = DirectSink{};
     defer sink.deinit();
     try client.backend().start(.client, {}, &sink);
-    try std.testing.expectEqual(@as(usize, 1), client.client_psk_offers.len);
+    try std.testing.expectEqual(@as(usize, 1), client.client_offer_lease.offers.len);
 
     // Captured from the offer's *final* resting place inside the backend
     // (after every intervening move), not the now-defunct local variable
     // above: only this copy is the one `clearFailedHandshakeState` must
     // reach.
-    const settled = &client.client_psk_offers.tickets[0];
+    const settled = &client.client_offer_lease.offers.tickets[0];
     const psk_memory = settled.common.resumption_psk.bytes[0..settled.common.resumption_psk.len];
     const ticket_memory = settled.ticket.slice();
     const nonce_memory = settled.ticket_nonce.bytes[0..settled.ticket_nonce.len];
@@ -3663,7 +3663,7 @@ test "a rejected ServerHello observably zeroes the client's offered PSK bytes, n
     const hello = try buildServerHello(&buf, .{ .selected_identity = 5 }); // beyond the single emitted offer
     try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, hello, &sink));
 
-    try std.testing.expect(client.client_psk_offers.isEmpty());
+    try std.testing.expect(client.client_offer_lease.offers.isEmpty());
     // `resumption_psk`/`ticket_nonce` are embedded fixed-size arrays, never
     // routed through an allocator or an optional-to-null transition, so
     // `secureZero`'s effect is directly and reliably observable here.

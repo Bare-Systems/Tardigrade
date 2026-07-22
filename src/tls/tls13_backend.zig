@@ -454,11 +454,11 @@ pub const Tls13Backend = struct {
     /// Client (#362): resumption tickets this backend may offer, owned until
     /// moved out at ClientHello emission or wiped after ServerHello selects
     /// (or does not select) one.
-    client_psk_offers: pre_shared_key.ClientPskOfferSet = .{},
+    client_offer_lease: pre_shared_key.ClientOfferLease = .{},
     psk_now_ctx: ?*anyopaque = null,
     psk_now_fn: ?*const fn (*anyopaque) i64 = null,
     /// Client (#362): the ticket state named by the server's
-    /// `selected_identity`, retained (moved out of `client_psk_offers`)
+    /// `selected_identity`, retained (moved out of `client_offer_lease.offers`)
     /// until EncryptedExtensions has been checked against its stored
     /// context and its `auth_binding` has been carried forward into
     /// `connection_auth_binding`. Deinitialized once that has happened, on
@@ -749,8 +749,25 @@ pub const Tls13Backend = struct {
     ) HandshakeError!void {
         if (self.role != .client) return error.InvalidHandshakeState;
         if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
-        self.client_psk_offers.deinit();
-        self.client_psk_offers.moveFrom(offers);
+        self.clearClientPskOffersAborted();
+        self.client_offer_lease.offers.moveFrom(offers);
+        self.psk_now_ctx = now_ctx;
+        self.psk_now_fn = nowUnixMsFn;
+    }
+
+    /// Client (#487): configure cache-owned offers with their single-use
+    /// lease. The backend owns exactly-once completion from this point.
+    pub fn setClientPskOfferLease(
+        self: *Tls13Backend,
+        lease: *pre_shared_key.ClientOfferLease,
+        now_ctx: *anyopaque,
+        nowUnixMsFn: *const fn (*anyopaque) i64,
+    ) HandshakeError!void {
+        if (self.role != .client) return error.InvalidHandshakeState;
+        if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        self.clearClientPskOffersAborted();
+        self.client_offer_lease = lease.*;
+        lease.* = .{};
         self.psk_now_ctx = now_ctx;
         self.psk_now_fn = nowUnixMsFn;
     }
@@ -831,6 +848,18 @@ pub const Tls13Backend = struct {
         const index = self.selected_server_psk.index;
         self.selected_server_psk.index = 0;
         return index;
+    }
+
+    fn mutableClientPskOffers(self: *Tls13Backend) *pre_shared_key.ClientPskOfferSet {
+        return &self.client_offer_lease.offers;
+    }
+
+    fn constClientPskOffers(self: *const Tls13Backend) *const pre_shared_key.ClientPskOfferSet {
+        return &self.client_offer_lease.offers;
+    }
+
+    fn clearClientPskOffersAborted(self: *Tls13Backend) void {
+        self.client_offer_lease.deinit();
     }
 
     pub fn setSessionTicketConsumer(
@@ -961,7 +990,7 @@ pub const Tls13Backend = struct {
         self.schedule = null;
         self.resumption_master_secret.deinit();
         self.session_ticket_consumer = null;
-        self.client_psk_offers.deinit();
+        self.clearClientPskOffersAborted();
         self.psk_now_ctx = null;
         self.psk_now_fn = null;
         self.psk_resolver = null;
@@ -1066,7 +1095,7 @@ pub const Tls13Backend = struct {
     /// not destroy them before the caller has had a chance to read them.
     fn clearFailedHandshakeState(self: *Tls13Backend) void {
         if (self.handshake_committed) return;
-        self.client_psk_offers.deinit();
+        self.clearClientPskOffersAborted();
         self.selected_client_psk.deinit();
         self.selected_client_psk_present = false;
         self.selected_server_psk.deinit();
@@ -1497,7 +1526,7 @@ pub const Tls13Backend = struct {
             try w.bytes(payload);
         }
 
-        // pre_shared_key (#362): `self.client_psk_offers` was already
+        // pre_shared_key (#362/#487): `self.client_offer_lease.offers` was already
         // compacted to exactly the eligible, size-fitting, wire-ordered
         // subset by `planPskOffer` (called from `startImpl` before
         // `core.start()`), so this block only needs to emit it verbatim —
@@ -1509,10 +1538,11 @@ pub const Tls13Backend = struct {
         defer crypto.secureZero(u8, std.mem.asBytes(&psk_secrets));
         var psk_count: usize = 0;
         var psk_offer_write: ?pre_shared_key.ClientOfferWrite = null;
-        if (!self.client_psk_offers.isEmpty()) {
+        const active_offers = self.constClientPskOffers();
+        if (!active_offers.isEmpty()) {
             const now_ms = self.psk_now_fn.?(self.psk_now_ctx.?);
             var psk_items: [pre_shared_key.max_offered_identities]pre_shared_key.OfferItem = undefined;
-            for (self.client_psk_offers.constSlice()) |*ticket| {
+            for (active_offers.constSlice()) |*ticket| {
                 @memcpy(&psk_secrets[psk_count], ticket.common.resumption_psk.slice());
                 psk_items[psk_count] = .{
                     .identity = ticket.ticket.slice(),
@@ -1534,7 +1564,7 @@ pub const Tls13Backend = struct {
                 // `max_message_len` (8 KiB) is far below the u16 (65535)
                 // vector limits these guard, and `planPskOffer` already
                 // rejected any ticket with a zero/oversized identity before
-                // it ever reached `self.client_psk_offers` — so none of
+                // it ever reached `self.client_offer_lease.offers` — so none of
                 // these are reachable through this concrete backend.
                 error.EmptyIdentity,
                 error.IdentityTooLarge,
@@ -1572,19 +1602,53 @@ pub const Tls13Backend = struct {
 
     /// #362: decide, before `core.start()` mutates any lifecycle/key-pair
     /// state, exactly which offered tickets will fit in the ClientHello and
-    /// in what wire order — compacting `self.client_psk_offers` in place to
+    /// in what wire order — compacting `self.client_offer_lease.offers` in place to
     /// exactly that subset (wiping whatever did not fit/qualify), so
     /// `sendClientHello`'s later, unfiltered write and `onServerHello`'s
     /// `selected_identity` interpretation can never disagree about wire
     /// order. `base_len` is the ordinary (non-PSK) ClientHello length
     /// already checked against `max_message_len` by the caller.
     fn planPskOffer(self: *Tls13Backend, base_len: usize) HandshakeError!void {
-        if (self.client_psk_offers.isEmpty()) return;
+        if (self.mutableClientPskOffers().isEmpty()) return;
         const now_fn = self.psk_now_fn orelse {
-            self.client_psk_offers.deinit();
+            self.clearClientPskOffersAborted();
             return;
         };
         const now_ms = now_fn(self.psk_now_ctx.?);
+
+        if (self.client_offer_lease.active) {
+            var total = try checkedAdd(base_len, 6 + 8);
+            var i: usize = 0;
+            while (i < self.client_offer_lease.offers.len) {
+                const ticket = &self.client_offer_lease.offers.tickets[i];
+                var keep = self.ticketEligibleToOffer(ticket, now_ms);
+                var stop = false;
+                if (keep) {
+                    const identity_len = ticket.ticket.slice().len;
+                    if (identity_len == 0 or identity_len > std.math.maxInt(u16)) {
+                        keep = false;
+                    } else {
+                        const entry_len = try checkedAdd(try checkedAdd(2, identity_len), 4);
+                        const candidate_total = try checkedAdd(try checkedAdd(total, entry_len), 1 + hash_len);
+                        if (candidate_total > max_message_len) {
+                            keep = false;
+                            stop = true;
+                        } else total = candidate_total;
+                    }
+                }
+                if (!keep) {
+                    self.client_offer_lease.dropOffer(i);
+                    if (stop) {
+                        while (i < self.client_offer_lease.offers.len) self.client_offer_lease.dropOffer(i);
+                        break;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            if (self.client_offer_lease.offers.isEmpty()) self.client_offer_lease.finish(.not_selected);
+            return;
+        }
 
         var emitted: pre_shared_key.ClientPskOfferSet = .{};
         errdefer emitted.deinit();
@@ -1592,7 +1656,8 @@ pub const Tls13Backend = struct {
         // pre_shared_key: 2 type + 2 ext_len + 2 identities_len + 2 binders_len.
         var total = try checkedAdd(base_len, 6 + 8);
 
-        for (self.client_psk_offers.slice()) |*ticket| {
+        const raw_offers = self.mutableClientPskOffers();
+        for (raw_offers.slice()) |*ticket| {
             if (emitted.len >= pre_shared_key.max_offered_identities) break;
             if (!self.ticketEligibleToOffer(ticket, now_ms)) continue;
             const identity_len = ticket.ticket.slice().len;
@@ -1605,8 +1670,8 @@ pub const Tls13Backend = struct {
             emitted.push(ticket) catch break; // bounded by the loop guard above
         }
 
-        self.client_psk_offers.deinit(); // whatever was ineligible or did not fit
-        self.client_psk_offers.moveFrom(&emitted);
+        raw_offers.deinit(); // whatever was ineligible or did not fit
+        raw_offers.moveFrom(&emitted);
     }
 
     /// Whether `ticket` is still safe and compatible to offer *now*: not
@@ -1706,7 +1771,7 @@ pub const Tls13Backend = struct {
         // offer/selected-ticket state sitting in a now-failed backend past
         // this call.
         errdefer {
-            self.client_psk_offers.deinit();
+            self.clearClientPskOffersAborted();
             self.selected_client_psk.deinit();
             self.selected_client_psk_present = false;
         }
@@ -1772,7 +1837,7 @@ pub const Tls13Backend = struct {
         defer crypto.secureZero(u8, &shared);
 
         // #362: consistency-check the server's selected_identity (if any)
-        // against our own offers — `self.client_psk_offers` was already
+        // against our own offers — `self.client_offer_lease.offers` was already
         // compacted to exactly the wire-emitted, wire-ordered subset by
         // `planPskOffer`, so `idx` names an actual offer, never a value the
         // server invented, and never a stale/filtered-out one. On success,
@@ -1782,9 +1847,12 @@ pub const Tls13Backend = struct {
         // forward. Every other offer is wiped here, on every path (selected
         // or not, malformed or not).
         var psk_secret: ?[hash_len]u8 = null;
+        const active_offers = self.mutableClientPskOffers();
         if (selected_identity) |idx| {
-            if (idx >= self.client_psk_offers.len) return error.IllegalParameter;
-            self.client_psk_offers.takeSelected(idx, &self.selected_client_psk);
+            if (idx >= active_offers.len) return error.IllegalParameter;
+            if (self.client_offer_lease.active) self.client_offer_lease.finishPins(.{ .selected = idx });
+            active_offers.takeSelected(idx, &self.selected_client_psk);
+            self.client_offer_lease = .{};
             self.selected_client_psk_present = true;
             const psk_slice = self.selected_client_psk.common.resumption_psk.slice();
             if (psk_slice.len != hash_len) return error.IllegalParameter;
@@ -1793,7 +1861,11 @@ pub const Tls13Backend = struct {
             @memcpy(&buf, psk_slice);
             psk_secret = buf;
         } else {
-            self.client_psk_offers.deinit();
+            if (self.client_offer_lease.active) {
+                self.client_offer_lease.finish(.not_selected);
+            } else {
+                self.client_offer_lease.offers.deinit();
+            }
         }
 
         self.wipeEphemeral();

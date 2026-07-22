@@ -585,11 +585,11 @@ pub const ClientSessionCache = struct {
         const new_bytes = clientAccountedBytes(cloned);
         if (new_bytes > self.limits.max_entry_bytes) return .rejected_capacity;
 
-        const origin_count = self.countOrigin(origin);
-        if (origin_count == 0 and self.countDistinctOrigins() >= self.limits.max_origins) {
-            return .rejected_capacity;
-        }
-
+        // `planClientInsertionLocked` folds expiry purging and the
+        // new-origin/`max_origins` admission decision into the same
+        // non-mutating dry run as ordinary capacity eviction — see its
+        // doc comment for why an origin's cardinality must be judged
+        // against a *post-purge* view, not raw current counts.
         var plan = (self.planClientInsertionLocked(origin, new_bytes, now_unix_ms) catch return .storage_failed) orelse
             return .rejected_capacity;
 
@@ -848,11 +848,6 @@ pub const ClientSessionCache = struct {
         const new_bytes = clientAccountedBytes(ticket);
         if (new_bytes > self.limits.max_entry_bytes) return .rejected_capacity;
 
-        const origin_count = self.countOrigin(origin);
-        if (origin_count == 0 and self.countDistinctOrigins() >= self.limits.max_origins) {
-            return .rejected_capacity;
-        }
-
         var plan = (self.planClientInsertionLocked(origin, new_bytes, now_unix_ms) catch return .storage_failed) orelse
             return .rejected_capacity;
 
@@ -903,18 +898,17 @@ pub const ClientSessionCache = struct {
         }
     }
 
-    fn countOrigin(self: *ClientSessionCache, origin: OriginDigest) usize {
-        var n: usize = 0;
-        for (self.entries.items) |e| {
-            if (std.mem.eql(u8, &e.origin, &origin)) n += 1;
-        }
-        return n;
-    }
-
-    fn countDistinctOrigins(self: *ClientSessionCache) usize {
+    /// Distinct origins among entries that are *not* expired as of
+    /// `now_unix_ms` — an origin whose every entry has expired doesn't
+    /// count, since `planClientInsertionLocked` always plans removal of
+    /// every expired entry regardless of whether eviction pressure
+    /// otherwise requires it (see that function's doc comment).
+    fn countDistinctLiveOrigins(self: *ClientSessionCache, now_unix_ms: i64) usize {
         var n: usize = 0;
         outer: for (self.entries.items, 0..) |e, i| {
+            if (e.ticket.common.isExpired(now_unix_ms)) continue;
             for (self.entries.items[0..i]) |prev| {
+                if (prev.ticket.common.isExpired(now_unix_ms)) continue;
                 if (std.mem.eql(u8, &prev.origin, &e.origin)) continue :outer;
             }
             n += 1;
@@ -923,16 +917,32 @@ pub const ClientSessionCache = struct {
     }
 
     /// A non-mutating dry run: computes the exact set of entries a new
-    /// `new_bytes`-sized entry in `origin` would need to evict, without
-    /// touching any cache state. Called *before* any fallible allocation
-    /// is attempted, so `storeLocked`/`restoreLocked` know precisely what
-    /// they are about to do and can reserve exactly the right capacity
-    /// before mutating anything. There is no lease/pinning concept on the
-    /// client side, so — unlike the stateful server cache — every live
-    /// entry is always a valid eviction candidate and this can only fail
-    /// to find room when `new_bytes` itself exceeds the cache's total
-    /// byte budget (`null`) or on the plan's own scratch allocation
-    /// (`error.OutOfMemory`).
+    /// `new_bytes`-sized entry in `origin` would need this cache to evict
+    /// (`null` if there is no way to make room, e.g. `new_bytes` itself
+    /// exceeds the total byte budget, or `origin` would exceed
+    /// `max_origins`), without touching any cache state. Called *before*
+    /// any fallible allocation is attempted, so `storeLocked`/
+    /// `restoreLocked` know precisely what they are about to do and can
+    /// reserve exactly the right capacity before mutating anything.
+    ///
+    /// Every already-expired entry, anywhere in the cache, is
+    /// unconditionally included in the plan — not merely *preferred* as a
+    /// victim when eviction pressure happens to need one. This is what
+    /// lets the `max_origins` admission decision below be judged against
+    /// the cache's state *as it will be immediately after this insert
+    /// commits* (i.e. with every stale entry already gone) rather than
+    /// its raw current state: without this, an origin whose only entries
+    /// have expired but were never purged (nothing since #364's
+    /// deliberate removal of eager purging — see the module doc — forces
+    /// that to happen promptly) would permanently occupy an `max_origins`
+    /// slot forever, blocking every other origin indefinitely. Because
+    /// removal is still only *planned* here, not applied, this stays
+    /// fully compatible with the atomicity guarantee: a rejected or
+    /// later-failed insert leaves every expired entry exactly as it was.
+    ///
+    /// There is no lease/pinning concept on the client side, so — unlike
+    /// the stateful server cache — every live entry is always a valid
+    /// eviction candidate once expired entries are accounted for.
     fn planClientInsertionLocked(
         self: *ClientSessionCache,
         origin: OriginDigest,
@@ -944,19 +954,33 @@ pub const ClientSessionCache = struct {
         var victims: std.ArrayListUnmanaged(*ClientEntry) = .empty;
         errdefer victims.deinit(self.allocator);
 
-        var origin_count = self.countOrigin(origin);
-        var global_count = self.entries.items.len;
-        var global_bytes = self.total_bytes;
+        var origin_count: usize = 0;
+        var global_count: usize = 0;
+        var global_bytes: usize = 0;
+        for (self.entries.items) |e| {
+            if (e.ticket.common.isExpired(now_unix_ms)) {
+                try victims.append(self.allocator, e);
+                continue;
+            }
+            global_count += 1;
+            global_bytes += e.bytes;
+            if (std.mem.eql(u8, &e.origin, &origin)) origin_count += 1;
+        }
+
+        if (origin_count == 0 and self.countDistinctLiveOrigins(now_unix_ms) >= self.limits.max_origins) {
+            victims.deinit(self.allocator);
+            return null;
+        }
 
         while (origin_count >= self.limits.max_entries_per_origin) {
-            const victim = self.findEvictionCandidateInOriginExcluding(origin, victims.items, now_unix_ms) orelse unreachable;
+            const victim = self.findOldestLiveInOriginExcluding(origin, victims.items) orelse unreachable;
             try victims.append(self.allocator, victim);
             origin_count -= 1;
             global_count -= 1;
             global_bytes -= victim.bytes;
         }
         while (global_count >= self.limits.max_entries or global_bytes + new_bytes > self.limits.max_total_bytes) {
-            const victim = self.findEvictionCandidateGlobalExcluding(victims.items, now_unix_ms) orelse unreachable;
+            const victim = self.findOldestLiveGlobalExcluding(victims.items) orelse unreachable;
             try victims.append(self.allocator, victim);
             global_count -= 1;
             global_bytes -= victim.bytes;
@@ -980,22 +1004,17 @@ pub const ClientSessionCache = struct {
         plan.victims.deinit(self.allocator);
     }
 
-    /// Prefers an already-expired entry (its `lru_sequence` is irrelevant
-    /// — it would be purged regardless) over the genuine oldest-by-LRU
-    /// live entry, so ordinary capacity-driven eviction opportunistically
-    /// reclaims stale entries first without needing a separate eager
-    /// purge pass before this plan is computed.
-    fn findEvictionCandidateInOriginExcluding(
+    /// Oldest-by-LRU search among candidates that are neither already
+    /// planned as a victim nor expired. Every expired entry is already
+    /// unconditionally included in `excluding` by the time this is
+    /// called (see `planClientInsertionLocked`), so — unlike earlier
+    /// revisions of this search — no separate expiry preference is
+    /// needed here: no expired candidate can remain.
+    fn findOldestLiveInOriginExcluding(
         self: *ClientSessionCache,
         origin: OriginDigest,
         excluding: []const *ClientEntry,
-        now_unix_ms: i64,
     ) ?*ClientEntry {
-        for (self.entries.items) |e| {
-            if (!std.mem.eql(u8, &e.origin, &origin)) continue;
-            if (containsClientEntryPtr(excluding, e)) continue;
-            if (e.ticket.common.isExpired(now_unix_ms)) return e;
-        }
         var best: ?*ClientEntry = null;
         for (self.entries.items) |e| {
             if (!std.mem.eql(u8, &e.origin, &origin)) continue;
@@ -1005,15 +1024,10 @@ pub const ClientSessionCache = struct {
         return best;
     }
 
-    fn findEvictionCandidateGlobalExcluding(
+    fn findOldestLiveGlobalExcluding(
         self: *ClientSessionCache,
         excluding: []const *ClientEntry,
-        now_unix_ms: i64,
     ) ?*ClientEntry {
-        for (self.entries.items) |e| {
-            if (containsClientEntryPtr(excluding, e)) continue;
-            if (e.ticket.common.isExpired(now_unix_ms)) return e;
-        }
         var best: ?*ClientEntry = null;
         for (self.entries.items) |e| {
             if (containsClientEntryPtr(excluding, e)) continue;
@@ -1047,18 +1061,29 @@ pub const ClientSessionCache = struct {
         return self.reserveLruSequenceBatchLocked(1);
     }
 
-    /// Reserves `count` consecutive fresh LRU sequence values atomically
-    /// (renumbering first if the remaining range is too small to fit all
-    /// of them), returning the first. Calling `nextLruSequence` in a loop
-    /// instead — one reservation per touched entry — is exactly the bug
-    /// this exists to avoid: if renumbering happened partway through such
-    /// a loop, values obtained before and after it would be on two
-    /// different numbering scales, corrupting relative order among the
-    /// entries touched in the same batch.
+    /// Reserves `n` consecutive fresh LRU sequence values atomically
+    /// (renumbering first if the remaining range is too small), returning
+    /// the first. Calling `nextLruSequence` in a loop instead — one
+    /// reservation per touched entry — is exactly the bug this exists to
+    /// avoid: if renumbering happened partway through such a loop, values
+    /// obtained before and after it would be on two different numbering
+    /// scales, corrupting relative order among the entries touched in the
+    /// same batch.
+    ///
+    /// The guard reserves room for the batch *and* the value the counter
+    /// itself will hold immediately afterward, not just the batch's last
+    /// value: reserving only through `first + (n - 1)` (the last value
+    /// actually handed out) would let `next_lru_sequence` land exactly on
+    /// `maxInt(u64)` via saturating assignment, and a *later* reservation
+    /// would then see `next_lru_sequence > maxInt(u64) - m` fail to hold
+    /// (maxInt is not `>` itself) and skip renumbering — handing out
+    /// `maxInt(u64)` a second time. Renumbering here first instead keeps
+    /// every live sequence value unique.
     fn reserveLruSequenceBatchLocked(self: *ClientSessionCache, n: u64) u64 {
-        if (self.next_lru_sequence > std.math.maxInt(u64) - (n - 1)) self.renumberLruSequencesLocked();
+        std.debug.assert(n > 0);
+        if (self.next_lru_sequence > std.math.maxInt(u64) - n) self.renumberLruSequencesLocked();
         const first = self.next_lru_sequence;
-        self.next_lru_sequence = first +| n;
+        self.next_lru_sequence = first + n; // safe: the guard above proved no overflow.
         return first;
     }
 
@@ -1533,54 +1558,36 @@ pub const StatefulServerCache = struct {
         return result;
     }
 
-    /// Whether `bytes` could possibly fit without evicting any currently
-    /// leased entry — a pure, non-mutating preflight. Leased entries are
-    /// never eviction candidates, so if the cache could never get under
-    /// its count/byte/per-origin limits using only *unleased* entries as
-    /// victims, the insert must be rejected before anything is mutated.
-    fn canFitLocked(self: *StatefulServerCache, origin: OriginDigest, new_bytes: usize) bool {
-        var leased_count: usize = 0;
-        var leased_bytes: usize = 0;
-        var it = self.entries.iterator();
+    /// Distinct origins with at least one entry that would survive a
+    /// purge as of `now_unix_ms` — leased entries always survive
+    /// (regardless of expiry, since leased entries are never purged), an
+    /// unleased entry survives only if it is not yet expired. An origin
+    /// whose every entry has expired-and-is-unleased doesn't count, since
+    /// `planInsertionLocked` always plans removal of every such entry
+    /// regardless of whether eviction pressure otherwise requires it (see
+    /// that function's doc comment).
+    fn countDistinctLiveOriginsLocked(self: *StatefulServerCache, now_unix_ms: i64) usize {
+        var n: usize = 0;
+        var it = self.origin_index.iterator();
         while (it.next()) |kv| {
-            const e = kv.value_ptr.*;
-            if (e.active_lease_epoch != null) {
-                leased_count += 1;
-                leased_bytes += e.bytes;
-            }
-        }
-        if (leased_count >= self.limits.max_entries) return false;
-        if (leased_bytes + new_bytes > self.limits.max_total_bytes) return false;
-
-        if (self.origin_index.get(origin)) |bucket| {
-            var origin_leased: usize = 0;
-            for (bucket.items) |id| {
+            for (kv.value_ptr.items) |id| {
                 const e = self.entries.get(id) orelse continue;
-                if (e.active_lease_epoch != null) origin_leased += 1;
+                if (e.active_lease_epoch != null or !e.state.common.isExpired(now_unix_ms)) {
+                    n += 1;
+                    break;
+                }
             }
-            if (origin_leased >= self.limits.max_entries_per_origin) return false;
         }
-        return true;
+        return n;
     }
 
-    fn originBucketLen(self: *StatefulServerCache, origin: OriginDigest) usize {
-        return if (self.origin_index.get(origin)) |b| b.items.len else 0;
-    }
-
-    /// Prefers an already-expired, unleased entry (its `lru_sequence` is
-    /// irrelevant — it would be purged regardless) over the genuine
-    /// oldest-by-LRU unleased entry, so ordinary capacity-driven eviction
-    /// opportunistically reclaims stale entries first without needing a
-    /// separate eager purge pass before this plan is computed (see
-    /// `insertLocked`'s doc comment).
-    fn findOldestUnleasedInOriginExcluding(self: *StatefulServerCache, origin: OriginDigest, excluding: []const u64, now_unix_ms: i64) ?u64 {
+    /// Oldest-by-LRU search among unleased candidates that are neither
+    /// already planned as a victim nor expired. Every expired-and-unleased
+    /// entry is already unconditionally included in `excluding` by the
+    /// time this is called (see `planInsertionLocked`), so no separate
+    /// expiry preference is needed here: no expired candidate can remain.
+    fn findOldestUnleasedInOriginExcluding(self: *StatefulServerCache, origin: OriginDigest, excluding: []const u64) ?u64 {
         const bucket = self.origin_index.getPtr(origin) orelse return null;
-        for (bucket.items) |id| {
-            if (std.mem.indexOfScalar(u64, excluding, id) != null) continue;
-            const e = self.entries.get(id) orelse continue;
-            if (e.active_lease_epoch != null) continue;
-            if (e.state.common.isExpired(now_unix_ms)) return id;
-        }
         var best_id: ?u64 = null;
         var best_seq: u64 = undefined;
         for (bucket.items) |id| {
@@ -1595,18 +1602,11 @@ pub const StatefulServerCache = struct {
         return best_id;
     }
 
-    fn findOldestUnleasedGlobalExcluding(self: *StatefulServerCache, excluding: []const u64, now_unix_ms: i64) ?u64 {
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            if (std.mem.indexOfScalar(u64, excluding, kv.key_ptr.*) != null) continue;
-            const e = kv.value_ptr.*;
-            if (e.active_lease_epoch != null) continue;
-            if (e.state.common.isExpired(now_unix_ms)) return kv.key_ptr.*;
-        }
+    fn findOldestUnleasedGlobalExcluding(self: *StatefulServerCache, excluding: []const u64) ?u64 {
         var best_id: ?u64 = null;
         var best_seq: u64 = undefined;
-        var it2 = self.entries.iterator();
-        while (it2.next()) |kv| {
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
             if (std.mem.indexOfScalar(u64, excluding, kv.key_ptr.*) != null) continue;
             const e = kv.value_ptr.*;
             if (e.active_lease_epoch != null) continue;
@@ -1619,38 +1619,95 @@ pub const StatefulServerCache = struct {
     }
 
     /// Computes, without mutating anything, the exact set of entries this
-    /// insertion will need to evict (`canFitLocked` already guarantees
-    /// this is possible using only unleased victims), plus whether the
-    /// target origin's bucket will still exist afterward. Called *before*
-    /// any fallible allocation is attempted, so `insertLocked` knows
-    /// precisely what it is about to do and can reserve exactly the right
-    /// capacity before mutating anything.
+    /// insertion will need to evict, plus whether the target origin's
+    /// bucket will still exist afterward. Called *before* any fallible
+    /// allocation is attempted, so `insertLocked` knows precisely what it
+    /// is about to do and can reserve exactly the right capacity before
+    /// mutating anything.
+    ///
+    /// Every already-expired, unleased entry anywhere in the cache is
+    /// unconditionally included in the plan — not merely *preferred* as a
+    /// victim when eviction pressure happens to need one (leased entries
+    /// are never purged, matching `purgeExpiredAllLocked`'s own
+    /// discipline). This is what lets the `max_origins` admission
+    /// decision below be judged against the cache's state *as it will be
+    /// immediately after this insert commits*, rather than its raw
+    /// current state: without this, an origin whose only entries have
+    /// expired but were never purged would permanently occupy an
+    /// `max_origins` slot forever, blocking every other origin
+    /// indefinitely. Because removal is still only *planned* here, not
+    /// applied, this stays fully compatible with the atomicity guarantee:
+    /// a rejected or later-failed insert leaves every expired entry
+    /// exactly as it was.
     fn planInsertionLocked(self: *StatefulServerCache, origin: OriginDigest, new_bytes: usize, now_unix_ms: i64) error{OutOfMemory}!?EvictionPlan {
-        if (!self.canFitLocked(origin, new_bytes)) return null;
-
         var victims: std.ArrayListUnmanaged(u64) = .empty;
         errdefer victims.deinit(self.allocator);
 
-        var origin_count = self.originBucketLen(origin);
-        var global_count = self.entries.count();
-        var global_bytes = self.total_bytes;
+        var leased_count: usize = 0;
+        var leased_bytes: usize = 0;
+        var origin_leased: usize = 0;
+        var global_count: usize = 0;
+        var global_bytes: usize = 0;
+        var origin_count: usize = 0;
+
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            const e = kv.value_ptr.*;
+            const in_origin = std.mem.eql(u8, &e.origin, &origin);
+            if (e.active_lease_epoch != null) {
+                leased_count += 1;
+                leased_bytes += e.bytes;
+                if (in_origin) origin_leased += 1;
+                continue;
+            }
+            if (e.state.common.isExpired(now_unix_ms)) {
+                try victims.append(self.allocator, kv.key_ptr.*);
+                continue;
+            }
+            global_count += 1;
+            global_bytes += e.bytes;
+            if (in_origin) origin_count += 1;
+        }
+
+        // Leased entries are never eviction candidates: if the cache
+        // could never get under its count/byte/per-origin limits using
+        // only unleased entries as victims (this insert's own new entry
+        // included), reject before anything is mutated.
+        if (leased_count >= self.limits.max_entries) {
+            victims.deinit(self.allocator);
+            return null;
+        }
+        if (leased_bytes + new_bytes > self.limits.max_total_bytes) {
+            victims.deinit(self.allocator);
+            return null;
+        }
+        if (origin_leased >= self.limits.max_entries_per_origin) {
+            victims.deinit(self.allocator);
+            return null;
+        }
+
+        const is_new_origin = (origin_count + origin_leased) == 0;
+        if (is_new_origin and self.countDistinctLiveOriginsLocked(now_unix_ms) >= self.limits.max_origins) {
+            victims.deinit(self.allocator);
+            return null;
+        }
 
         while (origin_count >= self.limits.max_entries_per_origin) {
-            const victim = self.findOldestUnleasedInOriginExcluding(origin, victims.items, now_unix_ms) orelse unreachable;
+            const victim = self.findOldestUnleasedInOriginExcluding(origin, victims.items) orelse unreachable;
             try victims.append(self.allocator, victim);
             origin_count -= 1;
             global_count -= 1;
             global_bytes -= self.entries.get(victim).?.bytes;
         }
         while (global_count >= self.limits.max_entries or global_bytes + new_bytes > self.limits.max_total_bytes) {
-            const victim = self.findOldestUnleasedGlobalExcluding(victims.items, now_unix_ms) orelse unreachable;
+            const victim = self.findOldestUnleasedGlobalExcluding(victims.items) orelse unreachable;
             try victims.append(self.allocator, victim);
             global_count -= 1;
             global_bytes -= self.entries.get(victim).?.bytes;
             if (std.mem.eql(u8, &self.entries.get(victim).?.origin, &origin) and origin_count > 0) origin_count -= 1;
         }
 
-        return EvictionPlan{ .victims = victims, .origin_bucket_survives = origin_count > 0 };
+        return EvictionPlan{ .victims = victims, .origin_bucket_survives = (origin_count + origin_leased) > 0 };
     }
 
     /// Mutation order: no expiry purge and no LRU-sequence reservation
@@ -1684,11 +1741,11 @@ pub const StatefulServerCache = struct {
         const handle_digest = digestHandle(&handle);
         if (self.handle_index.contains(handle_digest)) return .rejected_capacity;
 
-        const is_new_origin = !self.origin_index.contains(origin);
-        if (is_new_origin and self.origin_index.count() >= self.limits.max_origins) {
-            return .rejected_capacity;
-        }
-
+        // `planInsertionLocked` folds expiry purging and the
+        // new-origin/`max_origins` admission decision into the same
+        // non-mutating dry run as ordinary capacity eviction — see its
+        // doc comment for why an origin's cardinality must be judged
+        // against a *post-purge* view, not raw current counts.
         var plan = (self.planInsertionLocked(origin, bytes, now_unix_ms) catch return .storage_failed) orelse
             return .rejected_capacity;
 
@@ -2377,6 +2434,78 @@ test "max_origins rejects a new origin once the distinct-origin cap is reached" 
     try testing.expectEqual(StoreResult.rejected_capacity, cache.storeClone(&t2, 1, .reusable));
 }
 
+test "max_origins reclaims an already-expired origin without an explicit cleanup() call" {
+    // Round-6 review #1 regression. `storeLocked` no longer purges
+    // expired entries eagerly (see round 5), but the `max_origins`
+    // admission check must still be judged against the cache's
+    // *post-purge* state, not raw current origin counts — otherwise an
+    // origin whose only entry has expired but was never purged would
+    // permanently occupy an `max_origins` slot, blocking every other
+    // origin indefinitely until some unrelated caller happens to invoke
+    // `cleanup()` first.
+    var limits = Limits.client_default;
+    limits.max_origins = 1;
+    var cache = try ClientSessionCache.init(testing.allocator, limits);
+    defer cache.deinit();
+
+    var t1 = try makeClient(testing.allocator, "t1", "a.test");
+    defer t1.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&t1, 0, .reusable));
+
+    // Far past t1's lifetime — a.test's only entry is now expired, but
+    // nothing has purged it yet.
+    var t2 = try makeClient(testing.allocator, "t2", "b.test");
+    defer t2.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&t2, 2_000_000, .reusable));
+
+    try testing.expectEqual(@as(usize, 1), cache.count());
+    try testing.expectEqualStrings("t2", cache.entries.items[0].ticket.ticket.slice());
+}
+
+test "FailingAllocator sweep: a failed client store never purges an already-expired origin's entry it needed to reclaim" {
+    // Companion to the atomicity sweep above: this specifically forces
+    // the plan to select the expired entry as a victim *because* the
+    // origin-cardinality check requires reclaiming it (max_origins = 1,
+    // new origin), not because of ordinary count/byte pressure. A late
+    // allocation failure must still leave it completely untouched.
+    var backing: [1 << 16]u8 = undefined;
+    var limits = Limits.client_default;
+    limits.max_origins = 1;
+
+    var found_a_failure = false;
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var fba = std.heap.FixedBufferAllocator.init(&backing);
+        var cache = try ClientSessionCache.init(fba.allocator(), limits);
+        defer cache.deinit();
+
+        var stale = try makeClient(fba.allocator(), "already-expired", "a.test");
+        _ = cache.storeClone(&stale, 0, .reusable);
+        stale.deinit();
+
+        const snapshot_bytes = cache.total_bytes;
+        const snapshot_count = cache.entries.items.len;
+
+        var failing = std.testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = fail_index });
+        cache.allocator = failing.allocator();
+        var incoming = try makeClient(std.testing.allocator, "incoming", "b.test");
+        defer incoming.deinit();
+        const result = cache.storeClone(&incoming, 2_000_000, .reusable);
+        cache.allocator = fba.allocator();
+
+        if (result != .storage_failed) {
+            cache.deinit();
+            break;
+        }
+
+        found_a_failure = true;
+        try testing.expectEqual(snapshot_count, cache.entries.items.len);
+        try testing.expectEqual(snapshot_bytes, cache.total_bytes);
+        try testing.expectEqualStrings("already-expired", cache.entries.items[0].ticket.ticket.slice());
+    }
+    try testing.expect(found_a_failure);
+}
+
 test "max_entry_bytes rejects an oversized entry" {
     var limits = Limits.client_default;
     limits.max_entry_bytes = 8;
@@ -2456,6 +2585,42 @@ test "client LRU batch reservation near u64 boundary preserves exact recency ord
         if (e.ticket.ticket.eql(&c.ticket)) has_c = true;
     }
     try testing.expect(has_c);
+}
+
+test "reserveLruSequenceBatchLocked never hands out maxInt(u64) twice" {
+    // Round-6 review #2 regression: the previous guard only reserved room
+    // for the batch's *last* value, not for the counter value the field
+    // would be left holding afterward. With `n = 2` and
+    // `next_lru_sequence = maxInt(u64) - 1`, the old guard didn't
+    // renumber (the batch's last value, `maxInt(u64)`, is representable),
+    // `next_lru_sequence` then saturated to `maxInt(u64)` via `+|`, and a
+    // *subsequent* `n = 1` reservation also didn't renumber (`maxInt(u64)
+    // > maxInt(u64)` is false) — handing out `maxInt(u64)` a second time.
+    var cache = try ClientSessionCache.init(testing.allocator, Limits.client_default);
+    defer cache.deinit();
+
+    cache.next_lru_sequence = std.math.maxInt(u64) - 1;
+    const first_batch = cache.reserveLruSequenceBatchLocked(2);
+    const next_single = cache.reserveLruSequenceBatchLocked(1);
+
+    // Every value handed out (`first_batch`, `first_batch + 1`, and
+    // `next_single`) must be distinct.
+    try testing.expect(next_single != first_batch);
+    try testing.expect(next_single != first_batch + 1);
+    try testing.expect(first_batch + 1 != first_batch);
+}
+
+test "reserveLruSequenceBatchLocked renumbers when next_lru_sequence is already at maxInt(u64)" {
+    var cache = try ClientSessionCache.init(testing.allocator, Limits.client_default);
+    defer cache.deinit();
+    var t1 = try makeClient(testing.allocator, "t1", "example.test");
+    defer t1.deinit();
+    _ = cache.storeClone(&t1, 0, .reusable);
+
+    cache.next_lru_sequence = std.math.maxInt(u64);
+    const v = cache.reserveLruSequenceBatchLocked(1);
+    try testing.expect(v < std.math.maxInt(u64) - 1000);
+    try testing.expect(cache.next_lru_sequence < std.math.maxInt(u64) - 1000);
 }
 
 test "client insertion-sequence renumbering preserves offer order across overflow" {
@@ -2665,6 +2830,74 @@ test "handle generation retries on collision and fails after exhausting attempts
     var handle: [stateful_identity_len]u8 = undefined;
     try testing.expectEqual(StoreResult.rejected_handle_generation_failed, cache.insertMove(&s1, 0, .reusable, &handle));
     s1.deinit();
+}
+
+test "max_origins reclaims an already-expired server origin without an explicit cleanup() call" {
+    // Server-side counterpart to the client regression above.
+    var limits = Limits.stateful_server_default;
+    limits.max_origins = 1;
+    var cache = try StatefulServerCache.init(testing.allocator, limits, system_random_source);
+    defer cache.deinit();
+
+    var s1 = try makeServer(testing.allocator, "a.test");
+    var h1: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&s1, 0, .reusable, &h1));
+
+    // Far past s1's lifetime — a.test's only entry is now expired, but
+    // nothing has purged it yet.
+    var s2 = try makeServer(testing.allocator, "b.test");
+    var h2: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&s2, 2_000_000, .reusable, &h2));
+
+    try testing.expectEqual(@as(usize, 1), cache.count());
+    // Resolved at a time *before* the fixture's fixed `issued_at_unix_ms`
+    // (0) plus its lifetime would itself expire — `now_unix_ms = 2_000_000`
+    // above was only the timestamp `insertMove` used to judge `s1`'s
+    // expiry, not `s2`'s own issue time.
+    var hit_s2 = cache.resolveLease(&h2, 1);
+    defer hit_s2.deinit();
+    try testing.expect(hit_s2 == .hit);
+}
+
+test "FailingAllocator sweep: a failed stateful insert never purges an already-expired origin's entry it needed to reclaim" {
+    var backing: [1 << 16]u8 = undefined;
+    var limits = Limits.stateful_server_default;
+    limits.max_origins = 1;
+
+    var found_a_failure = false;
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var fba = std.heap.FixedBufferAllocator.init(&backing);
+        var cache = try StatefulServerCache.init(fba.allocator(), limits, system_random_source);
+        var s1 = try makeServer(fba.allocator(), "a.test");
+        var h1: [stateful_identity_len]u8 = undefined;
+        try testing.expectEqual(StoreResult.stored, cache.insertMove(&s1, 0, .reusable, &h1));
+
+        const snapshot_count = cache.entries.count();
+        const snapshot_bytes = cache.total_bytes;
+
+        var failing = std.testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = fail_index });
+        cache.allocator = failing.allocator();
+        var s2 = try makeServer(std.testing.allocator, "b.test");
+        defer s2.deinit();
+        var h2: [stateful_identity_len]u8 = undefined;
+        const result = cache.insertMove(&s2, 2_000_000, .reusable, &h2);
+        cache.allocator = fba.allocator();
+
+        if (result != .storage_failed) {
+            cache.deinit();
+            break;
+        }
+
+        found_a_failure = true;
+        try testing.expectEqual(snapshot_count, cache.entries.count());
+        try testing.expectEqual(snapshot_bytes, cache.total_bytes);
+        var still_there = cache.resolveLease(&h1, 1);
+        defer still_there.deinit();
+        try testing.expect(still_there == .hit);
+        cache.deinit();
+    }
+    try testing.expect(found_a_failure);
 }
 
 test "resolveLease refuses a new single-use lease while a persistence operation is in progress" {

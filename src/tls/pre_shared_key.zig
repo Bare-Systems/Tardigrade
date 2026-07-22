@@ -474,6 +474,63 @@ pub const ClientPskOfferSet = struct {
     }
 };
 
+pub const ClientOfferOutcome = union(enum) {
+    selected: usize,
+    not_selected,
+    aborted,
+};
+
+pub const ClientOfferToken = struct {
+    entry_id: u64 = 0,
+    lease_epoch: u64 = 0,
+    single_use: bool = false,
+};
+
+pub const ClientOfferLease = struct {
+    cache_ctx: ?*anyopaque = null,
+    cache_generation: u64 = 0,
+    offers: ClientPskOfferSet = .{},
+    tokens: [max_offered_identities]ClientOfferToken = [_]ClientOfferToken{.{}} ** max_offered_identities,
+    finishFn: ?*const fn (*ClientOfferLease, ClientOfferOutcome) void = null,
+    dropFn: ?*const fn (*ClientOfferLease, usize) void = null,
+    active: bool = false,
+
+    pub fn deinit(self: *ClientOfferLease) void {
+        self.finish(.aborted);
+    }
+
+    pub fn finish(self: *ClientOfferLease, outcome: ClientOfferOutcome) void {
+        self.finishPins(outcome);
+        self.offers.deinit();
+        self.* = .{};
+    }
+
+    pub fn finishPins(self: *ClientOfferLease, outcome: ClientOfferOutcome) void {
+        if (!self.active) return;
+        if (self.finishFn) |f| f(self, outcome);
+        self.active = false;
+        self.cache_ctx = null;
+        self.cache_generation = 0;
+        self.tokens = [_]ClientOfferToken{.{}} ** max_offered_identities;
+        self.finishFn = null;
+        self.dropFn = null;
+    }
+
+    pub fn dropOffer(self: *ClientOfferLease, index: usize) void {
+        std.debug.assert(self.active);
+        std.debug.assert(index < self.offers.len);
+        if (self.dropFn) |f| f(self, index);
+        self.offers.tickets[index].deinit();
+        var i = index;
+        while (i + 1 < self.offers.len) : (i += 1) {
+            self.offers.tickets[i].moveFrom(&self.offers.tickets[i + 1]);
+            self.tokens[i] = self.tokens[i + 1];
+        }
+        self.offers.len -= 1;
+        self.tokens[self.offers.len] = .{};
+    }
+};
+
 // -----------------------------------------------------------------------
 // Server resolver contract, shared by stateful (#364) and stateless (#363)
 // providers.

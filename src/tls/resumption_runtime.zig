@@ -37,7 +37,6 @@ pub const Config = struct {
     server_cache_limits: session_cache.Limits = .stateful_server_default,
 
     pub fn validate(self: Config) error{InvalidConfig}!void {
-        if (self.usage == .single_use) return error.InvalidConfig;
         if (self.ticket_lifetime_seconds == 0 or self.ticket_lifetime_seconds > session.max_lifetime_seconds)
             return error.InvalidConfig;
         if (self.mode != .disabled) {
@@ -208,7 +207,7 @@ test "config validates ticket lifetime ceiling" {
     try std.testing.expectError(error.InvalidConfig, (Config{ .ticket_lifetime_seconds = 0 }).validate());
     try std.testing.expectError(error.InvalidConfig, (Config{ .ticket_lifetime_seconds = session.max_lifetime_seconds + 1 }).validate());
     try (Config{ .ticket_lifetime_seconds = session.max_lifetime_seconds }).validate();
-    try std.testing.expectError(error.InvalidConfig, (Config{ .mode = .stateful, .usage = .single_use }).validate());
+    try (Config{ .mode = .stateful, .usage = .single_use }).validate();
 }
 
 const TestClock = struct {
@@ -258,6 +257,27 @@ fn sampleServerState(allocator: std.mem.Allocator, sni: []const u8) !session.Ser
     return state;
 }
 
+fn sampleClientTicket(allocator: std.mem.Allocator, ticket: []const u8, sni: []const u8) !session.ClientTicketState {
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xab} ** 32),
+        .server_name = sni,
+        .application_protocol = "h3",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 86_400,
+    });
+    var state: session.ClientTicketState = .{};
+    try state.init(allocator, session.Limits.default, &common, .{
+        .ticket = ticket,
+        .ticket_age_add = 1,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    return state;
+}
+
 test "disabled runtime exposes no server resolver and no client offers" {
     var clock = TestClock{};
     var entropy_ctx = TestEntropy{};
@@ -280,6 +300,35 @@ test "disabled runtime exposes no server resolver and no client offers" {
     try std.testing.expect(runtime.server_cache == null);
     try std.testing.expect(runtime.keyring == null);
     try std.testing.expectEqual(@as(usize, 0), entropy_ctx.calls);
+}
+
+test "stateful runtime accepts and offers single_use client tickets" {
+    var clock = TestClock{};
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateful, .usage = .single_use },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    var ticket = try sampleClientTicket(std.testing.allocator, "single-runtime", "runtime.test");
+    defer ticket.deinit();
+    try std.testing.expectEqual(session_cache.StoreResult.stored, runtime.storeClientTicket(&ticket));
+
+    var lookup = runtime.lookupClientOffers(.{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .server_name = "runtime.test",
+        .application_protocol = "h3",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("leaf"),
+    });
+    defer lookup.deinit();
+    try std.testing.expect(lookup == .hit);
+    try std.testing.expect(lookup.hit.active);
+    try std.testing.expectEqual(@as(usize, 1), lookup.hit.offers.len);
+    try std.testing.expectEqualStrings("single-runtime", lookup.hit.offers.constSlice()[0].ticket.slice());
 }
 
 test "stateful runtime resolves TDSH handles and misses TDTK/unknown prefixes" {

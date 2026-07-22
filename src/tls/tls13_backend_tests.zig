@@ -789,11 +789,11 @@ test "PSK round trip falls back to a full handshake when the resolver has no mat
 test "an ineligible offered ticket is filtered without desyncing the wire index of a later valid one" {
     // Regression coverage: `sendClientHello` used to filter eligible
     // tickets while writing the wire offer, but `onServerHello` indexed
-    // the *original*, unfiltered `client_psk_offers` array. With an
+    // the original, unfiltered client offer array. With an
     // expired ticket first and a valid one second, the wire would contain
     // only the valid ticket at index 0, but the client would resolve
     // `selected_identity = 0` back to the expired ticket's PSK — a silent
-    // secret mismatch. `client_psk_offers` is now compacted to exactly the
+    // secret mismatch. Client offers are now compacted to exactly the
     // wire-emitted, wire-ordered subset before `core.start()`, so this
     // must complete cleanly with matching keys on both sides.
     var harness = DirectHarness.init();
@@ -3497,7 +3497,7 @@ test "handshake-phase failure wipes PSK offer state before ServerHello even arri
     var sink = DirectSink{};
     defer sink.deinit();
     try client.backend().start(.client, {}, &sink);
-    try std.testing.expect(!client.client_psk_offers.isEmpty());
+    try std.testing.expect(!client.client_offer_lease.offers.isEmpty());
 
     // A Finished message at the initial epoch (ServerHello was expected) is
     // a wrong-transport-epoch rejection raised by `drainInput` itself,
@@ -3507,7 +3507,7 @@ test "handshake-phase failure wipes PSK offer state before ServerHello even arri
     const finished = try tls_core.messages.encode(.finished, "", &buf);
     try std.testing.expectError(error.UnexpectedTransportEpoch, client.backend().receive(.initial, finished, &sink));
 
-    try std.testing.expect(client.client_psk_offers.isEmpty());
+    try std.testing.expect(client.client_offer_lease.offers.isEmpty());
 }
 
 fn pushTestTicket(offers: *pre_shared_key.ClientPskOfferSet, psk: []const u8, ticket: []const u8) !void {
@@ -3528,6 +3528,54 @@ fn pushTestTicket(offers: *pre_shared_key.ClientPskOfferSet, psk: []const u8, ti
     });
     try offers.push(&state);
 }
+
+fn makeCacheTicket(psk: []const u8, ticket: []const u8) !session.ClientTicketState {
+    return makeCacheTicketIssuedAt(psk, ticket, 0);
+}
+
+fn makeCacheTicketIssuedAt(psk: []const u8, ticket: []const u8, issued_at_unix_ms: i64) !session.ClientTicketState {
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = psk,
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
+        .issued_at_unix_ms = issued_at_unix_ms,
+        .lifetime_seconds = 3600,
+    });
+    var state: session.ClientTicketState = .{};
+    try state.init(std.testing.allocator, session.Limits.default, &common, .{
+        .ticket = ticket,
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    return state;
+}
+
+fn cacheCandidate() session.CandidateContext {
+    return .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
+    };
+}
+
+fn storeCacheTicket(cache: *session_cache.ClientSessionCache, psk: []const u8, ticket: []const u8, now_ms: i64) !void {
+    var state = try makeCacheTicket(psk, ticket);
+    defer state.deinit();
+    try std.testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&state, now_ms, .single_use));
+}
+
+fn storeCacheTicketIssuedAt(cache: *session_cache.ClientSessionCache, psk: []const u8, ticket: []const u8, issued_at_unix_ms: i64, now_ms: i64) !void {
+    var state = try makeCacheTicketIssuedAt(psk, ticket, issued_at_unix_ms);
+    defer state.deinit();
+    try std.testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&state, now_ms, .single_use));
+}
+
+const CacheClock = struct {
+    fn now(_: *anyopaque) i64 {
+        return 0;
+    }
+};
 
 test "client selects a later (non-zero) identity when the server names it" {
     var client = tls_backend.Tls13Backend.initClient(
@@ -3553,7 +3601,7 @@ test "client selects a later (non-zero) identity when the server names it" {
     var sink = DirectSink{};
     defer sink.deinit();
     try client.backend().start(.client, {}, &sink);
-    try std.testing.expectEqual(@as(usize, 2), client.client_psk_offers.len);
+    try std.testing.expectEqual(@as(usize, 2), client.client_offer_lease.offers.len);
 
     var buf: [512]u8 = undefined;
     const hello = try buildServerHello(&buf, .{ .selected_identity = 1 });
@@ -3588,12 +3636,12 @@ test "client rejects a selected_identity equal to or beyond the emitted offer co
         var sink = DirectSink{};
         defer sink.deinit();
         try client.backend().start(.client, {}, &sink);
-        try std.testing.expectEqual(@as(usize, 1), client.client_psk_offers.len); // one offer emitted, index 0 valid
+        try std.testing.expectEqual(@as(usize, 1), client.client_offer_lease.offers.len); // one offer emitted, index 0 valid
 
         var buf: [512]u8 = undefined;
         const hello = try buildServerHello(&buf, .{ .selected_identity = bad_index });
         try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, hello, &sink));
-        try std.testing.expect(client.client_psk_offers.isEmpty());
+        try std.testing.expect(client.client_offer_lease.offers.isEmpty());
         try std.testing.expect(!client.selected_client_psk_present);
         try std.testing.expect(!client.core.psk_authenticated);
     }
@@ -3606,12 +3654,12 @@ test "client rejects a forged selected_identity when no PSK was ever offered" {
         .record,
     );
     defer client.deinit();
-    try std.testing.expect(client.client_psk_offers.isEmpty());
+    try std.testing.expect(client.client_offer_lease.offers.isEmpty());
 
     var sink = DirectSink{};
     defer sink.deinit();
     try client.backend().start(.client, {}, &sink);
-    try std.testing.expect(client.client_psk_offers.isEmpty());
+    try std.testing.expect(client.client_offer_lease.offers.isEmpty());
 
     var buf: [512]u8 = undefined;
     const hello = try buildServerHello(&buf, .{ .selected_identity = 0 });
@@ -3659,13 +3707,13 @@ test "a PSK-selected ServerHello with inconsistent suite/version/key-share is re
         var sink = DirectSink{};
         defer sink.deinit();
         try client.backend().start(.client, {}, &sink);
-        try std.testing.expectEqual(@as(usize, 1), client.client_psk_offers.len);
+        try std.testing.expectEqual(@as(usize, 1), client.client_offer_lease.offers.len);
 
         var buf: [512]u8 = undefined;
         const hello = try buildServerHello(&buf, case.opts);
         try std.testing.expectError(case.expected, client.backend().receive(.initial, hello, &sink));
 
-        try std.testing.expect(client.client_psk_offers.isEmpty());
+        try std.testing.expect(client.client_offer_lease.offers.isEmpty());
         try std.testing.expect(!client.selected_client_psk_present);
         try std.testing.expect(!client.core.psk_authenticated);
         try std.testing.expect(client.schedule == null);
@@ -3710,13 +3758,13 @@ test "a rejected ServerHello observably zeroes the client's offered PSK bytes, n
     var sink = DirectSink{};
     defer sink.deinit();
     try client.backend().start(.client, {}, &sink);
-    try std.testing.expectEqual(@as(usize, 1), client.client_psk_offers.len);
+    try std.testing.expectEqual(@as(usize, 1), client.client_offer_lease.offers.len);
 
     // Captured from the offer's *final* resting place inside the backend
     // (after every intervening move), not the now-defunct local variable
     // above: only this copy is the one `clearFailedHandshakeState` must
     // reach.
-    const settled = &client.client_psk_offers.tickets[0];
+    const settled = &client.client_offer_lease.offers.tickets[0];
     const psk_memory = settled.common.resumption_psk.bytes[0..settled.common.resumption_psk.len];
     const ticket_memory = settled.ticket.slice();
     const nonce_memory = settled.ticket_nonce.bytes[0..settled.ticket_nonce.len];
@@ -3728,7 +3776,7 @@ test "a rejected ServerHello observably zeroes the client's offered PSK bytes, n
     const hello = try buildServerHello(&buf, .{ .selected_identity = 5 }); // beyond the single emitted offer
     try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, hello, &sink));
 
-    try std.testing.expect(client.client_psk_offers.isEmpty());
+    try std.testing.expect(client.client_offer_lease.offers.isEmpty());
     // `resumption_psk`/`ticket_nonce` are embedded fixed-size arrays, never
     // routed through an allocator or an optional-to-null transition, so
     // `secureZero`'s effect is directly and reliably observable here.
@@ -3749,6 +3797,193 @@ test "a rejected ServerHello observably zeroes the client's offered PSK bytes, n
     // by the allocator, so they are unaffected by that undefined-fill.
     try std.testing.expectEqual(@as(usize, 0), settled.ticket.len);
     try std.testing.expectEqual(@as(usize, 0), settled.ticket.bytes.len);
+}
+
+test "cache-backed client offer lease consumes selected identity and releases the rest" {
+    var cache = try session_cache.ClientSessionCache.init(std.testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    const psk_a = [_]u8{0x11} ** tls_backend.hash_len;
+    const psk_b = [_]u8{0x22} ** tls_backend.hash_len;
+    try storeCacheTicket(&cache, &psk_a, "cache-ticket-a", 0);
+    try storeCacheTicket(&cache, &psk_b, "cache-ticket-b", 1);
+
+    var lookup = cache.lookupOffers(cacheCandidate(), 2);
+    defer lookup.deinit();
+    try std.testing.expect(lookup == .hit);
+    try std.testing.expectEqual(@as(usize, 2), lookup.hit.offers.len);
+    try std.testing.expectEqualStrings("cache-ticket-b", lookup.hit.offers.constSlice()[0].ticket.slice());
+    try std.testing.expectEqualStrings("cache-ticket-a", lookup.hit.offers.constSlice()[1].ticket.slice());
+
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer client.deinit();
+    var clock_dummy: u8 = 0;
+    try client.setClientPskOfferLease(&lookup.hit, &clock_dummy, CacheClock.now);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    var buf: [512]u8 = undefined;
+    const hello = try buildServerHello(&buf, .{ .selected_identity = 1 });
+    try client.backend().receive(.initial, hello, &sink);
+
+    try std.testing.expect(client.core.psk_authenticated);
+    try std.testing.expectEqualStrings("cache-ticket-a", client.selected_client_psk.ticket.slice());
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+    var after = cache.lookupOffers(cacheCandidate(), 6);
+    defer after.deinit();
+    try std.testing.expect(after == .hit);
+    try std.testing.expectEqual(@as(usize, 1), after.hit.offers.len);
+    try std.testing.expectEqualStrings("cache-ticket-b", after.hit.offers.constSlice()[0].ticket.slice());
+}
+
+test "cache-backed client offer lease releases all pins for invalid selected_identity" {
+    var cache = try session_cache.ClientSessionCache.init(std.testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    const psk_a = [_]u8{0x31} ** tls_backend.hash_len;
+    const psk_b = [_]u8{0x32} ** tls_backend.hash_len;
+    try storeCacheTicket(&cache, &psk_a, "bad-index-a", 0);
+    try storeCacheTicket(&cache, &psk_b, "bad-index-b", 1);
+
+    var lookup = cache.lookupOffers(cacheCandidate(), 2);
+    defer lookup.deinit();
+    try std.testing.expect(lookup == .hit);
+
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer client.deinit();
+    var clock_dummy: u8 = 0;
+    try client.setClientPskOfferLease(&lookup.hit, &clock_dummy, CacheClock.now);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    var buf: [512]u8 = undefined;
+    const hello = try buildServerHello(&buf, .{ .selected_identity = 7 });
+    try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, hello, &sink));
+
+    try std.testing.expectEqual(@as(usize, 2), cache.count());
+    var after = cache.lookupOffers(cacheCandidate(), 6);
+    defer after.deinit();
+    try std.testing.expect(after == .hit);
+    try std.testing.expectEqual(@as(usize, 2), after.hit.offers.len);
+}
+
+test "cache-backed client offer lease is not_selected when ServerHello omits PSK" {
+    var cache = try session_cache.ClientSessionCache.init(std.testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    const psk = [_]u8{0x41} ** tls_backend.hash_len;
+    try storeCacheTicket(&cache, &psk, "not-selected-cache", 0);
+
+    var lookup = cache.lookupOffers(cacheCandidate(), 1);
+    defer lookup.deinit();
+    try std.testing.expect(lookup == .hit);
+
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer client.deinit();
+    var clock_dummy: u8 = 0;
+    try client.setClientPskOfferLease(&lookup.hit, &clock_dummy, CacheClock.now);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    var buf: [512]u8 = undefined;
+    const hello = try buildServerHello(&buf, .{});
+    try client.backend().receive(.initial, hello, &sink);
+
+    try std.testing.expect(!client.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+    var after = cache.lookupOffers(cacheCandidate(), 2);
+    defer after.deinit();
+    try std.testing.expect(after == .hit);
+    try std.testing.expectEqualStrings("not-selected-cache", after.hit.offers.constSlice()[0].ticket.slice());
+}
+
+test "cache-backed client offer lease aborts on teardown before ServerHello" {
+    var cache = try session_cache.ClientSessionCache.init(std.testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    const psk = [_]u8{0x51} ** tls_backend.hash_len;
+    try storeCacheTicket(&cache, &psk, "aborted-cache", 0);
+
+    var lookup = cache.lookupOffers(cacheCandidate(), 1);
+    defer lookup.deinit();
+    try std.testing.expect(lookup == .hit);
+
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer client.deinit();
+    var clock_dummy: u8 = 0;
+    try client.setClientPskOfferLease(&lookup.hit, &clock_dummy, CacheClock.now);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    var finished_buf: [8]u8 = undefined;
+    const finished = try tls_core.messages.encode(.finished, "", &finished_buf);
+    try std.testing.expectError(error.UnexpectedTransportEpoch, client.backend().receive(.initial, finished, &sink));
+
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+    var after = cache.lookupOffers(cacheCandidate(), 2);
+    defer after.deinit();
+    try std.testing.expect(after == .hit);
+    try std.testing.expectEqualStrings("aborted-cache", after.hit.offers.constSlice()[0].ticket.slice());
+}
+
+test "cache-backed client offer filtering preserves selected index token mapping" {
+    var cache = try session_cache.ClientSessionCache.init(std.testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    const valid_psk = [_]u8{0x61} ** tls_backend.hash_len;
+    const future_psk = [_]u8{0x62} ** tls_backend.hash_len;
+    try storeCacheTicket(&cache, &valid_psk, "mapping-selected", 0);
+    try storeCacheTicketIssuedAt(&cache, &future_psk, "mapping-dropped", 5, 1);
+
+    var lookup = cache.lookupOffers(cacheCandidate(), 6);
+    defer lookup.deinit();
+    try std.testing.expect(lookup == .hit);
+    try std.testing.expectEqual(@as(usize, 2), lookup.hit.offers.len);
+    try std.testing.expectEqualStrings("mapping-dropped", lookup.hit.offers.constSlice()[0].ticket.slice());
+    try std.testing.expectEqualStrings("mapping-selected", lookup.hit.offers.constSlice()[1].ticket.slice());
+
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer client.deinit();
+    var clock_dummy: u8 = 0;
+    try client.setClientPskOfferLease(&lookup.hit, &clock_dummy, CacheClock.now);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    try std.testing.expectEqual(@as(usize, 1), client.client_offer_lease.offers.len);
+    try std.testing.expectEqualStrings("mapping-selected", client.client_offer_lease.offers.constSlice()[0].ticket.slice());
+
+    var buf: [512]u8 = undefined;
+    const hello = try buildServerHello(&buf, .{ .selected_identity = 0 });
+    try client.backend().receive(.initial, hello, &sink);
+
+    try std.testing.expect(client.core.psk_authenticated);
+    try std.testing.expectEqualStrings("mapping-selected", client.selected_client_psk.ticket.slice());
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+    var after = cache.lookupOffers(cacheCandidate(), 6);
+    defer after.deinit();
+    try std.testing.expect(after == .hit);
+    try std.testing.expectEqual(@as(usize, 1), after.hit.offers.len);
+    try std.testing.expectEqualStrings("mapping-dropped", after.hit.offers.constSlice()[0].ticket.slice());
 }
 
 /// Completes a PSK-resumed server handshake driven by `driveServerSelection`

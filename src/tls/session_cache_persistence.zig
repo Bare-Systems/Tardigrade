@@ -398,7 +398,13 @@ pub fn saveClientCache(
     backend: Backend,
     now_unix_ms: i64,
 ) SaveResult {
-    var snapshot = cache.cloneLiveForPersistence(cache.allocator, now_unix_ms) catch return .allocation_failed;
+    const token = cache.beginPersistenceOperation() catch return .cache_busy;
+    defer cache.endPersistenceOperation(token);
+
+    var snapshot = cache.cloneLiveForPersistence(cache.allocator, now_unix_ms) catch |err| return switch (err) {
+        error.OutOfMemory => .allocation_failed,
+        error.CacheBusy => .cache_busy,
+    };
     defer {
         for (snapshot.items) |*p| p.deinit();
         snapshot.deinit(cache.allocator);
@@ -433,6 +439,9 @@ pub fn loadClientCache(
     backend: Backend,
     now_unix_ms: i64,
 ) LoadResult {
+    const token = cache.beginPersistenceOperation() catch return .cache_busy;
+    defer cache.endPersistenceOperation(token);
+
     const sealed = (backend.load(cache.allocator) catch return .backend_failed) orelse return .absent;
     defer {
         secrets.secureZero(sealed);
@@ -971,9 +980,9 @@ test "persistence round trip preserves LRU eviction order across swapRemove-scra
 
         var offers = restored_order.lookupOffers(testCandidate("example.test"), 3);
         defer offers.deinit();
-        try testing.expectEqual(@as(usize, 2), offers.hit.len);
-        try testing.expectEqualStrings("t3", offers.hit.constSlice()[0].ticket.slice());
-        try testing.expectEqualStrings("t1", offers.hit.constSlice()[1].ticket.slice());
+        try testing.expectEqual(@as(usize, 2), offers.hit.offers.len);
+        try testing.expectEqualStrings("t3", offers.hit.offers.constSlice()[0].ticket.slice());
+        try testing.expectEqualStrings("t1", offers.hit.offers.constSlice()[1].ticket.slice());
     }
 
     // Verification B: eviction order survives the round trip. A separate
@@ -991,8 +1000,8 @@ test "persistence round trip preserves LRU eviction order across swapRemove-scra
     // t3 (which was never touched after t1's `lru_sequence` was refreshed).
     var after = restored_evict.lookupOffers(testCandidate("example.test"), 4);
     defer after.deinit();
-    try testing.expectEqual(@as(usize, 1), after.hit.len);
-    try testing.expectEqualStrings("t3", after.hit.constSlice()[0].ticket.slice());
+    try testing.expectEqual(@as(usize, 1), after.hit.offers.len);
+    try testing.expectEqualStrings("t3", after.hit.offers.constSlice()[0].ticket.slice());
 }
 
 test "loadClientCache discards expired entries and enforces current limits on reload" {
@@ -1011,6 +1020,79 @@ test "loadClientCache discards expired entries and enforces current limits on re
     // Reload far past the 1000s lifetime used by `testCommonParams`.
     try testing.expectEqual(LoadResult.loaded, loadClientCache(&restored, session.Limits.default, passthrough_protector, backend.interface(), 2_000_000));
     try testing.expectEqual(@as(usize, 0), restored.count());
+}
+
+test "client persistence is busy during outstanding single-use lease and does not resurrect consumed tickets" {
+    var cache = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    var t1 = try testClient(testing.allocator, "leased-ticket", "example.test");
+    try testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&t1, 0, .single_use));
+    t1.deinit();
+
+    var backend = MemoryBackend{ .allocator = testing.allocator };
+    defer backend.deinit();
+
+    var lease = cache.lookupOffers(testCandidate("example.test"), 1);
+    try testing.expect(lease == .hit);
+    try testing.expectEqual(SaveResult.cache_busy, saveClientCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
+    try testing.expectEqual(LoadResult.cache_busy, loadClientCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 1));
+    try testing.expect(backend.bytes == null);
+
+    lease.hit.finish(.{ .selected = 0 });
+    lease.deinit();
+    try testing.expectEqual(@as(usize, 0), cache.count());
+
+    try testing.expectEqual(SaveResult.saved, saveClientCache(&cache, session.Limits.default, passthrough_protector, backend.interface(), 2));
+    var restored = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
+    defer restored.deinit();
+    try testing.expectEqual(LoadResult.loaded, loadClientCache(&restored, session.Limits.default, passthrough_protector, backend.interface(), 3));
+    try testing.expectEqual(@as(usize, 0), restored.count());
+}
+
+test "stale client lease completion after cache adoption cannot consume the replacement" {
+    var cache = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    var t1 = try testClient(testing.allocator, "old-generation", "example.test");
+    try testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&t1, 0, .single_use));
+    t1.deinit();
+
+    var lease = cache.lookupOffers(testCandidate("example.test"), 1);
+    try testing.expect(lease == .hit);
+    try testing.expectEqualStrings("old-generation", lease.hit.offers.constSlice()[0].ticket.slice());
+
+    const replacement = try testClient(testing.allocator, "replacement-generation", "example.test");
+    var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = replacement, .usage = .single_use, .insertion_sequence = 10, .lru_sequence = 10 }};
+    try cache.restoreClones(&entries, 2);
+
+    lease.hit.finish(.{ .selected = 0 });
+    lease.deinit();
+    try testing.expectEqual(@as(usize, 1), cache.count());
+
+    var after = cache.lookupOffers(testCandidate("example.test"), 3);
+    defer after.deinit();
+    try testing.expect(after == .hit);
+    try testing.expectEqual(@as(usize, 1), after.hit.offers.len);
+    try testing.expectEqualStrings("replacement-generation", after.hit.offers.constSlice()[0].ticket.slice());
+}
+
+test "client persistence allocation failure leaves cache contents unchanged" {
+    var cache = try session_cache.ClientSessionCache.init(testing.allocator, session_cache.Limits.client_default);
+    defer cache.deinit();
+    var t1 = try testClient(testing.allocator, "still-offered", "example.test");
+    try testing.expectEqual(session_cache.StoreResult.stored, cache.storeClone(&t1, 0, .single_use));
+    t1.deinit();
+
+    var backing: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var failing = std.testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, cache.cloneLiveForPersistence(failing.allocator(), 1));
+    try testing.expectEqual(@as(usize, 1), cache.count());
+
+    var after = cache.lookupOffers(testCandidate("example.test"), 2);
+    defer after.deinit();
+    try testing.expect(after == .hit);
+    try testing.expectEqual(@as(usize, 1), after.hit.offers.len);
+    try testing.expectEqualStrings("still-offered", after.hit.offers.constSlice()[0].ticket.slice());
 }
 
 test "saveServerCache refuses a leased single-use entry and succeeds once it is committed" {

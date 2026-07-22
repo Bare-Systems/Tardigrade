@@ -2713,16 +2713,11 @@ pub const Tls13Backend = struct {
         var attempts: usize = 0;
         while (attempts < pre_shared_key.max_offered_identities) : (attempts += 1) {
             const pair = (it.next() catch return null) orelse break;
-            var candidate_state: session.ServerRecoverableState = .{};
-            // Unconditional: a resolver contract violation (a `false`/error
-            // return that nonetheless partially wrote `out`) must never
-            // leak recovered secret state, so this covers every exit from
-            // this iteration — not-found/ineligible `continue`, a resolver
-            // error, and the success `return` below.
-            defer candidate_state.deinit();
-            const found = resolver.resolve(pair.identity.identity, &candidate_state) catch
+            var resolved = resolver.resolve(pair.identity.identity) catch
                 return self.failCredential(.provider_internal_failure);
-            if (!found) continue;
+            defer resolved.deinit();
+            if (resolved == .miss) continue;
+            var hit = &resolved.hit;
 
             const candidate_ctx: session.CandidateContext = .{
                 .cipher_suite = self.negotiated_cipher_suite,
@@ -2732,10 +2727,10 @@ pub const Tls13Backend = struct {
                 .transport_compat = self.candidateTransportCompat(),
                 .application_compat = self.candidateApplicationCompat(),
             };
-            const decision = session.evaluateCompatibility(&candidate_state.common, candidate_ctx, now);
+            const decision = session.evaluateCompatibility(&hit.state.common, candidate_ctx, now);
             if (decision.resumption != .eligible) continue;
 
-            const psk_slice = candidate_state.common.resumption_psk.slice();
+            const psk_slice = hit.state.common.resumption_psk.slice();
             if (psk_slice.len != hash_len) return error.InvalidHandshakeState;
             var psk_buf: [hash_len]u8 = undefined;
             defer crypto.secureZero(u8, &psk_buf);
@@ -2749,14 +2744,12 @@ pub const Tls13Backend = struct {
             // alone never rejects this 1-RTT resumption.
             self.last_psk_age_skew = pre_shared_key.observeAgeSkew(
                 pair.identity.obfuscated_ticket_age,
-                candidate_state.ticket_age_add,
-                elapsedMillis(now, candidate_state.common.issued_at_unix_ms),
+                hit.state.ticket_age_add,
+                elapsedMillis(now, hit.state.common.issued_at_unix_ms),
             );
-            // Move the accepted session into backend ownership instead of
-            // letting the loop-scoped `defer candidate_state.deinit()`
-            // above destroy it — `moveFrom` zero-values `candidate_state`
-            // first, so that deferred deinit becomes a safe no-op.
-            self.selected_server_psk.state.moveFrom(&candidate_state);
+            if (hit.on_selected) |hook| hook.complete();
+            hit.lease.commit();
+            self.selected_server_psk.state.moveFrom(&hit.state);
             self.selected_server_psk.index = @intCast(attempts);
             self.selected_server_psk_present = true;
             return .{ .index = attempts, .psk = psk_buf };

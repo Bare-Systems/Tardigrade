@@ -2,7 +2,7 @@
 //! connections. The main gateway owns high-level request dispatch; this module
 //! owns low-level fd mode, peer address, and per-connection framing helpers.
 
-const compat = @import("zig_compat.zig");
+const compat = @import("zig_compat");
 const std = @import("std");
 const edge_config = @import("edge_config.zig");
 

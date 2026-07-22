@@ -20,6 +20,7 @@ const record_codec = tls_core.record_codec;
 const events = tls_core.events;
 const credentials = tls_core.credentials;
 const session = tls_core.session;
+const session_cache = tls_core.session_cache;
 const sni_provider = tls_core.sni_provider;
 
 fn clientEntropy() tls_backend.Entropy {
@@ -576,12 +577,11 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
         fn now(_: *anyopaque) i64 {
             return 2000;
         }
-        fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.resolve_calls += 1;
-            if (!std.mem.eql(u8, identity, "opaque-psk-ticket")) return false;
-            self.state.cloneInto(std.testing.allocator, out) catch return error.ResolverFailed;
-            return true;
+            if (!std.mem.eql(u8, identity, "opaque-psk-ticket")) return .miss;
+            return clonedResolveHit(self.state, std.testing.allocator);
         }
     };
     // `state` is a pointer, not a copy: `server_state` (below, an
@@ -698,12 +698,11 @@ test "PSK round trip resumes over the extension (QUIC-style) profile with asymme
         fn now(_: *anyopaque) i64 {
             return 2000;
         }
-        fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.resolve_calls += 1;
-            if (!std.mem.eql(u8, identity, "extension-profile-ticket")) return false;
-            self.state.cloneInto(std.testing.allocator, out) catch return error.ResolverFailed;
-            return true;
+            if (!std.mem.eql(u8, identity, "extension-profile-ticket")) return .miss;
+            return clonedResolveHit(self.state, std.testing.allocator);
         }
     };
     // Pointer, not a copy — see the identical note in the record-profile
@@ -768,8 +767,8 @@ test "PSK round trip falls back to a full handshake when the resolver has no mat
         fn now(_: *anyopaque) i64 {
             return 0;
         }
-        fn resolve(_: *anyopaque, _: []const u8, _: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
-            return false;
+        fn resolve(_: *anyopaque, _: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+            return .miss;
         }
     };
     try harness.server_backend.setServerPskResolver(.{
@@ -3123,6 +3122,15 @@ fn pskStoredStateWithBinding(psk: []const u8, auth_binding: session.AuthBinding)
     return state;
 }
 
+fn clonedResolveHit(
+    state: *session.ServerRecoverableState,
+    allocator: std.mem.Allocator,
+) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+    var out: session.ServerRecoverableState = .{};
+    state.cloneInto(allocator, &out) catch return error.ResolverFailed;
+    return .{ .hit = .{ .state = out, .lease = pre_shared_key.ServerPskLease.initNoop() } };
+}
+
 const CountingResolver = struct {
     state: *session.ServerRecoverableState,
     identity: []const u8,
@@ -3131,12 +3139,69 @@ const CountingResolver = struct {
     fn now(_: *anyopaque) i64 {
         return 0;
     }
-    fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+    fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         self.calls += 1;
-        if (!std.mem.eql(u8, identity, self.identity)) return false;
-        self.state.cloneInto(std.testing.allocator, out) catch return error.ResolverFailed;
-        return true;
+        if (!std.mem.eql(u8, identity, self.identity)) return .miss;
+        return clonedResolveHit(self.state, std.testing.allocator);
+    }
+};
+
+const LeaseProbe = struct {
+    commit_count: usize = 0,
+    release_count: usize = 0,
+    deinit_count: usize = 0,
+    sink: ?*DirectSink = null,
+    committed_sink_len: ?usize = null,
+
+    fn lease(self: *LeaseProbe) pre_shared_key.ServerPskLease {
+        return pre_shared_key.ServerPskLease.initOwned(self, commit, release, deinitLease);
+    }
+
+    fn commit(ctx: *anyopaque) void {
+        const self: *LeaseProbe = @ptrCast(@alignCast(ctx));
+        self.commit_count += 1;
+        if (self.sink) |sink| self.committed_sink_len = sink.len;
+    }
+
+    fn release(ctx: *anyopaque) void {
+        const self: *LeaseProbe = @ptrCast(@alignCast(ctx));
+        self.release_count += 1;
+    }
+
+    fn deinitLease(ctx: *anyopaque) void {
+        const self: *LeaseProbe = @ptrCast(@alignCast(ctx));
+        self.deinit_count += 1;
+    }
+};
+
+const TwoIdentityLeaseResolver = struct {
+    first_identity: []const u8,
+    first_state: *session.ServerRecoverableState,
+    first_lease: *LeaseProbe,
+    second_identity: []const u8,
+    second_state: *session.ServerRecoverableState,
+    second_lease: *LeaseProbe,
+    calls: usize = 0,
+
+    fn now(_: *anyopaque) i64 {
+        return 0;
+    }
+
+    fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (std.mem.eql(u8, identity, self.first_identity)) {
+            var out: session.ServerRecoverableState = .{};
+            self.first_state.cloneInto(std.testing.allocator, &out) catch return error.ResolverFailed;
+            return .{ .hit = .{ .state = out, .lease = self.first_lease.lease() } };
+        }
+        if (std.mem.eql(u8, identity, self.second_identity)) {
+            var out: session.ServerRecoverableState = .{};
+            self.second_state.cloneInto(std.testing.allocator, &out) catch return error.ResolverFailed;
+            return .{ .hit = .{ .state = out, .lease = self.second_lease.lease() } };
+        }
+        return .miss;
     }
 };
 
@@ -3810,12 +3875,11 @@ const TimedResolver = struct {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         return self.now_value;
     }
-    fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+    fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         self.calls += 1;
-        if (!std.mem.eql(u8, identity, self.identity)) return false;
-        self.state.cloneInto(std.testing.allocator, out) catch return error.ResolverFailed;
-        return true;
+        if (!std.mem.eql(u8, identity, self.identity)) return .miss;
+        return clonedResolveHit(self.state, std.testing.allocator);
     }
 };
 
@@ -4003,13 +4067,14 @@ const AllocFailResolver = struct {
     fn now(_: *anyopaque) i64 {
         return 0;
     }
-    fn resolve(ctx: *anyopaque, _: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+    fn resolve(ctx: *anyopaque, _: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        self.state.cloneInto(self.allocator, out) catch |err| {
+        var out: session.ServerRecoverableState = .{};
+        self.state.cloneInto(self.allocator, &out) catch |err| {
             self.saw_oom = (err == error.OutOfMemory);
             return error.ResolverFailed;
         };
-        return true;
+        return .{ .hit = .{ .state = out, .lease = pre_shared_key.ServerPskLease.initNoop() } };
     }
 };
 
@@ -4140,7 +4205,7 @@ test "a resolver operational failure is fatal and distinct from an ordinary miss
         fn now(_: *anyopaque) i64 {
             return 0;
         }
-        fn resolve(ctx: *anyopaque, _: []const u8, _: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        fn resolve(ctx: *anyopaque, _: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             return error.ResolverFailed;
@@ -4172,23 +4237,9 @@ test "a resolver that partially populates its output before failing leaves no re
         fn now(_: *anyopaque) i64 {
             return 0;
         }
-        fn resolve(ctx: *anyopaque, _: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+        fn resolve(ctx: *anyopaque, _: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
-            // Contract violation: partially populate `out` (as if a
-            // stateless envelope had decrypted an identity binding but not
-            // yet finished validating it), then fail instead of returning
-            // `false`. The backend must not trust or leak this partial
-            // state.
-            var common: session.ResumableSessionCommon = .{};
-            common.init(std.testing.allocator, session.Limits.default, .{
-                .cipher_suite = .tls_aes_128_gcm_sha256,
-                .resumption_psk = &([_]u8{0x77} ** tls_backend.hash_len),
-                .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
-                .issued_at_unix_ms = 0,
-                .lifetime_seconds = 3600,
-            }) catch unreachable;
-            out.init(&common, 0);
             return error.ResolverFailed;
         }
     };
@@ -4270,6 +4321,298 @@ test "a compatible candidate with a wrong binder is fatal and never probes a lat
     try std.testing.expectEqual(events_before_client_hello, sink.len);
 }
 
+test "resolver lease releases incompatible candidate and commits later selected identity" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0x91} ** tls_backend.hash_len;
+    var incompatible_state = pskStoredStateWithBinding(&psk, session.AuthBinding.fromLeafCertificateDer("different-leaf"));
+    defer incompatible_state.deinit();
+    var compatible_state = pskStoredState(&psk);
+    defer compatible_state.deinit();
+    var incompatible_lease = LeaseProbe{};
+    var compatible_lease = LeaseProbe{};
+    var resolver_state = TwoIdentityLeaseResolver{
+        .first_identity = "incompatible-ticket",
+        .first_state = &incompatible_state,
+        .first_lease = &incompatible_lease,
+        .second_identity = "compatible-ticket",
+        .second_state = &compatible_state,
+        .second_lease = &compatible_lease,
+    };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = TwoIdentityLeaseResolver.now,
+        .resolveFn = TwoIdentityLeaseResolver.resolve,
+    });
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{
+        .{ .identity = "incompatible-ticket", .binder_psk = &psk },
+        .{ .identity = "compatible-ticket", .binder_psk = &psk },
+    } } });
+
+    try std.testing.expectEqual(@as(usize, 2), resolver_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), incompatible_lease.commit_count);
+    try std.testing.expectEqual(@as(usize, 1), incompatible_lease.release_count);
+    try std.testing.expectEqual(@as(usize, 1), incompatible_lease.deinit_count);
+    try std.testing.expectEqual(@as(usize, 1), compatible_lease.commit_count);
+    try std.testing.expectEqual(@as(usize, 0), compatible_lease.release_count);
+    try std.testing.expectEqual(@as(usize, 1), compatible_lease.deinit_count);
+    try std.testing.expect(server.core.psk_authenticated);
+}
+
+test "resolver lease releases bad-binder candidate before fatal failure and probes no later identity" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0x92} ** tls_backend.hash_len;
+    const wrong_psk = [_]u8{0x93} ** tls_backend.hash_len;
+    var first_state = pskStoredState(&psk);
+    defer first_state.deinit();
+    var second_state = pskStoredState(&psk);
+    defer second_state.deinit();
+    var first_lease = LeaseProbe{};
+    var second_lease = LeaseProbe{};
+    var resolver_state = TwoIdentityLeaseResolver{
+        .first_identity = "bad-binder-ticket",
+        .first_state = &first_state,
+        .first_lease = &first_lease,
+        .second_identity = "later-ticket",
+        .second_state = &second_state,
+        .second_lease = &second_lease,
+    };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = TwoIdentityLeaseResolver.now,
+        .resolveFn = TwoIdentityLeaseResolver.resolve,
+    });
+
+    try std.testing.expectError(error.DecryptError, driveServerSelection(&server, .{ .psk = .{ .items = &.{
+        .{ .identity = "bad-binder-ticket", .binder_psk = &wrong_psk },
+        .{ .identity = "later-ticket", .binder_psk = &psk },
+    } } }));
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), first_lease.commit_count);
+    try std.testing.expectEqual(@as(usize, 1), first_lease.release_count);
+    try std.testing.expectEqual(@as(usize, 1), first_lease.deinit_count);
+    try std.testing.expectEqual(@as(usize, 0), second_lease.commit_count);
+    try std.testing.expectEqual(@as(usize, 0), second_lease.release_count);
+    try std.testing.expectEqual(@as(usize, 0), second_lease.deinit_count);
+}
+
+test "resolver lease commits before PSK-selected ServerHello is emitted" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0x94} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var unused_state = pskStoredState(&psk);
+    defer unused_state.deinit();
+    var selected_lease = LeaseProbe{};
+    var unused_lease = LeaseProbe{};
+    var resolver_state = TwoIdentityLeaseResolver{
+        .first_identity = "selected-ticket",
+        .first_state = &stored_state,
+        .first_lease = &selected_lease,
+        .second_identity = "unused-ticket",
+        .second_state = &unused_state,
+        .second_lease = &unused_lease,
+    };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = TwoIdentityLeaseResolver.now,
+        .resolveFn = TwoIdentityLeaseResolver.resolve,
+    });
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    selected_lease.sink = &sink;
+    try server.backend().start(.server, {}, &sink);
+    const events_before_client_hello = sink.len;
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .psk = .{ .items = &.{
+        .{ .identity = "selected-ticket", .binder_psk = &psk },
+    } } });
+    try server.backend().receive(.initial, hello, &sink);
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expectEqual(@as(usize, 1), selected_lease.commit_count);
+    try std.testing.expectEqual(@as(usize, 0), selected_lease.release_count);
+    try std.testing.expectEqual(@as(usize, 1), selected_lease.deinit_count);
+    try std.testing.expectEqual(events_before_client_hello, selected_lease.committed_sink_len.?);
+    try std.testing.expect(sink.len > events_before_client_hello);
+    try std.testing.expect(server.core.psk_authenticated);
+}
+
+test "stateful single-use cache adapter commits selected handle and consumes it" {
+    var cache = try session_cache.StatefulServerCache.init(
+        std.testing.allocator,
+        session_cache.Limits.stateful_server_default,
+        session_cache.system_random_source,
+    );
+    defer cache.deinit();
+
+    const psk = [_]u8{0x95} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    var handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&stored_state, 0, .single_use, &handle),
+    );
+
+    var adapter = session_cache.StatefulServerPskResolverAdapter{
+        .cache = &cache,
+        .allocator = std.testing.allocator,
+        .now_unix_ms = 0,
+    };
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+    try server.setServerPskResolver(adapter.resolver());
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{.{ .identity = &handle, .binder_psk = &psk }} } });
+    try std.testing.expect(server.core.psk_authenticated);
+
+    var after_success = try session_cache.resolveStatefulServerPsk(&cache, std.testing.allocator, &handle, 0);
+    defer after_success.deinit();
+    try std.testing.expect(after_success == .miss);
+}
+
+test "stateful single-use cache adapter releases handle after bad binder" {
+    var cache = try session_cache.StatefulServerCache.init(
+        std.testing.allocator,
+        session_cache.Limits.stateful_server_default,
+        session_cache.system_random_source,
+    );
+    defer cache.deinit();
+
+    const psk = [_]u8{0x96} ** tls_backend.hash_len;
+    const wrong_psk = [_]u8{0x97} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    var handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&stored_state, 0, .single_use, &handle),
+    );
+
+    var adapter = session_cache.StatefulServerPskResolverAdapter{
+        .cache = &cache,
+        .allocator = std.testing.allocator,
+        .now_unix_ms = 0,
+    };
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+    try server.setServerPskResolver(adapter.resolver());
+
+    try std.testing.expectError(error.DecryptError, driveServerSelection(&server, .{ .psk = .{ .items = &.{
+        .{ .identity = &handle, .binder_psk = &wrong_psk },
+    } } }));
+
+    var after_failure = try session_cache.resolveStatefulServerPsk(&cache, std.testing.allocator, &handle, 0);
+    defer after_failure.deinit();
+    try std.testing.expect(after_failure == .hit);
+}
+
+test "stateful reusable cache adapter refreshes LRU only after selected binder success" {
+    var limits = session_cache.Limits.stateful_server_default;
+    limits.max_entries = 3;
+    var cache = try session_cache.StatefulServerCache.init(
+        std.testing.allocator,
+        limits,
+        session_cache.system_random_source,
+    );
+    defer cache.deinit();
+
+    const rejected_psk = [_]u8{0xa1} ** tls_backend.hash_len;
+    var rejected_state = pskStoredStateWithBinding(
+        &rejected_psk,
+        session.AuthBinding.fromLeafCertificateDer("different-leaf"),
+    );
+    var rejected_handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&rejected_state, 0, .reusable, &rejected_handle),
+    );
+
+    const selected_psk = [_]u8{0xa2} ** tls_backend.hash_len;
+    var selected_state = pskStoredState(&selected_psk);
+    var selected_handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&selected_state, 1, .reusable, &selected_handle),
+    );
+
+    const middle_psk = [_]u8{0xa3} ** tls_backend.hash_len;
+    var middle_state = pskStoredState(&middle_psk);
+    var middle_handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&middle_state, 2, .reusable, &middle_handle),
+    );
+
+    var adapter = session_cache.StatefulServerPskResolverAdapter{
+        .cache = &cache,
+        .allocator = std.testing.allocator,
+        .now_unix_ms = 0,
+    };
+
+    var reject_server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer reject_server.deinit();
+    try reject_server.setServerPskResolver(adapter.resolver());
+    try driveServerSelection(&reject_server, .{ .psk = .{ .items = &.{.{
+        .identity = &rejected_handle,
+        .binder_psk = &rejected_psk,
+    }} } });
+    try std.testing.expect(!reject_server.core.psk_authenticated);
+
+    var pressure_state = pskStoredState(&([_]u8{0xa4} ** tls_backend.hash_len));
+    var pressure_handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&pressure_state, 3, .reusable, &pressure_handle),
+    );
+    var rejected_after_pressure = cache.resolveLease(&rejected_handle, 3);
+    defer rejected_after_pressure.deinit();
+    try std.testing.expect(rejected_after_pressure == .miss);
+
+    var selected_after_reject = cache.resolveLease(&selected_handle, 3);
+    defer selected_after_reject.deinit();
+    try std.testing.expect(selected_after_reject == .hit);
+    var middle_after_reject = cache.resolveLease(&middle_handle, 3);
+    defer middle_after_reject.deinit();
+    try std.testing.expect(middle_after_reject == .hit);
+
+    var select_server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer select_server.deinit();
+    try select_server.setServerPskResolver(adapter.resolver());
+    try driveServerSelection(&select_server, .{ .psk = .{ .items = &.{.{
+        .identity = &selected_handle,
+        .binder_psk = &selected_psk,
+    }} } });
+    try std.testing.expect(select_server.core.psk_authenticated);
+
+    var second_pressure_state = pskStoredState(&([_]u8{0xa5} ** tls_backend.hash_len));
+    var second_pressure_handle: [session_cache.stateful_identity_len]u8 = undefined;
+    try std.testing.expectEqual(
+        session_cache.StoreResult.stored,
+        cache.insertMove(&second_pressure_state, 4, .reusable, &second_pressure_handle),
+    );
+
+    var middle_after_success = cache.resolveLease(&middle_handle, 4);
+    defer middle_after_success.deinit();
+    try std.testing.expect(middle_after_success == .miss);
+    var selected_after_success = cache.resolveLease(&selected_handle, 4);
+    defer selected_after_success.deinit();
+    try std.testing.expect(selected_after_success == .hit);
+    var pressure_after_success = cache.resolveLease(&pressure_handle, 4);
+    defer pressure_after_success.deinit();
+    try std.testing.expect(pressure_after_success == .hit);
+    var second_pressure_after_success = cache.resolveLease(&second_pressure_handle, 4);
+    defer second_pressure_after_success.deinit();
+    try std.testing.expect(second_pressure_after_success == .hit);
+}
+
 const FbaCloningResolver = struct {
     state: *session.ServerRecoverableState,
     allocator: std.mem.Allocator,
@@ -4279,17 +4622,16 @@ const FbaCloningResolver = struct {
     fn now(_: *anyopaque) i64 {
         return 0;
     }
-    fn resolve(ctx: *anyopaque, identity: []const u8, out: *session.ServerRecoverableState) pre_shared_key.ResolveError!bool {
+    fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (!std.mem.eql(u8, identity, self.identity)) return false;
+        if (!std.mem.eql(u8, identity, self.identity)) return .miss;
         self.calls += 1;
         // Deliberately clones through a *different* allocator than the one
         // backing `self.state` itself, so the only writes ever made into
         // `allocator`'s backing storage are the transient per-attempt
         // candidate this resolver hands back to `selectPsk` — isolating
         // exactly the allocation this test means to observe.
-        self.state.cloneInto(self.allocator, out) catch return error.ResolverFailed;
-        return true;
+        return clonedResolveHit(self.state, self.allocator);
     }
 };
 

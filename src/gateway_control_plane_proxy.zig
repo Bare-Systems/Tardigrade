@@ -7,7 +7,7 @@
 //! belongs in `gateway_proxy_runtime.zig`, where future streaming/backpressure
 //! work can replace the current bounded-buffer compatibility executor.
 
-const compat = @import("zig_compat.zig");
+const compat = @import("zig_compat");
 const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");

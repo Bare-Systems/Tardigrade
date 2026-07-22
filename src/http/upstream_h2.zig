@@ -23,7 +23,7 @@
 //! worker indefinitely (the #196 guarantee).
 
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const frame = @import("http2_frame.zig");
 const hpack = @import("hpack.zig");
 const tls_termination = @import("tls_backend.zig");

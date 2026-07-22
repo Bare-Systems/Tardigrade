@@ -4,7 +4,7 @@
 //! general `proxy_pass` traffic; control-plane JSON helpers live in
 //! `gateway_control_plane_proxy.zig`.
 
-const compat = @import("zig_compat.zig");
+const compat = @import("zig_compat");
 const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");

@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 
 /// AES-256-GCM AEAD used for `ENC2:` secret storage.
 /// Key length: 32 bytes. Nonce length: 12 bytes. Tag length: 16 bytes.

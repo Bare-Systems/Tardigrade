@@ -1,4 +1,4 @@
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 /// DNS-based upstream service discovery for Tardigrade.
 ///
 /// Resolves a configured hostname to its A/AAAA addresses and produces a list

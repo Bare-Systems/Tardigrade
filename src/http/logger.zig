@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 
 /// Log severity levels, ordered from most to least verbose.
 pub const Level = enum(u8) {

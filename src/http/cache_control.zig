@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const Response = @import("response.zig").Response;
 
 /// Cache-Control directives configuration.

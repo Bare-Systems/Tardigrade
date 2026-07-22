@@ -1,4 +1,4 @@
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const std = @import("std");
 
 /// Thread-safe fixed-size byte buffer pool.

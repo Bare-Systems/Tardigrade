@@ -1,7 +1,7 @@
 //! Static-file runtime helpers for the edge gateway. This module owns static
 //! location serving, try_files fallback, and static error-page resolution.
 
-const compat = @import("zig_compat.zig");
+const compat = @import("zig_compat");
 const builtin = @import("builtin");
 const std = @import("std");
 const http = @import("http.zig");

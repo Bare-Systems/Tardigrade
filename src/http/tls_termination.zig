@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 const acme_client = @import("acme_client.zig");
 const encrypted_stream = @import("tls_core").encrypted_stream;
 const metrics_mod = @import("metrics.zig");

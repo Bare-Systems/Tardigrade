@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const compat = @import("zig_compat.zig");
+const compat = @import("zig_compat");
 const http = @import("http.zig");
 const tls_core = @import("tls_core");
 

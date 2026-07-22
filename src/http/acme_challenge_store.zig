@@ -7,7 +7,7 @@
 //! reads from this store to serve `/.well-known/acme-challenge/<token>`.
 
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
+const compat = @import("zig_compat");
 
 /// Thread-safe store for HTTP-01 ACME challenge tokens.
 pub const ChallengeStore = struct {

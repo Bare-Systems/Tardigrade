@@ -636,7 +636,9 @@ pub const ClientSessionCache = struct {
             }
         };
         var buf: [hard_max_entries_per_origin]Candidate = undefined;
+        var expired_ids: [hard_max_entries_per_origin]u64 = undefined;
         var n: usize = 0;
+        var expired_count: usize = 0;
         var had_expired_removal = false;
         var had_incompatible = false;
         var storage_failed = false;
@@ -662,10 +664,12 @@ pub const ClientSessionCache = struct {
                     continue;
                 }
                 if (e.ticket.common.isExpired(now_unix_ms) and e.active_lease_epoch == null) {
-                    _ = self.entries.swapRemove(i);
-                    self.total_bytes -= e.bytes;
-                    destroyClientEntry(self.allocator, e);
+                    if (expired_count < expired_ids.len) {
+                        expired_ids[expired_count] = e.entry_id;
+                        expired_count += 1;
+                    }
                     had_expired_removal = true;
+                    i += 1;
                     continue;
                 }
                 if (e.usage == .single_use and e.active_lease_epoch != null) {
@@ -705,12 +709,21 @@ pub const ClientSessionCache = struct {
             }
 
             // Phase 2: only now — with every selected clone already
-            // successful — reserve the batch (infallible, see module doc)
-            // and apply it. Re-find each entry by its stable `entry_id`
-            // rather than trusting a physical index captured before this
-            // point, since reservation may renumber and therefore
-            // physically reorder the backing array.
+            // successful — remove staged expired entries, then reserve the
+            // LRU batch (infallible, see module doc) and apply it. Re-find
+            // each entry by its stable `entry_id` rather than trusting a
+            // physical index captured before this point, since expiry
+            // removal or reservation may reorder the backing array.
             if (!storage_failed and clone_count > 0) {
+                for (expired_ids[0..expired_count]) |entry_id| {
+                    const idx = self.findIndexByEntryId(entry_id) orelse continue;
+                    const e = self.entries.items[idx];
+                    if (!e.ticket.common.isExpired(now_unix_ms) or e.active_lease_epoch != null) continue;
+                    _ = self.entries.swapRemove(idx);
+                    self.total_bytes -= e.bytes;
+                    destroyClientEntry(self.allocator, e);
+                }
+
                 const first_seq = self.reserveLruSequenceBatchLocked(clone_count);
                 for (0..clone_count) |offset| {
                     const idx = self.findIndexByEntryId(clone_entry_ids[offset]) orelse continue;
@@ -722,6 +735,15 @@ pub const ClientSessionCache = struct {
                     }
                     clone_lease_epochs[offset] = e.active_lease_epoch orelse 0;
                     clone_single_use[offset] = e.usage == .single_use;
+                }
+            } else if (!storage_failed and clone_count == 0 and expired_count > 0) {
+                for (expired_ids[0..expired_count]) |entry_id| {
+                    const idx = self.findIndexByEntryId(entry_id) orelse continue;
+                    const e = self.entries.items[idx];
+                    if (!e.ticket.common.isExpired(now_unix_ms) or e.active_lease_epoch != null) continue;
+                    _ = self.entries.swapRemove(idx);
+                    self.total_bytes -= e.bytes;
+                    destroyClientEntry(self.allocator, e);
                 }
             }
         }
@@ -2491,6 +2513,21 @@ fn makeClient(allocator: std.mem.Allocator, ticket: []const u8, sni: []const u8)
     return makeClientWithSecret(allocator, ticket, sni, &([_]u8{0xab} ** 32), "n");
 }
 
+fn makeClientIssuedAt(allocator: std.mem.Allocator, ticket: []const u8, sni: []const u8, issued_at_unix_ms: i64) !session.ClientTicketState {
+    var params = commonParams(&([_]u8{0xab} ** 32), sni);
+    params.issued_at_unix_ms = issued_at_unix_ms;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(allocator, session.Limits.default, params);
+    var state: session.ClientTicketState = .{};
+    try state.init(allocator, session.Limits.default, &common, .{
+        .ticket = ticket,
+        .ticket_age_add = 1,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = issued_at_unix_ms,
+    });
+    return state;
+}
+
 fn makeClientWithSecret(allocator: std.mem.Allocator, ticket: []const u8, sni: []const u8, psk: []const u8, nonce: []const u8) !session.ClientTicketState {
     var common: session.ResumableSessionCommon = .{};
     try common.init(allocator, session.Limits.default, commonParams(psk, sni));
@@ -2664,6 +2701,63 @@ test "consumed single_use client entry wipes inline secrets from allocator backi
 
     try testing.expect(std.mem.indexOf(u8, &backing, &consumed_psk) == null);
     try testing.expect(std.mem.indexOf(u8, &backing, consumed_nonce) == null);
+}
+
+test "lookupOffers clone allocation failure leaves expired entries and accounting unchanged" {
+    var backing: [1 << 16]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var cache = try ClientSessionCache.init(fba.allocator(), Limits.client_default);
+    defer cache.deinit();
+
+    var expired = try makeClient(fba.allocator(), "expired-during-oom", "oom.test");
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&expired, 0, .single_use));
+    expired.deinit();
+
+    var live = try makeClientIssuedAt(fba.allocator(), "live-during-oom", "oom.test", 1_500_000);
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&live, 1, .single_use));
+    live.deinit();
+
+    const snapshot_count = cache.count();
+    const snapshot_bytes = cache.total_bytes;
+    const snapshot_next_ins = cache.next_insertion_sequence;
+    const snapshot_next_lru = cache.next_lru_sequence;
+    const snapshot_next_lease = cache.next_lease_epoch;
+    const snapshot_generation = cache.cache_generation;
+    var snapshot_ids: [2]u64 = undefined;
+    var snapshot_lru: [2]u64 = undefined;
+    var snapshot_active: [2]?u64 = undefined;
+    var snapshot_tickets: [2][32]u8 = undefined;
+    var snapshot_ticket_lens: [2]usize = undefined;
+    for (cache.entries.items, 0..) |entry, i| {
+        snapshot_ids[i] = entry.entry_id;
+        snapshot_lru[i] = entry.lru_sequence;
+        snapshot_active[i] = entry.active_lease_epoch;
+        const ticket = entry.ticket.ticket.slice();
+        snapshot_ticket_lens[i] = ticket.len;
+        @memcpy(snapshot_tickets[i][0..ticket.len], ticket);
+    }
+
+    var failing = testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = 0 });
+    const original_allocator = cache.allocator;
+    cache.allocator = failing.allocator();
+    var result = cache.lookupOffers(testCandidate("oom.test"), 2_000_000);
+    result.deinit();
+    cache.allocator = original_allocator;
+    try testing.expect(result == .storage_failed);
+
+    try testing.expectEqual(snapshot_count, cache.count());
+    try testing.expectEqual(snapshot_bytes, cache.total_bytes);
+    try testing.expectEqual(snapshot_next_ins, cache.next_insertion_sequence);
+    try testing.expectEqual(snapshot_next_lru, cache.next_lru_sequence);
+    try testing.expectEqual(snapshot_next_lease, cache.next_lease_epoch);
+    try testing.expectEqual(snapshot_generation, cache.cache_generation);
+    try testing.expectEqual(@as(usize, 2), cache.entries.items.len);
+    for (cache.entries.items, 0..) |entry, i| {
+        try testing.expectEqual(snapshot_ids[i], entry.entry_id);
+        try testing.expectEqual(snapshot_lru[i], entry.lru_sequence);
+        try testing.expectEqual(snapshot_active[i], entry.active_lease_epoch);
+        try testing.expectEqualStrings(snapshot_tickets[i][0..snapshot_ticket_lens[i]], entry.ticket.ticket.slice());
+    }
 }
 
 test "single_use not_selected and aborted outcomes release without consuming" {

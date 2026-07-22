@@ -2640,6 +2640,32 @@ test "single_use lookup pins entries until selected outcome consumes exactly one
     try testing.expectEqualStrings("single-1", after.hit.offers.constSlice()[0].ticket.slice());
 }
 
+test "consumed single_use client entry wipes inline secrets from allocator backing memory" {
+    var backing: [1 << 16]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var cache = try ClientSessionCache.init(fba.allocator(), Limits.client_default);
+    defer cache.deinit();
+
+    const consumed_psk = [_]u8{0x47} ** 32;
+    const consumed_nonce = "CONSUMED-CLIENT-ENTRY-SECRET-NONCE";
+
+    var target = try makeClientWithSecret(fba.allocator(), "consume-ticket", "consume.test", &consumed_psk, consumed_nonce);
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&target, 0, .single_use));
+    target.deinit();
+
+    try testing.expect(std.mem.indexOf(u8, &backing, &consumed_psk) != null);
+    try testing.expect(std.mem.indexOf(u8, &backing, consumed_nonce) != null);
+
+    var lease = cache.lookupOffers(testCandidate("consume.test"), 1);
+    try testing.expect(lease == .hit);
+    lease.hit.finish(.{ .selected = 0 });
+    lease.deinit();
+    try testing.expectEqual(@as(usize, 0), cache.count());
+
+    try testing.expect(std.mem.indexOf(u8, &backing, &consumed_psk) == null);
+    try testing.expect(std.mem.indexOf(u8, &backing, consumed_nonce) == null);
+}
+
 test "single_use not_selected and aborted outcomes release without consuming" {
     var cache = try ClientSessionCache.init(testing.allocator, Limits.client_default);
     defer cache.deinit();

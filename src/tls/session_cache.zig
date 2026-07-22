@@ -1426,7 +1426,6 @@ pub fn resolveStatefulServerPsk(
             if (!hit.lease.single_use) {
                 var state: session.ServerRecoverableState = .{};
                 state.moveFrom(&hit.state);
-                hit.lease.active = false;
                 return .{ .hit = .{
                     .state = state,
                     .lease = pre_shared_key.ServerPskLease.initNoop(),

@@ -50,9 +50,10 @@ pub const HandshakeError = error{
     /// whose vector is empty or malformed, which remains a decode or parameter
     /// failure. Maps to `missing_extension` (RFC 8446 §6).
     MissingExtension,
-    /// A peer sent an extension that is syntactically valid but not permitted
-    /// in the current handshake context. Maps to `unsupported_extension`
-    /// (RFC 8446 §6).
+    /// The peer returned an extension for which the local endpoint did not send
+    /// the corresponding request, except where the protocol explicitly permits
+    /// an unsolicited extension such as `cookie` in HelloRetryRequest. Maps to
+    /// `unsupported_extension` (RFC 8446 §6).
     UnsupportedExtension,
     /// ALPN did not negotiate an acceptable application protocol.
     AlpnMismatch,

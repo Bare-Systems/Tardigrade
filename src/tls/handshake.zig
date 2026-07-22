@@ -145,6 +145,10 @@ pub const Core = struct {
         const message = messages.decode(raw) catch return error.MalformedHandshake;
         if (message.kind == .client_hello and self.retry_state == .hrr_sent)
             return error.UnexpectedHandshakeMessage;
+        if (self.role == .client and
+            message.kind == .server_hello and
+            self.handshake_state != .client_hello)
+            return error.UnexpectedHandshakeMessage;
         if (message.kind == .new_session_ticket) {
             if (self.handshake_lifecycle != .complete or self.role != .client)
                 return error.UnexpectedHandshakeMessage;
@@ -531,6 +535,19 @@ test "core rejects HRR before ClientHello1 was recorded without rebinding transc
     const after = client.transcriptHash();
     try std.testing.expectEqualSlices(u8, &before, &after);
     try std.testing.expectEqual(RetryState.none, client.retry_state);
+}
+
+test "core rejects normal ServerHello before ClientHello1 was recorded" {
+    var client = Core.init(.client);
+    try client.start();
+    const before = client.transcriptHash();
+
+    var bytes: [8]u8 = undefined;
+    const sh = try messages.encode(.server_hello, "sh", &bytes);
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, client.acceptReceived(sh));
+    const after = client.transcriptHash();
+    try std.testing.expectEqualSlices(u8, &before, &after);
+    try std.testing.expectEqual(state.HandshakeState.idle, client.handshake_state);
 }
 
 test "core requires dedicated ClientHello2 transitions after HRR" {

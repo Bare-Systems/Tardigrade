@@ -69,6 +69,7 @@ pub fn decode(
                 selected_version = try decodeSelectedVersion(extension.data, original_offers);
             },
             .key_share => {
+                if (!original_offers.key_share_seen) return error.UnsupportedExtension;
                 if (selected_group != null) return error.IllegalParameter;
                 selected_group = try decodeSelectedGroup(extension.data, original_offers);
             },
@@ -154,6 +155,8 @@ pub fn validateSecondClientHello(
     const second = try ClientHelloView.parse(second_message.body);
     try requirePskLast(first.extensions());
     try requirePskLast(second.extensions());
+    try validatePadding(first.extensions());
+    try validatePadding(second.extensions());
 
     if (!std.mem.eql(u8, first.legacy_version, second.legacy_version) or
         !std.mem.eql(u8, first.random, second.random) or
@@ -303,6 +306,14 @@ fn requirePskLast(extensions: []const ExtensionView) Error!void {
     }
 }
 
+fn validatePadding(extensions: []const ExtensionView) Error!void {
+    for (extensions) |extension| {
+        if (extension.id == @intFromEnum(algorithms.ExtensionType.padding) and
+            !std.mem.allEqual(u8, extension.data, 0))
+            return error.IllegalParameter;
+    }
+}
+
 fn requireSamePskIdentityOrder(first: []const u8, second: []const u8) Error!void {
     const first_psks = pre_shared_key.OfferedPsks.parse(first) catch return error.IllegalParameter;
     const second_psks = pre_shared_key.OfferedPsks.parse(second) catch return error.IllegalParameter;
@@ -402,6 +413,23 @@ test "decodes key-share and cookie HRR" {
     try testing.expectEqual(algorithms.CipherSuite.tls_aes_128_gcm_sha256, request.cipher_suite);
     try testing.expectEqual(algorithms.NamedGroup.x25519, request.selected_group.?);
     try testing.expectEqualStrings("cookie", request.cookie.?);
+}
+
+test "HRR key_share is unsupported when ClientHello1 omitted key_share extension" {
+    var offers = try baseOffers();
+    offers.key_share_seen = false;
+    var raw: [256]u8 = undefined;
+    const encoded = try encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+    }, &raw);
+    const message = try messages.decode(encoded);
+    try testing.expectError(error.UnsupportedExtension, decode(message.body, "", &offers));
+    try testing.expectEqual(alerts.AlertDescription.unsupported_extension, alerts.fromHandshakeError(error.UnsupportedExtension));
+
+    offers.key_share_seen = true;
+    _ = try decode(message.body, "", &offers);
 }
 
 test "rejects no-op and empty-cookie HRR" {
@@ -716,6 +744,31 @@ test "ClientHello2 validator accepts cookie-only HRR with unchanged key share" {
         .cipher_suite = .tls_aes_128_gcm_sha256,
         .selected_group = null,
         .cookie = "cookie",
+    }));
+}
+
+test "ClientHello2 validator permits only zero-filled padding mutations" {
+    const empty_padding = ExtensionView{ .id = @intFromEnum(algorithms.ExtensionType.padding), .data = "" };
+    const zero_padding = ExtensionView{ .id = @intFromEnum(algorithms.ExtensionType.padding), .data = &.{ 0, 0, 0, 0 } };
+    const nonzero_padding = ExtensionView{ .id = @intFromEnum(algorithms.ExtensionType.padding), .data = &.{ 0, 1, 0 } };
+
+    var first_buf: [768]u8 = undefined;
+    var second_buf: [768]u8 = undefined;
+    const first = try clientHelloWithExtensionList(&first_buf, 0xaa, .x25519, &.{empty_padding});
+    const resized_zero = try clientHelloWithExtensionList(&second_buf, 0xaa, .x25519, &.{zero_padding});
+    try validateSecondClientHello(first, resized_zero, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = null,
+        .cookie = null,
+    });
+
+    const invalid = try clientHelloWithExtensionList(&second_buf, 0xaa, .x25519, &.{nonzero_padding});
+    try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, invalid, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = null,
+        .cookie = null,
     }));
 }
 

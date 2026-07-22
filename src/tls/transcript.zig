@@ -86,15 +86,17 @@ test "rebindClientHello produces deterministic HRR transcript fixture" {
 
     var transcript = Transcript{};
     transcript.update(&client_hello_1);
-    const ch1_hash = transcript.peek();
     transcript.rebindClientHello();
     transcript.update(&hello_retry_request);
     transcript.update(&client_hello_2);
 
+    var independent_ch1_hash: [digest_len]u8 = undefined;
+    Hash.hash(&client_hello_1, &independent_ch1_hash, .{});
+
     var synthetic: [4 + digest_len]u8 = undefined;
     synthetic[0] = @intFromEnum(messages.MessageType.message_hash);
     std.mem.writeInt(u24, synthetic[1..4], digest_len, .big);
-    @memcpy(synthetic[4..], &ch1_hash);
+    @memcpy(synthetic[4..], &independent_ch1_hash);
 
     var direct = Hash.init(.{});
     direct.update(&synthetic);

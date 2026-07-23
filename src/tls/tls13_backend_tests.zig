@@ -658,7 +658,16 @@ const IssuedEarlyTicket = struct {
 /// server's recoverable state (for a `resumed` connection's resolver) with
 /// ownership moved out for the caller to `deinit`.
 fn issueEarlyCapableTicket(max_early_data_size: ?u32) !IssuedEarlyTicket {
-    var harness = DirectHarness.init();
+    return issueEarlyCapableTicketProfile(.record, max_early_data_size);
+}
+
+const EarlyTicketProfile = enum { record, extension };
+
+fn issueEarlyCapableTicketProfile(profile: EarlyTicketProfile, max_early_data_size: ?u32) !IssuedEarlyTicket {
+    var harness = switch (profile) {
+        .record => DirectHarness.init(),
+        .extension => DirectHarness.initExtension(),
+    };
     defer harness.deinit();
 
     const TicketCapture = struct {
@@ -801,6 +810,7 @@ test "0-RTT round trip: an early-capable ticket, matching policy, and an allowin
     // The ticket's own advertised allowance (32, from `issueEarlyCapableTicket`
     // above) survives into the accepted decision for the next carrier slice,
     // rather than being discarded at `.allowed => {}`.
+    try std.testing.expectEqual(@as(u32, 32), resumed.client_backend.earlyDataMaxBytes());
     try std.testing.expectEqual(@as(u32, 32), resumed.server_backend.earlyDataMaxBytes());
 
     const seen_candidate = replay_gate.seen orelse return error.TestExpectedEqual;
@@ -857,6 +867,7 @@ test "0-RTT is never attempted for a resume-only ticket even with client intent 
     try std.testing.expect(resumed.client_backend.core.psk_authenticated);
     try std.testing.expect(!resumed.client_backend.earlyDataAttempted());
     try std.testing.expect(!resumed.client_backend.earlyDataAccepted());
+    try std.testing.expectEqual(@as(u32, 0), resumed.client_backend.earlyDataMaxBytes());
     try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
     try std.testing.expectEqual(@as(?SecretSnapshot, null), resumed.observed.zero_rtt_secret[0]);
     try std.testing.expectEqual(@as(?SecretSnapshot, null), resumed.observed.zero_rtt_secret[1]);
@@ -1043,11 +1054,11 @@ test "0-RTT anti-replay defaults to unavailable (fails closed) when no gate is c
     try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_unavailable, resumed.server_backend.earlyDataDecision());
 }
 
-test "an early-data-specific compatibility gate can reject only 0-RTT while resumption still completes" {
-    var issued = try issueEarlyCapableTicket(32);
+test "an early-data-specific compatibility gate sees remembered transport metadata and rejects only 0-RTT" {
+    var issued = try issueEarlyCapableTicketProfile(.extension, 32);
     defer issued.deinit();
 
-    var resumed = DirectHarness.init();
+    var resumed = DirectHarness.initExtension();
     defer resumed.deinit();
 
     var offers: pre_shared_key.ClientPskOfferSet = .{};
@@ -1060,21 +1071,29 @@ test "an early-data-specific compatibility gate can reject only 0-RTT while resu
         .nowUnixMsFn = IdentityResolver.now,
         .resolveFn = IdentityResolver.resolve,
     });
+    try resumed.client_backend.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
+    try resumed.server_backend.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
     try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
     try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
 
-    // A gate that always reports a transport mismatch — modeling a future
-    // QUIC-owned "remembered transport parameters were reduced" check
-    // (#366 letter S) — deliberately independent of `resume_compat`
-    // (never configured `.exact` here), proving early data and ordinary
-    // resumption are no longer coupled through the same compatibility path.
+    const CapturingCompatGate = struct {
+        seen: ?tls_backend.EarlyDataCompatibilityCandidate = null,
+
+        fn decide(ctx: *anyopaque, candidate: tls_backend.EarlyDataCompatibilityCandidate) tls_backend.EarlyDataCompatibilityDecision {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen = candidate;
+            return .transport_incompatible;
+        }
+    };
+    var compat_gate = CapturingCompatGate{};
+    // A gate that reports a transport mismatch — modeling a future QUIC-owned
+    // "remembered transport parameters were reduced" check (#366 letter S) —
+    // deliberately independent of `resume_compat` (never configured `.exact`
+    // here), proving early data and ordinary resumption are no longer coupled
+    // through the same compatibility path.
     try resumed.server_backend.setEarlyDataCompatibilityGate(.{
-        .ctx = undefined,
-        .decideFn = struct {
-            fn decide(_: *anyopaque, _: tls_backend.EarlyDataCompatibilityCandidate) tls_backend.EarlyDataCompatibilityDecision {
-                return .transport_incompatible;
-            }
-        }.decide,
+        .ctx = &compat_gate,
+        .decideFn = CapturingCompatGate.decide,
     });
 
     try resumed.run();
@@ -1088,6 +1107,11 @@ test "an early-data-specific compatibility gate can reject only 0-RTT while resu
     try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
     try std.testing.expectEqual(tls_backend.EarlyDataDecision.transport_incompatible, resumed.server_backend.earlyDataDecision());
     try std.testing.expectEqual(@as(u32, 0), resumed.server_backend.earlyDataMaxBytes());
+    const remembered = (compat_gate.seen orelse return error.TestExpectedEqual).remembered_transport orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 57), remembered.format_id);
+    try std.testing.expectEqual(@as(u16, 1), remembered.format_version);
+    try std.testing.expectEqualStrings("server transport parameters", remembered.bytes);
 }
 
 test "0-RTT is rejected when the server selects an identity other than 0, even though the client attempted it" {
@@ -1199,6 +1223,69 @@ test "the ClientHello wire-encodes early_data before pre_shared_key only when 0-
     // beyond the harness's own `deinit`, which only runs the drivers'
     // `deinit` when `drivers_ready` — already true here.
     resumed.server_driver = DirectDriver.init(.server, resumed.server_backend.backend());
+}
+
+test "early-data intent does not trim a later 1-RTT PSK when identity 0 is resume-only at the ClientHello boundary" {
+    const first_psk = [_]u8{0x41} ** tls_backend.hash_len;
+    const second_psk = [_]u8{0x42} ** tls_backend.hash_len;
+    const one_byte_ticket = [_]u8{'a'};
+    const max_ticket = [_]u8{'b'} ** session.Limits.default.max_ticket_len;
+
+    var long_names: [16][255]u8 = undefined;
+    var alpns: [16]tls_core.policy.ProtocolName = undefined;
+    for (long_names[0..15], 0..) |*name, i| {
+        @memset(name, @intCast(i + 1));
+        alpns[i] = .{ .bytes = name[0..255] };
+    }
+
+    var found_boundary = false;
+    var trial_len: usize = 1;
+    while (trial_len <= 255 and !found_boundary) : (trial_len += 1) {
+        @memset(&long_names[15], 0xaa);
+        alpns[15] = .{ .bytes = long_names[15][0..trial_len] };
+
+        var policy = tls_core.policy.Policy.recordDefault();
+        policy.alpn_protocols = &alpns;
+        var client = tls_backend.Tls13Backend.initClientConfigured(
+            clientEntropy(),
+            .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+            tls_backend.recordConfig(policy),
+            .{},
+        );
+        defer client.deinit();
+
+        var offers: pre_shared_key.ClientPskOfferSet = .{};
+        try pushTestTicketWithEarlyPolicy(&offers, &first_psk, &one_byte_ticket, .resume_only);
+        try pushTestTicketWithEarlyPolicy(&offers, &second_psk, &max_ticket, .resume_only);
+        var clock_dummy: u8 = 0;
+        const Clock = struct {
+            fn now(_: *anyopaque) i64 {
+                return 0;
+            }
+        };
+        try client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+        try client.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16_384 });
+
+        var sink = DirectSink{};
+        defer sink.deinit();
+        try client.backend().start(.client, {}, &sink);
+
+        var client_hello: ?[]const u8 = null;
+        for (sink.items[0..sink.len]) |event| {
+            if (event == .handshake_bytes) client_hello = event.handshake_bytes.data;
+        }
+        const ch = client_hello orelse return error.TestExpectedEqual;
+        if (ch.len <= tls_backend.max_message_len - 4) continue;
+
+        found_boundary = true;
+        try std.testing.expectEqual(@as(usize, 2), client.client_offer_lease.offers.len);
+        try std.testing.expect(!client.earlyDataAttempted());
+        try std.testing.expectEqual(@as(u32, 0), client.earlyDataMaxBytes());
+        const early_data_ext: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.early_data);
+        try std.testing.expect(std.mem.indexOf(u8, ch, &std.mem.toBytes(std.mem.nativeToBig(u16, early_data_ext))) == null);
+    }
+
+    try std.testing.expect(found_boundary);
 }
 
 fn expectRuntimeResumedRecordHandshake(
@@ -4297,6 +4384,15 @@ test "handshake-phase failure wipes PSK offer state before ServerHello even arri
 }
 
 fn pushTestTicket(offers: *pre_shared_key.ClientPskOfferSet, psk: []const u8, ticket: []const u8) !void {
+    try pushTestTicketWithEarlyPolicy(offers, psk, ticket, .resume_only);
+}
+
+fn pushTestTicketWithEarlyPolicy(
+    offers: *pre_shared_key.ClientPskOfferSet,
+    psk: []const u8,
+    ticket: []const u8,
+    early_data: session.EarlyDataPolicy,
+) !void {
     var common: session.ResumableSessionCommon = .{};
     try common.init(std.testing.allocator, session.Limits.default, .{
         .cipher_suite = .tls_aes_128_gcm_sha256,
@@ -4304,6 +4400,7 @@ fn pushTestTicket(offers: *pre_shared_key.ClientPskOfferSet, psk: []const u8, ti
         .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
         .issued_at_unix_ms = 0,
         .lifetime_seconds = 3600,
+        .early_data = early_data,
     });
     var state: session.ClientTicketState = .{};
     try state.init(std.testing.allocator, session.Limits.default, &common, .{

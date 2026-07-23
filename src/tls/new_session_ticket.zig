@@ -176,8 +176,9 @@ pub fn buildClientTicketState(
         .issued_at_unix_ms = received_at_unix_ms,
         .lifetime_seconds = parsed.ticket_lifetime,
         .early_data = earlyDataPolicy(parsed.max_early_data_size),
-        .transport_compat = connection.transport_compat,
+        .transport_compat = if (parsed.max_early_data_size == null) connection.transport_compat else null,
         .application_compat = connection.application_compat,
+        .early_data_transport_compat = if (parsed.max_early_data_size != null) connection.transport_compat else null,
     });
 
     var state: session.ClientTicketState = .{};
@@ -242,8 +243,9 @@ pub fn buildServerRecoverableStateNoIdentity(
         .issued_at_unix_ms = issued_at_unix_ms,
         .lifetime_seconds = params.ticket_lifetime,
         .early_data = earlyDataPolicy(params.max_early_data_size),
-        .transport_compat = connection.transport_compat,
+        .transport_compat = if (params.max_early_data_size == null) connection.transport_compat else null,
         .application_compat = connection.application_compat,
+        .early_data_transport_compat = if (params.max_early_data_size != null) connection.transport_compat else null,
     });
 
     var state: session.ServerRecoverableState = .{};
@@ -822,7 +824,8 @@ fn exerciseClientTicketBuild(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualSlices(u8, "\x01\x02", state.ticket_nonce.slice());
     try std.testing.expectEqualStrings("example.com", state.common.server_name.?.slice());
     try std.testing.expectEqualStrings("h2", state.common.application_protocol.?.slice());
-    try std.testing.expect(state.common.transport_compat != null);
+    try std.testing.expect(state.common.transport_compat == null);
+    try std.testing.expect(state.common.early_data_transport_compat != null);
     try std.testing.expect(state.common.application_compat != null);
 }
 
@@ -845,7 +848,8 @@ fn exerciseServerTicketBuild(allocator: std.mem.Allocator) !void {
     defer state.deinit();
     try std.testing.expectEqualStrings("example.com", state.common.server_name.?.slice());
     try std.testing.expectEqualStrings("h2", state.common.application_protocol.?.slice());
-    try std.testing.expect(state.common.transport_compat != null);
+    try std.testing.expect(state.common.transport_compat == null);
+    try std.testing.expect(state.common.early_data_transport_compat != null);
     try std.testing.expect(state.common.application_compat != null);
 }
 

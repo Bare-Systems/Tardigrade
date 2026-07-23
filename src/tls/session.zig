@@ -307,6 +307,8 @@ pub const ResumableSessionCommon = struct {
     early_data: EarlyDataPolicy = .resume_only,
     transport_compat: ?CompatSnapshot = null,
     application_compat: ?CompatSnapshot = null,
+    early_data_transport_compat: ?CompatSnapshot = null,
+    early_data_application_compat: ?CompatSnapshot = null,
 
     pub const CompatBlobParams = struct {
         format_id: u16,
@@ -325,6 +327,8 @@ pub const ResumableSessionCommon = struct {
         early_data: EarlyDataPolicy = .resume_only,
         transport_compat: ?CompatBlobParams = null,
         application_compat: ?CompatBlobParams = null,
+        early_data_transport_compat: ?CompatBlobParams = null,
+        early_data_application_compat: ?CompatBlobParams = null,
     };
 
     pub const InitError = error{
@@ -394,6 +398,16 @@ pub const ResumableSessionCommon = struct {
             try snap.init(allocator, blob.format_id, blob.format_version, blob.bytes, limits.max_application_compat_len);
             next.application_compat = snap;
         }
+        if (params.early_data_transport_compat) |blob| {
+            var snap: CompatSnapshot = .{};
+            try snap.init(allocator, blob.format_id, blob.format_version, blob.bytes, limits.max_transport_compat_len);
+            next.early_data_transport_compat = snap;
+        }
+        if (params.early_data_application_compat) |blob| {
+            var snap: CompatSnapshot = .{};
+            try snap.init(allocator, blob.format_id, blob.format_version, blob.bytes, limits.max_application_compat_len);
+            next.early_data_application_compat = snap;
+        }
 
         self.moveFrom(&next);
     }
@@ -402,8 +416,12 @@ pub const ResumableSessionCommon = struct {
         self.resumption_psk.deinit();
         if (self.transport_compat) |*snap| snap.deinit();
         if (self.application_compat) |*snap| snap.deinit();
+        if (self.early_data_transport_compat) |*snap| snap.deinit();
+        if (self.early_data_application_compat) |*snap| snap.deinit();
         self.transport_compat = null;
         self.application_compat = null;
+        self.early_data_transport_compat = null;
+        self.early_data_application_compat = null;
     }
 
     /// `out` must be zero-valued or a previously-initialized, live value —
@@ -438,6 +456,16 @@ pub const ResumableSessionCommon = struct {
             var cloned: CompatSnapshot = .{};
             try snap.cloneInto(allocator, &cloned);
             next.application_compat = cloned;
+        }
+        if (self.early_data_transport_compat) |*snap| {
+            var cloned: CompatSnapshot = .{};
+            try snap.cloneInto(allocator, &cloned);
+            next.early_data_transport_compat = cloned;
+        }
+        if (self.early_data_application_compat) |*snap| {
+            var cloned: CompatSnapshot = .{};
+            try snap.cloneInto(allocator, &cloned);
+            next.early_data_application_compat = cloned;
         }
 
         out.moveFrom(&next);

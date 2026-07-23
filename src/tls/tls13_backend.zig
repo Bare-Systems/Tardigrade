@@ -389,16 +389,19 @@ pub const EarlyDataReplayGate = struct {
 /// until a transport-specific check is wired in.
 pub const EarlyDataCompatibilityDecision = enum { compatible, transport_incompatible, application_incompatible };
 
-/// Bounded, non-secret compatibility inputs: the ticket's stored
-/// transport/application snapshots against the current connection's
-/// candidate snapshots — the same shape `session.CandidateCompat` /
-/// `CompatSnapshot` already carry, flattened to slices so this seam does not
-/// need to import ownership/allocator-bearing session types.
+/// Bounded, non-secret compatibility input view that preserves the snapshot
+/// discriminator alongside the bytes. The gate's owner supplies the current
+/// local transport/application state in `ctx`; these fields are only the
+/// remembered values the selected ticket carries for early-data admission.
+pub const CompatView = struct {
+    format_id: u16,
+    format_version: u16,
+    bytes: []const u8,
+};
+
 pub const EarlyDataCompatibilityCandidate = struct {
-    stored_transport_compat: ?[]const u8 = null,
-    candidate_transport_compat: ?[]const u8 = null,
-    stored_application_compat: ?[]const u8 = null,
-    candidate_application_compat: ?[]const u8 = null,
+    remembered_transport: ?CompatView = null,
+    remembered_application: ?CompatView = null,
 };
 
 /// Server (#366): injectable early-data-specific compatibility gate,
@@ -683,11 +686,10 @@ pub const Tls13Backend = struct {
     /// RFC 8446 does not tell a client *why* the server omitted the
     /// extension when it did not accept.
     early_data_decision: EarlyDataDecision = .not_attempted,
-    /// Server: the ticket's advertised early-data byte allowance, captured
-    /// only when `early_data_decision == .accepted` — otherwise `0`. Exposed
-    /// via `earlyDataMaxBytes()` so the record/QUIC carrier slice knows how
-    /// much early-data plaintext it may accept while 0-RTT is live, instead
-    /// of discarding the ticket's own advertised limit.
+    /// Client: effective send allowance for the planned 0-RTT attempt
+    /// (`min(ticket allowance, configured max)`) while waiting for
+    /// EncryptedExtensions. Server: ticket allowance for an accepted attempt.
+    /// Cleared to zero when no early-data attempt is live/accepted.
     early_data_max_bytes: u32 = 0,
 
     const Slice = struct { start: usize, len: usize };
@@ -1045,9 +1047,10 @@ pub const Tls13Backend = struct {
         return self.early_data_decision;
     }
 
-    /// Server: the ticket's advertised early-data byte allowance, valid only
-    /// when `earlyDataAccepted()` is true (`0` otherwise). The record/QUIC
-    /// carrier bounds accepted early-data plaintext to this value.
+    /// Role-neutral early-data byte allowance. Client: maximum bytes this
+    /// attempt may send before EncryptedExtensions arrives. Server: maximum
+    /// bytes this accepted attempt may receive. Returns `0` when no such
+    /// allowance is currently live.
     pub fn earlyDataMaxBytes(self: *const Tls13Backend) u32 {
         return self.early_data_max_bytes;
     }
@@ -1715,7 +1718,7 @@ pub const Tls13Backend = struct {
         var state = new_session_ticket.buildClientTicketState(
             configured.allocator,
             parsed,
-            self.resumptionContext(),
+            self.resumptionContextForTicket(parsed.max_early_data_size != null),
             self.resumption_master_secret.slice(),
             received_at,
             configured.limits,
@@ -1933,6 +1936,7 @@ pub const Tls13Backend = struct {
 
         if (self.client_offer_lease.active) {
             var total = try checkedAdd(base_len, 6 + 8);
+            var kept: usize = 0;
             var i: usize = 0;
             while (i < self.client_offer_lease.offers.len) {
                 const ticket = &self.client_offer_lease.offers.tickets[i];
@@ -1944,7 +1948,9 @@ pub const Tls13Backend = struct {
                         keep = false;
                     } else {
                         const entry_len = try checkedAdd(try checkedAdd(2, identity_len), 4);
-                        const candidate_total = try checkedAdd(try checkedAdd(total, entry_len), 1 + hash_len);
+                        var candidate_total = try checkedAdd(try checkedAdd(total, entry_len), 1 + hash_len);
+                        if (kept == 0 and self.clientEarlyDataBudget(ticket) != null)
+                            candidate_total = try checkedAdd(candidate_total, 4);
                         if (candidate_total > max_message_len) {
                             keep = false;
                             stop = true;
@@ -1959,6 +1965,7 @@ pub const Tls13Backend = struct {
                     }
                     continue;
                 }
+                kept += 1;
                 i += 1;
             }
             if (self.client_offer_lease.offers.isEmpty()) self.client_offer_lease.finish(.not_selected);
@@ -1979,7 +1986,9 @@ pub const Tls13Backend = struct {
             if (identity_len == 0 or identity_len > std.math.maxInt(u16)) continue;
             // identity: 2 len + bytes + 4 age; binder: 1 len + digest.
             const entry_len = try checkedAdd(try checkedAdd(2, identity_len), 4);
-            const candidate_total = try checkedAdd(try checkedAdd(total, entry_len), 1 + hash_len);
+            var candidate_total = try checkedAdd(try checkedAdd(total, entry_len), 1 + hash_len);
+            if (emitted.len == 0 and self.clientEarlyDataBudget(ticket) != null)
+                candidate_total = try checkedAdd(candidate_total, 4);
             if (candidate_total > max_message_len) break; // does not fit: stop, in offer order
             total = candidate_total;
             emitted.push(ticket) catch break; // bounded by the loop guard above
@@ -1997,18 +2006,26 @@ pub const Tls13Backend = struct {
     /// `self.client_offer_lease.offers` to exactly the wire-emitted subset.
     fn planEarlyDataAttempt(self: *Tls13Backend) void {
         self.client_early_data_attempted = false;
+        self.early_data_max_bytes = 0;
         if (!self.client_early_data_intent.enabled) return;
 
         const offers = self.constClientPskOffers();
         if (offers.isEmpty()) return;
 
-        const max = switch (offers.constSlice()[0].common.early_data) {
-            .resume_only => return,
-            .early_data_capable => |n| n,
-        };
-        if (max == 0 or self.client_early_data_intent.max_bytes == 0) return;
+        const effective = self.clientEarlyDataBudget(&offers.constSlice()[0]) orelse return;
 
         self.client_early_data_attempted = true;
+        self.early_data_max_bytes = effective;
+    }
+
+    fn clientEarlyDataBudget(self: *const Tls13Backend, ticket: *const session.ClientTicketState) ?u32 {
+        if (!self.client_early_data_intent.enabled) return null;
+        const ticket_max = switch (ticket.common.early_data) {
+            .resume_only => return null,
+            .early_data_capable => |n| n,
+        };
+        const effective = @min(ticket_max, self.client_early_data_intent.max_bytes);
+        return if (effective == 0) null else effective;
     }
 
     /// Whether `ticket` is still safe and compatible to offer *now*: not
@@ -2076,16 +2093,6 @@ pub const Tls13Backend = struct {
         if (self.profile.extensionType() != null) {
             const payload = self.profile.localExtension() orelse return error.MissingTransportExtension;
             len = try checkedAdd(len, 2 + 2 + payload.len);
-        }
-        // #366: reserved whenever the client has opted in, regardless of
-        // whether `planEarlyDataAttempt` (which runs later, after this
-        // budget is used by `planPskOffer`'s own ticket-fitting arithmetic)
-        // ends up actually attempting 0-RTT — so a too-large PSK offer is
-        // rejected/trimmed by `planPskOffer` itself instead of the
-        // 4-byte `early_data` extension silently pushing `sendClientHello`'s
-        // fixed-capacity buffer past `max_message_len`.
-        if (self.client_early_data_intent.enabled) {
-            len = try checkedAdd(len, 4); // early_data: type(2) + length(2), empty body
         }
         return len;
     }
@@ -2345,6 +2352,8 @@ pub const Tls13Backend = struct {
             if (early_data_seen) {
                 self.early_data_accepted = true;
                 self.early_data_decision = .accepted;
+            } else {
+                self.early_data_max_bytes = 0;
             }
 
             self.connection_auth_binding = stored.auth_binding;
@@ -3185,10 +3194,8 @@ pub const Tls13Backend = struct {
                 .compatibility = decision.early_data,
                 .age_skew = age_skew,
                 .compat_candidate = .{
-                    .stored_transport_compat = if (hit.state.common.transport_compat) |*snap| snap.slice() else null,
-                    .candidate_transport_compat = if (self.candidateTransportCompat()) |c| c.bytes else null,
-                    .stored_application_compat = if (hit.state.common.application_compat) |*snap| snap.slice() else null,
-                    .candidate_application_compat = if (self.candidateApplicationCompat()) |c| c.bytes else null,
+                    .remembered_transport = compatView(hit.state.common.early_data_transport_compat),
+                    .remembered_application = compatView(hit.state.common.early_data_application_compat),
                 },
                 .replay_candidate = .{
                     .ticket_identity_fingerprint = identity_fingerprint,
@@ -3286,6 +3293,12 @@ pub const Tls13Backend = struct {
             .format_version = 1,
             .bytes = self.peer_transport_extension[0..self.peer_transport_extension_len],
         };
+    }
+
+    fn localTransportCompat(self: *const Tls13Backend) ?new_session_ticket.CompatBlob {
+        const bytes = self.profile.localExtension() orelse return null;
+        const ext_type = self.profile.extensionType() orelse return null;
+        return .{ .format_id = ext_type, .format_version = 1, .bytes = bytes };
     }
 
     /// PSK-resumed server flight: EncryptedExtensions straight to Finished —
@@ -3801,6 +3814,17 @@ pub const Tls13Backend = struct {
         };
     }
 
+    fn resumptionContextForTicket(self: *const Tls13Backend, early_data_capable: bool) new_session_ticket.ConnectionResumptionContext {
+        var ctx = self.resumptionContext();
+        if (early_data_capable) {
+            ctx.transport_compat = switch (self.role) {
+                .client => self.peerTransportCompat(),
+                .server => self.localTransportCompat(),
+            };
+        }
+        return ctx;
+    }
+
     fn peerAuthBinding(self: *const Tls13Backend) session.AuthBinding {
         if (self.peer_chain_count == 0) return session.AuthBinding.fromLeafCertificateDer("");
         const leaf = self.peer_chain_entries[0];
@@ -3983,7 +4007,7 @@ pub const Tls13Backend = struct {
                 .ticket_nonce = params.ticket_nonce,
                 .max_early_data_size = params.max_early_data_size,
             },
-            self.resumptionContext(),
+            self.resumptionContextForTicket(params.max_early_data_size != null),
             self.resumption_master_secret.slice(),
             params.issued_at_unix_ms,
             limits,
@@ -4139,6 +4163,11 @@ fn compatCompatible(stored: ?session.CompatSnapshot, candidate: ?session.Candida
         return s.format_id == c.format_id and s.format_version == c.format_version and std.mem.eql(u8, s.slice(), c.bytes);
     }
     return candidate == null;
+}
+
+fn compatView(stored: ?session.CompatSnapshot) ?CompatView {
+    const s = stored orelse return null;
+    return .{ .format_id = s.format_id, .format_version = s.format_version, .bytes = s.slice() };
 }
 
 fn mapPskReadError(err: pre_shared_key.ReadError) HandshakeError {

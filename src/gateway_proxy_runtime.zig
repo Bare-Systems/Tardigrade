@@ -643,12 +643,10 @@ pub fn handleLocationProxyPass(
     // even with the default of a single attempt.
     const max_stale_conn_retries: usize = 2;
     var stale_conn_retries: usize = 0;
-    var early_425_retry_used = false;
-    var early_425_extra_attempts: usize = 0;
-    var retry_as_ordinary = false;
+    var retry_state = BufferedProxyRetryState{};
 
     var attempt: usize = 0;
-    var upstream_response: DataPlaneProxyResponse = while (attempt < max_attempts + stale_conn_retries + early_425_extra_attempts) : (attempt += 1) {
+    var upstream_response: DataPlaneProxyResponse = while (attempt < retry_state.loopBound(max_attempts, stale_conn_retries)) : (attempt += 1) {
         const per_attempt_timeout_ms: u32 = blk: {
             if (cfg.upstream_timeout_budget_ms == 0) break :blk cfg.upstream_timeout_ms;
             const elapsed_ms = http.event_loop.monotonicMs() - budget_start_ms;
@@ -677,7 +675,7 @@ pub fn handleLocationProxyPass(
             auth_user_id,
             auth_device_id,
             auth_scopes,
-            if (retry_as_ordinary) false else first_attempt_forward_early_data,
+            retry_state.forwardEarlyData(first_attempt_forward_early_data),
             per_attempt_timeout_ms,
             cfg.upstream_connect_timeout_ms,
             cfg.upstream_response_timeout_ms,
@@ -723,8 +721,8 @@ pub fn handleLocationProxyPass(
                 ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.gateway_timeout), 0);
                 return @intFromEnum(http.Status.gateway_timeout);
             }
-            if (attempt + 1 < max_attempts) {
-                state.logger.warn(correlation_id, "proxy attempt {d}/{d} failed: {}", .{ attempt + 1, max_attempts, err });
+            if (retry_state.hasConfiguredRetryRemaining(attempt, max_attempts)) {
+                state.logger.warn(correlation_id, "proxy attempt {d}/{d} failed: {}", .{ retry_state.configuredAttemptIndex(attempt) + 1, max_attempts, err });
                 continue;
             }
             // All retry attempts are exhausted — synthesise a proper error
@@ -747,7 +745,7 @@ pub fn handleLocationProxyPass(
         if (result.statusCode() == @intFromEnum(http.Status.too_early) and shouldRetryEarlyUpstream425(
             ctx.early_data,
             first_attempt_forward_early_data,
-            early_425_retry_used,
+            retry_state.early_425_retry_used,
             method_str,
             matched_block,
         )) {
@@ -758,9 +756,7 @@ pub fn handleLocationProxyPass(
             if (!ctx.early_data.downstreamHandshakeComplete()) {
                 break result;
             }
-            early_425_retry_used = true;
-            early_425_extra_attempts = 1;
-            retry_as_ordinary = true;
+            retry_state.consumeEarly425Retry();
             state.logger.debug(correlation_id, "retrying early-data upstream 425 once after downstream handshake completion", .{});
             var r = result;
             state.metricsReleaseProxyBufferedBytes(r.bodyLen());
@@ -768,9 +764,9 @@ pub fn handleLocationProxyPass(
             continue;
         }
         // Retry on 5xx only when attempts remain and the method allows it.
-        if (result.statusCode() >= 500 and attempt + 1 < max_attempts) {
+        if (result.statusCode() >= 500 and retry_state.hasConfiguredRetryRemaining(attempt, max_attempts)) {
             state.recordUpstreamFailure(cfg, selection.base_url);
-            state.logger.warn(correlation_id, "proxy attempt {d}/{d} got {d}, retrying", .{ attempt + 1, max_attempts, result.statusCode() });
+            state.logger.warn(correlation_id, "proxy attempt {d}/{d} got {d}, retrying", .{ retry_state.configuredAttemptIndex(attempt) + 1, max_attempts, result.statusCode() });
             var r = result;
             state.metricsReleaseProxyBufferedBytes(r.bodyLen());
             r.deinit(allocator);
@@ -877,6 +873,34 @@ fn shouldRetryEarlyUpstream425(
     return true;
 }
 
+const BufferedProxyRetryState = struct {
+    early_425_retry_used: bool = false,
+    early_425_extra_attempts: usize = 0,
+    retry_as_ordinary: bool = false,
+
+    fn loopBound(self: BufferedProxyRetryState, max_attempts: usize, stale_conn_retries: usize) usize {
+        return max_attempts + stale_conn_retries + self.early_425_extra_attempts;
+    }
+
+    fn configuredAttemptIndex(self: BufferedProxyRetryState, attempt: usize) usize {
+        return attempt - @min(attempt, self.early_425_extra_attempts);
+    }
+
+    fn hasConfiguredRetryRemaining(self: BufferedProxyRetryState, attempt: usize, max_attempts: usize) bool {
+        return self.configuredAttemptIndex(attempt) + 1 < max_attempts;
+    }
+
+    fn forwardEarlyData(self: BufferedProxyRetryState, first_attempt_forward_early_data: bool) bool {
+        return if (self.retry_as_ordinary) false else first_attempt_forward_early_data;
+    }
+
+    fn consumeEarly425Retry(self: *BufferedProxyRetryState) void {
+        self.early_425_retry_used = true;
+        self.early_425_extra_attempts = 1;
+        self.retry_as_ordinary = true;
+    }
+};
+
 const Early425RetryHarnessResult = struct {
     downstream_status: u16,
     upstream_deliveries: usize,
@@ -907,30 +931,29 @@ fn runEarly425RetryHarness(
     early_ctx: *http.request_context.EarlyDataContext,
     method: []const u8,
     matched_block: *const edge_config.EdgeConfig.LocationBlock,
+    max_attempts: usize,
     upstream_statuses: []const u16,
     early_data_header_counts: *std.array_list.Managed(usize),
 ) !Early425RetryHarnessResult {
     const first_attempt_forward_early_data = early_ctx.inbound_marker or
         (early_ctx.transport_early and !early_ctx.downstreamHandshakeComplete());
-    var retry_used = false;
-    var retry_as_ordinary = false;
-    var extra_attempts: usize = 0;
+    var retry_state = BufferedProxyRetryState{};
     var deliveries: usize = 0;
 
     var attempt: usize = 0;
-    while (attempt < 1 + extra_attempts) : (attempt += 1) {
+    while (attempt < retry_state.loopBound(max_attempts, 0)) : (attempt += 1) {
         if (attempt >= upstream_statuses.len) return error.TestHarnessMissingStatus;
         try recordCanonicalEarlyDataHeaderCount(
             allocator,
             early_data_header_counts,
-            if (retry_as_ordinary) false else first_attempt_forward_early_data,
+            retry_state.forwardEarlyData(first_attempt_forward_early_data),
         );
         deliveries += 1;
         const status = upstream_statuses[attempt];
         if (status == @intFromEnum(http.Status.too_early) and shouldRetryEarlyUpstream425(
             early_ctx.*,
             first_attempt_forward_early_data,
-            retry_used,
+            retry_state.early_425_retry_used,
             method,
             matched_block,
         )) {
@@ -938,9 +961,10 @@ fn runEarly425RetryHarness(
             if (!early_ctx.downstreamHandshakeComplete()) {
                 return .{ .downstream_status = status, .upstream_deliveries = deliveries };
             }
-            retry_used = true;
-            extra_attempts = 1;
-            retry_as_ordinary = true;
+            retry_state.consumeEarly425Retry();
+            continue;
+        }
+        if (status >= 500 and retry_state.hasConfiguredRetryRemaining(attempt, max_attempts)) {
             continue;
         }
         return .{ .downstream_status = status, .upstream_deliveries = deliveries };
@@ -1057,7 +1081,7 @@ test "early upstream 425 retry sends marker once then retries ordinary to 200" {
     var header_counts = std.array_list.Managed(usize).init(allocator);
     defer header_counts.deinit();
 
-    const result = try runEarly425RetryHarness(allocator, &ctx, "GET", &block, &.{ 425, 200 }, &header_counts);
+    const result = try runEarly425RetryHarness(allocator, &ctx, "GET", &block, 1, &.{ 425, 200 }, &header_counts);
 
     try std.testing.expectEqual(@as(u16, 200), result.downstream_status);
     try std.testing.expectEqual(@as(usize, 2), result.upstream_deliveries);
@@ -1080,7 +1104,7 @@ test "early upstream 425 retry forwards second 425 without third delivery" {
     var header_counts = std.array_list.Managed(usize).init(allocator);
     defer header_counts.deinit();
 
-    const result = try runEarly425RetryHarness(allocator, &ctx, "GET", &block, &.{ 425, 425, 200 }, &header_counts);
+    const result = try runEarly425RetryHarness(allocator, &ctx, "GET", &block, 1, &.{ 425, 425, 200 }, &header_counts);
 
     try std.testing.expectEqual(@as(u16, 425), result.downstream_status);
     try std.testing.expectEqual(@as(usize, 2), result.upstream_deliveries);
@@ -1103,12 +1127,35 @@ test "inbound early-data marker forwards upstream 425 without local retry" {
     var header_counts = std.array_list.Managed(usize).init(allocator);
     defer header_counts.deinit();
 
-    const result = try runEarly425RetryHarness(allocator, &ctx, "GET", &block, &.{ 425, 200 }, &header_counts);
+    const result = try runEarly425RetryHarness(allocator, &ctx, "GET", &block, 1, &.{ 425, 200 }, &header_counts);
 
     try std.testing.expectEqual(@as(u16, 425), result.downstream_status);
     try std.testing.expectEqual(@as(usize, 1), result.upstream_deliveries);
     try std.testing.expectEqual(@as(usize, 0), barrier.waits);
     try std.testing.expectEqualSlices(usize, &.{1}, header_counts.items);
+}
+
+test "semantic upstream 425 retry does not consume configured 5xx retry budget" {
+    const allocator = std.testing.allocator;
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    };
+    var barrier = TestEarly425Barrier{};
+    var ctx = http.request_context.EarlyDataContext{ .transport_early = true, .downstream_handshake = barrier.barrier() };
+    var header_counts = std.array_list.Managed(usize).init(allocator);
+    defer header_counts.deinit();
+
+    const result = try runEarly425RetryHarness(allocator, &ctx, "GET", &block, 2, &.{ 425, 500, 200 }, &header_counts);
+
+    try std.testing.expectEqual(@as(u16, 200), result.downstream_status);
+    try std.testing.expectEqual(@as(usize, 3), result.upstream_deliveries);
+    try std.testing.expectEqual(@as(usize, 1), barrier.waits);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0, 0 }, header_counts.items);
 }
 
 test "data-plane buffered compatibility response limit uses dedicated upstream cap" {

@@ -2264,22 +2264,136 @@ const H1PreflightSideEffectProbe = struct {
     handler_calls: usize = 0,
 };
 
-fn runH1PreflightSideEffectProbe(
-    cfg: *const edge_config.EdgeConfig,
-    early_ctx: http.request_context.EarlyDataContext,
-    request: *const http.Request,
-    effects: *H1PreflightSideEffectProbe,
-) http.Status {
-    switch (earlyDataPreflightDecisionForH1(cfg, early_ctx, request)) {
-        .too_early, .defer_until_handshake => return .too_early,
-        .ordinary, .execute_local, .forward_rfc8470 => {},
+const H1PostPreflightOutcome = union(enum) {
+    terminal_status: u16,
+    logged_terminal,
+    route_status: u16,
+};
+
+const H1ProductionPostPreflightHooks = struct {
+    fn rejectEarly(
+        self: H1ProductionPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !u16 {
+        _ = self;
+        const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, ctx, correlation_id, keep_alive);
+        ghandlers.logAccessForRequest(state, ctx, request, status);
+        return status;
     }
-    effects.mirror_calls += 1;
-    effects.auth_calls += 1;
-    effects.rate_limit_mutations += 1;
-    effects.upstream_calls += 1;
-    effects.handler_calls += 1;
-    return .ok;
+
+    fn mirror(
+        self: H1ProductionPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        client_ip: []const u8,
+    ) !void {
+        _ = self;
+        if (cfg.mirror_rules.len > 0) {
+            ghandlers.spawnMirrorRequests(
+                allocator,
+                cfg.mirror_rules,
+                request.method.toString(),
+                request.uri.path,
+                request.body orelse "",
+                correlation_id,
+                client_ip,
+                request.headers.get("content-type"),
+            );
+        }
+    }
+
+    fn auth(
+        self: H1ProductionPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        headers: *const http.Headers,
+    ) !void {
+        _ = self;
+        try ghandlers.primeRequestAuthContext(allocator, cfg, state, ctx, headers);
+    }
+
+    fn middleware(
+        self: H1ProductionPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !bool {
+        _ = self;
+        return try ghandlers.runMiddlewarePipeline(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive);
+    }
+
+    fn route(
+        self: H1ProductionPostPreflightHooks,
+        conn: anytype,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: *bool,
+        client_ip: []const u8,
+        streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
+    ) !u16 {
+        _ = self;
+        return try ghandlers.routeRequest(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body);
+    }
+};
+
+fn executeH1PostPreflightOrchestration(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    keep_alive: *bool,
+    client_ip: []const u8,
+    streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
+    lifecycle: *http.request_lifecycle.RequestLifecycle,
+    hooks: anytype,
+) !H1PostPreflightOutcome {
+    switch (earlyDataPreflightDecisionForH1(cfg, ctx.early_data, request)) {
+        .ordinary, .execute_local, .forward_rfc8470 => {},
+        .too_early, .defer_until_handshake => {
+            const status = try hooks.rejectEarly(allocator, writer, state, ctx, request, correlation_id, keep_alive.*);
+            return .{ .terminal_status = status };
+        },
+    }
+
+    try hooks.mirror(allocator, cfg, request, correlation_id, client_ip);
+    try hooks.auth(allocator, cfg, state, ctx, &request.headers);
+
+    if (try hooks.middleware(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*)) {
+        return .logged_terminal;
+    }
+
+    if (lifecycle.checkDeadline(.routing)) {
+        try gp.sendApiError(allocator, writer, .request_timeout, "request_timeout", "Request deadline exceeded", correlation_id, keep_alive.*, state);
+        state.metricsRecord(408);
+        state.metricsRecordErrorCode("request_timeout");
+        ghandlers.logAccessForRequest(state, ctx, request, 408);
+        return .logged_terminal;
+    }
+
+    return .{ .route_status = try hooks.route(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body) };
 }
 
 fn mayNeedStreamingRequestBodyPreRead(cfg: *const edge_config.EdgeConfig) bool {
@@ -2692,48 +2806,28 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         effective_cfg.named_locations,
     );
 
-    switch (earlyDataPreflightDecisionForH1(effective_cfg, ctx.early_data, &request)) {
-        .ordinary, .execute_local, .forward_rfc8470 => {},
-        .too_early, .defer_until_handshake => {
-            const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
-            ghandlers.logAccessForRequest(state, &ctx, &request, status);
+    const outcome = try executeH1PostPreflightOrchestration(
+        conn,
+        allocator,
+        writer,
+        effective_cfg,
+        state,
+        &ctx,
+        &request,
+        correlation_id,
+        &keep_alive,
+        client_ip,
+        streaming_request_body,
+        &lifecycle,
+        H1ProductionPostPreflightHooks{},
+    );
+    switch (outcome) {
+        .terminal_status, .logged_terminal => return,
+        .route_status => |route_status| {
+            ghandlers.logAccessForRequest(state, &ctx, &request, route_status);
             return;
         },
     }
-
-    // --- Mirror requests (best-effort async) ---
-    if (effective_cfg.mirror_rules.len > 0) {
-        ghandlers.spawnMirrorRequests(
-            allocator,
-            effective_cfg.mirror_rules,
-            request.method.toString(),
-            request.uri.path,
-            request.body orelse "",
-            correlation_id,
-            client_ip,
-            request.headers.get("content-type"),
-        );
-    }
-
-    try ghandlers.primeRequestAuthContext(allocator, effective_cfg, state, &ctx, &request.headers);
-
-    if (try ghandlers.runMiddlewarePipeline(allocator, writer, effective_cfg, state, &ctx, &request, correlation_id, keep_alive)) {
-        return;
-    }
-
-    // Deadline check: if the overall request deadline elapsed during auth/middleware,
-    // reject now rather than dispatching to the (potentially slow) upstream handler.
-    if (lifecycle.checkDeadline(.routing)) {
-        try gp.sendApiError(allocator, writer, .request_timeout, "request_timeout", "Request deadline exceeded", correlation_id, keep_alive, state);
-        state.metricsRecord(408);
-        state.metricsRecordErrorCode("request_timeout");
-        ghandlers.logAccessForRequest(state, &ctx, &request, 408);
-        return;
-    }
-
-    const route_status = try ghandlers.routeRequest(conn, allocator, effective_cfg, state, &ctx, &request, correlation_id, &keep_alive, client_ip, streaming_request_body);
-    ghandlers.logAccessForRequest(state, &ctx, &request, route_status);
-    return;
 }
 
 test "HTTP/1.1 missing Host header rejected — version and header presence check" {
@@ -2813,6 +2907,114 @@ test "early data body framing allows zero content length only" {
     try std.testing.expect(earlyDataHasReplayExposedBodyFraming(&chunked.request));
 }
 
+const H1CountingPostPreflightHooks = struct {
+    effects: *H1PreflightSideEffectProbe,
+
+    fn rejectEarly(
+        self: H1CountingPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !u16 {
+        _ = self;
+        _ = allocator;
+        _ = writer;
+        _ = state;
+        _ = ctx;
+        _ = request;
+        _ = correlation_id;
+        _ = keep_alive;
+        return @intFromEnum(http.Status.too_early);
+    }
+
+    fn mirror(
+        self: H1CountingPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        client_ip: []const u8,
+    ) !void {
+        _ = allocator;
+        _ = cfg;
+        _ = request;
+        _ = correlation_id;
+        _ = client_ip;
+        self.effects.mirror_calls += 1;
+    }
+
+    fn auth(
+        self: H1CountingPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        headers: *const http.Headers,
+    ) !void {
+        _ = allocator;
+        _ = cfg;
+        _ = state;
+        _ = ctx;
+        _ = headers;
+        self.effects.auth_calls += 1;
+    }
+
+    fn middleware(
+        self: H1CountingPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !bool {
+        _ = allocator;
+        _ = writer;
+        _ = cfg;
+        _ = state;
+        _ = ctx;
+        _ = request;
+        _ = correlation_id;
+        _ = keep_alive;
+        self.effects.rate_limit_mutations += 1;
+        return false;
+    }
+
+    fn route(
+        self: H1CountingPostPreflightHooks,
+        conn: anytype,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: *bool,
+        client_ip: []const u8,
+        streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
+    ) !u16 {
+        _ = conn;
+        _ = allocator;
+        _ = cfg;
+        _ = state;
+        _ = ctx;
+        _ = request;
+        _ = correlation_id;
+        _ = keep_alive;
+        _ = client_ip;
+        _ = streaming_request_body;
+        self.effects.upstream_calls += 1;
+        self.effects.handler_calls += 1;
+        return @intFromEnum(http.Status.ok);
+    }
+};
+
 test "H1 early-data 425 preflight runs before side effects" {
     const allocator = std.testing.allocator;
     var blocks = [_]edge_config.EdgeConfig.LocationBlock{
@@ -2834,10 +3036,30 @@ test "H1 early-data 425 preflight runs before side effects" {
     var request = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\nEarly-Data: 1\r\n\r\n", MAX_REQUEST_SIZE);
     defer request.request.deinit();
     var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var ctx = http.request_context.RequestContext.init(allocator, "req-early", "127.0.0.1");
+    ctx.early_data.inbound_marker = true;
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-early", 0);
+    var keep_alive = false;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const outcome = try executeH1PostPreflightOrchestration(
+        {},
+        allocator,
+        &output.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-early",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1CountingPostPreflightHooks{ .effects = &effects },
+    );
 
-    const status = runH1PreflightSideEffectProbe(&cfg, .{ .inbound_marker = true }, &request.request, &effects);
-
-    try std.testing.expectEqual(http.Status.too_early, status);
+    try std.testing.expectEqual(@as(u16, @intFromEnum(http.Status.too_early)), outcome.terminal_status);
     try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
     try std.testing.expectEqual(@as(usize, 0), effects.auth_calls);
     try std.testing.expectEqual(@as(usize, 0), effects.rate_limit_mutations);
@@ -2864,10 +3086,30 @@ test "H1 early proxy with origin capability off never reaches upstream side effe
     var request = try http.Request.parseHead(allocator, "GET /proxy HTTP/1.1\r\nHost: example.test\r\nEarly-Data: 1\r\n\r\n", MAX_REQUEST_SIZE);
     defer request.request.deinit();
     var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var ctx = http.request_context.RequestContext.init(allocator, "req-off", "127.0.0.1");
+    ctx.early_data.inbound_marker = true;
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-off", 0);
+    var keep_alive = false;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const outcome = try executeH1PostPreflightOrchestration(
+        {},
+        allocator,
+        &output.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-off",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1CountingPostPreflightHooks{ .effects = &effects },
+    );
 
-    const status = runH1PreflightSideEffectProbe(&cfg, .{ .inbound_marker = true }, &request.request, &effects);
-
-    try std.testing.expectEqual(http.Status.too_early, status);
+    try std.testing.expectEqual(@as(u16, @intFromEnum(http.Status.too_early)), outcome.terminal_status);
     try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
 }
 

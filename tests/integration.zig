@@ -2432,6 +2432,14 @@ fn requireNativeTlsProfile() !void {
 }
 
 const PureZigTlsClient = struct {
+    const Options = struct {
+        ticket_consumer: ?tls_core.tls13_backend.Tls13Backend.SessionTicketConsumer = null,
+        ticket_limits: tls_core.session.Limits = tls_core.session.Limits.default,
+        psk_lease: ?*tls_core.pre_shared_key.ClientOfferLease = null,
+        psk_now_ctx: ?*anyopaque = null,
+        psk_now_fn: ?*const fn (*anyopaque) i64 = null,
+    };
+
     allocator: std.mem.Allocator,
     stream: compat.NetStream,
     entropy_source: tls_core.production_crypto.OsEntropy = .{},
@@ -2444,6 +2452,10 @@ const PureZigTlsClient = struct {
     }
 
     fn createWithServerName(allocator: std.mem.Allocator, port: u16, alpn: []const u8, server_name: ?[]const u8) !*PureZigTlsClient {
+        return createWithOptions(allocator, port, alpn, server_name, .{});
+    }
+
+    fn createWithOptions(allocator: std.mem.Allocator, port: u16, alpn: []const u8, server_name: ?[]const u8, options: Options) !*PureZigTlsClient {
         const self = try allocator.create(PureZigTlsClient);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -2460,6 +2472,19 @@ const PureZigTlsClient = struct {
             tls_core.tls13_backend.recordConfig(alpnPolicy(alpn)),
             .{ .server_name = server_name },
         );
+        if (options.ticket_consumer != null or options.psk_lease != null) {
+            try self.backend.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
+        }
+        if (options.ticket_consumer) |consumer| {
+            try self.backend.setSessionTicketConsumer(allocator, options.ticket_limits, consumer);
+        }
+        if (options.psk_lease) |lease| {
+            try self.backend.setClientPskOfferLease(
+                lease,
+                options.psk_now_ctx orelse return error.InvalidTestSetup,
+                options.psk_now_fn orelse return error.InvalidTestSetup,
+            );
+        }
         self.record = try tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
             allocator,
             .client,
@@ -2866,6 +2891,28 @@ fn prometheusMetricValue(body: []const u8, name: []const u8) ?u64 {
         if (line.len == name.len) continue;
         if (line[name.len] != ' ') continue;
         return std.fmt.parseInt(u64, std.mem.trim(u8, line[name.len + 1 ..], " \t"), 10) catch null;
+    }
+    return null;
+}
+
+fn prometheusLabeledMetricValue(body: []const u8, name: []const u8, labels: []const []const u8) ?u64 {
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, name)) continue;
+        if (line.len == name.len or line[name.len] != '{') continue;
+        const end_labels = std.mem.indexOfScalarPos(u8, line, name.len, '}') orelse continue;
+        const label_text = line[name.len + 1 .. end_labels];
+        var matched = true;
+        for (labels) |label| {
+            if (std.mem.indexOf(u8, label_text, label) == null) {
+                matched = false;
+                break;
+            }
+        }
+        if (!matched) continue;
+        const value_text = std.mem.trim(u8, line[end_labels + 1 ..], " \t");
+        return std.fmt.parseInt(u64, value_text, 10) catch null;
     }
     return null;
 }
@@ -7331,6 +7378,137 @@ test "native TLS listener appliance identity serves the exact configured SNI" {
     defer allocator.free(raw);
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(raw, "HTTP/1.1 200 OK"));
     try assertContains(raw, "alive");
+}
+
+test "#488: native TLS listener resumes and serves HTTP traffic with production metrics" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var client_entropy = tls_core.production_crypto.OsEntropy{};
+    var client_provider = tls_core.production_crypto.Provider.init(client_entropy.entropy());
+    var client_runtime = try tls_core.resumption_runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 2_000;
+            }
+        }.now },
+        client_provider.cryptoProvider(),
+    );
+    defer client_runtime.deinit();
+
+    const TicketCapture = struct {
+        allocator: std.mem.Allocator,
+        runtime: *tls_core.resumption_runtime.Runtime,
+        retained: tls_core.session.ClientTicketState = .{},
+        stored: tls_core.session_cache.StoreResult = undefined,
+        count: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.retained.deinit();
+            self.retained = .{};
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+            self.stored = self.runtime.storeClientTicket(ticket);
+            self.count += 1;
+        }
+    };
+    var capture = TicketCapture{ .allocator = allocator, .runtime = &client_runtime };
+    defer capture.retained.deinit();
+
+    const first_client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+        .ticket_consumer = .{
+            .ctx = &capture,
+            .nowUnixMsFn = TicketCapture.now,
+            .onTicketFn = TicketCapture.onTicket,
+        },
+    });
+    defer first_client.destroy();
+    try first_client.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const first_raw = try first_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(first_raw);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(first_raw, "HTTP/1.1 200 OK"));
+    try assertContains(first_raw, "alive");
+    try std.testing.expect(capture.count > 0);
+    try std.testing.expectEqual(tls_core.session_cache.StoreResult.stored, capture.stored);
+
+    const candidate: tls_core.session.CandidateContext = .{
+        .cipher_suite = capture.retained.common.cipher_suite,
+        .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
+        .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
+        .auth_binding = capture.retained.common.auth_binding,
+        .transport_compat = null,
+        .application_compat = null,
+    };
+    var lookup = client_runtime.lookupClientOffers(candidate);
+    defer lookup.deinit();
+    try std.testing.expect(lookup == .hit);
+    try std.testing.expectEqual(@as(usize, 1), lookup.hit.offers.len);
+
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2_500;
+        }
+    };
+    const resumed_client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+        .psk_lease = &lookup.hit,
+        .psk_now_ctx = &clock_dummy,
+        .psk_now_fn = ClientClock.now,
+    });
+    defer resumed_client.destroy();
+    try std.testing.expect(resumed_client.backend.core.psk_authenticated);
+    try resumed_client.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const resumed_raw = try resumed_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(resumed_raw);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(resumed_raw, "HTTP/1.1 200 OK"));
+    try assertContains(resumed_raw, "alive");
+
+    var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
+    try std.testing.expect((prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_ticket_issue_total", &.{
+        "transport=\"record\"",
+        "mode=\"stateful\"",
+        "result=\"success\"",
+    }) orelse 0) >= 1);
+    try std.testing.expect((prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_ticket_resolve_total", &.{
+        "mode=\"stateful\"",
+        "result=\"success\"",
+    }) orelse 0) >= 1);
+    try std.testing.expect((prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_attempt_total", &.{
+        "transport=\"record\"",
+    }) orelse 0) >= 1);
+    try std.testing.expect((prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{
+        "transport=\"record\"",
+        "outcome=\"accepted\"",
+    }) orelse 0) >= 1);
 }
 
 test "native TLS listener appliance rejects unknown SNI before HTTP dispatch" {

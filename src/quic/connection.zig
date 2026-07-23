@@ -2577,6 +2577,15 @@ const TestPair = struct {
         limits: tls_core.session.Limits,
         consumer: tls_core.tls13_backend.Tls13Backend.SessionTicketConsumer,
     ) !*TestPair {
+        return initWithTicketConsumerAndResumePolicy(allocator, limits, consumer, null);
+    }
+
+    fn initWithTicketConsumerAndResumePolicy(
+        allocator: std.mem.Allocator,
+        limits: tls_core.session.Limits,
+        consumer: tls_core.tls13_backend.Tls13Backend.SessionTicketConsumer,
+        resume_compat: ?tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy,
+    ) !*TestPair {
         const pair = try allocator.create(TestPair);
         pair.* = .{
             .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
@@ -2594,6 +2603,10 @@ const TestPair = struct {
             ),
         };
         errdefer allocator.destroy(pair);
+        if (resume_compat) |policy| {
+            try pair.client_backend.setResumeCompatibilityPolicy(policy);
+            try pair.server_backend.setResumeCompatibilityPolicy(policy);
+        }
         try pair.client_backend.engine.setSessionTicketConsumer(allocator, limits, consumer);
         pair.client = try Connection.init(allocator, .{
             .role = .client,
@@ -2942,11 +2955,15 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
     };
     var capture = CaptureImpl{ .runtime = &client_runtime };
     defer capture.retained.deinit();
-    var pair = try TestPair.initWithTicketConsumer(allocator, tls_core.session.Limits.default, .{
+    const resume_policy: tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = .{
+        .transport = .ignore,
+        .application = .ignore,
+    };
+    var pair = try TestPair.initWithTicketConsumerAndResumePolicy(allocator, tls_core.session.Limits.default, .{
         .ctx = &capture,
         .nowUnixMsFn = CaptureImpl.now,
         .onTicketFn = CaptureImpl.onTicket,
-    });
+    }, resume_policy);
     defer pair.deinit(allocator);
     try pair.pump();
 
@@ -2969,20 +2986,17 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
     // runtime's resolver before the handshake starts — proving the runtime's
     // cache/resolver composition (not a hand-rolled resolver) drives a real
     // abbreviated QUIC handshake.
-    // Built from the retained ticket's own fields rather than guessed
-    // constants: QUIC connections carry their negotiated transport
-    // parameters as `transport_compat`, which is part of the origin the
-    // ticket was actually issued under (unlike the plain record profile).
+    // Native QUIC 1-RTT resumption deliberately ignores connection-specific
+    // transport/application snapshots. Do not feed the old ticket snapshot
+    // back as the current candidate; doing so would only prove exact-match
+    // behavior and would mask valid reconnects with changed transport params.
     const candidate: tls_core.session.CandidateContext = .{
         .cipher_suite = capture.retained.common.cipher_suite,
         .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
         .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
         .auth_binding = capture.retained.common.auth_binding,
-        .transport_compat = if (capture.retained.common.transport_compat) |*snap| .{
-            .format_id = snap.format_id,
-            .format_version = snap.format_version,
-            .bytes = snap.slice(),
-        } else null,
+        .transport_compat = null,
+        .application_compat = null,
     };
     var lookup = client_runtime.lookupClientOffers(candidate);
     defer lookup.deinit();
@@ -3011,7 +3025,9 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
         }
     };
     try resumed.client_backend.engine.setClientPskOfferLease(&lookup.hit, &clock_dummy, ClientClock.now);
+    try resumed.client_backend.setResumeCompatibilityPolicy(resume_policy);
     try resumed.server_backend.setServerPskResolver(server_runtime.serverResolver().?);
+    try resumed.server_backend.setResumeCompatibilityPolicy(resume_policy);
 
     resumed.client = try Connection.init(allocator, .{
         .role = .client,

@@ -546,6 +546,33 @@ fn testResumptionRuntime(allocator: std.mem.Allocator) !tls.resumption_runtime.R
     );
 }
 
+const TicketIssueProbe = struct {
+    count: usize = 0,
+    transport: tls.resumption_runtime.Transport = undefined,
+    mode: tls.resumption_runtime.Mode = undefined,
+    result: tls.resumption_runtime.TicketResult = undefined,
+
+    fn observer(self: *TicketIssueProbe) tls.resumption_runtime.Observer {
+        return .{
+            .ctx = self,
+            .onTicketIssueFn = onTicketIssue,
+        };
+    }
+
+    fn onTicketIssue(
+        ctx: *anyopaque,
+        transport: tls.resumption_runtime.Transport,
+        mode: tls.resumption_runtime.Mode,
+        result: tls.resumption_runtime.TicketResult,
+    ) void {
+        const self: *TicketIssueProbe = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        self.transport = transport;
+        self.mode = mode;
+        self.result = result;
+    }
+};
+
 test "native TLS createWithOptions installs the shared server resolver when configured" {
     var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
     defer fixed.deinit();
@@ -585,6 +612,41 @@ test "native TLS without a resumption runtime never attempts ticket issuance" {
     try std.testing.expect(conn.backend.psk_resolver == null);
     conn.maybeIssueSessionTicket();
     try std.testing.expect(!conn.ticket_issue_attempted);
+}
+
+test "native TLS failed post-handshake issuance notifies the runtime observer once" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    var runtime = try testResumptionRuntime(std.testing.allocator);
+    defer runtime.deinit();
+    var probe = TicketIssueProbe{};
+    runtime.setObserver(probe.observer());
+
+    const conn = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .resumption_runtime = &runtime },
+    );
+    defer conn.destroy();
+
+    conn.record.lifecycle = .open;
+    conn.record.bridge.handshake_complete = true;
+    runtime.config.ticket_lifetime_seconds = 0;
+
+    conn.maybeIssueSessionTicket();
+    try std.testing.expect(conn.ticket_issue_attempted);
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
+    try std.testing.expectEqual(tls.resumption_runtime.Transport.record, probe.transport);
+    try std.testing.expectEqual(tls.resumption_runtime.Mode.stateful, probe.mode);
+    try std.testing.expectEqual(tls.resumption_runtime.TicketResult.failed, probe.result);
+
+    conn.maybeIssueSessionTicket();
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
 }
 
 test "native TLS never attempts ticket issuance before application data opens" {

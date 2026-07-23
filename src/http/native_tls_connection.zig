@@ -138,6 +138,11 @@ fn keyKindForScheme(scheme: credentials.SignatureScheme) sni_provider.KeyKind {
 pub const NativeTlsConnection = struct {
     pub const Options = struct {
         buffer_limits: encrypted_stream.BufferLimits = encrypted_stream.BufferLimits.defaults(),
+        /// #488: process-shared native resumption runtime, borrowed for the
+        /// lifetime of this connection. `null` (the default) leaves
+        /// resumption fully disabled: no resolver is installed and no
+        /// ticket is ever issued.
+        resumption_runtime: ?*tls.resumption_runtime.Runtime = null,
     };
 
     allocator: std.mem.Allocator,
@@ -148,6 +153,11 @@ pub const NativeTlsConnection = struct {
     negotiated: ?NegotiatedProtocol = null,
     entropy_source: production_crypto.OsEntropy = .{},
     crypto_provider_state: production_crypto.Provider = undefined,
+    resumption_runtime: ?*tls.resumption_runtime.Runtime = null,
+    /// Set exactly once this connection has attempted post-handshake ticket
+    /// issuance (successfully or not) — issuance is best-effort and must
+    /// never be retried on the same connection (#488).
+    ticket_issue_attempted: bool = false,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -187,6 +197,16 @@ pub const NativeTlsConnection = struct {
                 .transport = .record,
             },
         );
+        // #488: install the process-shared server resolver before the
+        // handshake can start — `setServerPskResolver` itself refuses once
+        // the backend has left `.idle`.
+        if (options.resumption_runtime) |runtime| {
+            backend.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore }) catch unreachable;
+            backend.setResumptionDecisionObserver(runtime.backendDecisionObserver(.record)) catch unreachable;
+            if (runtime.serverResolver()) |resolver| {
+                backend.setServerPskResolver(resolver) catch unreachable;
+            }
+        }
 
         const record = try allocator.create(encrypted_stream.PureZigRecordStream);
         errdefer allocator.destroy(record);
@@ -197,6 +217,7 @@ pub const NativeTlsConnection = struct {
             .backend = backend,
             .record = record,
             .policy = policy,
+            .resumption_runtime = options.resumption_runtime,
         };
         self.crypto_provider_state = production_crypto.Provider.init(self.entropy_source.entropy());
         record.* = try encrypted_stream.PureZigRecordStream.initWithCarrierBackendAndLimits(
@@ -246,7 +267,73 @@ pub const NativeTlsConnection = struct {
     }
 
     pub fn drive(self: *NativeTlsConnection) encrypted_stream.Error!encrypted_stream.DriveResult {
-        return self.record.drive();
+        const result = try self.record.drive();
+        self.maybeIssueSessionTicket();
+        return result;
+    }
+
+    /// #488: best-effort, exactly-once post-handshake ticket issuance. Only
+    /// attempted once authenticated application data has actually opened,
+    /// and never retried on this connection regardless of outcome — a
+    /// failure here is swallowed rather than tearing down an otherwise
+    /// usable connection.
+    fn maybeIssueSessionTicket(self: *NativeTlsConnection) void {
+        if (self.ticket_issue_attempted) return;
+        const runtime = self.resumption_runtime orelse return;
+        if (self.backend.role != .server) return;
+        if (!self.record.applicationDataOpen()) return;
+        self.ticket_issue_attempted = true;
+        self.issueSessionTicket(runtime) catch |err| {
+            runtime.observer.ticketIssue(.record, runtime.config.mode, switch (err) {
+                error.StatefulCapacityRefused => .rejected,
+                else => .failed,
+            });
+            return;
+        };
+        runtime.observer.ticketIssue(.record, runtime.config.mode, .success);
+    }
+
+    fn issueSessionTicket(self: *NativeTlsConnection, runtime: *tls.resumption_runtime.Runtime) !void {
+        const now_unix_ms = runtime.nowUnixMs();
+        const crypto_provider = self.crypto_provider_state.cryptoProvider();
+
+        var ticket_nonce: [8]u8 = undefined;
+        try crypto_provider.randomBytes(&ticket_nonce);
+        var age_add_bytes: [4]u8 = undefined;
+        try crypto_provider.randomBytes(&age_add_bytes);
+        const ticket_age_add = std.mem.readInt(u32, &age_add_bytes, .big);
+
+        const limits = runtime.config.session_limits;
+        var prepared = try self.backend.prepareNewSessionTicket(self.allocator, .{
+            .ticket_lifetime = runtime.config.ticket_lifetime_seconds,
+            .ticket_age_add = ticket_age_add,
+            .ticket_nonce = &ticket_nonce,
+            .issued_at_unix_ms = now_unix_ms,
+        }, limits);
+        defer prepared.deinit();
+
+        const scratch = try self.allocator.alloc(u8, runtime.maxIdentityLen());
+        defer {
+            std.crypto.secureZero(u8, scratch);
+            self.allocator.free(scratch);
+        }
+        var identity = try runtime.createIdentity(&prepared.state, now_unix_ms, scratch);
+        defer identity.deinit();
+
+        var sink = tls.tls13_transport.EventSink{};
+        defer sink.deinit();
+        self.backend.emitPreparedNewSessionTicket(self.allocator, &sink, &prepared, identity.slice(), limits) catch |err| {
+            runtime.rollbackIdentity(&identity);
+            return err;
+        };
+
+        for (sink.items[0..sink.len]) |event| switch (event) {
+            .handshake_bytes => |hb| self.record.tryQueuePostHandshake(.{ .handshake_bytes = .{ .epoch = hb.epoch, .data = hb.data } }) catch |err| {
+                runtime.rollbackIdentity(&identity);
+                return err;
+            },
+            else => {},
+        };
     }
 
     pub fn validatedNegotiatedProtocol(self: *NativeTlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
@@ -442,6 +529,214 @@ test "native TLS createWithOptions applies validated buffer limits" {
     const snapshot = conn.stream().bufferSnapshot();
     try std.testing.expect(snapshot.limits_enforced);
     try std.testing.expectEqual(limits.outbound_ciphertext.high, snapshot.limits.?.outbound_ciphertext.high);
+}
+
+fn fixedNowUnixMs(_: *anyopaque) i64 {
+    return 1000;
+}
+
+fn testResumptionRuntime(allocator: std.mem.Allocator) !tls.resumption_runtime.Runtime {
+    var entropy = production_crypto.OsEntropy{};
+    var provider_state = production_crypto.Provider.init(entropy.entropy());
+    return tls.resumption_runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = fixedNowUnixMs },
+        provider_state.cryptoProvider(),
+    );
+}
+
+const TicketIssueProbe = struct {
+    count: usize = 0,
+    transport: tls.resumption_runtime.Transport = undefined,
+    mode: tls.resumption_runtime.Mode = undefined,
+    result: tls.resumption_runtime.TicketResult = undefined,
+
+    fn observer(self: *TicketIssueProbe) tls.resumption_runtime.Observer {
+        return .{
+            .ctx = self,
+            .onTicketIssueFn = onTicketIssue,
+        };
+    }
+
+    fn onTicketIssue(
+        ctx: *anyopaque,
+        transport: tls.resumption_runtime.Transport,
+        mode: tls.resumption_runtime.Mode,
+        result: tls.resumption_runtime.TicketResult,
+    ) void {
+        const self: *TicketIssueProbe = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        self.transport = transport;
+        self.mode = mode;
+        self.result = result;
+    }
+};
+
+const CacheEventProbe = struct {
+    stored: usize = 0,
+
+    fn observer(self: *CacheEventProbe) tls.session_cache.Observer {
+        return .{ .ctx = self, .onEventFn = onEvent };
+    }
+
+    fn onEvent(ctx: *anyopaque, event: tls.session_cache.CacheEvent) void {
+        const self: *CacheEventProbe = @ptrCast(@alignCast(ctx));
+        if (event == .stored) self.stored += 1;
+    }
+};
+
+test "native TLS createWithOptions installs the shared server resolver when configured" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    var runtime = try testResumptionRuntime(std.testing.allocator);
+    defer runtime.deinit();
+
+    const conn = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .resumption_runtime = &runtime },
+    );
+    defer conn.destroy();
+
+    try std.testing.expect(conn.backend.psk_resolver != null);
+    try std.testing.expectEqual(@as(?*tls.resumption_runtime.Runtime, &runtime), conn.resumption_runtime);
+}
+
+test "native TLS without a resumption runtime never attempts ticket issuance" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    const conn = try NativeTlsConnection.create(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+    );
+    defer conn.destroy();
+
+    try std.testing.expect(conn.backend.psk_resolver == null);
+    conn.maybeIssueSessionTicket();
+    try std.testing.expect(!conn.ticket_issue_attempted);
+}
+
+test "native TLS failed post-handshake issuance notifies the runtime observer once" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    var runtime = try testResumptionRuntime(std.testing.allocator);
+    defer runtime.deinit();
+    var probe = TicketIssueProbe{};
+    runtime.setObserver(probe.observer());
+
+    const conn = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .resumption_runtime = &runtime },
+    );
+    defer conn.destroy();
+
+    conn.record.lifecycle = .open;
+    conn.record.bridge.handshake_complete = true;
+    runtime.config.ticket_lifetime_seconds = 0;
+
+    conn.maybeIssueSessionTicket();
+    try std.testing.expect(conn.ticket_issue_attempted);
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
+    try std.testing.expectEqual(tls.resumption_runtime.Transport.record, probe.transport);
+    try std.testing.expectEqual(tls.resumption_runtime.Mode.stateful, probe.mode);
+    try std.testing.expectEqual(tls.resumption_runtime.TicketResult.failed, probe.result);
+
+    conn.maybeIssueSessionTicket();
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
+}
+
+test "native TLS post-handshake queue pressure rolls back inserted stateful handle and keeps stream open" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    var runtime = try testResumptionRuntime(std.testing.allocator);
+    defer runtime.deinit();
+    var issue_probe = TicketIssueProbe{};
+    runtime.setObserver(issue_probe.observer());
+    var cache_probe = CacheEventProbe{};
+    runtime.server_cache.?.setObserver(cache_probe.observer());
+
+    const conn = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .resumption_runtime = &runtime },
+    );
+    defer conn.destroy();
+
+    const hs_read = [_]u8{0x21} ** 32;
+    const hs_write = [_]u8{0x22} ** 32;
+    const app_read = [_]u8{0x23} ** 32;
+    const app_write = [_]u8{0x24} ** 32;
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &hs_read } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &hs_write } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &app_read } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &app_write } });
+    try conn.record.applyEvent(.{ .discard_epoch = .initial });
+    try conn.record.applyEvent(.{ .discard_epoch = .handshake });
+    try conn.record.applyEvent(.handshake_complete);
+    conn.backend.core.handshake_lifecycle = .complete;
+    try conn.backend.resumption_master_secret.replace(&([_]u8{0x42} ** tls.tls13_backend.hash_len));
+
+    try std.testing.expectEqual(@as(usize, 0), runtime.server_cache.?.count());
+    conn.record.outbound_ciphertext.len = encrypted_stream.PureZigRecordStream.max_ciphertext_queue - 1;
+    conn.maybeIssueSessionTicket();
+
+    try std.testing.expect(conn.ticket_issue_attempted);
+    try std.testing.expectEqual(@as(usize, 1), cache_probe.stored);
+    try std.testing.expectEqual(@as(usize, 0), runtime.server_cache.?.count());
+    try std.testing.expectEqual(@as(usize, 1), issue_probe.count);
+    try std.testing.expectEqual(tls.resumption_runtime.TicketResult.failed, issue_probe.result);
+    try std.testing.expect(conn.record.lifecycle == .open);
+    try std.testing.expect(conn.record.failed == null);
+
+    conn.record.outbound_ciphertext.len = 0;
+    const written = try conn.record.stream().write("still-open");
+    try std.testing.expectEqual(@as(usize, "still-open".len), written);
+    try std.testing.expect(conn.record.queuedCiphertextLen() > 0);
+}
+
+test "native TLS never attempts ticket issuance before application data opens" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    var runtime = try testResumptionRuntime(std.testing.allocator);
+    defer runtime.deinit();
+
+    const conn = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .resumption_runtime = &runtime },
+    );
+    defer conn.destroy();
+
+    try std.testing.expect(!conn.record.applicationDataOpen());
+    conn.maybeIssueSessionTicket();
+    try std.testing.expect(!conn.ticket_issue_attempted);
 }
 
 test "native TLS negotiated protocol is unavailable before application data opens" {

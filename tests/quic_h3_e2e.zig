@@ -21,6 +21,7 @@
 const std = @import("std");
 const quic = @import("quic");
 const http3 = @import("http3");
+const tls_core = quic.tls_core;
 
 const connection = quic.connection;
 const tls_backend = quic.tls_backend;
@@ -239,8 +240,16 @@ const Sim = struct {
         to_server: Rules = .{},
         to_client: Rules = .{},
         quic: quic.config.Config = .{},
+        server_quic: ?quic.config.Config = null,
         limits: Limits = .{},
         log_failures: bool = true,
+        ticket_consumer: ?tls_core.tls13_backend.Tls13Backend.SessionTicketConsumer = null,
+        ticket_limits: tls_core.session.Limits = tls_core.session.Limits.default,
+        client_psk_lease: ?*tls_core.pre_shared_key.ClientOfferLease = null,
+        psk_now_ctx: ?*anyopaque = null,
+        psk_now_fn: ?*const fn (*anyopaque) i64 = null,
+        server_psk_resolver: ?tls_core.pre_shared_key.ServerPskResolver = null,
+        resume_compat: ?tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = null,
     };
 
     const FailureSnapshot = struct {
@@ -299,6 +308,23 @@ const Sim = struct {
                 .limits = sim_config.limits,
             },
         };
+        if (sim_config.resume_compat) |policy| {
+            try sim.client_backend.setResumeCompatibilityPolicy(policy);
+            try sim.server_backend.setResumeCompatibilityPolicy(policy);
+        }
+        if (sim_config.ticket_consumer) |consumer| {
+            try sim.client_backend.engine.setSessionTicketConsumer(allocator, sim_config.ticket_limits, consumer);
+        }
+        if (sim_config.client_psk_lease) |lease| {
+            try sim.client_backend.engine.setClientPskOfferLease(
+                lease,
+                sim_config.psk_now_ctx orelse return error.InvalidTestSetup,
+                sim_config.psk_now_fn orelse return error.InvalidTestSetup,
+            );
+        }
+        if (sim_config.server_psk_resolver) |resolver| {
+            try sim.server_backend.setServerPskResolver(resolver);
+        }
         sim.client = try Connection.init(allocator, .{
             .role = .client,
             .config = sim_config.quic,
@@ -310,7 +336,7 @@ const Sim = struct {
         errdefer sim.client.deinit();
         sim.server = try Connection.init(allocator, .{
             .role = .server,
-            .config = sim_config.quic,
+            .config = sim_config.server_quic orelse sim_config.quic,
             .local_cid = &odcid,
             .original_dcid = &odcid,
             .peer_cid = &client_cid,
@@ -546,6 +572,161 @@ test "e2e: lossless handshake, SETTINGS, request/response, clean close" {
     const info = sim.server.closeInfo().?;
     try testing.expect(info.is_application);
     try testing.expect(!info.local);
+}
+
+test "#488: runtime-backed resumed QUIC connection exchanges HTTP/3 after transport params change" {
+    const allocator = testing.allocator;
+    const runtime = tls_core.resumption_runtime;
+    const resume_policy: tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = .{
+        .transport = .ignore,
+        .application = .ignore,
+    };
+
+    var server_entropy = tls_core.production_crypto.OsEntropy{};
+    var server_provider = tls_core.production_crypto.Provider.init(server_entropy.entropy());
+    var server_runtime = try runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 1_000;
+            }
+        }.now },
+        server_provider.cryptoProvider(),
+    );
+    defer server_runtime.deinit();
+
+    var client_entropy = tls_core.production_crypto.OsEntropy{};
+    var client_provider = tls_core.production_crypto.Provider.init(client_entropy.entropy());
+    var client_runtime = try runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 2_000;
+            }
+        }.now },
+        client_provider.cryptoProvider(),
+    );
+    defer client_runtime.deinit();
+
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        runtime: *runtime.Runtime,
+        retained: tls_core.session.ClientTicketState = .{},
+        stored: tls_core.session_cache.StoreResult = undefined,
+        count: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.retained.deinit();
+            self.retained = .{};
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+            self.stored = self.runtime.storeClientTicket(ticket);
+            self.count += 1;
+        }
+    };
+    var capture = Capture{ .allocator = allocator, .runtime = &client_runtime };
+    defer capture.retained.deinit();
+
+    const issue_quic: quic.config.Config = .{
+        .initial_max_data = 32 * 1024,
+        .initial_max_stream_data_bidi_local = 8 * 1024,
+        .initial_max_stream_data_bidi_remote = 8 * 1024,
+        .initial_max_stream_data_uni = 4 * 1024,
+        .initial_max_streams_bidi = 12,
+        .initial_max_streams_uni = 6,
+    };
+    var first = try Sim.init(allocator, .{
+        .scenario = "resumption-issue-h3",
+        .quic = issue_quic,
+        .server_quic = issue_quic,
+        .ticket_consumer = .{
+            .ctx = &capture,
+            .nowUnixMsFn = Capture.now,
+            .onTicketFn = Capture.onTicket,
+        },
+        .resume_compat = resume_policy,
+    });
+    defer first.deinit();
+    errdefer |err| first.recordFailure(err);
+    try runH3Exchange(first);
+
+    var prepared = try first.server.prepareNewSessionTicket(allocator, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 1_000,
+    }, tls_core.session.Limits.default);
+    defer prepared.deinit();
+    var scratch: [256]u8 = undefined;
+    var identity = try server_runtime.createIdentity(&prepared.state, 1_000, &scratch);
+    defer identity.deinit();
+    try first.server.emitPreparedNewSessionTicket(&prepared, identity.slice(), tls_core.session.Limits.default);
+    const ticket_deadline = first.now_us + 30_000_000;
+    while (capture.count == 0 and first.now_us < ticket_deadline) {
+        if (!try first.step()) break;
+    }
+    try testing.expect(capture.count > 0);
+    try testing.expectEqual(tls_core.session_cache.StoreResult.stored, capture.stored);
+
+    const candidate: tls_core.session.CandidateContext = .{
+        .cipher_suite = capture.retained.common.cipher_suite,
+        .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
+        .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
+        .auth_binding = capture.retained.common.auth_binding,
+        .transport_compat = null,
+        .application_compat = null,
+    };
+    var lookup = client_runtime.lookupClientOffers(candidate);
+    defer lookup.deinit();
+    try testing.expect(lookup == .hit);
+
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2_500;
+        }
+    };
+    const resume_client_quic: quic.config.Config = .{
+        .idle_timeout_ms = 20_000,
+        .active_connection_id_limit = 5,
+        .initial_max_data = 64 * 1024,
+        .initial_max_stream_data_bidi_local = 12 * 1024,
+        .initial_max_stream_data_bidi_remote = 12 * 1024,
+        .initial_max_stream_data_uni = 6 * 1024,
+        .initial_max_streams_bidi = 20,
+        .initial_max_streams_uni = 8,
+    };
+    const resume_server_quic: quic.config.Config = .{
+        .idle_timeout_ms = 45_000,
+        .active_connection_id_limit = 6,
+        .initial_max_data = 96 * 1024,
+        .initial_max_stream_data_bidi_local = 16 * 1024,
+        .initial_max_stream_data_bidi_remote = 16 * 1024,
+        .initial_max_stream_data_uni = 8 * 1024,
+        .initial_max_streams_bidi = 24,
+        .initial_max_streams_uni = 10,
+    };
+    var resumed = try Sim.init(allocator, .{
+        .scenario = "resumed-h3-changed-transport",
+        .quic = resume_client_quic,
+        .server_quic = resume_server_quic,
+        .client_psk_lease = &lookup.hit,
+        .psk_now_ctx = &clock_dummy,
+        .psk_now_fn = ClientClock.now,
+        .server_psk_resolver = server_runtime.serverResolver().?,
+        .resume_compat = resume_policy,
+    });
+    defer resumed.deinit();
+    errdefer |err| resumed.recordFailure(err);
+    try runH3Exchange(resumed);
+    try testing.expect(resumed.client_backend.engine.core.psk_authenticated);
+    try testing.expect(resumed.server_backend.engine.core.psk_authenticated);
 }
 
 test "e2e: lost client Initial recovers via PTO" {

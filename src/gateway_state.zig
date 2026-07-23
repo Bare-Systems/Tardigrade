@@ -2641,6 +2641,11 @@ pub const WorkerContext = struct {
     /// Appliance profile: borrowed from the `ApplianceCredentials` owner.
     /// Otherwise: borrowed from the generic native credential store.
     native_tls_provider: ?tls_core.credentials.CredentialProvider = null,
+    /// #488: process-shared native TLS/QUIC resumption runtime, borrowed
+    /// for the lifetime of every native TCP connection this worker accepts.
+    /// `null` when native resumption is disabled (the default) or the
+    /// downstream path is not native TLS.
+    resumption_runtime: ?*tls_core.resumption_runtime.Runtime = null,
     session_pool: *ConnectionSessionPool,
     /// Event loop used to (un)watch idle keepalive connections (#138). A worker
     /// re-arms a parked fd here; the loop thread dispatches it back on readiness.

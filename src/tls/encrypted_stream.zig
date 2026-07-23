@@ -826,6 +826,28 @@ pub const PureZigRecordStream = struct {
         if (event == .handshake_complete) self.lifecycle = .open;
     }
 
+    /// Best-effort established-connection post-handshake queueing. Unlike
+    /// `applyEvent`, queue or sealing failure is reported to the caller without
+    /// calling `fail()` and without closing an otherwise usable connection.
+    pub fn tryQueuePostHandshake(self: *PureZigRecordStream, event: events.Event) Error!void {
+        if (self.failed) |err| return err;
+        if (self.lifecycle == .closed or self.lifecycle == .failed or self.lifecycle == .closing) return error.StreamClosed;
+        if (!self.applicationDataOpen()) return error.HandshakeNotComplete;
+        if (event != .handshake_bytes or event.handshake_bytes.epoch != .application) return error.InvalidHandshakeState;
+        const needed = try self.bridge.sealedHandshakeLen(event.handshake_bytes.epoch, event.handshake_bytes.data.len);
+        if (!self.hasHardRoom(.outbound_ciphertext, self.outbound_ciphertext.len, needed)) return self.rejectHardLimit(.outbound_ciphertext, error.WouldBlock);
+        if (self.outbound_ciphertext.available() < needed) return error.WouldBlock;
+
+        var offset: usize = 0;
+        while (offset < event.handshake_bytes.data.len) {
+            const take = @min(record_codec.max_plaintext_fragment_len, event.handshake_bytes.data.len - offset);
+            var record_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+            const record = try self.bridge.sealHandshake(.application, event.handshake_bytes.data[offset..][0..take], &record_buf);
+            try self.appendOutboundCiphertext(record);
+            offset += take;
+        }
+    }
+
     /// The record-layer side effects of an epoch discard, shared by the manual
     /// `applyEvent` path and the driver-owned path (`applyDriverOutcome`).
     fn applyDiscardSideEffects(self: *PureZigRecordStream, epoch: events.EncryptionEpoch) Error!void {

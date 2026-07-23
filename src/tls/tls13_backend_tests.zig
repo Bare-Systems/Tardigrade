@@ -603,7 +603,13 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
     try std.testing.expect(resumed.client_backend.core.psk_authenticated);
     try std.testing.expect(resumed.server_backend.core.psk_authenticated);
     // No certificate flight: the fixed server identity was never consumed.
-    try std.testing.expect(resumed.observed.certificate_state == null);
+    // `certificate_state` reports `.valid` anyway (#488) — a PSK-resumed
+    // handshake never sends Certificate, so the completion policy that
+    // requires a valid peer certificate for the client role would otherwise
+    // treat every resumed connection as fatally unauthenticated; the client
+    // instead inherits trust from the original full handshake that issued
+    // this ticket, confirmed here by the binder.
+    try std.testing.expectEqual(events.CertificateState.valid, resumed.observed.certificate_state.?);
 
     // The resumed connection is genuinely usable: application data flows
     // both ways under the PSK-derived keys.
@@ -612,6 +618,184 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
     const request = try resumed.client_bridge.sealApplicationData("resumed request", &protected2);
     const opened_request = try resumed.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext2);
     try std.testing.expectEqualStrings("resumed request", opened_request.inner.content);
+}
+
+fn expectRuntimeResumedRecordHandshake(
+    server_config: tls_core.resumption_runtime.Config,
+    client_config: tls_core.resumption_runtime.Config,
+    expected_identity: tls_core.resumption_runtime.Runtime.IdentityMode,
+) !void {
+    const resumption_runtime = tls_core.resumption_runtime;
+
+    // Phase 1: a full handshake. The server issues a ticket through the new
+    // #488 two-phase API (prepare -> Runtime.createIdentity -> emit) instead
+    // of the single-phase `emitNewSessionTicket`, and the client captures the
+    // resulting ClientTicketState into its own process-shared runtime.
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+
+    var server_runtime = try resumption_runtime.Runtime.init(
+        std.testing.allocator,
+        server_config,
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 1000;
+            }
+        }.now },
+        serverProvider(),
+    );
+    defer server_runtime.deinit();
+
+    var client_runtime = try resumption_runtime.Runtime.init(
+        std.testing.allocator,
+        client_config,
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 2000;
+            }
+        }.now },
+        clientProvider(),
+    );
+    defer client_runtime.deinit();
+
+    const TicketCapture = struct {
+        runtime: *resumption_runtime.Runtime,
+        stored: session_cache.StoreResult = undefined,
+
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.stored = self.runtime.storeClientTicket(ticket);
+        }
+    };
+    var capture = TicketCapture{ .runtime = &client_runtime };
+    const limits = session.Limits.default;
+    try harness.client_backend.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = TicketCapture.now,
+        .onTicketFn = TicketCapture.onTicket,
+    });
+    try harness.run();
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var prepared = try harness.server_backend.prepareNewSessionTicket(std.testing.allocator, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 1000,
+    }, limits);
+    defer prepared.deinit();
+    var scratch: [session.absolute_ticket_wire_max]u8 = undefined;
+    var identity = try server_runtime.createIdentity(&prepared.state, 1000, &scratch);
+    defer identity.deinit();
+    try std.testing.expectEqual(expected_identity, std.meta.activeTag(identity));
+    try harness.server_backend.emitPreparedNewSessionTicket(std.testing.allocator, &sink, &prepared, identity.slice(), limits);
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+
+    // Deliver the ticket to the client over the (encrypted) application
+    // channel, exactly as a real deployment would.
+    const ticket_event = sink.items[0].handshake_bytes;
+    var protected: [record_codec.max_ciphertext_record_len * 2]u8 = undefined;
+    const records = (try harness.server_bridge.applyEvent(.{ .handshake_bytes = .{
+        .epoch = ticket_event.epoch,
+        .data = ticket_event.data,
+    } }, &protected)).?;
+    var parser = record_codec.Parser.init(.ciphertext);
+    var record_sink = record_codec.RecordSink(8, record_codec.max_ciphertext_fragment_len * 8){};
+    try parser.feed(records, &record_sink);
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    for (record_sink.items[0..record_sink.len]) |record| {
+        const opened = try harness.client_bridge.openHandshake(.application, record, &plaintext);
+        _ = try harness.client_driver.receive(.application, opened.inner.content);
+    }
+    try std.testing.expectEqual(session_cache.StoreResult.stored, capture.stored);
+
+    // Phase 2: a fresh connection looks its offer up through the client
+    // runtime and the server resolves it through the *same* server runtime
+    // that issued it — proving the runtime's cache/resolver composition (not
+    // hand-rolled test stand-ins) drives a real abbreviated handshake.
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    const candidate: session.CandidateContext = .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .server_name = null,
+        // The `DirectHarness` backends negotiate ALPN `h2` by default even
+        // without an explicit policy override; the candidate must match the
+        // exact origin the ticket was actually issued under.
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+    };
+    var lookup = client_runtime.lookupClientOffers(candidate);
+    defer lookup.deinit();
+    try std.testing.expect(lookup == .hit);
+    try std.testing.expectEqual(@as(usize, 1), lookup.hit.offers.len);
+
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+    };
+    try resumed.client_backend.setClientPskOfferLease(&lookup.hit, &clock_dummy, ClientClock.now);
+    try resumed.server_backend.setServerPskResolver(server_runtime.serverResolver().?);
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+    // No certificate flight: this is a genuine PSK-abbreviated handshake, not
+    // merely a second successful full handshake. `certificate_state` reports
+    // `.valid` anyway (#488): the client inherits trust from the original
+    // full handshake that issued this ticket, confirmed here by the binder,
+    // since every transport completion policy otherwise requires a valid
+    // peer certificate for the client role.
+    try std.testing.expectEqual(events.CertificateState.valid, resumed.observed.certificate_state.?);
+
+    // The resumed connection is genuinely usable: application data flows
+    // both ways under the PSK-derived keys.
+    var protected2: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext2: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try resumed.client_bridge.sealApplicationData("resumed request", &protected2);
+    const opened_request = try resumed.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext2);
+    try std.testing.expectEqualStrings("resumed request", opened_request.inner.content);
+}
+
+test "#488: stateful runtime drives a genuine end-to-end resumed handshake via two-phase issuance" {
+    try expectRuntimeResumedRecordHandshake(
+        .{ .mode = .stateful },
+        .{ .mode = .stateful },
+        .stateful,
+    );
+}
+
+test "#488: stateless runtime drives a genuine end-to-end resumed handshake via two-phase issuance" {
+    try expectRuntimeResumedRecordHandshake(
+        .{ .mode = .stateless },
+        .{ .mode = .stateless },
+        .stateless,
+    );
+}
+
+test "#488: hybrid runtime falls back to stateless issuance and reconnects successfully" {
+    try expectRuntimeResumedRecordHandshake(
+        .{ .mode = .hybrid, .server_cache_limits = .{
+            .max_entries = 4,
+            .max_origins = 4,
+            .max_total_bytes = 1,
+            .max_entry_bytes = 1,
+            .max_entries_per_origin = 4,
+        } },
+        .{ .mode = .hybrid },
+        .stateless,
+    );
 }
 
 test "PSK round trip resumes over the extension (QUIC-style) profile with asymmetric client/server transport payloads" {
@@ -854,7 +1038,6 @@ test "an ineligible offered ticket is filtered without desyncing the wire index 
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
-
     try harness.run();
 
     try std.testing.expect(harness.client_driver.isComplete());
@@ -906,6 +1089,8 @@ test "handshake-time client authentication forces a full handshake even when a P
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try harness.server_backend.setResumptionDecisionObserver(decisions.observer());
 
     try harness.run();
 
@@ -916,6 +1101,8 @@ test "handshake-time client authentication forces a full handshake even when a P
     // The resolver is never even consulted: client_auth forces the full
     // fallback before PSK selection begins.
     try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.full_handshake, decisions.last.?);
     try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
 }
 
@@ -2236,6 +2423,7 @@ const PskOfferOptions = struct {
     /// Skip writing `psk_key_exchange_modes` — for the missing-extension
     /// malformed-input test.
     omit_modes: bool = false,
+    modes: []const pre_shared_key.PskKeyExchangeMode = &.{.psk_dhe_ke},
     /// When set, write this literal `pre_shared_key` extension_data
     /// verbatim instead of building it from `items` — bypasses
     /// `pre_shared_key.writeOffer`'s own `max_offered_identities` cap, for
@@ -2340,7 +2528,7 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
         if (!psk_opt.omit_modes) {
             try w.u16_(pre_shared_key.ext_psk_key_exchange_modes);
             const modes_ext_len = try w.reserve(2);
-            try pre_shared_key.writeModes(&w, &.{.psk_dhe_ke});
+            try pre_shared_key.writeModes(&w, psk_opt.modes);
             w.patch(2, modes_ext_len);
         }
         if (psk_opt.raw_ext_data) |raw| {
@@ -3147,6 +3335,21 @@ const CountingResolver = struct {
     }
 };
 
+const DecisionProbe = struct {
+    count: usize = 0,
+    last: ?tls_backend.Tls13Backend.ResumptionDecision = null,
+
+    fn observer(self: *DecisionProbe) tls_backend.Tls13Backend.ResumptionDecisionObserver {
+        return .{ .ctx = self, .onDecisionFn = onDecision };
+    }
+
+    fn onDecision(ctx: *anyopaque, decision: tls_backend.Tls13Backend.ResumptionDecision) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        self.last = decision;
+    }
+};
+
 const LeaseProbe = struct {
     commit_count: usize = 0,
     release_count: usize = 0,
@@ -3221,6 +3424,8 @@ test "async credential selection resumes PSK selection identically to the synchr
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     var sink = DirectSink{};
     defer sink.deinit();
@@ -4395,6 +4600,8 @@ test "resolver identity-resolution attempts are bounded to eight even when a nin
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     var ext_buf: [512]u8 = undefined;
     const raw_ext_data = try buildRawOfferedPsks(&ext_buf, 9);
@@ -4405,6 +4612,8 @@ test "resolver identity-resolution attempts are bounded to eight even when a nin
 
     try std.testing.expectEqual(@as(usize, 8), resolver_state.calls);
     try std.testing.expect(!server.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.miss, decisions.last.?);
 }
 
 test "resolver identity-resolution attempts stop at exactly eight when all eight are unusable" {
@@ -4452,6 +4661,8 @@ test "a resolver operational failure is fatal and distinct from an ordinary miss
         .nowUnixMsFn = FailingResolver.now,
         .resolveFn = FailingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     const psk = [_]u8{0x66} ** tls_backend.hash_len;
     try std.testing.expectError(error.CredentialProviderFailed, driveServerSelection(&server, .{
@@ -4461,6 +4672,8 @@ test "a resolver operational failure is fatal and distinct from an ordinary miss
     // identity, unlike an ordinary "unknown" miss.
     try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
     try std.testing.expectEqual(tls_backend.CredentialFailure.provider_internal_failure, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.fatal, decisions.last.?);
 }
 
 test "a resolver that partially populates its output before failing leaves no residue" {
@@ -4508,6 +4721,8 @@ test "server selects the first compatible identity: unknown first, valid second"
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     try driveServerSelection(&server, .{ .psk = .{ .items = &.{
         .{ .identity = "unknown-ticket", .binder_psk = &psk },
@@ -4517,6 +4732,8 @@ test "server selects the first compatible identity: unknown first, valid second"
     try std.testing.expectEqual(@as(usize, 2), resolver_state.calls);
     try std.testing.expect(server.core.psk_authenticated);
     try std.testing.expect(server.credentialFailure() == null);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.accepted, decisions.last.?);
 }
 
 test "a compatible candidate with a wrong binder is fatal and never probes a later identity" {
@@ -4533,6 +4750,8 @@ test "a compatible candidate with a wrong binder is fatal and never probes a lat
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     var sink = DirectSink{};
     defer sink.deinit();
@@ -4554,6 +4773,8 @@ test "a compatible candidate with a wrong binder is fatal and never probes a lat
     // failed selection: the fatal binder mismatch is caught before
     // anything is written to the wire.
     try std.testing.expectEqual(events_before_client_hello, sink.len);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.fatal, decisions.last.?);
 }
 
 test "resolver lease releases incompatible candidate and commits later selected identity" {
@@ -4580,6 +4801,8 @@ test "resolver lease releases incompatible candidate and commits later selected 
         .nowUnixMsFn = TwoIdentityLeaseResolver.now,
         .resolveFn = TwoIdentityLeaseResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     try driveServerSelection(&server, .{ .psk = .{ .items = &.{
         .{ .identity = "incompatible-ticket", .binder_psk = &psk },
@@ -4594,6 +4817,61 @@ test "resolver lease releases incompatible candidate and commits later selected 
     try std.testing.expectEqual(@as(usize, 0), compatible_lease.release_count);
     try std.testing.expectEqual(@as(usize, 1), compatible_lease.deinit_count);
     try std.testing.expect(server.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.accepted, decisions.last.?);
+}
+
+test "resolver incompatibility reports incompatible full-handshake fallback" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0xa1} ** tls_backend.hash_len;
+    var incompatible_state = pskStoredStateWithBinding(&psk, session.AuthBinding.fromLeafCertificateDer("different-leaf"));
+    defer incompatible_state.deinit();
+    var resolver_state = CountingResolver{ .state = &incompatible_state, .identity = "incompatible-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{
+        .{ .identity = "incompatible-ticket", .binder_psk = &psk },
+    } } });
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!server.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.incompatible, decisions.last.?);
+}
+
+test "unsupported PSK key-exchange mode reports full-handshake fallback" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0xb4} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "psk-ke-only-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
+
+    try driveServerSelection(&server, .{ .psk = .{
+        .modes = &.{.psk_ke},
+        .items = &.{.{ .identity = "psk-ke-only-ticket", .binder_psk = &psk }},
+    } });
+
+    try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+    try std.testing.expect(!server.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.full_handshake, decisions.last.?);
 }
 
 test "resolver lease releases bad-binder candidate before fatal failure and probes no later identity" {

@@ -181,6 +181,18 @@ pub const EdgeConfig = struct {
     tls_session_cache_size: u32,
     tls_session_timeout_seconds: u32,
     tls_session_tickets_enabled: bool,
+    /// #488: native (pure-Zig) TLS/QUIC resumption runtime configuration.
+    /// Deliberately distinct from the `tls_session_*`/`tls_session_tickets_*`
+    /// fields above, which remain OpenSSL-facing only — native settings
+    /// affect only the native TLS-over-TCP and QUIC/H3 engines and must
+    /// never be conflated with the OpenSSL terminator's own session config.
+    /// One of "disabled" (default), "stateful", "stateless", "hybrid"; see
+    /// `nativeResumptionMode`.
+    tls_native_resumption_mode: []const u8,
+    tls_native_resumption_ticket_lifetime_seconds: u32,
+    /// One of "reusable" (default) or "single_use"; see
+    /// `nativeResumptionTicketUsage`.
+    tls_native_resumption_ticket_usage: []const u8,
     tls_ocsp_stapling_enabled: bool,
     tls_ocsp_response_path: []const u8,
     tls_ocsp_auto_refresh: bool,
@@ -560,6 +572,8 @@ pub const EdgeConfig = struct {
             allocator.free(sc.key_path);
         }
         allocator.free(self.tls_sni_certs);
+        allocator.free(self.tls_native_resumption_mode);
+        allocator.free(self.tls_native_resumption_ticket_usage);
         allocator.free(self.tls_ocsp_response_path);
         allocator.free(self.tls_acme_directory_url);
         for (self.tls_acme_domains) |d| allocator.free(d);
@@ -765,6 +779,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const tls_session_cache_size = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_SESSION_CACHE_SIZE", 20_480);
     const tls_session_timeout_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS", 300);
     const tls_session_tickets_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_SESSION_TICKETS", !is_appliance_tls_profile);
+    // #488: native resumption defaults to disabled/safe regardless of TLS
+    // profile — this is a distinct opt-in surface from the OpenSSL-facing
+    // `tls_session_*` settings above and is validated deterministically in
+    // `validate()`, not silently coerced here.
+    const tls_native_resumption_mode = envOrDefault(allocator, "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", "disabled") catch unreachable;
+    errdefer allocator.free(tls_native_resumption_mode);
+    const tls_native_resumption_ticket_lifetime_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_LIFETIME_SECONDS", 86_400);
+    const tls_native_resumption_ticket_usage = envOrDefault(allocator, "TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_USAGE", "reusable") catch unreachable;
+    errdefer allocator.free(tls_native_resumption_ticket_usage);
     const tls_ocsp_stapling_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_OCSP_STAPLING", false);
     const tls_ocsp_response_path = envOrDefault(allocator, "TARDIGRADE_TLS_OCSP_RESPONSE_PATH", "") catch unreachable;
     errdefer allocator.free(tls_ocsp_response_path);
@@ -1447,6 +1470,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_session_cache_size = tls_session_cache_size,
         .tls_session_timeout_seconds = tls_session_timeout_seconds,
         .tls_session_tickets_enabled = tls_session_tickets_enabled,
+        .tls_native_resumption_mode = tls_native_resumption_mode,
+        .tls_native_resumption_ticket_lifetime_seconds = tls_native_resumption_ticket_lifetime_seconds,
+        .tls_native_resumption_ticket_usage = tls_native_resumption_ticket_usage,
         .tls_ocsp_stapling_enabled = tls_ocsp_stapling_enabled,
         .tls_ocsp_response_path = tls_ocsp_response_path,
         .tls_ocsp_auto_refresh = tls_ocsp_auto_refresh,
@@ -2591,6 +2617,54 @@ pub fn hasTlsFiles(cfg: *const EdgeConfig) bool {
 pub const is_appliance_tls_profile =
     std.mem.eql(u8, build_options.tls_profile, "appliance");
 
+/// #488: native (pure-Zig) resumption mode this config resolves to. Callers
+/// must only rely on this after `validate()` has succeeded — an unrecognized
+/// raw string falls back to `.disabled`, the safe default, rather than
+/// silently picking some other mode.
+pub fn nativeResumptionMode(cfg: *const EdgeConfig) tls_core.resumption_runtime.Mode {
+    if (std.mem.eql(u8, cfg.tls_native_resumption_mode, "stateful")) return .stateful;
+    if (std.mem.eql(u8, cfg.tls_native_resumption_mode, "stateless")) return .stateless;
+    if (std.mem.eql(u8, cfg.tls_native_resumption_mode, "hybrid")) return .hybrid;
+    return .disabled;
+}
+
+/// #488: native ticket usage policy this config resolves to. See
+/// `nativeResumptionMode` for the same "only valid after `validate()`"
+/// caveat.
+pub fn nativeResumptionTicketUsage(cfg: *const EdgeConfig) tls_core.resumption_runtime.TicketUsage {
+    if (std.mem.eql(u8, cfg.tls_native_resumption_ticket_usage, "single_use")) return .single_use;
+    return .reusable;
+}
+
+/// #488: native resumption settings are a distinct configuration boundary
+/// from the OpenSSL-facing `tls_session_*` fields — validated deterministically
+/// here rather than silently coerced at load time, so an invalid mode,
+/// usage, or ticket lifetime fails startup/reload instead of falling back.
+/// Pure and logless (like `validateOtelSampleRate`); `validate()` logs the
+/// specific reason at its call site.
+fn validateNativeResumptionConfig(cfg: *const EdgeConfig) !void {
+    const mode = cfg.tls_native_resumption_mode;
+    if (!std.mem.eql(u8, mode, "disabled") and
+        !std.mem.eql(u8, mode, "stateful") and
+        !std.mem.eql(u8, mode, "stateless") and
+        !std.mem.eql(u8, mode, "hybrid"))
+    {
+        return error.InvalidConfigValue;
+    }
+
+    const usage = cfg.tls_native_resumption_ticket_usage;
+    if (!std.mem.eql(u8, usage, "reusable") and !std.mem.eql(u8, usage, "single_use")) {
+        return error.InvalidConfigValue;
+    }
+
+    if (!std.mem.eql(u8, mode, "disabled")) {
+        const lifetime = cfg.tls_native_resumption_ticket_lifetime_seconds;
+        if (lifetime == 0 or lifetime > tls_core.session.max_lifetime_seconds) {
+            return error.InvalidConfigValue;
+        }
+    }
+}
+
 /// Server-name policy for the downstream TLS identity (#392). A configured
 /// name must always be one valid, non-wildcard DNS host name. The appliance
 /// profile additionally requires exactly one identity: a server name must be
@@ -2738,6 +2812,13 @@ pub fn validate(cfg: *const EdgeConfig) !void {
     }
     try validateOptionalFile(cfg.tls_cert_path, "tls_cert_path");
     try validateOptionalFile(cfg.tls_key_path, "tls_key_path");
+    validateNativeResumptionConfig(cfg) catch {
+        std.log.err(
+            "config validation failed: TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE must be one of disabled/stateful/stateless/hybrid, TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_USAGE must be reusable/single_use, and (once enabled) TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_LIFETIME_SECONDS must be nonzero and <= {d} (mode='{s}' usage='{s}' lifetime={d})",
+            .{ tls_core.session.max_lifetime_seconds, cfg.tls_native_resumption_mode, cfg.tls_native_resumption_ticket_usage, cfg.tls_native_resumption_ticket_lifetime_seconds },
+        );
+        return error.InvalidConfigValue;
+    };
     try validateTlsServerNamePolicy(cfg);
     try validateApplianceTlsProfile(cfg);
     for (cfg.tls_sni_certs) |entry| {
@@ -3633,6 +3714,77 @@ test "validate TLS cert/key pair rejects mismatched presence" {
     try validateTlsCertKeyPair("/cert.pem", "/key.pem");
     try std.testing.expectError(error.InvalidConfigPath, validateTlsCertKeyPair("/cert.pem", ""));
     try std.testing.expectError(error.InvalidConfigPath, validateTlsCertKeyPair("", "/key.pem"));
+}
+
+test "native resumption config defaults to disabled and validates cleanly" {
+    const allocator = std.testing.allocator;
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+
+    try std.testing.expectEqualStrings("disabled", cfg.tls_native_resumption_mode);
+    try std.testing.expectEqualStrings("reusable", cfg.tls_native_resumption_ticket_usage);
+    try std.testing.expectEqual(tls_core.resumption_runtime.Mode.disabled, nativeResumptionMode(&cfg));
+    try std.testing.expectEqual(tls_core.resumption_runtime.TicketUsage.reusable, nativeResumptionTicketUsage(&cfg));
+    try validateNativeResumptionConfig(&cfg);
+}
+
+test "native resumption config rejects an unrecognized mode or ticket usage" {
+    const allocator = std.testing.allocator;
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+
+    allocator.free(cfg.tls_native_resumption_mode);
+    cfg.tls_native_resumption_mode = try allocator.dupe(u8, "bogus");
+    try std.testing.expectError(error.InvalidConfigValue, validateNativeResumptionConfig(&cfg));
+    // An unrecognized mode falls back to the safe default rather than
+    // panicking or picking an arbitrary other mode.
+    try std.testing.expectEqual(tls_core.resumption_runtime.Mode.disabled, nativeResumptionMode(&cfg));
+
+    allocator.free(cfg.tls_native_resumption_mode);
+    cfg.tls_native_resumption_mode = try allocator.dupe(u8, "stateful");
+    try validateNativeResumptionConfig(&cfg);
+
+    allocator.free(cfg.tls_native_resumption_ticket_usage);
+    cfg.tls_native_resumption_ticket_usage = try allocator.dupe(u8, "bogus");
+    try std.testing.expectError(error.InvalidConfigValue, validateNativeResumptionConfig(&cfg));
+}
+
+test "native resumption ticket lifetime must be nonzero and within the ceiling, only once enabled" {
+    const allocator = std.testing.allocator;
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+
+    // A zero/oversized lifetime is harmless while resumption stays disabled.
+    cfg.tls_native_resumption_ticket_lifetime_seconds = 0;
+    try validateNativeResumptionConfig(&cfg);
+
+    allocator.free(cfg.tls_native_resumption_mode);
+    cfg.tls_native_resumption_mode = try allocator.dupe(u8, "hybrid");
+    try std.testing.expectError(error.InvalidConfigValue, validateNativeResumptionConfig(&cfg));
+
+    cfg.tls_native_resumption_ticket_lifetime_seconds = tls_core.session.max_lifetime_seconds + 1;
+    try std.testing.expectError(error.InvalidConfigValue, validateNativeResumptionConfig(&cfg));
+
+    cfg.tls_native_resumption_ticket_lifetime_seconds = tls_core.session.max_lifetime_seconds;
+    try validateNativeResumptionConfig(&cfg);
+}
+
+test "nativeResumptionMode and nativeResumptionTicketUsage cover every recognized value" {
+    const allocator = std.testing.allocator;
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+
+    const modes = [_][]const u8{ "disabled", "stateful", "stateless", "hybrid" };
+    const expected_modes = [_]tls_core.resumption_runtime.Mode{ .disabled, .stateful, .stateless, .hybrid };
+    for (modes, expected_modes) |raw, expected| {
+        allocator.free(cfg.tls_native_resumption_mode);
+        cfg.tls_native_resumption_mode = try allocator.dupe(u8, raw);
+        try std.testing.expectEqual(expected, nativeResumptionMode(&cfg));
+    }
+
+    allocator.free(cfg.tls_native_resumption_ticket_usage);
+    cfg.tls_native_resumption_ticket_usage = try allocator.dupe(u8, "single_use");
+    try std.testing.expectEqual(tls_core.resumption_runtime.TicketUsage.single_use, nativeResumptionTicketUsage(&cfg));
 }
 
 test "appliance profile defaults never trip validateApplianceTlsProfile" {

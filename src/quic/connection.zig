@@ -1411,6 +1411,59 @@ pub const Connection = struct {
         return ticket_state;
     }
 
+    /// #488: install the process-shared server resolver. Must be called
+    /// before the handshake starts, matching the shared engine's own
+    /// precondition — the same contract native TLS-over-TCP uses.
+    pub fn setServerPskResolver(self: *Connection, resolver: tls_core.pre_shared_key.ServerPskResolver) tls_handshake.HandshakeError!void {
+        try self.tls.setServerPskResolver(resolver);
+    }
+
+    /// #488 two-phase issuance, step 1 (QUIC): derives the RMS-bound PSK and
+    /// the exact `ServerRecoverableState` a stateful insertion or stateless
+    /// seal will consume. See `tls_core.tls13_backend.Tls13Backend.prepareNewSessionTicket`.
+    pub fn prepareNewSessionTicket(
+        self: *Connection,
+        allocator: std.mem.Allocator,
+        params: tls_handshake.PrepareNewSessionTicketParams,
+        limits: tls_core.session.Limits,
+    ) tls_handshake.HandshakeError!tls_handshake.PreparedNewSessionTicket {
+        if (self.state_ != .established or self.role != .server) return error.InvalidHandshakeState;
+        limits.validate() catch return error.IllegalParameter;
+        return self.tls.prepareNewSessionTicket(allocator, params, limits);
+    }
+
+    /// #488 two-phase issuance, step 2 (QUIC): queues the `NewSessionTicket`
+    /// carrying `identity` through the same reserved application-CRYPTO path
+    /// as single-phase `emitNewSessionTicket`, so retransmission/ordering
+    /// bookkeeping is never duplicated.
+    pub fn emitPreparedNewSessionTicket(
+        self: *Connection,
+        prepared: *const tls_handshake.PreparedNewSessionTicket,
+        identity: []const u8,
+        limits: tls_core.session.Limits,
+    ) tls_handshake.HandshakeError!void {
+        if (self.state_ != .established or self.role != .server) return error.InvalidHandshakeState;
+        if (identity.len == 0 or identity.len > limits.max_ticket_len) return error.TicketTooLarge;
+        const emit_params: tls_core.new_session_ticket.EmitParams = .{
+            .ticket_lifetime = prepared.ticket_lifetime,
+            .ticket_age_add = prepared.ticket_age_add,
+            .ticket_nonce = prepared.ticketNonce(),
+            .ticket = identity,
+            .max_early_data_size = prepared.max_early_data_size,
+        };
+        const body_len = tls_core.new_session_ticket.encodedLen(emit_params) catch return error.IllegalParameter;
+        const message_len = 4 + body_len;
+        const tx = &self.crypto_tx[2];
+        var reservation = tx.prepareAppend(self.allocator, message_len, max_application_crypto_outstanding) catch return error.HandshakeBufferOverflow;
+        defer reservation.deinit();
+
+        var sink = tls_handshake.EventSink{};
+        defer sink.deinit();
+        try self.tls.emitPreparedNewSessionTicket(self.allocator, &sink, prepared, identity, limits);
+        tx.commitReservation(&reservation);
+        try self.queueApplicationCryptoEventsReserved(&sink, message_len);
+    }
+
     fn queueApplicationCryptoEventsReserved(self: *Connection, sink: *tls_handshake.EventSink, expected_bytes: usize) tls_handshake.HandshakeError!void {
         var appended: usize = 0;
         for (sink.items[0..sink.len]) |event| {
@@ -2524,6 +2577,15 @@ const TestPair = struct {
         limits: tls_core.session.Limits,
         consumer: tls_core.tls13_backend.Tls13Backend.SessionTicketConsumer,
     ) !*TestPair {
+        return initWithTicketConsumerAndResumePolicy(allocator, limits, consumer, null);
+    }
+
+    fn initWithTicketConsumerAndResumePolicy(
+        allocator: std.mem.Allocator,
+        limits: tls_core.session.Limits,
+        consumer: tls_core.tls13_backend.Tls13Backend.SessionTicketConsumer,
+        resume_compat: ?tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy,
+    ) !*TestPair {
         const pair = try allocator.create(TestPair);
         pair.* = .{
             .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
@@ -2541,6 +2603,10 @@ const TestPair = struct {
             ),
         };
         errdefer allocator.destroy(pair);
+        if (resume_compat) |policy| {
+            try pair.client_backend.setResumeCompatibilityPolicy(policy);
+            try pair.server_backend.setResumeCompatibilityPolicy(policy);
+        }
         try pair.client_backend.engine.setSessionTicketConsumer(allocator, limits, consumer);
         pair.client = try Connection.init(allocator, .{
             .role = .client,
@@ -2756,6 +2822,247 @@ test "driver: server NewSessionTicket uses application CRYPTO retransmission and
     var buf: [16]u8 = undefined;
     const request = try pair.server.readStream(id, &buf);
     try testing.expectEqualStrings("after", buf[0..request.len]);
+}
+
+test "driver: two-phase prepare/emit NewSessionTicket delivers over application CRYPTO" {
+    const CaptureImpl = struct {
+        count: usize = 0,
+        ticket_len: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            self.ticket_len = ticket.ticket.slice().len;
+        }
+    };
+
+    const allocator = testing.allocator;
+    var capture = CaptureImpl{};
+    var pair = try TestPair.initWithTicketConsumer(allocator, tls_core.session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = CaptureImpl.now,
+        .onTicketFn = CaptureImpl.onTicket,
+    });
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var prepared = try pair.server.prepareNewSessionTicket(allocator, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer prepared.deinit();
+    try testing.expect(!std.mem.allEqual(u8, prepared.state.common.resumption_psk.slice(), 0));
+
+    try pair.server.emitPreparedNewSessionTicket(&prepared, "two-phase-ticket", tls_core.session.Limits.default);
+
+    var datagram: [2048]u8 = undefined;
+    const dropped = pair.server.pollTransmit(&datagram, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expect(dropped.len > 0);
+    const sent = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
+    try testing.expectEqual(PacketNumberSpace.application, sent.space);
+    try testing.expect(sent.crypto != null);
+    pair.server.requeueRecord(sent);
+
+    try pair.pump();
+    try testing.expectEqual(@as(usize, 1), capture.count);
+    try testing.expectEqual(@as(usize, "two-phase-ticket".len), capture.ticket_len);
+}
+
+test "driver: prepareNewSessionTicket and emitPreparedNewSessionTicket require an established server connection" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+
+    try testing.expectError(error.InvalidHandshakeState, pair.server.prepareNewSessionTicket(allocator, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default));
+
+    try pair.pump();
+    var prepared = try pair.server.prepareNewSessionTicket(allocator, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer prepared.deinit();
+
+    // A client connection can never prepare or emit a ticket.
+    try testing.expectError(error.InvalidHandshakeState, pair.client.prepareNewSessionTicket(allocator, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default));
+    try testing.expectError(error.TicketTooLarge, pair.server.emitPreparedNewSessionTicket(&prepared, "", tls_core.session.Limits.default));
+}
+
+test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake via two-phase issuance" {
+    const resumption_runtime = tls_core.resumption_runtime;
+    const allocator = testing.allocator;
+
+    var server_entropy = tls_core.production_crypto.OsEntropy{};
+    var server_provider = tls_core.production_crypto.Provider.init(server_entropy.entropy());
+    var server_runtime = try resumption_runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 1000;
+            }
+        }.now },
+        server_provider.cryptoProvider(),
+    );
+    defer server_runtime.deinit();
+
+    var client_entropy = tls_core.production_crypto.OsEntropy{};
+    var client_provider = tls_core.production_crypto.Provider.init(client_entropy.entropy());
+    var client_runtime = try resumption_runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 2000;
+            }
+        }.now },
+        client_provider.cryptoProvider(),
+    );
+    defer client_runtime.deinit();
+
+    // Phase 1: a full QUIC handshake. The server issues a ticket through the
+    // #488 two-phase API and the client captures it into its own runtime.
+    const CaptureImpl = struct {
+        runtime: *resumption_runtime.Runtime,
+        stored: tls_core.session_cache.StoreResult = undefined,
+        retained: tls_core.session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(testing.allocator, &self.retained) catch unreachable;
+            self.stored = self.runtime.storeClientTicket(ticket);
+        }
+    };
+    var capture = CaptureImpl{ .runtime = &client_runtime };
+    defer capture.retained.deinit();
+    const resume_policy: tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = .{
+        .transport = .ignore,
+        .application = .ignore,
+    };
+    var pair = try TestPair.initWithTicketConsumerAndResumePolicy(allocator, tls_core.session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = CaptureImpl.now,
+        .onTicketFn = CaptureImpl.onTicket,
+    }, resume_policy);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var prepared = try pair.server.prepareNewSessionTicket(allocator, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 1000,
+    }, tls_core.session.Limits.default);
+    defer prepared.deinit();
+    var scratch: [256]u8 = undefined;
+    var identity = try server_runtime.createIdentity(&prepared.state, 1000, &scratch);
+    try testing.expect(identity == .stateful);
+    try pair.server.emitPreparedNewSessionTicket(&prepared, identity.slice(), tls_core.session.Limits.default);
+    try pair.pump();
+    try testing.expectEqual(tls_core.session_cache.StoreResult.stored, capture.stored);
+
+    // Phase 2: a fresh QUIC connection pair. The client looks its offer up
+    // through the client runtime; the server installs the *same* server
+    // runtime's resolver before the handshake starts — proving the runtime's
+    // cache/resolver composition (not a hand-rolled resolver) drives a real
+    // abbreviated QUIC handshake.
+    // Native QUIC 1-RTT resumption deliberately ignores connection-specific
+    // transport/application snapshots. Do not feed the old ticket snapshot
+    // back as the current candidate; doing so would only prove exact-match
+    // behavior and would mask valid reconnects with changed transport params.
+    const candidate: tls_core.session.CandidateContext = .{
+        .cipher_suite = capture.retained.common.cipher_suite,
+        .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
+        .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
+        .auth_binding = capture.retained.common.auth_binding,
+        .transport_compat = null,
+        .application_compat = null,
+    };
+    var lookup = client_runtime.lookupClientOffers(candidate);
+    defer lookup.deinit();
+    try testing.expect(lookup == .hit);
+    try testing.expectEqual(@as(usize, 1), lookup.hit.offers.len);
+
+    const resumed = try allocator.create(TestPair);
+    defer allocator.destroy(resumed);
+    resumed.* = .{
+        .client_backend = tls_backend_mod.Tls13Backend.initClient(
+            .{ .hello_random = [_]u8{0xd1} ** 32, .key_share_seed = [_]u8{0x31} ** 32 },
+            .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+        ),
+        .server_backend = tls_backend_mod.Tls13Backend.initServer(
+            .{ .hello_random = [_]u8{0xd2} ** 32, .key_share_seed = [_]u8{0x32} ** 32 },
+            try tls_backend_mod.Identity.initPkcs8(
+                tls_backend_mod.testdata.certificate_der,
+                tls_backend_mod.testdata.private_key_pkcs8_der,
+            ),
+        ),
+    };
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+    };
+    try resumed.client_backend.engine.setClientPskOfferLease(&lookup.hit, &clock_dummy, ClientClock.now);
+    try resumed.client_backend.setResumeCompatibilityPolicy(resume_policy);
+    try resumed.server_backend.setServerPskResolver(server_runtime.serverResolver().?);
+    try resumed.server_backend.setResumeCompatibilityPolicy(resume_policy);
+
+    resumed.client = try Connection.init(allocator, .{
+        .role = .client,
+        .local_cid = &TestPair.client_cid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.odcid,
+        .tls = resumed.client_backend.backend(),
+        .now_us = resumed.now_us,
+    });
+    defer resumed.client.deinit();
+    resumed.server = try Connection.init(allocator, .{
+        .role = .server,
+        .local_cid = &TestPair.odcid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.client_cid,
+        .tls = resumed.server_backend.backend(),
+        .now_us = resumed.now_us,
+    });
+    defer resumed.server.deinit();
+
+    try resumed.pump();
+
+    try testing.expect(resumed.client.isEstablished());
+    try testing.expect(resumed.server.isEstablished());
+    try testing.expect(resumed.client_backend.engine.core.psk_authenticated);
+    try testing.expect(resumed.server_backend.engine.core.psk_authenticated);
+
+    // The resumed connection is genuinely usable: application data flows.
+    const id = try resumed.client.openStream(.bidi);
+    try testing.expectEqual(@as(usize, 5), try resumed.client.writeStream(id, "hello", true));
+    try resumed.pump();
+    try testing.expectEqual(@as(?StreamId, id), resumed.server.acceptStream());
+    var buf: [16]u8 = undefined;
+    const request = try resumed.server.readStream(id, &buf);
+    try testing.expectEqualStrings("hello", buf[0..request.len]);
 }
 
 test "driver: maximum NewSessionTicket survives real loss reordering PTO and ACK cleanup" {

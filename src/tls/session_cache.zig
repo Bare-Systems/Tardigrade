@@ -2407,6 +2407,23 @@ pub const StatefulServerCache = struct {
         }
     }
 
+    /// Unconditionally removes and wipes a just-inserted entry by its
+    /// bearer handle, regardless of lease/expiry state (#488 issuance
+    /// rollback: a handle `insertMove` already committed to storage but
+    /// whose `NewSessionTicket` never reached the peer — e.g. post-
+    /// handshake emission/queueing failed — must not remain resolvable, or
+    /// a client could never plausibly have received; a peer can never
+    /// legitimately offer it). Ordinary consumption after successful
+    /// delivery goes through `resolveLease`/`ServerLease`, never this. A
+    /// handle that is not present (already rolled back, evicted, or never
+    /// stored) is a silent no-op.
+    pub fn revokeHandle(self: *StatefulServerCache, handle: *const [stateful_identity_len]u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry_id = self.handle_index.get(digestHandle(handle)) orelse return;
+        self.removeEntryLocked(entry_id);
+    }
+
     /// Removes and wipes a stored entry by its stable `entry_id`,
     /// unindexing its handle and updating (and, if now empty, removing) its
     /// origin bucket.

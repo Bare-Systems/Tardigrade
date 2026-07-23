@@ -30,6 +30,8 @@ pub fn shouldSkipUpstreamRequestHeader(name: []const u8, connection_header: ?[]c
         std.ascii.eqlIgnoreCase(name[0..tardigrade_prefix.len], tardigrade_prefix))
         return true;
 
+    if (std.ascii.eqlIgnoreCase(name, http.early_data.HEADER_NAME)) return true;
+
     if (connectionHeaderReferencesHeader(connection_header, name)) return true;
 
     return std.ascii.eqlIgnoreCase(name, "accept-encoding") or
@@ -61,6 +63,7 @@ pub fn shouldSkipUpstreamRequestHeader(name: []const u8, connection_header: ?[]c
 pub fn shouldSkipUpstreamResponseHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "connection") or
         std.ascii.eqlIgnoreCase(name, "content-encoding") or
+        std.ascii.eqlIgnoreCase(name, http.early_data.HEADER_NAME) or
         std.ascii.eqlIgnoreCase(name, "content-length") or
         std.ascii.eqlIgnoreCase(name, "keep-alive") or
         std.ascii.eqlIgnoreCase(name, "proxy-connection") or
@@ -102,6 +105,11 @@ pub fn appendProxyRequestHeaders(
         if (shouldSkipUpstreamRequestHeader(header.name, connection_header)) continue;
         try extra_headers.append(.{ .name = header.name, .value = header.value });
     }
+}
+
+pub fn appendCanonicalEarlyDataHeader(extra_headers: *std.array_list.Managed(std.http.Header), enabled: bool) !void {
+    if (!enabled) return;
+    try extra_headers.append(.{ .name = http.early_data.HEADER_NAME, .value = http.early_data.HEADER_VALUE });
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +324,11 @@ test "shouldSkipUpstreamRequestHeader strips standard hop-by-hop headers" {
     try std.testing.expect(shouldSkipUpstreamRequestHeader("Upgrade", null));
 }
 
+test "shouldSkipUpstreamRequestHeader strips raw Early-Data before canonical append" {
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Early-Data", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("early-data", "Early-Data"));
+}
+
 test "shouldSkipUpstreamRequestHeader strips headers named by Connection" {
     const connection_header = "X-Test-Hop, keep-alive, Another-Hop";
     try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Test-Hop", connection_header));
@@ -369,6 +382,45 @@ test "shouldSkipUpstreamResponseHeader strips stale content-encoding" {
     try std.testing.expect(shouldSkipUpstreamResponseHeader("Content-Encoding"));
     try std.testing.expect(shouldSkipUpstreamResponseHeader("content-encoding"));
     try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
+}
+
+test "shouldSkipUpstreamResponseHeader strips Early-Data response headers" {
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("Early-Data"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("early-data"));
+}
+
+test "appendCanonicalEarlyDataHeader emits exactly one RFC 8470 marker when enabled" {
+    var headers = std.array_list.Managed(std.http.Header).init(std.testing.allocator);
+    defer headers.deinit();
+
+    try appendCanonicalEarlyDataHeader(&headers, false);
+    try std.testing.expectEqual(@as(usize, 0), headers.items.len);
+
+    try appendCanonicalEarlyDataHeader(&headers, true);
+    try std.testing.expectEqual(@as(usize, 1), headers.items.len);
+    try std.testing.expectEqualStrings("Early-Data", headers.items[0].name);
+    try std.testing.expectEqualStrings("1", headers.items[0].value);
+}
+
+test "appendProxyRequestHeaders normalizes duplicate inbound Early-Data through canonical helper" {
+    var request_headers = http.Headers.init(std.testing.allocator);
+    defer request_headers.deinit();
+    try request_headers.append("Connection", "Early-Data");
+    try request_headers.append("Early-Data", "0");
+    try request_headers.append("early-data", "garbage");
+    try request_headers.append("X-Application", "kept");
+
+    var extra_headers = std.array_list.Managed(std.http.Header).init(std.testing.allocator);
+    defer extra_headers.deinit();
+
+    try appendProxyRequestHeaders(&extra_headers, &request_headers);
+    try appendCanonicalEarlyDataHeader(&extra_headers, true);
+
+    try std.testing.expectEqual(@as(usize, 2), extra_headers.items.len);
+    try std.testing.expectEqualStrings("x-application", extra_headers.items[0].name);
+    try std.testing.expectEqualStrings("kept", extra_headers.items[0].value);
+    try std.testing.expectEqualStrings("Early-Data", extra_headers.items[1].name);
+    try std.testing.expectEqualStrings("1", extra_headers.items[1].value);
 }
 
 test "shouldSkipUpstreamResponseHeader strips upstream Server and X-Powered-By" {

@@ -106,6 +106,28 @@ pub const ProxyStreamingPolicy = enum {
     }
 };
 
+pub const EarlyDataPolicy = enum {
+    off,
+    replay_safe,
+
+    pub fn parse(value: []const u8) ?EarlyDataPolicy {
+        if (std.ascii.eqlIgnoreCase(value, "off")) return .off;
+        if (std.ascii.eqlIgnoreCase(value, "replay_safe") or std.ascii.eqlIgnoreCase(value, "replay-safe")) return .replay_safe;
+        return null;
+    }
+};
+
+pub const ProxyEarlyDataPolicy = enum {
+    off,
+    rfc8470,
+
+    pub fn parse(value: []const u8) ?ProxyEarlyDataPolicy {
+        if (std.ascii.eqlIgnoreCase(value, "off")) return .off;
+        if (std.ascii.eqlIgnoreCase(value, "rfc8470") or std.ascii.eqlIgnoreCase(value, "rfc-8470")) return .rfc8470;
+        return null;
+    }
+};
+
 pub const LocationBlock = struct {
     match_type: MatchType,
     pattern: []const u8,
@@ -114,6 +136,8 @@ pub const LocationBlock = struct {
     error_pages: []ErrorPageRule = &.{},
     auth: AuthMode = .off,
     proxy_streaming_policy: ProxyStreamingPolicy = .inherit,
+    early_data: EarlyDataPolicy = .off,
+    proxy_early_data: ProxyEarlyDataPolicy = .off,
 
     pub fn deinit(self: *LocationBlock, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);
@@ -206,6 +230,13 @@ fn normalizeRequestPath(request_uri: []const u8) []const u8 {
     const query_start = std.mem.findScalar(u8, request_uri, '?') orelse request_uri.len;
     const fragment_start = std.mem.findScalar(u8, request_uri[0..query_start], '#') orelse query_start;
     return request_uri[0..fragment_start];
+}
+
+test "early data route policy parsers accept canonical and dashed values" {
+    try std.testing.expectEqual(EarlyDataPolicy.off, EarlyDataPolicy.parse("off").?);
+    try std.testing.expectEqual(EarlyDataPolicy.replay_safe, EarlyDataPolicy.parse("replay-safe").?);
+    try std.testing.expectEqual(ProxyEarlyDataPolicy.rfc8470, ProxyEarlyDataPolicy.parse("rfc-8470").?);
+    try std.testing.expect(ProxyEarlyDataPolicy.parse("yes") == null);
 }
 
 test "exact match beats prefix match" {

@@ -81,6 +81,8 @@ const LocationBlockBuilder = struct {
     rewrite_flag: ?[]u8 = null,
     auth: ?[]u8 = null,
     proxy_streaming: ?[]u8 = null,
+    early_data: ?[]u8 = null,
+    proxy_early_data: ?[]u8 = null,
     error_pages: std.ArrayList(ErrorPageBuilder) = .empty,
 
     fn actionKind(self: *const LocationBlockBuilder) ?[]const u8 {
@@ -110,6 +112,8 @@ const LocationBlockBuilder = struct {
         if (self.rewrite_flag) |value| allocator.free(value);
         if (self.auth) |value| allocator.free(value);
         if (self.proxy_streaming) |value| allocator.free(value);
+        if (self.early_data) |value| allocator.free(value);
+        if (self.proxy_early_data) |value| allocator.free(value);
         for (self.error_pages.items) |entry| {
             allocator.free(entry.status_codes_csv);
             allocator.free(entry.target);
@@ -803,6 +807,22 @@ fn parseLocationStatement(
         try replaceOptionalOwned(allocator, &builder.proxy_streaming, value_interp);
         return;
     }
+    if (std.ascii.eqlIgnoreCase(directive, "early_data")) {
+        if (!isLocationEarlyDataPolicy(value_interp)) {
+            std.log.err("config syntax error at {s}:{d}: early_data must be one of off, replay_safe", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        }
+        try replaceOptionalOwned(allocator, &builder.early_data, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_early_data")) {
+        if (!isLocationProxyEarlyDataPolicy(value_interp)) {
+            std.log.err("config syntax error at {s}:{d}: proxy_early_data must be one of off, rfc8470", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        }
+        try replaceOptionalOwned(allocator, &builder.proxy_early_data, value_interp);
+        return;
+    }
 }
 
 fn isLocationProxyStreamingPolicy(value: []const u8) bool {
@@ -814,6 +834,18 @@ fn isLocationProxyStreamingPolicy(value: []const u8) bool {
         std.ascii.eqlIgnoreCase(value, "full") or
         std.ascii.eqlIgnoreCase(value, "request_response") or
         std.ascii.eqlIgnoreCase(value, "request-response");
+}
+
+fn isLocationEarlyDataPolicy(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "off") or
+        std.ascii.eqlIgnoreCase(value, "replay_safe") or
+        std.ascii.eqlIgnoreCase(value, "replay-safe");
+}
+
+fn isLocationProxyEarlyDataPolicy(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "off") or
+        std.ascii.eqlIgnoreCase(value, "rfc8470") or
+        std.ascii.eqlIgnoreCase(value, "rfc-8470");
 }
 
 fn ensureLocationActionAllowed(
@@ -886,6 +918,24 @@ fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlock
             const with_stream_policy = try std.fmt.allocPrint(allocator, "{s}|stream:{s}", .{ entry, mode });
             allocator.free(entry);
             entry = with_stream_policy;
+        }
+    }
+    if (builder.early_data) |policy| {
+        if (!std.ascii.eqlIgnoreCase(policy, "off")) {
+            const with_early_data = try std.fmt.allocPrint(allocator, "{s}|early_data:{s}", .{ entry, policy });
+            allocator.free(entry);
+            entry = with_early_data;
+        }
+    }
+    if (builder.proxy_early_data) |policy| {
+        if (!std.ascii.eqlIgnoreCase(policy, "off")) {
+            if (builder.proxy_pass == null) {
+                allocator.free(entry);
+                return error.InvalidConfigSyntax;
+            }
+            const with_proxy_early_data = try std.fmt.allocPrint(allocator, "{s}|proxy_early_data:{s}", .{ entry, policy });
+            allocator.free(entry);
+            entry = with_proxy_early_data;
         }
     }
     return entry;
@@ -1311,6 +1361,76 @@ test "location block serializes proxy streaming policy" {
         "prefix|/bulk/|proxy_pass|http://127.0.0.1:9001|stream:full;prefix|/compat/|proxy_pass|http://127.0.0.1:9002|stream:off",
         overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
     );
+}
+
+test "location block serializes early data policies" {
+    const allocator = std.testing.allocator;
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{
+        .sub_path = "location-early-data.conf",
+        .data =
+        \\location /submit/ {
+        \\    proxy_pass http://127.0.0.1:9001;
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}
+        ,
+    });
+
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "location-early-data.conf");
+    defer allocator.free(absolute);
+
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+
+    try parseFile(allocator, absolute, &overrides, &vars, &visited);
+
+    try std.testing.expectEqualStrings(
+        "prefix|/submit/|proxy_pass|http://127.0.0.1:9001|early_data:replay_safe|proxy_early_data:rfc8470",
+        overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
+    );
+}
+
+test "location block rejects proxy early data on non proxy action" {
+    const allocator = std.testing.allocator;
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{
+        .sub_path = "location-early-data-invalid.conf",
+        .data =
+        \\location /local/ {
+        \\    return 200 ok;
+        \\    proxy_early_data rfc8470;
+        \\}
+        ,
+    });
+
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "location-early-data-invalid.conf");
+    defer allocator.free(absolute);
+
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+
+    try std.testing.expectError(error.InvalidConfigSyntax, parseFile(allocator, absolute, &overrides, &vars, &visited));
 }
 
 test "location block supports alias and fastcgi pass serialization" {

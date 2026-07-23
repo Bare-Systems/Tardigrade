@@ -37,6 +37,7 @@ pub const jwt = @import("http/jwt.zig");
 pub const logger = @import("http/logger.zig");
 pub const cache_control = @import("http/cache_control.zig");
 pub const compression = @import("http/compression.zig");
+pub const early_data = @import("http/early_data.zig");
 pub const metrics = @import("http/metrics.zig");
 pub const shutdown = @import("http/shutdown.zig");
 pub const health_checker = @import("http/health_checker.zig");

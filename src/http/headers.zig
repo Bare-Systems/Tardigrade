@@ -111,6 +111,11 @@ pub const Headers = struct {
         return self.get(name) != null;
     }
 
+    /// RFC 8470 marker detection is based on field presence, not value.
+    pub fn hasEarlyDataMarker(self: *const Headers) bool {
+        return self.countByName("early-data") > 0;
+    }
+
     /// Count how many times a header name appears.
     pub fn countByName(self: *const Headers, name: []const u8) usize {
         var lower_buf: [256]u8 = undefined;
@@ -297,6 +302,21 @@ test "missing header returns null" {
     try testing.expect(headers.get("X-Missing") == null);
     try testing.expect(!headers.contains("X-Missing"));
     try testing.expect(headers.contains("Host"));
+}
+
+test "early data marker uses presence regardless of value" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try testing.expect(!headers.hasEarlyDataMarker());
+    try headers.append("Early-Data", "0");
+    try testing.expect(headers.hasEarlyDataMarker());
+    try headers.append("early-data", "not-one");
+    try testing.expect(headers.hasEarlyDataMarker());
+    try testing.expectEqual(@as(usize, 2), headers.countByName("Early-Data"));
 }
 
 test "invalid header - no colon" {

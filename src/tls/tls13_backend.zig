@@ -346,8 +346,20 @@ pub const EarlyDataReplayDecision = enum { allow, replay, unavailable };
 /// Bounded, non-secret metadata about an early-data attempt handed to the
 /// anti-replay gate — never the raw ticket, PSK, or binder. #368 owns the
 /// actual replay store; this is only the seam.
+///
+/// `selected_identity` alone (the field this type originally carried) is
+/// always `0` for every acceptable 0-RTT attempt — every candidate that
+/// reaches this gate has already passed `selected_identity_not_zero` — so it
+/// cannot distinguish one ticket/attempt from another. `ticket_identity_fingerprint`
+/// is what a real store keys on: a one-way digest of the offered ticket's
+/// opaque wire identity, so #368 can recognize "this exact ticket instance
+/// was already used for 0-RTT" without ever being handed the bearer ticket
+/// itself. `obfuscated_ticket_age` is the client's wire-visible (already
+/// obfuscated, already transmitted in the clear) ticket age, useful as
+/// auxiliary replay-window bookkeeping.
 pub const EarlyDataReplayCandidate = struct {
-    selected_identity: u16 = 0,
+    ticket_identity_fingerprint: [32]u8 = [_]u8{0} ** 32,
+    obfuscated_ticket_age: u32 = 0,
 };
 
 /// Server (#366/#368 seam): injectable anti-replay decision for an
@@ -361,6 +373,45 @@ pub const EarlyDataReplayGate = struct {
 
     fn decide(self: EarlyDataReplayGate, candidate: EarlyDataReplayCandidate) EarlyDataReplayDecision {
         const f = self.decideFn orelse return .unavailable;
+        return f(self.ctx, candidate);
+    }
+};
+
+/// #366: the outcome of an early-data-*specific* compatibility check,
+/// deliberately independent of `Tls13Backend.ResumeCompatibilityPolicy` /
+/// `session.evaluateCompatibility`'s resumption-eligibility gate — so a
+/// future transport-parameter check (e.g. QUIC's "remembered limits must
+/// not be reduced", #366 letter S) can reject *only* early data while
+/// ordinary 1-RTT resumption still succeeds even when `resume_compat` is
+/// configured to `.ignore` transport/application snapshots for resumption
+/// itself. The default gate (see `EarlyDataCompatibilityGate`) never
+/// produces anything but `.compatible`, so this is a pure extension seam
+/// until a transport-specific check is wired in.
+pub const EarlyDataCompatibilityDecision = enum { compatible, transport_incompatible, application_incompatible };
+
+/// Bounded, non-secret compatibility inputs: the ticket's stored
+/// transport/application snapshots against the current connection's
+/// candidate snapshots — the same shape `session.CandidateCompat` /
+/// `CompatSnapshot` already carry, flattened to slices so this seam does not
+/// need to import ownership/allocator-bearing session types.
+pub const EarlyDataCompatibilityCandidate = struct {
+    stored_transport_compat: ?[]const u8 = null,
+    candidate_transport_compat: ?[]const u8 = null,
+    stored_application_compat: ?[]const u8 = null,
+    candidate_application_compat: ?[]const u8 = null,
+};
+
+/// Server (#366): injectable early-data-specific compatibility gate,
+/// consulted independently of (in addition to) ordinary resumption
+/// eligibility. Defaults to always-compatible: no additional restriction
+/// beyond what `session.evaluateCompatibility` already required for
+/// resumption.
+pub const EarlyDataCompatibilityGate = struct {
+    ctx: *anyopaque = @ptrCast(@constCast(&empty_observer_dummy)),
+    decideFn: ?*const fn (*anyopaque, EarlyDataCompatibilityCandidate) EarlyDataCompatibilityDecision = null,
+
+    fn decide(self: EarlyDataCompatibilityGate, candidate: EarlyDataCompatibilityCandidate) EarlyDataCompatibilityDecision {
+        const f = self.decideFn orelse return .compatible;
         return f(self.ctx, candidate);
     }
 };
@@ -618,15 +669,26 @@ pub const Tls13Backend = struct {
     /// via `setEarlyDataReplayGate` before `start`. Defaults to
     /// `.unavailable`, which rejects only early data.
     early_data_replay_gate: EarlyDataReplayGate = .{},
+    /// Server (#366): injectable early-data-specific compatibility gate,
+    /// configured via `setEarlyDataCompatibilityGate` before `start`.
+    /// Defaults to always-compatible.
+    early_data_compat_gate: EarlyDataCompatibilityGate = .{},
     /// Whether 0-RTT was accepted for this connection — mirrors
     /// `early_data_decision == .accepted`, kept separately for cheap
     /// boolean access from record/QUIC carriers.
     early_data_accepted: bool = false,
     /// Server: authoritative reason `decideServerEarlyData` reached for the
-    /// selected candidate. Client: only ever observes `.accepted` (RFC 8446
-    /// does not tell a client *why* the server omitted the extension), so
-    /// this stays `.not_attempted` on the client except when accepted.
+    /// selected candidate. Client: mirrors `early_data_accepted` — `.accepted`
+    /// when the server signaled acceptance, `.not_attempted` otherwise, since
+    /// RFC 8446 does not tell a client *why* the server omitted the
+    /// extension when it did not accept.
     early_data_decision: EarlyDataDecision = .not_attempted,
+    /// Server: the ticket's advertised early-data byte allowance, captured
+    /// only when `early_data_decision == .accepted` — otherwise `0`. Exposed
+    /// via `earlyDataMaxBytes()` so the record/QUIC carrier slice knows how
+    /// much early-data plaintext it may accept while 0-RTT is live, instead
+    /// of discarding the ticket's own advertised limit.
+    early_data_max_bytes: u32 = 0,
 
     const Slice = struct { start: usize, len: usize };
     const PendingStage = enum { server_select, server_sign, client_select, client_sign, peer_verify };
@@ -947,10 +1009,27 @@ pub const Tls13Backend = struct {
         self.early_data_replay_gate = gate;
     }
 
-    /// Client: whether the ClientHello just sent actually attempted 0-RTT.
-    /// Independent of acceptance — see `earlyDataAccepted`.
+    /// Server (#366): configure the early-data-specific compatibility gate,
+    /// consulted independently of ordinary resumption eligibility. Must be
+    /// called before `start`; the default gate always reports `.compatible`.
+    pub fn setEarlyDataCompatibilityGate(self: *Tls13Backend, gate: EarlyDataCompatibilityGate) HandshakeError!void {
+        if (self.role != .server) return error.InvalidHandshakeState;
+        if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        self.early_data_compat_gate = gate;
+    }
+
+    /// Whether 0-RTT was attempted on this connection. Client: whether the
+    /// ClientHello just sent carried `early_data` (independent of
+    /// acceptance — see `earlyDataAccepted`). Server: whether the peer's
+    /// ClientHello carried `early_data`, regardless of whether this
+    /// connection went on to accept it — the later record/QUIC carrier
+    /// needs this even for an attempted-but-rejected connection (e.g. to
+    /// still expect and boundedly discard skipped first-flight ciphertext).
     pub fn earlyDataAttempted(self: *const Tls13Backend) bool {
-        return self.client_early_data_attempted;
+        return switch (self.role) {
+            .client => self.client_early_data_attempted,
+            .server => self.client_hello_early_data_seen,
+        };
     }
 
     /// Whether 0-RTT was accepted for this connection.
@@ -964,6 +1043,13 @@ pub const Tls13Backend = struct {
     /// (RFC 8446 EncryptedExtensions simply omits the extension).
     pub fn earlyDataDecision(self: *const Tls13Backend) EarlyDataDecision {
         return self.early_data_decision;
+    }
+
+    /// Server: the ticket's advertised early-data byte allowance, valid only
+    /// when `earlyDataAccepted()` is true (`0` otherwise). The record/QUIC
+    /// carrier bounds accepted early-data plaintext to this value.
+    pub fn earlyDataMaxBytes(self: *const Tls13Backend) u32 {
+        return self.early_data_max_bytes;
     }
 
     /// #362/#365: configure this connection's application-layer
@@ -1187,8 +1273,10 @@ pub const Tls13Backend = struct {
         self.client_hello_early_data_seen = false;
         self.server_early_data_policy = .{};
         self.early_data_replay_gate = .{};
+        self.early_data_compat_gate = .{};
         self.early_data_accepted = false;
         self.early_data_decision = .not_attempted;
+        self.early_data_max_bytes = 0;
         self.selected_client_psk.deinit();
         self.selected_client_psk_present = false;
         self.selected_server_psk.deinit();
@@ -1298,6 +1386,7 @@ pub const Tls13Backend = struct {
         self.client_hello_early_data_seen = false;
         self.early_data_accepted = false;
         self.early_data_decision = .not_attempted;
+        self.early_data_max_bytes = 0;
         self.clearClientHelloPsk();
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
@@ -1988,6 +2077,16 @@ pub const Tls13Backend = struct {
             const payload = self.profile.localExtension() orelse return error.MissingTransportExtension;
             len = try checkedAdd(len, 2 + 2 + payload.len);
         }
+        // #366: reserved whenever the client has opted in, regardless of
+        // whether `planEarlyDataAttempt` (which runs later, after this
+        // budget is used by `planPskOffer`'s own ticket-fitting arithmetic)
+        // ends up actually attempting 0-RTT — so a too-large PSK offer is
+        // rejected/trimmed by `planPskOffer` itself instead of the
+        // 4-byte `early_data` extension silently pushing `sendClientHello`'s
+        // fixed-capacity buffer past `max_message_len`.
+        if (self.client_early_data_intent.enabled) {
+            len = try checkedAdd(len, 4); // early_data: type(2) + length(2), empty body
+        }
         return len;
     }
 
@@ -2243,7 +2342,10 @@ pub const Tls13Backend = struct {
             // accepted `early_data` extension, regardless of what the
             // client attempted.
             if (early_data_seen and stored.early_data == .resume_only) return error.IllegalParameter;
-            if (early_data_seen) self.early_data_accepted = true;
+            if (early_data_seen) {
+                self.early_data_accepted = true;
+                self.early_data_decision = .accepted;
+            }
 
             self.connection_auth_binding = stored.auth_binding;
         }
@@ -3076,13 +3178,29 @@ pub const Tls13Backend = struct {
             // first-flight data) and only after binder verification, so an
             // early-data rejection never rejects an otherwise-valid PSK
             // resumption.
+            var identity_fingerprint: [hash_len]u8 = undefined;
+            Sha256.hash(pair.identity.identity, &identity_fingerprint, .{});
             const early_decision = self.decideServerEarlyData(.{
                 .selected_index = attempts,
                 .compatibility = decision.early_data,
                 .age_skew = age_skew,
+                .compat_candidate = .{
+                    .stored_transport_compat = if (hit.state.common.transport_compat) |*snap| snap.slice() else null,
+                    .candidate_transport_compat = if (self.candidateTransportCompat()) |c| c.bytes else null,
+                    .stored_application_compat = if (hit.state.common.application_compat) |*snap| snap.slice() else null,
+                    .candidate_application_compat = if (self.candidateApplicationCompat()) |c| c.bytes else null,
+                },
+                .replay_candidate = .{
+                    .ticket_identity_fingerprint = identity_fingerprint,
+                    .obfuscated_ticket_age = pair.identity.obfuscated_ticket_age,
+                },
             });
             self.early_data_decision = early_decision;
             self.early_data_accepted = early_decision == .accepted;
+            self.early_data_max_bytes = if (early_decision == .accepted) switch (decision.early_data) {
+                .allowed => |max| max,
+                .disabled, .incompatible => 0,
+            } else 0;
             if (early_decision == .accepted) {
                 var client_hello_hash: [hash_len]u8 = undefined;
                 Sha256.hash(capture.message[0..capture.message_len], &client_hello_hash, .{});
@@ -3118,12 +3236,18 @@ pub const Tls13Backend = struct {
         selected_index: usize,
         compatibility: session.EarlyDataEligibility,
         age_skew: pre_shared_key.AgeSkew,
+        compat_candidate: EarlyDataCompatibilityCandidate,
+        replay_candidate: EarlyDataReplayCandidate,
     };
 
     /// #366: the server's live 0-RTT decision for the just-selected,
     /// binder-verified candidate. `inputs.compatibility` already reflects
     /// `client_hello_early_data_seen`/identity-0/ticket-capability via
-    /// `session.evaluateCompatibility`'s `want_early_data`; resource
+    /// `session.evaluateCompatibility`'s `want_early_data`; the early-data-
+    /// specific compatibility gate (`early_data_compat_gate`) runs
+    /// independently of that resumption-level check, so it can reject only
+    /// early data even when `resume_compat` is configured to `.ignore`
+    /// transport/application snapshots for ordinary resumption. Resource
     /// admission (byte/request caps) is a composition-root concern layered
     /// on top of this backend and is never produced here.
     fn decideServerEarlyData(self: *Tls13Backend, inputs: ServerEarlyDataInputs) EarlyDataDecision {
@@ -3140,9 +3264,14 @@ pub const Tls13Backend = struct {
             .disabled, .incompatible => return .ticket_not_capable,
             .allowed => {},
         }
+        switch (self.early_data_compat_gate.decide(inputs.compat_candidate)) {
+            .transport_incompatible => return .transport_incompatible,
+            .application_incompatible => return .application_incompatible,
+            .compatible => {},
+        }
         if (!skewWithinTolerance(inputs.age_skew.skew_ms, self.server_early_data_policy.age_skew_tolerance_ms))
             return .age_skew;
-        return switch (self.early_data_replay_gate.decide(.{ .selected_identity = @intCast(inputs.selected_index) })) {
+        return switch (self.early_data_replay_gate.decide(inputs.replay_candidate)) {
             .allow => .accepted,
             .replay => .replay_rejected,
             .unavailable => .replay_unavailable,
@@ -3967,6 +4096,37 @@ fn skewWithinTolerance(skew_ms: i64, tolerance_ms: u64) bool {
     else
         @intCast(skew_ms);
     return magnitude <= tolerance_ms;
+}
+
+test "skewWithinTolerance accepts exact positive and negative boundaries" {
+    try std.testing.expect(skewWithinTolerance(1000, 1000));
+    try std.testing.expect(skewWithinTolerance(-1000, 1000));
+}
+
+test "skewWithinTolerance rejects one past either boundary" {
+    try std.testing.expect(!skewWithinTolerance(1001, 1000));
+    try std.testing.expect(!skewWithinTolerance(-1001, 1000));
+}
+
+test "skewWithinTolerance treats exact zero skew and zero tolerance consistently" {
+    try std.testing.expect(skewWithinTolerance(0, 0));
+    try std.testing.expect(!skewWithinTolerance(1, 0));
+    try std.testing.expect(!skewWithinTolerance(-1, 0));
+}
+
+test "skewWithinTolerance handles minInt(i64) without trapping" {
+    // `-minInt(i64)` overflows `i64` itself (its magnitude is exactly
+    // `2^63`, one past `maxInt(i64)`); the `i128` promotion inside
+    // `skewWithinTolerance` is what makes this representable at all rather
+    // than trapping.
+    const magnitude_of_min_i64: u64 = @as(u64, 1) << 63;
+    try std.testing.expect(skewWithinTolerance(std.math.minInt(i64), magnitude_of_min_i64));
+    try std.testing.expect(!skewWithinTolerance(std.math.minInt(i64), magnitude_of_min_i64 - 1));
+}
+
+test "skewWithinTolerance handles maxInt(i64) at the u64 tolerance boundary" {
+    try std.testing.expect(skewWithinTolerance(std.math.maxInt(i64), @as(u64, std.math.maxInt(i64))));
+    try std.testing.expect(!skewWithinTolerance(std.math.maxInt(i64), @as(u64, std.math.maxInt(i64)) - 1));
 }
 
 /// Symmetric optional equality for a stored `CompatSnapshot` against a

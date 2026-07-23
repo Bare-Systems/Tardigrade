@@ -764,14 +764,25 @@ test "0-RTT round trip: an early-capable ticket, matching policy, and an allowin
 
     try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
     try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
-    var replay_gate_ctx: u8 = 0;
+
+    // A capturing replay gate: proves the candidate the gate receives
+    // actually distinguishes this specific ticket (a real, non-zero
+    // fingerprint of its opaque wire identity), not just "identity 0" —
+    // the fingerprint alone (the previous, sole field) can never do that,
+    // since 0-RTT is only ever attempted against wire identity 0.
+    const CapturingReplayGate = struct {
+        seen: ?tls_backend.EarlyDataReplayCandidate = null,
+
+        fn decide(ctx: *anyopaque, candidate: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen = candidate;
+            return .allow;
+        }
+    };
+    var replay_gate = CapturingReplayGate{};
     try resumed.server_backend.setEarlyDataReplayGate(.{
-        .ctx = &replay_gate_ctx,
-        .decideFn = struct {
-            fn decide(_: *anyopaque, _: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
-                return .allow;
-            }
-        }.decide,
+        .ctx = &replay_gate,
+        .decideFn = CapturingReplayGate.decide,
     });
 
     try resumed.run();
@@ -783,8 +794,20 @@ test "0-RTT round trip: an early-capable ticket, matching policy, and an allowin
 
     try std.testing.expect(resumed.client_backend.earlyDataAttempted());
     try std.testing.expect(resumed.client_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.accepted, resumed.client_backend.earlyDataDecision());
+    try std.testing.expect(resumed.server_backend.earlyDataAttempted());
     try std.testing.expect(resumed.server_backend.earlyDataAccepted());
     try std.testing.expectEqual(tls_backend.EarlyDataDecision.accepted, resumed.server_backend.earlyDataDecision());
+    // The ticket's own advertised allowance (32, from `issueEarlyCapableTicket`
+    // above) survives into the accepted decision for the next carrier slice,
+    // rather than being discarded at `.allowed => {}`.
+    try std.testing.expectEqual(@as(u32, 32), resumed.server_backend.earlyDataMaxBytes());
+
+    const seen_candidate = replay_gate.seen orelse return error.TestExpectedEqual;
+    var expected_fingerprint: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("opaque-early-ticket", &expected_fingerprint, .{});
+    try std.testing.expectEqualSlices(u8, &expected_fingerprint, &seen_candidate.ticket_identity_fingerprint);
+    try std.testing.expect(!std.mem.allEqual(u8, &seen_candidate.ticket_identity_fingerprint, 0));
 
     // The client's `c e traffic` secret (derived from the final ClientHello
     // it sent) and the server's own derivation (from the same ClientHello,
@@ -864,6 +887,9 @@ test "0-RTT is never attempted when the client never opts in, even for an early-
     try std.testing.expect(resumed.client_driver.isComplete());
     try std.testing.expect(resumed.server_driver.isComplete());
     try std.testing.expect(!resumed.client_backend.earlyDataAttempted());
+    // The server's role-aware `earlyDataAttempted()` correctly reports
+    // false too: the peer's ClientHello genuinely never carried `early_data`.
+    try std.testing.expect(!resumed.server_backend.earlyDataAttempted());
     try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
     try std.testing.expectEqual(tls_backend.EarlyDataDecision.not_attempted, resumed.server_backend.earlyDataDecision());
 }
@@ -898,8 +924,14 @@ test "0-RTT is attempted but rejected when the server's early-data policy is dis
 
     try std.testing.expect(resumed.client_backend.earlyDataAttempted());
     try std.testing.expect(!resumed.client_backend.earlyDataAccepted());
+    // `earlyDataAttempted()` is role-aware: the server side must also
+    // report the peer's attempt (regardless of rejection), since the later
+    // record/QUIC carrier needs to know to expect and boundedly discard
+    // skipped first-flight ciphertext even on this rejected path.
+    try std.testing.expect(resumed.server_backend.earlyDataAttempted());
     try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
     try std.testing.expectEqual(tls_backend.EarlyDataDecision.disabled, resumed.server_backend.earlyDataDecision());
+    try std.testing.expectEqual(@as(u32, 0), resumed.server_backend.earlyDataMaxBytes());
     // The client still derived and emitted its own 0-RTT write secret (the
     // attempt itself always happens locally); only the server never emits
     // a matching read secret, since it never reached `.accepted`.
@@ -1009,6 +1041,53 @@ test "0-RTT anti-replay defaults to unavailable (fails closed) when no gate is c
     try std.testing.expect(resumed.server_backend.core.psk_authenticated);
     try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
     try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_unavailable, resumed.server_backend.earlyDataDecision());
+}
+
+test "an early-data-specific compatibility gate can reject only 0-RTT while resumption still completes" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+
+    // A gate that always reports a transport mismatch — modeling a future
+    // QUIC-owned "remembered transport parameters were reduced" check
+    // (#366 letter S) — deliberately independent of `resume_compat`
+    // (never configured `.exact` here), proving early data and ordinary
+    // resumption are no longer coupled through the same compatibility path.
+    try resumed.server_backend.setEarlyDataCompatibilityGate(.{
+        .ctx = undefined,
+        .decideFn = struct {
+            fn decide(_: *anyopaque, _: tls_backend.EarlyDataCompatibilityCandidate) tls_backend.EarlyDataCompatibilityDecision {
+                return .transport_incompatible;
+            }
+        }.decide,
+    });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    // Resumption itself is unaffected by the early-data-specific rejection.
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.transport_incompatible, resumed.server_backend.earlyDataDecision());
+    try std.testing.expectEqual(@as(u32, 0), resumed.server_backend.earlyDataMaxBytes());
 }
 
 test "0-RTT is rejected when the server selects an identity other than 0, even though the client attempted it" {

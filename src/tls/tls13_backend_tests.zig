@@ -1071,8 +1071,6 @@ test "an early-data-specific compatibility gate sees remembered transport metada
         .nowUnixMsFn = IdentityResolver.now,
         .resolveFn = IdentityResolver.resolve,
     });
-    try resumed.client_backend.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
-    try resumed.server_backend.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
     try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
     try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
 
@@ -1088,9 +1086,9 @@ test "an early-data-specific compatibility gate sees remembered transport metada
     var compat_gate = CapturingCompatGate{};
     // A gate that reports a transport mismatch — modeling a future QUIC-owned
     // "remembered transport parameters were reduced" check (#366 letter S) —
-    // deliberately independent of `resume_compat` (never configured `.exact`
-    // here), proving early data and ordinary resumption are no longer coupled
-    // through the same compatibility path.
+    // while the default ordinary `.exact` transport compatibility still
+    // succeeds, proving early data and ordinary resumption are no longer
+    // coupled through the same compatibility path.
     try resumed.server_backend.setEarlyDataCompatibilityGate(.{
         .ctx = &compat_gate,
         .decideFn = CapturingCompatGate.decide,

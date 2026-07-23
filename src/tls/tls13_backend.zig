@@ -3817,7 +3817,7 @@ pub const Tls13Backend = struct {
     fn resumptionContextForTicket(self: *const Tls13Backend, early_data_capable: bool) new_session_ticket.ConnectionResumptionContext {
         var ctx = self.resumptionContext();
         if (early_data_capable) {
-            ctx.transport_compat = switch (self.role) {
+            ctx.early_data_transport_compat = switch (self.role) {
                 .client => self.peerTransportCompat(),
                 .server => self.localTransportCompat(),
             };

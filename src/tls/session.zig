@@ -862,6 +862,8 @@ const field_lifetime_seconds: u16 = 0x0007;
 const field_early_data: u16 = 0x0008;
 const field_transport_compat: u16 = 0x8001;
 const field_application_compat: u16 = 0x8002;
+const field_early_data_transport_compat: u16 = 0x8003;
+const field_early_data_application_compat: u16 = 0x8004;
 
 const field_ticket: u16 = 0x0010;
 const field_ticket_age_add: u16 = 0x0011;
@@ -929,6 +931,8 @@ fn commonEncodedLen(common: *const ResumableSessionCommon) usize {
     total += tlvLen(earlyDataFieldLen(common.early_data));
     if (common.transport_compat) |*snap| total += tlvLen(4 + snap.slice().len);
     if (common.application_compat) |*snap| total += tlvLen(4 + snap.slice().len);
+    if (common.early_data_transport_compat) |*snap| total += tlvLen(4 + snap.slice().len);
+    if (common.early_data_application_compat) |*snap| total += tlvLen(4 + snap.slice().len);
     return total;
 }
 
@@ -953,6 +957,8 @@ fn commonFieldCount(common: *const ResumableSessionCommon) usize {
     if (common.application_protocol != null) count += 1;
     if (common.transport_compat != null) count += 1;
     if (common.application_compat != null) count += 1;
+    if (common.early_data_transport_compat != null) count += 1;
+    if (common.early_data_application_compat != null) count += 1;
     return count;
 }
 
@@ -964,6 +970,12 @@ fn checkCommonAgainstLimits(common: *const ResumableSessionCommon, limits: Limit
         if (snap.slice().len > limits.max_transport_compat_len) return error.FieldTooLarge;
     }
     if (common.application_compat) |*snap| {
+        if (snap.slice().len > limits.max_application_compat_len) return error.FieldTooLarge;
+    }
+    if (common.early_data_transport_compat) |*snap| {
+        if (snap.slice().len > limits.max_transport_compat_len) return error.FieldTooLarge;
+    }
+    if (common.early_data_application_compat) |*snap| {
         if (snap.slice().len > limits.max_application_compat_len) return error.FieldTooLarge;
     }
 }
@@ -1010,6 +1022,12 @@ fn validateCommonForEncoding(common: *const ResumableSessionCommon) EncodeError!
         if (snap.blob.len > snap.blob.bytes.len) return error.InvalidState;
     }
     if (common.application_compat) |*snap| {
+        if (snap.blob.len > snap.blob.bytes.len) return error.InvalidState;
+    }
+    if (common.early_data_transport_compat) |*snap| {
+        if (snap.blob.len > snap.blob.bytes.len) return error.InvalidState;
+    }
+    if (common.early_data_application_compat) |*snap| {
         if (snap.blob.len > snap.blob.bytes.len) return error.InvalidState;
     }
 }
@@ -1099,6 +1117,10 @@ fn writeCommon(out: []u8, pos: *usize, common: *const ResumableSessionCommon, co
     if (common.transport_compat) |*snap| writeCompatSnapshot(out, pos, field_transport_compat, snap, compat_scratch);
     if (common.application_compat) |*snap|
         writeCompatSnapshot(out, pos, field_application_compat, snap, compat_scratch);
+    if (common.early_data_transport_compat) |*snap|
+        writeCompatSnapshot(out, pos, field_early_data_transport_compat, snap, compat_scratch);
+    if (common.early_data_application_compat) |*snap|
+        writeCompatSnapshot(out, pos, field_early_data_application_compat, snap, compat_scratch);
 }
 
 fn writeHeader(out: []u8, kind: RecordType, field_section_len: u32) void {
@@ -1186,6 +1208,8 @@ const CommonFields = struct {
     early_data: ?EarlyDataPolicy = null,
     transport_compat: ?RawCompat = null,
     application_compat: ?RawCompat = null,
+    early_data_transport_compat: ?RawCompat = null,
+    early_data_application_compat: ?RawCompat = null,
 };
 
 const RawCompat = struct {
@@ -1290,6 +1314,14 @@ fn parseSharedField(builder: *CommonFields, limits: Limits, field_id: u16, value
             builder.application_compat = try decodeRawCompat(value, limits.max_application_compat_len);
             return true;
         },
+        field_early_data_transport_compat => {
+            builder.early_data_transport_compat = try decodeRawCompat(value, limits.max_transport_compat_len);
+            return true;
+        },
+        field_early_data_application_compat => {
+            builder.early_data_application_compat = try decodeRawCompat(value, limits.max_application_compat_len);
+            return true;
+        },
         else => return false,
     }
 }
@@ -1313,6 +1345,12 @@ fn buildCommon(
     var application_compat: ?ResumableSessionCommon.CompatBlobParams = null;
     if (fields.application_compat) |raw|
         application_compat = .{ .format_id = raw.format_id, .format_version = raw.format_version, .bytes = raw.bytes };
+    var early_data_transport_compat: ?ResumableSessionCommon.CompatBlobParams = null;
+    if (fields.early_data_transport_compat) |raw|
+        early_data_transport_compat = .{ .format_id = raw.format_id, .format_version = raw.format_version, .bytes = raw.bytes };
+    var early_data_application_compat: ?ResumableSessionCommon.CompatBlobParams = null;
+    if (fields.early_data_application_compat) |raw|
+        early_data_application_compat = .{ .format_id = raw.format_id, .format_version = raw.format_version, .bytes = raw.bytes };
 
     out.init(allocator, limits, .{
         .cipher_suite = cipher_suite,
@@ -1325,6 +1363,8 @@ fn buildCommon(
         .early_data = early_data,
         .transport_compat = transport_compat,
         .application_compat = application_compat,
+        .early_data_transport_compat = early_data_transport_compat,
+        .early_data_application_compat = early_data_application_compat,
     }) catch |err| switch (err) {
         error.InvalidDnsName => return error.InvalidSni,
         error.EmptyServerName => return error.EmptyServerName,
@@ -2282,6 +2322,77 @@ test "encode enforces max_application_compat_len symmetrically with decode" {
     // Decoding the same bytes under the tighter application-compat limit
     // must also fail, proving encode and decode agree on every limit.
     try testing.expectError(error.FieldTooLarge, decode(testing.allocator, tight_application, encoded));
+}
+
+test "client encode decode preserves early-data compatibility snapshots" {
+    var common: ResumableSessionCommon = .{};
+    try common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xab} ** 32),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+        .early_data = .{ .early_data_capable = 32 },
+        .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = "ordinary-transport" },
+        .application_compat = .{ .format_id = 2, .format_version = 1, .bytes = "ordinary-application" },
+        .early_data_transport_compat = .{ .format_id = 3, .format_version = 7, .bytes = "early-transport" },
+        .early_data_application_compat = .{ .format_id = 4, .format_version = 8, .bytes = "early-application" },
+    });
+    var state: ClientTicketState = .{};
+    try state.init(testing.allocator, Limits.default, &common, .{
+        .ticket = "ticket",
+        .ticket_age_add = 1,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    defer state.deinit();
+
+    var buf: [4096]u8 = undefined;
+    const encoded = try encodeClient(&state, Limits.default, &buf);
+    var decoded = try decode(testing.allocator, Limits.default, encoded);
+    defer decoded.deinit();
+
+    try testing.expectEqualStrings("ordinary-transport", decoded.client.common.transport_compat.?.slice());
+    try testing.expectEqualStrings("ordinary-application", decoded.client.common.application_compat.?.slice());
+    try testing.expectEqual(@as(u16, 3), decoded.client.common.early_data_transport_compat.?.format_id);
+    try testing.expectEqual(@as(u16, 7), decoded.client.common.early_data_transport_compat.?.format_version);
+    try testing.expectEqualStrings("early-transport", decoded.client.common.early_data_transport_compat.?.slice());
+    try testing.expectEqual(@as(u16, 4), decoded.client.common.early_data_application_compat.?.format_id);
+    try testing.expectEqual(@as(u16, 8), decoded.client.common.early_data_application_compat.?.format_version);
+    try testing.expectEqualStrings("early-application", decoded.client.common.early_data_application_compat.?.slice());
+}
+
+test "server encode decode preserves early-data compatibility snapshots" {
+    var common: ResumableSessionCommon = .{};
+    try common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xcd} ** 32),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+        .early_data = .{ .early_data_capable = 64 },
+        .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = "ordinary-transport" },
+        .application_compat = .{ .format_id = 2, .format_version = 1, .bytes = "ordinary-application" },
+        .early_data_transport_compat = .{ .format_id = 5, .format_version = 9, .bytes = "server-early-transport" },
+        .early_data_application_compat = .{ .format_id = 6, .format_version = 10, .bytes = "server-early-application" },
+    });
+    var state: ServerRecoverableState = .{};
+    state.init(&common, 7);
+    defer state.deinit();
+
+    var buf: [4096]u8 = undefined;
+    const encoded = try encodeServer(&state, Limits.default, &buf);
+    var decoded = try decode(testing.allocator, Limits.default, encoded);
+    defer decoded.deinit();
+
+    try testing.expectEqualStrings("ordinary-transport", decoded.server.common.transport_compat.?.slice());
+    try testing.expectEqualStrings("ordinary-application", decoded.server.common.application_compat.?.slice());
+    try testing.expectEqual(@as(u16, 5), decoded.server.common.early_data_transport_compat.?.format_id);
+    try testing.expectEqual(@as(u16, 9), decoded.server.common.early_data_transport_compat.?.format_version);
+    try testing.expectEqualStrings("server-early-transport", decoded.server.common.early_data_transport_compat.?.slice());
+    try testing.expectEqual(@as(u16, 6), decoded.server.common.early_data_application_compat.?.format_id);
+    try testing.expectEqual(@as(u16, 10), decoded.server.common.early_data_application_compat.?.format_version);
+    try testing.expectEqualStrings("server-early-application", decoded.server.common.early_data_application_compat.?.slice());
 }
 
 test "encode enforces max_fields symmetrically with decode" {

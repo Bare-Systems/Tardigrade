@@ -488,6 +488,25 @@ fn sampleServerState(allocator: std.mem.Allocator, sni: []const u8) !session.Ser
     return state;
 }
 
+fn sampleEarlyDataServerState(allocator: std.mem.Allocator, sni: []const u8) !session.ServerRecoverableState {
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0x43} ** 32),
+        .server_name = sni,
+        .application_protocol = "h3",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 86_400,
+        .early_data = .{ .early_data_capable = 32 },
+        .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = "ordinary-transport" },
+        .early_data_transport_compat = .{ .format_id = 57, .format_version = 1, .bytes = "remembered-server-transport" },
+    });
+    var state: session.ServerRecoverableState = .{};
+    state.init(&common, 7);
+    return state;
+}
+
 fn sampleClientTicket(allocator: std.mem.Allocator, ticket: []const u8, sni: []const u8) !session.ClientTicketState {
     var common: session.ResumableSessionCommon = .{};
     try common.init(allocator, session.Limits.default, .{
@@ -816,6 +835,34 @@ test "createIdentity stateless seals into caller scratch and does not consume st
     var hit = try resolver.resolve(identity.slice());
     defer hit.deinit();
     try std.testing.expect(hit == .hit);
+}
+
+test "createIdentity stateless preserves early-data transport compatibility" {
+    var clock = TestClock{};
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    var state = try sampleEarlyDataServerState(std.testing.allocator, "early-stateless.test");
+    defer state.deinit();
+    var scratch: [2048]u8 = undefined;
+    var identity = try runtime.createIdentity(&state, clock.now_ms, &scratch);
+
+    const resolver = runtime.serverResolver().?;
+    var hit = try resolver.resolve(identity.slice());
+    defer hit.deinit();
+    try std.testing.expect(hit == .hit);
+    try std.testing.expectEqualStrings("ordinary-transport", hit.hit.state.common.transport_compat.?.slice());
+    const early_transport = hit.hit.state.common.early_data_transport_compat orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 57), early_transport.format_id);
+    try std.testing.expectEqual(@as(u16, 1), early_transport.format_version);
+    try std.testing.expectEqualStrings("remembered-server-transport", early_transport.slice());
 }
 
 test "createIdentity hybrid falls back to stateless on ordinary stateful capacity refusal" {

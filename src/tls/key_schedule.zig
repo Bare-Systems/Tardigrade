@@ -185,6 +185,22 @@ pub const KeySchedule = struct {
         }
     }
 
+    /// RFC 8446 §7.1/§4.2.10: the client's 0-RTT traffic secret, derived
+    /// from a resumption PSK and the hash of the *complete* ClientHello
+    /// (including its real binders) — never the binder-truncated prefix
+    /// used for binder computation itself. Independent of `KeySchedule`:
+    /// unlike `initWithPsk`, early data has no ECDHE contribution and is
+    /// derived directly from the early secret, before `derived_early_secret`
+    /// folds in the (EC)DHE shared secret for the handshake/master chain.
+    pub fn clientEarlyTrafficSecret(
+        psk: *const [hash_len]u8,
+        client_hello_hash: [hash_len]u8,
+    ) [hash_len]u8 {
+        var early_secret = HkdfSha256.extract("", psk);
+        defer crypto.secureZero(u8, &early_secret);
+        return tls.hkdfExpandLabel(HkdfSha256, early_secret, "c e traffic", &client_hello_hash, hash_len);
+    }
+
     pub fn finishedKey(traffic_secret: *const [hash_len]u8) [hash_len]u8 {
         return tls.hkdfExpandLabel(HkdfSha256, traffic_secret.*, "finished", "", hash_len);
     }
@@ -365,6 +381,40 @@ test "a different resumption PSK produces a different PSK-resumed schedule" {
     defer schedule_b.wipe();
 
     try std.testing.expect(!std.mem.eql(u8, &schedule_a.master_secret, &schedule_b.master_secret));
+}
+
+test "clientEarlyTrafficSecret matches an independently computed known-answer fixture" {
+    // Checked-in literals computed independently of this module (plain
+    // Python hmac/hashlib HKDF-Extract + RFC 8446 HKDF-Expand-Label), not by
+    // re-deriving with the helper under test.
+    const psk = [_]u8{0x99} ** hash_len;
+    const hello_hash = [_]u8{0x24} ** hash_len;
+
+    const early = KeySchedule.clientEarlyTrafficSecret(&psk, hello_hash);
+    try std.testing.expectEqualSlices(u8, &hexBytes("16d133c56483399331d093c3389c265a9547962c6b494b215e02e4eb92900afd"), &early);
+}
+
+test "clientEarlyTrafficSecret differs when the PSK differs" {
+    const psk_a = [_]u8{0x99} ** hash_len;
+    const psk_b = [_]u8{0xaa} ** hash_len;
+    const hello_hash_a = [_]u8{0x24} ** hash_len;
+    const hello_hash_b = [_]u8{0x11} ** hash_len;
+
+    const early_a = KeySchedule.clientEarlyTrafficSecret(&psk_a, hello_hash_a);
+    const early_b = KeySchedule.clientEarlyTrafficSecret(&psk_b, hello_hash_b);
+    try std.testing.expectEqualSlices(u8, &hexBytes("e69f3f7132880345ceda14cd7dcef6aeec62182cb3973d19a50371d75832f596"), &early_b);
+    try std.testing.expect(!std.mem.eql(u8, &early_a, &early_b));
+}
+
+test "clientEarlyTrafficSecret differs when only the ClientHello hash differs" {
+    // Same PSK as the first fixture above, but a different (complete)
+    // ClientHello hash: the early secret must bind to the exact transcript,
+    // not just the PSK, so this must differ from `early_a`.
+    const psk = [_]u8{0x99} ** hash_len;
+    const hello_hash = [_]u8{0x77} ** hash_len;
+
+    const early = KeySchedule.clientEarlyTrafficSecret(&psk, hello_hash);
+    try std.testing.expectEqualSlices(u8, &hexBytes("7d693eba9b582d3867e21784c2682d6ecef79deacbd28089a705e45ea8273310"), &early);
 }
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {

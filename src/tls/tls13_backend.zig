@@ -37,6 +37,7 @@ const X25519 = crypto.dh.X25519;
 const Ed25519 = crypto.sign.Ed25519;
 const EcdsaP256 = crypto.sign.ecdsa.EcdsaP256Sha256;
 const Certificate = crypto.Certificate;
+const Sha256 = crypto.hash.sha2.Sha256;
 
 const EncryptionLevel = events.EncryptionEpoch;
 const CertificateState = events.CertificateState;
@@ -192,6 +193,7 @@ const ext_signature_algorithms: u16 = @intFromEnum(tls_algorithms.ExtensionType.
 const ext_alpn: u16 = @intFromEnum(tls_algorithms.ExtensionType.application_layer_protocol_negotiation);
 const ext_supported_versions: u16 = @intFromEnum(tls_algorithms.ExtensionType.supported_versions);
 const ext_key_share: u16 = @intFromEnum(tls_algorithms.ExtensionType.key_share);
+const ext_early_data: u16 = @intFromEnum(tls_algorithms.ExtensionType.early_data);
 pub const max_transport_extension_len = 512;
 
 const native_protocol_versions = [_]tls_algorithms.ProtocolVersion{.tls13};
@@ -291,6 +293,77 @@ const hello_retry_request_random = [32]u8{
 // ===========================================================================
 
 pub const KeySchedule = tls_key_schedule.KeySchedule;
+
+// ===========================================================================
+// 0-RTT / early-data vocabulary (#366).
+//
+// Native TLS 1.3/QUIC 0-RTT mechanics: explicit client opt-in, a server-side
+// identity-0/skew/replay decision made inside the existing `selectPsk`
+// selection, and EncryptedExtensions acceptance signaling. Ticket
+// advertisement, record/QUIC key installation, and HTTP-level request-safety
+// gating are separate follow-up slices (#366's own suggested PR breakdown);
+// this backend owns only the TLS-layer negotiation and secret derivation.
+// ===========================================================================
+
+/// Client: explicit application opt-in to attempt 0-RTT on this connection.
+/// Disabled by default — configured before `start` via
+/// `setClientEarlyDataIntent`.
+pub const ClientEarlyDataIntent = struct {
+    enabled: bool = false,
+    max_bytes: u32 = 0,
+};
+
+/// Why (or whether) 0-RTT was accepted for this connection. Distinct from
+/// the boolean `earlyDataAccepted()`/`earlyDataAttempted()` accessors: this
+/// is the closed set of reasons a caller can log/meter without ever
+/// exposing secret or attacker-controlled values.
+pub const EarlyDataDecision = enum {
+    not_attempted,
+    accepted,
+    disabled,
+    ticket_not_capable,
+    selected_identity_not_zero,
+    age_skew,
+    transport_incompatible,
+    application_incompatible,
+    replay_rejected,
+    replay_unavailable,
+    resource_limited,
+};
+
+/// Server: enablement/tolerance for accepting 0-RTT. Disabled by default;
+/// configured before `start` via `setServerEarlyDataPolicy`. Resource
+/// admission (`EarlyDataDecision.resource_limited`) is a composition-root
+/// concern (concurrent-request/byte caps) layered on top of this backend,
+/// not decided here.
+pub const ServerEarlyDataPolicy = struct {
+    enabled: bool = false,
+    age_skew_tolerance_ms: u64 = 60_000,
+};
+
+pub const EarlyDataReplayDecision = enum { allow, replay, unavailable };
+
+/// Bounded, non-secret metadata about an early-data attempt handed to the
+/// anti-replay gate — never the raw ticket, PSK, or binder. #368 owns the
+/// actual replay store; this is only the seam.
+pub const EarlyDataReplayCandidate = struct {
+    selected_identity: u16 = 0,
+};
+
+/// Server (#366/#368 seam): injectable anti-replay decision for an
+/// otherwise-acceptable 0-RTT attempt. The default (`decideFn == null`)
+/// reports `.unavailable`, which rejects only early data and preserves
+/// ordinary 1-RTT resumption — production is safe with no replay store
+/// configured at all.
+pub const EarlyDataReplayGate = struct {
+    ctx: *anyopaque = @ptrCast(@constCast(&empty_observer_dummy)),
+    decideFn: ?*const fn (*anyopaque, EarlyDataReplayCandidate) EarlyDataReplayDecision = null,
+
+    fn decide(self: EarlyDataReplayGate, candidate: EarlyDataReplayCandidate) EarlyDataReplayDecision {
+        const f = self.decideFn orelse return .unavailable;
+        return f(self.ctx, candidate);
+    }
+};
 
 const ExtensionGuard = struct {
     pub const max_extensions = 64;
@@ -523,10 +596,41 @@ pub const Tls13Backend = struct {
     /// never rejects ordinary 1-RTT resumption; #366 is the intended
     /// consumer (e.g. to gate early-data acceptance).
     last_psk_age_skew: ?pre_shared_key.AgeSkew = null,
+    /// Client (#366): explicit opt-in to attempt 0-RTT, configured via
+    /// `setClientEarlyDataIntent` before `start`.
+    client_early_data_intent: ClientEarlyDataIntent = .{},
+    /// Client: whether the ClientHello just sent actually carried the
+    /// `early_data` extension (decided by `planEarlyDataAttempt` from the
+    /// first surviving PSK offer — #487's wire-index/lease semantics are
+    /// never reordered to find an early-capable ticket).
+    client_early_data_attempted: bool = false,
+    /// Client: the wire index of the identity ServerHello selected (if
+    /// any), retained so `onEncryptedExtensions` can check an accepted
+    /// `early_data` extension applies only to identity 0.
+    selected_client_psk_index: ?u16 = null,
+    /// Server: whether the just-parsed ClientHello carried the (empty)
+    /// `early_data` extension.
+    client_hello_early_data_seen: bool = false,
+    /// Server (#366): enablement/tolerance for accepting 0-RTT, configured
+    /// via `setServerEarlyDataPolicy` before `start`.
+    server_early_data_policy: ServerEarlyDataPolicy = .{},
+    /// Server (#366/#368 seam): injectable anti-replay decision, configured
+    /// via `setEarlyDataReplayGate` before `start`. Defaults to
+    /// `.unavailable`, which rejects only early data.
+    early_data_replay_gate: EarlyDataReplayGate = .{},
+    /// Whether 0-RTT was accepted for this connection — mirrors
+    /// `early_data_decision == .accepted`, kept separately for cheap
+    /// boolean access from record/QUIC carriers.
+    early_data_accepted: bool = false,
+    /// Server: authoritative reason `decideServerEarlyData` reached for the
+    /// selected candidate. Client: only ever observes `.accepted` (RFC 8446
+    /// does not tell a client *why* the server omitted the extension), so
+    /// this stays `.not_attempted` on the client except when accepted.
+    early_data_decision: EarlyDataDecision = .not_attempted,
 
     const Slice = struct { start: usize, len: usize };
     const PendingStage = enum { server_select, server_sign, client_select, client_sign, peer_verify };
-    const PskSelected = struct { index: usize, psk: [hash_len]u8 };
+    const PskSelected = struct { index: usize, psk: [hash_len]u8, early_data: EarlyDataDecision = .not_attempted };
     pub const ResumptionDecision = enum { accepted, miss, incompatible, full_handshake, fatal };
 
     pub const ResumptionDecisionObserver = struct {
@@ -814,6 +918,54 @@ pub const Tls13Backend = struct {
         self.resumption_decision_observer = observer;
     }
 
+    /// Client (#366): opt in to attempting 0-RTT on this connection. Must
+    /// be called before `start`; disabled (the default) means the client
+    /// never emits `early_data` even when an early-capable ticket is
+    /// offered.
+    pub fn setClientEarlyDataIntent(self: *Tls13Backend, intent: ClientEarlyDataIntent) HandshakeError!void {
+        if (self.role != .client) return error.InvalidHandshakeState;
+        if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        self.client_early_data_intent = intent;
+    }
+
+    /// Server (#366): configure whether/how tolerantly this connection
+    /// accepts 0-RTT. Must be called before `start`; disabled (the
+    /// default) means this connection never accepts early data even from
+    /// an early-capable ticket.
+    pub fn setServerEarlyDataPolicy(self: *Tls13Backend, policy: ServerEarlyDataPolicy) HandshakeError!void {
+        if (self.role != .server) return error.InvalidHandshakeState;
+        if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        self.server_early_data_policy = policy;
+    }
+
+    /// Server (#366/#368 seam): configure the anti-replay decision hook
+    /// consulted for an otherwise-acceptable 0-RTT attempt. Must be called
+    /// before `start`; the default gate reports `.unavailable`.
+    pub fn setEarlyDataReplayGate(self: *Tls13Backend, gate: EarlyDataReplayGate) HandshakeError!void {
+        if (self.role != .server) return error.InvalidHandshakeState;
+        if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        self.early_data_replay_gate = gate;
+    }
+
+    /// Client: whether the ClientHello just sent actually attempted 0-RTT.
+    /// Independent of acceptance — see `earlyDataAccepted`.
+    pub fn earlyDataAttempted(self: *const Tls13Backend) bool {
+        return self.client_early_data_attempted;
+    }
+
+    /// Whether 0-RTT was accepted for this connection.
+    pub fn earlyDataAccepted(self: *const Tls13Backend) bool {
+        return self.early_data_accepted;
+    }
+
+    /// The authoritative server-side reason 0-RTT was or was not accepted
+    /// (see `EarlyDataDecision`). On the client this only ever reaches
+    /// `.accepted`; a client-observed rejection carries no reason
+    /// (RFC 8446 EncryptedExtensions simply omits the extension).
+    pub fn earlyDataDecision(self: *const Tls13Backend) EarlyDataDecision {
+        return self.early_data_decision;
+    }
+
     /// #362/#365: configure this connection's application-layer
     /// compatibility snapshot (e.g. HTTP/3 settings), compared against a
     /// candidate PSK's stored value on the server and used to recheck an
@@ -1029,6 +1181,14 @@ pub const Tls13Backend = struct {
         self.application_compat_present = false;
         self.application_compat_len = 0;
         self.last_psk_age_skew = null;
+        self.client_early_data_intent = .{};
+        self.client_early_data_attempted = false;
+        self.selected_client_psk_index = null;
+        self.client_hello_early_data_seen = false;
+        self.server_early_data_policy = .{};
+        self.early_data_replay_gate = .{};
+        self.early_data_accepted = false;
+        self.early_data_decision = .not_attempted;
         self.selected_client_psk.deinit();
         self.selected_client_psk_present = false;
         self.selected_server_psk.deinit();
@@ -1131,6 +1291,13 @@ pub const Tls13Backend = struct {
         self.selected_server_psk.deinit();
         self.selected_server_psk_present = false;
         self.last_psk_age_skew = null;
+        // #366: a failed handshake must never leave a stale 0-RTT
+        // acceptance bit visible to a carrier.
+        self.client_early_data_attempted = false;
+        self.selected_client_psk_index = null;
+        self.client_hello_early_data_seen = false;
+        self.early_data_accepted = false;
+        self.early_data_decision = .not_attempted;
         self.clearClientHelloPsk();
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
@@ -1162,6 +1329,10 @@ pub const Tls13Backend = struct {
             // order — before any lifecycle/key-pair state is mutated below,
             // so a too-large offer never partially advances the handshake.
             _ = try self.planPskOffer(base_len);
+            // #366: decide whether to attempt 0-RTT from the (now final)
+            // first surviving offer, after offer planning but still before
+            // any lifecycle/key-pair state is mutated.
+            self.planEarlyDataAttempt();
         }
         self.core.start() catch |err| return mapCoreError(err);
         switch (self.role) {
@@ -1556,6 +1727,15 @@ pub const Tls13Backend = struct {
             try w.bytes(payload);
         }
 
+        // early_data (#366): an empty extension announcing a 0-RTT attempt.
+        // Order relative to `pre_shared_key` doesn't matter under RFC
+        // 8446 §4.2.11 (only `pre_shared_key` itself must be last), so this
+        // is placed before the PSK block below for wire-format stability.
+        if (self.client_early_data_attempted) {
+            try w.u16_(ext_early_data);
+            try w.u16_(0);
+        }
+
         // pre_shared_key (#362/#487): `self.client_offer_lease.offers` was already
         // compacted to exactly the eligible, size-fitting, wire-ordered
         // subset by `planPskOffer` (called from `startImpl` before
@@ -1626,6 +1806,22 @@ pub const Tls13Backend = struct {
         }
 
         const message = buf[0..w.len];
+
+        // #366: the client 0-RTT traffic secret is derived from the hash of
+        // this *complete* ClientHello (patched lengths, real binders) —
+        // never the binder-truncated prefix used just above. `psk_secrets[0]`
+        // is identity 0's PSK (the only identity 0-RTT may use), matching
+        // `planEarlyDataAttempt`'s "first surviving offer only" rule.
+        if (self.client_early_data_attempted) {
+            var client_hello_hash: [hash_len]u8 = undefined;
+            Sha256.hash(message, &client_hello_hash, .{});
+
+            var early = KeySchedule.clientEarlyTrafficSecret(&psk_secrets[0], client_hello_hash);
+            defer crypto.secureZero(u8, &early);
+
+            try self.emitSecret(sink, .zero_rtt, .write, &early);
+        }
+
         self.core.recordSent(message) catch |err| return mapCoreError(err);
         try sink.emitCrypto(.initial, message);
     }
@@ -1702,6 +1898,28 @@ pub const Tls13Backend = struct {
 
         raw_offers.deinit(); // whatever was ineligible or did not fit
         raw_offers.moveFrom(&emitted);
+    }
+
+    /// #366: decide whether to attempt 0-RTT, from the first surviving wire
+    /// offer only — tickets are never reordered to find an early-capable
+    /// one, which both preserves #487's wire-index/lease semantics and
+    /// naturally enforces the TLS "selected identity must be 0" requirement
+    /// for early data. Called after `planPskOffer` has already compacted
+    /// `self.client_offer_lease.offers` to exactly the wire-emitted subset.
+    fn planEarlyDataAttempt(self: *Tls13Backend) void {
+        self.client_early_data_attempted = false;
+        if (!self.client_early_data_intent.enabled) return;
+
+        const offers = self.constClientPskOffers();
+        if (offers.isEmpty()) return;
+
+        const max = switch (offers.constSlice()[0].common.early_data) {
+            .resume_only => return,
+            .early_data_capable => |n| n,
+        };
+        if (max == 0 or self.client_early_data_intent.max_bytes == 0) return;
+
+        self.client_early_data_attempted = true;
     }
 
     /// Whether `ticket` is still safe and compatible to offer *now*: not
@@ -1878,6 +2096,10 @@ pub const Tls13Backend = struct {
         // or not, malformed or not).
         var psk_secret: ?[hash_len]u8 = null;
         const active_offers = self.mutableClientPskOffers();
+        // #366: retained regardless of `idx`'s value so
+        // `onEncryptedExtensions` can check an accepted `early_data`
+        // extension applies only to identity 0.
+        self.selected_client_psk_index = selected_identity;
         if (selected_identity) |idx| {
             if (idx >= active_offers.len) return error.IllegalParameter;
             if (self.client_offer_lease.active) self.client_offer_lease.finishPins(.{ .selected = idx });
@@ -1934,6 +2156,7 @@ pub const Tls13Backend = struct {
         var guard = ExtensionGuard{};
         var transport_extension_seen = false;
         var alpn_seen = false;
+        var early_data_seen = false;
         var extensions = Reader{ .bytes = try r.slice(try r.u16_()) };
         try r.expectEnd();
         while (extensions.remaining() > 0) {
@@ -1956,6 +2179,12 @@ pub const Tls13Backend = struct {
                     alpn_seen = true;
                     try sink.emitAlpn(name);
                 },
+                // #366: RFC 8446 §4.2.10 defines this extension's
+                // EncryptedExtensions form as empty too.
+                ext_early_data => {
+                    try ext.expectEnd();
+                    early_data_seen = true;
+                },
                 else => {
                     if (self.profile.extensionType()) |expected_type| {
                         if (expected_type == ext_id) {
@@ -1967,6 +2196,13 @@ pub const Tls13Backend = struct {
             }
         }
         if (!alpn_seen and !self.policy.allow_absent_alpn) return error.AlpnMismatch;
+        // #366: an EncryptedExtensions `early_data` the client never
+        // attempted, or applying to a non-zero selected identity, is a
+        // protocol violation — not merely "not accepted".
+        if (early_data_seen) {
+            if (!self.client_early_data_attempted) return error.IllegalParameter;
+            if ((self.selected_client_psk_index orelse return error.IllegalParameter) != 0) return error.IllegalParameter;
+        }
         tls_negotiation.validateServerSelection(self.policy, .{
             .version = self.negotiated_version,
             .cipher_suite = self.negotiated_cipher_suite,
@@ -2002,6 +2238,12 @@ pub const Tls13Backend = struct {
                 null;
             if (self.resume_compat.transport == .exact and !compatCompatible(stored.transport_compat, received_transport)) return error.IllegalParameter;
             if (self.resume_compat.application == .exact and !compatCompatible(stored.application_compat, self.candidateApplicationCompat())) return error.IllegalParameter;
+
+            // #366: a resume-only ticket can never be the basis for an
+            // accepted `early_data` extension, regardless of what the
+            // client attempted.
+            if (early_data_seen and stored.early_data == .resume_only) return error.IllegalParameter;
+            if (early_data_seen) self.early_data_accepted = true;
 
             self.connection_auth_binding = stored.auth_binding;
         }
@@ -2485,6 +2727,7 @@ pub const Tls13Backend = struct {
         self.peer_sig_scheme_count = 0;
         self.server_name_present = false;
         self.server_name_len = 0;
+        self.client_hello_early_data_seen = false;
 
         const ClientHelloObserver = struct {
             transport_extension_type: ?u16,
@@ -2492,6 +2735,7 @@ pub const Tls13Backend = struct {
             psk_modes_seen: bool = false,
             psk_dhe_ke_offered: bool = false,
             psk_ext: ?struct { body_offset: usize, len: usize } = null,
+            early_data_seen: bool = false,
 
             fn observe(ctx: *anyopaque, observation: tls_negotiation.ExtensionObservation) tls_negotiation.Error!void {
                 const self_obs: *@This() = @ptrCast(@alignCast(ctx));
@@ -2512,6 +2756,12 @@ pub const Tls13Backend = struct {
                             .len = observation.data.len,
                         };
                     },
+                    // #366: RFC 8446 §4.2.10 defines this extension's
+                    // ClientHello form as empty; anything else is malformed.
+                    ext_early_data => {
+                        if (observation.data.len != 0) return error.MalformedExtension;
+                        self_obs.early_data_seen = true;
+                    },
                     else => if (self_obs.transport_extension_type) |expected_type| {
                         if (expected_type == observation.id) self_obs.transport_params = observation.data;
                     },
@@ -2527,6 +2777,10 @@ pub const Tls13Backend = struct {
         const offers = parsed.offers;
         const hello_selection = tls_negotiation.negotiateServerHello(self.policy, &offers) catch |err| return mapNegotiationError(err);
         if (observer.psk_ext != null and !observer.psk_modes_seen) return error.MissingExtension;
+        // #366: early_data without an accompanying PSK offer is malformed —
+        // 0-RTT is only meaningful alongside a resumption attempt.
+        if (observer.early_data_seen and observer.psk_ext == null) return error.MissingExtension;
+        self.client_hello_early_data_seen = observer.early_data_seen;
         // signature_algorithms is required whenever the server authenticates
         // with a certificate (RFC 8446 §9.2). A missing or empty list is a
         // malformed/missing required *peer* extension — attribute it to the
@@ -2669,7 +2923,7 @@ pub const Tls13Backend = struct {
         defer self.clearClientHelloPsk();
         const credential_info = try self.inspectSelectedServerCredential(credential);
         self.connection_auth_binding = credential_info.binding;
-        var psk_selected = try self.selectPsk(credential_info.binding);
+        var psk_selected = try self.selectPsk(credential_info.binding, sink);
         defer if (psk_selected) |*sel| crypto.secureZero(u8, &sel.psk);
 
         // ServerHello (Initial level).
@@ -2738,7 +2992,7 @@ pub const Tls13Backend = struct {
     /// continues to the next offered identity. Returns `null` — meaning
     /// "continue with the existing full-certificate flow" — whenever PSK is
     /// not configured/offered/eligible, or no candidate is acceptable.
-    fn selectPsk(self: *Tls13Backend, current_binding: session.AuthBinding) HandshakeError!?PskSelected {
+    fn selectPsk(self: *Tls13Backend, current_binding: session.AuthBinding, sink: *EventSink) HandshakeError!?PskSelected {
         const resolver = self.psk_resolver orelse return null;
         const capture = self.client_hello_psk orelse return null;
         if (self.client_auth != .disabled) {
@@ -2775,6 +3029,10 @@ pub const Tls13Backend = struct {
             saw_resolved = true;
             var hit = &resolved.hit;
 
+            // #366: 0-RTT may only be attempted against the first offered
+            // identity (wire index 0) — never reordered/probed for a later
+            // early-capable identity.
+            const wants_early = self.client_hello_early_data_seen and attempts == 0;
             const candidate_ctx: session.CandidateContext = .{
                 .cipher_suite = self.negotiated_cipher_suite,
                 .server_name = self.serverNameSlice(),
@@ -2782,6 +3040,7 @@ pub const Tls13Backend = struct {
                 .auth_binding = current_binding,
                 .transport_compat = if (self.resume_compat.transport == .exact) self.candidateTransportCompat() else null,
                 .application_compat = if (self.resume_compat.application == .exact) self.candidateApplicationCompat() else null,
+                .want_early_data = wants_early,
             };
             const decision = session.evaluateCompatibility(&hit.state.common, candidate_ctx, now);
             if (decision.resumption != .eligible) {
@@ -2804,18 +3063,45 @@ pub const Tls13Backend = struct {
 
             // #362: surface the ticket-age skew observation for #366 — skew
             // alone never rejects this 1-RTT resumption.
-            self.last_psk_age_skew = pre_shared_key.observeAgeSkew(
+            const age_skew = pre_shared_key.observeAgeSkew(
                 pair.identity.obfuscated_ticket_age,
                 hit.state.ticket_age_add,
                 elapsedMillis(now, hit.state.common.issued_at_unix_ms),
             );
+            self.last_psk_age_skew = age_skew;
+
+            // #366: the live 0-RTT decision, made here (not from
+            // `takePskAgeSkew`/`takeSelectedServerPsk`, which intentionally
+            // release state only after handshake commit — too late for
+            // first-flight data) and only after binder verification, so an
+            // early-data rejection never rejects an otherwise-valid PSK
+            // resumption.
+            const early_decision = self.decideServerEarlyData(.{
+                .selected_index = attempts,
+                .compatibility = decision.early_data,
+                .age_skew = age_skew,
+            });
+            self.early_data_decision = early_decision;
+            self.early_data_accepted = early_decision == .accepted;
+            if (early_decision == .accepted) {
+                var client_hello_hash: [hash_len]u8 = undefined;
+                Sha256.hash(capture.message[0..capture.message_len], &client_hello_hash, .{});
+
+                var early = KeySchedule.clientEarlyTrafficSecret(&psk_buf, client_hello_hash);
+                defer crypto.secureZero(u8, &early);
+
+                // The server never emits a 0-RTT *write* key; server
+                // responses always use 1-RTT keys.
+                try self.emitSecret(sink, .zero_rtt, .read, &early);
+            }
+
             if (hit.on_selected) |hook| hook.complete();
             hit.lease.commit();
             self.selected_server_psk.state.moveFrom(&hit.state);
             self.selected_server_psk.index = @intCast(attempts);
             self.selected_server_psk_present = true;
             self.resumption_decision_observer.notify(.accepted);
-            return .{ .index = attempts, .psk = psk_buf };
+            return .{ .index = attempts, .psk = psk_buf, .early_data = early_decision };
         }
         if (attempts > 0) {
             self.resumption_decision_observer.notify(if (saw_incompatible)
@@ -2826,6 +3112,41 @@ pub const Tls13Backend = struct {
                 .miss);
         }
         return null;
+    }
+
+    const ServerEarlyDataInputs = struct {
+        selected_index: usize,
+        compatibility: session.EarlyDataEligibility,
+        age_skew: pre_shared_key.AgeSkew,
+    };
+
+    /// #366: the server's live 0-RTT decision for the just-selected,
+    /// binder-verified candidate. `inputs.compatibility` already reflects
+    /// `client_hello_early_data_seen`/identity-0/ticket-capability via
+    /// `session.evaluateCompatibility`'s `want_early_data`; resource
+    /// admission (byte/request caps) is a composition-root concern layered
+    /// on top of this backend and is never produced here.
+    fn decideServerEarlyData(self: *Tls13Backend, inputs: ServerEarlyDataInputs) EarlyDataDecision {
+        if (!self.client_hello_early_data_seen) return .not_attempted;
+        if (!self.server_early_data_policy.enabled) return .disabled;
+        if (inputs.selected_index != 0) return .selected_identity_not_zero;
+        switch (inputs.compatibility) {
+            // Reached only for the selected (already resumption-eligible)
+            // candidate, so `.incompatible` (which `evaluateCompatibility`
+            // only produces when resumption itself is ineligible) cannot
+            // actually occur here; `.disabled` is the real "ticket is
+            // resume-only" case for an identity-0, early_data-requesting
+            // candidate.
+            .disabled, .incompatible => return .ticket_not_capable,
+            .allowed => {},
+        }
+        if (!skewWithinTolerance(inputs.age_skew.skew_ms, self.server_early_data_policy.age_skew_tolerance_ms))
+            return .age_skew;
+        return switch (self.early_data_replay_gate.decide(.{ .selected_identity = @intCast(inputs.selected_index) })) {
+            .allow => .accepted,
+            .replay => .replay_rejected,
+            .unavailable => .replay_unavailable,
+        };
     }
 
     fn candidateTransportCompat(self: *const Tls13Backend) ?session.CandidateCompat {
@@ -2861,6 +3182,14 @@ pub const Tls13Backend = struct {
             try w.u16_(extension_type);
             try w.u16_(@intCast(payload.len));
             try w.bytes(payload);
+        }
+        // #366: signal 0-RTT acceptance with an empty `early_data`
+        // extension — omitted (not merely absent-with-a-flag) for a
+        // PSK-resumed but early-rejected connection, so the client's
+        // omission-based rejection check has something concrete to check.
+        if (self.early_data_decision == .accepted) {
+            try w.u16_(ext_early_data);
+            try w.u16_(0);
         }
         w.patch(2, ee_extensions);
         w.patch(3, ee_len);
@@ -3628,6 +3957,16 @@ fn elapsedMillis(now_ms: i64, issued_ms: i64) u64 {
     const delta: i128 = @as(i128, now_ms) - @as(i128, issued_ms);
     if (delta <= 0) return 0;
     return @intCast(@min(delta, @as(i128, std.math.maxInt(u64))));
+}
+
+/// #366: overflow-safe `|skew_ms| <= tolerance_ms`. The `i128` promotion is
+/// deliberate: `-minInt(i64)` must not trap.
+fn skewWithinTolerance(skew_ms: i64, tolerance_ms: u64) bool {
+    const magnitude: u64 = if (skew_ms < 0)
+        @intCast(-@as(i128, skew_ms))
+    else
+        @intCast(skew_ms);
+    return magnitude <= tolerance_ms;
 }
 
 /// Symmetric optional equality for a stored `CompatSnapshot` against a

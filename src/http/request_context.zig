@@ -4,6 +4,19 @@ const Allocator = std.mem.Allocator;
 const Request = @import("request.zig").Request;
 const RequestLifecycle = @import("request_lifecycle.zig").RequestLifecycle;
 
+pub const EarlyDataContext = struct {
+    transport_early: bool = false,
+    inbound_marker: bool = false,
+
+    pub fn replayExposed(self: EarlyDataContext) bool {
+        return self.transport_early or self.inbound_marker;
+    }
+
+    pub fn mayRetryUpstream425(self: EarlyDataContext) bool {
+        return self.transport_early and !self.inbound_marker;
+    }
+};
+
 /// Per-request context propagated through the middleware pipeline.
 ///
 /// Captures identity, timing, and metadata so downstream handlers
@@ -33,6 +46,8 @@ pub const RequestContext = struct {
     api_version: ?u16,
     /// Idempotency key if provided.
     idempotency_key: ?[]const u8,
+    /// HTTP early-data provenance for this request hop and prior hops.
+    early_data: EarlyDataContext,
     /// Upstream address selected for proxied requests.
     upstream_addr: ?[]const u8,
     /// Final upstream status observed for proxied requests.
@@ -57,6 +72,7 @@ pub const RequestContext = struct {
             .client_ip = client_ip,
             .api_version = null,
             .idempotency_key = null,
+            .early_data = .{},
             .upstream_addr = null,
             .upstream_status = null,
             .response_bytes = 0,
@@ -184,6 +200,19 @@ test "RequestContext setApiVersion and setIdempotencyKey" {
     try std.testing.expect(ctx.idempotency_key == null);
     ctx.setIdempotencyKey("idem-xyz");
     try std.testing.expectEqualStrings("idem-xyz", ctx.idempotency_key.?);
+}
+
+test "EarlyDataContext tracks current and prior hop exposure" {
+    try std.testing.expect(!(@as(EarlyDataContext, .{}).replayExposed()));
+    try std.testing.expect((@as(EarlyDataContext, .{ .transport_early = true })).replayExposed());
+    try std.testing.expect((@as(EarlyDataContext, .{ .inbound_marker = true })).replayExposed());
+}
+
+test "EarlyDataContext retries upstream 425 only for current-hop early data" {
+    try std.testing.expect(!(@as(EarlyDataContext, .{})).mayRetryUpstream425());
+    try std.testing.expect((@as(EarlyDataContext, .{ .transport_early = true })).mayRetryUpstream425());
+    try std.testing.expect(!(@as(EarlyDataContext, .{ .inbound_marker = true })).mayRetryUpstream425());
+    try std.testing.expect(!(@as(EarlyDataContext, .{ .transport_early = true, .inbound_marker = true })).mayRetryUpstream425());
 }
 
 test "extractClientIp prefers X-Forwarded-For" {

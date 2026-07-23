@@ -2352,16 +2352,20 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         if (pattern.len == 0 or action_kind.len == 0) return error.InvalidLocationBlockFormat;
 
         var action: http.location_router.Action = undefined;
+        var action_owned = false;
+        errdefer if (action_owned) action.deinit(allocator);
         if (std.ascii.eqlIgnoreCase(action_kind, "proxy_pass")) {
             const target_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const target = std.mem.trim(u8, target_raw, " \t\r\n");
             if (target.len == 0) return error.InvalidLocationBlockFormat;
             action = .{ .proxy_pass = try allocator.dupe(u8, target) };
+            action_owned = true;
         } else if (std.ascii.eqlIgnoreCase(action_kind, "fastcgi_pass")) {
             const target_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const target = std.mem.trim(u8, target_raw, " \t\r\n");
             if (target.len == 0) return error.InvalidLocationBlockFormat;
             action = .{ .fastcgi_pass = try allocator.dupe(u8, target) };
+            action_owned = true;
         } else if (std.ascii.eqlIgnoreCase(action_kind, "return")) {
             const status_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const body_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
@@ -2370,6 +2374,7 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
                 .status = status,
                 .body = try allocator.dupe(u8, std.mem.trim(u8, body_raw, " \t\r\n")),
             } };
+            action_owned = true;
         } else if (std.ascii.eqlIgnoreCase(action_kind, "rewrite")) {
             const replacement_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const flag_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
@@ -2380,6 +2385,7 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
                 .replacement = try allocator.dupe(u8, replacement),
                 .flag = flag,
             } };
+            action_owned = true;
         } else if (std.ascii.eqlIgnoreCase(action_kind, "static_root")) {
             const root_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const alias_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
@@ -2397,22 +2403,33 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
                 .index = try allocator.dupe(u8, std.mem.trim(u8, index_raw, " \t\r\n")),
                 .try_files = try allocator.dupe(u8, std.mem.trim(u8, try_files_raw, " \t\r\n")),
             } };
+            action_owned = true;
         } else {
             return error.InvalidLocationBlockFormat;
         }
 
         var auth: http.location_router.AuthMode = .off;
         var proxy_streaming_policy: http.location_router.ProxyStreamingPolicy = .inherit;
+        var early_data: http.location_router.EarlyDataPolicy = .off;
+        var proxy_early_data: http.location_router.ProxyEarlyDataPolicy = .off;
         while (fields.next()) |option_raw| {
             const option = std.mem.trim(u8, option_raw, " \t\r\n");
             if (std.mem.startsWith(u8, option, "auth:")) {
                 auth = http.location_router.AuthMode.parse(option["auth:".len..]) orelse return error.InvalidLocationBlockFormat;
             } else if (std.mem.startsWith(u8, option, "stream:")) {
                 proxy_streaming_policy = http.location_router.ProxyStreamingPolicy.parse(option["stream:".len..]) orelse return error.InvalidLocationBlockFormat;
+            } else if (std.mem.startsWith(u8, option, "early_data:")) {
+                early_data = http.location_router.EarlyDataPolicy.parse(option["early_data:".len..]) orelse return error.InvalidLocationBlockFormat;
+            } else if (std.mem.startsWith(u8, option, "proxy_early_data:")) {
+                proxy_early_data = http.location_router.ProxyEarlyDataPolicy.parse(option["proxy_early_data:".len..]) orelse return error.InvalidLocationBlockFormat;
             } else {
                 return error.InvalidLocationBlockFormat;
             }
         }
+        if (proxy_early_data == .rfc8470) switch (action) {
+            .proxy_pass => {},
+            else => return error.InvalidLocationBlockFormat,
+        };
 
         try out.append(allocator, .{
             .match_type = match_type,
@@ -2422,7 +2439,10 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .error_pages = &.{},
             .auth = auth,
             .proxy_streaming_policy = proxy_streaming_policy,
+            .early_data = early_data,
+            .proxy_early_data = proxy_early_data,
         });
+        action_owned = false;
     }
 
     return out.toOwnedSlice(allocator);
@@ -2863,7 +2883,7 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         switch (block.action) {
             .proxy_pass => |target| if (isAbsoluteHttpUrl(target) or isUnixEndpoint(target)) try validateOptionalUpstreamBaseUrl(target, "location.proxy_pass"),
             .fastcgi_pass => |target| try validateOptionalSocketEndpoint(target, "location.fastcgi_pass"),
-            else => {},
+            else => if (block.proxy_early_data == .rfc8470) return error.InvalidConfigValue,
         }
     }
 
@@ -3614,6 +3634,33 @@ test "parse location blocks include route streaming policy option" {
     try std.testing.expectEqual(http.location_router.ProxyStreamingPolicy.off, blocks[0].proxy_streaming_policy);
     try std.testing.expectEqual(http.location_router.ProxyStreamingPolicy.full, blocks[1].proxy_streaming_policy);
     try std.testing.expectEqual(http.location_router.AuthMode.required, blocks[1].auth);
+}
+
+test "parse location blocks include early data policy options" {
+    const allocator = std.testing.allocator;
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "prefix|/safe/|return|200|ok|early_data:replay_safe;prefix|/proxy/|proxy_pass|http://127.0.0.1:9002|early_data:replay_safe|proxy_early_data:rfc8470",
+    );
+    defer {
+        for (blocks) |*block| {
+            block.deinit(allocator);
+        }
+        allocator.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqual(http.location_router.EarlyDataPolicy.replay_safe, blocks[0].early_data);
+    try std.testing.expectEqual(http.location_router.ProxyEarlyDataPolicy.off, blocks[0].proxy_early_data);
+    try std.testing.expectEqual(http.location_router.EarlyDataPolicy.replay_safe, blocks[1].early_data);
+    try std.testing.expectEqual(http.location_router.ProxyEarlyDataPolicy.rfc8470, blocks[1].proxy_early_data);
+}
+
+test "parse location blocks reject proxy early data on non proxy action" {
+    try std.testing.expectError(
+        error.InvalidLocationBlockFormat,
+        parseLocationBlocks(std.testing.allocator, "prefix|/local/|return|200|ok|proxy_early_data:rfc8470"),
+    );
 }
 
 test "apply location error pages csv" {

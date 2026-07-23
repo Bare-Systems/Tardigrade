@@ -2228,6 +2228,20 @@ fn streamingUploadEligibilityBeforeBodyRead(
     };
 }
 
+fn earlyDataHasReplayExposedBodyFraming(request: *const http.Request) bool {
+    if (request.hasTransferEncoding()) return true;
+    const content_length = request.contentLength() orelse return false;
+    return content_length != 0;
+}
+
+fn traceRejectionStatus(
+    method: http.Method,
+    early_ctx: http.request_context.EarlyDataContext,
+) ?http.Status {
+    if (method != .TRACE) return null;
+    return if (early_ctx.replayExposed()) .too_early else .method_not_allowed;
+}
+
 fn mayNeedStreamingRequestBodyPreRead(cfg: *const edge_config.EdgeConfig) bool {
     if (cfg.proxy_streaming_mode.requestStreamingEnabled()) return true;
     for (cfg.location_blocks) |block| {
@@ -2441,19 +2455,6 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         return;
     }
 
-    // --- RFC 7231 §4.3.8 / ASVS-14.5.1: Reject TRACE globally ---
-    // TRACE echoes the request back to the client, enabling Cross-Site
-    // Tracing (XST) attacks that can expose cookies and auth headers even
-    // when HttpOnly is set. Tardigrade has no use for TRACE on any route —
-    // gateway-to-upstream tracing is handled via W3C traceparent headers.
-    // Reject before routing so no location block can accidentally serve it.
-    if (request.method == .TRACE) {
-        try gp.sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive, state);
-        var ctx_trace = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
-        ghandlers.logAccessForRequest(state, &ctx_trace, &request, 405);
-        return;
-    }
-
     // --- Request Context ---
     const effective_connection_ip = if (session.proxy_client_ip_len > 0)
         session.proxy_client_ip_buf[0..session.proxy_client_ip_len]
@@ -2461,9 +2462,28 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         connection_ip;
     const client_ip = http.request_context.extractClientIp(&request, effective_connection_ip);
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-    ctx.early_data.transport_early = session.early_data_transport_early;
+    // #367 slice 2 keeps this as request-scoped handoff state. The production
+    // #366 H1 record provenance carrier is not present on this branch yet, so
+    // H1 transport provenance stays false rather than using connection state.
+    ctx.early_data.transport_early = false;
     ctx.early_data.inbound_marker = request.headers.hasEarlyDataMarker();
-    ctx.early_data.downstream_handshake = session.downstream_handshake;
+
+    // --- RFC 7231 §4.3.8 / ASVS-14.5.1: Reject TRACE globally ---
+    // TRACE echoes the request back to the client, enabling Cross-Site
+    // Tracing (XST) attacks that can expose cookies and auth headers even
+    // when HttpOnly is set. Tardigrade has no use for TRACE on any route —
+    // gateway-to-upstream tracing is handled via W3C traceparent headers.
+    // Reject before routing so no location block can accidentally serve it.
+    if (traceRejectionStatus(request.method, ctx.early_data)) |trace_status| {
+        if (trace_status == .too_early) {
+            const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+            ghandlers.logAccessForRequest(state, &ctx, &request, status);
+            return;
+        }
+        try gp.sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive, state);
+        ghandlers.logAccessForRequest(state, &ctx, &request, 405);
+        return;
+    }
 
     // --- ACME HTTP-01 challenge response (/.well-known/acme-challenge/<token>) ---
     const acme_prefix = "/.well-known/acme-challenge/";
@@ -2632,7 +2652,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         effective_cfg.named_locations,
     );
 
-    switch (ghandlers.earlyDataDecisionForRequest(effective_cfg, ctx.early_data, request.method, request.uri.path)) {
+    switch (ghandlers.earlyDataDecisionForRequest(effective_cfg, ctx.early_data, request.method, request.uri.path, earlyDataHasReplayExposedBodyFraming(&request))) {
         .ordinary, .execute_local, .forward_rfc8470 => {},
         .too_early, .defer_until_handshake => {
             const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
@@ -2720,6 +2740,37 @@ test "TRACE method rejected globally — XST / ASVS-14.5.1 condition check" {
     try std.testing.expect(http_method.Method.POST != .TRACE);
     try std.testing.expect(http_method.Method.DELETE != .TRACE);
     try std.testing.expect(http_method.Method.OPTIONS != .TRACE);
+}
+
+test "TRACE early data is rejected with 425 before ordinary TRACE 405" {
+    const ordinary = http.request_context.EarlyDataContext{};
+    const marked = http.request_context.EarlyDataContext{ .inbound_marker = true };
+    const transport = http.request_context.EarlyDataContext{ .transport_early = true };
+
+    try std.testing.expectEqual(http.Status.method_not_allowed, traceRejectionStatus(.TRACE, ordinary).?);
+    try std.testing.expectEqual(http.Status.too_early, traceRejectionStatus(.TRACE, marked).?);
+    try std.testing.expectEqual(http.Status.too_early, traceRejectionStatus(.TRACE, transport).?);
+    try std.testing.expect(traceRejectionStatus(.GET, marked) == null);
+}
+
+test "early data body framing allows zero content length only" {
+    const allocator = std.testing.allocator;
+
+    var no_body = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\n\r\n", MAX_REQUEST_SIZE);
+    defer no_body.request.deinit();
+    try std.testing.expect(!earlyDataHasReplayExposedBodyFraming(&no_body.request));
+
+    var zero_length = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\n\r\n", MAX_REQUEST_SIZE);
+    defer zero_length.request.deinit();
+    try std.testing.expect(!earlyDataHasReplayExposedBodyFraming(&zero_length.request));
+
+    var nonzero_length = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\nContent-Length: 1\r\n\r\n", MAX_REQUEST_SIZE);
+    defer nonzero_length.request.deinit();
+    try std.testing.expect(earlyDataHasReplayExposedBodyFraming(&nonzero_length.request));
+
+    var chunked = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n", MAX_REQUEST_SIZE);
+    defer chunked.request.deinit();
+    try std.testing.expect(earlyDataHasReplayExposedBodyFraming(&chunked.request));
 }
 
 test "return_response method enforcement — non-GET/HEAD rejected on static returns" {

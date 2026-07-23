@@ -131,14 +131,30 @@ pub fn earlyDataDecisionForRequest(
     early_ctx: http.request_context.EarlyDataContext,
     method: http.Method,
     path: []const u8,
+    has_body_framing: bool,
 ) http.early_data.Decision {
     if (!early_ctx.replayExposed()) return .ordinary;
+    if (has_body_framing) return .too_early;
     if (isTranscriptRoutePath(path)) return .too_early;
+    if (hasMatchingMirrorRule(cfg.mirror_rules, method.toString(), path)) return .too_early;
 
     return switch (resolveRoutePath(cfg.metrics_path, cfg.location_blocks, path)) {
         .reload_status, .metrics, .unmatched => .too_early,
         .location => |matched| locationEarlyDataDecision(early_ctx, method, matched.block),
     };
+}
+
+fn hasMatchingMirrorRule(
+    rules: []const edge_config.EdgeConfig.MirrorRule,
+    method: []const u8,
+    path: []const u8,
+) bool {
+    for (rules) |rule| {
+        if (!http.rewrite.methodMatches(rule.method, method)) continue;
+        if (!http.rewrite.regexMatches(rule.pattern, path)) continue;
+        return true;
+    }
+    return false;
 }
 
 pub fn writeTooEarlyResponse(
@@ -236,17 +252,41 @@ test "earlyDataDecisionForRequest gates H1 routes before side effects" {
 
     const ordinary = http.request_context.EarlyDataContext{};
     const early = http.request_context.EarlyDataContext{ .transport_early = true };
-    try std.testing.expectEqual(http.early_data.Decision.ordinary, earlyDataDecisionForRequest(&cfg, ordinary, .GET, "/off"));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/off"));
-    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .GET, "/safe"));
-    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .HEAD, "/safe"));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .POST, "/safe"));
-    try std.testing.expectEqual(http.early_data.Decision.forward_rfc8470, earlyDataDecisionForRequest(&cfg, early, .GET, "/proxy"));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/auth"));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/rewrite"));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, cfg.metrics_path));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/transcripts"));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/missing"));
+    try std.testing.expectEqual(http.early_data.Decision.ordinary, earlyDataDecisionForRequest(&cfg, ordinary, .GET, "/off", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/off", false));
+    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .GET, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .HEAD, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/safe", true));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .HEAD, "/safe", true));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .POST, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.forward_rfc8470, earlyDataDecisionForRequest(&cfg, early, .GET, "/proxy", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/auth", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/rewrite", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, cfg.metrics_path, false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/transcripts", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/missing", false));
+}
+
+test "earlyDataDecisionForRequest rejects matching mirrors before side effects" {
+    var blocks = [_]http.location_router.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/safe",
+            .priority = 0,
+            .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+            .early_data = .replay_safe,
+        },
+    };
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{
+        .{ .method = "GET", .pattern = "^/safe$", .target_url = "http://127.0.0.1:9002/mirror" },
+    };
+    cfg.mirror_rules = mirrors[0..];
+
+    const early = http.request_context.EarlyDataContext{ .transport_early = true };
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .HEAD, "/safe", false));
 }
 
 test "writeTooEarlyResponse emits no-store 425 without double-counting callers" {
@@ -425,6 +465,7 @@ fn minimalAuthConfig(blocks: []http.location_router.LocationBlock, token_hashes:
     cfg.auth_request_url = "";
     cfg.location_blocks = blocks;
     cfg.metrics_path = "/status/metrics";
+    cfg.mirror_rules = &.{};
     return cfg;
 }
 

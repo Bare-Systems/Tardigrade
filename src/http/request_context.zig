@@ -13,7 +13,7 @@ pub const EarlyDataContext = struct {
     }
 
     pub fn mayRetryUpstream425(self: EarlyDataContext) bool {
-        return self.inbound_marker and !self.transport_early;
+        return self.transport_early and !self.inbound_marker;
     }
 };
 
@@ -206,7 +206,12 @@ test "EarlyDataContext tracks current and prior hop exposure" {
     try std.testing.expect(!(@as(EarlyDataContext, .{}).replayExposed()));
     try std.testing.expect((@as(EarlyDataContext, .{ .transport_early = true })).replayExposed());
     try std.testing.expect((@as(EarlyDataContext, .{ .inbound_marker = true })).replayExposed());
-    try std.testing.expect((@as(EarlyDataContext, .{ .inbound_marker = true })).mayRetryUpstream425());
+}
+
+test "EarlyDataContext retries upstream 425 only for current-hop early data" {
+    try std.testing.expect(!(@as(EarlyDataContext, .{})).mayRetryUpstream425());
+    try std.testing.expect((@as(EarlyDataContext, .{ .transport_early = true })).mayRetryUpstream425());
+    try std.testing.expect(!(@as(EarlyDataContext, .{ .inbound_marker = true })).mayRetryUpstream425());
     try std.testing.expect(!(@as(EarlyDataContext, .{ .transport_early = true, .inbound_marker = true })).mayRetryUpstream425());
 }
 

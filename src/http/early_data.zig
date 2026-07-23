@@ -38,15 +38,17 @@ pub fn decide(inputs: Inputs) Decision {
     const exposed = inputs.replay_exposed or inputs.transport_early or inputs.inbound_marker;
     if (!exposed) return .ordinary;
 
-    if (inputs.action_class == .defer_until_handshake) return .defer_until_handshake;
+    if (inputs.action_class == .defer_until_handshake and inputs.transport_early and !inputs.inbound_marker) {
+        return .defer_until_handshake;
+    }
 
-    const replay_safe = inputs.method_safe or inputs.route_replay_safe;
-    if (!replay_safe) return .too_early;
+    if (!inputs.method_safe) return .too_early;
+    if (!inputs.route_replay_safe) return .too_early;
 
     return switch (inputs.action_class) {
         .local => .execute_local,
         .proxy => if (inputs.proxy_origin_rfc8470) .forward_rfc8470 else .too_early,
-        .defer_until_handshake => unreachable,
+        .defer_until_handshake => .too_early,
     };
 }
 
@@ -56,9 +58,7 @@ pub fn tooEarlyPlan() TooEarlyPlan {
 
 pub fn methodSafe(method: []const u8) bool {
     return std.ascii.eqlIgnoreCase(method, "GET") or
-        std.ascii.eqlIgnoreCase(method, "HEAD") or
-        std.ascii.eqlIgnoreCase(method, "OPTIONS") or
-        std.ascii.eqlIgnoreCase(method, "TRACE");
+        std.ascii.eqlIgnoreCase(method, "HEAD");
 }
 
 test "early data decision treats unexposed requests as ordinary" {
@@ -90,7 +90,7 @@ test "early data decision executes replay-safe local work" {
         .replay_exposed = false,
         .transport_early = true,
         .inbound_marker = false,
-        .method_safe = false,
+        .method_safe = true,
         .route_replay_safe = true,
         .action_class = .local,
         .proxy_origin_rfc8470 = false,
@@ -103,7 +103,7 @@ test "early data decision forwards only to RFC 8470 aware proxy origins" {
         .transport_early = false,
         .inbound_marker = true,
         .method_safe = true,
-        .route_replay_safe = false,
+        .route_replay_safe = true,
         .action_class = .proxy,
         .proxy_origin_rfc8470 = false,
     };
@@ -112,6 +112,27 @@ test "early data decision forwards only to RFC 8470 aware proxy origins" {
     var aware = base;
     aware.proxy_origin_rfc8470 = true;
     try std.testing.expectEqual(Decision.forward_rfc8470, decide(aware));
+}
+
+test "early data decision requires both method and route replay-safety gates" {
+    try std.testing.expectEqual(Decision.too_early, decide(.{
+        .replay_exposed = true,
+        .transport_early = false,
+        .inbound_marker = false,
+        .method_safe = false,
+        .route_replay_safe = true,
+        .action_class = .local,
+        .proxy_origin_rfc8470 = false,
+    }));
+    try std.testing.expectEqual(Decision.too_early, decide(.{
+        .replay_exposed = false,
+        .transport_early = false,
+        .inbound_marker = true,
+        .method_safe = true,
+        .route_replay_safe = false,
+        .action_class = .proxy,
+        .proxy_origin_rfc8470 = true,
+    }));
 }
 
 test "early data decision supports explicit handshake deferral" {
@@ -126,10 +147,26 @@ test "early data decision supports explicit handshake deferral" {
     }));
 }
 
-test "early data method safety follows HTTP safe methods" {
+test "early data decision does not defer prior-hop exposure" {
+    try std.testing.expectEqual(Decision.too_early, decide(.{
+        .replay_exposed = false,
+        .transport_early = false,
+        .inbound_marker = true,
+        .method_safe = true,
+        .route_replay_safe = true,
+        .action_class = .defer_until_handshake,
+        .proxy_origin_rfc8470 = false,
+    }));
+}
+
+test "early data method safety is limited to GET and HEAD" {
     try std.testing.expect(methodSafe("GET"));
     try std.testing.expect(methodSafe("head"));
-    try std.testing.expect(methodSafe("OPTIONS"));
-    try std.testing.expect(methodSafe("TRACE"));
+    try std.testing.expect(!methodSafe("OPTIONS"));
+    try std.testing.expect(!methodSafe("TRACE"));
     try std.testing.expect(!methodSafe("POST"));
+    try std.testing.expect(!methodSafe("PUT"));
+    try std.testing.expect(!methodSafe("PATCH"));
+    try std.testing.expect(!methodSafe("DELETE"));
+    try std.testing.expect(!methodSafe("CONNECT"));
 }

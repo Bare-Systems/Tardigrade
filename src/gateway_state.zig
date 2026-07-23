@@ -2804,6 +2804,8 @@ pub const ConnectionSession = struct {
     proxy_protocol_checked: bool = false,
     proxy_client_ip_len: usize = 0,
     proxy_client_ip_buf: [64]u8 = undefined,
+    early_data_transport_early: bool = false,
+    downstream_handshake: ?http.request_context.DownstreamHandshakeBarrier = null,
 };
 
 pub const ConnectionSessionPool = struct {
@@ -2850,6 +2852,8 @@ pub const ConnectionSessionPool = struct {
         session.pending_buf = null;
         session.proxy_protocol_checked = false;
         session.proxy_client_ip_len = 0;
+        session.early_data_transport_early = false;
+        session.downstream_handshake = null;
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -3123,6 +3127,12 @@ test "connection session pool reuses released sessions" {
 
     const first = try pool.acquire();
     first.pending_len = 42;
+    first.early_data_transport_early = true;
+    first.downstream_handshake = .{
+        .ctx = first,
+        .is_complete_fn = testSessionHandshakeComplete,
+        .wait_or_drive_fn = testSessionHandshakeWait,
+    };
     pool.release(first);
 
     const second = try pool.acquire();
@@ -3130,7 +3140,15 @@ test "connection session pool reuses released sessions" {
 
     try std.testing.expect(first == second);
     try std.testing.expectEqual(@as(usize, 0), second.pending_len);
+    try std.testing.expect(!second.early_data_transport_early);
+    try std.testing.expect(second.downstream_handshake == null);
 }
+
+fn testSessionHandshakeComplete(_: *anyopaque) bool {
+    return true;
+}
+
+fn testSessionHandshakeWait(_: *anyopaque) anyerror!void {}
 
 test "reloadable config store retires old config after last lease" {
     var first_cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});

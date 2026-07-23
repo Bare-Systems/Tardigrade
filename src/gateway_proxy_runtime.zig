@@ -45,6 +45,7 @@ pub const StreamingFallbackReason = enum {
     body_too_large,
     body_dependent_middleware,
     unsupported_route_type,
+    early_data_retry_semantics,
 
     pub fn metricLabel(self: StreamingFallbackReason) []const u8 {
         return switch (self) {
@@ -57,6 +58,7 @@ pub const StreamingFallbackReason = enum {
             .body_too_large => "body_too_large",
             .body_dependent_middleware => "body_dependent_middleware",
             .unsupported_route_type => "unsupported_route_type",
+            .early_data_retry_semantics => "early_data_retry_semantics",
         };
     }
 };
@@ -142,6 +144,7 @@ pub fn executeBufferedDataPlaneProxyRequest(
     auth_user_id: ?[]const u8,
     auth_device_id: ?[]const u8,
     auth_scopes: ?[]const u8,
+    forward_early_data: bool,
     attempt_timeout_ms: u32,
     connect_timeout_ms: u32,
     response_timeout_ms: u32,
@@ -169,6 +172,7 @@ pub fn executeBufferedDataPlaneProxyRequest(
         auth_user_id,
         auth_device_id,
         auth_scopes,
+        forward_early_data,
         attempt_timeout_ms,
         connect_timeout_ms,
         response_timeout_ms,
@@ -518,8 +522,13 @@ pub fn handleLocationProxyPass(
     // idempotent-only guard is enabled (default on).
     const max_attempts = proxyRetryAttemptLimit(cfg.upstream_retry_attempts, cfg.upstream_retry_idempotent_only, method_str);
     const budget_start_ms = http.event_loop.monotonicMs();
+    const first_attempt_forward_early_data = ctx.early_data.inbound_marker or
+        (ctx.early_data.transport_early and !ctx.early_data.downstreamHandshakeComplete());
+    const needs_early_425_orchestration = ctx.early_data.replayExposed();
 
-    const fallback_reason: StreamingFallbackReason = switch (streamingEligibilityForDataPlaneProxyRequest(cfg, matched_block, &resolved, upstream_url.value, max_attempts)) {
+    const fallback_reason: StreamingFallbackReason = if (needs_early_425_orchestration)
+        .early_data_retry_semantics
+    else switch (streamingEligibilityForDataPlaneProxyRequest(cfg, matched_block, &resolved, upstream_url.value, max_attempts)) {
         .stream => {
             state.recordUpstreamAttemptStart(selection.base_url);
             const proxy_buffer_observer = state.proxyBufferObserver();
@@ -633,9 +642,12 @@ pub fn handleLocationProxyPass(
     // even with the default of a single attempt.
     const max_stale_conn_retries: usize = 2;
     var stale_conn_retries: usize = 0;
+    var early_425_retry_used = false;
+    var early_425_extra_attempts: usize = 0;
+    var retry_as_ordinary = false;
 
     var attempt: usize = 0;
-    var upstream_response: DataPlaneProxyResponse = while (attempt < max_attempts + stale_conn_retries) : (attempt += 1) {
+    var upstream_response: DataPlaneProxyResponse = while (attempt < max_attempts + stale_conn_retries + early_425_extra_attempts) : (attempt += 1) {
         const per_attempt_timeout_ms: u32 = blk: {
             if (cfg.upstream_timeout_budget_ms == 0) break :blk cfg.upstream_timeout_ms;
             const elapsed_ms = http.event_loop.monotonicMs() - budget_start_ms;
@@ -664,6 +676,7 @@ pub fn handleLocationProxyPass(
             auth_user_id,
             auth_device_id,
             auth_scopes,
+            if (retry_as_ordinary) false else first_attempt_forward_early_data,
             per_attempt_timeout_ms,
             cfg.upstream_connect_timeout_ms,
             cfg.upstream_response_timeout_ms,
@@ -730,6 +743,29 @@ pub fn handleLocationProxyPass(
         };
         const upstream_ttfb_ms = http.event_loop.monotonicMs() - upstream_start_ms;
         state.metricsRecordProxyBufferedRequest(result.bodyLen(), upstream_ttfb_ms);
+        if (result.statusCode() == @intFromEnum(http.Status.too_early) and shouldRetryEarlyUpstream425(
+            ctx.early_data,
+            first_attempt_forward_early_data,
+            early_425_retry_used,
+            method_str,
+            matched_block,
+        )) {
+            ctx.early_data.waitOrDriveDownstreamHandshake() catch |err| {
+                state.logger.warn(correlation_id, "could not complete downstream handshake before early-data 425 retry: {}", .{err});
+                break result;
+            };
+            if (!ctx.early_data.downstreamHandshakeComplete()) {
+                break result;
+            }
+            early_425_retry_used = true;
+            early_425_extra_attempts = 1;
+            retry_as_ordinary = true;
+            state.logger.debug(correlation_id, "retrying early-data upstream 425 once after downstream handshake completion", .{});
+            var r = result;
+            state.metricsReleaseProxyBufferedBytes(r.bodyLen());
+            r.deinit(allocator);
+            continue;
+        }
         // Retry on 5xx only when attempts remain and the method allows it.
         if (result.statusCode() >= 500 and attempt + 1 < max_attempts) {
             state.recordUpstreamFailure(cfg, selection.base_url);
@@ -773,7 +809,7 @@ pub fn handleLocationProxyPass(
     if (!isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
         if (upstream_response.statusCode() >= 500) {
             state.recordUpstreamFailure(cfg, selection.base_url);
-        } else {
+        } else if (upstream_response.statusCode() != @intFromEnum(http.Status.too_early)) {
             state.recordUpstreamSuccess(cfg, selection.base_url);
         }
     }
@@ -824,6 +860,22 @@ fn shouldRetryStaleUpstreamConnection(
     return isHttpMethodIdempotent(method) or !idempotent_only;
 }
 
+fn shouldRetryEarlyUpstream425(
+    early_ctx: http.request_context.EarlyDataContext,
+    first_attempt_forwarded_early_data: bool,
+    retry_used: bool,
+    method: []const u8,
+    matched_block: *const edge_config.EdgeConfig.LocationBlock,
+) bool {
+    if (!first_attempt_forwarded_early_data) return false;
+    if (retry_used) return false;
+    if (!early_ctx.mayRetryUpstream425()) return false;
+    if (!http.early_data.methodSafe(method)) return false;
+    if (matched_block.early_data != .replay_safe) return false;
+    if (matched_block.proxy_early_data != .rfc8470) return false;
+    return true;
+}
+
 test "shouldRetryStaleUpstreamConnection retries idempotent methods on closed keep-alive" {
     try std.testing.expect(shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "GET", 0, 2, true));
     try std.testing.expect(shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "GET", 1, 2, true));
@@ -843,6 +895,55 @@ test "shouldRetryStaleUpstreamConnection only triggers for pre-delivery closes" 
     try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.ReadFailed, "GET", 0, 2, true));
     try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.ConnectionResetByPeer, "GET", 0, 2, true));
     try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.Timeout, "GET", 0, 2, true));
+}
+
+test "shouldRetryEarlyUpstream425 permits exactly current-hop replay-safe RFC8470 retry" {
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    };
+
+    try std.testing.expect(shouldRetryEarlyUpstream425(
+        .{ .transport_early = true },
+        true,
+        false,
+        "GET",
+        &block,
+    ));
+    try std.testing.expect(!shouldRetryEarlyUpstream425(
+        .{ .transport_early = true, .inbound_marker = true },
+        true,
+        false,
+        "GET",
+        &block,
+    ));
+    try std.testing.expect(!shouldRetryEarlyUpstream425(
+        .{ .transport_early = true },
+        true,
+        true,
+        "GET",
+        &block,
+    ));
+    try std.testing.expect(!shouldRetryEarlyUpstream425(
+        .{ .transport_early = true },
+        true,
+        false,
+        "POST",
+        &block,
+    ));
+    var origin_unknown = block;
+    origin_unknown.proxy_early_data = .off;
+    try std.testing.expect(!shouldRetryEarlyUpstream425(
+        .{ .transport_early = true },
+        true,
+        false,
+        "GET",
+        &origin_unknown,
+    ));
 }
 
 test "data-plane buffered compatibility response limit uses dedicated upstream cap" {
@@ -876,6 +977,7 @@ test "streaming eligibility returns typed fallback reasons" {
     };
 
     try std.testing.expectEqual(StreamingEligibility.stream, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, &resolved, url, 1));
+    try std.testing.expectEqualStrings("early_data_retry_semantics", StreamingFallbackReason.early_data_retry_semantics.metricLabel());
 
     var off_block = block;
     off_block.proxy_streaming_policy = .off;

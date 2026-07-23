@@ -2460,12 +2460,21 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     else
         connection_ip;
     const client_ip = http.request_context.extractClientIp(&request, effective_connection_ip);
+    var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
+    ctx.early_data.transport_early = session.early_data_transport_early;
+    ctx.early_data.inbound_marker = request.headers.hasEarlyDataMarker();
+    ctx.early_data.downstream_handshake = session.downstream_handshake;
 
     // --- ACME HTTP-01 challenge response (/.well-known/acme-challenge/<token>) ---
     const acme_prefix = "/.well-known/acme-challenge/";
     if (state.acme_challenge_store != null and
         std.mem.startsWith(u8, request.uri.path, acme_prefix))
     {
+        if (ctx.early_data.replayExposed()) {
+            const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+            ghandlers.logAccessForRequest(state, &ctx, &request, status);
+            return;
+        }
         const token = request.uri.path[acme_prefix.len..];
         if (state.acme_challenge_store.?.getCopy(allocator, token)) |key_auth| {
             defer allocator.free(key_auth);
@@ -2479,8 +2488,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             // ACME HTTP-01 challenges are ordinary requests; keep them visible in
             // access logs and status metrics like every other terminal (#201).
             state.metricsRecord(200);
-            var ctx_acme = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-            ghandlers.logAccessForRequest(state, &ctx_acme, &request, 200);
+            ghandlers.logAccessForRequest(state, &ctx, &request, 200);
             return;
         }
     }
@@ -2488,11 +2496,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     var effective_cfg_storage = cfg.*;
     const effective_cfg = ga.resolveRequestConfig(cfg, request.headers.get("host"), &effective_cfg_storage) orelse {
         try gp.sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
-        var ctx_404 = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-        ghandlers.logAccessForRequest(state, &ctx_404, &request, 404);
+        ghandlers.logAccessForRequest(state, &ctx, &request, 404);
         return;
     };
-    var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
     if (!ga.hostMatchesServerNames(effective_cfg, &request)) {
         try gp.sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
         ghandlers.logAccessForRequest(state, &ctx, &request, 404);
@@ -2547,6 +2553,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 request.uri.path = rewritten_path;
             },
             .redirect => |r| {
+                if (ctx.early_data.replayExposed()) {
+                    const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+                    ghandlers.logAccessForRequest(state, &ctx, &request, status);
+                    return;
+                }
                 var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
                 defer response.deinit();
                 _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
@@ -2557,6 +2568,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 return;
             },
             .returned => |r| {
+                if (ctx.early_data.replayExposed()) {
+                    const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+                    ghandlers.logAccessForRequest(state, &ctx, &request, status);
+                    return;
+                }
                 const result = try ghandlers.writeReturnResponsePlan(allocator, writer, state, &ctx, ghandlers.planDirectResponse(r.status, r.body), correlation_id, keep_alive);
                 state.metricsRecord(result.status);
                 if (result.error_code) |code| state.metricsRecordErrorCode(code);
@@ -2580,6 +2596,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             request.uri.path = rewritten_path;
         },
         .redirect => |r| {
+            if (ctx.early_data.replayExposed()) {
+                const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+                ghandlers.logAccessForRequest(state, &ctx, &request, status);
+                return;
+            }
             var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
             defer response.deinit();
             _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
@@ -2590,6 +2611,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             return;
         },
         .returned => |r| {
+            if (ctx.early_data.replayExposed()) {
+                const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+                ghandlers.logAccessForRequest(state, &ctx, &request, status);
+                return;
+            }
             const result = try ghandlers.writeReturnResponsePlan(allocator, writer, state, &ctx, ghandlers.planDirectResponse(r.status, r.body), correlation_id, keep_alive);
             state.metricsRecord(result.status);
             if (result.error_code) |code| state.metricsRecordErrorCode(code);
@@ -2605,6 +2631,15 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         effective_cfg.internal_redirect_rules,
         effective_cfg.named_locations,
     );
+
+    switch (ghandlers.earlyDataDecisionForRequest(effective_cfg, ctx.early_data, request.method, request.uri.path)) {
+        .ordinary, .execute_local, .forward_rfc8470 => {},
+        .too_early, .defer_until_handshake => {
+            const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+            ghandlers.logAccessForRequest(state, &ctx, &request, status);
+            return;
+        },
+    }
 
     // --- Mirror requests (best-effort async) ---
     if (effective_cfg.mirror_rules.len > 0) {

@@ -82,6 +82,92 @@ pub fn resolveRoutePath(
     return .unmatched;
 }
 
+fn methodEarlyDataSafe(method: http.Method) bool {
+    return http.early_data.methodSafe(method.toString());
+}
+
+fn routeReplaySafe(block: *const http.location_router.LocationBlock) bool {
+    return block.early_data == .replay_safe;
+}
+
+fn locationEarlyDataDecision(
+    early_ctx: http.request_context.EarlyDataContext,
+    method: http.Method,
+    block: *const http.location_router.LocationBlock,
+) http.early_data.Decision {
+    if (block.auth == .required) return .too_early;
+    return switch (block.action) {
+        .static_root, .return_response => http.early_data.decide(.{
+            .replay_exposed = early_ctx.replayExposed(),
+            .transport_early = early_ctx.transport_early,
+            .inbound_marker = early_ctx.inbound_marker,
+            .method_safe = methodEarlyDataSafe(method),
+            .route_replay_safe = routeReplaySafe(block),
+            .action_class = .local,
+            .proxy_origin_rfc8470 = false,
+        }),
+        .proxy_pass => http.early_data.decide(.{
+            .replay_exposed = early_ctx.replayExposed(),
+            .transport_early = early_ctx.transport_early,
+            .inbound_marker = early_ctx.inbound_marker,
+            .method_safe = methodEarlyDataSafe(method),
+            .route_replay_safe = routeReplaySafe(block),
+            .action_class = .proxy,
+            .proxy_origin_rfc8470 = block.proxy_early_data == .rfc8470,
+        }),
+        .fastcgi_pass, .rewrite => .too_early,
+    };
+}
+
+fn isTranscriptRoutePath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/transcripts") or
+        std.mem.startsWith(u8, path, "/transcripts/") or
+        std.mem.eql(u8, path, "/bearclaw/transcripts") or
+        std.mem.startsWith(u8, path, "/bearclaw/transcripts/");
+}
+
+pub fn earlyDataDecisionForRequest(
+    cfg: *const edge_config.EdgeConfig,
+    early_ctx: http.request_context.EarlyDataContext,
+    method: http.Method,
+    path: []const u8,
+) http.early_data.Decision {
+    if (!early_ctx.replayExposed()) return .ordinary;
+    if (isTranscriptRoutePath(path)) return .too_early;
+
+    return switch (resolveRoutePath(cfg.metrics_path, cfg.location_blocks, path)) {
+        .reload_status, .metrics, .unmatched => .too_early,
+        .location => |matched| locationEarlyDataDecision(early_ctx, method, matched.block),
+    };
+}
+
+pub fn writeTooEarlyResponse(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    correlation_id: []const u8,
+    keep_alive: bool,
+) !u16 {
+    const plan = http.early_data.tooEarlyPlan();
+    const payload = try buildApiErrorJson(allocator, plan.code, "Too Early", correlation_id);
+    defer allocator.free(payload);
+
+    var response = http.Response.json(allocator, payload);
+    defer response.deinit();
+    _ = response
+        .setStatus(plan.status)
+        .setConnection(keep_alive)
+        .setHeader("Cache-Control", "no-store");
+    setRequestIdHeaders(&response, correlation_id);
+    ctx.response_bytes = payload.len;
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(@intFromEnum(plan.status));
+    state.metricsRecordErrorCode(plan.code);
+    return @intFromEnum(plan.status);
+}
+
 test "resolveRoutePath: reload-status and metrics precede location matching" {
     const blocks = [_]http.location_router.LocationBlock{
         .{ .match_type = .prefix, .pattern = "/", .priority = 0, .action = .{ .return_response = .{ .status = 200, .body = "" } } },
@@ -104,6 +190,82 @@ test "resolveRoutePath: location match carries the block, else unmatched" {
         else => try std.testing.expect(false),
     }
     try std.testing.expectEqual(std.meta.Tag(RouteDecision).unmatched, std.meta.activeTag(resolveRoutePath("/status/metrics", &blocks, "/nope")));
+}
+
+test "earlyDataDecisionForRequest gates H1 routes before side effects" {
+    var blocks = [_]http.location_router.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/off",
+            .priority = 0,
+            .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/safe",
+            .priority = 1,
+            .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+            .early_data = .replay_safe,
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/proxy",
+            .priority = 2,
+            .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+            .early_data = .replay_safe,
+            .proxy_early_data = .rfc8470,
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/auth",
+            .priority = 3,
+            .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+            .early_data = .replay_safe,
+            .auth = .required,
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/rewrite",
+            .priority = 4,
+            .action = .{ .rewrite = .{ .replacement = "/safe", .flag = .last } },
+            .early_data = .replay_safe,
+        },
+    };
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+
+    const ordinary = http.request_context.EarlyDataContext{};
+    const early = http.request_context.EarlyDataContext{ .transport_early = true };
+    try std.testing.expectEqual(http.early_data.Decision.ordinary, earlyDataDecisionForRequest(&cfg, ordinary, .GET, "/off"));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/off"));
+    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .GET, "/safe"));
+    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .HEAD, "/safe"));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .POST, "/safe"));
+    try std.testing.expectEqual(http.early_data.Decision.forward_rfc8470, earlyDataDecisionForRequest(&cfg, early, .GET, "/proxy"));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/auth"));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/rewrite"));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, cfg.metrics_path));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/transcripts"));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/missing"));
+}
+
+test "writeTooEarlyResponse emits no-store 425 without double-counting callers" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var ctx = http.request_context.RequestContext.init(allocator, "req-425", "127.0.0.1");
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    const status = try writeTooEarlyResponse(allocator, &output.writer, &state, &ctx, "req-425", false);
+
+    const raw = output.written();
+    try std.testing.expectEqual(@as(u16, 425), status);
+    try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 425 Too Early\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, raw, "cache-control: no-store\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"code\":\"too_early\"") != null);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.status_4xx);
 }
 
 /// The rendering decision for a location `return` directive, shared by h1 and h3
@@ -1509,6 +1671,7 @@ fn handleHttp3LocationProxyPass(
         null,
         null,
         null,
+        false,
         ctx.cfg.upstream_timeout_ms,
         ctx.cfg.upstream_connect_timeout_ms,
         ctx.cfg.upstream_response_timeout_ms,

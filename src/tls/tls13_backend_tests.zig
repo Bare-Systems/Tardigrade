@@ -127,6 +127,13 @@ const DirectObserved = struct {
     application_read: [2]?KeySnapshot = .{ null, null },
     handshake_write_secret: [2]?SecretSnapshot = .{ null, null },
     application_write_secret: [2]?SecretSnapshot = .{ null, null },
+    // #366: record/QUIC 0-RTT key installation is a follow-up slice, so
+    // `record_epoch_bridge.Bridge` deliberately does not support the
+    // `.zero_rtt` epoch yet. `pumpDirect` below captures a `.zero_rtt`
+    // secret event directly (client write / server read) instead of
+    // routing it through the bridge, so 0-RTT tests can still drive a real
+    // end-to-end handshake through this harness.
+    zero_rtt_secret: [2]?SecretSnapshot = .{ null, null },
     handshake_write_seq_after_first_record: [2]?u64 = .{ null, null },
     alpn: [32]u8 = undefined,
     alpn_len: usize = 0,
@@ -219,6 +226,10 @@ fn pumpDirect(
             }
         },
         .traffic_secret => |traffic_secret| {
+            if (traffic_secret.epoch == .zero_rtt) {
+                observed.zero_rtt_secret[@intFromEnum(sender_side)] = SecretSnapshot.capture(traffic_secret.data);
+                continue;
+            }
             var scratch: [1]u8 = undefined;
             _ = try sender_bridge.applyEvent(.{ .traffic_secret = .{
                 .epoch = traffic_secret.epoch,
@@ -618,6 +629,661 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
     const request = try resumed.client_bridge.sealApplicationData("resumed request", &protected2);
     const opened_request = try resumed.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext2);
     try std.testing.expectEqualStrings("resumed request", opened_request.inner.content);
+}
+
+// ==========================================================================
+// #366: 0-RTT policy gate — TLS vocabulary/negotiation slice.
+//
+// Record/QUIC key installation and the HTTP-level request-safety gate are
+// separate follow-up slices; these tests only prove the TLS-layer
+// negotiation (ClientHello/EncryptedExtensions `early_data`, the server's
+// live identity-0/skew/replay decision, and the derived early secret)
+// through the real backend and driver, via `DirectHarness`'s `zero_rtt`
+// secret capture (see `pumpDirect`).
+// ==========================================================================
+
+const IssuedEarlyTicket = struct {
+    ticket: session.ClientTicketState = .{},
+    server_state: session.ServerRecoverableState = .{},
+
+    fn deinit(self: *IssuedEarlyTicket) void {
+        self.ticket.deinit();
+        self.server_state.deinit();
+    }
+};
+
+/// Runs a full handshake and has the server issue a ticket advertising
+/// `max_early_data_size`, delivering it to the client exactly as `PSK round
+/// trip` above does, then returns the client's captured ticket and the
+/// server's recoverable state (for a `resumed` connection's resolver) with
+/// ownership moved out for the caller to `deinit`.
+fn issueEarlyCapableTicket(max_early_data_size: ?u32) !IssuedEarlyTicket {
+    return issueEarlyCapableTicketProfile(.record, max_early_data_size);
+}
+
+const EarlyTicketProfile = enum { record, extension };
+
+fn issueEarlyCapableTicketProfile(profile: EarlyTicketProfile, max_early_data_size: ?u32) !IssuedEarlyTicket {
+    var harness = switch (profile) {
+        .record => DirectHarness.init(),
+        .extension => DirectHarness.initExtension(),
+    };
+    defer harness.deinit();
+
+    const TicketCapture = struct {
+        ticket: session.ClientTicketState = .{},
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(std.testing.allocator, &self.ticket) catch unreachable;
+        }
+    };
+    var capture = TicketCapture{};
+    errdefer capture.ticket.deinit();
+    const limits = session.Limits.default;
+    try harness.client_backend.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = TicketCapture.now,
+        .onTicketFn = TicketCapture.onTicket,
+    });
+    try harness.run();
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try harness.server_backend.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "opaque-early-ticket",
+        .max_early_data_size = max_early_data_size,
+        .issued_at_unix_ms = 1000,
+    }, limits);
+    errdefer server_state.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+
+    const ticket_event = sink.items[0].handshake_bytes;
+    var protected: [record_codec.max_ciphertext_record_len * 2]u8 = undefined;
+    const records = (try harness.server_bridge.applyEvent(.{ .handshake_bytes = .{
+        .epoch = ticket_event.epoch,
+        .data = ticket_event.data,
+    } }, &protected)).?;
+    var parser = record_codec.Parser.init(.ciphertext);
+    var record_sink = record_codec.RecordSink(8, record_codec.max_ciphertext_fragment_len * 8){};
+    try parser.feed(records, &record_sink);
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    for (record_sink.items[0..record_sink.len]) |record| {
+        const opened = try harness.client_bridge.openHandshake(.application, record, &plaintext);
+        _ = try harness.client_driver.receive(.application, opened.inner.content);
+    }
+    try std.testing.expect(capture.ticket.ticket.slice().len > 0);
+
+    var result = IssuedEarlyTicket{};
+    result.ticket.moveFrom(&capture.ticket);
+    result.server_state.moveFrom(&server_state);
+    return result;
+}
+
+/// Wires a fresh `resumed` `DirectHarness` to offer `issued.ticket` and
+/// resolve it back to `issued.server_state`, but does not configure any
+/// 0-RTT policy — callers set `client_early_data_intent`/
+/// `server_early_data_policy`/the replay gate afterward.
+/// A resolver keyed on exact identity match, mirroring `Resolver` in `PSK
+/// round trip` above — an instance (not a file-scope var) so its state
+/// safely outlives the setup call that wires it into
+/// `resumed.server_backend`, for the whole life of the test.
+const IdentityResolver = struct {
+    state: *session.ServerRecoverableState,
+
+    fn now(_: *anyopaque) i64 {
+        return 2000;
+    }
+    fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (!std.mem.eql(u8, identity, "opaque-early-ticket")) return .miss;
+        return clonedResolveHit(self.state, std.testing.allocator);
+    }
+};
+
+fn earlyDataResumedClientClock(_: *anyopaque) i64 {
+    return 2000;
+}
+
+test "0-RTT round trip: an early-capable ticket, matching policy, and an allowing replay gate is accepted by both sides" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+
+    // A capturing replay gate: proves the candidate the gate receives
+    // actually distinguishes this specific ticket (a real, non-zero
+    // fingerprint of its opaque wire identity), not just "identity 0" —
+    // the fingerprint alone (the previous, sole field) can never do that,
+    // since 0-RTT is only ever attempted against wire identity 0.
+    const CapturingReplayGate = struct {
+        seen: ?tls_backend.EarlyDataReplayCandidate = null,
+
+        fn decide(ctx: *anyopaque, candidate: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen = candidate;
+            return .allow;
+        }
+    };
+    var replay_gate = CapturingReplayGate{};
+    try resumed.server_backend.setEarlyDataReplayGate(.{
+        .ctx = &replay_gate,
+        .decideFn = CapturingReplayGate.decide,
+    });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+
+    try std.testing.expect(resumed.client_backend.earlyDataAttempted());
+    try std.testing.expect(resumed.client_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.accepted, resumed.client_backend.earlyDataDecision());
+    try std.testing.expect(resumed.server_backend.earlyDataAttempted());
+    try std.testing.expect(resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.accepted, resumed.server_backend.earlyDataDecision());
+    // The ticket's own advertised allowance (32, from `issueEarlyCapableTicket`
+    // above) survives into the accepted decision for the next carrier slice,
+    // rather than being discarded at `.allowed => {}`.
+    try std.testing.expectEqual(@as(u32, 32), resumed.client_backend.earlyDataMaxBytes());
+    try std.testing.expectEqual(@as(u32, 32), resumed.server_backend.earlyDataMaxBytes());
+
+    const seen_candidate = replay_gate.seen orelse return error.TestExpectedEqual;
+    var expected_fingerprint: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("opaque-early-ticket", &expected_fingerprint, .{});
+    try std.testing.expectEqualSlices(u8, &expected_fingerprint, &seen_candidate.ticket_identity_fingerprint);
+    try std.testing.expect(!std.mem.allEqual(u8, &seen_candidate.ticket_identity_fingerprint, 0));
+
+    // The client's `c e traffic` secret (derived from the final ClientHello
+    // it sent) and the server's own derivation (from the same ClientHello,
+    // captured pre-binder-verification) must be byte-identical — a real
+    // cross-check, not a tautology, since each side runs
+    // `KeySchedule.clientEarlyTrafficSecret` independently.
+    try std.testing.expectEqualSlices(
+        u8,
+        &resumed.observed.zero_rtt_secret[0].?.bytes,
+        &resumed.observed.zero_rtt_secret[1].?.bytes,
+    );
+
+    // The resumed 1-RTT connection remains usable afterward regardless of
+    // the 0-RTT outcome (record/QUIC 0-RTT delivery is a follow-up slice).
+    var protected2: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext2: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try resumed.client_bridge.sealApplicationData("resumed request", &protected2);
+    const opened_request = try resumed.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext2);
+    try std.testing.expectEqualStrings("resumed request", opened_request.inner.content);
+}
+
+test "0-RTT is never attempted for a resume-only ticket even with client intent enabled" {
+    var issued = try issueEarlyCapableTicket(null); // resume_only: no max_early_data_size
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(!resumed.client_backend.earlyDataAttempted());
+    try std.testing.expect(!resumed.client_backend.earlyDataAccepted());
+    try std.testing.expectEqual(@as(u32, 0), resumed.client_backend.earlyDataMaxBytes());
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(@as(?SecretSnapshot, null), resumed.observed.zero_rtt_secret[0]);
+    try std.testing.expectEqual(@as(?SecretSnapshot, null), resumed.observed.zero_rtt_secret[1]);
+}
+
+test "0-RTT is never attempted when the client never opts in, even for an early-capable ticket" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+    // Client intent left at its disabled default.
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    try std.testing.expect(!resumed.client_backend.earlyDataAttempted());
+    // The server's role-aware `earlyDataAttempted()` correctly reports
+    // false too: the peer's ClientHello genuinely never carried `early_data`.
+    try std.testing.expect(!resumed.server_backend.earlyDataAttempted());
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.not_attempted, resumed.server_backend.earlyDataDecision());
+}
+
+test "0-RTT is attempted but rejected when the server's early-data policy is disabled (the default)" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    // Server early-data policy left at its disabled default.
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    // Resumption itself is unaffected by the rejected early-data attempt.
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+
+    try std.testing.expect(resumed.client_backend.earlyDataAttempted());
+    try std.testing.expect(!resumed.client_backend.earlyDataAccepted());
+    // `earlyDataAttempted()` is role-aware: the server side must also
+    // report the peer's attempt (regardless of rejection), since the later
+    // record/QUIC carrier needs to know to expect and boundedly discard
+    // skipped first-flight ciphertext even on this rejected path.
+    try std.testing.expect(resumed.server_backend.earlyDataAttempted());
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.disabled, resumed.server_backend.earlyDataDecision());
+    try std.testing.expectEqual(@as(u32, 0), resumed.server_backend.earlyDataMaxBytes());
+    // The client still derived and emitted its own 0-RTT write secret (the
+    // attempt itself always happens locally); only the server never emits
+    // a matching read secret, since it never reached `.accepted`.
+    try std.testing.expect(resumed.observed.zero_rtt_secret[0] != null);
+    try std.testing.expectEqual(@as(?SecretSnapshot, null), resumed.observed.zero_rtt_secret[1]);
+}
+
+fn earlyDataSkewedClientClock(_: *anyopaque) i64 {
+    // The ticket was issued and received at simulated t=1000 (see
+    // `issueEarlyCapableTicket`'s `TicketCapture.now`); the server's own
+    // resolver clock (`IdentityResolver.now`) reports t=2000, for a genuine
+    // 1000ms server-observed age. Reporting a much larger "now" here makes
+    // the *client's* apparent ticket age diverge sharply from that — real
+    // clock skew, not merely two different-but-consistent clocks.
+    return 6000;
+}
+
+test "0-RTT is rejected for a ticket-age skew outside the configured tolerance" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataSkewedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 10 });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.age_skew, resumed.server_backend.earlyDataDecision());
+}
+
+test "0-RTT is rejected when the anti-replay gate reports replay, without affecting resumption" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+    var replay_gate_ctx: u8 = 0;
+    try resumed.server_backend.setEarlyDataReplayGate(.{
+        .ctx = &replay_gate_ctx,
+        .decideFn = struct {
+            fn decide(_: *anyopaque, _: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+                return .replay;
+            }
+        }.decide,
+    });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_rejected, resumed.server_backend.earlyDataDecision());
+}
+
+test "0-RTT anti-replay defaults to unavailable (fails closed) when no gate is configured" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+    // No `setEarlyDataReplayGate` call: production is safe with no replay
+    // store configured at all.
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_unavailable, resumed.server_backend.earlyDataDecision());
+}
+
+test "an early-data-specific compatibility gate sees remembered transport metadata and rejects only 0-RTT" {
+    var issued = try issueEarlyCapableTicketProfile(.extension, 32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.initExtension();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+
+    const CapturingCompatGate = struct {
+        seen: ?tls_backend.EarlyDataCompatibilityCandidate = null,
+
+        fn decide(ctx: *anyopaque, candidate: tls_backend.EarlyDataCompatibilityCandidate) tls_backend.EarlyDataCompatibilityDecision {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen = candidate;
+            return .transport_incompatible;
+        }
+    };
+    var compat_gate = CapturingCompatGate{};
+    // A gate that reports a transport mismatch — modeling a future QUIC-owned
+    // "remembered transport parameters were reduced" check (#366 letter S) —
+    // while the default ordinary `.exact` transport compatibility still
+    // succeeds, proving early data and ordinary resumption are no longer
+    // coupled through the same compatibility path.
+    try resumed.server_backend.setEarlyDataCompatibilityGate(.{
+        .ctx = &compat_gate,
+        .decideFn = CapturingCompatGate.decide,
+    });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    // Resumption itself is unaffected by the early-data-specific rejection.
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.transport_incompatible, resumed.server_backend.earlyDataDecision());
+    try std.testing.expectEqual(@as(u32, 0), resumed.server_backend.earlyDataMaxBytes());
+    const remembered = (compat_gate.seen orelse return error.TestExpectedEqual).remembered_transport orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 57), remembered.format_id);
+    try std.testing.expectEqual(@as(u16, 1), remembered.format_version);
+    try std.testing.expectEqualStrings("server transport parameters", remembered.bytes);
+}
+
+test "0-RTT is rejected when the server selects an identity other than 0, even though the client attempted it" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+    // A second, ordinary (non-early-capable) ticket that the resolver will
+    // actually select, offered *after* the early-capable one so wire index
+    // 0 stays the early-capable ticket the client attempted 0-RTT against.
+    var second_issued = try issueEarlyCapableTicket(null);
+    defer second_issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    try offers.push(&second_issued.ticket);
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+    };
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+
+    // The resolver misses identity 0 (forcing selection of identity 1),
+    // regardless of which ticket's opaque identity it actually is —
+    // `issueEarlyCapableTicket` gives both the same opaque identity string,
+    // so the resolver is keyed on call count instead.
+    const CallCountResolver = struct {
+        state: *session.ServerRecoverableState,
+        calls: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+        fn resolve(ctx: *anyopaque, _: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (self.calls == 1) return .miss;
+            return clonedResolveHit(self.state, std.testing.allocator);
+        }
+    };
+    var resolver_state = CallCountResolver{ .state = &second_issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CallCountResolver.now,
+        .resolveFn = CallCountResolver.resolve,
+    });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 2), resolver_state.calls);
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.selected_identity_not_zero, resumed.server_backend.earlyDataDecision());
+}
+
+test "the ClientHello wire-encodes early_data before pre_shared_key only when 0-RTT is attempted" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+
+    resumed.client_driver = DirectDriver.init(.client, resumed.client_backend.backend());
+    resumed.drivers_ready = true;
+    const initial_sink = try resumed.client_driver.start({});
+    // Attempting 0-RTT means `sendClientHello` also emits its own
+    // `.zero_rtt`/`.write` secret event (see `tls13_backend.zig`), ahead of
+    // the ClientHello's `handshake_bytes` event — find the ClientHello
+    // itself rather than assuming its position.
+    var client_hello: ?[]const u8 = null;
+    for (initial_sink.items[0..initial_sink.len]) |event| {
+        if (event == .handshake_bytes) client_hello = event.handshake_bytes.data;
+    }
+    const ch = client_hello orelse return error.TestExpectedEqual;
+
+    const early_data_ext: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.early_data);
+    const psk_ext: u16 = pre_shared_key.ext_pre_shared_key;
+    const early_data_pos = std.mem.indexOf(u8, ch, &std.mem.toBytes(std.mem.nativeToBig(u16, early_data_ext))) orelse
+        return error.TestExpectedEqual;
+    // `pre_shared_key`'s own 2-byte type also appears inside the extension
+    // as the identities/binders vector lengths never happen to collide
+    // with the exact 2-byte pattern `0029` (41) at a *type* position for
+    // this fixed, small ClientHello — found from the end so the match is
+    // unambiguous even so.
+    const psk_ext_pos = std.mem.lastIndexOf(u8, ch, &std.mem.toBytes(std.mem.nativeToBig(u16, psk_ext))) orelse
+        return error.TestExpectedEqual;
+    try std.testing.expect(early_data_pos < psk_ext_pos);
+
+    // Server never started (no `harness.run()`): nothing to tear down
+    // beyond the harness's own `deinit`, which only runs the drivers'
+    // `deinit` when `drivers_ready` — already true here.
+    resumed.server_driver = DirectDriver.init(.server, resumed.server_backend.backend());
+}
+
+test "early-data intent does not trim a later 1-RTT PSK when identity 0 is resume-only at the ClientHello boundary" {
+    const first_psk = [_]u8{0x41} ** tls_backend.hash_len;
+    const second_psk = [_]u8{0x42} ** tls_backend.hash_len;
+    const one_byte_ticket = [_]u8{'a'};
+    const max_ticket = [_]u8{'b'} ** session.Limits.default.max_ticket_len;
+
+    var long_names: [16][255]u8 = undefined;
+    var alpns: [16]tls_core.policy.ProtocolName = undefined;
+    for (long_names[0..15], 0..) |*name, i| {
+        @memset(name, @intCast(i + 1));
+        alpns[i] = .{ .bytes = name[0..255] };
+    }
+
+    var found_boundary = false;
+    var trial_len: usize = 1;
+    while (trial_len <= 255 and !found_boundary) : (trial_len += 1) {
+        @memset(&long_names[15], 0xaa);
+        alpns[15] = .{ .bytes = long_names[15][0..trial_len] };
+
+        var policy = tls_core.policy.Policy.recordDefault();
+        policy.alpn_protocols = &alpns;
+        var client = tls_backend.Tls13Backend.initClientConfigured(
+            clientEntropy(),
+            .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+            tls_backend.recordConfig(policy),
+            .{},
+        );
+        defer client.deinit();
+
+        var offers: pre_shared_key.ClientPskOfferSet = .{};
+        try pushTestTicketWithEarlyPolicy(&offers, &first_psk, &one_byte_ticket, .resume_only);
+        try pushTestTicketWithEarlyPolicy(&offers, &second_psk, &max_ticket, .resume_only);
+        var clock_dummy: u8 = 0;
+        const Clock = struct {
+            fn now(_: *anyopaque) i64 {
+                return 0;
+            }
+        };
+        try client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+        try client.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16_384 });
+
+        var sink = DirectSink{};
+        defer sink.deinit();
+        try client.backend().start(.client, {}, &sink);
+
+        var client_hello: ?[]const u8 = null;
+        for (sink.items[0..sink.len]) |event| {
+            if (event == .handshake_bytes) client_hello = event.handshake_bytes.data;
+        }
+        const ch = client_hello orelse return error.TestExpectedEqual;
+        if (ch.len <= tls_backend.max_message_len - 4) continue;
+
+        found_boundary = true;
+        try std.testing.expectEqual(@as(usize, 2), client.client_offer_lease.offers.len);
+        try std.testing.expect(!client.earlyDataAttempted());
+        try std.testing.expectEqual(@as(u32, 0), client.earlyDataMaxBytes());
+        const early_data_ext: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.early_data);
+        try std.testing.expect(std.mem.indexOf(u8, ch, &std.mem.toBytes(std.mem.nativeToBig(u16, early_data_ext))) == null);
+    }
+
+    try std.testing.expect(found_boundary);
 }
 
 fn expectRuntimeResumedRecordHandshake(
@@ -3716,6 +4382,15 @@ test "handshake-phase failure wipes PSK offer state before ServerHello even arri
 }
 
 fn pushTestTicket(offers: *pre_shared_key.ClientPskOfferSet, psk: []const u8, ticket: []const u8) !void {
+    try pushTestTicketWithEarlyPolicy(offers, psk, ticket, .resume_only);
+}
+
+fn pushTestTicketWithEarlyPolicy(
+    offers: *pre_shared_key.ClientPskOfferSet,
+    psk: []const u8,
+    ticket: []const u8,
+    early_data: session.EarlyDataPolicy,
+) !void {
     var common: session.ResumableSessionCommon = .{};
     try common.init(std.testing.allocator, session.Limits.default, .{
         .cipher_suite = .tls_aes_128_gcm_sha256,
@@ -3723,6 +4398,7 @@ fn pushTestTicket(offers: *pre_shared_key.ClientPskOfferSet, psk: []const u8, ti
         .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
         .issued_at_unix_ms = 0,
         .lifetime_seconds = 3600,
+        .early_data = early_data,
     });
     var state: session.ClientTicketState = .{};
     try state.init(std.testing.allocator, session.Limits.default, &common, .{

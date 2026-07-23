@@ -41,6 +41,8 @@ pub const ConnectionResumptionContext = struct {
     auth_binding: session.AuthBinding,
     transport_compat: ?CompatBlob = null,
     application_compat: ?CompatBlob = null,
+    early_data_transport_compat: ?CompatBlob = null,
+    early_data_application_compat: ?CompatBlob = null,
 };
 
 pub const EncodeError = error{
@@ -178,6 +180,8 @@ pub fn buildClientTicketState(
         .early_data = earlyDataPolicy(parsed.max_early_data_size),
         .transport_compat = connection.transport_compat,
         .application_compat = connection.application_compat,
+        .early_data_transport_compat = connection.early_data_transport_compat,
+        .early_data_application_compat = connection.early_data_application_compat,
     });
 
     var state: session.ClientTicketState = .{};
@@ -244,6 +248,8 @@ pub fn buildServerRecoverableStateNoIdentity(
         .early_data = earlyDataPolicy(params.max_early_data_size),
         .transport_compat = connection.transport_compat,
         .application_compat = connection.application_compat,
+        .early_data_transport_compat = connection.early_data_transport_compat,
+        .early_data_application_compat = connection.early_data_application_compat,
     });
 
     var state: session.ServerRecoverableState = .{};
@@ -798,6 +804,8 @@ fn allocationSweepContext() ConnectionResumptionContext {
         .auth_binding = session.AuthBinding.fromLeafCertificateDer("leaf"),
         .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = "transport-compat" },
         .application_compat = .{ .format_id = 2, .format_version = 1, .bytes = "application-compat" },
+        .early_data_transport_compat = .{ .format_id = 3, .format_version = 1, .bytes = "early-transport-compat" },
+        .early_data_application_compat = .{ .format_id = 4, .format_version = 1, .bytes = "early-application-compat" },
     };
 }
 
@@ -823,7 +831,9 @@ fn exerciseClientTicketBuild(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("example.com", state.common.server_name.?.slice());
     try std.testing.expectEqualStrings("h2", state.common.application_protocol.?.slice());
     try std.testing.expect(state.common.transport_compat != null);
+    try std.testing.expect(state.common.early_data_transport_compat != null);
     try std.testing.expect(state.common.application_compat != null);
+    try std.testing.expect(state.common.early_data_application_compat != null);
 }
 
 fn exerciseServerTicketBuild(allocator: std.mem.Allocator) !void {
@@ -846,7 +856,9 @@ fn exerciseServerTicketBuild(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("example.com", state.common.server_name.?.slice());
     try std.testing.expectEqualStrings("h2", state.common.application_protocol.?.slice());
     try std.testing.expect(state.common.transport_compat != null);
+    try std.testing.expect(state.common.early_data_transport_compat != null);
     try std.testing.expect(state.common.application_compat != null);
+    try std.testing.expect(state.common.early_data_application_compat != null);
 }
 
 fn exerciseClientTicketClone(allocator: std.mem.Allocator) !void {

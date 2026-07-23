@@ -483,6 +483,7 @@ pub const Tls13Backend = struct {
     /// Server (#362): the configured stateful/stateless identity resolver.
     /// `null` means this server never offers PSK resumption.
     psk_resolver: ?pre_shared_key.ServerPskResolver = null,
+    resume_compat: ResumeCompatibilityPolicy = .{},
     offered_psk_modes_seen: bool = false,
     offered_psk_dhe_ke: bool = false,
     /// Server: a captured copy of the just-parsed ClientHello, kept only
@@ -782,6 +783,18 @@ pub const Tls13Backend = struct {
         if (self.role != .server) return error.InvalidHandshakeState;
         if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
         self.psk_resolver = resolver;
+    }
+
+    pub const SnapshotResumePolicy = enum { exact, ignore };
+
+    pub const ResumeCompatibilityPolicy = struct {
+        transport: SnapshotResumePolicy = .exact,
+        application: SnapshotResumePolicy = .exact,
+    };
+
+    pub fn setResumeCompatibilityPolicy(self: *Tls13Backend, policy: ResumeCompatibilityPolicy) HandshakeError!void {
+        if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        self.resume_compat = policy;
     }
 
     /// #362/#365: configure this connection's application-layer
@@ -1970,8 +1983,8 @@ pub const Tls13Backend = struct {
                 .{ .format_id = blob.format_id, .format_version = blob.format_version, .bytes = blob.bytes }
             else
                 null;
-            if (!compatCompatible(stored.transport_compat, received_transport)) return error.IllegalParameter;
-            if (!compatCompatible(stored.application_compat, self.candidateApplicationCompat())) return error.IllegalParameter;
+            if (self.resume_compat.transport == .exact and !compatCompatible(stored.transport_compat, received_transport)) return error.IllegalParameter;
+            if (self.resume_compat.application == .exact and !compatCompatible(stored.application_compat, self.candidateApplicationCompat())) return error.IllegalParameter;
 
             self.connection_auth_binding = stored.auth_binding;
         }
@@ -2736,8 +2749,8 @@ pub const Tls13Backend = struct {
                 .server_name = self.serverNameSlice(),
                 .application_protocol = self.selectedAlpn(),
                 .auth_binding = current_binding,
-                .transport_compat = self.candidateTransportCompat(),
-                .application_compat = self.candidateApplicationCompat(),
+                .transport_compat = if (self.resume_compat.transport == .exact) self.candidateTransportCompat() else null,
+                .application_compat = if (self.resume_compat.application == .exact) self.candidateApplicationCompat() else null,
             };
             const decision = session.evaluateCompatibility(&hit.state.common, candidate_ctx, now);
             if (decision.resumption != .eligible) continue;
@@ -3279,8 +3292,8 @@ pub const Tls13Backend = struct {
             .server_name = if (self.server_name_present) self.server_name[0..self.server_name_len] else null,
             .application_protocol = self.selectedAlpn(),
             .auth_binding = self.effectiveAuthBinding(),
-            .transport_compat = self.peerTransportCompat(),
-            .application_compat = self.ownedApplicationCompat(),
+            .transport_compat = if (self.resume_compat.transport == .exact) self.peerTransportCompat() else null,
+            .application_compat = if (self.resume_compat.application == .exact) self.ownedApplicationCompat() else null,
         };
     }
 

@@ -206,13 +206,15 @@ pub const Tls13Backend = struct {
     }
 
     pub fn initClientWithOptions(entropy: Entropy, trust: Trust, options: ClientOptions) Tls13Backend {
-        return .{ .engine = shared.Tls13Backend.initClientConfigured(entropy, trust, .{
+        var self = Tls13Backend{ .engine = shared.Tls13Backend.initClientConfigured(entropy, trust, .{
             .policy = tls_core.policy.Policy.quicDefault(),
             .transport = .{ .extension = .{
                 .extension_type = ext_quic_transport_parameters,
                 .local = "",
             } },
         }, options) };
+        self.engine.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore }) catch unreachable;
+        return self;
     }
 
     pub fn initClientWithAllocator(allocator: std.mem.Allocator, entropy: Entropy, trust: Trust) HandshakeError!Tls13Backend {
@@ -227,13 +229,15 @@ pub const Tls13Backend = struct {
     }
 
     pub fn initServer(entropy: Entropy, identity: Identity) Tls13Backend {
-        return .{ .engine = shared.Tls13Backend.initServerConfigured(entropy, identity, .{
+        var self = Tls13Backend{ .engine = shared.Tls13Backend.initServerConfigured(entropy, identity, .{
             .policy = tls_core.policy.Policy.quicDefault(),
             .transport = .{ .extension = .{
                 .extension_type = ext_quic_transport_parameters,
                 .local = "",
             } },
         }) };
+        self.engine.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore }) catch unreachable;
+        return self;
     }
 
     pub fn initServerWithAllocator(allocator: std.mem.Allocator, entropy: Entropy, identity: Identity) Tls13Backend {
@@ -243,13 +247,15 @@ pub const Tls13Backend = struct {
     }
 
     pub fn initServerWithProvider(entropy: Entropy, provider: CredentialProvider) Tls13Backend {
-        return .{ .engine = shared.Tls13Backend.initServerWithProviderConfigured(entropy, provider, .{
+        var self = Tls13Backend{ .engine = shared.Tls13Backend.initServerWithProviderConfigured(entropy, provider, .{
             .policy = tls_core.policy.Policy.quicDefault(),
             .transport = .{ .extension = .{
                 .extension_type = ext_quic_transport_parameters,
                 .local = "",
             } },
         }) };
+        self.engine.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore }) catch unreachable;
+        return self;
     }
 
     pub fn initServerWithAllocatorAndProvider(allocator: std.mem.Allocator, entropy: Entropy, provider: CredentialProvider) Tls13Backend {

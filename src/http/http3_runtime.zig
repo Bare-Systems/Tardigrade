@@ -124,6 +124,7 @@ const ConnEntry = struct {
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
+    resumption_outcome_recorded: bool = false,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
         self.h3.deinit();
@@ -378,6 +379,7 @@ pub const Runtime = struct {
 
         if (!was_established and entry.conn.isEstablished()) {
             self.noteHandshakeComplete();
+            self.recordResumptionOutcome(entry);
         }
         self.maybeIssueSessionTicket(entry);
 
@@ -583,7 +585,23 @@ pub const Runtime = struct {
         const runtime = self.resumption_runtime orelse return;
         if (!entry.conn.isEstablished()) return;
         entry.ticket_issue_attempted = true;
-        self.issueSessionTicket(entry, runtime) catch {};
+        self.issueSessionTicket(entry, runtime) catch |err| {
+            runtime.observer.ticketIssue(.quic, runtime.config.mode, switch (err) {
+                error.StatefulCapacityRefused => .rejected,
+                else => .failed,
+            });
+            return;
+        };
+        runtime.observer.ticketIssue(.quic, runtime.config.mode, .success);
+    }
+
+    fn recordResumptionOutcome(self: *Runtime, entry: *ConnEntry) void {
+        if (entry.resumption_outcome_recorded) return;
+        const runtime = self.resumption_runtime orelse return;
+        if (!entry.backend.engine.core.psk_authenticated) return;
+        entry.resumption_outcome_recorded = true;
+        runtime.observer.resumptionAttempt(.quic);
+        runtime.observer.resumptionOutcome(.quic, .accepted);
     }
 
     fn issueSessionTicket(self: *Runtime, entry: *ConnEntry, runtime: *tls_core.resumption_runtime.Runtime) !void {
@@ -606,8 +624,12 @@ pub const Runtime = struct {
         defer prepared.deinit();
 
         const scratch = try allocator.alloc(u8, runtime.maxIdentityLen());
-        defer allocator.free(scratch);
+        defer {
+            std.crypto.secureZero(u8, scratch);
+            allocator.free(scratch);
+        }
         var identity = try runtime.createIdentity(&prepared.state, now_unix_ms, scratch);
+        defer identity.deinit();
 
         entry.conn.emitPreparedNewSessionTicket(&prepared, identity.slice(), limits) catch |err| {
             runtime.rollbackIdentity(&identity);

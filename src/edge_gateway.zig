@@ -278,6 +278,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             state.logger.warn(null, "native TLS/QUIC resumption runtime failed to initialize: {s}; continuing without native resumption", .{@errorName(err)});
             break :blk null;
         };
+        if (native_resumption_runtime) |*rt| rt.setObserver(nativeResumptionMetricsObserver(&state));
     }
     defer if (native_resumption_runtime) |*rt| rt.deinit();
     var http3_dispatch_ctx = ghandlers.Http3DispatchContext{
@@ -777,6 +778,83 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.warn(null, "drain timeout elapsed; force-closed {d} queued connection(s)", .{drain_result.forced_closes});
     }
     state.logger.info(null, "Graceful shutdown complete (forced_closes={d} drain_timed_out={})", .{ drain_result.forced_closes, drain_result.timed_out });
+}
+
+fn nativeResumptionMetricsObserver(state: *GatewayState) tls_core.resumption_runtime.Observer {
+    return .{
+        .ctx = state,
+        .onTicketIssueFn = nativeResumptionTicketIssue,
+        .onTicketStoreFn = nativeResumptionTicketStore,
+        .onTicketResolveFn = nativeResumptionTicketResolve,
+        .onResumptionAttemptFn = nativeResumptionAttempt,
+        .onResumptionOutcomeFn = nativeResumptionOutcome,
+    };
+}
+
+fn nativeResumptionTransport(transport: tls_core.resumption_runtime.Transport) http.metrics.ResumptionTransport {
+    return switch (transport) {
+        .record => .record,
+        .quic => .quic,
+    };
+}
+
+fn nativeResumptionMode(mode: tls_core.resumption_runtime.Mode) http.metrics.ResumptionMode {
+    return switch (mode) {
+        .disabled, .stateful => .stateful,
+        .stateless => .stateless,
+        .hybrid => .hybrid,
+    };
+}
+
+fn nativeTicketResult(result: tls_core.resumption_runtime.TicketResult) http.metrics.TicketResult {
+    return switch (result) {
+        .success => .success,
+        .rejected => .rejected,
+        .failed => .failed,
+    };
+}
+
+fn nativeResumptionOutcomeValue(outcome: tls_core.resumption_runtime.ResumptionOutcome) http.metrics.ResumptionOutcome {
+    return switch (outcome) {
+        .accepted => .accepted,
+        .full_handshake => .full_handshake,
+        .fatal => .fatal,
+    };
+}
+
+fn nativeResumptionTicketIssue(ctx: *anyopaque, transport: tls_core.resumption_runtime.Transport, mode: tls_core.resumption_runtime.Mode, result: tls_core.resumption_runtime.TicketResult) void {
+    const state: *GatewayState = @ptrCast(@alignCast(ctx));
+    state.metrics_mutex.lock();
+    defer state.metrics_mutex.unlock();
+    state.metrics.recordTicketIssue(nativeResumptionTransport(transport), nativeResumptionMode(mode), nativeTicketResult(result));
+}
+
+fn nativeResumptionTicketStore(ctx: *anyopaque, result: tls_core.resumption_runtime.TicketResult) void {
+    const state: *GatewayState = @ptrCast(@alignCast(ctx));
+    state.metrics_mutex.lock();
+    defer state.metrics_mutex.unlock();
+    state.metrics.recordTicketStore(nativeTicketResult(result));
+}
+
+fn nativeResumptionTicketResolve(ctx: *anyopaque, mode: tls_core.resumption_runtime.Mode, result: tls_core.resumption_runtime.TicketResult) void {
+    const state: *GatewayState = @ptrCast(@alignCast(ctx));
+    state.metrics_mutex.lock();
+    defer state.metrics_mutex.unlock();
+    state.metrics.recordTicketResolve(nativeResumptionMode(mode), nativeTicketResult(result));
+}
+
+fn nativeResumptionAttempt(ctx: *anyopaque, transport: tls_core.resumption_runtime.Transport) void {
+    const state: *GatewayState = @ptrCast(@alignCast(ctx));
+    state.metrics_mutex.lock();
+    defer state.metrics_mutex.unlock();
+    state.metrics.recordResumptionAttempt(nativeResumptionTransport(transport));
+}
+
+fn nativeResumptionOutcome(ctx: *anyopaque, transport: tls_core.resumption_runtime.Transport, outcome: tls_core.resumption_runtime.ResumptionOutcome) void {
+    const state: *GatewayState = @ptrCast(@alignCast(ctx));
+    state.metrics_mutex.lock();
+    defer state.metrics_mutex.unlock();
+    state.metrics.recordResumptionOutcome(nativeResumptionTransport(transport), nativeResumptionOutcomeValue(outcome));
 }
 
 fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.logger.Logger) !void {

@@ -18,6 +18,40 @@ const provider = crypto.provider;
 
 pub const Mode = enum { disabled, stateful, stateless, hybrid };
 pub const TicketUsage = enum { reusable, single_use };
+pub const Transport = enum { record, quic };
+pub const TicketResult = enum { success, rejected, failed };
+pub const ResumptionOutcome = enum { accepted, full_handshake, fatal };
+
+pub const Observer = struct {
+    ctx: *anyopaque = @ptrCast(@constCast(&empty_observer_dummy)),
+    onTicketIssueFn: ?*const fn (*anyopaque, Transport, Mode, TicketResult) void = null,
+    onTicketStoreFn: ?*const fn (*anyopaque, TicketResult) void = null,
+    onTicketResolveFn: ?*const fn (*anyopaque, Mode, TicketResult) void = null,
+    onResumptionAttemptFn: ?*const fn (*anyopaque, Transport) void = null,
+    onResumptionOutcomeFn: ?*const fn (*anyopaque, Transport, ResumptionOutcome) void = null,
+
+    pub fn ticketIssue(self: Observer, transport: Transport, mode: Mode, result: TicketResult) void {
+        if (self.onTicketIssueFn) |f| f(self.ctx, transport, mode, result);
+    }
+
+    pub fn ticketStore(self: Observer, result: TicketResult) void {
+        if (self.onTicketStoreFn) |f| f(self.ctx, result);
+    }
+
+    pub fn ticketResolve(self: Observer, mode: Mode, result: TicketResult) void {
+        if (self.onTicketResolveFn) |f| f(self.ctx, mode, result);
+    }
+
+    pub fn resumptionAttempt(self: Observer, transport: Transport) void {
+        if (self.onResumptionAttemptFn) |f| f(self.ctx, transport);
+    }
+
+    pub fn resumptionOutcome(self: Observer, transport: Transport, outcome: ResumptionOutcome) void {
+        if (self.onResumptionOutcomeFn) |f| f(self.ctx, transport, outcome);
+    }
+};
+
+var empty_observer_dummy: u8 = 0;
 
 pub const Clock = struct {
     ctx: *anyopaque,
@@ -58,6 +92,7 @@ pub const Runtime = struct {
     client_cache: ?session_cache.ClientSessionCache = null,
     server_cache: ?session_cache.StatefulServerCache = null,
     keyring: ?ticket_protection.ReloadableKeyRing = null,
+    observer: Observer = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -123,9 +158,16 @@ pub const Runtime = struct {
     }
 
     pub fn storeClientTicket(self: *Runtime, ticket: *const session.ClientTicketState) session_cache.StoreResult {
-        if (self.client_cache) |*cache|
-            return cache.storeClone(ticket, self.nowUnixMs(), usagePolicy(self.config.usage));
-        return .rejected_capacity;
+        const result = if (self.client_cache) |*cache|
+            cache.storeClone(ticket, self.nowUnixMs(), usagePolicy(self.config.usage))
+        else
+            .rejected_capacity;
+        self.observer.ticketStore(storeResultToTicketResult(result));
+        return result;
+    }
+
+    pub fn setObserver(self: *Runtime, observer: Observer) void {
+        self.observer = observer;
     }
 
     /// Safe upper bound on the wire length of an identity this runtime can
@@ -161,9 +203,22 @@ pub const Runtime = struct {
                 .stateless => |s| s.buf[0..s.len],
             };
         }
+
+        pub fn deinit(self: *Identity) void {
+            switch (self.*) {
+                .stateful => |*handle| crypto.secrets.secureZero(handle[0..]),
+                .stateless => |s| crypto.secrets.secureZero(s.buf[0..s.len]),
+            }
+            self.* = undefined;
+        }
     };
 
-    pub const CreateIdentityError = error{ StorageUnavailable, SealFailed };
+    pub const CreateIdentityError = error{
+        StatefulCapacityRefused,
+        StatefulStorageFailed,
+        HandleGenerationFailed,
+        SealFailed,
+    };
 
     /// Consumes `state` — the exact prepared `ServerRecoverableState` from
     /// `Tls13Backend.prepareNewSessionTicket` — into this runtime's
@@ -186,12 +241,12 @@ pub const Runtime = struct {
         scratch: []u8,
     ) CreateIdentityError!Identity {
         return switch (self.config.mode) {
-            .disabled => error.StorageUnavailable,
+            .disabled => error.StatefulCapacityRefused,
             .stateful => self.createStatefulIdentity(state, now_unix_ms),
             .stateless => self.createStatelessIdentity(state, now_unix_ms, scratch),
             .hybrid => self.createStatefulIdentity(state, now_unix_ms) catch |err| switch (err) {
-                error.StorageUnavailable => self.createStatelessIdentity(state, now_unix_ms, scratch),
-                error.SealFailed => err,
+                error.StatefulCapacityRefused => self.createStatelessIdentity(state, now_unix_ms, scratch),
+                else => err,
             },
         };
     }
@@ -201,12 +256,15 @@ pub const Runtime = struct {
         state: *session.ServerRecoverableState,
         now_unix_ms: i64,
     ) CreateIdentityError!Identity {
-        const cache = if (self.server_cache) |*cache| cache else return error.StorageUnavailable;
+        const cache = if (self.server_cache) |*cache| cache else return error.StatefulCapacityRefused;
         var handle: [session_cache.stateful_identity_len]u8 = undefined;
+        defer crypto.secrets.secureZero(handle[0..]);
         const result = cache.insertMove(state, now_unix_ms, usagePolicy(self.config.usage), &handle);
         return switch (result) {
             .stored => .{ .stateful = handle },
-            .rejected_capacity, .storage_failed, .rejected_handle_generation_failed => error.StorageUnavailable,
+            .rejected_capacity => error.StatefulCapacityRefused,
+            .storage_failed => error.StatefulStorageFailed,
+            .rejected_handle_generation_failed => error.HandleGenerationFailed,
             .replaced, .rejected_unsupported_usage => unreachable,
         };
     }
@@ -217,7 +275,7 @@ pub const Runtime = struct {
         now_unix_ms: i64,
         scratch: []u8,
     ) CreateIdentityError!Identity {
-        const keyring = if (self.keyring) |*keyring| keyring else return error.StorageUnavailable;
+        const keyring = if (self.keyring) |*keyring| keyring else return error.StatefulCapacityRefused;
         var protector = ticket_protection.Protector{
             .provider = self.provider,
             .keyring = keyring,
@@ -250,8 +308,15 @@ pub const Runtime = struct {
         const now = self.nowUnixMs();
 
         if (session_cache.isValidStatefulHandleShape(identity)) {
-            if (self.server_cache) |*cache|
-                return session_cache.resolveStatefulServerPsk(cache, self.allocator, identity, now);
+            if (self.server_cache) |*cache| {
+                const result = session_cache.resolveStatefulServerPsk(cache, self.allocator, identity, now) catch |err| {
+                    self.observer.ticketResolve(.stateful, .failed);
+                    return err;
+                };
+                self.observer.ticketResolve(.stateful, if (result == .hit) .success else .rejected);
+                return result;
+            }
+            self.observer.ticketResolve(.stateful, .rejected);
             return .miss;
         }
 
@@ -263,11 +328,19 @@ pub const Runtime = struct {
                 .limits = self.config.session_limits,
             };
             var state: session.ServerRecoverableState = .{};
-            const found = protector.resolve(self.allocator, identity, now, &state) catch return error.ResolverFailed;
-            if (!found) return .miss;
+            const found = protector.resolve(self.allocator, identity, now, &state) catch {
+                self.observer.ticketResolve(.stateless, .failed);
+                return error.ResolverFailed;
+            };
+            if (!found) {
+                self.observer.ticketResolve(.stateless, .rejected);
+                return .miss;
+            }
+            self.observer.ticketResolve(.stateless, .success);
             return .{ .hit = .{ .state = state, .lease = pre_shared_key.ServerPskLease.initNoop() } };
         }
 
+        self.observer.ticketResolve(self.config.mode, .rejected);
         return .miss;
     }
 
@@ -306,6 +379,14 @@ fn usagePolicy(usage: TicketUsage) session_cache.UsagePolicy {
     return switch (usage) {
         .reusable => .reusable,
         .single_use => .single_use,
+    };
+}
+
+pub fn storeResultToTicketResult(result: session_cache.StoreResult) TicketResult {
+    return switch (result) {
+        .stored, .replaced => .success,
+        .rejected_capacity, .rejected_unsupported_usage => .rejected,
+        .storage_failed, .rejected_handle_generation_failed => .failed,
     };
 }
 
@@ -350,6 +431,16 @@ const TestEntropy = struct {
         if (self.fail) return error.EntropyFailure;
         @memset(buffer, self.byte);
         self.byte +%= 1;
+    }
+};
+
+const FailingHandleRandom = struct {
+    fn source() session_cache.RandomSource {
+        return .{ .ctx = @ptrCast(@constCast(&empty_observer_dummy)), .fillFn = fill };
+    }
+
+    fn fill(_: *anyopaque, _: []u8) error{EntropyFailure}!void {
+        return error.EntropyFailure;
     }
 };
 
@@ -729,6 +820,53 @@ test "createIdentity hybrid falls back to stateless on ordinary stateful capacit
     try std.testing.expect(hit == .hit);
 }
 
+test "createIdentity hybrid does not fall back on stateful storage failure" {
+    var clock = TestClock{};
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .hybrid },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_allocator = runtime.server_cache.?.allocator;
+    runtime.server_cache.?.allocator = failing.allocator();
+    defer {
+        runtime.server_cache.?.allocator = original_allocator;
+    }
+
+    var state = try sampleServerState(std.testing.allocator, "hybrid-storage-failed.test");
+    defer state.deinit();
+    var scratch = [_]u8{0} ** 1024;
+    try std.testing.expectError(error.StatefulStorageFailed, runtime.createIdentity(&state, clock.now_ms, &scratch));
+    try std.testing.expect(!std.mem.startsWith(u8, &scratch, &ticket_protection.magic));
+}
+
+test "createIdentity hybrid does not fall back on stateful handle generation failure" {
+    var clock = TestClock{};
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .hybrid },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    runtime.server_cache.?.random = FailingHandleRandom.source();
+
+    var state = try sampleServerState(std.testing.allocator, "hybrid-handle-failed.test");
+    defer state.deinit();
+    var scratch = [_]u8{0} ** 1024;
+    try std.testing.expectError(error.HandleGenerationFailed, runtime.createIdentity(&state, clock.now_ms, &scratch));
+    try std.testing.expect(!std.mem.startsWith(u8, &scratch, &ticket_protection.magic));
+}
+
 test "rollbackIdentity revokes a stateful handle so it no longer resolves" {
     var clock = TestClock{};
     var entropy_ctx = TestEntropy{};
@@ -779,7 +917,7 @@ test "rollbackIdentity is a no-op for a stateless envelope" {
     try std.testing.expect(hit == .hit);
 }
 
-test "createIdentity disabled runtime always reports storage unavailable" {
+test "createIdentity disabled runtime reports typed stateful refusal" {
     var clock = TestClock{};
     var entropy_ctx = TestEntropy{};
     var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
@@ -793,5 +931,5 @@ test "createIdentity disabled runtime always reports storage unavailable" {
 
     var state = try sampleServerState(std.testing.allocator, "disabled.test");
     defer state.deinit();
-    try std.testing.expectError(error.StorageUnavailable, runtime.createIdentity(&state, clock.now_ms, &.{}));
+    try std.testing.expectError(error.StatefulCapacityRefused, runtime.createIdentity(&state, clock.now_ms, &.{}));
 }

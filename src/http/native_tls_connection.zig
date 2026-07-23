@@ -158,6 +158,7 @@ pub const NativeTlsConnection = struct {
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
+    resumption_outcome_recorded: bool = false,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -197,6 +198,7 @@ pub const NativeTlsConnection = struct {
                 .transport = .record,
             },
         );
+        backend.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore }) catch unreachable;
         // #488: install the process-shared server resolver before the
         // handshake can start — `setServerPskResolver` itself refuses once
         // the backend has left `.idle`.
@@ -266,8 +268,19 @@ pub const NativeTlsConnection = struct {
 
     pub fn drive(self: *NativeTlsConnection) encrypted_stream.Error!encrypted_stream.DriveResult {
         const result = try self.record.drive();
+        self.maybeRecordResumptionOutcome();
         self.maybeIssueSessionTicket();
         return result;
+    }
+
+    fn maybeRecordResumptionOutcome(self: *NativeTlsConnection) void {
+        if (self.resumption_outcome_recorded) return;
+        const runtime = self.resumption_runtime orelse return;
+        if (!self.record.applicationDataOpen()) return;
+        if (!self.backend.core.psk_authenticated) return;
+        self.resumption_outcome_recorded = true;
+        runtime.observer.resumptionAttempt(.record);
+        runtime.observer.resumptionOutcome(.record, .accepted);
     }
 
     /// #488: best-effort, exactly-once post-handshake ticket issuance. Only
@@ -281,7 +294,14 @@ pub const NativeTlsConnection = struct {
         if (self.backend.role != .server) return;
         if (!self.record.applicationDataOpen()) return;
         self.ticket_issue_attempted = true;
-        self.issueSessionTicket(runtime) catch {};
+        self.issueSessionTicket(runtime) catch |err| {
+            runtime.observer.ticketIssue(.record, runtime.config.mode, switch (err) {
+                error.StatefulCapacityRefused => .rejected,
+                else => .failed,
+            });
+            return;
+        };
+        runtime.observer.ticketIssue(.record, runtime.config.mode, .success);
     }
 
     fn issueSessionTicket(self: *NativeTlsConnection, runtime: *tls.resumption_runtime.Runtime) !void {
@@ -304,8 +324,12 @@ pub const NativeTlsConnection = struct {
         defer prepared.deinit();
 
         const scratch = try self.allocator.alloc(u8, runtime.maxIdentityLen());
-        defer self.allocator.free(scratch);
+        defer {
+            std.crypto.secureZero(u8, scratch);
+            self.allocator.free(scratch);
+        }
         var identity = try runtime.createIdentity(&prepared.state, now_unix_ms, scratch);
+        defer identity.deinit();
 
         var sink = tls.tls13_transport.EventSink{};
         defer sink.deinit();
@@ -315,7 +339,7 @@ pub const NativeTlsConnection = struct {
         };
 
         for (sink.items[0..sink.len]) |event| switch (event) {
-            .handshake_bytes => |hb| self.record.applyEvent(.{ .handshake_bytes = .{ .epoch = hb.epoch, .data = hb.data } }) catch |err| {
+            .handshake_bytes => |hb| self.record.tryQueuePostHandshake(.{ .handshake_bytes = .{ .epoch = hb.epoch, .data = hb.data } }) catch |err| {
                 runtime.rollbackIdentity(&identity);
                 return err;
             },

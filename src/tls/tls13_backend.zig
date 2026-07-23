@@ -2740,9 +2740,15 @@ pub const Tls13Backend = struct {
     /// not configured/offered/eligible, or no candidate is acceptable.
     fn selectPsk(self: *Tls13Backend, current_binding: session.AuthBinding) HandshakeError!?PskSelected {
         const resolver = self.psk_resolver orelse return null;
-        if (self.client_auth != .disabled) return null;
-        if (!self.offered_psk_modes_seen or !self.offered_psk_dhe_ke) return null;
         const capture = self.client_hello_psk orelse return null;
+        if (self.client_auth != .disabled) {
+            self.resumption_decision_observer.notify(.full_handshake);
+            return null;
+        }
+        if (!self.offered_psk_modes_seen or !self.offered_psk_dhe_ke) {
+            self.resumption_decision_observer.notify(.full_handshake);
+            return null;
+        }
         const ext_data = capture.message[capture.ext_data_offset..][0..capture.ext_data_len];
         // Already validated once in `onClientHello`; re-parsing the same
         // captured bytes cannot fail.

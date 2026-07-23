@@ -573,6 +573,19 @@ const TicketIssueProbe = struct {
     }
 };
 
+const CacheEventProbe = struct {
+    stored: usize = 0,
+
+    fn observer(self: *CacheEventProbe) tls.session_cache.Observer {
+        return .{ .ctx = self, .onEventFn = onEvent };
+    }
+
+    fn onEvent(ctx: *anyopaque, event: tls.session_cache.CacheEvent) void {
+        const self: *CacheEventProbe = @ptrCast(@alignCast(ctx));
+        if (event == .stored) self.stored += 1;
+    }
+};
+
 test "native TLS createWithOptions installs the shared server resolver when configured" {
     var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
     defer fixed.deinit();
@@ -647,6 +660,60 @@ test "native TLS failed post-handshake issuance notifies the runtime observer on
 
     conn.maybeIssueSessionTicket();
     try std.testing.expectEqual(@as(usize, 1), probe.count);
+}
+
+test "native TLS post-handshake queue pressure rolls back inserted stateful handle and keeps stream open" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    var runtime = try testResumptionRuntime(std.testing.allocator);
+    defer runtime.deinit();
+    var issue_probe = TicketIssueProbe{};
+    runtime.setObserver(issue_probe.observer());
+    var cache_probe = CacheEventProbe{};
+    runtime.server_cache.?.setObserver(cache_probe.observer());
+
+    const conn = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .resumption_runtime = &runtime },
+    );
+    defer conn.destroy();
+
+    const hs_read = [_]u8{0x21} ** 32;
+    const hs_write = [_]u8{0x22} ** 32;
+    const app_read = [_]u8{0x23} ** 32;
+    const app_write = [_]u8{0x24} ** 32;
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &hs_read } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &hs_write } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &app_read } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &app_write } });
+    try conn.record.applyEvent(.{ .discard_epoch = .initial });
+    try conn.record.applyEvent(.{ .discard_epoch = .handshake });
+    try conn.record.applyEvent(.handshake_complete);
+    conn.backend.core.handshake_lifecycle = .complete;
+    try conn.backend.resumption_master_secret.replace(&([_]u8{0x42} ** tls.tls13_backend.hash_len));
+
+    try std.testing.expectEqual(@as(usize, 0), runtime.server_cache.?.count());
+    conn.record.outbound_ciphertext.len = encrypted_stream.PureZigRecordStream.max_ciphertext_queue - 1;
+    conn.maybeIssueSessionTicket();
+
+    try std.testing.expect(conn.ticket_issue_attempted);
+    try std.testing.expectEqual(@as(usize, 1), cache_probe.stored);
+    try std.testing.expectEqual(@as(usize, 0), runtime.server_cache.?.count());
+    try std.testing.expectEqual(@as(usize, 1), issue_probe.count);
+    try std.testing.expectEqual(tls.resumption_runtime.TicketResult.failed, issue_probe.result);
+    try std.testing.expect(conn.record.lifecycle == .open);
+    try std.testing.expect(conn.record.failed == null);
+
+    conn.record.outbound_ciphertext.len = 0;
+    const written = try conn.record.stream().write("still-open");
+    try std.testing.expectEqual(@as(usize, "still-open".len), written);
+    try std.testing.expect(conn.record.queuedCiphertextLen() > 0);
 }
 
 test "native TLS never attempts ticket issuance before application data opens" {

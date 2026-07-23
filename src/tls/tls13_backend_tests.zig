@@ -620,7 +620,11 @@ test "PSK round trip: an offered, resolved, and verified ticket resumes the hand
     try std.testing.expectEqualStrings("resumed request", opened_request.inner.content);
 }
 
-test "#488: resumption_runtime.Runtime drives a genuine end-to-end resumed handshake via two-phase issuance" {
+fn expectRuntimeResumedRecordHandshake(
+    server_config: tls_core.resumption_runtime.Config,
+    client_config: tls_core.resumption_runtime.Config,
+    expected_identity: tls_core.resumption_runtime.Runtime.IdentityMode,
+) !void {
     const resumption_runtime = tls_core.resumption_runtime;
 
     // Phase 1: a full handshake. The server issues a ticket through the new
@@ -632,7 +636,7 @@ test "#488: resumption_runtime.Runtime drives a genuine end-to-end resumed hands
 
     var server_runtime = try resumption_runtime.Runtime.init(
         std.testing.allocator,
-        .{ .mode = .stateful },
+        server_config,
         .{ .ctx = undefined, .nowUnixMsFn = struct {
             fn now(_: *anyopaque) i64 {
                 return 1000;
@@ -644,7 +648,7 @@ test "#488: resumption_runtime.Runtime drives a genuine end-to-end resumed hands
 
     var client_runtime = try resumption_runtime.Runtime.init(
         std.testing.allocator,
-        .{ .mode = .stateful },
+        client_config,
         .{ .ctx = undefined, .nowUnixMsFn = struct {
             fn now(_: *anyopaque) i64 {
                 return 2000;
@@ -686,9 +690,10 @@ test "#488: resumption_runtime.Runtime drives a genuine end-to-end resumed hands
         .issued_at_unix_ms = 1000,
     }, limits);
     defer prepared.deinit();
-    var scratch: [256]u8 = undefined;
+    var scratch: [session.absolute_ticket_wire_max]u8 = undefined;
     var identity = try server_runtime.createIdentity(&prepared.state, 1000, &scratch);
-    try std.testing.expect(identity == .stateful);
+    defer identity.deinit();
+    try std.testing.expectEqual(expected_identity, std.meta.activeTag(identity));
     try harness.server_backend.emitPreparedNewSessionTicket(std.testing.allocator, &sink, &prepared, identity.slice(), limits);
     try std.testing.expectEqual(@as(usize, 1), sink.len);
 
@@ -761,6 +766,36 @@ test "#488: resumption_runtime.Runtime drives a genuine end-to-end resumed hands
     const request = try resumed.client_bridge.sealApplicationData("resumed request", &protected2);
     const opened_request = try resumed.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext2);
     try std.testing.expectEqualStrings("resumed request", opened_request.inner.content);
+}
+
+test "#488: stateful runtime drives a genuine end-to-end resumed handshake via two-phase issuance" {
+    try expectRuntimeResumedRecordHandshake(
+        .{ .mode = .stateful },
+        .{ .mode = .stateful },
+        .stateful,
+    );
+}
+
+test "#488: stateless runtime drives a genuine end-to-end resumed handshake via two-phase issuance" {
+    try expectRuntimeResumedRecordHandshake(
+        .{ .mode = .stateless },
+        .{ .mode = .stateless },
+        .stateless,
+    );
+}
+
+test "#488: hybrid runtime falls back to stateless issuance and reconnects successfully" {
+    try expectRuntimeResumedRecordHandshake(
+        .{ .mode = .hybrid, .server_cache_limits = .{
+            .max_entries = 4,
+            .max_origins = 4,
+            .max_total_bytes = 1,
+            .max_entry_bytes = 1,
+            .max_entries_per_origin = 4,
+        } },
+        .{ .mode = .hybrid },
+        .stateless,
+    );
 }
 
 test "PSK round trip resumes over the extension (QUIC-style) profile with asymmetric client/server transport payloads" {
@@ -1003,7 +1038,6 @@ test "an ineligible offered ticket is filtered without desyncing the wire index 
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
-
     try harness.run();
 
     try std.testing.expect(harness.client_driver.isComplete());
@@ -1055,6 +1089,8 @@ test "handshake-time client authentication forces a full handshake even when a P
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try harness.server_backend.setResumptionDecisionObserver(decisions.observer());
 
     try harness.run();
 
@@ -1065,6 +1101,8 @@ test "handshake-time client authentication forces a full handshake even when a P
     // The resolver is never even consulted: client_auth forces the full
     // fallback before PSK selection begins.
     try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.full_handshake, decisions.last.?);
     try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
 }
 
@@ -2385,6 +2423,7 @@ const PskOfferOptions = struct {
     /// Skip writing `psk_key_exchange_modes` — for the missing-extension
     /// malformed-input test.
     omit_modes: bool = false,
+    modes: []const pre_shared_key.PskKeyExchangeMode = &.{.psk_dhe_ke},
     /// When set, write this literal `pre_shared_key` extension_data
     /// verbatim instead of building it from `items` — bypasses
     /// `pre_shared_key.writeOffer`'s own `max_offered_identities` cap, for
@@ -2489,7 +2528,7 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
         if (!psk_opt.omit_modes) {
             try w.u16_(pre_shared_key.ext_psk_key_exchange_modes);
             const modes_ext_len = try w.reserve(2);
-            try pre_shared_key.writeModes(&w, &.{.psk_dhe_ke});
+            try pre_shared_key.writeModes(&w, psk_opt.modes);
             w.patch(2, modes_ext_len);
         }
         if (psk_opt.raw_ext_data) |raw| {
@@ -4806,6 +4845,33 @@ test "resolver incompatibility reports incompatible full-handshake fallback" {
     try std.testing.expect(!server.core.psk_authenticated);
     try std.testing.expectEqual(@as(usize, 1), decisions.count);
     try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.incompatible, decisions.last.?);
+}
+
+test "unsupported PSK key-exchange mode reports full-handshake fallback" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0xb4} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "psk-ke-only-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
+
+    try driveServerSelection(&server, .{ .psk = .{
+        .modes = &.{.psk_ke},
+        .items = &.{.{ .identity = "psk-ke-only-ticket", .binder_psk = &psk }},
+    } });
+
+    try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+    try std.testing.expect(!server.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.full_handshake, decisions.last.?);
 }
 
 test "resolver lease releases bad-binder candidate before fatal failure and probes no later identity" {

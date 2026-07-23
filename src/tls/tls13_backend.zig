@@ -55,6 +55,7 @@ pub const max_message_len = 8 * 1024;
 /// ticket identity plus its handshake header and small fixed/vector fields.
 pub const max_new_session_ticket_message_len = tls13_transport.max_new_session_ticket_message_len;
 const handshake_header_len = 4;
+var empty_observer_dummy: u8 = 0;
 
 const PostHandshakeInput = struct {
     allocator: ?std.mem.Allocator = null,
@@ -484,6 +485,7 @@ pub const Tls13Backend = struct {
     /// `null` means this server never offers PSK resumption.
     psk_resolver: ?pre_shared_key.ServerPskResolver = null,
     resume_compat: ResumeCompatibilityPolicy = .{},
+    resumption_decision_observer: ResumptionDecisionObserver = .{},
     offered_psk_modes_seen: bool = false,
     offered_psk_dhe_ke: bool = false,
     /// Server: a captured copy of the just-parsed ClientHello, kept only
@@ -525,6 +527,16 @@ pub const Tls13Backend = struct {
     const Slice = struct { start: usize, len: usize };
     const PendingStage = enum { server_select, server_sign, client_select, client_sign, peer_verify };
     const PskSelected = struct { index: usize, psk: [hash_len]u8 };
+    pub const ResumptionDecision = enum { accepted, miss, incompatible, full_handshake, fatal };
+
+    pub const ResumptionDecisionObserver = struct {
+        ctx: *anyopaque = @ptrCast(@constCast(&empty_observer_dummy)),
+        onDecisionFn: ?*const fn (*anyopaque, ResumptionDecision) void = null,
+
+        pub fn notify(self: ResumptionDecisionObserver, decision: ResumptionDecision) void {
+            if (self.onDecisionFn) |f| f(self.ctx, decision);
+        }
+    };
 
     /// Server (#362): the accepted `ServerRecoverableState` a successful PSK
     /// selection moves into backend ownership — not only the derived PSK
@@ -795,6 +807,11 @@ pub const Tls13Backend = struct {
     pub fn setResumeCompatibilityPolicy(self: *Tls13Backend, policy: ResumeCompatibilityPolicy) HandshakeError!void {
         if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
         self.resume_compat = policy;
+    }
+
+    pub fn setResumptionDecisionObserver(self: *Tls13Backend, observer: ResumptionDecisionObserver) HandshakeError!void {
+        if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        self.resumption_decision_observer = observer;
     }
 
     /// #362/#365: configure this connection's application-layer
@@ -2729,19 +2746,27 @@ pub const Tls13Backend = struct {
         const ext_data = capture.message[capture.ext_data_offset..][0..capture.ext_data_len];
         // Already validated once in `onClientHello`; re-parsing the same
         // captured bytes cannot fail.
-        const offered = pre_shared_key.OfferedPsks.parse(ext_data) catch return null;
+        const offered = pre_shared_key.OfferedPsks.parse(ext_data) catch {
+            self.resumption_decision_observer.notify(.fatal);
+            return null;
+        };
         const truncated_len = capture.ext_data_offset + offered.binder_vector_offset;
         const truncated_prefix = capture.message[0..truncated_len];
         const now = resolver.nowUnixMs();
 
         var it = offered.pairs();
         var attempts: usize = 0;
+        var saw_resolved = false;
+        var saw_incompatible = false;
         while (attempts < pre_shared_key.max_offered_identities) : (attempts += 1) {
             const pair = (it.next() catch return null) orelse break;
-            var resolved = resolver.resolve(pair.identity.identity) catch
+            var resolved = resolver.resolve(pair.identity.identity) catch {
+                self.resumption_decision_observer.notify(.fatal);
                 return self.failCredential(.provider_internal_failure);
+            };
             defer resolved.deinit();
             if (resolved == .miss) continue;
+            saw_resolved = true;
             var hit = &resolved.hit;
 
             const candidate_ctx: session.CandidateContext = .{
@@ -2753,7 +2778,10 @@ pub const Tls13Backend = struct {
                 .application_compat = if (self.resume_compat.application == .exact) self.candidateApplicationCompat() else null,
             };
             const decision = session.evaluateCompatibility(&hit.state.common, candidate_ctx, now);
-            if (decision.resumption != .eligible) continue;
+            if (decision.resumption != .eligible) {
+                saw_incompatible = true;
+                continue;
+            }
 
             const psk_slice = hit.state.common.resumption_psk.slice();
             if (psk_slice.len != hash_len) return error.InvalidHandshakeState;
@@ -2763,7 +2791,10 @@ pub const Tls13Backend = struct {
 
             const ok = pre_shared_key.verifyBinder(.sha256, &psk_buf, truncated_prefix, pair.binder) catch
                 return error.InvalidHandshakeState;
-            if (!ok) return error.DecryptError; // fatal: never probe a later identity
+            if (!ok) {
+                self.resumption_decision_observer.notify(.fatal);
+                return error.DecryptError; // fatal: never probe a later identity
+            }
 
             // #362: surface the ticket-age skew observation for #366 — skew
             // alone never rejects this 1-RTT resumption.
@@ -2777,7 +2808,16 @@ pub const Tls13Backend = struct {
             self.selected_server_psk.state.moveFrom(&hit.state);
             self.selected_server_psk.index = @intCast(attempts);
             self.selected_server_psk_present = true;
+            self.resumption_decision_observer.notify(.accepted);
             return .{ .index = attempts, .psk = psk_buf };
+        }
+        if (attempts > 0) {
+            self.resumption_decision_observer.notify(if (saw_incompatible)
+                .incompatible
+            else if (saw_resolved)
+                .full_handshake
+            else
+                .miss);
         }
         return null;
     }

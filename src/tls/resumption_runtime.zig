@@ -13,6 +13,7 @@ const pre_shared_key = @import("pre_shared_key.zig");
 const session = @import("session.zig");
 const session_cache = @import("session_cache.zig");
 const ticket_protection = @import("ticket_protection.zig");
+const tls13_backend = @import("tls13_backend.zig");
 
 const provider = crypto.provider;
 
@@ -20,7 +21,7 @@ pub const Mode = enum { disabled, stateful, stateless, hybrid };
 pub const TicketUsage = enum { reusable, single_use };
 pub const Transport = enum { record, quic };
 pub const TicketResult = enum { success, rejected, failed };
-pub const ResumptionOutcome = enum { accepted, full_handshake, fatal };
+pub const ResumptionOutcome = enum { accepted, full_handshake, incompatible, miss, fatal };
 
 pub const Observer = struct {
     ctx: *anyopaque = @ptrCast(@constCast(&empty_observer_dummy)),
@@ -168,6 +169,13 @@ pub const Runtime = struct {
 
     pub fn setObserver(self: *Runtime, observer: Observer) void {
         self.observer = observer;
+    }
+
+    pub fn backendDecisionObserver(self: *Runtime, transport: Transport) tls13_backend.Tls13Backend.ResumptionDecisionObserver {
+        return switch (transport) {
+            .record => .{ .ctx = self, .onDecisionFn = backendRecordDecision },
+            .quic => .{ .ctx = self, .onDecisionFn = backendQuicDecision },
+        };
     }
 
     /// Safe upper bound on the wire length of an identity this runtime can
@@ -372,6 +380,26 @@ pub const Runtime = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidConfig,
         };
+    }
+
+    fn backendRecordDecision(ctx: *anyopaque, decision: tls13_backend.Tls13Backend.ResumptionDecision) void {
+        backendDecision(ctx, .record, decision);
+    }
+
+    fn backendQuicDecision(ctx: *anyopaque, decision: tls13_backend.Tls13Backend.ResumptionDecision) void {
+        backendDecision(ctx, .quic, decision);
+    }
+
+    fn backendDecision(ctx: *anyopaque, transport: Transport, decision: tls13_backend.Tls13Backend.ResumptionDecision) void {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        self.observer.resumptionAttempt(transport);
+        self.observer.resumptionOutcome(transport, switch (decision) {
+            .accepted => .accepted,
+            .miss => .miss,
+            .incompatible => .incompatible,
+            .full_handshake => .full_handshake,
+            .fatal => .fatal,
+        });
     }
 };
 

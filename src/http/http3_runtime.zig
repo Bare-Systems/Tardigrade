@@ -124,7 +124,6 @@ const ConnEntry = struct {
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
-    resumption_outcome_recorded: bool = false,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
         self.h3.deinit();
@@ -379,7 +378,6 @@ pub const Runtime = struct {
 
         if (!was_established and entry.conn.isEstablished()) {
             self.noteHandshakeComplete();
-            self.recordResumptionOutcome(entry);
         }
         self.maybeIssueSessionTicket(entry);
 
@@ -419,6 +417,14 @@ pub const Runtime = struct {
         // native TCP, before the handshake can start — `Connection.init`
         // below arms the responder.
         if (self.resumption_runtime) |runtime| {
+            backend.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore }) catch {
+                allocator.destroy(backend);
+                return null;
+            };
+            backend.setResumptionDecisionObserver(runtime.backendDecisionObserver(.quic)) catch {
+                allocator.destroy(backend);
+                return null;
+            };
             if (runtime.serverResolver()) |resolver| {
                 backend.setServerPskResolver(resolver) catch {
                     allocator.destroy(backend);
@@ -593,15 +599,6 @@ pub const Runtime = struct {
             return;
         };
         runtime.observer.ticketIssue(.quic, runtime.config.mode, .success);
-    }
-
-    fn recordResumptionOutcome(self: *Runtime, entry: *ConnEntry) void {
-        if (entry.resumption_outcome_recorded) return;
-        const runtime = self.resumption_runtime orelse return;
-        if (!entry.backend.engine.core.psk_authenticated) return;
-        entry.resumption_outcome_recorded = true;
-        runtime.observer.resumptionAttempt(.quic);
-        runtime.observer.resumptionOutcome(.quic, .accepted);
     }
 
     fn issueSessionTicket(self: *Runtime, entry: *ConnEntry, runtime: *tls_core.resumption_runtime.Runtime) !void {

@@ -3296,6 +3296,21 @@ const CountingResolver = struct {
     }
 };
 
+const DecisionProbe = struct {
+    count: usize = 0,
+    last: ?tls_backend.Tls13Backend.ResumptionDecision = null,
+
+    fn observer(self: *DecisionProbe) tls_backend.Tls13Backend.ResumptionDecisionObserver {
+        return .{ .ctx = self, .onDecisionFn = onDecision };
+    }
+
+    fn onDecision(ctx: *anyopaque, decision: tls_backend.Tls13Backend.ResumptionDecision) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        self.last = decision;
+    }
+};
+
 const LeaseProbe = struct {
     commit_count: usize = 0,
     release_count: usize = 0,
@@ -3370,6 +3385,8 @@ test "async credential selection resumes PSK selection identically to the synchr
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     var sink = DirectSink{};
     defer sink.deinit();
@@ -4544,6 +4561,8 @@ test "resolver identity-resolution attempts are bounded to eight even when a nin
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     var ext_buf: [512]u8 = undefined;
     const raw_ext_data = try buildRawOfferedPsks(&ext_buf, 9);
@@ -4554,6 +4573,8 @@ test "resolver identity-resolution attempts are bounded to eight even when a nin
 
     try std.testing.expectEqual(@as(usize, 8), resolver_state.calls);
     try std.testing.expect(!server.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.miss, decisions.last.?);
 }
 
 test "resolver identity-resolution attempts stop at exactly eight when all eight are unusable" {
@@ -4601,6 +4622,8 @@ test "a resolver operational failure is fatal and distinct from an ordinary miss
         .nowUnixMsFn = FailingResolver.now,
         .resolveFn = FailingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     const psk = [_]u8{0x66} ** tls_backend.hash_len;
     try std.testing.expectError(error.CredentialProviderFailed, driveServerSelection(&server, .{
@@ -4610,6 +4633,8 @@ test "a resolver operational failure is fatal and distinct from an ordinary miss
     // identity, unlike an ordinary "unknown" miss.
     try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
     try std.testing.expectEqual(tls_backend.CredentialFailure.provider_internal_failure, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.fatal, decisions.last.?);
 }
 
 test "a resolver that partially populates its output before failing leaves no residue" {
@@ -4657,6 +4682,8 @@ test "server selects the first compatible identity: unknown first, valid second"
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     try driveServerSelection(&server, .{ .psk = .{ .items = &.{
         .{ .identity = "unknown-ticket", .binder_psk = &psk },
@@ -4666,6 +4693,8 @@ test "server selects the first compatible identity: unknown first, valid second"
     try std.testing.expectEqual(@as(usize, 2), resolver_state.calls);
     try std.testing.expect(server.core.psk_authenticated);
     try std.testing.expect(server.credentialFailure() == null);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.accepted, decisions.last.?);
 }
 
 test "a compatible candidate with a wrong binder is fatal and never probes a later identity" {
@@ -4682,6 +4711,8 @@ test "a compatible candidate with a wrong binder is fatal and never probes a lat
         .nowUnixMsFn = CountingResolver.now,
         .resolveFn = CountingResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     var sink = DirectSink{};
     defer sink.deinit();
@@ -4703,6 +4734,8 @@ test "a compatible candidate with a wrong binder is fatal and never probes a lat
     // failed selection: the fatal binder mismatch is caught before
     // anything is written to the wire.
     try std.testing.expectEqual(events_before_client_hello, sink.len);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.fatal, decisions.last.?);
 }
 
 test "resolver lease releases incompatible candidate and commits later selected identity" {
@@ -4729,6 +4762,8 @@ test "resolver lease releases incompatible candidate and commits later selected 
         .nowUnixMsFn = TwoIdentityLeaseResolver.now,
         .resolveFn = TwoIdentityLeaseResolver.resolve,
     });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
 
     try driveServerSelection(&server, .{ .psk = .{ .items = &.{
         .{ .identity = "incompatible-ticket", .binder_psk = &psk },
@@ -4743,6 +4778,34 @@ test "resolver lease releases incompatible candidate and commits later selected 
     try std.testing.expectEqual(@as(usize, 0), compatible_lease.release_count);
     try std.testing.expectEqual(@as(usize, 1), compatible_lease.deinit_count);
     try std.testing.expect(server.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.accepted, decisions.last.?);
+}
+
+test "resolver incompatibility reports incompatible full-handshake fallback" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0xa1} ** tls_backend.hash_len;
+    var incompatible_state = pskStoredStateWithBinding(&psk, session.AuthBinding.fromLeafCertificateDer("different-leaf"));
+    defer incompatible_state.deinit();
+    var resolver_state = CountingResolver{ .state = &incompatible_state, .identity = "incompatible-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+    var decisions = DecisionProbe{};
+    try server.setResumptionDecisionObserver(decisions.observer());
+
+    try driveServerSelection(&server, .{ .psk = .{ .items = &.{
+        .{ .identity = "incompatible-ticket", .binder_psk = &psk },
+    } } });
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!server.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.incompatible, decisions.last.?);
 }
 
 test "resolver lease releases bad-binder candidate before fatal failure and probes no later identity" {

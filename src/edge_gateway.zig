@@ -274,9 +274,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             },
             .{ .ctx = undefined, .nowUnixMsFn = systemNowUnixMs },
             native_resumption_provider.cryptoProvider(),
-        ) catch |err| blk: {
-            state.logger.warn(null, "native TLS/QUIC resumption runtime failed to initialize: {s}; continuing without native resumption", .{@errorName(err)});
-            break :blk null;
+        ) catch |err| {
+            state.logger.err(null, "native TLS/QUIC resumption initialization failed ({s}); refusing to start", .{@errorName(err)});
+            return err;
         };
         if (native_resumption_runtime) |*rt| rt.setObserver(nativeResumptionMetricsObserver(&state));
     }
@@ -818,6 +818,8 @@ fn nativeResumptionOutcomeValue(outcome: tls_core.resumption_runtime.ResumptionO
     return switch (outcome) {
         .accepted => .accepted,
         .full_handshake => .full_handshake,
+        .incompatible => .incompatible,
+        .miss => .miss,
         .fatal => .fatal,
     };
 }

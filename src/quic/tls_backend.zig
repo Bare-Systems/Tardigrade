@@ -206,15 +206,13 @@ pub const Tls13Backend = struct {
     }
 
     pub fn initClientWithOptions(entropy: Entropy, trust: Trust, options: ClientOptions) Tls13Backend {
-        var self = Tls13Backend{ .engine = shared.Tls13Backend.initClientConfigured(entropy, trust, .{
+        return .{ .engine = shared.Tls13Backend.initClientConfigured(entropy, trust, .{
             .policy = tls_core.policy.Policy.quicDefault(),
             .transport = .{ .extension = .{
                 .extension_type = ext_quic_transport_parameters,
                 .local = "",
             } },
         }, options) };
-        self.engine.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore }) catch unreachable;
-        return self;
     }
 
     pub fn initClientWithAllocator(allocator: std.mem.Allocator, entropy: Entropy, trust: Trust) HandshakeError!Tls13Backend {
@@ -229,15 +227,13 @@ pub const Tls13Backend = struct {
     }
 
     pub fn initServer(entropy: Entropy, identity: Identity) Tls13Backend {
-        var self = Tls13Backend{ .engine = shared.Tls13Backend.initServerConfigured(entropy, identity, .{
+        return .{ .engine = shared.Tls13Backend.initServerConfigured(entropy, identity, .{
             .policy = tls_core.policy.Policy.quicDefault(),
             .transport = .{ .extension = .{
                 .extension_type = ext_quic_transport_parameters,
                 .local = "",
             } },
         }) };
-        self.engine.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore }) catch unreachable;
-        return self;
     }
 
     pub fn initServerWithAllocator(allocator: std.mem.Allocator, entropy: Entropy, identity: Identity) Tls13Backend {
@@ -247,15 +243,13 @@ pub const Tls13Backend = struct {
     }
 
     pub fn initServerWithProvider(entropy: Entropy, provider: CredentialProvider) Tls13Backend {
-        var self = Tls13Backend{ .engine = shared.Tls13Backend.initServerWithProviderConfigured(entropy, provider, .{
+        return .{ .engine = shared.Tls13Backend.initServerWithProviderConfigured(entropy, provider, .{
             .policy = tls_core.policy.Policy.quicDefault(),
             .transport = .{ .extension = .{
                 .extension_type = ext_quic_transport_parameters,
                 .local = "",
             } },
         }) };
-        self.engine.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore }) catch unreachable;
-        return self;
     }
 
     pub fn initServerWithAllocatorAndProvider(allocator: std.mem.Allocator, entropy: Entropy, provider: CredentialProvider) Tls13Backend {
@@ -353,6 +347,14 @@ pub const Tls13Backend = struct {
     /// arms the responder), matching the shared engine's own precondition.
     pub fn setServerPskResolver(self: *Tls13Backend, resolver: tls_core.pre_shared_key.ServerPskResolver) HandshakeError!void {
         self.engine.setServerPskResolver(resolver) catch |err| return mapError(err);
+    }
+
+    pub fn setResumeCompatibilityPolicy(self: *Tls13Backend, policy: shared.Tls13Backend.ResumeCompatibilityPolicy) HandshakeError!void {
+        self.engine.setResumeCompatibilityPolicy(policy) catch |err| return mapError(err);
+    }
+
+    pub fn setResumptionDecisionObserver(self: *Tls13Backend, observer: shared.Tls13Backend.ResumptionDecisionObserver) HandshakeError!void {
+        self.engine.setResumptionDecisionObserver(observer) catch |err| return mapError(err);
     }
 
     fn setServerPskResolverVtable(ptr: *anyopaque, resolver: tls_core.pre_shared_key.ServerPskResolver) HandshakeError!void {

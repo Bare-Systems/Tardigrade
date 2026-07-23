@@ -158,7 +158,6 @@ pub const NativeTlsConnection = struct {
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
-    resumption_outcome_recorded: bool = false,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -198,11 +197,12 @@ pub const NativeTlsConnection = struct {
                 .transport = .record,
             },
         );
-        backend.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore }) catch unreachable;
         // #488: install the process-shared server resolver before the
         // handshake can start — `setServerPskResolver` itself refuses once
         // the backend has left `.idle`.
         if (options.resumption_runtime) |runtime| {
+            backend.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore }) catch unreachable;
+            backend.setResumptionDecisionObserver(runtime.backendDecisionObserver(.record)) catch unreachable;
             if (runtime.serverResolver()) |resolver| {
                 backend.setServerPskResolver(resolver) catch unreachable;
             }
@@ -268,19 +268,8 @@ pub const NativeTlsConnection = struct {
 
     pub fn drive(self: *NativeTlsConnection) encrypted_stream.Error!encrypted_stream.DriveResult {
         const result = try self.record.drive();
-        self.maybeRecordResumptionOutcome();
         self.maybeIssueSessionTicket();
         return result;
-    }
-
-    fn maybeRecordResumptionOutcome(self: *NativeTlsConnection) void {
-        if (self.resumption_outcome_recorded) return;
-        const runtime = self.resumption_runtime orelse return;
-        if (!self.record.applicationDataOpen()) return;
-        if (!self.backend.core.psk_authenticated) return;
-        self.resumption_outcome_recorded = true;
-        runtime.observer.resumptionAttempt(.record);
-        runtime.observer.resumptionOutcome(.record, .accepted);
     }
 
     /// #488: best-effort, exactly-once post-handshake ticket issuance. Only

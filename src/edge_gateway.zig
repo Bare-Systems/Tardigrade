@@ -2242,6 +2242,46 @@ fn traceRejectionStatus(
     return if (early_ctx.replayExposed()) .too_early else .method_not_allowed;
 }
 
+fn earlyDataPreflightDecisionForH1(
+    cfg: *const edge_config.EdgeConfig,
+    early_ctx: http.request_context.EarlyDataContext,
+    request: *const http.Request,
+) http.early_data.Decision {
+    return ghandlers.earlyDataDecisionForRequest(
+        cfg,
+        early_ctx,
+        request.method,
+        request.uri.path,
+        earlyDataHasReplayExposedBodyFraming(request),
+    );
+}
+
+const H1PreflightSideEffectProbe = struct {
+    mirror_calls: usize = 0,
+    auth_calls: usize = 0,
+    rate_limit_mutations: usize = 0,
+    upstream_calls: usize = 0,
+    handler_calls: usize = 0,
+};
+
+fn runH1PreflightSideEffectProbe(
+    cfg: *const edge_config.EdgeConfig,
+    early_ctx: http.request_context.EarlyDataContext,
+    request: *const http.Request,
+    effects: *H1PreflightSideEffectProbe,
+) http.Status {
+    switch (earlyDataPreflightDecisionForH1(cfg, early_ctx, request)) {
+        .too_early, .defer_until_handshake => return .too_early,
+        .ordinary, .execute_local, .forward_rfc8470 => {},
+    }
+    effects.mirror_calls += 1;
+    effects.auth_calls += 1;
+    effects.rate_limit_mutations += 1;
+    effects.upstream_calls += 1;
+    effects.handler_calls += 1;
+    return .ok;
+}
+
 fn mayNeedStreamingRequestBodyPreRead(cfg: *const edge_config.EdgeConfig) bool {
     if (cfg.proxy_streaming_mode.requestStreamingEnabled()) return true;
     for (cfg.location_blocks) |block| {
@@ -2652,7 +2692,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         effective_cfg.named_locations,
     );
 
-    switch (ghandlers.earlyDataDecisionForRequest(effective_cfg, ctx.early_data, request.method, request.uri.path, earlyDataHasReplayExposedBodyFraming(&request))) {
+    switch (earlyDataPreflightDecisionForH1(effective_cfg, ctx.early_data, &request)) {
         .ordinary, .execute_local, .forward_rfc8470 => {},
         .too_early, .defer_until_handshake => {
             const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
@@ -2771,6 +2811,64 @@ test "early data body framing allows zero content length only" {
     var chunked = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n", MAX_REQUEST_SIZE);
     defer chunked.request.deinit();
     try std.testing.expect(earlyDataHasReplayExposedBodyFraming(&chunked.request));
+}
+
+test "H1 early-data 425 preflight runs before side effects" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/safe",
+            .priority = 0,
+            .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+            .early_data = .replay_safe,
+        },
+    };
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{
+        .{ .method = "GET", .pattern = "^/safe$", .target_url = "http://127.0.0.1:9002/mirror" },
+    };
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+    var request = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\nEarly-Data: 1\r\n\r\n", MAX_REQUEST_SIZE);
+    defer request.request.deinit();
+    var effects = H1PreflightSideEffectProbe{};
+
+    const status = runH1PreflightSideEffectProbe(&cfg, .{ .inbound_marker = true }, &request.request, &effects);
+
+    try std.testing.expectEqual(http.Status.too_early, status);
+    try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.auth_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.rate_limit_mutations);
+    try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.handler_calls);
+}
+
+test "H1 early proxy with origin capability off never reaches upstream side effects" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/proxy",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+            .early_data = .replay_safe,
+            .proxy_early_data = .off,
+        },
+    };
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = &.{};
+    var request = try http.Request.parseHead(allocator, "GET /proxy HTTP/1.1\r\nHost: example.test\r\nEarly-Data: 1\r\n\r\n", MAX_REQUEST_SIZE);
+    defer request.request.deinit();
+    var effects = H1PreflightSideEffectProbe{};
+
+    const status = runH1PreflightSideEffectProbe(&cfg, .{ .inbound_marker = true }, &request.request, &effects);
+
+    try std.testing.expectEqual(http.Status.too_early, status);
+    try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
 }
 
 test "return_response method enforcement — non-GET/HEAD rejected on static returns" {

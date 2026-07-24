@@ -184,6 +184,7 @@ pub const Runtime = struct {
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
         };
+        http3.frame.validateLocallySupportedSettings(runtime.h3_settings) catch return error.InvalidH3Settings;
         runtime.h3_application_compat_len = (http3.early_data.encodeSettingsSnapshot(
             runtime.h3_settings,
             &runtime.h3_application_compat,
@@ -860,6 +861,35 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
     const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 });
     try testing.expectEqual(@as(u64, 1350), mid.max_udp_payload_size);
     try testing.expectEqual(quic.config.MigrationPolicy.disabled, mid.migration_policy);
+}
+
+fn expectInvalidH3SettingsAtRuntimeInit(settings: http3.frame.Settings) !void {
+    var logger = logger_mod.Logger.init(.err, "http3-invalid-settings-test");
+    try testing.expectError(error.InvalidH3Settings, Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .h3_settings = settings,
+    }));
+}
+
+test "runtime init rejects unsupported local H3 setting qpack_max_table_capacity" {
+    try expectInvalidH3SettingsAtRuntimeInit(.{ .qpack_max_table_capacity = 1 });
+}
+
+test "runtime init rejects unsupported local H3 setting qpack_blocked_streams" {
+    try expectInvalidH3SettingsAtRuntimeInit(.{ .qpack_blocked_streams = 1 });
+}
+
+test "runtime init rejects unsupported local H3 setting enable_connect_protocol" {
+    try expectInvalidH3SettingsAtRuntimeInit(.{ .enable_connect_protocol = true });
+}
+
+test "runtime init rejects unsupported local H3 setting h3_datagram" {
+    try expectInvalidH3SettingsAtRuntimeInit(.{ .h3_datagram = true });
+}
+
+test "runtime init rejects unsupported local H3 setting max_field_section_size" {
+    try expectInvalidH3SettingsAtRuntimeInit(.{ .max_field_section_size = 1024 });
 }
 
 test "admissionAllowed enforces global and per-source caps at the boundary" {

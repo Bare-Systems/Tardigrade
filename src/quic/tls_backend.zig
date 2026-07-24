@@ -277,6 +277,7 @@ pub const Tls13Backend = struct {
             .setCidBindingFn = setCidBinding,
             .peerCidBindingFn = peerCidBinding,
             .setPostHandshakeAllocatorFn = setPostHandshakeAllocator,
+            .setEarlyDataApplicationCompatFn = setEarlyDataApplicationCompatVtable,
             .emitNewSessionTicketFn = emitNewSessionTicket,
             .setServerPskResolverFn = setServerPskResolverVtable,
             .prepareNewSessionTicketFn = prepareNewSessionTicket,
@@ -362,6 +363,11 @@ pub const Tls13Backend = struct {
 
     pub fn setEarlyDataApplicationCompat(self: *Tls13Backend, blob: ?tls_core.new_session_ticket.CompatBlob) HandshakeError!void {
         self.engine.setEarlyDataApplicationCompat(blob) catch |err| return mapError(err);
+    }
+
+    fn setEarlyDataApplicationCompatVtable(ptr: *anyopaque, blob: ?tls_core.new_session_ticket.CompatBlob) HandshakeError!void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        try self.setEarlyDataApplicationCompat(blob);
     }
 
     pub fn setEarlyDataCompatibilityGate(self: *Tls13Backend, gate: EarlyDataCompatibilityGate) HandshakeError!void {

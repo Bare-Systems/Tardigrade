@@ -180,6 +180,18 @@ pub const Settings = struct {
     h3_datagram: bool = false,
 };
 
+pub const LocalSettingsValidationError = error{UnsupportedH3Setting};
+
+/// Fail closed for features this static/basic H3 path cannot honor yet.
+pub fn validateLocallySupportedSettings(settings: Settings) LocalSettingsValidationError!void {
+    if (settings.qpack_max_table_capacity != 0) return error.UnsupportedH3Setting;
+    if (settings.qpack_blocked_streams != 0) return error.UnsupportedH3Setting;
+    if (settings.enable_connect_protocol) return error.UnsupportedH3Setting;
+    if (settings.h3_datagram) return error.UnsupportedH3Setting;
+    // Current request/session path does not enforce this bound yet.
+    if (settings.max_field_section_size != null) return error.UnsupportedH3Setting;
+}
+
 pub fn encodeSettings(settings: []const Setting, out: []u8) EncodeError![]u8 {
     var pos: usize = 0;
     for (settings) |setting| {

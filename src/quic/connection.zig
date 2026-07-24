@@ -1418,6 +1418,15 @@ pub const Connection = struct {
         try self.tls.setServerPskResolver(resolver);
     }
 
+    /// #367: update the application snapshot that will be stamped into
+    /// subsequently issued early-capable NewSessionTickets.
+    pub fn setEarlyDataApplicationCompat(
+        self: *Connection,
+        blob: ?tls_core.new_session_ticket.CompatBlob,
+    ) tls_handshake.HandshakeError!void {
+        try self.tls.setEarlyDataApplicationCompat(blob);
+    }
+
     /// #488 two-phase issuance, step 1 (QUIC): derives the RMS-bound PSK and
     /// the exact `ServerRecoverableState` a stateful insertion or stateless
     /// seal will consume. See `tls_core.tls13_backend.Tls13Backend.prepareNewSessionTicket`.

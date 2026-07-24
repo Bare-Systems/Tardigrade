@@ -1299,6 +1299,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     auth_user_id: ?[]const u8,
     auth_device_id: ?[]const u8,
     auth_scopes: ?[]const u8,
+    forward_early_data: bool,
     attempt_timeout_ms: u32,
     connect_timeout_ms: u32,
     /// If > 0, caps the time from finished request-send to first response byte.
@@ -1315,7 +1316,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     if (cancel_token) |tok| {
         if (tok.isStopped()) return error.RequestCancelled;
     }
-    const proxy_extra_header_slack = 10;
+    const proxy_extra_header_slack = 11;
     const max_buffered_response_bytes = maxBufferedUpstreamResponseBytes(cfg);
     const uri = try std.Uri.parse(url);
 
@@ -1328,6 +1329,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     defer extra_headers.deinit();
     try extra_headers.ensureUnusedCapacity(request_headers.count() + proxy_extra_header_slack);
     try gph.appendProxyRequestHeaders(&extra_headers, request_headers);
+    try gph.appendCanonicalEarlyDataHeader(&extra_headers, forward_early_data);
     try gph.appendRequestIdHeaders(&extra_headers, correlation_id);
     try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for.value });
     try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });

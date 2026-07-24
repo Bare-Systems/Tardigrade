@@ -2228,6 +2228,174 @@ fn streamingUploadEligibilityBeforeBodyRead(
     };
 }
 
+fn earlyDataHasReplayExposedBodyFraming(request: *const http.Request) bool {
+    if (request.hasTransferEncoding()) return true;
+    const content_length = request.contentLength() orelse return false;
+    return content_length != 0;
+}
+
+fn traceRejectionStatus(
+    method: http.Method,
+    early_ctx: http.request_context.EarlyDataContext,
+) ?http.Status {
+    if (method != .TRACE) return null;
+    return if (early_ctx.replayExposed()) .too_early else .method_not_allowed;
+}
+
+fn earlyDataPreflightDecisionForH1(
+    cfg: *const edge_config.EdgeConfig,
+    early_ctx: http.request_context.EarlyDataContext,
+    request: *const http.Request,
+) http.early_data.Decision {
+    return ghandlers.earlyDataDecisionForRequest(
+        cfg,
+        early_ctx,
+        request.method,
+        request.uri.path,
+        earlyDataHasReplayExposedBodyFraming(request),
+    );
+}
+
+const H1PreflightSideEffectProbe = struct {
+    mirror_calls: usize = 0,
+    auth_calls: usize = 0,
+    rate_limit_mutations: usize = 0,
+    upstream_calls: usize = 0,
+    handler_calls: usize = 0,
+};
+
+const H1PostPreflightOutcome = union(enum) {
+    terminal_status: u16,
+    logged_terminal,
+    route_status: u16,
+};
+
+const H1ProductionPostPreflightHooks = struct {
+    fn rejectEarly(
+        self: H1ProductionPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !u16 {
+        _ = self;
+        const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, ctx, correlation_id, keep_alive);
+        ghandlers.logAccessForRequest(state, ctx, request, status);
+        return status;
+    }
+
+    fn mirror(
+        self: H1ProductionPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        client_ip: []const u8,
+    ) !void {
+        _ = self;
+        if (cfg.mirror_rules.len > 0) {
+            ghandlers.spawnMirrorRequests(
+                allocator,
+                cfg.mirror_rules,
+                request.method.toString(),
+                request.uri.path,
+                request.body orelse "",
+                correlation_id,
+                client_ip,
+                request.headers.get("content-type"),
+            );
+        }
+    }
+
+    fn auth(
+        self: H1ProductionPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        headers: *const http.Headers,
+    ) !void {
+        _ = self;
+        try ghandlers.primeRequestAuthContext(allocator, cfg, state, ctx, headers);
+    }
+
+    fn middleware(
+        self: H1ProductionPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !bool {
+        _ = self;
+        return try ghandlers.runMiddlewarePipeline(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive);
+    }
+
+    fn route(
+        self: H1ProductionPostPreflightHooks,
+        conn: anytype,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *http.Request,
+        correlation_id: []const u8,
+        keep_alive: *bool,
+        client_ip: []const u8,
+        streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
+    ) !u16 {
+        _ = self;
+        return try ghandlers.routeRequest(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body);
+    }
+};
+
+fn executeH1PostPreflightOrchestration(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *http.Request,
+    correlation_id: []const u8,
+    keep_alive: *bool,
+    client_ip: []const u8,
+    streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
+    lifecycle: *http.request_lifecycle.RequestLifecycle,
+    hooks: anytype,
+) !H1PostPreflightOutcome {
+    switch (earlyDataPreflightDecisionForH1(cfg, ctx.early_data, request)) {
+        .ordinary, .execute_local, .forward_rfc8470 => {},
+        .too_early, .defer_until_handshake => {
+            const status = try hooks.rejectEarly(allocator, writer, state, ctx, request, correlation_id, keep_alive.*);
+            return .{ .terminal_status = status };
+        },
+    }
+
+    try hooks.mirror(allocator, cfg, request, correlation_id, client_ip);
+    try hooks.auth(allocator, cfg, state, ctx, &request.headers);
+
+    if (try hooks.middleware(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*)) {
+        return .logged_terminal;
+    }
+
+    if (lifecycle.checkDeadline(.routing)) {
+        try gp.sendApiError(allocator, writer, .request_timeout, "request_timeout", "Request deadline exceeded", correlation_id, keep_alive.*, state);
+        state.metricsRecord(408);
+        state.metricsRecordErrorCode("request_timeout");
+        ghandlers.logAccessForRequest(state, ctx, request, 408);
+        return .logged_terminal;
+    }
+
+    return .{ .route_status = try hooks.route(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body) };
+}
+
 fn mayNeedStreamingRequestBodyPreRead(cfg: *const edge_config.EdgeConfig) bool {
     if (cfg.proxy_streaming_mode.requestStreamingEnabled()) return true;
     for (cfg.location_blocks) |block| {
@@ -2441,31 +2609,46 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         return;
     }
 
-    // --- RFC 7231 §4.3.8 / ASVS-14.5.1: Reject TRACE globally ---
-    // TRACE echoes the request back to the client, enabling Cross-Site
-    // Tracing (XST) attacks that can expose cookies and auth headers even
-    // when HttpOnly is set. Tardigrade has no use for TRACE on any route —
-    // gateway-to-upstream tracing is handled via W3C traceparent headers.
-    // Reject before routing so no location block can accidentally serve it.
-    if (request.method == .TRACE) {
-        try gp.sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive, state);
-        var ctx_trace = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
-        ghandlers.logAccessForRequest(state, &ctx_trace, &request, 405);
-        return;
-    }
-
     // --- Request Context ---
     const effective_connection_ip = if (session.proxy_client_ip_len > 0)
         session.proxy_client_ip_buf[0..session.proxy_client_ip_len]
     else
         connection_ip;
     const client_ip = http.request_context.extractClientIp(&request, effective_connection_ip);
+    var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
+    // #367 slice 2 keeps this as request-scoped handoff state. The production
+    // #366 H1 record provenance carrier is not present on this branch yet, so
+    // H1 transport provenance stays false rather than using connection state.
+    ctx.early_data.transport_early = false;
+    ctx.early_data.inbound_marker = request.headers.hasEarlyDataMarker();
+
+    // --- RFC 7231 §4.3.8 / ASVS-14.5.1: Reject TRACE globally ---
+    // TRACE echoes the request back to the client, enabling Cross-Site
+    // Tracing (XST) attacks that can expose cookies and auth headers even
+    // when HttpOnly is set. Tardigrade has no use for TRACE on any route —
+    // gateway-to-upstream tracing is handled via W3C traceparent headers.
+    // Reject before routing so no location block can accidentally serve it.
+    if (traceRejectionStatus(request.method, ctx.early_data)) |trace_status| {
+        if (trace_status == .too_early) {
+            const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+            ghandlers.logAccessForRequest(state, &ctx, &request, status);
+            return;
+        }
+        try gp.sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive, state);
+        ghandlers.logAccessForRequest(state, &ctx, &request, 405);
+        return;
+    }
 
     // --- ACME HTTP-01 challenge response (/.well-known/acme-challenge/<token>) ---
     const acme_prefix = "/.well-known/acme-challenge/";
     if (state.acme_challenge_store != null and
         std.mem.startsWith(u8, request.uri.path, acme_prefix))
     {
+        if (ctx.early_data.replayExposed()) {
+            const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+            ghandlers.logAccessForRequest(state, &ctx, &request, status);
+            return;
+        }
         const token = request.uri.path[acme_prefix.len..];
         if (state.acme_challenge_store.?.getCopy(allocator, token)) |key_auth| {
             defer allocator.free(key_auth);
@@ -2479,8 +2662,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             // ACME HTTP-01 challenges are ordinary requests; keep them visible in
             // access logs and status metrics like every other terminal (#201).
             state.metricsRecord(200);
-            var ctx_acme = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-            ghandlers.logAccessForRequest(state, &ctx_acme, &request, 200);
+            ghandlers.logAccessForRequest(state, &ctx, &request, 200);
             return;
         }
     }
@@ -2488,11 +2670,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     var effective_cfg_storage = cfg.*;
     const effective_cfg = ga.resolveRequestConfig(cfg, request.headers.get("host"), &effective_cfg_storage) orelse {
         try gp.sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
-        var ctx_404 = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-        ghandlers.logAccessForRequest(state, &ctx_404, &request, 404);
+        ghandlers.logAccessForRequest(state, &ctx, &request, 404);
         return;
     };
-    var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
     if (!ga.hostMatchesServerNames(effective_cfg, &request)) {
         try gp.sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
         ghandlers.logAccessForRequest(state, &ctx, &request, 404);
@@ -2547,6 +2727,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 request.uri.path = rewritten_path;
             },
             .redirect => |r| {
+                if (ctx.early_data.replayExposed()) {
+                    const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+                    ghandlers.logAccessForRequest(state, &ctx, &request, status);
+                    return;
+                }
                 var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
                 defer response.deinit();
                 _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
@@ -2557,6 +2742,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 return;
             },
             .returned => |r| {
+                if (ctx.early_data.replayExposed()) {
+                    const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+                    ghandlers.logAccessForRequest(state, &ctx, &request, status);
+                    return;
+                }
                 const result = try ghandlers.writeReturnResponsePlan(allocator, writer, state, &ctx, ghandlers.planDirectResponse(r.status, r.body), correlation_id, keep_alive);
                 state.metricsRecord(result.status);
                 if (result.error_code) |code| state.metricsRecordErrorCode(code);
@@ -2580,6 +2770,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             request.uri.path = rewritten_path;
         },
         .redirect => |r| {
+            if (ctx.early_data.replayExposed()) {
+                const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+                ghandlers.logAccessForRequest(state, &ctx, &request, status);
+                return;
+            }
             var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
             defer response.deinit();
             _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
@@ -2590,6 +2785,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             return;
         },
         .returned => |r| {
+            if (ctx.early_data.replayExposed()) {
+                const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
+                ghandlers.logAccessForRequest(state, &ctx, &request, status);
+                return;
+            }
             const result = try ghandlers.writeReturnResponsePlan(allocator, writer, state, &ctx, ghandlers.planDirectResponse(r.status, r.body), correlation_id, keep_alive);
             state.metricsRecord(result.status);
             if (result.error_code) |code| state.metricsRecordErrorCode(code);
@@ -2606,39 +2806,28 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         effective_cfg.named_locations,
     );
 
-    // --- Mirror requests (best-effort async) ---
-    if (effective_cfg.mirror_rules.len > 0) {
-        ghandlers.spawnMirrorRequests(
-            allocator,
-            effective_cfg.mirror_rules,
-            request.method.toString(),
-            request.uri.path,
-            request.body orelse "",
-            correlation_id,
-            client_ip,
-            request.headers.get("content-type"),
-        );
+    const outcome = try executeH1PostPreflightOrchestration(
+        conn,
+        allocator,
+        writer,
+        effective_cfg,
+        state,
+        &ctx,
+        &request,
+        correlation_id,
+        &keep_alive,
+        client_ip,
+        streaming_request_body,
+        &lifecycle,
+        H1ProductionPostPreflightHooks{},
+    );
+    switch (outcome) {
+        .terminal_status, .logged_terminal => return,
+        .route_status => |route_status| {
+            ghandlers.logAccessForRequest(state, &ctx, &request, route_status);
+            return;
+        },
     }
-
-    try ghandlers.primeRequestAuthContext(allocator, effective_cfg, state, &ctx, &request.headers);
-
-    if (try ghandlers.runMiddlewarePipeline(allocator, writer, effective_cfg, state, &ctx, &request, correlation_id, keep_alive)) {
-        return;
-    }
-
-    // Deadline check: if the overall request deadline elapsed during auth/middleware,
-    // reject now rather than dispatching to the (potentially slow) upstream handler.
-    if (lifecycle.checkDeadline(.routing)) {
-        try gp.sendApiError(allocator, writer, .request_timeout, "request_timeout", "Request deadline exceeded", correlation_id, keep_alive, state);
-        state.metricsRecord(408);
-        state.metricsRecordErrorCode("request_timeout");
-        ghandlers.logAccessForRequest(state, &ctx, &request, 408);
-        return;
-    }
-
-    const route_status = try ghandlers.routeRequest(conn, allocator, effective_cfg, state, &ctx, &request, correlation_id, &keep_alive, client_ip, streaming_request_body);
-    ghandlers.logAccessForRequest(state, &ctx, &request, route_status);
-    return;
 }
 
 test "HTTP/1.1 missing Host header rejected — version and header presence check" {
@@ -2685,6 +2874,243 @@ test "TRACE method rejected globally — XST / ASVS-14.5.1 condition check" {
     try std.testing.expect(http_method.Method.POST != .TRACE);
     try std.testing.expect(http_method.Method.DELETE != .TRACE);
     try std.testing.expect(http_method.Method.OPTIONS != .TRACE);
+}
+
+test "TRACE early data is rejected with 425 before ordinary TRACE 405" {
+    const ordinary = http.request_context.EarlyDataContext{};
+    const marked = http.request_context.EarlyDataContext{ .inbound_marker = true };
+    const transport = http.request_context.EarlyDataContext{ .transport_early = true };
+
+    try std.testing.expectEqual(http.Status.method_not_allowed, traceRejectionStatus(.TRACE, ordinary).?);
+    try std.testing.expectEqual(http.Status.too_early, traceRejectionStatus(.TRACE, marked).?);
+    try std.testing.expectEqual(http.Status.too_early, traceRejectionStatus(.TRACE, transport).?);
+    try std.testing.expect(traceRejectionStatus(.GET, marked) == null);
+}
+
+test "early data body framing allows zero content length only" {
+    const allocator = std.testing.allocator;
+
+    var no_body = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\n\r\n", MAX_REQUEST_SIZE);
+    defer no_body.request.deinit();
+    try std.testing.expect(!earlyDataHasReplayExposedBodyFraming(&no_body.request));
+
+    var zero_length = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\n\r\n", MAX_REQUEST_SIZE);
+    defer zero_length.request.deinit();
+    try std.testing.expect(!earlyDataHasReplayExposedBodyFraming(&zero_length.request));
+
+    var nonzero_length = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\nContent-Length: 1\r\n\r\n", MAX_REQUEST_SIZE);
+    defer nonzero_length.request.deinit();
+    try std.testing.expect(earlyDataHasReplayExposedBodyFraming(&nonzero_length.request));
+
+    var chunked = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n", MAX_REQUEST_SIZE);
+    defer chunked.request.deinit();
+    try std.testing.expect(earlyDataHasReplayExposedBodyFraming(&chunked.request));
+}
+
+const H1CountingPostPreflightHooks = struct {
+    effects: *H1PreflightSideEffectProbe,
+
+    fn rejectEarly(
+        self: H1CountingPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !u16 {
+        _ = self;
+        _ = allocator;
+        _ = writer;
+        _ = state;
+        _ = ctx;
+        _ = request;
+        _ = correlation_id;
+        _ = keep_alive;
+        return @intFromEnum(http.Status.too_early);
+    }
+
+    fn mirror(
+        self: H1CountingPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        client_ip: []const u8,
+    ) !void {
+        _ = allocator;
+        _ = cfg;
+        _ = request;
+        _ = correlation_id;
+        _ = client_ip;
+        self.effects.mirror_calls += 1;
+    }
+
+    fn auth(
+        self: H1CountingPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        headers: *const http.Headers,
+    ) !void {
+        _ = allocator;
+        _ = cfg;
+        _ = state;
+        _ = ctx;
+        _ = headers;
+        self.effects.auth_calls += 1;
+    }
+
+    fn middleware(
+        self: H1CountingPostPreflightHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !bool {
+        _ = allocator;
+        _ = writer;
+        _ = cfg;
+        _ = state;
+        _ = ctx;
+        _ = request;
+        _ = correlation_id;
+        _ = keep_alive;
+        self.effects.rate_limit_mutations += 1;
+        return false;
+    }
+
+    fn route(
+        self: H1CountingPostPreflightHooks,
+        conn: anytype,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *http.Request,
+        correlation_id: []const u8,
+        keep_alive: *bool,
+        client_ip: []const u8,
+        streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
+    ) !u16 {
+        _ = conn;
+        _ = allocator;
+        _ = cfg;
+        _ = state;
+        _ = ctx;
+        _ = request;
+        _ = correlation_id;
+        _ = keep_alive;
+        _ = client_ip;
+        _ = streaming_request_body;
+        self.effects.upstream_calls += 1;
+        self.effects.handler_calls += 1;
+        return @intFromEnum(http.Status.ok);
+    }
+};
+
+test "H1 early-data 425 preflight runs before side effects" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/safe",
+            .priority = 0,
+            .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+            .early_data = .replay_safe,
+        },
+    };
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{
+        .{ .method = "GET", .pattern = "^/safe$", .target_url = "http://127.0.0.1:9002/mirror" },
+    };
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+    var request = try http.Request.parseHead(allocator, "GET /safe HTTP/1.1\r\nHost: example.test\r\nEarly-Data: 1\r\n\r\n", MAX_REQUEST_SIZE);
+    defer request.request.deinit();
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var ctx = http.request_context.RequestContext.init(allocator, "req-early", "127.0.0.1");
+    ctx.early_data.inbound_marker = true;
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-early", 0);
+    var keep_alive = false;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const outcome = try executeH1PostPreflightOrchestration(
+        {},
+        allocator,
+        &output.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-early",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1CountingPostPreflightHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, @intFromEnum(http.Status.too_early)), outcome.terminal_status);
+    try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.auth_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.rate_limit_mutations);
+    try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.handler_calls);
+}
+
+test "H1 early proxy with origin capability off never reaches upstream side effects" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/proxy",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+            .early_data = .replay_safe,
+            .proxy_early_data = .off,
+        },
+    };
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = &.{};
+    var request = try http.Request.parseHead(allocator, "GET /proxy HTTP/1.1\r\nHost: example.test\r\nEarly-Data: 1\r\n\r\n", MAX_REQUEST_SIZE);
+    defer request.request.deinit();
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var ctx = http.request_context.RequestContext.init(allocator, "req-off", "127.0.0.1");
+    ctx.early_data.inbound_marker = true;
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-off", 0);
+    var keep_alive = false;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const outcome = try executeH1PostPreflightOrchestration(
+        {},
+        allocator,
+        &output.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-off",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1CountingPostPreflightHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, @intFromEnum(http.Status.too_early)), outcome.terminal_status);
+    try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
 }
 
 test "return_response method enforcement — non-GET/HEAD rejected on static returns" {

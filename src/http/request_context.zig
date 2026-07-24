@@ -7,6 +7,7 @@ const RequestLifecycle = @import("request_lifecycle.zig").RequestLifecycle;
 pub const EarlyDataContext = struct {
     transport_early: bool = false,
     inbound_marker: bool = false,
+    downstream_handshake: ?DownstreamHandshakeBarrier = null,
 
     pub fn replayExposed(self: EarlyDataContext) bool {
         return self.transport_early or self.inbound_marker;
@@ -14,6 +15,30 @@ pub const EarlyDataContext = struct {
 
     pub fn mayRetryUpstream425(self: EarlyDataContext) bool {
         return self.transport_early and !self.inbound_marker;
+    }
+
+    pub fn downstreamHandshakeComplete(self: EarlyDataContext) bool {
+        const barrier = self.downstream_handshake orelse return true;
+        return barrier.isComplete();
+    }
+
+    pub fn waitOrDriveDownstreamHandshake(self: EarlyDataContext) !void {
+        const barrier = self.downstream_handshake orelse return;
+        try barrier.waitOrDrive();
+    }
+};
+
+pub const DownstreamHandshakeBarrier = struct {
+    ctx: *anyopaque,
+    is_complete_fn: *const fn (*anyopaque) bool,
+    wait_or_drive_fn: *const fn (*anyopaque) anyerror!void,
+
+    pub fn isComplete(self: DownstreamHandshakeBarrier) bool {
+        return self.is_complete_fn(self.ctx);
+    }
+
+    pub fn waitOrDrive(self: DownstreamHandshakeBarrier) !void {
+        try self.wait_or_drive_fn(self.ctx);
     }
 };
 
@@ -213,6 +238,41 @@ test "EarlyDataContext retries upstream 425 only for current-hop early data" {
     try std.testing.expect((@as(EarlyDataContext, .{ .transport_early = true })).mayRetryUpstream425());
     try std.testing.expect(!(@as(EarlyDataContext, .{ .inbound_marker = true })).mayRetryUpstream425());
     try std.testing.expect(!(@as(EarlyDataContext, .{ .transport_early = true, .inbound_marker = true })).mayRetryUpstream425());
+}
+
+const TestHandshakeBarrier = struct {
+    complete: bool = false,
+    waits: usize = 0,
+
+    fn isComplete(ptr: *anyopaque) bool {
+        const self: *TestHandshakeBarrier = @ptrCast(@alignCast(ptr));
+        return self.complete;
+    }
+
+    fn waitOrDrive(ptr: *anyopaque) anyerror!void {
+        const self: *TestHandshakeBarrier = @ptrCast(@alignCast(ptr));
+        self.waits += 1;
+        self.complete = true;
+    }
+
+    fn barrier(self: *TestHandshakeBarrier) DownstreamHandshakeBarrier {
+        return .{
+            .ctx = self,
+            .is_complete_fn = isComplete,
+            .wait_or_drive_fn = waitOrDrive,
+        };
+    }
+};
+
+test "EarlyDataContext handshake barrier defaults complete and can be driven" {
+    try std.testing.expect((@as(EarlyDataContext, .{})).downstreamHandshakeComplete());
+
+    var test_barrier = TestHandshakeBarrier{};
+    var ctx = EarlyDataContext{ .downstream_handshake = test_barrier.barrier() };
+    try std.testing.expect(!ctx.downstreamHandshakeComplete());
+    try ctx.waitOrDriveDownstreamHandshake();
+    try std.testing.expect(ctx.downstreamHandshakeComplete());
+    try std.testing.expectEqual(@as(usize, 1), test_barrier.waits);
 }
 
 test "extractClientIp prefers X-Forwarded-For" {

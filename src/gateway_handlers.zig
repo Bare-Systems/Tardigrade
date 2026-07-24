@@ -2060,6 +2060,10 @@ pub fn logAccess(state: *GatewayState, ctx: *const http.request_context.RequestC
         .response_bytes = ctx.response_bytes,
         .error_category = classifyErrorCategory(status),
         .cancel_reason = cancel_reason,
+        .early_data_source = @tagName(ctx.early_data.source()),
+        .early_data_action = @tagName(ctx.early_data_action),
+        .early_data_retry_result = @tagName(ctx.early_data_retry_result),
+        .early_data_replay_exposed = ctx.early_data.replayExposed(),
     };
     entry.log();
 }

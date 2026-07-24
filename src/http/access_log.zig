@@ -19,6 +19,14 @@ pub const AccessLogEntry = struct {
     /// Cancellation or timeout reason when the request was terminated early.
     /// Empty string when the request completed normally.
     cancel_reason: []const u8 = "",
+    /// Bounded replay-exposure source label.
+    early_data_source: []const u8 = "none",
+    /// Bounded early-data policy action label.
+    early_data_action: []const u8 = "ordinary",
+    /// Bounded upstream 425 retry result label.
+    early_data_retry_result: []const u8 = "none",
+    /// True when this request is replay-exposed by transport or prior-hop marker.
+    early_data_replay_exposed: bool = false,
 
     pub fn log(self: AccessLogEntry) void {
         emit(self);
@@ -188,7 +196,7 @@ fn appendEntry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cfg: Confi
     switch (cfg.format) {
         .json => try out.print(
             allocator,
-            "{{\"type\":\"access\",\"ts\":\"{s}\",\"request_id\":\"{s}\",\"correlation_id\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"status\":{d},\"latency_ms\":{d},\"client_ip\":\"{s}\",\"upstream_addr\":\"{s}\",\"upstream_status\":{s},\"identity\":\"{s}\",\"user_agent\":\"{s}\",\"bytes_sent\":{d},\"response_bytes\":{d},\"error_category\":\"{s}\",\"cancel_reason\":\"{s}\"}}\n",
+            "{{\"type\":\"access\",\"ts\":\"{s}\",\"request_id\":\"{s}\",\"correlation_id\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"status\":{d},\"latency_ms\":{d},\"client_ip\":\"{s}\",\"upstream_addr\":\"{s}\",\"upstream_status\":{s},\"identity\":\"{s}\",\"user_agent\":\"{s}\",\"bytes_sent\":{d},\"response_bytes\":{d},\"error_category\":\"{s}\",\"cancel_reason\":\"{s}\",\"early_data_source\":\"{s}\",\"early_data_action\":\"{s}\",\"early_data_retry_result\":\"{s}\",\"early_data_replay_exposed\":{s}}}\n",
             .{
                 ts,
                 entry.correlation_id,
@@ -206,19 +214,23 @@ fn appendEntry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cfg: Confi
                 entry.response_bytes,
                 entry.error_category,
                 entry.cancel_reason,
+                entry.early_data_source,
+                entry.early_data_action,
+                entry.early_data_retry_result,
+                if (entry.early_data_replay_exposed) "true" else "false",
             },
         ),
         .plain => if (entry.cancel_reason.len > 0)
             try out.print(
                 allocator,
-                "{s} {s} {d} {d}ms ip={s} req={s} upstream={s} upstream_status={?d} bytes={d} ua=\"{s}\" err={s} cancel={s}\n",
-                .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.upstream_addr, entry.upstream_status, entry.response_bytes, entry.user_agent, entry.error_category, entry.cancel_reason },
+                "{s} {s} {d} {d}ms ip={s} req={s} upstream={s} upstream_status={?d} bytes={d} ua=\"{s}\" err={s} cancel={s} early_source={s} early_action={s} early_retry={s} replay_exposed={}\n",
+                .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.upstream_addr, entry.upstream_status, entry.response_bytes, entry.user_agent, entry.error_category, entry.cancel_reason, entry.early_data_source, entry.early_data_action, entry.early_data_retry_result, entry.early_data_replay_exposed },
             )
         else
             try out.print(
                 allocator,
-                "{s} {s} {d} {d}ms ip={s} req={s} upstream={s} upstream_status={?d} bytes={d} ua=\"{s}\" err={s}\n",
-                .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.upstream_addr, entry.upstream_status, entry.response_bytes, entry.user_agent, entry.error_category },
+                "{s} {s} {d} {d}ms ip={s} req={s} upstream={s} upstream_status={?d} bytes={d} ua=\"{s}\" err={s} early_source={s} early_action={s} early_retry={s} replay_exposed={}\n",
+                .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.upstream_addr, entry.upstream_status, entry.response_bytes, entry.user_agent, entry.error_category, entry.early_data_source, entry.early_data_action, entry.early_data_retry_result, entry.early_data_replay_exposed },
             ),
         .custom => try appendTemplate(allocator, out, if (cfg.custom_template.len > 0) cfg.custom_template else "{method} {path} {status}", ts, entry),
     }
@@ -269,6 +281,14 @@ fn appendTemplate(allocator: std.mem.Allocator, out: *std.ArrayList(u8), templat
                     entry.error_category
                 else if (std.mem.eql(u8, key, "cancel_reason"))
                     entry.cancel_reason
+                else if (std.mem.eql(u8, key, "early_data_source"))
+                    entry.early_data_source
+                else if (std.mem.eql(u8, key, "early_data_action"))
+                    entry.early_data_action
+                else if (std.mem.eql(u8, key, "early_data_retry_result"))
+                    entry.early_data_retry_result
+                else if (std.mem.eql(u8, key, "early_data_replay_exposed"))
+                    if (entry.early_data_replay_exposed) "true" else "false"
                 else
                     "";
                 try out.appendSlice(allocator, replacement);
@@ -417,6 +437,10 @@ test "formatEntry json contains required fields" {
     try std.testing.expect(std.mem.find(u8, line, "\"identity\":\"user-1\"") != null);
     try std.testing.expect(std.mem.find(u8, line, "\"upstream_status\":200") != null);
     try std.testing.expect(std.mem.find(u8, line, "\"cancel_reason\":\"\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"early_data_source\":\"none\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"early_data_action\":\"ordinary\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"early_data_retry_result\":\"none\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"early_data_replay_exposed\":false") != null);
 }
 
 test "formatEntry json encodes null upstream_status as literal null" {

@@ -11,7 +11,18 @@ Runtime logs and access logs are JSON by default.
   `request_id` and `correlation_id`
 - access logs: `type`, `ts`, `request_id`, `correlation_id`, `method`, `path`,
   `status`, `latency_ms`, `client_ip`, `upstream_addr`, `upstream_status`,
-  `identity`, `bytes_sent`, `response_bytes`, and `error_category`
+  `identity`, `bytes_sent`, `response_bytes`, `error_category`,
+  `early_data_source`, `early_data_action`, `early_data_retry_result`, and
+  `early_data_replay_exposed`
+
+Early-data access-log fields are bounded enums/booleans only:
+
+- `early_data_source`: `none`, `transport`, `header`, `both`
+- `early_data_action`: `ordinary`, `accepted`, `forwarded`, `too_early`,
+  `deferred`, `retried`
+- `early_data_retry_result`: `none`, `success`, `too_early`, `failed`
+- `early_data_replay_exposed`: `true` when transport and/or header provenance
+  indicates replay exposure for this request
 
 Access logs are written through `src/http/access_log.zig`. Runtime component
 logs are written through `src/http/logger.zig`.
@@ -77,6 +88,15 @@ logs are written through `src/http/logger.zig`.
   eligibility. Upload and response eligibility are evaluated separately, so one
   request can contribute more than one fallback event.
 - reverse-proxy upstream TTFB summary: `tardigrade_proxy_ttfb_ms`
+- HTTP-level early-data counters (fixed labels only):
+  `tardigrade_http_early_data_requests_total{protocol,source}`,
+  `tardigrade_http_early_data_decisions_total{protocol,decision}`,
+  `tardigrade_http_early_data_upstream_425_total{action}`,
+  `tardigrade_http_early_data_retry_total{result}`,
+  and `tardigrade_http3_early_data_compat_total{decision}`
+
+Early-data metric label sets are intentionally bounded and never include
+high-cardinality request attributes (URL, request id, stream id, host, IP).
 
 The latency histogram is intentionally global rather than route-labeled to keep
 hot-path overhead predictable.

@@ -26,6 +26,40 @@ pub const EarlyDataContext = struct {
         const barrier = self.downstream_handshake orelse return;
         try barrier.waitOrDrive();
     }
+
+    pub fn source(self: EarlyDataContext) EarlyDataSource {
+        return if (self.transport_early and self.inbound_marker)
+            .both
+        else if (self.transport_early)
+            .transport
+        else if (self.inbound_marker)
+            .header
+        else
+            .none;
+    }
+};
+
+pub const EarlyDataSource = enum {
+    none,
+    transport,
+    header,
+    both,
+};
+
+pub const EarlyDataAction = enum {
+    ordinary,
+    accepted,
+    too_early,
+    forwarded,
+    retried,
+    deferred,
+};
+
+pub const EarlyDataRetryResult = enum {
+    none,
+    success,
+    too_early,
+    failure,
 };
 
 pub const DownstreamHandshakeBarrier = struct {
@@ -73,6 +107,10 @@ pub const RequestContext = struct {
     idempotency_key: ?[]const u8,
     /// HTTP early-data provenance for this request hop and prior hops.
     early_data: EarlyDataContext,
+    /// Bounded early-data action label for observability.
+    early_data_action: EarlyDataAction,
+    /// Bounded retry result label for upstream 425 retry observability.
+    early_data_retry_result: EarlyDataRetryResult,
     /// Upstream address selected for proxied requests.
     upstream_addr: ?[]const u8,
     /// Final upstream status observed for proxied requests.
@@ -98,6 +136,8 @@ pub const RequestContext = struct {
             .api_version = null,
             .idempotency_key = null,
             .early_data = .{},
+            .early_data_action = .ordinary,
+            .early_data_retry_result = .none,
             .upstream_addr = null,
             .upstream_status = null,
             .response_bytes = 0,

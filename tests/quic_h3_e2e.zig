@@ -610,11 +610,9 @@ test "#367 slice3: client ticket snapshots move from defaults to decoded peer SE
 
     try sim.runUntil(Sim.bothEstablished, 30_000_000);
 
-    var client_h3 = H3.init(allocator, .client);
-    defer client_h3.deinit();
-    try client_h3.start(sim.client);
-
     // Ticket #1 arrives before client has observed peer SETTINGS.
+    // This is also before H3.start(), so defaults must have been installed
+    // at connection initialization time.
     try issueEarlyCapableTicket(sim, 0x01, 0x41, 1_000);
     const first_ticket_deadline = sim.now_us + 20_000_000;
     while (capture.count < 1 and sim.now_us < first_ticket_deadline) {
@@ -629,6 +627,10 @@ test "#367 slice3: client ticket snapshots move from defaults to decoded peer SE
         .bytes = ticket1_compat.slice(),
     });
     try testing.expectEqual(http3.frame.Settings{}, ticket1_settings);
+
+    var client_h3 = H3.init(allocator, .client);
+    defer client_h3.deinit();
+    try client_h3.start(sim.client);
 
     // Now the client observes the peer SETTINGS frame with non-default values.
     const control_id = try sim.server.openStream(.uni);

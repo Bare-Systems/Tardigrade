@@ -127,7 +127,7 @@ pub const TlsBackend = struct {
     }
 
     pub fn setEarlyDataApplicationCompat(self: TlsBackend, blob: ?tls_core.new_session_ticket.CompatBlob) HandshakeError!void {
-        const set = self.setEarlyDataApplicationCompatFn orelse return error.InvalidHandshakeState;
+        const set = self.setEarlyDataApplicationCompatFn orelse return;
         try set(self.transport.ptr, blob);
     }
 

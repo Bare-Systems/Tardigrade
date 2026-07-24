@@ -1055,6 +1055,18 @@ pub const Tls13Backend = struct {
         return self.early_data_max_bytes;
     }
 
+    /// Client (#367): the remembered application-level compatibility state
+    /// carried by the same first surviving ticket that produced
+    /// `earlyDataAttempted()` / `earlyDataMaxBytes()`. HTTP/3 uses this
+    /// before EncryptedExtensions to decide which remembered SETTINGS govern
+    /// client-side 0-RTT; `null` means RFC defaults.
+    pub fn clientEarlyDataApplicationCompat(self: *const Tls13Backend) ?CompatView {
+        if (self.role != .client or !self.client_early_data_attempted) return null;
+        const offers = self.constClientPskOffers();
+        if (offers.isEmpty()) return null;
+        return compatView(offers.constSlice()[0].common.early_data_application_compat);
+    }
+
     /// #362/#365: configure this connection's application-layer
     /// compatibility snapshot (e.g. HTTP/3 settings), compared against a
     /// candidate PSK's stored value on the server and used to recheck an
@@ -3821,6 +3833,7 @@ pub const Tls13Backend = struct {
                 .client => self.peerTransportCompat(),
                 .server => self.localTransportCompat(),
             };
+            ctx.early_data_application_compat = self.ownedApplicationCompat();
         }
         return ctx;
     }

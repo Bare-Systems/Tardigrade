@@ -78,6 +78,7 @@ pub fn Conn(comptime Transport: type) type {
         peer_qpack_encoder: ?u64 = null,
         peer_qpack_decoder: ?u64 = null,
         peer_control_view: frame.ControlStream = .{},
+        local_settings: frame.Settings = .{},
         /// Peer uni streams whose type varint has not fully arrived yet, and
         /// unknown-type streams we drain and ignore.
         pending_uni: std.AutoHashMap(u64, PendingUni),
@@ -116,9 +117,14 @@ pub fn Conn(comptime Transport: type) type {
         };
 
         pub fn init(allocator: std.mem.Allocator, role: Role) Self {
+            return initWithSettings(allocator, role, .{});
+        }
+
+        pub fn initWithSettings(allocator: std.mem.Allocator, role: Role, settings: frame.Settings) Self {
             return .{
                 .allocator = allocator,
                 .role = role,
+                .local_settings = settings,
                 .pending_uni = std.AutoHashMap(u64, PendingUni).init(allocator),
                 .requests = std.AutoHashMap(u64, *ServerRequest).init(allocator),
                 .responses = std.AutoHashMap(u64, *ClientResponse).init(allocator),
@@ -190,13 +196,37 @@ pub fn Conn(comptime Transport: type) type {
             var bytes: [64]u8 = undefined;
             var len: usize = 0;
             len += (try frame.encodeStreamType(.control, bytes[len..])).len;
-            var settings_payload: [16]u8 = undefined;
-            // Static-table-only QPACK: all our SETTINGS are the RFC defaults,
-            // so the frame is legitimately empty.
-            const settings = try frame.encodeSettings(&.{}, &settings_payload);
+            var settings_payload: [64]u8 = undefined;
+            var settings_entries: [5]frame.Setting = undefined;
+            const settings = try encodeLocalSettings(self.local_settings, &settings_entries, &settings_payload);
             len += (try frame.encodeKnownFrame(.settings, settings, bytes[len..])).len;
             _ = try transport.writeStream(control, bytes[0..len], false);
             self.control_out = control;
+        }
+
+        fn encodeLocalSettings(settings: frame.Settings, entries: *[5]frame.Setting, out: []u8) ![]u8 {
+            var count: usize = 0;
+            if (settings.qpack_max_table_capacity != 0) {
+                entries[count] = .{ .id = .qpack_max_table_capacity, .id_value = 0x01, .value = settings.qpack_max_table_capacity };
+                count += 1;
+            }
+            if (settings.max_field_section_size) |max| {
+                entries[count] = .{ .id = .max_field_section_size, .id_value = 0x06, .value = max };
+                count += 1;
+            }
+            if (settings.qpack_blocked_streams != 0) {
+                entries[count] = .{ .id = .qpack_blocked_streams, .id_value = 0x07, .value = settings.qpack_blocked_streams };
+                count += 1;
+            }
+            if (settings.enable_connect_protocol) {
+                entries[count] = .{ .id = .enable_connect_protocol, .id_value = 0x08, .value = 1 };
+                count += 1;
+            }
+            if (settings.h3_datagram) {
+                entries[count] = .{ .id = .h3_datagram, .id_value = 0x33, .value = 1 };
+                count += 1;
+            }
+            return frame.encodeSettings(entries[0..count], out);
         }
 
         /// Drain newly accepted and readable peer streams. Call after every
@@ -655,6 +685,37 @@ test "H3 conn: SETTINGS exchange and request/response over a mock transport" {
     try testing.expectEqualStrings("pong", response.body);
     try testing.expectEqualStrings("server", response.headers[0].name);
     client.releaseResponse(id);
+}
+
+test "H3 conn: start emits configured non-default SETTINGS" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.initWithSettings(allocator, .server, .{
+        .qpack_max_table_capacity = 1024,
+        .qpack_blocked_streams = 2,
+        .max_field_section_size = 4096,
+        .enable_connect_protocol = true,
+    });
+    defer server.deinit();
+
+    try server.start(&server_transport);
+    try testing.expectEqual(@as(?u64, 3), server.control_out);
+    const stream = client_transport.streams.get(3) orelse return error.TestExpectedEqual;
+    var control = frame.ControlStream{};
+    defer control.deinit(allocator);
+    try testing.expectEqual(stream.data.items.len, try control.ingest(allocator, stream.data.items));
+    try testing.expect(control.saw_settings);
+    try testing.expectEqual(@as(u64, 1024), control.settings.qpack_max_table_capacity);
+    try testing.expectEqual(@as(u64, 2), control.settings.qpack_blocked_streams);
+    try testing.expectEqual(@as(?u64, 4096), control.settings.max_field_section_size);
+    try testing.expect(control.settings.enable_connect_protocol);
 }
 
 test "H3 conn: duplicate QPACK encoder stream is a stream creation error" {

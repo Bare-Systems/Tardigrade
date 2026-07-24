@@ -960,6 +960,127 @@ fn earlyDataSkewedClientClock(_: *anyopaque) i64 {
     return 6000;
 }
 
+test "early-capable tickets stamp early application compatibility snapshot" {
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    const app_snapshot = "h3-settings-snapshot";
+    try harness.server_backend.setApplicationCompat(.{
+        .format_id = 0x6833,
+        .format_version = 1,
+        .bytes = app_snapshot,
+    });
+    try harness.client_backend.setApplicationCompat(.{
+        .format_id = 0x6833,
+        .format_version = 1,
+        .bytes = app_snapshot,
+    });
+
+    const TicketCapture = struct {
+        ticket: session.ClientTicketState = .{},
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(std.testing.allocator, &self.ticket) catch unreachable;
+        }
+    };
+    var capture = TicketCapture{};
+    defer capture.ticket.deinit();
+    const limits = session.Limits.default;
+    try harness.client_backend.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = TicketCapture.now,
+        .onTicketFn = TicketCapture.onTicket,
+    });
+    try harness.run();
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try harness.server_backend.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "early-app-compat-ticket",
+        .max_early_data_size = 32,
+        .issued_at_unix_ms = 1000,
+    }, limits);
+    defer server_state.deinit();
+    try std.testing.expectEqualStrings(app_snapshot, server_state.common.early_data_application_compat.?.slice());
+    try std.testing.expectEqual(@as(u16, 0x6833), server_state.common.early_data_application_compat.?.format_id);
+
+    const ticket_event = sink.items[0].handshake_bytes;
+    var protected: [record_codec.max_ciphertext_record_len * 2]u8 = undefined;
+    const records = (try harness.server_bridge.applyEvent(.{ .handshake_bytes = .{
+        .epoch = ticket_event.epoch,
+        .data = ticket_event.data,
+    } }, &protected)).?;
+    var parser = record_codec.Parser.init(.ciphertext);
+    var record_sink = record_codec.RecordSink(8, record_codec.max_ciphertext_fragment_len * 8){};
+    try parser.feed(records, &record_sink);
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    for (record_sink.items[0..record_sink.len]) |record| {
+        const opened = try harness.client_bridge.openHandshake(.application, record, &plaintext);
+        _ = try harness.client_driver.receive(.application, opened.inner.content);
+    }
+    try std.testing.expectEqualStrings(app_snapshot, capture.ticket.common.early_data_application_compat.?.slice());
+    try std.testing.expectEqual(@as(u16, 1), capture.ticket.common.early_data_application_compat.?.format_version);
+}
+
+test "client early application compat follows the planned identity-0 early attempt" {
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer client.deinit();
+
+    const psk = [_]u8{0x42} ** tls_backend.hash_len;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+        .early_data = .{ .early_data_capable = 64 },
+        .early_data_application_compat = .{
+            .format_id = 0x6833,
+            .format_version = 1,
+            .bytes = "remembered-h3-settings",
+        },
+    });
+    defer common.deinit();
+    var ticket: session.ClientTicketState = .{};
+    try ticket.init(std.testing.allocator, session.Limits.default, &common, .{
+        .ticket = "identity-0",
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    defer ticket.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 0;
+        }
+    };
+    try client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+    try client.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16 });
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    try std.testing.expect(client.earlyDataAttempted());
+    try std.testing.expectEqual(@as(u32, 16), client.earlyDataMaxBytes());
+    const remembered = client.clientEarlyDataApplicationCompat() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 0x6833), remembered.format_id);
+    try std.testing.expectEqual(@as(u16, 1), remembered.format_version);
+    try std.testing.expectEqualStrings("remembered-h3-settings", remembered.bytes);
+}
+
 test "0-RTT is rejected for a ticket-age skew outside the configured tolerance" {
     var issued = try issueEarlyCapableTicket(32);
     defer issued.deinit();

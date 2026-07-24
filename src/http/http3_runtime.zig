@@ -61,6 +61,7 @@ pub const Config = struct {
     tls_min_version: []const u8 = "1.3",
     tls_max_version: []const u8 = "1.3",
     enable_0rtt: bool = false,
+    h3_settings: http3.frame.Settings = .{},
     connection_migration: bool = false,
     max_datagram_size: usize = 1350,
     request_handler: ?RequestHandler = null,
@@ -143,6 +144,9 @@ pub const Runtime = struct {
     credential_provider: ?tls_core.credentials.CredentialProvider,
     resumption_runtime: ?*tls_core.resumption_runtime.Runtime,
     quic_config: quic.config.Config,
+    h3_settings: http3.frame.Settings,
+    h3_application_compat: [http3.early_data.encoded_snapshot_len]u8 = undefined,
+    h3_application_compat_len: usize = 0,
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
     stopping: std.atomic.Value(bool),
@@ -175,9 +179,14 @@ pub const Runtime = struct {
             .credential_provider = cfg.credential_provider,
             .resumption_runtime = cfg.resumption_runtime,
             .quic_config = quicConfigFrom(cfg),
+            .h3_settings = cfg.h3_settings,
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
         };
+        runtime.h3_application_compat_len = (http3.early_data.encodeSettingsSnapshot(
+            runtime.h3_settings,
+            &runtime.h3_application_compat,
+        ) catch unreachable).len;
 
         if (cfg.enable_0rtt) {
             logger.warn(null, "http3: 0-RTT is not supported by the native QUIC stack; continuing without it", .{});
@@ -421,6 +430,21 @@ pub const Runtime = struct {
                 allocator.destroy(backend);
                 return null;
             };
+            backend.setApplicationCompat(.{
+                .format_id = http3.early_data.format_id,
+                .format_version = http3.early_data.format_version,
+                .bytes = self.h3_application_compat[0..self.h3_application_compat_len],
+            }) catch {
+                allocator.destroy(backend);
+                return null;
+            };
+            backend.setEarlyDataCompatibilityGate(.{
+                .ctx = self,
+                .decideFn = h3EarlyDataCompatibility,
+            }) catch {
+                allocator.destroy(backend);
+                return null;
+            };
             backend.setResumptionDecisionObserver(runtime.backendDecisionObserver(.quic)) catch {
                 allocator.destroy(backend);
                 return null;
@@ -454,7 +478,7 @@ pub const Runtime = struct {
         entry.* = .{
             .backend = backend,
             .conn = conn,
-            .h3 = H3.init(allocator, .server),
+            .h3 = H3.initWithSettings(allocator, .server, self.h3_settings),
             .peer = peer,
             .cid_len = parsed.dcid.len,
             .accepted_at_us = now,
@@ -631,6 +655,19 @@ pub const Runtime = struct {
         entry.conn.emitPreparedNewSessionTicket(&prepared, identity.slice(), limits) catch |err| {
             runtime.rollbackIdentity(&identity);
             return err;
+        };
+    }
+
+    fn h3EarlyDataCompatibility(ctx: *anyopaque, candidate: tls_core.tls13_backend.EarlyDataCompatibilityCandidate) tls_core.tls13_backend.EarlyDataCompatibilityDecision {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        const app = candidate.remembered_application orelse return .application_incompatible;
+        return switch (http3.early_data.compatibility(.{
+            .format_id = app.format_id,
+            .format_version = app.format_version,
+            .bytes = app.bytes,
+        }, self.h3_settings)) {
+            .compatible => .compatible,
+            .missing_state, .malformed_state, .settings_incompatible => .application_incompatible,
         };
     }
 

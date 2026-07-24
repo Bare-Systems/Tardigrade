@@ -10,6 +10,7 @@ pub const session = @import("session.zig");
 pub const conn = @import("conn.zig");
 pub const qlog = @import("qlog.zig");
 pub const priority = @import("priority.zig");
+pub const early_data = @import("early_data.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

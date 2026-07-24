@@ -752,6 +752,49 @@ fn earlyDataResumedClientClock(_: *anyopaque) i64 {
     return 2000;
 }
 
+fn deliverApplicationTicket(harness: *DirectHarness, handshake_bytes: []const u8) !void {
+    var protected: [record_codec.max_ciphertext_record_len * 2]u8 = undefined;
+    const records = (try harness.server_bridge.applyEvent(.{ .handshake_bytes = .{
+        .epoch = .application,
+        .data = handshake_bytes,
+    } }, &protected)).?;
+    var parser = record_codec.Parser.init(.ciphertext);
+    var record_sink = record_codec.RecordSink(8, record_codec.max_ciphertext_fragment_len * 8){};
+    try parser.feed(records, &record_sink);
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    for (record_sink.items[0..record_sink.len]) |record| {
+        const opened = try harness.client_bridge.openHandshake(.application, record, &plaintext);
+        _ = try harness.client_driver.receive(.application, opened.inner.content);
+    }
+}
+
+fn replaceEarlyApplicationCompat(common: *session.ResumableSessionCommon, bytes: []const u8) !void {
+    if (common.early_data_application_compat) |*existing| existing.deinit();
+    common.early_data_application_compat = null;
+    var snap: session.CompatSnapshot = .{};
+    try snap.init(std.testing.allocator, 0x6833, 1, bytes, session.Limits.default.max_application_compat_len);
+    common.early_data_application_compat = snap;
+    snap = .{};
+}
+
+const AllowReplayGate = struct {
+    fn decide(_: *anyopaque, _: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+        return .allow;
+    }
+};
+
+const H3ApplicationCompatGate = struct {
+    compatible_bytes: []const u8,
+
+    fn decide(ctx: *anyopaque, candidate: tls_backend.EarlyDataCompatibilityCandidate) tls_backend.EarlyDataCompatibilityDecision {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const app = candidate.remembered_application orelse return .application_incompatible;
+        if (app.format_id != 0x6833 or app.format_version != 1) return .application_incompatible;
+        if (!std.mem.eql(u8, app.bytes, self.compatible_bytes)) return .application_incompatible;
+        return .compatible;
+    }
+};
+
 test "0-RTT round trip: an early-capable ticket, matching policy, and an allowing replay gate is accepted by both sides" {
     var issued = try issueEarlyCapableTicket(32);
     defer issued.deinit();
@@ -958,6 +1001,279 @@ fn earlyDataSkewedClientClock(_: *anyopaque) i64 {
     // the *client's* apparent ticket age diverge sharply from that — real
     // clock skew, not merely two different-but-consistent clocks.
     return 6000;
+}
+
+test "H3 application incompatibility rejects only 0-RTT while PSK resumption succeeds" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+    try replaceEarlyApplicationCompat(&issued.ticket.common, "malformed-h3-settings");
+    try replaceEarlyApplicationCompat(&issued.server_state.common, "malformed-h3-settings");
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16_384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+    var replay_ctx: u8 = 0;
+    try resumed.server_backend.setEarlyDataReplayGate(.{ .ctx = &replay_ctx, .decideFn = AllowReplayGate.decide });
+    var compat_gate = H3ApplicationCompatGate{ .compatible_bytes = "compatible-h3-settings" };
+    try resumed.server_backend.setEarlyDataCompatibilityGate(.{ .ctx = &compat_gate, .decideFn = H3ApplicationCompatGate.decide });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.client_backend.earlyDataAttempted());
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.application_incompatible, resumed.server_backend.earlyDataDecision());
+}
+
+test "H3 application compatibility allows 0-RTT when replay gate allows" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+    try replaceEarlyApplicationCompat(&issued.ticket.common, "compatible-h3-settings");
+    try replaceEarlyApplicationCompat(&issued.server_state.common, "compatible-h3-settings");
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16_384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+    var replay_ctx: u8 = 0;
+    try resumed.server_backend.setEarlyDataReplayGate(.{ .ctx = &replay_ctx, .decideFn = AllowReplayGate.decide });
+    var compat_gate = H3ApplicationCompatGate{ .compatible_bytes = "compatible-h3-settings" };
+    try resumed.server_backend.setEarlyDataCompatibilityGate(.{ .ctx = &compat_gate, .decideFn = H3ApplicationCompatGate.decide });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.client_backend.earlyDataAttempted());
+    try std.testing.expect(resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.accepted, resumed.server_backend.earlyDataDecision());
+    try std.testing.expectEqual(@as(u32, 32), resumed.server_backend.earlyDataMaxBytes());
+}
+
+test "early-capable tickets stamp early application compatibility snapshot" {
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    const app_snapshot = "h3-settings-snapshot";
+    try harness.server_backend.setApplicationCompat(.{
+        .format_id = 9,
+        .format_version = 1,
+        .bytes = "ordinary-application-compat",
+    });
+    try harness.client_backend.setApplicationCompat(.{
+        .format_id = 9,
+        .format_version = 1,
+        .bytes = "ordinary-application-compat",
+    });
+    try harness.server_backend.setEarlyDataApplicationCompat(.{
+        .format_id = 0x6833,
+        .format_version = 1,
+        .bytes = app_snapshot,
+    });
+    try harness.client_backend.setEarlyDataApplicationCompat(.{
+        .format_id = 0x6833,
+        .format_version = 1,
+        .bytes = app_snapshot,
+    });
+
+    const TicketCapture = struct {
+        ticket: session.ClientTicketState = .{},
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(std.testing.allocator, &self.ticket) catch unreachable;
+        }
+    };
+    var capture = TicketCapture{};
+    defer capture.ticket.deinit();
+    const limits = session.Limits.default;
+    try harness.client_backend.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = TicketCapture.now,
+        .onTicketFn = TicketCapture.onTicket,
+    });
+    try harness.run();
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try harness.server_backend.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "early-app-compat-ticket",
+        .max_early_data_size = 32,
+        .issued_at_unix_ms = 1000,
+    }, limits);
+    defer server_state.deinit();
+    try std.testing.expectEqualStrings(app_snapshot, server_state.common.early_data_application_compat.?.slice());
+    try std.testing.expectEqual(@as(u16, 0x6833), server_state.common.early_data_application_compat.?.format_id);
+    try std.testing.expectEqualStrings("ordinary-application-compat", server_state.common.application_compat.?.slice());
+
+    const ticket_event = sink.items[0].handshake_bytes;
+    var protected: [record_codec.max_ciphertext_record_len * 2]u8 = undefined;
+    const records = (try harness.server_bridge.applyEvent(.{ .handshake_bytes = .{
+        .epoch = ticket_event.epoch,
+        .data = ticket_event.data,
+    } }, &protected)).?;
+    var parser = record_codec.Parser.init(.ciphertext);
+    var record_sink = record_codec.RecordSink(8, record_codec.max_ciphertext_fragment_len * 8){};
+    try parser.feed(records, &record_sink);
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    for (record_sink.items[0..record_sink.len]) |record| {
+        const opened = try harness.client_bridge.openHandshake(.application, record, &plaintext);
+        _ = try harness.client_driver.receive(.application, opened.inner.content);
+    }
+    try std.testing.expectEqualStrings(app_snapshot, capture.ticket.common.early_data_application_compat.?.slice());
+    try std.testing.expectEqual(@as(u16, 1), capture.ticket.common.early_data_application_compat.?.format_version);
+}
+
+test "early application compat can update after handshake for later NSTs only" {
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    const defaults = "default-h3-settings";
+    const decoded_settings = "decoded-peer-h3-settings";
+    try harness.client_backend.setEarlyDataApplicationCompat(.{
+        .format_id = 0x6833,
+        .format_version = 1,
+        .bytes = defaults,
+    });
+
+    const TicketCapture = struct {
+        tickets: [2]session.ClientTicketState = .{ .{}, .{} },
+        count: usize = 0,
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.count >= self.tickets.len) unreachable;
+            ticket.cloneInto(std.testing.allocator, &self.tickets[self.count]) catch unreachable;
+            self.count += 1;
+        }
+    };
+    var capture = TicketCapture{};
+    defer {
+        for (&capture.tickets) |*ticket| ticket.deinit();
+    }
+    const limits = session.Limits.default;
+    try harness.client_backend.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = TicketCapture.now,
+        .onTicketFn = TicketCapture.onTicket,
+    });
+    try harness.run();
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var first_state = try harness.server_backend.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "first-ticket",
+        .max_early_data_size = 32,
+        .issued_at_unix_ms = 1000,
+    }, limits);
+    defer first_state.deinit();
+    try deliverApplicationTicket(&harness, sink.items[0].handshake_bytes.data);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings(defaults, capture.tickets[0].common.early_data_application_compat.?.slice());
+
+    try harness.client_backend.setEarlyDataApplicationCompat(.{
+        .format_id = 0x6833,
+        .format_version = 1,
+        .bytes = decoded_settings,
+    });
+    sink.reset();
+    var second_state = try harness.server_backend.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 501,
+        .ticket_nonce = "\x02",
+        .opaque_ticket = "second-ticket",
+        .max_early_data_size = 32,
+        .issued_at_unix_ms = 1000,
+    }, limits);
+    defer second_state.deinit();
+    try deliverApplicationTicket(&harness, sink.items[0].handshake_bytes.data);
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expectEqualStrings(defaults, capture.tickets[0].common.early_data_application_compat.?.slice());
+    try std.testing.expectEqualStrings(decoded_settings, capture.tickets[1].common.early_data_application_compat.?.slice());
+}
+
+test "client early application compat follows the planned identity-0 early attempt" {
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer client.deinit();
+
+    const psk = [_]u8{0x42} ** tls_backend.hash_len;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(""),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+        .early_data = .{ .early_data_capable = 64 },
+        .early_data_application_compat = .{
+            .format_id = 0x6833,
+            .format_version = 1,
+            .bytes = "remembered-h3-settings",
+        },
+    });
+    defer common.deinit();
+    var ticket: session.ClientTicketState = .{};
+    try ticket.init(std.testing.allocator, session.Limits.default, &common, .{
+        .ticket = "identity-0",
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    defer ticket.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 0;
+        }
+    };
+    try client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+    try client.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16 });
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    try std.testing.expect(client.earlyDataAttempted());
+    try std.testing.expectEqual(@as(u32, 16), client.earlyDataMaxBytes());
+    const remembered = client.clientEarlyDataApplicationCompat() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 0x6833), remembered.format_id);
+    try std.testing.expectEqual(@as(u16, 1), remembered.format_version);
+    try std.testing.expectEqualStrings("remembered-h3-settings", remembered.bytes);
 }
 
 test "0-RTT is rejected for a ticket-age skew outside the configured tolerance" {

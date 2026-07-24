@@ -72,6 +72,10 @@ pub const TlsBackend = struct {
     setCidBindingFn: ?*const fn (ptr: *anyopaque, binding: config.CidBinding) void = null,
     peerCidBindingFn: ?*const fn (ptr: *anyopaque) config.CidBinding = null,
     setPostHandshakeAllocatorFn: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) HandshakeError!void = null,
+    setEarlyDataApplicationCompatFn: ?*const fn (
+        ptr: *anyopaque,
+        blob: ?tls_core.new_session_ticket.CompatBlob,
+    ) HandshakeError!void = null,
     emitNewSessionTicketFn: ?*const fn (
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -120,6 +124,11 @@ pub const TlsBackend = struct {
 
     pub fn setPostHandshakeAllocator(self: TlsBackend, allocator: std.mem.Allocator) HandshakeError!void {
         if (self.setPostHandshakeAllocatorFn) |set| try set(self.transport.ptr, allocator);
+    }
+
+    pub fn setEarlyDataApplicationCompat(self: TlsBackend, blob: ?tls_core.new_session_ticket.CompatBlob) HandshakeError!void {
+        const set = self.setEarlyDataApplicationCompatFn orelse return;
+        try set(self.transport.ptr, blob);
     }
 
     pub fn emitNewSessionTicket(

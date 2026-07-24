@@ -13,6 +13,7 @@
 //! rejected per RFC 9114 §7.2.3 (we never send MAX_PUSH_ID).
 
 const std = @import("std");
+const early_data = @import("early_data.zig");
 const frame = @import("frame.zig");
 const qpack = @import("qpack.zig");
 const session = @import("session.zig");
@@ -25,6 +26,7 @@ pub const H3Error = error{
     ProtocolError,
     ResponseTooLarge,
     UnknownStream,
+    UnsupportedH3Setting,
 };
 
 /// HTTP/3 wire error codes (RFC 9114 §8.1). Zig errors carry no payload, so
@@ -78,6 +80,7 @@ pub fn Conn(comptime Transport: type) type {
         peer_qpack_encoder: ?u64 = null,
         peer_qpack_decoder: ?u64 = null,
         peer_control_view: frame.ControlStream = .{},
+        local_settings: frame.Settings = .{},
         /// Peer uni streams whose type varint has not fully arrived yet, and
         /// unknown-type streams we drain and ignore.
         pending_uni: std.AutoHashMap(u64, PendingUni),
@@ -116,9 +119,14 @@ pub fn Conn(comptime Transport: type) type {
         };
 
         pub fn init(allocator: std.mem.Allocator, role: Role) Self {
+            return initWithSettings(allocator, role, .{});
+        }
+
+        pub fn initWithSettings(allocator: std.mem.Allocator, role: Role, settings: frame.Settings) Self {
             return .{
                 .allocator = allocator,
                 .role = role,
+                .local_settings = settings,
                 .pending_uni = std.AutoHashMap(u64, PendingUni).init(allocator),
                 .requests = std.AutoHashMap(u64, *ServerRequest).init(allocator),
                 .responses = std.AutoHashMap(u64, *ClientResponse).init(allocator),
@@ -147,6 +155,19 @@ pub fn Conn(comptime Transport: type) type {
         pub fn closeCode(self: *const Self) u64 {
             const code = self.close_code orelse ErrorCode.general_protocol_error;
             return code.wire();
+        }
+
+        pub fn peerSettings(self: *const Self) ?frame.Settings {
+            if (!self.peer_control_view.saw_settings) return null;
+            return self.peer_control_view.settings;
+        }
+
+        /// Client-side #367 handoff: before SETTINGS arrives, H3 0-RTT uses
+        /// RFC defaults; after the peer control stream is decoded,
+        /// subsequently received tickets inherit the remembered server
+        /// SETTINGS snapshot.
+        pub fn encodePeerSettingsForEarlyDataTicket(self: *const Self, out: []u8) early_data.SnapshotError![]const u8 {
+            return early_data.encodeSettingsSnapshot(self.peerSettings() orelse .{}, out);
         }
 
         /// Record the wire close code (first failure wins) and produce the
@@ -186,17 +207,54 @@ pub fn Conn(comptime Transport: type) type {
         /// connection is established.
         pub fn start(self: *Self, transport: *Transport) !void {
             if (self.control_out != null) return;
+            frame.validateLocallySupportedSettings(self.local_settings) catch return error.UnsupportedH3Setting;
             const control = try transport.openStream(.uni);
             var bytes: [64]u8 = undefined;
             var len: usize = 0;
             len += (try frame.encodeStreamType(.control, bytes[len..])).len;
-            var settings_payload: [16]u8 = undefined;
-            // Static-table-only QPACK: all our SETTINGS are the RFC defaults,
-            // so the frame is legitimately empty.
-            const settings = try frame.encodeSettings(&.{}, &settings_payload);
+            var settings_payload: [64]u8 = undefined;
+            var settings_entries: [5]frame.Setting = undefined;
+            const settings = try encodeLocalSettings(self.local_settings, &settings_entries, &settings_payload);
             len += (try frame.encodeKnownFrame(.settings, settings, bytes[len..])).len;
             _ = try transport.writeStream(control, bytes[0..len], false);
             self.control_out = control;
+            if (self.role == .client) try self.publishEarlyTicketSnapshot(transport);
+        }
+
+        fn publishEarlyTicketSnapshot(self: *const Self, transport: *Transport) H3Error!void {
+            if (!@hasDecl(Transport, "setEarlyDataApplicationCompat")) return;
+            var snapshot: [early_data.encoded_snapshot_len]u8 = undefined;
+            const encoded = self.encodePeerSettingsForEarlyDataTicket(&snapshot) catch return error.ProtocolError;
+            transport.setEarlyDataApplicationCompat(.{
+                .format_id = early_data.format_id,
+                .format_version = early_data.format_version,
+                .bytes = encoded,
+            }) catch return error.ProtocolError;
+        }
+
+        fn encodeLocalSettings(settings: frame.Settings, entries: *[5]frame.Setting, out: []u8) ![]u8 {
+            var count: usize = 0;
+            if (settings.qpack_max_table_capacity != 0) {
+                entries[count] = .{ .id = .qpack_max_table_capacity, .id_value = 0x01, .value = settings.qpack_max_table_capacity };
+                count += 1;
+            }
+            if (settings.max_field_section_size) |max| {
+                entries[count] = .{ .id = .max_field_section_size, .id_value = 0x06, .value = max };
+                count += 1;
+            }
+            if (settings.qpack_blocked_streams != 0) {
+                entries[count] = .{ .id = .qpack_blocked_streams, .id_value = 0x07, .value = settings.qpack_blocked_streams };
+                count += 1;
+            }
+            if (settings.enable_connect_protocol) {
+                entries[count] = .{ .id = .enable_connect_protocol, .id_value = 0x08, .value = 1 };
+                count += 1;
+            }
+            if (settings.h3_datagram) {
+                entries[count] = .{ .id = .h3_datagram, .id_value = 0x33, .value = 1 };
+                count += 1;
+            }
+            return frame.encodeSettings(entries[0..count], out);
         }
 
         /// Drain newly accepted and readable peer streams. Call after every
@@ -280,10 +338,14 @@ pub fn Conn(comptime Transport: type) type {
                         }
                     }
                     if (bytes.len > 0 and state.typ == .control) {
+                        const had_settings = self.peer_control_view.saw_settings;
                         _ = self.peer_control_view.ingest(self.allocator, bytes) catch |err| {
                             return self.failControl(err);
                         };
                         if (self.peer_control_view.saw_settings) self.metrics.settings_received = true;
+                        if (self.role == .client and !had_settings and self.peer_control_view.saw_settings) {
+                            try self.publishEarlyTicketSnapshot(transport);
+                        }
                     }
                     // QPACK encoder/decoder instructions: with a zero-capacity
                     // dynamic table the peer sends none that affect state;
@@ -655,6 +717,127 @@ test "H3 conn: SETTINGS exchange and request/response over a mock transport" {
     try testing.expectEqualStrings("pong", response.body);
     try testing.expectEqualStrings("server", response.headers[0].name);
     client.releaseResponse(id);
+}
+
+test "H3 conn: start emits default SETTINGS" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.initWithSettings(allocator, .server, .{});
+    defer server.deinit();
+
+    try server.start(&server_transport);
+    try testing.expectEqual(@as(?u64, 3), server.control_out);
+    const stream = client_transport.streams.get(3) orelse return error.TestExpectedEqual;
+    var control = frame.ControlStream{};
+    defer control.deinit(allocator);
+    try testing.expectEqual(stream.data.items.len, try control.ingest(allocator, stream.data.items));
+    try testing.expect(control.saw_settings);
+    try testing.expectEqual(frame.Settings{}, control.settings);
+}
+
+test "H3 conn: start rejects unsupported qpack_max_table_capacity" {
+    const allocator = testing.allocator;
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+
+    const H3 = Conn(MockTransport);
+    var server = H3.initWithSettings(allocator, .server, .{ .qpack_max_table_capacity = 1 });
+    defer server.deinit();
+
+    try testing.expectError(error.UnsupportedH3Setting, server.start(&server_transport));
+}
+
+test "H3 conn: start rejects unsupported qpack_blocked_streams" {
+    const allocator = testing.allocator;
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+
+    const H3 = Conn(MockTransport);
+    var server = H3.initWithSettings(allocator, .server, .{ .qpack_blocked_streams = 1 });
+    defer server.deinit();
+
+    try testing.expectError(error.UnsupportedH3Setting, server.start(&server_transport));
+}
+
+test "H3 conn: start rejects unsupported enable_connect_protocol" {
+    const allocator = testing.allocator;
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+
+    const H3 = Conn(MockTransport);
+    var server = H3.initWithSettings(allocator, .server, .{ .enable_connect_protocol = true });
+    defer server.deinit();
+
+    try testing.expectError(error.UnsupportedH3Setting, server.start(&server_transport));
+}
+
+test "H3 conn: start rejects unsupported h3_datagram" {
+    const allocator = testing.allocator;
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+
+    const H3 = Conn(MockTransport);
+    var server = H3.initWithSettings(allocator, .server, .{ .h3_datagram = true });
+    defer server.deinit();
+
+    try testing.expectError(error.UnsupportedH3Setting, server.start(&server_transport));
+}
+
+test "H3 conn: start rejects unsupported max_field_section_size" {
+    const allocator = testing.allocator;
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+
+    const H3 = Conn(MockTransport);
+    var server = H3.initWithSettings(allocator, .server, .{ .max_field_section_size = 1024 });
+    defer server.deinit();
+
+    try testing.expectError(error.UnsupportedH3Setting, server.start(&server_transport));
+}
+
+test "H3 conn: early ticket snapshot uses defaults until peer SETTINGS arrive" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var snapshot: [early_data.encoded_snapshot_len]u8 = undefined;
+    const defaults = try client.encodePeerSettingsForEarlyDataTicket(&snapshot);
+    try testing.expectEqual(frame.Settings{}, try early_data.decodeSettingsSnapshot(defaults));
+
+    const control_id = try server_transport.openStream(.uni);
+    var settings_payload_buf: [64]u8 = undefined;
+    const settings_payload = try frame.encodeSettings(&.{
+        .{ .id = .qpack_blocked_streams, .id_value = 0x07, .value = 3 },
+        .{ .id = .max_field_section_size, .id_value = 0x06, .value = 8192 },
+        .{ .id = .enable_connect_protocol, .id_value = 0x08, .value = 1 },
+    }, &settings_payload_buf);
+    var control_buf: [128]u8 = undefined;
+    var control_len: usize = 0;
+    control_len += (try frame.encodeStreamType(.control, control_buf[control_len..])).len;
+    control_len += (try frame.encodeKnownFrame(.settings, settings_payload, control_buf[control_len..])).len;
+    _ = try server_transport.writeStream(control_id, control_buf[0..control_len], false);
+
+    try client.pump(&client_transport);
+    const remembered = try client.encodePeerSettingsForEarlyDataTicket(&snapshot);
+    try testing.expectEqual(frame.Settings{
+        .qpack_blocked_streams = 3,
+        .max_field_section_size = 8192,
+        .enable_connect_protocol = true,
+    }, try early_data.decodeSettingsSnapshot(remembered));
 }
 
 test "H3 conn: duplicate QPACK encoder stream is a stream creation error" {

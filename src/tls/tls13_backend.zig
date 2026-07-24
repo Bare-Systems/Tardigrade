@@ -419,6 +419,8 @@ pub const EarlyDataCompatibilityGate = struct {
     }
 };
 
+const max_early_application_compat_len = session.Limits.default.max_application_compat_len;
+
 const ExtensionGuard = struct {
     pub const max_extensions = 64;
 
@@ -644,6 +646,14 @@ pub const Tls13Backend = struct {
     application_compat_bytes: [session.hard_max_compat_len]u8 = undefined,
     application_compat_len: usize = 0,
     application_compat_present: bool = false,
+    /// #367: application compatibility snapshot used only for early-capable
+    /// tickets. HTTP/3 updates this across the NST lifecycle independently of
+    /// ordinary 1-RTT resumption's `application_compat`.
+    early_application_compat_format_id: u16 = 0,
+    early_application_compat_format_version: u16 = 0,
+    early_application_compat_bytes: [max_early_application_compat_len]u8 = undefined,
+    early_application_compat_len: usize = 0,
+    early_application_compat_present: bool = false,
     /// #362: the most recent successful PSK selection's ticket-age skew
     /// observation (apparent vs. actual elapsed time since issuance), taken
     /// exactly once by `takePskAgeSkew`. Informational only — skew alone
@@ -1055,6 +1065,18 @@ pub const Tls13Backend = struct {
         return self.early_data_max_bytes;
     }
 
+    /// Client (#367): the remembered application-level compatibility state
+    /// carried by the same first surviving ticket that produced
+    /// `earlyDataAttempted()` / `earlyDataMaxBytes()`. HTTP/3 uses this
+    /// before EncryptedExtensions to decide which remembered SETTINGS govern
+    /// client-side 0-RTT; `null` means RFC defaults.
+    pub fn clientEarlyDataApplicationCompat(self: *const Tls13Backend) ?CompatView {
+        if (self.role != .client or !self.client_early_data_attempted) return null;
+        const offers = self.constClientPskOffers();
+        if (offers.isEmpty()) return null;
+        return compatView(offers.constSlice()[0].common.early_data_application_compat);
+    }
+
     /// #362/#365: configure this connection's application-layer
     /// compatibility snapshot (e.g. HTTP/3 settings), compared against a
     /// candidate PSK's stored value on the server and used to recheck an
@@ -1088,6 +1110,38 @@ pub const Tls13Backend = struct {
             .format_id = self.application_compat_format_id,
             .format_version = self.application_compat_format_version,
             .bytes = self.application_compat_bytes[0..self.application_compat_len],
+        };
+    }
+
+    /// #367: configure the application snapshot stamped only into
+    /// early-capable tickets. Unlike `setApplicationCompat`, this may be
+    /// called after handshake completion so an H3 client can seed RFC default
+    /// SETTINGS before `start()` and update to decoded peer SETTINGS before
+    /// later NewSessionTickets arrive.
+    pub fn setEarlyDataApplicationCompat(self: *Tls13Backend, blob: ?new_session_ticket.CompatBlob) HandshakeError!void {
+        switch (self.core.handshake_lifecycle) {
+            .idle, .complete => {},
+            .running, .failed => return error.InvalidHandshakeState,
+        }
+        if (blob) |b| {
+            if (b.bytes.len > self.early_application_compat_bytes.len) return error.TransportBufferOverflow;
+            self.early_application_compat_format_id = b.format_id;
+            self.early_application_compat_format_version = b.format_version;
+            @memcpy(self.early_application_compat_bytes[0..b.bytes.len], b.bytes);
+            self.early_application_compat_len = b.bytes.len;
+            self.early_application_compat_present = true;
+        } else {
+            self.early_application_compat_present = false;
+            self.early_application_compat_len = 0;
+        }
+    }
+
+    pub fn ownedEarlyDataApplicationCompat(self: *const Tls13Backend) ?new_session_ticket.CompatBlob {
+        if (!self.early_application_compat_present) return null;
+        return .{
+            .format_id = self.early_application_compat_format_id,
+            .format_version = self.early_application_compat_format_version,
+            .bytes = self.early_application_compat_bytes[0..self.early_application_compat_len],
         };
     }
 
@@ -1269,6 +1323,9 @@ pub const Tls13Backend = struct {
         crypto.secureZero(u8, &self.application_compat_bytes);
         self.application_compat_present = false;
         self.application_compat_len = 0;
+        crypto.secureZero(u8, &self.early_application_compat_bytes);
+        self.early_application_compat_present = false;
+        self.early_application_compat_len = 0;
         self.last_psk_age_skew = null;
         self.client_early_data_intent = .{};
         self.client_early_data_attempted = false;
@@ -3821,6 +3878,7 @@ pub const Tls13Backend = struct {
                 .client => self.peerTransportCompat(),
                 .server => self.localTransportCompat(),
             };
+            ctx.early_data_application_compat = self.ownedEarlyDataApplicationCompat();
         }
         return ctx;
     }

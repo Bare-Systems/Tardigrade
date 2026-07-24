@@ -88,6 +88,10 @@ pub const error_key_update: u64 = 0x0e;
 /// CRYPTO_ERROR base (0x0100–0x01ff carries the TLS alert).
 pub const error_crypto_base: u64 = 0x0100;
 
+const h3_early_data_format_id: u16 = 0x6833;
+const h3_early_data_format_version: u16 = 1;
+const h3_default_settings_snapshot = [_]u8{0} ** 25;
+
 pub const IngestError = error{OutOfMemory};
 
 pub const Event = union(enum) {
@@ -682,6 +686,14 @@ pub const Connection = struct {
         conn.handshake.manual_key_discard = true;
         conn.handshake.allow_unverified_certificate = options.allow_unverified_certificate;
         if (options.role == .client) {
+            options.tls.setEarlyDataApplicationCompat(.{
+                .format_id = h3_early_data_format_id,
+                .format_version = h3_early_data_format_version,
+                .bytes = &h3_default_settings_snapshot,
+            }) catch |err| {
+                conn.failHandshake(err);
+                return conn;
+            };
             options.tls.setPostHandshakeAllocator(allocator) catch |err| {
                 conn.failHandshake(err);
                 return conn;
@@ -1416,6 +1428,15 @@ pub const Connection = struct {
     /// precondition — the same contract native TLS-over-TCP uses.
     pub fn setServerPskResolver(self: *Connection, resolver: tls_core.pre_shared_key.ServerPskResolver) tls_handshake.HandshakeError!void {
         try self.tls.setServerPskResolver(resolver);
+    }
+
+    /// #367: update the application snapshot that will be stamped into
+    /// subsequently issued early-capable NewSessionTickets.
+    pub fn setEarlyDataApplicationCompat(
+        self: *Connection,
+        blob: ?tls_core.new_session_ticket.CompatBlob,
+    ) tls_handshake.HandshakeError!void {
+        try self.tls.setEarlyDataApplicationCompat(blob);
     }
 
     /// #488 two-phase issuance, step 1 (QUIC): derives the RMS-bound PSK and

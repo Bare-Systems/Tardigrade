@@ -553,6 +553,145 @@ fn runH3Exchange(sim: *Sim) !void {
     try testing.expect(sim.network.max_observed_bytes <= sim.limits.max_queued_bytes);
 }
 
+test "#367 slice3: client ticket snapshots move from defaults to decoded peer SETTINGS without mutating earlier ticket" {
+    const allocator = testing.allocator;
+
+    const Capture = struct {
+        tickets: [2]tls_core.session.ClientTicketState = .{ .{}, .{} },
+        count: usize = 0,
+
+        fn deinit(self: *@This()) void {
+            for (&self.tickets) |*ticket| ticket.deinit();
+        }
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.count >= self.tickets.len) return;
+            self.tickets[self.count].deinit();
+            self.tickets[self.count] = .{};
+            ticket.cloneInto(testing.allocator, &self.tickets[self.count]) catch unreachable;
+            self.count += 1;
+        }
+    };
+
+    const issueEarlyCapableTicket = struct {
+        fn issue(sim: *Sim, nonce: u8, ticket_id: u8, issued_at_unix_ms: i64) !void {
+            var opaque_ticket = [1]u8{ticket_id};
+            var ticket_state = try sim.server.emitNewSessionTicket(.{
+                .ticket_lifetime = 3600,
+                .ticket_age_add = 100 + ticket_id,
+                .ticket_nonce = &[_]u8{nonce},
+                .opaque_ticket = &opaque_ticket,
+                .max_early_data_size = 4096,
+                .issued_at_unix_ms = issued_at_unix_ms,
+            }, tls_core.session.Limits.default);
+            defer ticket_state.deinit();
+        }
+    }.issue;
+
+    var capture = Capture{};
+    defer capture.deinit();
+
+    var sim = try Sim.init(allocator, .{
+        .scenario = "slice3-remembered-settings-lifecycle",
+        .ticket_consumer = .{
+            .ctx = &capture,
+            .nowUnixMsFn = Capture.now,
+            .onTicketFn = Capture.onTicket,
+        },
+        .resume_compat = .{ .transport = .ignore, .application = .ignore },
+    });
+    defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
+
+    try sim.runUntil(Sim.bothEstablished, 30_000_000);
+
+    // Ticket #1 arrives before client has observed peer SETTINGS.
+    // This is also before H3.start(), so defaults must have been installed
+    // at connection initialization time.
+    try issueEarlyCapableTicket(sim, 0x01, 0x41, 1_000);
+    const first_ticket_deadline = sim.now_us + 20_000_000;
+    while (capture.count < 1 and sim.now_us < first_ticket_deadline) {
+        if (!try sim.step()) break;
+    }
+    try testing.expectEqual(@as(usize, 1), capture.count);
+
+    const ticket1_compat = capture.tickets[0].common.early_data_application_compat orelse return error.TestExpectedEqual;
+    const ticket1_settings = try http3.early_data.decodeCompatView(.{
+        .format_id = ticket1_compat.format_id,
+        .format_version = ticket1_compat.format_version,
+        .bytes = ticket1_compat.slice(),
+    });
+    try testing.expectEqual(http3.frame.Settings{}, ticket1_settings);
+
+    var client_h3 = H3.init(allocator, .client);
+    defer client_h3.deinit();
+    try client_h3.start(sim.client);
+
+    // Now the client observes the peer SETTINGS frame with non-default values.
+    const control_id = try sim.server.openStream(.uni);
+    var settings_payload_buf: [64]u8 = undefined;
+    const settings_payload = try http3.frame.encodeSettings(&.{
+        .{ .id = .qpack_blocked_streams, .id_value = 0x07, .value = 3 },
+        .{ .id = .max_field_section_size, .id_value = 0x06, .value = 8192 },
+        .{ .id = .enable_connect_protocol, .id_value = 0x08, .value = 1 },
+    }, &settings_payload_buf);
+    var control_buf: [128]u8 = undefined;
+    var control_len: usize = 0;
+    control_len += (try http3.frame.encodeStreamType(.control, control_buf[control_len..])).len;
+    control_len += (try http3.frame.encodeKnownFrame(.settings, settings_payload, control_buf[control_len..])).len;
+
+    var written: usize = 0;
+    while (written < control_len) {
+        const n = try sim.server.writeStream(control_id, control_buf[written..control_len], false);
+        if (n == 0) {
+            _ = try sim.step();
+            continue;
+        }
+        written += n;
+    }
+
+    const settings_seen_deadline = sim.now_us + 20_000_000;
+    while (!client_h3.metrics.settings_received and sim.now_us < settings_seen_deadline) {
+        _ = try sim.step();
+        try client_h3.pump(sim.client);
+    }
+    try testing.expect(client_h3.metrics.settings_received);
+
+    // Ticket #2 arrives after peer SETTINGS was decoded by the H3 client.
+    try issueEarlyCapableTicket(sim, 0x02, 0x42, 1_500);
+    const second_ticket_deadline = sim.now_us + 20_000_000;
+    while (capture.count < 2 and sim.now_us < second_ticket_deadline) {
+        _ = try sim.step();
+        try client_h3.pump(sim.client);
+    }
+    try testing.expectEqual(@as(usize, 2), capture.count);
+
+    const ticket2_compat = capture.tickets[1].common.early_data_application_compat orelse return error.TestExpectedEqual;
+    const ticket2_settings = try http3.early_data.decodeCompatView(.{
+        .format_id = ticket2_compat.format_id,
+        .format_version = ticket2_compat.format_version,
+        .bytes = ticket2_compat.slice(),
+    });
+    try testing.expectEqual(http3.frame.Settings{
+        .qpack_blocked_streams = 3,
+        .max_field_section_size = 8192,
+        .enable_connect_protocol = true,
+    }, ticket2_settings);
+
+    // Earlier ingested ticket remains unchanged.
+    const ticket1_settings_after = try http3.early_data.decodeCompatView(.{
+        .format_id = ticket1_compat.format_id,
+        .format_version = ticket1_compat.format_version,
+        .bytes = ticket1_compat.slice(),
+    });
+    try testing.expectEqual(http3.frame.Settings{}, ticket1_settings_after);
+}
+
 test "e2e: lossless handshake, SETTINGS, request/response, clean close" {
     var sim = try Sim.init(testing.allocator, .{ .scenario = "lossless" });
     defer sim.deinit();

@@ -38,6 +38,7 @@ pub const Http3RuntimeError = error{
     NotYetImplemented,
     BindFailed,
     TlsBootstrapFailed,
+    InvalidH3Settings,
 };
 
 pub const RequestHandler = *const fn (
@@ -61,6 +62,7 @@ pub const Config = struct {
     tls_min_version: []const u8 = "1.3",
     tls_max_version: []const u8 = "1.3",
     enable_0rtt: bool = false,
+    h3_settings: http3.frame.Settings = .{},
     connection_migration: bool = false,
     max_datagram_size: usize = 1350,
     request_handler: ?RequestHandler = null,
@@ -143,6 +145,9 @@ pub const Runtime = struct {
     credential_provider: ?tls_core.credentials.CredentialProvider,
     resumption_runtime: ?*tls_core.resumption_runtime.Runtime,
     quic_config: quic.config.Config,
+    h3_settings: http3.frame.Settings,
+    h3_application_compat: [http3.early_data.encoded_snapshot_len]u8 = undefined,
+    h3_application_compat_len: usize = 0,
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
     stopping: std.atomic.Value(bool),
@@ -175,9 +180,15 @@ pub const Runtime = struct {
             .credential_provider = cfg.credential_provider,
             .resumption_runtime = cfg.resumption_runtime,
             .quic_config = quicConfigFrom(cfg),
+            .h3_settings = cfg.h3_settings,
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
         };
+        http3.frame.validateLocallySupportedSettings(runtime.h3_settings) catch return error.InvalidH3Settings;
+        runtime.h3_application_compat_len = (http3.early_data.encodeSettingsSnapshot(
+            runtime.h3_settings,
+            &runtime.h3_application_compat,
+        ) catch return error.InvalidH3Settings).len;
 
         if (cfg.enable_0rtt) {
             logger.warn(null, "http3: 0-RTT is not supported by the native QUIC stack; continuing without it", .{});
@@ -421,6 +432,21 @@ pub const Runtime = struct {
                 allocator.destroy(backend);
                 return null;
             };
+            backend.setEarlyDataApplicationCompat(.{
+                .format_id = http3.early_data.format_id,
+                .format_version = http3.early_data.format_version,
+                .bytes = self.h3_application_compat[0..self.h3_application_compat_len],
+            }) catch {
+                allocator.destroy(backend);
+                return null;
+            };
+            backend.setEarlyDataCompatibilityGate(.{
+                .ctx = self,
+                .decideFn = h3EarlyDataCompatibility,
+            }) catch {
+                allocator.destroy(backend);
+                return null;
+            };
             backend.setResumptionDecisionObserver(runtime.backendDecisionObserver(.quic)) catch {
                 allocator.destroy(backend);
                 return null;
@@ -454,7 +480,7 @@ pub const Runtime = struct {
         entry.* = .{
             .backend = backend,
             .conn = conn,
-            .h3 = H3.init(allocator, .server),
+            .h3 = H3.initWithSettings(allocator, .server, self.h3_settings),
             .peer = peer,
             .cid_len = parsed.dcid.len,
             .accepted_at_us = now,
@@ -631,6 +657,19 @@ pub const Runtime = struct {
         entry.conn.emitPreparedNewSessionTicket(&prepared, identity.slice(), limits) catch |err| {
             runtime.rollbackIdentity(&identity);
             return err;
+        };
+    }
+
+    fn h3EarlyDataCompatibility(ctx: *anyopaque, candidate: tls_core.tls13_backend.EarlyDataCompatibilityCandidate) tls_core.tls13_backend.EarlyDataCompatibilityDecision {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        const app = candidate.remembered_application orelse return .application_incompatible;
+        return switch (http3.early_data.compatibility(.{
+            .format_id = app.format_id,
+            .format_version = app.format_version,
+            .bytes = app.bytes,
+        }, self.h3_settings)) {
+            .compatible => .compatible,
+            .missing_state, .malformed_state, .settings_incompatible => .application_incompatible,
         };
     }
 
@@ -822,6 +861,35 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
     const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 });
     try testing.expectEqual(@as(u64, 1350), mid.max_udp_payload_size);
     try testing.expectEqual(quic.config.MigrationPolicy.disabled, mid.migration_policy);
+}
+
+fn expectInvalidH3SettingsAtRuntimeInit(settings: http3.frame.Settings) !void {
+    var logger = logger_mod.Logger.init(.err, "http3-invalid-settings-test");
+    try testing.expectError(error.InvalidH3Settings, Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .h3_settings = settings,
+    }));
+}
+
+test "runtime init rejects unsupported local H3 setting qpack_max_table_capacity" {
+    try expectInvalidH3SettingsAtRuntimeInit(.{ .qpack_max_table_capacity = 1 });
+}
+
+test "runtime init rejects unsupported local H3 setting qpack_blocked_streams" {
+    try expectInvalidH3SettingsAtRuntimeInit(.{ .qpack_blocked_streams = 1 });
+}
+
+test "runtime init rejects unsupported local H3 setting enable_connect_protocol" {
+    try expectInvalidH3SettingsAtRuntimeInit(.{ .enable_connect_protocol = true });
+}
+
+test "runtime init rejects unsupported local H3 setting h3_datagram" {
+    try expectInvalidH3SettingsAtRuntimeInit(.{ .h3_datagram = true });
+}
+
+test "runtime init rejects unsupported local H3 setting max_field_section_size" {
+    try expectInvalidH3SettingsAtRuntimeInit(.{ .max_field_section_size = 1024 });
 }
 
 test "admissionAllowed enforces global and per-source caps at the boundary" {

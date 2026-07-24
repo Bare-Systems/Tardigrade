@@ -28,6 +28,9 @@ pub const hash_len = shared.hash_len;
 pub const max_message_len = shared.max_message_len;
 pub const max_certificate_len = shared.max_certificate_len;
 pub const testdata = shared.testdata;
+pub const EarlyDataCompatibilityCandidate = shared.EarlyDataCompatibilityCandidate;
+pub const EarlyDataCompatibilityDecision = shared.EarlyDataCompatibilityDecision;
+pub const EarlyDataCompatibilityGate = shared.EarlyDataCompatibilityGate;
 
 const ext_quic_transport_parameters: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.quic_transport_parameters);
 const tp_max_idle_timeout: u64 = 0x01;
@@ -274,6 +277,7 @@ pub const Tls13Backend = struct {
             .setCidBindingFn = setCidBinding,
             .peerCidBindingFn = peerCidBinding,
             .setPostHandshakeAllocatorFn = setPostHandshakeAllocator,
+            .setEarlyDataApplicationCompatFn = setEarlyDataApplicationCompatVtable,
             .emitNewSessionTicketFn = emitNewSessionTicket,
             .setServerPskResolverFn = setServerPskResolverVtable,
             .prepareNewSessionTicketFn = prepareNewSessionTicket,
@@ -351,6 +355,23 @@ pub const Tls13Backend = struct {
 
     pub fn setResumeCompatibilityPolicy(self: *Tls13Backend, policy: shared.Tls13Backend.ResumeCompatibilityPolicy) HandshakeError!void {
         self.engine.setResumeCompatibilityPolicy(policy) catch |err| return mapError(err);
+    }
+
+    pub fn setApplicationCompat(self: *Tls13Backend, blob: ?tls_core.new_session_ticket.CompatBlob) HandshakeError!void {
+        self.engine.setApplicationCompat(blob) catch |err| return mapError(err);
+    }
+
+    pub fn setEarlyDataApplicationCompat(self: *Tls13Backend, blob: ?tls_core.new_session_ticket.CompatBlob) HandshakeError!void {
+        self.engine.setEarlyDataApplicationCompat(blob) catch |err| return mapError(err);
+    }
+
+    fn setEarlyDataApplicationCompatVtable(ptr: *anyopaque, blob: ?tls_core.new_session_ticket.CompatBlob) HandshakeError!void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        try self.setEarlyDataApplicationCompat(blob);
+    }
+
+    pub fn setEarlyDataCompatibilityGate(self: *Tls13Backend, gate: EarlyDataCompatibilityGate) HandshakeError!void {
+        self.engine.setEarlyDataCompatibilityGate(gate) catch |err| return mapError(err);
     }
 
     pub fn setResumptionDecisionObserver(self: *Tls13Backend, observer: shared.Tls13Backend.ResumptionDecisionObserver) HandshakeError!void {

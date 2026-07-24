@@ -33,6 +33,10 @@ pub const Http2PendingStream = struct {
     headers: http.Headers,
     body: std.array_list.Managed(u8),
     priority_weight: u8 = 16,
+    transport_early: bool = false,
+    dispatch_count: u8 = 0,
+    early_request_recorded: bool = false,
+    deferred_recorded: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Http2PendingStream {
         return .{
@@ -1377,6 +1381,36 @@ pub const GatewayState = struct {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
         self.metrics.recordErrorCode(code);
+    }
+
+    pub fn metricsRecordEarlyDataRequest(self: *GatewayState, protocol: http.metrics.HttpProtocol, source: http.metrics.EarlyDataSource) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordHttpEarlyDataRequest(protocol, source);
+    }
+
+    pub fn metricsRecordEarlyDataDecision(self: *GatewayState, protocol: http.metrics.HttpProtocol, decision: http.metrics.EarlyDataDecision) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordHttpEarlyDataDecision(protocol, decision);
+    }
+
+    pub fn metricsRecordEarlyDataUpstream425(self: *GatewayState, action: http.metrics.EarlyDataUpstream425Action) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordHttpEarlyDataUpstream425(action);
+    }
+
+    pub fn metricsRecordEarlyDataRetry(self: *GatewayState, result: http.metrics.EarlyDataRetryResult) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordHttpEarlyDataRetry(result);
+    }
+
+    pub fn metricsRecordHttp3EarlyDataCompat(self: *GatewayState, decision: http.metrics.H3EarlyDataCompatDecision) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordHttp3EarlyDataCompat(decision);
     }
 
     pub fn metricsRecordReloadAttempt(self: *GatewayState) void {

@@ -26,10 +26,23 @@ pub const ResumptionOutcome = enum { accepted, full_handshake, incompatible, mis
 pub const ResumptionMode = enum { stateful, stateless, hybrid };
 pub const TicketResult = enum { success, rejected, failed };
 
+pub const HttpProtocol = enum { h1, h2, h3 };
+pub const EarlyDataSource = enum { transport, header, both };
+pub const EarlyDataDecision = enum { accepted, too_early, deferred, forwarded };
+pub const EarlyDataUpstream425Action = enum { forwarded, retried };
+pub const EarlyDataRetryResult = enum { success, too_early, failure };
+pub const H3EarlyDataCompatDecision = enum { compatible, transport_incompatible, settings_incompatible, missing_state };
+
 const resumption_transport_count = 2;
 const resumption_outcome_count = 5;
 const resumption_mode_count = 3;
 const ticket_result_count = 3;
+const http_protocol_count = 3;
+const early_data_source_count = 3;
+const early_data_decision_count = 4;
+const early_data_upstream_425_action_count = 2;
+const early_data_retry_result_count = 3;
+const h3_early_data_compat_decision_count = 4;
 
 /// Server-wide metrics counters.
 ///
@@ -169,6 +182,16 @@ pub const Metrics = struct {
     tls_ticket_store_total: [ticket_result_count]u64,
     /// #488: server-side ticket resolution attempts by mode and result.
     tls_ticket_resolve_total: [resumption_mode_count][ticket_result_count]u64,
+    /// HTTP early-data replay-exposed requests by protocol and source.
+    http_early_data_requests_total: [http_protocol_count][early_data_source_count]u64,
+    /// HTTP early-data decisions by protocol.
+    http_early_data_decisions_total: [http_protocol_count][early_data_decision_count]u64,
+    /// Upstream 425 handling actions (bounded RFC 8470 semantics only).
+    http_early_data_upstream_425_total: [early_data_upstream_425_action_count]u64,
+    /// Local one-shot upstream 425 retry outcomes.
+    http_early_data_retry_total: [early_data_retry_result_count]u64,
+    /// HTTP/3 early-data compatibility outcomes.
+    http3_early_data_compat_total: [h3_early_data_compat_decision_count]u64,
     /// Total graceful-shutdown drains started.
     drain_total: u64,
     /// Total drains that hit the configured drain timeout before work finished.
@@ -280,6 +303,11 @@ pub const Metrics = struct {
             .tls_ticket_issue_total = .{.{.{0} ** ticket_result_count} ** resumption_mode_count} ** resumption_transport_count,
             .tls_ticket_store_total = .{0} ** ticket_result_count,
             .tls_ticket_resolve_total = .{.{0} ** ticket_result_count} ** resumption_mode_count,
+            .http_early_data_requests_total = .{.{0} ** early_data_source_count} ** http_protocol_count,
+            .http_early_data_decisions_total = .{.{0} ** early_data_decision_count} ** http_protocol_count,
+            .http_early_data_upstream_425_total = .{0} ** early_data_upstream_425_action_count,
+            .http_early_data_retry_total = .{0} ** early_data_retry_result_count,
+            .http3_early_data_compat_total = .{0} ** h3_early_data_compat_decision_count,
             .drain_total = 0,
             .drain_timeouts_total = 0,
             .drain_forced_closes_total = 0,
@@ -357,6 +385,26 @@ pub const Metrics = struct {
     /// #488: record a server-side ticket/handle resolution attempt.
     pub fn recordTicketResolve(self: *Metrics, mode: ResumptionMode, result: TicketResult) void {
         self.tls_ticket_resolve_total[resumptionModeIndex(mode)][ticketResultIndex(result)] += 1;
+    }
+
+    pub fn recordHttpEarlyDataRequest(self: *Metrics, protocol: HttpProtocol, source: EarlyDataSource) void {
+        self.http_early_data_requests_total[httpProtocolIndex(protocol)][earlyDataSourceIndex(source)] += 1;
+    }
+
+    pub fn recordHttpEarlyDataDecision(self: *Metrics, protocol: HttpProtocol, decision: EarlyDataDecision) void {
+        self.http_early_data_decisions_total[httpProtocolIndex(protocol)][earlyDataDecisionIndex(decision)] += 1;
+    }
+
+    pub fn recordHttpEarlyDataUpstream425(self: *Metrics, action: EarlyDataUpstream425Action) void {
+        self.http_early_data_upstream_425_total[earlyDataUpstream425ActionIndex(action)] += 1;
+    }
+
+    pub fn recordHttpEarlyDataRetry(self: *Metrics, result: EarlyDataRetryResult) void {
+        self.http_early_data_retry_total[earlyDataRetryResultIndex(result)] += 1;
+    }
+
+    pub fn recordHttp3EarlyDataCompat(self: *Metrics, decision: H3EarlyDataCompatDecision) void {
+        self.http3_early_data_compat_total[h3EarlyDataCompatDecisionIndex(decision)] += 1;
     }
 
     /// Record the start of a config hot-reload attempt.
@@ -846,6 +894,7 @@ pub const Metrics = struct {
 
         try self.appendTlsBufferPrometheus(&out);
         try self.appendResumptionPrometheus(&out);
+        try self.appendHttpEarlyDataPrometheus(&out);
 
         try out.print(
             \\# HELP tardigrade_proxy_client_aborts_total Total proxied transfers aborted by downstream clients
@@ -1225,6 +1274,74 @@ pub const Metrics = struct {
         }
     }
 
+    fn appendHttpEarlyDataPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        try out.appendSlice(
+            \\# HELP tardigrade_http_early_data_requests_total Replay-exposed HTTP requests by protocol and source
+            \\# TYPE tardigrade_http_early_data_requests_total counter
+            \\
+        );
+        inline for (.{ HttpProtocol.h1, HttpProtocol.h2, HttpProtocol.h3 }) |protocol| {
+            inline for (.{ EarlyDataSource.transport, EarlyDataSource.header, EarlyDataSource.both }) |source| {
+                try out.print("tardigrade_http_early_data_requests_total{{protocol=\"{s}\",source=\"{s}\"}} {d}\n", .{
+                    httpProtocolLabel(protocol),
+                    earlyDataSourceLabel(source),
+                    self.http_early_data_requests_total[httpProtocolIndex(protocol)][earlyDataSourceIndex(source)],
+                });
+            }
+        }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_http_early_data_decisions_total Early-data policy decisions by protocol
+            \\# TYPE tardigrade_http_early_data_decisions_total counter
+            \\
+        );
+        inline for (.{ HttpProtocol.h1, HttpProtocol.h2, HttpProtocol.h3 }) |protocol| {
+            inline for (.{ EarlyDataDecision.accepted, EarlyDataDecision.too_early, EarlyDataDecision.deferred, EarlyDataDecision.forwarded }) |decision| {
+                try out.print("tardigrade_http_early_data_decisions_total{{protocol=\"{s}\",decision=\"{s}\"}} {d}\n", .{
+                    httpProtocolLabel(protocol),
+                    earlyDataDecisionLabel(decision),
+                    self.http_early_data_decisions_total[httpProtocolIndex(protocol)][earlyDataDecisionIndex(decision)],
+                });
+            }
+        }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_http_early_data_upstream_425_total Upstream 425 handling actions
+            \\# TYPE tardigrade_http_early_data_upstream_425_total counter
+            \\
+        );
+        inline for (.{ EarlyDataUpstream425Action.forwarded, EarlyDataUpstream425Action.retried }) |action| {
+            try out.print("tardigrade_http_early_data_upstream_425_total{{action=\"{s}\"}} {d}\n", .{
+                earlyDataUpstream425ActionLabel(action),
+                self.http_early_data_upstream_425_total[earlyDataUpstream425ActionIndex(action)],
+            });
+        }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_http_early_data_retry_total Bounded local upstream-425 retry outcomes
+            \\# TYPE tardigrade_http_early_data_retry_total counter
+            \\
+        );
+        inline for (.{ EarlyDataRetryResult.success, EarlyDataRetryResult.too_early, EarlyDataRetryResult.failure }) |result| {
+            try out.print("tardigrade_http_early_data_retry_total{{result=\"{s}\"}} {d}\n", .{
+                earlyDataRetryResultLabel(result),
+                self.http_early_data_retry_total[earlyDataRetryResultIndex(result)],
+            });
+        }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_http3_early_data_compat_total HTTP/3 early-data compatibility outcomes
+            \\# TYPE tardigrade_http3_early_data_compat_total counter
+            \\
+        );
+        inline for (.{ H3EarlyDataCompatDecision.compatible, H3EarlyDataCompatDecision.transport_incompatible, H3EarlyDataCompatDecision.settings_incompatible, H3EarlyDataCompatDecision.missing_state }) |decision| {
+            try out.print("tardigrade_http3_early_data_compat_total{{decision=\"{s}\"}} {d}\n", .{
+                h3EarlyDataCompatDecisionLabel(decision),
+                self.http3_early_data_compat_total[h3EarlyDataCompatDecisionIndex(decision)],
+            });
+        }
+    }
+
     /// Format metrics as a JSON string.
     /// Caller owns the returned memory.
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
@@ -1411,6 +1528,104 @@ fn ticketResultLabel(result: TicketResult) []const u8 {
         .success => "success",
         .rejected => "rejected",
         .failed => "failed",
+    };
+}
+
+fn httpProtocolIndex(protocol: HttpProtocol) usize {
+    return switch (protocol) {
+        .h1 => 0,
+        .h2 => 1,
+        .h3 => 2,
+    };
+}
+
+fn earlyDataSourceIndex(source: EarlyDataSource) usize {
+    return switch (source) {
+        .transport => 0,
+        .header => 1,
+        .both => 2,
+    };
+}
+
+fn earlyDataDecisionIndex(decision: EarlyDataDecision) usize {
+    return switch (decision) {
+        .accepted => 0,
+        .too_early => 1,
+        .deferred => 2,
+        .forwarded => 3,
+    };
+}
+
+fn earlyDataUpstream425ActionIndex(action: EarlyDataUpstream425Action) usize {
+    return switch (action) {
+        .forwarded => 0,
+        .retried => 1,
+    };
+}
+
+fn earlyDataRetryResultIndex(result: EarlyDataRetryResult) usize {
+    return switch (result) {
+        .success => 0,
+        .too_early => 1,
+        .failure => 2,
+    };
+}
+
+fn h3EarlyDataCompatDecisionIndex(decision: H3EarlyDataCompatDecision) usize {
+    return switch (decision) {
+        .compatible => 0,
+        .transport_incompatible => 1,
+        .settings_incompatible => 2,
+        .missing_state => 3,
+    };
+}
+
+fn httpProtocolLabel(protocol: HttpProtocol) []const u8 {
+    return switch (protocol) {
+        .h1 => "h1",
+        .h2 => "h2",
+        .h3 => "h3",
+    };
+}
+
+fn earlyDataSourceLabel(source: EarlyDataSource) []const u8 {
+    return switch (source) {
+        .transport => "transport",
+        .header => "header",
+        .both => "both",
+    };
+}
+
+fn earlyDataDecisionLabel(decision: EarlyDataDecision) []const u8 {
+    return switch (decision) {
+        .accepted => "accepted",
+        .too_early => "too_early",
+        .deferred => "deferred",
+        .forwarded => "forwarded",
+    };
+}
+
+fn earlyDataUpstream425ActionLabel(action: EarlyDataUpstream425Action) []const u8 {
+    return switch (action) {
+        .forwarded => "forwarded",
+        .retried => "retried",
+    };
+}
+
+fn earlyDataRetryResultLabel(result: EarlyDataRetryResult) []const u8 {
+    return switch (result) {
+        .success => "success",
+        .too_early => "too_early",
+        .failure => "failure",
+    };
+}
+
+fn h3EarlyDataCompatDecisionLabel(decision: H3EarlyDataCompatDecision) []const u8 {
+    return switch (decision) {
+        .compatible => "compatible",
+        .transport_incompatible => "transport_incompatible",
+        .settings_incompatible => "settings_incompatible",
+        .missing_state => "missing_state",
     };
 }
 
@@ -1868,4 +2083,36 @@ test "worker queue wait histogram appears in Prometheus and JSON output (#136)" 
     defer allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"worker_queue_wait_count\":1") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"worker_queue_wait_sum_us\":500") != null);
+}
+
+test "early-data metrics record bounded labels and emit Prometheus series" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+
+    m.recordHttpEarlyDataRequest(.h1, .header);
+    m.recordHttpEarlyDataRequest(.h2, .transport);
+    m.recordHttpEarlyDataDecision(.h1, .too_early);
+    m.recordHttpEarlyDataDecision(.h2, .deferred);
+    m.recordHttpEarlyDataDecision(.h3, .accepted);
+    m.recordHttpEarlyDataUpstream425(.forwarded);
+    m.recordHttpEarlyDataUpstream425(.retried);
+    m.recordHttpEarlyDataRetry(.success);
+    m.recordHttpEarlyDataRetry(.too_early);
+    m.recordHttp3EarlyDataCompat(.compatible);
+    m.recordHttp3EarlyDataCompat(.missing_state);
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_requests_total{protocol=\"h1\",source=\"header\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_requests_total{protocol=\"h2\",source=\"transport\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h1\",decision=\"too_early\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h2\",decision=\"deferred\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h3\",decision=\"accepted\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_upstream_425_total{action=\"forwarded\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_upstream_425_total{action=\"retried\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"success\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"too_early\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_early_data_compat_total{decision=\"compatible\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_early_data_compat_total{decision=\"missing_state\"} 1") != null);
 }

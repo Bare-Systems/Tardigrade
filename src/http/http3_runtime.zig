@@ -21,6 +21,7 @@ const compat = @import("zig_compat");
 const std = @import("std");
 const http3_session = @import("http3_session.zig");
 const logger_mod = @import("logger.zig");
+const metrics_mod = @import("metrics.zig");
 const response_mod = @import("response.zig");
 const shutdown = @import("shutdown.zig");
 const stream_transport = @import("stream_transport");
@@ -67,6 +68,8 @@ pub const Config = struct {
     max_datagram_size: usize = 1350,
     request_handler: ?RequestHandler = null,
     request_handler_ctx: ?*anyopaque = null,
+    early_data_compat_metrics_ctx: ?*anyopaque = null,
+    early_data_compat_metrics_cb: ?*const fn (*anyopaque, metrics_mod.H3EarlyDataCompatDecision) void = null,
 };
 
 /// Half-open admission limits (#328 review). The native stack does not send
@@ -148,6 +151,8 @@ pub const Runtime = struct {
     h3_settings: http3.frame.Settings,
     h3_application_compat: [http3.early_data.encoded_snapshot_len]u8 = undefined,
     h3_application_compat_len: usize = 0,
+    early_data_compat_metrics_ctx: ?*anyopaque = null,
+    early_data_compat_metrics_cb: ?*const fn (*anyopaque, metrics_mod.H3EarlyDataCompatDecision) void = null,
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
     stopping: std.atomic.Value(bool),
@@ -181,6 +186,8 @@ pub const Runtime = struct {
             .resumption_runtime = cfg.resumption_runtime,
             .quic_config = quicConfigFrom(cfg),
             .h3_settings = cfg.h3_settings,
+            .early_data_compat_metrics_ctx = cfg.early_data_compat_metrics_ctx,
+            .early_data_compat_metrics_cb = cfg.early_data_compat_metrics_cb,
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
         };
@@ -662,15 +669,35 @@ pub const Runtime = struct {
 
     fn h3EarlyDataCompatibility(ctx: *anyopaque, candidate: tls_core.tls13_backend.EarlyDataCompatibilityCandidate) tls_core.tls13_backend.EarlyDataCompatibilityDecision {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
-        const app = candidate.remembered_application orelse return .application_incompatible;
+        const app = candidate.remembered_application orelse {
+            self.recordH3EarlyDataCompat(.missing_state);
+            return .application_incompatible;
+        };
+
         return switch (http3.early_data.compatibility(.{
             .format_id = app.format_id,
             .format_version = app.format_version,
             .bytes = app.bytes,
         }, self.h3_settings)) {
-            .compatible => .compatible,
-            .missing_state, .malformed_state, .settings_incompatible => .application_incompatible,
+            .compatible => blk: {
+                self.recordH3EarlyDataCompat(.compatible);
+                break :blk .compatible;
+            },
+            .missing_state => blk: {
+                self.recordH3EarlyDataCompat(.missing_state);
+                break :blk .application_incompatible;
+            },
+            .malformed_state, .settings_incompatible => blk: {
+                self.recordH3EarlyDataCompat(.settings_incompatible);
+                break :blk .application_incompatible;
+            },
         };
+    }
+
+    fn recordH3EarlyDataCompat(self: *Runtime, decision: metrics_mod.H3EarlyDataCompatDecision) void {
+        const cb = self.early_data_compat_metrics_cb orelse return;
+        const cb_ctx = self.early_data_compat_metrics_ctx orelse return;
+        cb(cb_ctx, decision);
     }
 
     fn noteConnectionAccepted(self: *Runtime) void {

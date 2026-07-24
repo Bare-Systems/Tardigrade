@@ -483,6 +483,10 @@ pub fn handleLocationProxyPass(
     matched_block: *const edge_config.EdgeConfig.LocationBlock,
     streaming_request_body: ?StreamingRequestBody,
 ) !u16 {
+    if (ctx.early_data.replayExposed()) {
+        ctx.early_data_action = .forwarded;
+    }
+
     const upstream_scope = .global;
     const upstream_pool = upstreamPoolForScope(cfg, upstream_scope);
     var proxy_temp_arena = std.heap.ArenaAllocator.init(allocator);
@@ -878,16 +882,27 @@ fn runBufferedProxyAttempts(
             method,
             matched_block,
         )) {
+            attempt_executor.recordEarlyUpstream425Action(.retried);
             early_ctx.waitOrDriveDownstreamHandshake() catch |err| {
+                attempt_executor.recordEarlyRetryResult(.failure);
                 try attempt_executor.onEarly425HandshakeFailure(err);
                 return .{ .response = result };
             };
             if (!early_ctx.downstreamHandshakeComplete()) {
+                attempt_executor.recordEarlyRetryResult(.failure);
                 return .{ .response = result };
             }
             retry_state.consumeEarly425Retry();
             try attempt_executor.onEarly425Retry(&result);
             continue;
+        }
+        if (result.statusCode() == @intFromEnum(http.Status.too_early)) {
+            attempt_executor.recordEarlyUpstream425Action(.forwarded);
+            if (retry_state.early_425_retry_used) {
+                attempt_executor.recordEarlyRetryResult(.too_early);
+            }
+        } else if (retry_state.early_425_retry_used) {
+            attempt_executor.recordEarlyRetryResult(.success);
         }
         if (result.statusCode() >= 500 and retry_state.hasConfiguredRetryRemaining(attempt, max_attempts)) {
             try attempt_executor.onConfigured5xxRetry(retry_state.configuredAttemptIndex(attempt), max_attempts, &result);
@@ -917,6 +932,28 @@ const ProductionBufferedProxyAttemptExecutor = struct {
     selection_base_url: []const u8,
     budget_start_ms: u64,
     last_attempt_start_ms: u64 = 0,
+
+    fn recordEarlyUpstream425Action(
+        self: *ProductionBufferedProxyAttemptExecutor,
+        action: http.metrics.EarlyDataUpstream425Action,
+    ) void {
+        self.state.metricsRecordEarlyDataUpstream425(action);
+    }
+
+    fn recordEarlyRetryResult(
+        self: *ProductionBufferedProxyAttemptExecutor,
+        result: http.metrics.EarlyDataRetryResult,
+    ) void {
+        self.state.metricsRecordEarlyDataRetry(result);
+        self.ctx.early_data_retry_result = switch (result) {
+            .success => .success,
+            .too_early => .too_early,
+            .failure => .failure,
+        };
+        if (result == .success) {
+            self.ctx.early_data_action = .retried;
+        }
+    }
 
     fn perAttemptTimeoutMs(self: *ProductionBufferedProxyAttemptExecutor) !u32 {
         if (self.cfg.upstream_timeout_budget_ms == 0) return self.cfg.upstream_timeout_ms;
@@ -1040,6 +1077,32 @@ const ScriptedBufferedAttemptExecutor = struct {
     deliveries: usize = 0,
     terminal_attempt_errors: usize = 0,
     handshake_failures: usize = 0,
+    early_425_forwarded: usize = 0,
+    early_425_retried: usize = 0,
+    early_retry_success: usize = 0,
+    early_retry_too_early: usize = 0,
+    early_retry_failure: usize = 0,
+
+    fn recordEarlyUpstream425Action(
+        self: *ScriptedBufferedAttemptExecutor,
+        action: http.metrics.EarlyDataUpstream425Action,
+    ) void {
+        switch (action) {
+            .forwarded => self.early_425_forwarded += 1,
+            .retried => self.early_425_retried += 1,
+        }
+    }
+
+    fn recordEarlyRetryResult(
+        self: *ScriptedBufferedAttemptExecutor,
+        result: http.metrics.EarlyDataRetryResult,
+    ) void {
+        switch (result) {
+            .success => self.early_retry_success += 1,
+            .too_early => self.early_retry_too_early += 1,
+            .failure => self.early_retry_failure += 1,
+        }
+    }
 
     fn execute(
         self: *ScriptedBufferedAttemptExecutor,
@@ -1125,6 +1188,22 @@ const ErrorBufferedAttemptExecutor = struct {
     execute_calls: usize = 0,
     terminal_attempt_errors: usize = 0,
     configured_error_retries: usize = 0,
+
+    fn recordEarlyUpstream425Action(
+        self: *ErrorBufferedAttemptExecutor,
+        action: http.metrics.EarlyDataUpstream425Action,
+    ) void {
+        _ = self;
+        _ = action;
+    }
+
+    fn recordEarlyRetryResult(
+        self: *ErrorBufferedAttemptExecutor,
+        result: http.metrics.EarlyDataRetryResult,
+    ) void {
+        _ = self;
+        _ = result;
+    }
 
     fn execute(
         self: *ErrorBufferedAttemptExecutor,

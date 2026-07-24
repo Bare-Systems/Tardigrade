@@ -687,6 +687,7 @@ pub fn handleLocationProxyPass(
             ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.gateway_timeout), 0);
             return @intFromEnum(http.Status.gateway_timeout);
         },
+        .retry_budget_exhausted => return error.Timeout,
         .terminal_error => |err| {
             // All retry attempts are exhausted — synthesise a proper error
             // response so the client receives a complete HTTP message instead
@@ -826,6 +827,7 @@ const BufferedProxyAttemptsResult = union(enum) {
     response: DataPlaneProxyResponse,
     upstream_at_capacity,
     request_cancelled,
+    retry_budget_exhausted,
     terminal_error: anyerror,
 };
 
@@ -845,6 +847,7 @@ fn runBufferedProxyAttempts(
     var attempt: usize = 0;
     while (attempt < retry_state.loopBound(max_attempts, stale_conn_retries)) : (attempt += 1) {
         const resp = attempt_executor.execute(attempt, retry_state.forwardEarlyData(first_attempt_forward_early_data)) catch |err| {
+            if (err == error.ProxyBudgetExhausted) return .retry_budget_exhausted;
             if (shouldRetryStaleUpstreamConnection(
                 err,
                 method,
@@ -857,8 +860,8 @@ fn runBufferedProxyAttempts(
                 continue;
             }
             if (err == error.UpstreamAtCapacity) return .upstream_at_capacity;
-            if (err == error.RequestCancelled) return .request_cancelled;
             try attempt_executor.onTerminalAttemptError(err);
+            if (err == error.RequestCancelled) return .request_cancelled;
             if (retry_state.hasConfiguredRetryRemaining(attempt, max_attempts)) {
                 try attempt_executor.onConfiguredErrorRetry(retry_state.configuredAttemptIndex(attempt), max_attempts, err);
                 continue;
@@ -875,7 +878,10 @@ fn runBufferedProxyAttempts(
             method,
             matched_block,
         )) {
-            try early_ctx.waitOrDriveDownstreamHandshake();
+            early_ctx.waitOrDriveDownstreamHandshake() catch |err| {
+                try attempt_executor.onEarly425HandshakeFailure(err);
+                return .{ .response = result };
+            };
             if (!early_ctx.downstreamHandshakeComplete()) {
                 return .{ .response = result };
             }
@@ -910,11 +916,12 @@ const ProductionBufferedProxyAttemptExecutor = struct {
     auth_scopes: ?[]const u8,
     selection_base_url: []const u8,
     budget_start_ms: u64,
+    last_attempt_start_ms: u64 = 0,
 
     fn perAttemptTimeoutMs(self: *ProductionBufferedProxyAttemptExecutor) !u32 {
         if (self.cfg.upstream_timeout_budget_ms == 0) return self.cfg.upstream_timeout_ms;
         const elapsed_ms = http.event_loop.monotonicMs() - self.budget_start_ms;
-        if (elapsed_ms >= self.cfg.upstream_timeout_budget_ms) return error.Timeout;
+        if (elapsed_ms >= self.cfg.upstream_timeout_budget_ms) return error.ProxyBudgetExhausted;
         const remaining = self.cfg.upstream_timeout_budget_ms - elapsed_ms;
         if (self.cfg.upstream_timeout_ms == 0) {
             return @intCast(@min(remaining, @as(u64, std.math.maxInt(u32))));
@@ -930,6 +937,7 @@ const ProductionBufferedProxyAttemptExecutor = struct {
         _ = attempt;
         const per_attempt_timeout_ms = try self.perAttemptTimeoutMs();
         self.state.recordUpstreamAttemptStart(self.selection_base_url);
+        self.last_attempt_start_ms = http.event_loop.monotonicMs();
         const resp = executeBufferedDataPlaneProxyRequest(
             self.allocator,
             self.cfg,
@@ -962,7 +970,7 @@ const ProductionBufferedProxyAttemptExecutor = struct {
         self: *ProductionBufferedProxyAttemptExecutor,
         result: *DataPlaneProxyResponse,
     ) !void {
-        const upstream_ttfb_ms = http.event_loop.monotonicMs() - self.budget_start_ms;
+        const upstream_ttfb_ms = http.event_loop.monotonicMs() - self.last_attempt_start_ms;
         self.state.metricsRecordProxyBufferedRequest(result.bodyLen(), upstream_ttfb_ms);
     }
 
@@ -999,6 +1007,13 @@ const ProductionBufferedProxyAttemptExecutor = struct {
         result.deinit(self.allocator);
     }
 
+    fn onEarly425HandshakeFailure(
+        self: *ProductionBufferedProxyAttemptExecutor,
+        err: anyerror,
+    ) !void {
+        self.state.logger.warn(self.correlation_id, "could not complete downstream handshake before early-data 425 retry: {}", .{err});
+    }
+
     fn onConfigured5xxRetry(
         self: *ProductionBufferedProxyAttemptExecutor,
         configured_attempt_index: usize,
@@ -1015,6 +1030,7 @@ const ProductionBufferedProxyAttemptExecutor = struct {
 const Early425RetryHarnessResult = struct {
     downstream_status: u16,
     upstream_deliveries: usize,
+    handshake_failures: usize = 0,
 };
 
 const ScriptedBufferedAttemptExecutor = struct {
@@ -1022,6 +1038,8 @@ const ScriptedBufferedAttemptExecutor = struct {
     upstream_statuses: []const u16,
     early_data_header_counts: *std.array_list.Managed(usize),
     deliveries: usize = 0,
+    terminal_attempt_errors: usize = 0,
+    handshake_failures: usize = 0,
 
     fn execute(
         self: *ScriptedBufferedAttemptExecutor,
@@ -1048,6 +1066,13 @@ const ScriptedBufferedAttemptExecutor = struct {
         _ = result;
     }
 
+    fn onEarly425HandshakeFailure(
+        self: *ScriptedBufferedAttemptExecutor,
+        _: anyerror,
+    ) !void {
+        self.handshake_failures += 1;
+    }
+
     fn onStaleConnectionRetry(
         self: *ScriptedBufferedAttemptExecutor,
         stale_conn_retries: usize,
@@ -1062,7 +1087,7 @@ const ScriptedBufferedAttemptExecutor = struct {
         self: *ScriptedBufferedAttemptExecutor,
         _: anyerror,
     ) !void {
-        _ = self;
+        self.terminal_attempt_errors += 1;
     }
 
     fn onConfiguredErrorRetry(
@@ -1092,6 +1117,87 @@ const ScriptedBufferedAttemptExecutor = struct {
         _ = configured_attempt_index;
         _ = max_attempts;
         result.deinit(self.allocator);
+    }
+};
+
+const ErrorBufferedAttemptExecutor = struct {
+    err: anyerror,
+    execute_calls: usize = 0,
+    terminal_attempt_errors: usize = 0,
+    configured_error_retries: usize = 0,
+
+    fn execute(
+        self: *ErrorBufferedAttemptExecutor,
+        attempt: usize,
+        forward_early_data: bool,
+    ) !DataPlaneProxyResponse {
+        _ = attempt;
+        _ = forward_early_data;
+        self.execute_calls += 1;
+        return self.err;
+    }
+
+    fn onBufferedResponse(
+        self: *ErrorBufferedAttemptExecutor,
+        result: *DataPlaneProxyResponse,
+    ) !void {
+        _ = self;
+        _ = result;
+    }
+
+    fn onStaleConnectionRetry(
+        self: *ErrorBufferedAttemptExecutor,
+        stale_conn_retries: usize,
+        max_stale_conn_retries: usize,
+    ) !void {
+        _ = self;
+        _ = stale_conn_retries;
+        _ = max_stale_conn_retries;
+    }
+
+    fn onTerminalAttemptError(
+        self: *ErrorBufferedAttemptExecutor,
+        _: anyerror,
+    ) !void {
+        self.terminal_attempt_errors += 1;
+    }
+
+    fn onConfiguredErrorRetry(
+        self: *ErrorBufferedAttemptExecutor,
+        configured_attempt_index: usize,
+        max_attempts: usize,
+        _: anyerror,
+    ) !void {
+        _ = configured_attempt_index;
+        _ = max_attempts;
+        self.configured_error_retries += 1;
+    }
+
+    fn onEarly425Retry(
+        self: *ErrorBufferedAttemptExecutor,
+        result: *DataPlaneProxyResponse,
+    ) !void {
+        _ = self;
+        _ = result;
+    }
+
+    fn onEarly425HandshakeFailure(
+        self: *ErrorBufferedAttemptExecutor,
+        _: anyerror,
+    ) !void {
+        _ = self;
+    }
+
+    fn onConfigured5xxRetry(
+        self: *ErrorBufferedAttemptExecutor,
+        configured_attempt_index: usize,
+        max_attempts: usize,
+        result: *DataPlaneProxyResponse,
+    ) !void {
+        _ = self;
+        _ = configured_attempt_index;
+        _ = max_attempts;
+        _ = result;
     }
 };
 
@@ -1147,9 +1253,10 @@ fn runEarly425RetryHarness(
             return .{
                 .downstream_status = mutable_response.statusCode(),
                 .upstream_deliveries = executor.deliveries,
+                .handshake_failures = executor.handshake_failures,
             };
         },
-        .upstream_at_capacity, .request_cancelled, .terminal_error => error.TestUnexpectedTerminalProxyResult,
+        .upstream_at_capacity, .request_cancelled, .retry_budget_exhausted, .terminal_error => error.TestUnexpectedTerminalProxyResult,
     };
 }
 
@@ -1225,6 +1332,7 @@ test "shouldRetryEarlyUpstream425 permits exactly current-hop replay-safe RFC847
 
 const TestEarly425Barrier = struct {
     complete: bool = false,
+    fail_wait: bool = false,
     waits: usize = 0,
 
     fn isComplete(ptr: *anyopaque) bool {
@@ -1235,6 +1343,7 @@ const TestEarly425Barrier = struct {
     fn waitOrDrive(ptr: *anyopaque) anyerror!void {
         const self: *TestEarly425Barrier = @ptrCast(@alignCast(ptr));
         self.waits += 1;
+        if (self.fail_wait) return error.TestHandshakeDriveFailed;
         self.complete = true;
     }
 
@@ -1293,6 +1402,30 @@ test "early upstream 425 retry forwards second 425 without third delivery" {
     try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, header_counts.items);
 }
 
+test "early upstream 425 handshake failure forwards original 425" {
+    const allocator = std.testing.allocator;
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    };
+    var barrier = TestEarly425Barrier{ .fail_wait = true };
+    var ctx = http.request_context.EarlyDataContext{ .transport_early = true, .downstream_handshake = barrier.barrier() };
+    var header_counts = std.array_list.Managed(usize).init(allocator);
+    defer header_counts.deinit();
+
+    const result = try runEarly425RetryHarness(allocator, &ctx, "GET", &block, 1, &.{ 425, 200 }, &header_counts);
+
+    try std.testing.expectEqual(@as(u16, 425), result.downstream_status);
+    try std.testing.expectEqual(@as(usize, 1), result.upstream_deliveries);
+    try std.testing.expectEqual(@as(usize, 1), barrier.waits);
+    try std.testing.expectEqual(@as(usize, 1), result.handshake_failures);
+    try std.testing.expectEqualSlices(usize, &.{1}, header_counts.items);
+}
+
 test "inbound early-data marker forwards upstream 425 without local retry" {
     const allocator = std.testing.allocator;
     const block = edge_config.EdgeConfig.LocationBlock{
@@ -1337,6 +1470,46 @@ test "semantic upstream 425 retry does not consume configured 5xx retry budget" 
     try std.testing.expectEqual(@as(usize, 3), result.upstream_deliveries);
     try std.testing.expectEqual(@as(usize, 1), barrier.waits);
     try std.testing.expectEqualSlices(usize, &.{ 1, 0, 0 }, header_counts.items);
+}
+
+test "buffered proxy attempts record RequestCancelled as upstream failure before terminating" {
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    };
+    var ctx = http.request_context.EarlyDataContext{};
+    var executor = ErrorBufferedAttemptExecutor{ .err = error.RequestCancelled };
+
+    const result = try runBufferedProxyAttempts(&ctx, false, "GET", &block, 3, 0, true, &executor);
+
+    try std.testing.expectEqual(std.meta.Tag(BufferedProxyAttemptsResult).request_cancelled, std.meta.activeTag(result));
+    try std.testing.expectEqual(@as(usize, 1), executor.execute_calls);
+    try std.testing.expectEqual(@as(usize, 1), executor.terminal_attempt_errors);
+    try std.testing.expectEqual(@as(usize, 0), executor.configured_error_retries);
+}
+
+test "buffered proxy attempts stop on local retry budget exhaustion before upstream failure accounting" {
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    };
+    var ctx = http.request_context.EarlyDataContext{};
+    var executor = ErrorBufferedAttemptExecutor{ .err = error.ProxyBudgetExhausted };
+
+    const result = try runBufferedProxyAttempts(&ctx, false, "GET", &block, 3, 0, true, &executor);
+
+    try std.testing.expectEqual(std.meta.Tag(BufferedProxyAttemptsResult).retry_budget_exhausted, std.meta.activeTag(result));
+    try std.testing.expectEqual(@as(usize, 1), executor.execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), executor.terminal_attempt_errors);
+    try std.testing.expectEqual(@as(usize, 0), executor.configured_error_retries);
 }
 
 test "data-plane buffered compatibility response limit uses dedicated upstream cap" {

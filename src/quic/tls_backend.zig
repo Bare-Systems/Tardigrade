@@ -360,6 +360,10 @@ pub const Tls13Backend = struct {
         self.engine.setApplicationCompat(blob) catch |err| return mapError(err);
     }
 
+    pub fn setEarlyDataApplicationCompat(self: *Tls13Backend, blob: ?tls_core.new_session_ticket.CompatBlob) HandshakeError!void {
+        self.engine.setEarlyDataApplicationCompat(blob) catch |err| return mapError(err);
+    }
+
     pub fn setEarlyDataCompatibilityGate(self: *Tls13Backend, gate: EarlyDataCompatibilityGate) HandshakeError!void {
         self.engine.setEarlyDataCompatibilityGate(gate) catch |err| return mapError(err);
     }

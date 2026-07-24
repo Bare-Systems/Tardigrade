@@ -38,6 +38,7 @@ pub const Http3RuntimeError = error{
     NotYetImplemented,
     BindFailed,
     TlsBootstrapFailed,
+    InvalidH3Settings,
 };
 
 pub const RequestHandler = *const fn (
@@ -186,7 +187,7 @@ pub const Runtime = struct {
         runtime.h3_application_compat_len = (http3.early_data.encodeSettingsSnapshot(
             runtime.h3_settings,
             &runtime.h3_application_compat,
-        ) catch unreachable).len;
+        ) catch return error.InvalidH3Settings).len;
 
         if (cfg.enable_0rtt) {
             logger.warn(null, "http3: 0-RTT is not supported by the native QUIC stack; continuing without it", .{});
@@ -430,7 +431,7 @@ pub const Runtime = struct {
                 allocator.destroy(backend);
                 return null;
             };
-            backend.setApplicationCompat(.{
+            backend.setEarlyDataApplicationCompat(.{
                 .format_id = http3.early_data.format_id,
                 .format_version = http3.early_data.format_version,
                 .bytes = self.h3_application_compat[0..self.h3_application_compat_len],

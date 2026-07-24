@@ -13,6 +13,7 @@
 //! rejected per RFC 9114 §7.2.3 (we never send MAX_PUSH_ID).
 
 const std = @import("std");
+const early_data = @import("early_data.zig");
 const frame = @import("frame.zig");
 const qpack = @import("qpack.zig");
 const session = @import("session.zig");
@@ -153,6 +154,19 @@ pub fn Conn(comptime Transport: type) type {
         pub fn closeCode(self: *const Self) u64 {
             const code = self.close_code orelse ErrorCode.general_protocol_error;
             return code.wire();
+        }
+
+        pub fn peerSettings(self: *const Self) ?frame.Settings {
+            if (!self.peer_control_view.saw_settings) return null;
+            return self.peer_control_view.settings;
+        }
+
+        /// Client-side #367 handoff: before SETTINGS arrives, H3 0-RTT uses
+        /// RFC defaults; after the peer control stream is decoded,
+        /// subsequently received tickets inherit the remembered server
+        /// SETTINGS snapshot.
+        pub fn encodePeerSettingsForEarlyDataTicket(self: *const Self, out: []u8) early_data.SnapshotError![]const u8 {
+            return early_data.encodeSettingsSnapshot(self.peerSettings() orelse .{}, out);
         }
 
         /// Record the wire close code (first failure wins) and produce the
@@ -716,6 +730,38 @@ test "H3 conn: start emits configured non-default SETTINGS" {
     try testing.expectEqual(@as(u64, 2), control.settings.qpack_blocked_streams);
     try testing.expectEqual(@as(?u64, 4096), control.settings.max_field_section_size);
     try testing.expect(control.settings.enable_connect_protocol);
+}
+
+test "H3 conn: early ticket snapshot uses defaults until peer SETTINGS arrive" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var snapshot: [early_data.encoded_snapshot_len]u8 = undefined;
+    const defaults = try client.encodePeerSettingsForEarlyDataTicket(&snapshot);
+    try testing.expectEqual(frame.Settings{}, try early_data.decodeSettingsSnapshot(defaults));
+
+    var server = H3.initWithSettings(allocator, .server, .{
+        .qpack_blocked_streams = 3,
+        .max_field_section_size = 8192,
+        .enable_connect_protocol = true,
+    });
+    defer server.deinit();
+    try server.start(&server_transport);
+    try client.pump(&client_transport);
+    const remembered = try client.encodePeerSettingsForEarlyDataTicket(&snapshot);
+    try testing.expectEqual(frame.Settings{
+        .qpack_blocked_streams = 3,
+        .max_field_section_size = 8192,
+        .enable_connect_protocol = true,
+    }, try early_data.decodeSettingsSnapshot(remembered));
 }
 
 test "H3 conn: duplicate QPACK encoder stream is a stream creation error" {

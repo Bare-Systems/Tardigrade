@@ -214,6 +214,7 @@ operate without guessing which config file or pid file is active.
 | Observability | [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
 | Proxy security | [docs/PROXY_SECURITY.md](docs/PROXY_SECURITY.md) |
 | Security test plan | [docs/SECURITY_TEST_PLAN.md](docs/SECURITY_TEST_PLAN.md) |
+| TLS interop & conformance matrix | [docs/TLS_INTEROP_MATRIX.md](docs/TLS_INTEROP_MATRIX.md) |
 | Pentest playbook | [docs/PENTEST_PLAYBOOK.md](docs/PENTEST_PLAYBOOK.md) |
 | Code review checklist | [docs/CODE_REVIEW_CHECKLIST.md](docs/CODE_REVIEW_CHECKLIST.md) |
 | Release checklist | [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) |

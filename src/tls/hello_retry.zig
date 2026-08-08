@@ -1059,6 +1059,13 @@ fn fuzzHrrAndClientHello2(_: void, smith: *testing.Smith) !void {
         error.TooManyExtensions,
         error.MessageTooLarge,
         error.IncompleteHandshake,
+        // #338: part of the shared handshake error set. Neither is reachable
+        // from HelloRetryRequest coding — an HRR is validated against the
+        // offers this client already sent, not negotiated afresh — but the
+        // set is enumerated exhaustively here so a newly added failure class
+        // cannot be silently swallowed by a catch-all.
+        error.NoMutualParameters,
+        error.UnsupportedProtocolVersion,
         => {},
     }
 
@@ -1176,6 +1183,13 @@ fn fuzzHrrAndClientHello2(_: void, smith: *testing.Smith) !void {
         error.TooManyExtensions,
         error.MessageTooLarge,
         error.IncompleteHandshake,
+        // #338: part of the shared handshake error set. Neither is reachable
+        // from HelloRetryRequest coding — an HRR is validated against the
+        // offers this client already sent, not negotiated afresh — but the
+        // set is enumerated exhaustively here so a newly added failure class
+        // cannot be silently swallowed by a catch-all.
+        error.NoMutualParameters,
+        error.UnsupportedProtocolVersion,
         => {},
     };
 }

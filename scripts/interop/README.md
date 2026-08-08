@@ -4,6 +4,15 @@ Focused out-of-process interop tests for the native Zig QUIC/HTTP-3 stack
 (`src/quic/` + `src/http3/`). External implementations run as **separate
 processes**; nothing foreign links into Tardigrade.
 
+> **Looking for the TLS conformance matrix?** `run-tls-interop.sh` (#338) is
+> the broad suite: the shared TLS 1.3 engine as both client and server, over
+> both the record and QUIC transports, across every supported
+> cipher-suite/group/signature tuple, against OpenSSL and GnuTLS, plus the
+> negative rows that pin the RFC 8446 §6 failure class. See
+> [`docs/TLS_INTEROP_MATRIX.md`](../../docs/TLS_INTEROP_MATRIX.md). This file
+> documents the narrower HTTP/3 *peer* matrix, which that suite links to rather
+> than duplicates.
+
 ## What it exercises
 
 For every peer, in both directions where practical: QUIC v1 + TLS 1.3

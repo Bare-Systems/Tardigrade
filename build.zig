@@ -798,6 +798,22 @@ pub fn build(b: *std.Build) void {
     quic_step.dependOn(&run_quic_h3_udp_tests.step);
     test_step.dependOn(&run_quic_h3_udp_tests.step);
 
+    // Shared interop/conformance matrix vocabulary (#338): the single place
+    // that maps a matrix row's cipher-suite/group/signature/ALPN names onto
+    // an engine policy. Both interop tools import it, so a row means the
+    // same thing on the record transport and on QUIC.
+    const tls_interop_matrix_mod = b.createModule(.{
+        .root_source_file = b.path("tests/tls_interop_matrix.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tls_interop_matrix_mod.addImport("tls_core", tls_core_mod);
+    const tls_interop_matrix_tests = b.addTest(.{ .root_module = tls_interop_matrix_mod });
+    const run_tls_interop_matrix_tests = b.addRunArtifact(tls_interop_matrix_tests);
+    const tls_interop_matrix_step = b.step("test-tls-interop-matrix", "Run #338 interop matrix vocabulary unit tests");
+    tls_interop_matrix_step.dependOn(&run_tls_interop_matrix_tests.step);
+    test_step.dependOn(&run_tls_interop_matrix_tests.step);
+
     // Out-of-process interop client/server for #247 phase 5. Built on the
     // native driver only; external peers (ngtcp2/nghttp3, quiche, aioquic)
     // run as separate processes — see scripts/interop/README.md.
@@ -810,6 +826,7 @@ pub fn build(b: *std.Build) void {
     h3_interop_mod.addImport("quic", quic_mod);
     h3_interop_mod.addImport("http3", http3_mod);
     h3_interop_mod.addImport("stream_transport", stream_transport_mod);
+    h3_interop_mod.addImport("tls_interop_matrix", tls_interop_matrix_mod);
     const h3_interop_tool = b.addExecutable(.{
         .name = "h3_interop_tool",
         .root_module = h3_interop_mod,
@@ -817,6 +834,27 @@ pub fn build(b: *std.Build) void {
     const h3_interop_install = b.addInstallArtifact(h3_interop_tool, .{});
     const h3_interop_step = b.step("build-h3-interop", "Build the native HTTP/3 interop client/server tool");
     h3_interop_step.dependOn(&h3_interop_install.step);
+
+    // Out-of-process record-transport TLS conformance driver (#338). Runs
+    // the shared engine as client or server against external peers
+    // (`openssl s_server`/`s_client`, `gnutls-serv`/`gnutls-cli`) over a
+    // real TCP socket — see scripts/interop/run-tls-interop.sh.
+    const tls_interop_mod = b.createModule(.{
+        .root_source_file = b.path("tests/tls_interop_tool.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tls_interop_mod.addImport("tls_core", tls_core_mod);
+    tls_interop_mod.addImport("crypto", crypto_mod);
+    tls_interop_mod.addImport("tls_interop_matrix", tls_interop_matrix_mod);
+    const tls_interop_tool = b.addExecutable(.{
+        .name = "tls_interop_tool",
+        .root_module = tls_interop_mod,
+    });
+    const tls_interop_install = b.addInstallArtifact(tls_interop_tool, .{});
+    const tls_interop_step = b.step("build-tls-interop", "Build the shared-TLS-engine record-transport interop client/server tool");
+    tls_interop_step.dependOn(&tls_interop_install.step);
 
     // Pure-Zig PKI foundation (#339): no system libraries. Consumes the
     // crypto-provider seam for certificate signature verification (#343).

@@ -447,6 +447,13 @@ pub const PureZigRecordStream = struct {
     expected_alpn_len: usize = 0,
     require_alpn: bool = false,
     certificate_state: events.CertificateState = .not_checked,
+    /// The description of the fatal alert the peer sent, retained alongside
+    /// the resulting `error.PeerFatalAlert` (#338). The error alone says only
+    /// *that* the peer rejected us; conformance work and operator diagnostics
+    /// need to know *which* RFC 8446 §6 failure class it chose, and a peer's
+    /// alert description is public wire data, never secret. Diagnostic only --
+    /// nothing in the stream's own state machine reads it.
+    peer_alert: ?alerts.AlertDescription = null,
     /// A terminal handshake failure whose emitted fatal alert is being flushed
     /// to the carrier before the stream latches closed (`drive()` step 13). The
     /// underlying failure is preserved regardless of whether the alert lands.
@@ -610,6 +617,15 @@ pub const PureZigRecordStream = struct {
     /// The peer certificate validation outcome the backend reported.
     pub fn certificateState(self: *const PureZigRecordStream) events.CertificateState {
         return self.certificate_state;
+    }
+
+    /// The description of the fatal alert the peer sent, when the stream
+    /// failed with `error.PeerFatalAlert` (#338). `null` when the peer sent no
+    /// fatal alert -- including when *this* side is the one that rejected the
+    /// handshake, whose own alert is derived from its typed failure through
+    /// `alerts.fromHandshakeError`.
+    pub fn peerAlert(self: *const PureZigRecordStream) ?alerts.AlertDescription {
+        return self.peer_alert;
     }
 
     pub fn deinit(self: *PureZigRecordStream) void {
@@ -1168,9 +1184,27 @@ pub const PureZigRecordStream = struct {
     /// ClientHello is what flips that flag, and happens before either
     /// epoch could plausibly move for a client that hasn't received
     /// anything back yet.
+    ///
+    /// #338: the epoch proxy alone is *not* sufficient for a server that
+    /// answered ClientHello1 with a HelloRetryRequest. An HRR flight derives
+    /// no traffic secrets, so both epochs are still `.initial` even though a
+    /// complete ClientHello has demonstrably been accepted -- and RFC 8446
+    /// §5.1 has a middlebox-compatibility client send `change_cipher_spec`
+    /// immediately after receiving the HRR, before ClientHello2. Rejecting it
+    /// there made the record transport unable to complete an HRR handshake
+    /// with essentially any real client (found by the external conformance
+    /// matrix against `openssl s_client -groups P-256:X25519`). Asking the
+    /// backend whether it has sent an HRR keeps the original property intact:
+    /// it is still driver-completion state, still only true after a fully
+    /// reassembled and accepted ClientHello, so a CCS spliced into the middle
+    /// of a partial ClientHello is rejected exactly as before.
     fn firstClientHelloAccepted(self: *const PureZigRecordStream) bool {
         if (self.role == .client) return self.handshake_started;
-        return self.read_epoch != .initial or self.write_epoch != .initial;
+        if (self.read_epoch != .initial or self.write_epoch != .initial) return true;
+        // Captured by pointer: the driver embeds a multi-kilobyte `EventSink`,
+        // and this runs once per inbound change_cipher_spec record.
+        if (self.handshake_driver) |*driver| return driver.backend.helloRetryRequestSent();
+        return false;
     }
 
     /// Capture the negotiated ALPN. RFC 7301 caps a protocol name at 255 bytes;
@@ -1212,6 +1246,10 @@ pub const PureZigRecordStream = struct {
             error.DecryptError,
             error.MissingExtension,
             error.UnsupportedCertificate,
+            // #338: no-overlap and version-negotiation failures carry their
+            // own RFC-mandated alerts (handshake_failure, protocol_version).
+            error.NoMutualParameters,
+            error.UnsupportedProtocolVersion,
             => alerts.fromHandshakeError(@errorCast(err)),
             else => null,
         };
@@ -1623,6 +1661,10 @@ pub const PureZigRecordStream = struct {
             return;
         }
         if (description == .user_canceled) return;
+        // Recorded before failing so the failure class survives the teardown
+        // (#338). Only the first fatal alert is kept: it is the one that
+        // actually ended the connection.
+        if (self.peer_alert == null) self.peer_alert = description;
         return self.fail(error.PeerFatalAlert);
     }
 

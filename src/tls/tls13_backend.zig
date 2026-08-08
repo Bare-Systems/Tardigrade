@@ -1528,7 +1528,15 @@ pub const Tls13Backend = struct {
             .earlyDataAttemptedFn = earlyDataAttemptedImpl,
             .earlyDataMaxBytesFn = earlyDataMaxBytesImpl,
             .earlyDataDiscardLimitFn = earlyDataDiscardLimitImpl,
+            .helloRetryRequestSentFn = helloRetryRequestSentImpl,
         };
+    }
+
+    /// #338: a server has sent a HelloRetryRequest, which it only does after
+    /// accepting a complete first ClientHello. See `helloRetryRequestSentFn`.
+    fn helloRetryRequestSentImpl(ptr: *anyopaque) bool {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.core.retry_state == .hrr_sent;
     }
 
     fn earlyDataAttemptedImpl(ptr: *anyopaque) bool {
@@ -2312,6 +2320,36 @@ pub const Tls13Backend = struct {
             error.CredentialProviderFailed => error.CredentialProviderFailed,
             error.ClientCertificateRequired => error.ClientCertificateRequired,
             error.DecryptError => error.DecryptError,
+            // #338: raised by policy negotiation (`mapNegotiationError`), not
+            // the codec core, but likewise part of the shared error set.
+            error.NoMutualParameters => error.NoMutualParameters,
+            error.UnsupportedProtocolVersion => error.UnsupportedProtocolVersion,
+        };
+    }
+
+    /// #338: the same negotiation failure carries a *different* RFC-mandated
+    /// alert depending on which side observed it, so the two directions map
+    /// separately.
+    ///
+    /// This is the server reading a peer's ClientHello. "No mutually supported
+    /// cipher suite/group/signature scheme" here means the two endpoints share
+    /// nothing — every value the client sent was individually legal — and
+    /// RFC 8446 §4.1.1 requires `handshake_failure` rather than a
+    /// parameter-validity complaint. Likewise §4.2.1 gives version negotiation
+    /// its own `protocol_version` alert.
+    ///
+    /// `mapNegotiationError` stays as-is for the client direction: a
+    /// ServerHello naming a suite, group, or version the client never offered
+    /// is the *server* violating the protocol, which RFC 8446 §4.1.3/§4.2.1
+    /// say the client rejects with `illegal_parameter`.
+    fn mapPeerHelloNegotiationError(err: tls_negotiation.Error) HandshakeError {
+        return switch (err) {
+            error.NoMutualCipherSuite,
+            error.NoMutualNamedGroup,
+            error.NoMutualSignatureScheme,
+            => error.NoMutualParameters,
+            error.UnsupportedProtocolVersion => error.UnsupportedProtocolVersion,
+            else => mapNegotiationError(err),
         };
     }
 
@@ -4075,7 +4113,7 @@ pub const Tls13Backend = struct {
         const parsed = tls_negotiation.parseClientHelloObserved(body, .{
             .ctx = &observer,
             .observeFn = ClientHelloObserver.observe,
-        }) catch |err| return mapNegotiationError(err);
+        }) catch |err| return mapPeerHelloNegotiationError(err);
         const offers = parsed.offers;
         // #484: `drainInput`'s preflight (`validateSecondClientHelloAgainstRetained`)
         // already validated this ClientHello2 against the retained
@@ -4099,7 +4137,7 @@ pub const Tls13Backend = struct {
         // fallback.
         var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
         var groups_storage: [native_named_groups.len]tls_algorithms.NamedGroup = undefined;
-        const hello_selection = tls_negotiation.negotiateServerHello(self.effectivePolicy(&suites_storage, &groups_storage), &offers) catch |err| return mapNegotiationError(err);
+        const hello_selection = tls_negotiation.negotiateServerHello(self.effectivePolicy(&suites_storage, &groups_storage), &offers) catch |err| return mapPeerHelloNegotiationError(err);
         if (hello_selection.version != .tls13) return error.IllegalParameter;
         // #564: commit the negotiated suite — and select the transcript's
         // hash family accordingly — as soon as it is known, before any

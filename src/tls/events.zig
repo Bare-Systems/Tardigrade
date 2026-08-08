@@ -93,6 +93,25 @@ pub const HandshakeError = error{
     /// terminating with the `decrypt_error` alert, distinct from a trust
     /// rejection (`CertificateInvalid`/bad_certificate).
     DecryptError,
+    /// There is no overlap between what the peer offered and what local policy
+    /// enables along some negotiated dimension — cipher suite, named group, or
+    /// signature scheme. Every field the peer sent was individually
+    /// well-formed and legal, so this is *not* `IllegalParameter`: the two
+    /// sides simply have nothing in common.
+    ///
+    /// RFC 8446 §4.1.1 is explicit that this case terminates with
+    /// `handshake_failure` (or `insufficient_security`), and #338's external
+    /// conformance matrix asserts that against real peers. Folding it into
+    /// `IllegalParameter` sent `illegal_parameter` instead, which told a peer
+    /// its ClientHello was malformed when it was perfectly valid.
+    NoMutualParameters,
+    /// The peer's `supported_versions` was present and well-formed but offered
+    /// no version this endpoint supports. RFC 8446 §4.2.1 requires aborting
+    /// with the `protocol_version` alert specifically, so a peer can tell a
+    /// version-negotiation failure from a malformed hello. Distinct from a
+    /// ClientHello with no `supported_versions` at all, which is
+    /// `MissingExtension`.
+    UnsupportedProtocolVersion,
 };
 
 /// The transcript/HKDF hash a negotiated cipher suite selects

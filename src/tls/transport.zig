@@ -307,6 +307,14 @@ pub fn ContractWithOptions(
             earlyDataAttemptedFn: ?*const fn (ptr: *anyopaque) bool = null,
             earlyDataMaxBytesFn: ?*const fn (ptr: *anyopaque) u32 = null,
             earlyDataDiscardLimitFn: ?*const fn (ptr: *anyopaque) u32 = null,
+            /// True once this side has *sent* a HelloRetryRequest (#338).
+            /// Only a server ever does, and only after it has accepted a
+            /// complete, well-formed first ClientHello -- which is precisely
+            /// what a record-layer transport needs to know to open RFC 8446
+            /// §5.1's middlebox-compatibility window, since an HRR flight
+            /// derives no traffic secrets to infer that from. Backends that
+            /// never emit HRR leave this null.
+            helloRetryRequestSentFn: ?*const fn (ptr: *anyopaque) bool = null,
 
             pub fn start(self: Backend, role: state.Role, params: TransportParameters, sink: *EventSink) ErrorSet!void {
                 return self.startFn(self.ptr, role, params, sink);
@@ -346,6 +354,14 @@ pub fn ContractWithOptions(
             pub fn earlyDataDiscardLimit(self: Backend) u32 {
                 if (self.earlyDataDiscardLimitFn) |f| return f(self.ptr);
                 return 0;
+            }
+
+            /// See `helloRetryRequestSentFn`. Defaults to false, which keeps
+            /// the middlebox-compatibility window closed for any backend that
+            /// does not report HRR -- the conservative direction.
+            pub fn helloRetryRequestSent(self: Backend) bool {
+                if (self.helloRetryRequestSentFn) |f| return f(self.ptr);
+                return false;
             }
 
             pub fn deinit(self: Backend) void {

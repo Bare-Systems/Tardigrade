@@ -4,7 +4,51 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **HelloRetryRequest handshakes failed against compatibility-mode TLS clients
+  (#338)** — RFC 8446 §5.1 has a client send `change_cipher_spec` immediately
+  after receiving a HelloRetryRequest, before ClientHello2. An HRR flight
+  derives no traffic secrets, so the record transport's "has a ClientHello been
+  accepted yet?" test — which inferred the answer from encryption-epoch
+  movement — still said no, and the legal record was rejected with
+  `UnexpectedRecordContent`. In practice that meant the native TLS listener
+  could not complete an HRR handshake with essentially any real client. The
+  record transport now asks the backend whether it has sent an HRR
+  (`Backend.helloRetryRequestSent`), which is likewise only true after a
+  complete, accepted ClientHello — so a `change_cipher_spec` spliced into a
+  *partial* ClientHello is still rejected exactly as before. Found by the new
+  external conformance matrix and covered by socket-harness regressions in
+  both directions.
+- **No-overlap negotiation failures sent the wrong TLS alert (#338)** — no
+  mutually supported cipher suite, named group, or signature scheme was
+  reported as `illegal_parameter`, telling the peer its ClientHello was
+  malformed when every value in it was legal. RFC 8446 §4.1.1 requires
+  `handshake_failure` (or `insufficient_security`). Adds the distinct
+  `NoMutualParameters` handshake failure for that case, plus a distinct
+  `UnsupportedProtocolVersion` failure mapping to the `protocol_version` alert
+  per RFC 8446 §4.2.1 rather than being folded into `illegal_parameter`.
+
 ### Testing
+- **Shared TLS-engine interoperability and conformance suite (#338, research
+  story 323-J)** — an automated external matrix that drives the one TLS 1.3
+  engine as both client and server, over both the record and QUIC transports,
+  against independent out-of-process implementations (OpenSSL and GnuTLS; no
+  foreign code is linked in). `scripts/interop/run-tls-interop.sh` walks every
+  supported cipher-suite × group × signature tuple in both roles and asserts on
+  what was actually negotiated rather than merely that a handshake completed,
+  exercises HelloRetryRequest in both directions, and pins the RFC 8446 §6
+  failure class for the negative rows (ALPN/cipher/group/signature no-overlap,
+  TLS 1.2 downgrade, absent SNI, wrong pinned certificate, and two malformed
+  record-ordering cases). Both transports build their negotiation policy from a
+  single shared vocabulary (`tests/tls_interop_matrix.zig`, derived from the
+  engine's own `native_capabilities`), so a matrix row means the same engine
+  configuration on either transport and a newly supported algorithm becomes a
+  new row automatically. Adds the `tls_interop_tool` record-transport driver
+  (`zig build build-tls-interop`), matrix flags and policy-configurable QUIC
+  constructors for the existing `h3_interop_tool`, secret-free transcripts and
+  reduced failure fixtures for every row, a reduced `--profile ci` that keeps
+  both roles, both transports, every cipher suite and every negative row, and a
+  CI job running it on every PR. Documented in `docs/TLS_INTEROP_MATRIX.md`.
 - **Shared crypto fuzzing contract and CryptoProvider fuzz targets (#376,
   epic #327-G)** — adds `docs/CRYPTO_FUZZ_CONTRACT.md`, the shared
   deterministic-reproduction/bounded-work/arithmetic-safety/lifetime/secret-

@@ -55,10 +55,32 @@ pub fn fromHandshakeError(err: events.HandshakeError) AlertDescription {
         // A CertificateVerify signature failed proof of possession
         // (RFC 8446 §4.4.3).
         error.DecryptError => .decrypt_error,
+        // No overlap along a negotiated dimension. RFC 8446 §4.1.1: "it MUST
+        // abort the handshake with either a 'handshake_failure' or
+        // 'insufficient_security' fatal alert."
+        error.NoMutualParameters => .handshake_failure,
+        // RFC 8446 §4.2.1: a server that cannot select a supported version
+        // aborts with `protocol_version`, not a generic parameter alert.
+        error.UnsupportedProtocolVersion => .protocol_version,
     };
 }
 
 const testing = @import("std").testing;
+
+test "#338 no overlap along a negotiated dimension maps to handshake_failure, not illegal_parameter" {
+    // RFC 8446 §4.1.1. `illegal_parameter` would tell the peer its
+    // ClientHello was malformed when every value in it was legal; external
+    // implementations report the two classes differently, so the distinction
+    // is observable in the #338 conformance matrix.
+    try testing.expectEqual(AlertDescription.handshake_failure, fromHandshakeError(error.NoMutualParameters));
+    try testing.expect(fromHandshakeError(error.NoMutualParameters) != fromHandshakeError(error.IllegalParameter));
+}
+
+test "#338 an unsupported offered version maps to protocol_version" {
+    // RFC 8446 §4.2.1 names this alert specifically so a peer can tell a
+    // version-negotiation failure from a malformed hello.
+    try testing.expectEqual(AlertDescription.protocol_version, fromHandshakeError(error.UnsupportedProtocolVersion));
+}
 
 test "malformed handshake bytes map to decode_error" {
     try testing.expectEqual(AlertDescription.decode_error, fromHandshakeError(error.MalformedHandshake));

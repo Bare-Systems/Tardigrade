@@ -264,8 +264,29 @@ pub const Tls13Backend = struct {
     }
 
     pub fn initClientWithOptions(entropy: Entropy, tls_crypto_provider: crypto_provider.CryptoProvider, trust: Trust, options: ClientOptions) Tls13Backend {
+        return initClientWithPolicyAndOptions(entropy, tls_crypto_provider, trust, tls_core.policy.Policy.quicDefault(), options);
+    }
+
+    /// QUIC's transport-parameters extension profile, with an explicitly
+    /// supplied negotiation policy instead of `quicDefault()` (#338). The
+    /// external conformance matrix needs to pin one cipher-suite/group/
+    /// signature tuple per row and run it over *both* transports; without
+    /// this, a QUIC row could only ever exercise the default policy while the
+    /// record transport walked the whole matrix.
+    ///
+    /// `policy.transport_mode` must be `.quic`: the mode is what selects
+    /// QUIC's own extension handling inside the engine, and a record-mode
+    /// policy here would silently produce a handshake that is neither.
+    pub fn initClientWithPolicyAndOptions(
+        entropy: Entropy,
+        tls_crypto_provider: crypto_provider.CryptoProvider,
+        trust: Trust,
+        policy: tls_core.policy.Policy,
+        options: ClientOptions,
+    ) Tls13Backend {
+        std.debug.assert(policy.transport_mode == .quic);
         return .{ .engine = shared.Tls13Backend.initClientConfigured(entropy, tls_crypto_provider, trust, .{
-            .policy = tls_core.policy.Policy.quicDefault(),
+            .policy = policy,
             .transport = .{ .extension = .{
                 .extension_type = ext_quic_transport_parameters,
                 .local = "",
@@ -296,8 +317,22 @@ pub const Tls13Backend = struct {
     }
 
     pub fn initServer(entropy: Entropy, tls_crypto_provider: crypto_provider.CryptoProvider, identity: Identity) Tls13Backend {
+        return initServerWithPolicy(entropy, tls_crypto_provider, identity, tls_core.policy.Policy.quicDefault());
+    }
+
+    /// The server counterpart to `initClientWithPolicyAndOptions` (#338):
+    /// QUIC's extension profile with an explicitly supplied negotiation
+    /// policy, so a conformance row can pin the same tuple on both roles.
+    /// `policy.transport_mode` must be `.quic`.
+    pub fn initServerWithPolicy(
+        entropy: Entropy,
+        tls_crypto_provider: crypto_provider.CryptoProvider,
+        identity: Identity,
+        policy: tls_core.policy.Policy,
+    ) Tls13Backend {
+        std.debug.assert(policy.transport_mode == .quic);
         return .{ .engine = shared.Tls13Backend.initServerConfigured(entropy, tls_crypto_provider, identity, .{
-            .policy = tls_core.policy.Policy.quicDefault(),
+            .policy = policy,
             .transport = .{ .extension = .{
                 .extension_type = ext_quic_transport_parameters,
                 .local = "",

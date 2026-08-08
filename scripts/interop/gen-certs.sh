@@ -1,8 +1,14 @@
 #!/bin/sh
-# Generate the interop test certificates (#247): one Ed25519 identity (the
-# native stack's default profile; accepted by GnuTLS/OpenSSL peers) and one
+# Generate the interop test certificates (#247, #338): one Ed25519 identity
+# (the native stack's default profile; accepted by GnuTLS/OpenSSL peers), one
 # ECDSA P-256 identity (required by BoringSSL-based peers such as quiche,
-# whose default verifier does not offer Ed25519).
+# whose default verifier does not offer Ed25519), and one RSA-2048 identity
+# (the credential the `rsa-pss-rsae-sha256` rows of the #338 conformance
+# matrix need; 2048 bits keeps the DER leaf inside the engine's
+# `max_certificate_len`).
+#
+# The signature dimension of the matrix picks which of these a row uses --
+# see `identityKeyForSignature` in tests/tls_interop_matrix.zig.
 #
 # usage: gen-certs.sh OUT_DIR
 set -eu
@@ -23,5 +29,6 @@ gen() { # name algo-args...
 
 gen ed25519 -algorithm ed25519
 gen p256 -algorithm EC -pkeyopt ec_paramgen_curve:P-256
+gen rsa2048 -algorithm RSA -pkeyopt rsa_keygen_bits:2048
 
 echo "certificates written to $out"

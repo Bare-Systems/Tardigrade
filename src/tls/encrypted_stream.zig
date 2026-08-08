@@ -756,12 +756,16 @@ pub const PureZigRecordStream = struct {
     }
 
     /// Complete an orderly close. Beyond dropping every owned buffer this also
-    /// wipes the bridge's key material: a `.closed` stream rejects every entry
-    /// point, so no record can ever be sealed or opened again, and leaving
-    /// application traffic keys resident until an eventual `deinit()` is
-    /// retention without a purpose. `fail()` already wipes them on the terminal
-    /// path; this is the same rule for the orderly one.
+    /// releases the two other holders of secret-bearing state -- the handshake
+    /// driver (whose borrowed `EventSink` may still hold copied traffic-secret
+    /// scratch until `Driver.deinit()`, per the transport contract) and the
+    /// bridge's key material. A `.closed` stream rejects every entry point, so
+    /// no record can ever be sealed or opened again and nothing here can be
+    /// needed again; holding either until an eventual outer `deinit()` is
+    /// retention without a purpose. This is the same teardown order `deinit()`
+    /// and `fail()` use, for the orderly path.
     fn finishClose(self: *PureZigRecordStream) void {
+        self.teardownDriver();
         self.clearOwnedQueues();
         self.bridge.deinit();
         self.lifecycle = .closed;
@@ -1767,7 +1771,11 @@ pub const PureZigRecordStream = struct {
         return @as(u64, plaintext_limit) + records * overhead_per_record;
     }
 
+    /// A torn-down driver is never polled again: `finishClose`/`fail`/`deinit`
+    /// release the backend, and `drive()` can reach this predicate later in the
+    /// same call after an in-loop `queueCloseNotify` completed the close.
     fn authStillPending(self: *const PureZigRecordStream) bool {
+        if (self.driver_torn_down) return false;
         if (self.handshake_driver) |*driver| return driver.authPending();
         return false;
     }
@@ -4229,6 +4237,9 @@ const ScriptedRecordBackend = struct {
     auth_pending: bool = false,
     auth_pending_polls: usize = 0,
     auth_poll_count: usize = 0,
+    /// How many times the stream released this backend. `Driver.deinit` is not
+    /// idempotent, so this must never exceed one.
+    deinit_count: usize = 0,
 
     const hs_c2s = secret(0x11);
     const hs_s2c = secret(0x22);
@@ -4236,7 +4247,12 @@ const ScriptedRecordBackend = struct {
     const app_s2c = secret(0x44);
 
     fn recordBackend(self: *ScriptedRecordBackend) RecordHandshakeBackend {
-        return .{ .ptr = self, .startFn = start, .receiveFn = receive, .authPendingFn = authPending, .resumeFn = resumeAuth };
+        return .{ .ptr = self, .startFn = start, .receiveFn = receive, .authPendingFn = authPending, .resumeFn = resumeAuth, .deinitFn = backendDeinit };
+    }
+
+    fn backendDeinit(ptr: *anyopaque) void {
+        const self: *ScriptedRecordBackend = @ptrCast(@alignCast(ptr));
+        self.deinit_count += 1;
     }
 
     fn start(ptr: *anyopaque, role: tls_state.Role, _: void, sink: *RecordTransport.EventSink) RecordHandshakeError!void {
@@ -5042,8 +5058,12 @@ const StreamOracle = struct {
     peer_sent: usize = 0,
     /// Plaintext bytes the subject delivered to its application.
     subject_received: usize = 0,
-    /// False once the peer saw `close_notify` or failed: it then swallows
-    /// further input, so it can no longer witness the subject's byte stream.
+    /// False once the peer has seen the subject's `close_notify`: from then on
+    /// it swallows further input by contract, so it can no longer witness the
+    /// subject's byte stream. This is the *only* thing that retires the peer --
+    /// a record the peer cannot open or parse means the subject emitted bytes
+    /// the real record path rejects, which is precisely the corruption this
+    /// target exists to catch, so those errors propagate and fail the case.
     peer_usable: bool = true,
     /// The subject's latched terminal error, once one exists.
     terminal: ?anyerror = null,
@@ -5056,11 +5076,11 @@ fn drainPeerPlaintext(peer: *PureZigRecordStream, oracle: *StreamOracle) !void {
     var rounds: usize = 0;
     while (rounds < fuzz_stream_sync_rounds) : (rounds += 1) {
         const n = peer.readPlaintext(&buf) catch |err| switch (err) {
+            // Nothing buffered, or a peer that has already seen `close_notify`.
             error.WouldBlock, error.EndOfStream => return,
-            else => {
-                oracle.peer_usable = false;
-                return;
-            },
+            // Anything else means the plaintext the subject produced could not
+            // be delivered by the real record path.
+            else => return err,
         };
         if (n == 0) return;
         for (buf[0..n], 0..) |byte, i| {
@@ -5083,13 +5103,14 @@ fn syncCapture(carrier: *ScriptedCarrier, peer: *PureZigRecordStream, oracle: *S
     }
     var rounds: usize = 0;
     while (carrier.captured_len > 0 and rounds < fuzz_stream_sync_rounds) : (rounds += 1) {
+        // Only `WouldBlock` is an expected outcome here: it is the peer's own
+        // buffer pressure, and the same bytes are retried next round. Every
+        // other error means the subject emitted ciphertext the real record path
+        // could not authenticate or frame, so it must fail the case rather than
+        // quietly retire the oracle.
         const consumed = peer.feedCiphertext(carrier.captureSlice()) catch |err| switch (err) {
             error.WouldBlock => 0,
-            else => {
-                oracle.peer_usable = false;
-                carrier.captured_len = 0;
-                return;
-            },
+            else => return err,
         };
         if (consumed > 0) carrier.consumeCapture(consumed);
         try drainPeerPlaintext(peer, oracle);
@@ -5124,18 +5145,17 @@ fn enqueuePeerRecord(
 
     var chunk: [fuzz_stream_peer_chunk]u8 = undefined;
     for (chunk[0..len], 0..) |*byte, i| byte.* = peerStreamByte(oracle.peer_sent + i);
+    // `WouldBlock` is the peer's own outbound backpressure and simply means
+    // "not this round"; anything else is a real defect in the record path.
     const n = peer.writePlaintext(chunk[0..len]) catch |err| switch (err) {
         error.WouldBlock => return,
-        else => {
-            oracle.peer_usable = false;
-            return;
-        },
+        else => return err,
     };
 
     var buf: [256]u8 = undefined;
     while (peer.queuedCiphertextLen() > 0) {
-        const moved = peer.drainCiphertext(&buf) catch break;
-        if (moved == 0) break;
+        const moved = try peer.drainCiphertext(&buf);
+        try testing.expect(moved > 0);
         try testing.expect(carrier.pushInbound(buf[0..moved]));
     }
     oracle.peer_sent += n;
@@ -5246,8 +5266,13 @@ fn driveChecked(
     if (result.made_progress) {
         try testing.expect(read_bytes + write_bytes > 0 or state_changed);
     } else {
-        // ...and a drive that reports none must not have moved a byte in or
-        // out of any owned queue.
+        // ...and a drive that reports none moved no carrier byte, changed no
+        // observable state, and left every owned queue exactly as it was. This
+        // is the full "no spin under repeated zero-progress readiness"
+        // property, not just one projection of it.
+        try testing.expectEqual(@as(usize, 0), read_bytes);
+        try testing.expectEqual(@as(usize, 0), write_bytes);
+        try testing.expect(!state_changed);
         try testing.expect(std.meta.eql(queues_before, subject.bufferSnapshot().current));
     }
     return result;
@@ -5414,9 +5439,17 @@ fn fuzzEncryptedStreamProgressionInput(_: void, smith: *std.testing.Smith) !void
     var write_src: [record_codec.max_plaintext_fragment_len]u8 = undefined;
     var read_buf: [fuzz_stream_max_read_buf]u8 = undefined;
 
-    for (0..smith.index(4)) |_| {
+    // Every case carries real bytes in both directions before the fuzzer's
+    // program starts: one mandatory inbound record and one mandatory
+    // application write, plus a fuzzer-chosen number of extra inbound records.
+    // Without that floor a program whose scripts never move a byte would reach
+    // the accounting assertions with nothing to account for.
+    for (0..1 + smith.index(3)) |_| {
         try enqueuePeerRecord(&peer, &carrier_state, &oracle, 1 + smith.index(fuzz_stream_peer_chunk));
     }
+    try subjectWriteOnce(&subject, &oracle, write_src[0 .. 1 + smith.index(64)]);
+    try testing.expect(oracle.peer_sent > 0);
+    try testing.expect(oracle.subject_sent > 0);
     try checkStreamInvariants(&subject, &carrier_state);
 
     var torn_down = false;
@@ -5508,6 +5541,52 @@ fn fuzzEncryptedStreamProgressionInput(_: void, smith: *std.testing.Smith) !void
         try checkStreamInvariants(&subject, &carrier_state);
         if (oracle.terminal != null) break;
         if (!result.made_progress and oracle.subject_received == before_received) break;
+    }
+
+    if (oracle.terminal) |err| {
+        try expectStableTerminal(&subject, &carrier_state, err);
+        if (carrier_state.owns_handle) try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+        return;
+    }
+
+    // Deterministic epilogue. The scripts have already done their fragmentation
+    // work; lifting the obstruction lets everything still queued or in flight
+    // drain, so the byte accounting below is actually reached instead of being
+    // skipped for any case whose script happened never to let a byte through.
+    // This is what makes the seed-corpus replay a real end-to-end check on
+    // every record the subject emitted and every record it consumed.
+    if (subject.lifecycle != .closed and !subject.carrier_eof) {
+        // Stage one opens the write side only. Every drive here is a
+        // *write-only* drive, so the carrier bytes it moves are the sole thing
+        // that can justify `made_progress` -- which is what makes
+        // `driveChecked`'s no-progress branch a real check rather than one a
+        // concurrent read could satisfy on its behalf.
+        carrier_state.read_script_len = 1;
+        carrier_state.read_script[0] = .would_block;
+        carrier_state.write_script_len = 1;
+        carrier_state.write_script[0] = .{ .transfer = scripted_capture_capacity };
+        var drain_rounds: usize = 0;
+        while (oracle.terminal == null and drain_rounds < fuzz_stream_flush_rounds) : (drain_rounds += 1) {
+            const result = try driveChecked(&subject, &carrier_state, &oracle) orelse break;
+            try syncCapture(&carrier_state, &peer, &oracle);
+            try checkStreamInvariants(&subject, &carrier_state);
+            if (oracle.terminal != null or !result.made_progress) break;
+        }
+        try testing.expect(drain_rounds < fuzz_stream_flush_rounds);
+
+        // Stage two opens the read side too and settles the whole stream.
+        carrier_state.read_script[0] = .{ .transfer = scripted_inbound_capacity };
+        var epilogue_rounds: usize = 0;
+        while (oracle.terminal == null and epilogue_rounds < fuzz_stream_flush_rounds) : (epilogue_rounds += 1) {
+            const before_received = oracle.subject_received;
+            const result = try driveChecked(&subject, &carrier_state, &oracle) orelse break;
+            try syncCapture(&carrier_state, &peer, &oracle);
+            try subjectReadOnce(&subject, &oracle, &read_buf);
+            try checkStreamInvariants(&subject, &carrier_state);
+            if (oracle.terminal != null) break;
+            if (!result.made_progress and oracle.subject_received == before_received) break;
+        }
+        try testing.expect(epilogue_rounds < fuzz_stream_flush_rounds);
     }
 
     if (oracle.terminal) |err| {
@@ -5693,7 +5772,8 @@ fn cleanupAuthenticationFailureCase(smith: *std.testing.Smith, cp: provider.Cryp
     try establishForSuite(&peer, &subject, suite);
 
     var oracle = StreamOracle{};
-    // Optionally put genuine plaintext ahead of the tampered record.
+    // Optionally put genuine plaintext ahead of the tampered record. Bounded so
+    // the fixed inbound queue always keeps room for the tampered record itself.
     for (0..smith.index(3)) |_| {
         try enqueuePeerRecord(&peer, &carrier_state, &oracle, 1 + smith.index(fuzz_stream_peer_chunk));
     }
@@ -5708,16 +5788,23 @@ fn cleanupAuthenticationFailureCase(smith: *std.testing.Smith, cp: provider.Cryp
     // it: this record's content is never legitimate output, so if any byte of
     // it ever reached the application, `subjectReadOnce`'s per-byte check would
     // reject it rather than mistake it for the stream continuing.
+    //
+    // Every step of this construction is deterministic once the family is
+    // selected: the peer is open with a drained outbound queue, one sealed
+    // record is at most `header + chunk + type + tag` bytes, and the inbound
+    // queue was reserved with room to spare. Nothing here may quietly return
+    // and let the case pass without testing the property it is named for.
     const content_len = 1 + smith.index(fuzz_stream_peer_chunk);
     var content: [fuzz_stream_peer_chunk]u8 = undefined;
     for (content[0..content_len], 0..) |*byte, i| byte.* = ~peerStreamByte(oracle.peer_sent + i);
-    _ = peer.writePlaintext(content[0..content_len]) catch return;
+    try testing.expectEqual(content_len, try peer.writePlaintext(content[0..content_len]));
     var record_buf: [256]u8 = undefined;
-    const record_len = peer.drainCiphertext(&record_buf) catch return;
-    if (record_len <= record_codec.header_len) return;
+    const record_len = try peer.drainCiphertext(&record_buf);
+    try testing.expectEqual(@as(usize, 0), peer.queuedCiphertextLen());
+    try testing.expect(record_len > record_codec.header_len);
     const offset = record_codec.header_len + smith.index(record_len - record_codec.header_len);
     record_buf[offset] ^= @as(u8, 1) << @intCast(smith.index(8));
-    if (!carrier_state.pushInbound(record_buf[0..record_len])) return;
+    try testing.expect(carrier_state.pushInbound(record_buf[0..record_len]));
 
     var read_buf: [fuzz_stream_max_read_buf]u8 = undefined;
     var drives: usize = 0;
@@ -5730,13 +5817,12 @@ fn cleanupAuthenticationFailureCase(smith: *std.testing.Smith, cp: provider.Cryp
     }
     try testing.expect(drives < 256);
 
-    // The tampered record reached the bridge only if the carrier script let it
-    // through; when it did, the failure is exactly `AuthenticationFailed`.
-    if (oracle.terminal) |err| {
-        try testing.expectEqual(@as(anyerror, error.AuthenticationFailed), err);
-        try expectStableTerminal(&subject, &carrier_state, err);
-        if (carrier_state.owns_handle) try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
-    }
+    // The tampered record always reaches the bridge -- the read script's first
+    // step is forced to transfer, and `drive_record_budget` comfortably covers
+    // the at most three records queued -- so the outcome is unconditional.
+    try testing.expectEqual(@as(?anyerror, error.AuthenticationFailed), oracle.terminal);
+    try expectStableTerminal(&subject, &carrier_state, error.AuthenticationFailed);
+    if (carrier_state.owns_handle) try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
     // Whatever was delivered before the failure was genuine peer plaintext,
     // never the tampered record's contents: `subjectReadOnce` checks every
     // byte against the generated stream, and the tampered record's plaintext
@@ -5807,23 +5893,24 @@ fn cleanupEpochTransitionCase(smith: *std.testing.Smith, cp: provider.CryptoProv
 }
 
 /// Teardown with every owned buffer, both parsers, and a pending terminal state
-/// populated at once.
+/// populated *at once*. Each of those states is dirtied deterministically and
+/// asserted nonzero immediately before `deinit()`, so the zeroization checks
+/// that follow cannot pass vacuously against storage that was never written.
 fn cleanupTeardownCase(smith: *std.testing.Smith, cp: provider.CryptoProvider, suite: algorithms.CipherSuite) !void {
     var carrier_state = ScriptedCarrier{ .owns_handle = smith.index(2) == 0 };
+    // Both directions blocked, so nothing this case queues can drain before
+    // teardown observes it.
     carrier_state.read_script_len = 1;
-    carrier_state.read_script[0] = .{ .transfer = scripted_inbound_capacity };
+    carrier_state.read_script[0] = .would_block;
     carrier_state.write_script_len = 1;
     carrier_state.write_script[0] = .would_block;
 
-    var peer = PureZigRecordStream.init(.client, cp, suite);
-    defer peer.deinit();
     var subject = PureZigRecordStream.initWithCarrier(.server, cp, suite, carrier_state.carrier());
     defer subject.deinit();
 
     const secret_len = algorithms.transcriptHash(suite).digestLength();
     const client_hs = wideSecret(0x61);
     const server_hs = wideSecret(0x62);
-    try peer.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = client_hs[0..secret_len] } });
     try subject.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = client_hs[0..secret_len] } });
     try subject.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = server_hs[0..secret_len] } });
     subject.write_epoch = .handshake;
@@ -5831,25 +5918,57 @@ fn cleanupTeardownCase(smith: *std.testing.Smith, cp: provider.CryptoProvider, s
     // Outbound ciphertext: sealed handshake records the blocked carrier cannot
     // drain.
     for (0..1 + smith.index(3)) |_| {
-        subject.applyEvent(.{ .handshake_bytes = .{ .epoch = .handshake, .data = "server-handshake-flight" } }) catch break;
+        try subject.applyEvent(.{ .handshake_bytes = .{ .epoch = .handshake, .data = "server-handshake-flight" } });
     }
 
-    // Inbound handshake plaintext, plus a partial record left in the parser.
-    var record_buf: [256]u8 = undefined;
-    try peer.applyEvent(.{ .handshake_bytes = .{ .epoch = .handshake, .data = "client-handshake-flight" } });
-    const sealed = try peer.drainCiphertext(&record_buf);
-    _ = subject.feedHandshakeCiphertext(.handshake, record_buf[0..sealed]) catch {};
-    const partial_len = 1 + smith.index(record_codec.header_len + 2);
-    _ = subject.feedHandshakeCiphertext(.handshake, record_buf[0..@min(partial_len, sealed)]) catch {};
+    // Both parsers dirty simultaneously: a partial plaintext record buffered at
+    // the initial epoch and a partial protected record buffered at the
+    // handshake epoch. `feedOne`'s exact-consumption contract means a nonzero
+    // length in either can only be a genuinely incomplete record.
+    const initial_partial = [_]u8{ @intFromEnum(record_codec.ContentType.handshake), 0x03, 0x03 };
+    _ = try subject.feedHandshakeCiphertext(.initial, initial_partial[0 .. 1 + smith.index(initial_partial.len)]);
+    const protected_partial = [_]u8{
+        @intFromEnum(record_codec.ContentType.application_data),
+        0x03,
+        0x03,
+        0x00,
+        0x10,
+        0x01,
+        0x02,
+        0x03,
+    };
+    _ = try subject.feedHandshakeCiphertext(
+        .handshake,
+        protected_partial[0 .. record_codec.header_len + 1 + smith.index(3)],
+    );
 
-    // Carrier input the read budget has not reached yet.
+    // Inbound plaintext with its provenance shadow, inbound handshake bytes,
+    // and carrier input the read budget has not reached. These go through the
+    // stream's own append accessors so the provenance shadow stays in step.
+    // Normal lifecycle rules cannot leave every one of these nonzero at the
+    // same instant; the property under test is that teardown zeroes *nonzero*
+    // owned storage, so dirtying it directly is the point.
     var filler: [128]u8 = undefined;
-    for (&filler, 0..) |*byte, i| byte.* = @truncate(i);
-    _ = carrier_state.pushInbound(&filler);
-    subject.inbound_carrier.append(&filler) catch {};
+    for (&filler, 0..) |*byte, i| byte.* = @truncate(i +% 1);
+    try subject.appendInboundPlaintext(&filler, smith.index(2) == 0);
+    try subject.appendInboundHandshake(&filler);
+    try subject.appendInboundCarrier(&filler);
 
-    // ...and a pending terminal alert flush that the blocked carrier is holding.
-    if (smith.index(2) == 0) subject.deferHandshakeFailure(error.CertificateInvalid, null);
+    // ...and a pending terminal alert the blocked carrier is still holding.
+    subject.deferHandshakeFailure(error.CertificateInvalid, null);
+
+    // Preconditions: every state whose zeroization is asserted below really is
+    // nonzero right now.
+    try testing.expect(subject.inbound_carrier.len > 0);
+    try testing.expect(subject.inbound_plaintext.len > 0);
+    try testing.expect(subject.inbound_plaintext_provenance.len > 0);
+    try testing.expect(subject.inbound_handshake.len > 0);
+    try testing.expect(subject.outbound_ciphertext.len > 0);
+    try testing.expect(subject.initial_parser.len > 0);
+    try testing.expect(subject.ciphertext_parser.len > 0);
+    try testing.expect(subject.pending_terminal != null);
+    try testing.expect(subject.bridge.hasReadKeys(.handshake));
+    try testing.expect(subject.bridge.hasWriteKeys(.handshake));
 
     subject.deinit();
 
@@ -6200,6 +6319,81 @@ test "encrypted stream inbound plaintext saturation pauses carrier reads and res
     try testing.expectEqual(@as(u64, 1), resumed.counters.inbound_read_pauses);
     try testing.expectEqual(@as(u64, 1), resumed.counters.inbound_read_resumes);
     try testing.expectEqual(@as(?anyerror, null), oracle.terminal);
+}
+
+test "encrypted stream orderly close releases the handshake driver and its secret scratch" {
+    const cp = testProvider();
+
+    // A completed session, closed cleanly. This is the `finishClose` path
+    // `drive()` takes once `close_notify` has drained.
+    {
+        var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+        var client_backend = ScriptedRecordBackend{ .role = .client };
+        var server_backend = ScriptedRecordBackend{ .role = .server };
+        var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+        defer client.deinit();
+        var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+        defer server.deinit();
+
+        try driveBothUntil(&client, &server, bothComplete);
+        try testing.expect(client.bridge.hasWriteKeys(.application));
+        // The driver's borrowed sink copied traffic-secret bytes into its
+        // scratch during the handshake; that is the state teardown must wipe.
+        const used_before = client.handshake_driver.?.sink.used;
+        try testing.expect(used_before > 0);
+        try testing.expect(!client.driver_torn_down);
+        try testing.expectEqual(@as(usize, 0), client_backend.deinit_count);
+
+        client.stream().close();
+        var rounds: usize = 0;
+        while (client.lifecycle != .closed and rounds < 64) : (rounds += 1) {
+            _ = try client.stream().drive();
+            _ = try server.stream().drive();
+        }
+        try testing.expect(rounds < 64);
+
+        // The orderly close released the driver and its backend exactly once,
+        // wiped the sink's used secret scratch, and dropped every bridge key --
+        // without waiting for an outer `deinit()`.
+        try testing.expect(client.driver_torn_down);
+        try testing.expectEqual(@as(usize, 1), client_backend.deinit_count);
+        try testing.expectEqual(@as(usize, 0), client.handshake_driver.?.sink.used);
+        try testing.expect(std.mem.allEqual(u8, client.handshake_driver.?.sink.scratch[0..used_before], 0));
+        try testing.expect(!client.bridge.hasReadKeys(.application));
+        try testing.expect(!client.bridge.hasWriteKeys(.application));
+        try expectClosedConformance(client.stream());
+
+        // ...and the later `deinit()` does not release the backend a second
+        // time (`Driver.deinit` is not idempotent).
+        client.deinit();
+        try testing.expectEqual(@as(usize, 1), client_backend.deinit_count);
+    }
+
+    // Cancellation before the handshake completes takes the other
+    // `finishClose` path, through `queueCloseNotify`'s unkeyed branch.
+    inline for (.{ true, false }) |install_keys| {
+        var backend = CountingRecordBackend{ .install_keys = install_keys };
+        var carrier = CountingOwnedCarrier{};
+        var stream = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, carrier.carrier(), backend.recordBackend());
+        defer stream.deinit();
+
+        _ = try stream.stream().drive();
+        const used_before = stream.handshake_driver.?.sink.used;
+        try testing.expect(used_before > 0);
+
+        stream.stream().close();
+        _ = try stream.stream().drive();
+        try testing.expectEqual(Lifecycle.closed, stream.lifecycle);
+        try testing.expect(stream.driver_torn_down);
+        try testing.expectEqual(@as(usize, 1), backend.deinit_count);
+        try testing.expectEqual(@as(usize, 1), carrier.close_count);
+        try testing.expectEqual(@as(usize, 0), stream.handshake_driver.?.sink.used);
+        try testing.expect(std.mem.allEqual(u8, stream.handshake_driver.?.sink.scratch[0..used_before], 0));
+
+        stream.deinit();
+        try testing.expectEqual(@as(usize, 1), backend.deinit_count);
+        try testing.expectEqual(@as(usize, 1), carrier.close_count);
+    }
 }
 
 test "encrypted stream close is terminal and idempotent from every lifecycle state" {

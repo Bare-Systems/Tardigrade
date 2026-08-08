@@ -824,8 +824,28 @@ issue's implementation-plan comment:
   `peerStreamByte`) rather than buffered, so "no loss or duplication" is
   "the `n`th delivered byte equals `f(n)`" plus a monotone
   delivered-at-most-accepted bound — which keeps a 16 KiB fragment write
-  expressible without a 16 KiB oracle buffer. Around every `drive()` the
-  target asserts:
+  expressible without a 16 KiB oracle buffer.
+
+  The peer is the *validator* for everything the subject emits, so its errors
+  are never swallowed: only `WouldBlock` (its own buffer pressure, retried next
+  round) and the explicit clean-`close_notify` branch are expected outcomes.
+  Any other error from `feedCiphertext`/`readPlaintext`/`writePlaintext` means
+  the subject produced bytes the real record path could not authenticate,
+  frame, or deliver — exactly the corruption this target exists to catch — and
+  propagates out of the case.
+
+  Two structural rules keep the seed-corpus replay from being vacuous. Every
+  case carries a **mandatory traffic floor** — at least one inbound record and
+  one application write before the fuzzer's program — so there is always
+  something to account for. And after the program and its flush loop, a
+  **two-stage deterministic epilogue** lifts the scripted obstruction: stage
+  one opens the write side only (so every drive is a *write-only* drive and
+  carrier bytes are the sole thing that can justify `made_progress`), then
+  stage two opens the read side and settles the stream. Without that epilogue a
+  case whose script never let a byte through would reach the accounting
+  assertions with nothing to assert.
+
+  Around every `drive()` the target asserts:
 
   - exact outbound byte conservation, `queued_before == queued_after +
     bytes the carrier accepted`, so a partial write discards only the
@@ -838,8 +858,9 @@ issue's implementation-plan comment:
     which is the "no spin under repeated zero-progress readiness" property
     stated as a bound;
   - `made_progress` is *real*: a drive claiming progress moved a carrier byte
-    or changed observable state, and a drive claiming none moved no byte in
-    or out of any owned queue;
+    or changed observable state, and a drive claiming none moved **no carrier
+    byte in either direction, changed no observable state, and left every
+    owned queue exactly as it was**;
   - `drive`'s returned readiness equals the stream's readiness on return.
 
   Per operation it also asserts every queue stays inside both its watermark
@@ -868,19 +889,38 @@ issue's implementation-plan comment:
   including both parsers' pending arrays and the plaintext provenance shadow —
   and that no key material survives at any epoch in either direction.
 
+  Each family is deterministic once selected, and asserts its own outcome
+  unconditionally: the authentication-failure family constructs and delivers
+  its tampered record with `try` rather than early-returning on setup trouble,
+  and requires `AuthenticationFailed` rather than accepting "no terminal error
+  happened"; the teardown family dirties every state whose zeroization it
+  checks — both parsers simultaneously, inbound plaintext with its provenance
+  shadow, inbound handshake bytes, unparsed carrier input, queued outbound
+  ciphertext, and a pending terminal alert — and asserts each one is nonzero
+  immediately before `deinit()`. A scenario that cannot reach its own property
+  is a gap in the target, not a passing case.
+
   **Production finding.** Asserting that teardown property against the
-  *orderly* close path showed a completed close was not clearing the bridge.
-  `fail()` wipes every key, and `deinit()` wipes every key, but a stream that
-  finished a clean `close_notify` exchange only called `clearOwnedQueues()`
-  and latched `.closed` — its application traffic keys stayed resident until
-  the caller got around to `deinit()`. Nothing could *use* them (`.closed`
-  rejects every entry point), so this is retention rather than an exploitable
-  path, but it is retention with no purpose, and the record contract's rule is
-  that a torn-down session keeps no secret-bearing state. The five orderly
-  close-completion sites now share one `finishClose()` helper that wipes the
-  bridge along with the queues. Mutation-validated: removing `bridge.deinit()`
-  from `finishClose` fails `encrypted stream close is terminal and idempotent
-  from every lifecycle state` under plain `zig build test-tls`.
+  *orderly* close path showed a completed close was not clearing its
+  secret-bearing state. `fail()` and `deinit()` each release the handshake
+  driver and wipe every bridge key, but a stream that finished a clean
+  `close_notify` exchange only called `clearOwnedQueues()` and latched
+  `.closed`. Two holders survived until the caller got around to `deinit()`:
+
+  1. the bridge's **application traffic keys**; and
+  2. the owned **handshake driver**, whose borrowed `EventSink` may still hold
+     copied traffic-secret scratch until `Driver.deinit()` — a retention the
+     transport contract documents explicitly.
+
+  Nothing could *use* either (`.closed` rejects every entry point), so this is
+  retention rather than an exploitable path, but it is retention with no
+  purpose, and the record contract's rule is that a torn-down session keeps no
+  secret-bearing state. The five orderly close-completion sites now share one
+  `finishClose()` helper that runs the same teardown order as `deinit()` and
+  `fail()`: `teardownDriver()`, then the queues, then the bridge.
+  `authStillPending()` gained the matching `driver_torn_down` guard, because
+  `drive()` can reach it later in the same call after an in-loop
+  `queueCloseNotify()` completed the close.
 
   Following the #493-A/B standard, the scripted corpus classes the issue
   requires that a seed-corpus replay cannot reliably reach have named
@@ -895,6 +935,25 @@ issue's implementation-plan comment:
   | `…output saturation pauses plaintext writes and resumes below the low watermark` | one pause per crossing, a rejected retry consuming nothing, one resume, no byte lost across the cycle |
   | `…inbound plaintext saturation pauses carrier reads and resumes after draining` | the same, for the read side |
   | `…close is terminal and idempotent from every lifecycle state` | close during handshaking, open, closing, and failed; carrier released exactly once; the `finishClose` key wipe |
+  | `…orderly close releases the handshake driver and its secret scratch` | a completed driver-owned session and a mid-handshake cancellation: driver and backend released exactly once *at close*, the sink's used secret scratch zeroed, and a later `deinit()` that does not release the backend twice |
+
+  Mutation-validated:
+
+  | Mutation | Caught by |
+  | --- | --- |
+  | Drop `bridge.deinit()` from `finishClose` | `…close is terminal and idempotent from every lifecycle state` |
+  | Drop `teardownDriver()` from `finishClose` | `…orderly close releases the handshake driver and its secret scratch` |
+  | Subject emits one corrupted ciphertext byte toward the peer | progression target, seed replay |
+  | A carrier write is not reported as `made_progress` | progression target, seed replay (via the epilogue's write-only stage) |
+  | `drive()` latches a carrier error instead of the preserved root error | cleanup target, seed replay |
+  | `ByteQueue.clear` stops zeroing its backing storage | cleanup target, seed replay, plus two named cleanup tests |
+  | `drive()`'s write loop consumes one byte more than the carrier accepted | `…partial carrier writes preserve the exact unwritten suffix` plus four existing tests |
+
+  The corruption mutation has to be scoped to the subject's own role:
+  corrupting *both* directions makes the case terminate early on a bad inbound
+  record and never reach the outbound accounting at all — a useful reminder
+  that a mutation which merely turns some test red is not the same as one that
+  proves the property under test bites.
 
   TLS-over-TCP KeyUpdate and key replacement remain #357: the bridge exposes
   no such surface today, so the epoch target's operation set is the extension

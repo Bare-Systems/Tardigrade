@@ -113,14 +113,19 @@ All notable user-facing changes to Tardigrade are documented here.
   fatal-alert flush under partial/blocked/zero-progress/failing writes, a
   record authentication failure behind already-delivered plaintext, a
   `.handshake` epoch discard landing on a partially buffered record, and
-  teardown with every buffer and a pending terminal state populated —
-  asserting in each case that the root error latches unchanged and that every
-  owned buffer, both parsers, the provenance shadow, and all key material are
-  zeroed, not merely emptied. Adds seven named deterministic companions for
-  the scripted classes a seed-corpus replay cannot reliably reach (one-byte
-  reads/writes, permanent no-progress carriers, carrier EOF at every record
-  boundary, partial-write suffix preservation, output and inbound
-  saturation/recovery, and close from every lifecycle state).
+  teardown with every buffer, both parsers, and a pending terminal state
+  populated at once and asserted nonzero first — asserting in each case that
+  the root error latches unchanged and that every owned buffer, both parsers,
+  the provenance shadow, and all key material are zeroed, not merely emptied.
+  The validating peer's record errors are never swallowed, every case carries a
+  mandatory floor of real traffic in both directions, and a two-stage
+  deterministic epilogue drains what the scripts obstructed so the end-to-end
+  byte accounting is actually reached. Adds eight named deterministic
+  companions for the scripted classes a seed-corpus replay cannot reliably
+  reach (one-byte reads/writes, permanent no-progress carriers, carrier EOF at
+  every record boundary, partial-write suffix preservation, output and inbound
+  saturation/recovery, close from every lifecycle state, and driver teardown on
+  orderly close).
 
 ### Features
 - **QUIC negotiated TLS suite packet protection (#566)** — Handshake, 0-RTT,
@@ -785,17 +790,22 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Fixed
 - **A cleanly closed native TLS record stream no longer retains traffic keys
-  (#493-C, epic #325-K)** — `fail()` and `deinit()` each wiped every bridge
-  key, but a stream that completed an orderly `close_notify` exchange only
-  dropped its owned buffers and latched `.closed`, leaving application
-  traffic keys resident until the caller happened to call `deinit()`. A
-  `.closed` stream rejects every entry point, so nothing could use those keys
-  — this is retention without a purpose rather than an exploitable path — but
-  the record contract's rule is that a torn-down session keeps no
-  secret-bearing state. The five orderly close-completion sites now share a
-  `finishClose()` helper that wipes the bridge along with the queues. Found
-  by #493-C's teardown property; pinned by `encrypted stream close is
-  terminal and idempotent from every lifecycle state`.
+  or its handshake driver (#493-C, epic #325-K)** — `fail()` and `deinit()`
+  each release the handshake driver and wipe every bridge key, but a stream
+  that completed an orderly `close_notify` exchange only dropped its owned
+  buffers and latched `.closed`. That left two holders of secret-bearing state
+  alive until the caller happened to call `deinit()`: the bridge's application
+  traffic keys, and the owned handshake driver, whose borrowed `EventSink` can
+  still hold copied traffic-secret scratch until `Driver.deinit()`. A `.closed`
+  stream rejects every entry point, so nothing could use either — this is
+  retention without a purpose rather than an exploitable path — but the record
+  contract's rule is that a torn-down session keeps no secret-bearing state.
+  The five orderly close-completion sites now share a `finishClose()` helper
+  that runs the same teardown order as `deinit()`/`fail()`: driver, then
+  queues, then bridge. Found by #493-C's teardown property; pinned by
+  `encrypted stream close is terminal and idempotent from every lifecycle
+  state` and `encrypted stream orderly close releases the handshake driver and
+  its secret scratch`.
 - **TLS record epoch bridge teardown is now terminal (#493-B)** — found by
   review of the #493-B fuzz oracle. The record contract has two session
   teardown paths, and both reset `handshake_complete` to false — which was

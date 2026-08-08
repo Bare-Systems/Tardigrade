@@ -755,6 +755,18 @@ pub const PureZigRecordStream = struct {
         self.refreshBackpressure();
     }
 
+    /// Complete an orderly close. Beyond dropping every owned buffer this also
+    /// wipes the bridge's key material: a `.closed` stream rejects every entry
+    /// point, so no record can ever be sealed or opened again, and leaving
+    /// application traffic keys resident until an eventual `deinit()` is
+    /// retention without a purpose. `fail()` already wipes them on the terminal
+    /// path; this is the same rule for the orderly one.
+    fn finishClose(self: *PureZigRecordStream) void {
+        self.clearOwnedQueues();
+        self.bridge.deinit();
+        self.lifecycle = .closed;
+    }
+
     fn clearOwnedQueues(self: *PureZigRecordStream) void {
         self.inbound_carrier.clear();
         self.inbound_plaintext.clear();
@@ -1392,8 +1404,7 @@ pub const PureZigRecordStream = struct {
         try self.outbound_ciphertext.discard(count);
         self.noteQueueMutation();
         if (self.lifecycle == .closing and self.carrier == null and self.close_notify_queued and self.outbound_ciphertext.len == 0) {
-            self.clearOwnedQueues();
-            self.lifecycle = .closed;
+            self.finishClose();
         }
     }
 
@@ -1503,8 +1514,7 @@ pub const PureZigRecordStream = struct {
             }
 
             if (self.lifecycle == .closing and self.close_notify_queued and self.outbound_ciphertext.len == 0 and wrote_close_notify) {
-                self.clearOwnedQueues();
-                self.lifecycle = .closed;
+                self.finishClose();
                 self.closeCarrier();
                 made_progress = true;
                 return .{ .made_progress = made_progress, .readiness = self.readiness() };
@@ -1553,8 +1563,7 @@ pub const PureZigRecordStream = struct {
         } else if (self.lifecycle == .closing) {
             if (try self.queueCloseNotify()) made_progress = true;
             if (self.close_notify_queued and self.outbound_ciphertext.len == 0) {
-                self.clearOwnedQueues();
-                self.lifecycle = .closed;
+                self.finishClose();
                 made_progress = true;
             }
         } else if (!self.authStillPending()) {
@@ -1562,8 +1571,7 @@ pub const PureZigRecordStream = struct {
         }
 
         if (self.lifecycle == .closing and self.carrier != null and self.close_notify_queued and self.outbound_ciphertext.len == 0) {
-            self.clearOwnedQueues();
-            self.lifecycle = .closed;
+            self.finishClose();
             self.closeCarrier();
             made_progress = true;
         }
@@ -1796,8 +1804,7 @@ pub const PureZigRecordStream = struct {
     fn queueCloseNotify(self: *PureZigRecordStream) Error!bool {
         if (self.lifecycle != .closing or self.close_notify_queued) return false;
         if (!self.bridge.handshake_complete) {
-            self.clearOwnedQueues();
-            self.lifecycle = .closed;
+            self.finishClose();
             self.closeCarrier();
             return true;
         }
@@ -1991,20 +1998,38 @@ fn secret(comptime fill: u8) [32]u8 {
     return [_]u8{fill} ** 32;
 }
 
-fn establish(client: *PureZigRecordStream, server: *PureZigRecordStream) !void {
-    const client_hs = secret(0x11);
-    const server_hs = secret(0x22);
-    const client_app = secret(0x33);
-    const server_app = secret(0x44);
+/// A secret buffer wide enough for any supported suite's digest length, so a
+/// SHA-384 suite can be driven from the same helper as a SHA-256 one.
+fn wideSecret(comptime fill: u8) [provider.max_digest_len]u8 {
+    return [_]u8{fill} ** provider.max_digest_len;
+}
 
-    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &client_hs } });
-    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &server_hs } });
-    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } });
-    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
-    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &client_app } });
-    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &server_app } });
-    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &client_app } });
-    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &server_app } });
+fn establish(client: *PureZigRecordStream, server: *PureZigRecordStream) !void {
+    return establishForSuite(client, server, .tls_aes_128_gcm_sha256);
+}
+
+/// `establish`, for a caller-chosen suite: the traffic-secret length a bridge
+/// accepts is that suite's transcript-hash digest length, so a SHA-384 suite
+/// needs 48-byte secrets rather than 32.
+fn establishForSuite(client: *PureZigRecordStream, server: *PureZigRecordStream, suite: algorithms.CipherSuite) !void {
+    const secret_len = algorithms.transcriptHash(suite).digestLength();
+    const client_hs_buf = wideSecret(0x11);
+    const server_hs_buf = wideSecret(0x22);
+    const client_app_buf = wideSecret(0x33);
+    const server_app_buf = wideSecret(0x44);
+    const client_hs = client_hs_buf[0..secret_len];
+    const server_hs = server_hs_buf[0..secret_len];
+    const client_app = client_app_buf[0..secret_len];
+    const server_app = server_app_buf[0..secret_len];
+
+    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = client_hs } });
+    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = server_hs } });
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = client_hs } });
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = server_hs } });
+    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = client_app } });
+    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = server_app } });
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = client_app } });
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = server_app } });
     try client.applyEvent(.{ .discard_epoch = .initial });
     try server.applyEvent(.{ .discard_epoch = .initial });
     try client.applyEvent(.{ .discard_epoch = .handshake });
@@ -4800,4 +4825,1456 @@ test "driver-owned handshake latches on the flush deadline when a fatal alert ca
     try testing.expectEqual(@as(?anyerror, error.UnexpectedHandshakeMessage), server_error);
     try testing.expectEqual(Lifecycle.failed, server.lifecycle);
     try expectLatchedFailureConformance(server.stream(), error.UnexpectedHandshakeMessage);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+
+// #493-C encrypted-stream / scripted-carrier fuzz targets. See
+// docs/CRYPTO_FUZZ_CONTRACT.md's "#493" section for the shared rules these
+// follow (fresh provider per case, fixed buffers, explicit operation bounds,
+// typed-error classification, sanitized diagnostics).
+//
+// Nothing below opens a socket, resolves a name, or performs any other network
+// I/O: `ScriptedCarrier` is the only transport, it is backed entirely by fixed
+// arrays, and the existing `testSocketPair` helpers are deliberately never
+// called from a fuzz callback.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// One step of a `ScriptedCarrier` read or write script.
+const CarrierAction = union(enum) {
+    /// Transfer at most this many bytes (further bounded by the caller's slice
+    /// and by the fixture's own fixed capacity). A `.transfer` that has nothing
+    /// to move reports `WouldBlock` rather than zero, because a zero-byte
+    /// carrier *read* means EOF to `drive()`.
+    transfer: usize,
+    /// Temporary no-readiness in either direction.
+    would_block,
+    /// Zero-byte progress: EOF on the read side, a no-progress write on the
+    /// write side (which must not make `drive()` spin).
+    zero,
+    end_of_stream,
+    /// The one typed carrier error this fixture injects per direction.
+    fail,
+};
+
+const scripted_script_len = 8;
+const scripted_inbound_capacity = 4096;
+const scripted_capture_capacity = 4096;
+
+/// A deterministic, fixed-capacity, test-only `Carrier`. Inbound bytes come
+/// from a preloaded queue; outbound bytes land in a capture buffer the test
+/// drains itself. Read and write behaviour is driven by independent cyclic
+/// action scripts, so partial I/O, would-block, zero progress, EOF, and a
+/// typed failure are all reachable without any real descriptor.
+///
+/// Deliberately private to this file's tests: no fake-carrier API leaks into
+/// production.
+const ScriptedCarrier = struct {
+    inbound: [scripted_inbound_capacity]u8 = undefined,
+    inbound_len: usize = 0,
+    inbound_head: usize = 0,
+    captured: [scripted_capture_capacity]u8 = undefined,
+    captured_len: usize = 0,
+
+    read_script: [scripted_script_len]CarrierAction = [_]CarrierAction{.{ .transfer = scripted_inbound_capacity }} ** scripted_script_len,
+    read_script_len: usize = 1,
+    read_cursor: usize = 0,
+    write_script: [scripted_script_len]CarrierAction = [_]CarrierAction{.{ .transfer = scripted_capture_capacity }} ** scripted_script_len,
+    write_script_len: usize = 1,
+    write_cursor: usize = 0,
+
+    read_calls: usize = 0,
+    write_calls: usize = 0,
+    read_bytes: usize = 0,
+    write_bytes: usize = 0,
+    close_calls: usize = 0,
+    owns_handle: bool = false,
+
+    fn carrier(self: *ScriptedCarrier) Carrier {
+        return .{
+            .ptr = self,
+            .readFn = scriptedRead,
+            .writeFn = scriptedWrite,
+            .closeFn = scriptedClose,
+            .owns_handle = self.owns_handle,
+        };
+    }
+
+    fn inboundPending(self: *const ScriptedCarrier) usize {
+        return self.inbound_len - self.inbound_head;
+    }
+
+    fn inboundAvailable(self: *const ScriptedCarrier) usize {
+        return scripted_inbound_capacity - self.inboundPending();
+    }
+
+    /// Append inbound bytes, compacting the already-consumed prefix first.
+    /// Returns false when the fixed capacity cannot hold `bytes`.
+    fn pushInbound(self: *ScriptedCarrier, bytes: []const u8) bool {
+        if (bytes.len > self.inboundAvailable()) return false;
+        if (bytes.len > scripted_inbound_capacity - self.inbound_len) {
+            const pending = self.inboundPending();
+            std.mem.copyForwards(u8, self.inbound[0..pending], self.inbound[self.inbound_head..self.inbound_len]);
+            self.inbound_head = 0;
+            self.inbound_len = pending;
+        }
+        @memcpy(self.inbound[self.inbound_len..][0..bytes.len], bytes);
+        self.inbound_len += bytes.len;
+        return true;
+    }
+
+    fn captureSlice(self: *const ScriptedCarrier) []const u8 {
+        return self.captured[0..self.captured_len];
+    }
+
+    fn consumeCapture(self: *ScriptedCarrier, count: usize) void {
+        std.debug.assert(count <= self.captured_len);
+        const remaining = self.captured_len - count;
+        std.mem.copyForwards(u8, self.captured[0..remaining], self.captured[count..self.captured_len]);
+        self.captured_len = remaining;
+    }
+
+    fn nextAction(script: []const CarrierAction, cursor: *usize) CarrierAction {
+        const action = script[cursor.* % script.len];
+        cursor.* += 1;
+        return action;
+    }
+
+    fn scriptedRead(ptr: *anyopaque, out: []u8) Error!usize {
+        const self: *ScriptedCarrier = @ptrCast(@alignCast(ptr));
+        self.read_calls += 1;
+        switch (nextAction(self.read_script[0..self.read_script_len], &self.read_cursor)) {
+            .would_block => return error.WouldBlock,
+            .zero => return 0,
+            .end_of_stream => return error.EndOfStream,
+            .fail => return error.SocketReadFailed,
+            .transfer => |cap| {
+                const pending = self.inboundPending();
+                if (pending == 0 or out.len == 0 or cap == 0) return error.WouldBlock;
+                const n = @min(@min(cap, out.len), pending);
+                @memcpy(out[0..n], self.inbound[self.inbound_head..][0..n]);
+                self.inbound_head += n;
+                self.read_bytes += n;
+                return n;
+            },
+        }
+    }
+
+    fn scriptedWrite(ptr: *anyopaque, bytes: []const u8) Error!usize {
+        const self: *ScriptedCarrier = @ptrCast(@alignCast(ptr));
+        self.write_calls += 1;
+        switch (nextAction(self.write_script[0..self.write_script_len], &self.write_cursor)) {
+            .would_block => return error.WouldBlock,
+            .zero => return 0,
+            .end_of_stream => return error.EndOfStream,
+            .fail => return error.SocketWriteFailed,
+            .transfer => |cap| {
+                const room = scripted_capture_capacity - self.captured_len;
+                const n = @min(@min(cap, bytes.len), room);
+                if (n == 0) return error.WouldBlock;
+                @memcpy(self.captured[self.captured_len..][0..n], bytes[0..n]);
+                self.captured_len += n;
+                self.write_bytes += n;
+                return n;
+            },
+        }
+    }
+
+    fn scriptedClose(ptr: *anyopaque) void {
+        const self: *ScriptedCarrier = @ptrCast(@alignCast(ptr));
+        self.close_calls += 1;
+    }
+};
+
+/// Draw one bounded, cyclic carrier action script. `.fail` and `.end_of_stream`
+/// occupy one slot each out of twelve so that ordinary partial-progress and
+/// would-block interleavings dominate; the corpus pins the harsher scripts
+/// explicitly.
+fn scriptFromSmith(smith: *std.testing.Smith, out: *[scripted_script_len]CarrierAction, max_transfer: usize) usize {
+    const len = 1 + smith.index(scripted_script_len);
+    for (out[0..len]) |*action| {
+        action.* = switch (smith.index(12)) {
+            0, 1, 2 => .would_block,
+            3 => .zero,
+            4 => .end_of_stream,
+            5 => .fail,
+            6, 7 => .{ .transfer = 1 },
+            8 => .{ .transfer = 2 + smith.index(30) },
+            9 => .{ .transfer = 1 + smith.index(max_transfer) },
+            else => .{ .transfer = max_transfer },
+        };
+    }
+    return len;
+}
+
+const fuzz_stream_max_operations = 24;
+const fuzz_stream_max_read_buf = 512;
+const fuzz_stream_peer_chunk = 64;
+/// Inbound-queue headroom required before the peer seals another record:
+/// header + content + inner content type + the largest AEAD tag, rounded up.
+const fuzz_stream_peer_record_reserve = record_codec.header_len + fuzz_stream_peer_chunk + 1 + 32;
+/// Bounded drain/flush iteration budgets. Exceeding one is itself a failure:
+/// it means the state machine kept claiming progress without terminating.
+const fuzz_stream_sync_rounds = 96;
+const fuzz_stream_flush_rounds = 96;
+
+/// The two application byte streams are generated rather than buffered, so the
+/// oracle only has to carry offsets: byte `i` of each direction has one fixed
+/// value, and "no loss or duplication" becomes "the `n`th delivered byte equals
+/// `f(n)`" plus a monotone delivered-at-most-accepted bound. That keeps a
+/// maximum-fragment write (16 KiB) expressible without a 16 KiB oracle buffer.
+fn subjectStreamByte(i: usize) u8 {
+    return @truncate(i *% 31 +% 7);
+}
+
+fn peerStreamByte(i: usize) u8 {
+    return @truncate(i *% 17 +% 129);
+}
+
+/// Independent plaintext/ciphertext accounting for one progression case.
+const StreamOracle = struct {
+    /// Plaintext bytes the subject accepted from its application.
+    subject_sent: usize = 0,
+    /// Plaintext bytes the peer has read back out, i.e. that actually survived
+    /// sealing, the scripted carrier, and the peer's parser.
+    peer_received: usize = 0,
+    /// Plaintext bytes the peer sealed into the carrier's inbound queue.
+    peer_sent: usize = 0,
+    /// Plaintext bytes the subject delivered to its application.
+    subject_received: usize = 0,
+    /// False once the peer saw `close_notify` or failed: it then swallows
+    /// further input, so it can no longer witness the subject's byte stream.
+    peer_usable: bool = true,
+    /// The subject's latched terminal error, once one exists.
+    terminal: ?anyerror = null,
+};
+
+/// Read everything currently available from the peer, checking each delivered
+/// byte against the subject's generated stream.
+fn drainPeerPlaintext(peer: *PureZigRecordStream, oracle: *StreamOracle) !void {
+    var buf: [fuzz_stream_max_read_buf]u8 = undefined;
+    var rounds: usize = 0;
+    while (rounds < fuzz_stream_sync_rounds) : (rounds += 1) {
+        const n = peer.readPlaintext(&buf) catch |err| switch (err) {
+            error.WouldBlock, error.EndOfStream => return,
+            else => {
+                oracle.peer_usable = false;
+                return;
+            },
+        };
+        if (n == 0) return;
+        for (buf[0..n], 0..) |byte, i| {
+            try testing.expectEqual(subjectStreamByte(oracle.peer_received + i), byte);
+        }
+        oracle.peer_received += n;
+        // Delivered can never run ahead of accepted: that would be duplication.
+        try testing.expect(oracle.peer_received <= oracle.subject_sent);
+    }
+    return error.PeerDrainDidNotTerminate;
+}
+
+/// Move whatever the subject wrote to its carrier into the peer, then read the
+/// peer's plaintext back out. This is the only place the captured ciphertext is
+/// interpreted, so the capture buffer doubles as the "bytes in flight" queue.
+fn syncCapture(carrier: *ScriptedCarrier, peer: *PureZigRecordStream, oracle: *StreamOracle) !void {
+    if (!oracle.peer_usable) {
+        carrier.captured_len = 0;
+        return;
+    }
+    var rounds: usize = 0;
+    while (carrier.captured_len > 0 and rounds < fuzz_stream_sync_rounds) : (rounds += 1) {
+        const consumed = peer.feedCiphertext(carrier.captureSlice()) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => {
+                oracle.peer_usable = false;
+                carrier.captured_len = 0;
+                return;
+            },
+        };
+        if (consumed > 0) carrier.consumeCapture(consumed);
+        try drainPeerPlaintext(peer, oracle);
+        if (peer.peer_closed) {
+            // The subject's `close_notify` landed. Everything ahead of it in
+            // the capture was already delivered above, so the accounting is
+            // complete; the peer now swallows input and can witness no more.
+            oracle.peer_usable = false;
+            carrier.captured_len = 0;
+            return;
+        }
+        if (consumed == 0) break;
+    }
+    try drainPeerPlaintext(peer, oracle);
+}
+
+/// Seal one bounded plaintext chunk from the peer into the carrier's inbound
+/// queue. Refuses rather than truncates when the fixed capacity is short, so
+/// the inbound accounting can never silently lose a byte.
+fn enqueuePeerRecord(
+    peer: *PureZigRecordStream,
+    carrier: *ScriptedCarrier,
+    oracle: *StreamOracle,
+    len: usize,
+) !void {
+    if (!oracle.peer_usable or len == 0) return;
+    // Refuse rather than truncate: one sealed record for a
+    // `fuzz_stream_peer_chunk` fragment is header + content + content-type +
+    // tag, and the inbound accounting must never silently lose a byte.
+    if (carrier.inboundAvailable() < fuzz_stream_peer_record_reserve) return;
+    if (peer.queuedCiphertextLen() != 0) return;
+
+    var chunk: [fuzz_stream_peer_chunk]u8 = undefined;
+    for (chunk[0..len], 0..) |*byte, i| byte.* = peerStreamByte(oracle.peer_sent + i);
+    const n = peer.writePlaintext(chunk[0..len]) catch |err| switch (err) {
+        error.WouldBlock => return,
+        else => {
+            oracle.peer_usable = false;
+            return;
+        },
+    };
+
+    var buf: [256]u8 = undefined;
+    while (peer.queuedCiphertextLen() > 0) {
+        const moved = peer.drainCiphertext(&buf) catch break;
+        if (moved == 0) break;
+        try testing.expect(carrier.pushInbound(buf[0..moved]));
+    }
+    oracle.peer_sent += n;
+}
+
+/// Per-operation invariants that must hold at every point of a progression
+/// program, terminal or not.
+fn checkStreamInvariants(subject: *PureZigRecordStream, carrier: *const ScriptedCarrier) !void {
+    // An owned carrier handle is released at most once, ever.
+    try testing.expect(carrier.close_calls <= 1);
+
+    const snapshot = subject.bufferSnapshot();
+    const limits = snapshot.limits.?;
+    try testing.expect(snapshot.current.inbound_ciphertext <= limits.inbound_ciphertext.hard);
+    try testing.expect(snapshot.current.inbound_plaintext <= limits.inbound_plaintext.hard);
+    try testing.expect(snapshot.current.outbound_ciphertext <= limits.outbound_ciphertext.hard);
+    try testing.expect(snapshot.current.handshake <= limits.handshake.hard);
+    // ...and inside the fixed backing capacities, independently of the limits.
+    try testing.expect(subject.inbound_carrier.len <= PureZigRecordStream.max_carrier_input_queue);
+    try testing.expect(subject.inbound_plaintext.len <= PureZigRecordStream.max_plaintext_queue);
+    try testing.expect(subject.outbound_ciphertext.len <= PureZigRecordStream.max_ciphertext_queue);
+    try testing.expect(subject.inbound_handshake.len <= PureZigRecordStream.max_handshake_queue);
+    try testing.expect(subject.initial_parser.len <= record_codec.max_ciphertext_record_len);
+    try testing.expect(subject.ciphertext_parser.len <= record_codec.max_ciphertext_record_len);
+    // The plaintext queue and its provenance shadow move together.
+    try testing.expectEqual(subject.inbound_plaintext.len, subject.inbound_plaintext_provenance.len);
+    try testing.expect(snapshot.peak_total >= snapshot.current.total());
+
+    // Backpressure pauses and resumes strictly alternate from "not paused", so
+    // the two counters differ by exactly the current flag. `clearOwnedQueues`
+    // drops the flags wholesale on a terminal transition, so the invariant is
+    // scoped to a stream that has not been torn down or latched.
+    if (subject.failed == null and subject.lifecycle != .closed and subject.lifecycle != .failed) {
+        const counters = snapshot.counters;
+        try testing.expect(counters.inbound_read_pauses >= counters.inbound_read_resumes);
+        try testing.expect(counters.plaintext_write_pauses >= counters.plaintext_write_resumes);
+        try testing.expectEqual(
+            @as(u64, if (snapshot.pause_state.inbound_read_paused) 1 else 0),
+            counters.inbound_read_pauses - counters.inbound_read_resumes,
+        );
+        try testing.expectEqual(
+            @as(u64, if (snapshot.pause_state.plaintext_write_paused) 1 else 0),
+            counters.plaintext_write_pauses - counters.plaintext_write_resumes,
+        );
+    }
+}
+
+/// One `drive()`, with the per-call carrier work budgets asserted around it.
+/// A successful carrier read or write always moves at least one byte, so
+/// bounding calls by bytes-plus-a-constant is exactly the "no spin under
+/// repeated zero-progress readiness" property.
+fn driveChecked(
+    subject: *PureZigRecordStream,
+    carrier: *ScriptedCarrier,
+    oracle: *StreamOracle,
+) !?DriveResult {
+    const read_calls_before = carrier.read_calls;
+    const write_calls_before = carrier.write_calls;
+    const read_bytes_before = carrier.read_bytes;
+    const write_bytes_before = carrier.write_bytes;
+
+    const outbound_before = subject.queuedCiphertextLen();
+    const close_notify_before = subject.close_notify_queued;
+    const lifecycle_before = subject.lifecycle;
+    const queues_before = subject.bufferSnapshot().current;
+    const carrier_eof_before = subject.carrier_eof;
+    const peer_closed_before = subject.peer_closed;
+    const deferred_before = subject.pending_terminal_read_error;
+
+    const result = subject.stream().drive() catch |err| {
+        oracle.terminal = err;
+        return null;
+    };
+
+    // Exact outbound byte conservation across a (possibly partial) carrier
+    // write: everything that left the queue is exactly what the carrier
+    // accepted, so a partial write discards only the written prefix and keeps
+    // the unwritten suffix intact. Skipped for the two drives that legitimately
+    // change the queue by other means -- sealing `close_notify`, and the
+    // terminal/close transition that clears every owned queue.
+    if (close_notify_before == subject.close_notify_queued and lifecycle_before == subject.lifecycle) {
+        try testing.expectEqual(outbound_before, subject.queuedCiphertextLen() + (carrier.write_bytes - write_bytes_before));
+    }
+
+    const read_bytes = carrier.read_bytes - read_bytes_before;
+    const write_bytes = carrier.write_bytes - write_bytes_before;
+    try testing.expect(read_bytes <= PureZigRecordStream.drive_read_budget + PureZigRecordStream.drive_read_chunk);
+    try testing.expect(write_bytes <= PureZigRecordStream.drive_write_budget + record_codec.max_ciphertext_record_len);
+    // At most one non-productive read call (the one that ends the read loop),
+    // and at most three non-productive writes (each of `drive`'s two write
+    // loops, plus slack for the terminal-alert flush path).
+    try testing.expect(carrier.read_calls - read_calls_before <= read_bytes + 2);
+    try testing.expect(carrier.write_calls - write_calls_before <= write_bytes + 3);
+    // `drive` must report the readiness the stream actually has on return.
+    try testing.expectEqual(subject.readiness(), result.readiness);
+
+    // Progress must be *real*: a drive that claims progress moved at least one
+    // carrier byte or changed observable stream state. Together with the fixed
+    // queue capacities and the per-drive budgets above, that is what makes
+    // repeated driving terminate instead of spinning on a would-block or
+    // zero-write carrier.
+    const state_changed = lifecycle_before != subject.lifecycle or
+        close_notify_before != subject.close_notify_queued or
+        carrier_eof_before != subject.carrier_eof or
+        peer_closed_before != subject.peer_closed or
+        !std.meta.eql(deferred_before, subject.pending_terminal_read_error) or
+        !std.meta.eql(queues_before, subject.bufferSnapshot().current);
+    if (result.made_progress) {
+        try testing.expect(read_bytes + write_bytes > 0 or state_changed);
+    } else {
+        // ...and a drive that reports none must not have moved a byte in or
+        // out of any owned queue.
+        try testing.expect(std.meta.eql(queues_before, subject.bufferSnapshot().current));
+    }
+    return result;
+}
+
+/// Every owned buffer is empty *and* zeroed, both parsers are reset, and no key
+/// material survives. Holds on all three teardown paths: `fail()`, `deinit()`,
+/// and -- since they now share `finishClose()` -- a completed orderly close.
+///
+/// Negotiation metadata and deferred terminal state are deliberately excluded:
+/// `fail()`/`deinit()` clear those too, but an orderly close keeps the
+/// negotiated ALPN so a caller can still report the protocol it spoke. See
+/// `expectTeardownMetadataCleared` for the stricter check.
+fn expectStreamStateCleared(subject: *PureZigRecordStream) !void {
+    try testing.expectEqual(@as(usize, 0), subject.inbound_carrier.len);
+    try testing.expectEqual(@as(usize, 0), subject.inbound_plaintext.len);
+    try testing.expectEqual(@as(usize, 0), subject.inbound_handshake.len);
+    try testing.expectEqual(@as(usize, 0), subject.outbound_ciphertext.len);
+    try testing.expectEqual(@as(usize, 0), subject.inbound_plaintext_provenance.len);
+    try testing.expectEqual(@as(usize, 0), subject.initial_parser.len);
+    try testing.expectEqual(@as(usize, 0), subject.ciphertext_parser.len);
+
+    // No stale plaintext or ciphertext left behind in the backing storage.
+    try testing.expect(std.mem.allEqual(u8, &subject.inbound_carrier.buf, 0));
+    try testing.expect(std.mem.allEqual(u8, &subject.inbound_plaintext.buf, 0));
+    try testing.expect(std.mem.allEqual(u8, &subject.inbound_handshake.buf, 0));
+    try testing.expect(std.mem.allEqual(u8, &subject.outbound_ciphertext.buf, 0));
+    try testing.expect(std.mem.allEqual(u8, &subject.initial_parser.pending, 0));
+    try testing.expect(std.mem.allEqual(u8, &subject.ciphertext_parser.pending, 0));
+    try testing.expect(std.mem.allEqual(bool, &subject.inbound_plaintext_provenance.buf, false));
+
+    // ...and no key material, at any epoch, in either direction.
+    inline for (.{ events.EncryptionEpoch.zero_rtt, .handshake, .application }) |epoch| {
+        try testing.expect(!subject.bridge.hasReadKeys(epoch));
+        try testing.expect(!subject.bridge.hasWriteKeys(epoch));
+    }
+    try testing.expect(!subject.bridge.handshake_complete);
+}
+
+/// The extra state `fail()` and `deinit()` clear on top of
+/// `expectStreamStateCleared`: captured negotiation metadata and any deferred
+/// terminal condition.
+fn expectTeardownMetadataCleared(subject: *PureZigRecordStream) !void {
+    try expectStreamStateCleared(subject);
+    try testing.expectEqual(@as(usize, 0), subject.alpn_len);
+    try testing.expect(!subject.alpn_captured);
+    try testing.expectEqual(@as(usize, 0), subject.expected_alpn_len);
+    try testing.expect(!subject.require_alpn);
+    try testing.expectEqual(events.CertificateState.not_checked, subject.certificate_state);
+    try testing.expectEqual(@as(?Error, null), subject.pending_terminal);
+    try testing.expectEqual(@as(?Error, null), subject.pending_terminal_read_error);
+    try testing.expectEqual(@as(usize, 0), subject.terminal_flush_attempts);
+}
+
+/// A latched failure is stable: it survives repetition, is never replaced by a
+/// cleanup or carrier error, and cannot revive the stream.
+fn expectStableTerminal(subject: *PureZigRecordStream, carrier: *const ScriptedCarrier, expected: anyerror) !void {
+    for (0..3) |_| {
+        try expectLatchedFailureConformance(subject.stream(), expected);
+        try checkStreamInvariants(subject, carrier);
+    }
+    try expectTeardownMetadataCleared(subject);
+}
+
+/// Classify a plaintext-I/O error. A latched stream records its terminal
+/// error; an *un*-latched stream may only refuse I/O for one of the two
+/// deferred terminal conditions -- a fatal alert still flushing
+/// (`pending_terminal`) or a terminal read error waiting behind buffered
+/// plaintext (`pending_terminal_read_error`) -- and must report that condition
+/// unchanged rather than substituting another error.
+fn classifyStreamError(subject: *PureZigRecordStream, oracle: *StreamOracle, err: anyerror) !void {
+    if (subject.failed != null) {
+        oracle.terminal = err;
+        return;
+    }
+    const deferred = if (subject.pending_terminal) |pending|
+        pending
+    else if (subject.pending_terminal_read_error) |pending|
+        pending
+    else
+        return error.UnlatchedStreamErrorWithoutDeferredCause;
+    try testing.expectEqual(@as(anyerror, deferred), err);
+}
+
+/// One plaintext read from the subject, checked against the peer's generated
+/// stream. A deferred terminal read error must be surfaced unchanged, and only
+/// after the plaintext buffered ahead of it has been delivered.
+fn subjectReadOnce(subject: *PureZigRecordStream, oracle: *StreamOracle, out: []u8) !void {
+    const n = subject.stream().read(out) catch |err| switch (err) {
+        // `StreamClosed` is the closed-lifecycle contract, not a latched
+        // failure: `readPlaintext` reports a real failure ahead of it.
+        error.WouldBlock, error.EndOfStream, error.StreamClosed => return,
+        else => return classifyStreamError(subject, oracle, err),
+    };
+    for (out[0..n], 0..) |byte, i| {
+        try testing.expectEqual(peerStreamByte(oracle.subject_received + i), byte);
+    }
+    oracle.subject_received += n;
+    try testing.expect(oracle.subject_received <= oracle.peer_sent);
+}
+
+fn subjectWriteOnce(subject: *PureZigRecordStream, oracle: *StreamOracle, src: []u8) !void {
+    for (src, 0..) |*byte, i| byte.* = subjectStreamByte(oracle.subject_sent + i);
+    const n = subject.stream().write(src) catch |err| switch (err) {
+        error.WouldBlock, error.StreamClosed => return,
+        else => return classifyStreamError(subject, oracle, err),
+    };
+    try testing.expect(n <= src.len);
+    oracle.subject_sent += n;
+}
+
+test "fuzz: TLS record: encrypted stream scripted carrier progression preserves bytes and terminal state" {
+    try testing.fuzz({}, fuzzEncryptedStreamProgressionInput, .{
+        .corpus = &.{
+            "",
+            &[_]u8{0},
+            // Operation-selector programs covering the classes the generator
+            // draws from: drive-only, read/write interleaving, close then
+            // repeated drive, enqueue-then-drain, and teardown.
+            &[_]u8{ 0, 0, 0, 0 },
+            &[_]u8{ 4, 0, 1, 0, 1, 0 },
+            &[_]u8{ 2, 0, 2, 0, 0, 0 },
+            &[_]u8{ 2, 0, 3, 0, 0, 0, 0 },
+            &[_]u8{ 4, 4, 0, 1, 1, 1, 0, 1 },
+            &[_]u8{ 2, 5, 6, 0, 3, 5, 5 },
+            &[_]u8{ 4, 0, 1, 7 },
+            &[_]u8{ 2, 0, 7 },
+            &([_]u8{0} ** 48),
+            &([_]u8{0xff} ** 48),
+            &([_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 } ** 6),
+            &([_]u8{ 2, 0, 4, 1 } ** 12),
+        },
+    });
+}
+
+fn fuzzEncryptedStreamProgressionInput(_: void, smith: *std.testing.Smith) !void {
+    const pure_zig = crypto.pure_zig;
+    // Fresh provider per case, per the #493 shared rules -- not this module's
+    // process-wide `testProvider()` singleton.
+    var entropy = pure_zig.DeterministicEntropy.init(0x493e);
+    var provider_state = pure_zig.Provider.init(entropy.entropy());
+    const cp = provider_state.cryptoProvider();
+
+    const suite: algorithms.CipherSuite = switch (smith.index(3)) {
+        0 => .tls_aes_128_gcm_sha256,
+        1 => .tls_aes_256_gcm_sha384,
+        else => .tls_chacha20_poly1305_sha256,
+    };
+
+    var carrier_state = ScriptedCarrier{ .owns_handle = smith.index(2) == 0 };
+    carrier_state.read_script_len = scriptFromSmith(smith, &carrier_state.read_script, scripted_inbound_capacity);
+    carrier_state.write_script_len = scriptFromSmith(smith, &carrier_state.write_script, scripted_capture_capacity);
+
+    // The peer is a full record stream too: it seals every inbound record and
+    // opens every outbound one, so the oracle is checked against the real
+    // record path rather than against a hand-rolled encoder.
+    var peer = PureZigRecordStream.init(.client, cp, suite);
+    defer peer.deinit();
+    var subject = PureZigRecordStream.initWithCarrier(.server, cp, suite, carrier_state.carrier());
+    defer subject.deinit();
+    try establishForSuite(&peer, &subject, suite);
+
+    var oracle = StreamOracle{};
+    var write_src: [record_codec.max_plaintext_fragment_len]u8 = undefined;
+    var read_buf: [fuzz_stream_max_read_buf]u8 = undefined;
+
+    for (0..smith.index(4)) |_| {
+        try enqueuePeerRecord(&peer, &carrier_state, &oracle, 1 + smith.index(fuzz_stream_peer_chunk));
+    }
+    try checkStreamInvariants(&subject, &carrier_state);
+
+    var torn_down = false;
+    const operations = smith.index(fuzz_stream_max_operations + 1);
+    for (0..operations) |_| {
+        if (oracle.terminal != null) break;
+        switch (smith.index(7)) {
+            0 => _ = try driveChecked(&subject, &carrier_state, &oracle),
+            1 => {
+                const cap: usize = switch (smith.index(5)) {
+                    0 => 0,
+                    1 => 1,
+                    2 => 2,
+                    3 => 64,
+                    else => fuzz_stream_max_read_buf,
+                };
+                try subjectReadOnce(&subject, &oracle, read_buf[0..cap]);
+            },
+            2 => {
+                const len: usize = switch (smith.index(6)) {
+                    0 => 1,
+                    1 => 2,
+                    2 => 7,
+                    3 => 64,
+                    4 => 1024,
+                    // The maximum a single `writePlaintext` can accept, so
+                    // outbound saturation is reachable inside the op budget.
+                    else => record_codec.max_plaintext_fragment_len,
+                };
+                try subjectWriteOnce(&subject, &oracle, write_src[0..len]);
+            },
+            3 => subject.stream().close(),
+            4 => try enqueuePeerRecord(&peer, &carrier_state, &oracle, 1 + smith.index(fuzz_stream_peer_chunk)),
+            5 => {
+                // Repeated driving with no intervening application or carrier
+                // change. Each call is checked by `driveChecked`; a *stable*
+                // script's settle-and-stay-settled behaviour is pinned by the
+                // named companions instead, which do not have this target's
+                // advancing script cursor confounding "nothing changed in
+                // between".
+                for (0..2 + smith.index(2)) |_| {
+                    if (oracle.terminal != null) break;
+                    _ = try driveChecked(&subject, &carrier_state, &oracle);
+                }
+            },
+            else => {
+                // Cancellation/teardown, reachable after any operation class.
+                // Kept a minority outcome so most programs run to their full
+                // operation budget rather than ending on the first draw.
+                if (smith.index(4) == 0) {
+                    subject.deinit();
+                    torn_down = true;
+                } else {
+                    _ = try driveChecked(&subject, &carrier_state, &oracle);
+                }
+            },
+        }
+        if (torn_down) break;
+        try syncCapture(&carrier_state, &peer, &oracle);
+        try checkStreamInvariants(&subject, &carrier_state);
+    }
+
+    if (torn_down) {
+        try expectTeardownMetadataCleared(&subject);
+        try testing.expectEqual(Lifecycle.closed, subject.lifecycle);
+        if (carrier_state.owns_handle) try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+        for (0..3) |_| {
+            try expectClosedConformance(subject.stream());
+            try checkStreamInvariants(&subject, &carrier_state);
+        }
+        // A second teardown is safe and does not double-release the handle.
+        subject.deinit();
+        try testing.expect(carrier_state.close_calls <= 1);
+        return;
+    }
+
+    // Bounded flush: drive and drain until the stream settles. The round cap is
+    // a runtime bound rather than the anti-spin property -- a one-byte-per-call
+    // write script legitimately needs many rounds to drain a saturated queue.
+    // The real guarantees are asserted per drive in `driveChecked`: bounded
+    // carrier work, progress only when a byte or some observable state actually
+    // moved, and no queue movement when no progress is reported.
+    var flush_rounds: usize = 0;
+    while (oracle.terminal == null and flush_rounds < fuzz_stream_flush_rounds) : (flush_rounds += 1) {
+        const before_received = oracle.subject_received;
+        const result = try driveChecked(&subject, &carrier_state, &oracle) orelse break;
+        try syncCapture(&carrier_state, &peer, &oracle);
+        try subjectReadOnce(&subject, &oracle, &read_buf);
+        try checkStreamInvariants(&subject, &carrier_state);
+        if (oracle.terminal != null) break;
+        if (!result.made_progress and oracle.subject_received == before_received) break;
+    }
+
+    if (oracle.terminal) |err| {
+        try expectStableTerminal(&subject, &carrier_state, err);
+        if (carrier_state.owns_handle) try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+        return;
+    }
+
+    // Outbound accounting: once nothing is queued or in flight, every plaintext
+    // byte the subject accepted arrived at the peer exactly once.
+    if ((oracle.peer_usable or peer.peer_closed) and
+        subject.queuedCiphertextLen() == 0 and
+        carrier_state.captured_len == 0)
+    {
+        try testing.expectEqual(oracle.subject_sent, oracle.peer_received);
+    }
+    // Inbound accounting: same, in the other direction, for a stream still open
+    // (a completed close clears the owned queues by contract).
+    if (subject.lifecycle == .open and
+        carrier_state.inboundPending() == 0 and
+        subject.inbound_carrier.len == 0 and
+        subject.ciphertext_parser.len == 0 and
+        subject.inbound_plaintext.len == 0)
+    {
+        try testing.expectEqual(oracle.peer_sent, oracle.subject_received);
+    }
+
+    if (subject.lifecycle == .closed) {
+        for (0..3) |_| {
+            try expectClosedConformance(subject.stream());
+            try checkStreamInvariants(&subject, &carrier_state);
+        }
+        if (carrier_state.owns_handle) try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+    }
+}
+
+/// Root failures whose fatal alert `deferHandshakeFailure` queues and
+/// `drive()` then flushes. Each one must survive the flush unchanged, however
+/// the carrier behaves.
+const fuzz_cleanup_root_errors = [_]Error{
+    error.UnexpectedHandshakeMessage,
+    error.CertificateInvalid,
+    error.AlpnMismatch,
+    error.IllegalParameter,
+    error.MalformedHandshake,
+    error.DecryptError,
+    // No mapped alert: the failure must still latch unchanged.
+    error.SecretExportFailed,
+};
+
+/// Enough drives for the slowest legal flush this target can script: a handful
+/// of pre-queued handshake records draining at one byte per writable
+/// notification, behind a script that only becomes writable one step in eight.
+const fuzz_cleanup_max_drives = 4096;
+
+test "fuzz: TLS record: encrypted stream cleanup preserves root errors across alerts and epoch transitions" {
+    try testing.fuzz({}, fuzzEncryptedStreamCleanupInput, .{
+        .corpus = &.{
+            "",
+            &[_]u8{0},
+            // One entry per scenario family, plus a spread of script and
+            // root-error selectors within each.
+            &[_]u8{ 0, 0, 0, 0, 0, 0 },
+            &[_]u8{ 0, 1, 1, 3, 2, 5 },
+            &[_]u8{ 1, 0, 0, 2, 4 },
+            &[_]u8{ 1, 1, 3, 0, 7 },
+            &[_]u8{ 2, 0, 0, 0 },
+            &[_]u8{ 2, 1, 5, 9 },
+            &[_]u8{ 3, 0, 1, 2, 3 },
+            &[_]u8{ 3, 1, 0, 0, 0, 0 },
+            &([_]u8{0} ** 32),
+            &([_]u8{0xff} ** 32),
+            &([_]u8{ 0, 1, 2, 3 } ** 8),
+        },
+    });
+}
+
+fn fuzzEncryptedStreamCleanupInput(_: void, smith: *std.testing.Smith) !void {
+    const pure_zig = crypto.pure_zig;
+    var entropy = pure_zig.DeterministicEntropy.init(0x493f);
+    var provider_state = pure_zig.Provider.init(entropy.entropy());
+    const cp = provider_state.cryptoProvider();
+
+    const suite: algorithms.CipherSuite = switch (smith.index(3)) {
+        0 => .tls_aes_128_gcm_sha256,
+        1 => .tls_aes_256_gcm_sha384,
+        else => .tls_chacha20_poly1305_sha256,
+    };
+
+    switch (smith.index(4)) {
+        0 => try cleanupDeferredAlertCase(smith, cp, suite),
+        1 => try cleanupAuthenticationFailureCase(smith, cp, suite),
+        2 => try cleanupEpochTransitionCase(smith, cp, suite),
+        else => try cleanupTeardownCase(smith, cp, suite),
+    }
+}
+
+/// A terminal handshake failure whose fatal alert is flushed to a scripted
+/// carrier that may progress partially, block, make no progress, or fail. The
+/// preserved root error must latch unchanged in every case, within the bounded
+/// flush deadline, leaving no secret-bearing state behind.
+fn cleanupDeferredAlertCase(smith: *std.testing.Smith, cp: provider.CryptoProvider, suite: algorithms.CipherSuite) !void {
+    var carrier_state = ScriptedCarrier{ .owns_handle = smith.index(2) == 0 };
+    carrier_state.write_script_len = scriptFromSmith(smith, &carrier_state.write_script, scripted_capture_capacity);
+    carrier_state.read_script_len = 1;
+    carrier_state.read_script[0] = .would_block;
+
+    var subject = PureZigRecordStream.initWithCarrier(.client, cp, suite, carrier_state.carrier());
+    defer subject.deinit();
+
+    // Half the cases queue the alert under real handshake write keys (a
+    // protected alert record) behind zero or more earlier handshake records, so
+    // the flush has to drain more than the deadline's worth of bytes; the rest
+    // leave the write epoch at `.initial`, where the alert is a plaintext
+    // record.
+    if (smith.index(2) == 0) {
+        const secret_len = algorithms.transcriptHash(suite).digestLength();
+        const handshake_secret = wideSecret(0x5a);
+        try subject.bridge.installTrafficSecret(.handshake, .write, handshake_secret[0..secret_len]);
+        subject.write_epoch = .handshake;
+        for (0..smith.index(4)) |_| {
+            var record_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+            const record = try subject.bridge.sealHandshake(.handshake, "queued-before-alert", &record_buf);
+            subject.outbound_ciphertext.append(record) catch break;
+        }
+    }
+
+    const root = fuzz_cleanup_root_errors[smith.index(fuzz_cleanup_root_errors.len)];
+    subject.deferHandshakeFailure(root, null);
+    try testing.expectEqual(@as(?Error, root), subject.pending_terminal);
+    const queued_before_flush = subject.queuedCiphertextLen();
+
+    var oracle = StreamOracle{};
+    var drives: usize = 0;
+    while (oracle.terminal == null and drives < fuzz_cleanup_max_drives) : (drives += 1) {
+        const result = try driveChecked(&subject, &carrier_state, &oracle) orelse break;
+        try checkStreamInvariants(&subject, &carrier_state);
+        // Until it latches, the stream advertises only the write it needs to
+        // finish the flush -- no new reads and no plaintext I/O.
+        if (subject.pending_terminal != null) {
+            try testing.expect(!result.readiness.wants_read);
+            try testing.expect(!result.readiness.can_read_plaintext);
+            try testing.expect(!result.readiness.can_write_plaintext);
+        }
+    }
+
+    // The root error latched, and a partial, blocked, zero-progress, or failing
+    // alert write never replaced it.
+    try testing.expectEqual(@as(?anyerror, root), oracle.terminal);
+    try testing.expectEqual(Lifecycle.failed, subject.lifecycle);
+    // Flush attempts stay bounded: no byte can leave the queue more than once,
+    // and a carrier that never drains hits the deadline instead of wedging.
+    try testing.expect(carrier_state.write_bytes <= queued_before_flush);
+    try testing.expect(drives < fuzz_cleanup_max_drives);
+    try expectStableTerminal(&subject, &carrier_state, root);
+    if (carrier_state.owns_handle) try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+}
+
+/// A record-layer authentication failure behind (optionally) already-delivered
+/// plaintext: the failure must latch, must never yield the tampered record's
+/// contents, and must clear every owned buffer.
+fn cleanupAuthenticationFailureCase(smith: *std.testing.Smith, cp: provider.CryptoProvider, suite: algorithms.CipherSuite) !void {
+    var carrier_state = ScriptedCarrier{ .owns_handle = smith.index(2) == 0 };
+    carrier_state.read_script_len = scriptFromSmith(smith, &carrier_state.read_script, scripted_inbound_capacity);
+    carrier_state.write_script_len = 1;
+    carrier_state.write_script[0] = .{ .transfer = scripted_capture_capacity };
+    // A scripted read failure or EOF would pre-empt the tampered record with a
+    // different terminal error; this case is about the authentication path.
+    for (carrier_state.read_script[0..carrier_state.read_script_len]) |*action| {
+        switch (action.*) {
+            .end_of_stream, .fail, .zero => action.* = .would_block,
+            else => {},
+        }
+    }
+    // ...and at least one step must move bytes, so the tampered record is
+    // actually reachable rather than blocked forever.
+    carrier_state.read_script[0] = .{ .transfer = scripted_inbound_capacity };
+
+    var peer = PureZigRecordStream.init(.client, cp, suite);
+    defer peer.deinit();
+    var subject = PureZigRecordStream.initWithCarrier(.server, cp, suite, carrier_state.carrier());
+    defer subject.deinit();
+    try establishForSuite(&peer, &subject, suite);
+
+    var oracle = StreamOracle{};
+    // Optionally put genuine plaintext ahead of the tampered record.
+    for (0..smith.index(3)) |_| {
+        try enqueuePeerRecord(&peer, &carrier_state, &oracle, 1 + smith.index(fuzz_stream_peer_chunk));
+    }
+
+    // One genuine record, then one byte of its payload flipped. The AEAD
+    // authenticates the header as associated data and the payload as
+    // ciphertext-plus-tag, so a payload mutation is always an authentication
+    // failure rather than a framing error.
+    //
+    // Its plaintext is the bitwise *complement* of what the generated stream
+    // would carry next, and `oracle.peer_sent` is deliberately not advanced for
+    // it: this record's content is never legitimate output, so if any byte of
+    // it ever reached the application, `subjectReadOnce`'s per-byte check would
+    // reject it rather than mistake it for the stream continuing.
+    const content_len = 1 + smith.index(fuzz_stream_peer_chunk);
+    var content: [fuzz_stream_peer_chunk]u8 = undefined;
+    for (content[0..content_len], 0..) |*byte, i| byte.* = ~peerStreamByte(oracle.peer_sent + i);
+    _ = peer.writePlaintext(content[0..content_len]) catch return;
+    var record_buf: [256]u8 = undefined;
+    const record_len = peer.drainCiphertext(&record_buf) catch return;
+    if (record_len <= record_codec.header_len) return;
+    const offset = record_codec.header_len + smith.index(record_len - record_codec.header_len);
+    record_buf[offset] ^= @as(u8, 1) << @intCast(smith.index(8));
+    if (!carrier_state.pushInbound(record_buf[0..record_len])) return;
+
+    var read_buf: [fuzz_stream_max_read_buf]u8 = undefined;
+    var drives: usize = 0;
+    while (oracle.terminal == null and drives < 256) : (drives += 1) {
+        const result = try driveChecked(&subject, &carrier_state, &oracle) orelse break;
+        try subjectReadOnce(&subject, &oracle, &read_buf);
+        try checkStreamInvariants(&subject, &carrier_state);
+        if (oracle.terminal != null) break;
+        if (!result.made_progress and carrier_state.inboundPending() == 0) break;
+    }
+    try testing.expect(drives < 256);
+
+    // The tampered record reached the bridge only if the carrier script let it
+    // through; when it did, the failure is exactly `AuthenticationFailed`.
+    if (oracle.terminal) |err| {
+        try testing.expectEqual(@as(anyerror, error.AuthenticationFailed), err);
+        try expectStableTerminal(&subject, &carrier_state, err);
+        if (carrier_state.owns_handle) try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+    }
+    // Whatever was delivered before the failure was genuine peer plaintext,
+    // never the tampered record's contents: `subjectReadOnce` checks every
+    // byte against the generated stream, and the tampered record's plaintext
+    // was never enqueued in that stream.
+    try testing.expect(oracle.subject_received <= oracle.peer_sent);
+}
+
+/// A `.handshake` epoch discard landing on a not-yet-complete buffered record.
+/// The transition must fail closed rather than let those bytes be reinterpreted
+/// under application keys.
+fn cleanupEpochTransitionCase(smith: *std.testing.Smith, cp: provider.CryptoProvider, suite: algorithms.CipherSuite) !void {
+    var carrier_state = ScriptedCarrier{ .owns_handle = smith.index(2) == 0 };
+    carrier_state.read_script_len = 1;
+    carrier_state.read_script[0] = .would_block;
+    carrier_state.write_script_len = 1;
+    carrier_state.write_script[0] = .would_block;
+
+    var subject = PureZigRecordStream.initWithCarrier(.server, cp, suite, carrier_state.carrier());
+    defer subject.deinit();
+
+    const secret_len = algorithms.transcriptHash(suite).digestLength();
+    const handshake_read = wideSecret(0x51);
+    const handshake_write = wideSecret(0x52);
+    const application_read = wideSecret(0x53);
+    const application_write = wideSecret(0x54);
+    try subject.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = handshake_read[0..secret_len] } });
+    try subject.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = handshake_write[0..secret_len] } });
+    try subject.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = application_read[0..secret_len] } });
+    try subject.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = application_write[0..secret_len] } });
+
+    // A record header declaring more payload than is delivered. `feedOne`'s
+    // exact-consumption contract means a nonzero parser length here can only be
+    // a genuinely incomplete record, never a legitimate next-record suffix.
+    const declared: usize = 1 + smith.index(64);
+    // Strictly fewer payload bytes than declared, so the record can never
+    // complete and be opened; the parser is left holding a genuine partial.
+    const delivered = smith.index(declared);
+    var wire: [record_codec.header_len + 64]u8 = undefined;
+    wire[0] = @intFromEnum(record_codec.ContentType.application_data);
+    wire[1] = 0x03;
+    wire[2] = 0x03;
+    wire[3] = @intCast(declared >> 8);
+    wire[4] = @intCast(declared & 0xff);
+    for (wire[record_codec.header_len..][0..delivered], 0..) |*byte, i| byte.* = @truncate(i *% 7 +% 3);
+    // ...and how much of that prefix actually arrives, from none of it (which
+    // leaves the parser empty, the legal-discard control case) through a split
+    // header to the whole incomplete prefix.
+    const feed_len = smith.index(record_codec.header_len + delivered + 1);
+    _ = try subject.feedHandshakeCiphertext(.handshake, wire[0..feed_len]);
+
+    const partial = subject.ciphertext_parser.len != 0;
+    const result = subject.applyEvent(.{ .discard_epoch = .handshake });
+    if (partial) {
+        try testing.expectError(error.PartialRecordAtEpochTransition, result);
+        // Latched, cleared, and stable: the buffered prefix cannot be resumed
+        // or reinterpreted under application keys by any later call.
+        try expectStableTerminal(&subject, &carrier_state, error.PartialRecordAtEpochTransition);
+        try testing.expectError(error.PartialRecordAtEpochTransition, subject.applyEvent(.handshake_complete));
+        try testing.expectError(error.PartialRecordAtEpochTransition, subject.feedCiphertext(wire[0..feed_len]));
+        if (carrier_state.owns_handle) try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+    } else {
+        try result;
+        try testing.expectEqual(@as(?Error, null), subject.failed);
+        try testing.expect(!subject.bridge.hasReadKeys(.handshake));
+        try testing.expect(!subject.bridge.hasWriteKeys(.handshake));
+        try checkStreamInvariants(&subject, &carrier_state);
+    }
+}
+
+/// Teardown with every owned buffer, both parsers, and a pending terminal state
+/// populated at once.
+fn cleanupTeardownCase(smith: *std.testing.Smith, cp: provider.CryptoProvider, suite: algorithms.CipherSuite) !void {
+    var carrier_state = ScriptedCarrier{ .owns_handle = smith.index(2) == 0 };
+    carrier_state.read_script_len = 1;
+    carrier_state.read_script[0] = .{ .transfer = scripted_inbound_capacity };
+    carrier_state.write_script_len = 1;
+    carrier_state.write_script[0] = .would_block;
+
+    var peer = PureZigRecordStream.init(.client, cp, suite);
+    defer peer.deinit();
+    var subject = PureZigRecordStream.initWithCarrier(.server, cp, suite, carrier_state.carrier());
+    defer subject.deinit();
+
+    const secret_len = algorithms.transcriptHash(suite).digestLength();
+    const client_hs = wideSecret(0x61);
+    const server_hs = wideSecret(0x62);
+    try peer.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = client_hs[0..secret_len] } });
+    try subject.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = client_hs[0..secret_len] } });
+    try subject.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = server_hs[0..secret_len] } });
+    subject.write_epoch = .handshake;
+
+    // Outbound ciphertext: sealed handshake records the blocked carrier cannot
+    // drain.
+    for (0..1 + smith.index(3)) |_| {
+        subject.applyEvent(.{ .handshake_bytes = .{ .epoch = .handshake, .data = "server-handshake-flight" } }) catch break;
+    }
+
+    // Inbound handshake plaintext, plus a partial record left in the parser.
+    var record_buf: [256]u8 = undefined;
+    try peer.applyEvent(.{ .handshake_bytes = .{ .epoch = .handshake, .data = "client-handshake-flight" } });
+    const sealed = try peer.drainCiphertext(&record_buf);
+    _ = subject.feedHandshakeCiphertext(.handshake, record_buf[0..sealed]) catch {};
+    const partial_len = 1 + smith.index(record_codec.header_len + 2);
+    _ = subject.feedHandshakeCiphertext(.handshake, record_buf[0..@min(partial_len, sealed)]) catch {};
+
+    // Carrier input the read budget has not reached yet.
+    var filler: [128]u8 = undefined;
+    for (&filler, 0..) |*byte, i| byte.* = @truncate(i);
+    _ = carrier_state.pushInbound(&filler);
+    subject.inbound_carrier.append(&filler) catch {};
+
+    // ...and a pending terminal alert flush that the blocked carrier is holding.
+    if (smith.index(2) == 0) subject.deferHandshakeFailure(error.CertificateInvalid, null);
+
+    subject.deinit();
+
+    try expectTeardownMetadataCleared(&subject);
+    try testing.expectEqual(Lifecycle.closed, subject.lifecycle);
+    if (carrier_state.owns_handle) try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+    for (0..3) |_| {
+        try expectClosedConformance(subject.stream());
+        try checkStreamInvariants(&subject, &carrier_state);
+    }
+    // Repeated teardown neither double-releases the handle nor resurrects state.
+    subject.deinit();
+    subject.deinit();
+    try testing.expect(carrier_state.close_calls <= 1);
+    try expectTeardownMetadataCleared(&subject);
+}
+
+// ── #493-C named deterministic companions ──────────────────────────────────
+//
+// The scripted corpus classes the issue requires that CI's seed-corpus replay
+// cannot reliably reach, pinned as named tests next to the fuzz targets --
+// following the standard #493-A set for `encodeInnerPlaintext` and #493-B for
+// the epoch lifecycle. `-Dtls-record-test-filter` selects these by name too.
+
+/// Bring up a scripted-carrier subject and a keyed peer for a companion case.
+const CompanionPair = struct {
+    peer: PureZigRecordStream,
+    subject: PureZigRecordStream,
+
+    fn init(cp: provider.CryptoProvider, carrier_state: *ScriptedCarrier) !CompanionPair {
+        var pair = CompanionPair{
+            .peer = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256),
+            .subject = PureZigRecordStream.initWithCarrier(.server, cp, .tls_aes_128_gcm_sha256, carrier_state.carrier()),
+        };
+        try establish(&pair.peer, &pair.subject);
+        return pair;
+    }
+
+    fn deinit(self: *CompanionPair) void {
+        self.peer.deinit();
+        self.subject.deinit();
+    }
+};
+
+/// Drive, sync, and read until the stream settles or latches. Returns the
+/// number of rounds it took; exceeding the bound is a failure.
+fn runCompanionUntilSettled(
+    subject: *PureZigRecordStream,
+    peer: *PureZigRecordStream,
+    carrier_state: *ScriptedCarrier,
+    oracle: *StreamOracle,
+    read_buf: []u8,
+) !usize {
+    var rounds: usize = 0;
+    while (oracle.terminal == null and rounds < 8192) : (rounds += 1) {
+        const result = try driveChecked(subject, carrier_state, oracle) orelse break;
+        try syncCapture(carrier_state, peer, oracle);
+        try subjectReadOnce(subject, oracle, read_buf);
+        try checkStreamInvariants(subject, carrier_state);
+        if (oracle.terminal != null) break;
+        if (!result.made_progress and
+            subject.inbound_plaintext.len == 0 and
+            carrier_state.inboundPending() == 0 and
+            carrier_state.captured_len == 0) break;
+    }
+    try testing.expect(rounds < 8192);
+    return rounds;
+}
+
+test "encrypted stream scripted carrier delivers every byte across one-byte reads and writes" {
+    const cp = testProvider();
+    var carrier_state = ScriptedCarrier{};
+    carrier_state.read_script_len = 1;
+    carrier_state.read_script[0] = .{ .transfer = 1 };
+    carrier_state.write_script_len = 1;
+    carrier_state.write_script[0] = .{ .transfer = 1 };
+
+    var pair = try CompanionPair.init(cp, &carrier_state);
+    defer pair.deinit();
+
+    var oracle = StreamOracle{};
+    for (0..3) |_| try enqueuePeerRecord(&pair.peer, &carrier_state, &oracle, 40);
+    var src: [97]u8 = undefined;
+    try subjectWriteOnce(&pair.subject, &oracle, &src);
+    try testing.expectEqual(@as(usize, 97), oracle.subject_sent);
+
+    var read_buf: [1]u8 = undefined;
+    _ = try runCompanionUntilSettled(&pair.subject, &pair.peer, &carrier_state, &oracle, &read_buf);
+
+    try testing.expectEqual(@as(?anyerror, null), oracle.terminal);
+    // Every byte, both directions, exactly once, through single-byte carrier
+    // transfers in both directions.
+    try testing.expectEqual(oracle.peer_sent, oracle.subject_received);
+    try testing.expectEqual(oracle.subject_sent, oracle.peer_received);
+    try testing.expectEqual(@as(usize, 120), oracle.subject_received);
+}
+
+test "encrypted stream settles without spinning under repeated would-block and zero-progress carriers" {
+    const cp = testProvider();
+    // A zero-byte carrier *read* is EOF by contract, so only the write side
+    // varies between the two permanent no-progress conditions.
+    inline for (.{ CarrierAction.would_block, CarrierAction.zero }) |write_action| {
+        var carrier_state = ScriptedCarrier{};
+        carrier_state.read_script_len = 1;
+        carrier_state.read_script[0] = .would_block;
+        carrier_state.write_script_len = 1;
+        carrier_state.write_script[0] = write_action;
+
+        var pair = try CompanionPair.init(cp, &carrier_state);
+        defer pair.deinit();
+
+        var oracle = StreamOracle{};
+        var src: [64]u8 = undefined;
+        try subjectWriteOnce(&pair.subject, &oracle, &src);
+        const queued = pair.subject.queuedCiphertextLen();
+        try testing.expect(queued > 0);
+
+        var previous: ?Readiness = null;
+        for (0..64) |_| {
+            const calls_before = carrier_state.read_calls + carrier_state.write_calls;
+            const result = (try driveChecked(&pair.subject, &carrier_state, &oracle)).?;
+            // No progress is claimed, no byte moves, the queue is unchanged,
+            // and readiness is stable across every repetition.
+            try testing.expect(!result.made_progress);
+            try testing.expectEqual(queued, pair.subject.queuedCiphertextLen());
+            try testing.expectEqual(@as(usize, 0), carrier_state.write_bytes);
+            try testing.expectEqual(@as(usize, 0), carrier_state.read_bytes);
+            // ...and the work inside one `drive()` stays constant: the two
+            // write loops and the read loop each give up after one call.
+            try testing.expect(carrier_state.read_calls + carrier_state.write_calls - calls_before <= 4);
+            if (previous) |prev| try testing.expectEqual(prev, result.readiness);
+            previous = result.readiness;
+        }
+        try testing.expect(previous.?.wants_write);
+        try testing.expectEqual(@as(?anyerror, null), oracle.terminal);
+    }
+}
+
+test "encrypted stream carrier EOF at every record boundary preserves truncation and delivery order" {
+    const cp = testProvider();
+    // One complete record's worth of bytes, cut at each boundary the issue
+    // names: before the record, inside the five-byte header, inside the
+    // payload, one byte short, and exactly after a complete record.
+    var template = ScriptedCarrier{};
+    var template_pair = try CompanionPair.init(cp, &template);
+    defer template_pair.deinit();
+    var template_oracle = StreamOracle{};
+    try enqueuePeerRecord(&template_pair.peer, &template, &template_oracle, 32);
+    const record_len = template.inboundPending();
+    try testing.expect(record_len > record_codec.header_len + 1);
+    var record: [256]u8 = undefined;
+    @memcpy(record[0..record_len], template.inbound[0..record_len]);
+
+    const cuts = [_]usize{
+        0,
+        3,
+        record_codec.header_len,
+        record_codec.header_len + 1,
+        record_len - 1,
+        record_len,
+    };
+    for (cuts) |cut| {
+        var carrier_state = ScriptedCarrier{};
+        carrier_state.read_script_len = 2;
+        carrier_state.read_script[0] = .{ .transfer = scripted_inbound_capacity };
+        carrier_state.read_script[1] = .end_of_stream;
+        carrier_state.write_script_len = 1;
+        carrier_state.write_script[0] = .{ .transfer = scripted_capture_capacity };
+
+        var pair = try CompanionPair.init(cp, &carrier_state);
+        defer pair.deinit();
+        // The same generated plaintext the template record carries, so
+        // `subjectReadOnce`'s byte check applies to this pair too.
+        var oracle = StreamOracle{ .peer_sent = 32 };
+        try testing.expect(carrier_state.pushInbound(record[0..cut]));
+
+        var read_buf: [64]u8 = undefined;
+        var rounds: usize = 0;
+        while (oracle.terminal == null and rounds < 64) : (rounds += 1) {
+            // Deliberately no early exit on a no-progress round: the read
+            // script only reaches its `end_of_stream` step on a later call, so
+            // stopping at the first would-block would never see the EOF.
+            _ = try driveChecked(&pair.subject, &carrier_state, &oracle) orelse break;
+            try subjectReadOnce(&pair.subject, &oracle, &read_buf);
+            try checkStreamInvariants(&pair.subject, &carrier_state);
+        }
+        try testing.expect(rounds < 64);
+
+        // Truncation is terminal in every case: an unclean EOF is never a
+        // clean close.
+        try testing.expectEqual(@as(?anyerror, error.TruncatedStream), oracle.terminal);
+        try expectStableTerminal(&pair.subject, &carrier_state, error.TruncatedStream);
+        if (cut == record_len) {
+            // A complete record ahead of the EOF is delivered first, and only
+            // then is the preserved truncation surfaced.
+            try testing.expectEqual(@as(usize, 32), oracle.subject_received);
+        } else {
+            // A partial record yields nothing: no unauthenticated prefix leaks.
+            try testing.expectEqual(@as(usize, 0), oracle.subject_received);
+        }
+    }
+}
+
+test "encrypted stream partial carrier writes preserve the exact unwritten suffix" {
+    const cp = testProvider();
+    var carrier_state = ScriptedCarrier{};
+    carrier_state.read_script_len = 1;
+    carrier_state.read_script[0] = .would_block;
+    // One byte accepted, then blocked: every drive leaves a partially written
+    // record behind.
+    carrier_state.write_script_len = 2;
+    carrier_state.write_script[0] = .{ .transfer = 1 };
+    carrier_state.write_script[1] = .would_block;
+
+    var pair = try CompanionPair.init(cp, &carrier_state);
+    defer pair.deinit();
+
+    var oracle = StreamOracle{};
+    var src: [200]u8 = undefined;
+    try subjectWriteOnce(&pair.subject, &oracle, &src);
+
+    var expected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const total = pair.subject.queuedCiphertextLen();
+    @memcpy(expected[0..total], pair.subject.peekCiphertext());
+    try testing.expect(total > 8);
+
+    var rounds: usize = 0;
+    while (carrier_state.write_bytes < total and rounds < 4 * total) : (rounds += 1) {
+        _ = (try driveChecked(&pair.subject, &carrier_state, &oracle)).?;
+        const moved = carrier_state.write_bytes;
+        // The written prefix is exact and the retained suffix is byte-identical
+        // to what was queued: a partial write discards only what the carrier
+        // actually accepted.
+        try testing.expectEqualSlices(u8, expected[0..moved], carrier_state.captureSlice());
+        try testing.expectEqualSlices(u8, expected[moved..total], pair.subject.peekCiphertext());
+    }
+    try testing.expectEqual(total, carrier_state.write_bytes);
+    // ...and the reassembled record still opens at the peer.
+    try syncCapture(&carrier_state, &pair.peer, &oracle);
+    try testing.expectEqual(oracle.subject_sent, oracle.peer_received);
+}
+
+test "encrypted stream output saturation pauses plaintext writes and resumes below the low watermark" {
+    const cp = testProvider();
+    var carrier_state = ScriptedCarrier{};
+    carrier_state.read_script_len = 1;
+    carrier_state.read_script[0] = .would_block;
+    carrier_state.write_script_len = 1;
+    carrier_state.write_script[0] = .would_block;
+
+    var pair = try CompanionPair.init(cp, &carrier_state);
+    defer pair.deinit();
+
+    var oracle = StreamOracle{};
+    var src: [record_codec.max_plaintext_fragment_len]u8 = undefined;
+    var accepted: usize = 0;
+    var attempts: usize = 0;
+    while (attempts < 16) : (attempts += 1) {
+        const before = oracle.subject_sent;
+        try subjectWriteOnce(&pair.subject, &oracle, &src);
+        if (oracle.subject_sent == before) break;
+        accepted += 1;
+    }
+    try testing.expect(accepted > 0);
+    try testing.expect(attempts < 16);
+
+    const paused = pair.subject.bufferSnapshot();
+    try testing.expect(paused.pause_state.plaintext_write_paused);
+    // Exactly one pause for one threshold crossing, and no resume yet.
+    try testing.expectEqual(@as(u64, 1), paused.counters.plaintext_write_pauses);
+    try testing.expectEqual(@as(u64, 0), paused.counters.plaintext_write_resumes);
+    try testing.expect(!pair.subject.readiness().can_write_plaintext);
+    // A rejected retry consumes nothing.
+    const queued_when_paused = pair.subject.queuedCiphertextLen();
+    try testing.expectError(error.WouldBlock, pair.subject.stream().write(&src));
+    try testing.expectEqual(queued_when_paused, pair.subject.queuedCiphertextLen());
+    try testing.expectEqual(@as(u64, 1), pair.subject.bufferSnapshot().counters.plaintext_write_pauses);
+
+    // Drain below the low watermark and the stream resumes exactly once.
+    carrier_state.write_script[0] = .{ .transfer = scripted_capture_capacity };
+    var rounds: usize = 0;
+    while (pair.subject.bufferSnapshot().pause_state.plaintext_write_paused and rounds < 256) : (rounds += 1) {
+        _ = (try driveChecked(&pair.subject, &carrier_state, &oracle)).?;
+        try syncCapture(&carrier_state, &pair.peer, &oracle);
+        try checkStreamInvariants(&pair.subject, &carrier_state);
+    }
+    try testing.expect(rounds < 256);
+    const resumed = pair.subject.bufferSnapshot();
+    try testing.expect(!resumed.pause_state.plaintext_write_paused);
+    try testing.expectEqual(@as(u64, 1), resumed.counters.plaintext_write_pauses);
+    try testing.expectEqual(@as(u64, 1), resumed.counters.plaintext_write_resumes);
+    try testing.expect(pair.subject.readiness().can_write_plaintext);
+
+    // Drain everything still queued or in flight, then check that no byte was
+    // lost or duplicated across the whole pause/resume cycle.
+    var drains: usize = 0;
+    while (drains < 4096 and (pair.subject.queuedCiphertextLen() != 0 or carrier_state.captured_len != 0)) : (drains += 1) {
+        _ = (try driveChecked(&pair.subject, &carrier_state, &oracle)).?;
+        try syncCapture(&carrier_state, &pair.peer, &oracle);
+        try checkStreamInvariants(&pair.subject, &carrier_state);
+    }
+    try testing.expect(drains < 4096);
+    try testing.expectEqual(oracle.subject_sent, oracle.peer_received);
+}
+
+test "encrypted stream inbound plaintext saturation pauses carrier reads and resumes after draining" {
+    const cp = testProvider();
+    var carrier_state = ScriptedCarrier{};
+    carrier_state.read_script_len = 1;
+    carrier_state.read_script[0] = .{ .transfer = scripted_inbound_capacity };
+    carrier_state.write_script_len = 1;
+    carrier_state.write_script[0] = .{ .transfer = scripted_capture_capacity };
+
+    var pair = try CompanionPair.init(cp, &carrier_state);
+    defer pair.deinit();
+
+    var oracle = StreamOracle{};
+    var rounds: usize = 0;
+    while (!pair.subject.bufferSnapshot().pause_state.inbound_read_paused and rounds < 512) : (rounds += 1) {
+        while (carrier_state.inboundAvailable() > 4 * record_codec.header_len + 2 * fuzz_stream_peer_chunk) {
+            const before = oracle.peer_sent;
+            try enqueuePeerRecord(&pair.peer, &carrier_state, &oracle, fuzz_stream_peer_chunk);
+            if (oracle.peer_sent == before) break;
+        }
+        _ = (try driveChecked(&pair.subject, &carrier_state, &oracle)).?;
+        try checkStreamInvariants(&pair.subject, &carrier_state);
+    }
+    try testing.expect(rounds < 512);
+
+    const paused = pair.subject.bufferSnapshot();
+    try testing.expect(paused.pause_state.inbound_read_paused);
+    try testing.expectEqual(@as(u64, 1), paused.counters.inbound_read_pauses);
+    try testing.expectEqual(@as(u64, 0), paused.counters.inbound_read_resumes);
+    try testing.expect(!pair.subject.readiness().wants_read);
+
+    // Drain the plaintext below the low watermark: reads resume exactly once,
+    // and every buffered byte is still the peer's, in order.
+    var read_buf: [fuzz_stream_max_read_buf]u8 = undefined;
+    var drains: usize = 0;
+    while (pair.subject.bufferSnapshot().pause_state.inbound_read_paused and drains < 4096) : (drains += 1) {
+        try subjectReadOnce(&pair.subject, &oracle, &read_buf);
+        _ = (try driveChecked(&pair.subject, &carrier_state, &oracle)).?;
+        try checkStreamInvariants(&pair.subject, &carrier_state);
+    }
+    try testing.expect(drains < 4096);
+    const resumed = pair.subject.bufferSnapshot();
+    try testing.expect(!resumed.pause_state.inbound_read_paused);
+    try testing.expectEqual(@as(u64, 1), resumed.counters.inbound_read_pauses);
+    try testing.expectEqual(@as(u64, 1), resumed.counters.inbound_read_resumes);
+    try testing.expectEqual(@as(?anyerror, null), oracle.terminal);
+}
+
+test "encrypted stream close is terminal and idempotent from every lifecycle state" {
+    const cp = testProvider();
+
+    // handshaking: no application keys, so close discards immediately.
+    {
+        var carrier_state = ScriptedCarrier{ .owns_handle = true };
+        var subject = PureZigRecordStream.initWithCarrier(.server, cp, .tls_aes_128_gcm_sha256, carrier_state.carrier());
+        defer subject.deinit();
+        subject.stream().close();
+        subject.stream().close();
+        _ = try subject.stream().drive();
+        try testing.expectEqual(Lifecycle.closed, subject.lifecycle);
+        try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+        try expectClosedConformance(subject.stream());
+        try expectStreamStateCleared(&subject);
+    }
+
+    // open: a real `close_notify` is sealed, flushed, and closes the carrier
+    // exactly once; the peer sees a clean close rather than truncation.
+    {
+        var carrier_state = ScriptedCarrier{ .owns_handle = true };
+        carrier_state.read_script_len = 1;
+        carrier_state.read_script[0] = .would_block;
+        carrier_state.write_script_len = 1;
+        carrier_state.write_script[0] = .{ .transfer = scripted_capture_capacity };
+
+        var pair = try CompanionPair.init(cp, &carrier_state);
+        defer pair.deinit();
+        var oracle = StreamOracle{};
+        var src: [48]u8 = undefined;
+        try subjectWriteOnce(&pair.subject, &oracle, &src);
+
+        pair.subject.stream().close();
+        // Closing, but not yet closed: `close_notify` waits behind the queued
+        // application record.
+        try testing.expectEqual(Lifecycle.closing, pair.subject.lifecycle);
+        pair.subject.stream().close(); // idempotent
+        try testing.expectEqual(Lifecycle.closing, pair.subject.lifecycle);
+
+        var rounds: usize = 0;
+        while (pair.subject.lifecycle != .closed and rounds < 64) : (rounds += 1) {
+            _ = (try driveChecked(&pair.subject, &carrier_state, &oracle)).?;
+            try syncCapture(&carrier_state, &pair.peer, &oracle);
+        }
+        try testing.expect(rounds < 64);
+        try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+        try testing.expectEqual(oracle.subject_sent, oracle.peer_received);
+        try testing.expect(pair.peer.peer_closed);
+        try expectClosedConformance(pair.subject.stream());
+        try expectStreamStateCleared(&pair.subject);
+        // Closing again after the fact changes nothing.
+        pair.subject.stream().close();
+        try testing.expectEqual(Lifecycle.closed, pair.subject.lifecycle);
+        try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+    }
+
+    // failed: close after a latched failure neither revives the stream nor
+    // releases the (already released) handle a second time.
+    {
+        var carrier_state = ScriptedCarrier{ .owns_handle = true };
+        carrier_state.read_script_len = 1;
+        carrier_state.read_script[0] = .fail;
+        carrier_state.write_script_len = 1;
+        carrier_state.write_script[0] = .would_block;
+
+        var pair = try CompanionPair.init(cp, &carrier_state);
+        defer pair.deinit();
+        try testing.expectError(error.SocketReadFailed, pair.subject.stream().drive());
+        try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+        pair.subject.stream().close();
+        try testing.expectEqual(Lifecycle.failed, pair.subject.lifecycle);
+        try expectLatchedFailureConformance(pair.subject.stream(), error.SocketReadFailed);
+        try expectTeardownMetadataCleared(&pair.subject);
+        try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
+    }
 }

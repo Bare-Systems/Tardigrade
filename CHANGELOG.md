@@ -89,6 +89,38 @@ All notable user-facing changes to Tardigrade are documented here.
   "a torn-down session never acquires key material again" as its own rule
   rather than re-deriving it from the bridge's per-epoch flags, which is
   what turns those defects into detected disagreements instead of matches.
+- **Encrypted-stream and scripted-carrier fuzz targets (#493-C, epic
+  #325-K)** — completes #493 with the final two `std.testing.Smith` targets
+  under `test-tls-record-fuzz`, both in `src/tls/encrypted_stream.zig` and
+  both entirely memory-backed: a private, fixed-array `ScriptedCarrier`
+  implements the production `Carrier` vtable with a bounded inbound queue, a
+  capture buffer, cyclic read/write action scripts (partial transfer,
+  `WouldBlock`, zero-byte progress, `EndOfStream`, one typed carrier error),
+  and call counters, so no fuzz callback opens a socket or touches the
+  existing socket-pair helpers. `encrypted stream scripted carrier
+  progression preserves bytes and terminal state` runs bounded programs of
+  `drive`/`read`/`write`/`close`/enqueue/repeat/teardown operations against a
+  real record-stream pair, checking every delivered byte against a generated
+  stream oracle and asserting, around every `drive()`, exact outbound byte
+  conservation across partial writes, the per-drive carrier byte budgets, a
+  calls-versus-bytes bound that rules out spinning, that claimed progress
+  always corresponds to a real byte or state change (and that no-progress
+  moves nothing), and that reported readiness matches the stream's. Per
+  operation it also pins queue watermarks and fixed capacities, plaintext/
+  provenance agreement, at-most-once owned-carrier release, and exact
+  backpressure pause/resume alternation. `encrypted stream cleanup preserves
+  root errors across alerts and epoch transitions` covers the deferred
+  fatal-alert flush under partial/blocked/zero-progress/failing writes, a
+  record authentication failure behind already-delivered plaintext, a
+  `.handshake` epoch discard landing on a partially buffered record, and
+  teardown with every buffer and a pending terminal state populated —
+  asserting in each case that the root error latches unchanged and that every
+  owned buffer, both parsers, the provenance shadow, and all key material are
+  zeroed, not merely emptied. Adds seven named deterministic companions for
+  the scripted classes a seed-corpus replay cannot reliably reach (one-byte
+  reads/writes, permanent no-progress carriers, carrier EOF at every record
+  boundary, partial-write suffix preservation, output and inbound
+  saturation/recovery, and close from every lifecycle state).
 
 ### Features
 - **QUIC negotiated TLS suite packet protection (#566)** — Handshake, 0-RTT,
@@ -752,6 +784,18 @@ All notable user-facing changes to Tardigrade are documented here.
   number space so Initial, Handshake, and Application ranges cannot merge.
 
 ### Fixed
+- **A cleanly closed native TLS record stream no longer retains traffic keys
+  (#493-C, epic #325-K)** — `fail()` and `deinit()` each wiped every bridge
+  key, but a stream that completed an orderly `close_notify` exchange only
+  dropped its owned buffers and latched `.closed`, leaving application
+  traffic keys resident until the caller happened to call `deinit()`. A
+  `.closed` stream rejects every entry point, so nothing could use those keys
+  — this is retention without a purpose rather than an exploitable path — but
+  the record contract's rule is that a torn-down session keeps no
+  secret-bearing state. The five orderly close-completion sites now share a
+  `finishClose()` helper that wipes the bridge along with the queues. Found
+  by #493-C's teardown property; pinned by `encrypted stream close is
+  terminal and idempotent from every lifecycle state`.
 - **TLS record epoch bridge teardown is now terminal (#493-B)** — found by
   review of the #493-B fuzz oracle. The record contract has two session
   teardown paths, and both reset `handshake_complete` to false — which was

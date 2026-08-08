@@ -525,10 +525,13 @@ zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="
 zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: inner plaintext framing, padding, and bounds remain transactional" --fuzz=10M --summary all --error-style verbose
 zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: protection tamper and sequence boundaries preserve authentication state" --fuzz=10M --summary all --error-style verbose
 zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: epoch operation sequences preserve one-way key lifecycle" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: encrypted stream scripted carrier progression preserves bytes and terminal state" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: encrypted stream cleanup preserves root errors across alerts and epoch transitions" --fuzz=10M --summary all --error-style verbose
 
 # Replay one named deterministic regression/companion case on its own
 # (the same filter option also selects non-"fuzz:" test names):
 zig build test-tls-record-fuzz -Dtls-record-test-filter="seal classifies every rejection stage at its exact boundary for every suite" --summary all --error-style verbose
+zig build test-tls-record-fuzz -Dtls-record-test-filter="encrypted stream close is terminal and idempotent from every lifecycle state" --summary all --error-style verbose
 ```
 
 No #493 target performs network I/O, draws ambient entropy, loads a real
@@ -547,6 +550,21 @@ and works entirely from fixed stack buffers. The explicit bounds are:
 | Protection output buffer | `max_ciphertext_record_len` (16 645 bytes) |
 | Epoch operations per program | 48 (`fuzz_epoch_max_operations`) |
 | Epoch record content | 24 bytes (`fuzz_epoch_content_len`) |
+| Stream operations per program | 24 (`fuzz_stream_max_operations`) |
+| Scripted carrier script length | 8 actions, cyclic (`scripted_script_len`) |
+| Scripted carrier inbound queue | 4 096 bytes (`scripted_inbound_capacity`) |
+| Scripted carrier capture buffer | 4 096 bytes (`scripted_capture_capacity`) |
+| Peer plaintext chunk per record | 64 bytes (`fuzz_stream_peer_chunk`) |
+| Caller read buffer | 512 bytes (`fuzz_stream_max_read_buf`) |
+| Post-program flush rounds | 96 (`fuzz_stream_flush_rounds`) |
+| Cleanup-case drives | 4 096 (`fuzz_cleanup_max_drives`) |
+
+The stream targets additionally inherit the production per-`drive()` budgets
+and fixed queue capacities, and assert them from the outside:
+`drive_read_budget`/`drive_write_budget` (`2 * max_ciphertext_record_len`
+each), `drive_read_chunk` (4 096), `drive_record_budget` (8), and the four
+owned queues (`max_carrier_input_queue`, `max_plaintext_queue`,
+`max_ciphertext_queue`, `max_handshake_queue`).
 
 Boundary arms deliberately reach the real protocol limits
 (`max_plaintext_fragment_len`, `max_ciphertext_fragment_len`, and one past
@@ -776,13 +794,113 @@ issue's implementation-plan comment:
   named companion. The last two rows are what keep the oracle honest: the
   model cannot silently regress back to mirroring the implementation on
   either teardown path.
-- **#493-C** (scripted in-memory carrier, encrypted-stream progression, docs
-  closeout) is tracked as a follow-on slice of the same issue and will
-  extend this section and the `-Dtls-record-test-filter` namespace when it
-  lands, rather than duplicating this contract. TLS-over-TCP KeyUpdate and
-  key replacement remain #357: the bridge exposes no such surface today, so
-  the epoch target's operation set is the extension point for it rather
-  than a fabricated API.
+- **#493-C** (this slice) — the `encrypted_stream.zig` targets, the scripted
+  in-memory carrier they run on, and this closeout.
+
+  `ScriptedCarrier` is a private test-only `Carrier` implementation built
+  entirely from fixed arrays: a bounded inbound queue, a bounded capture
+  buffer for everything the stream writes, independent cyclic read and write
+  action scripts (`transfer at most N`, `WouldBlock`, zero-byte progress,
+  `EndOfStream`, one typed carrier error per direction), and read/write/close
+  call counters. It opens no descriptor, and neither stream target calls the
+  module's existing socket-pair helpers — those stay behind the deterministic
+  integration tests they already serve. A `.transfer` step with nothing to
+  move reports `WouldBlock` rather than zero, because a zero-byte carrier
+  *read* is EOF to `drive()`; zero-byte *writes* are scripted separately as
+  the no-progress case.
+
+  `encrypted stream scripted carrier progression preserves bytes and terminal
+  state` runs a bounded program of at most 24 operations — `drive`, plaintext
+  `read` with a caller-buffer matrix, plaintext `write` (up to the exact
+  `max_plaintext_fragment_len` a single call can accept, so outbound
+  saturation is reachable inside the budget), `close`, enqueueing another
+  peer record, repeated `drive`, and teardown — against a real
+  `PureZigRecordStream` pair. The peer is a full record stream too, so every
+  inbound record is genuinely sealed and every outbound record genuinely
+  opened; the oracle is checked against the record path rather than a
+  hand-rolled encoder.
+
+  Both application byte streams are *generated* (`subjectStreamByte`,
+  `peerStreamByte`) rather than buffered, so "no loss or duplication" is
+  "the `n`th delivered byte equals `f(n)`" plus a monotone
+  delivered-at-most-accepted bound — which keeps a 16 KiB fragment write
+  expressible without a 16 KiB oracle buffer. Around every `drive()` the
+  target asserts:
+
+  - exact outbound byte conservation, `queued_before == queued_after +
+    bytes the carrier accepted`, so a partial write discards only the
+    written prefix and keeps the unwritten suffix intact (skipped only for
+    the two drives that legitimately change the queue by other means:
+    sealing `close_notify`, and the close/terminal transition that clears
+    every owned queue);
+  - the per-drive carrier byte budgets, and — because a successful carrier
+    read or write always moves at least one byte — `calls <= bytes + k`,
+    which is the "no spin under repeated zero-progress readiness" property
+    stated as a bound;
+  - `made_progress` is *real*: a drive claiming progress moved a carrier byte
+    or changed observable state, and a drive claiming none moved no byte in
+    or out of any owned queue;
+  - `drive`'s returned readiness equals the stream's readiness on return.
+
+  Per operation it also asserts every queue stays inside both its watermark
+  and its fixed capacity, the plaintext queue and its provenance shadow move
+  together, an owned carrier handle is released at most once ever, and — for
+  a stream that has not been torn down — that backpressure pauses and resumes
+  strictly alternate (`pauses - resumes == (paused ? 1 : 0)`, exactly, for
+  both directions). Errors from plaintext I/O are classified rather than
+  swallowed: an un-latched stream may only refuse I/O for one of the two
+  deferred terminal conditions (`pending_terminal`,
+  `pending_terminal_read_error`) and must report that condition unchanged.
+
+  `encrypted stream cleanup preserves root errors across alerts and epoch
+  transitions` covers the security-sensitive terminal paths in four scenario
+  families: a deferred fatal-alert flush against a scripted write side that
+  may progress partially, block, make no progress, or fail (the root error
+  must latch unchanged, within the bounded deadline, with `write_bytes` never
+  exceeding what was queued); a record-layer authentication failure behind
+  already-delivered genuine plaintext; a `.handshake` epoch discard landing on
+  a partially buffered record (`PartialRecordAtEpochTransition`, after which
+  neither `handshake_complete` nor a further feed can reinterpret those bytes
+  under application keys); and teardown with every owned buffer, both parsers,
+  carrier input, and a pending terminal alert populated at once. Every
+  terminal outcome runs `expectStreamStateCleared`, which checks that each
+  owned buffer is not merely empty but *zeroed* in its backing storage —
+  including both parsers' pending arrays and the plaintext provenance shadow —
+  and that no key material survives at any epoch in either direction.
+
+  **Production finding.** Asserting that teardown property against the
+  *orderly* close path showed a completed close was not clearing the bridge.
+  `fail()` wipes every key, and `deinit()` wipes every key, but a stream that
+  finished a clean `close_notify` exchange only called `clearOwnedQueues()`
+  and latched `.closed` — its application traffic keys stayed resident until
+  the caller got around to `deinit()`. Nothing could *use* them (`.closed`
+  rejects every entry point), so this is retention rather than an exploitable
+  path, but it is retention with no purpose, and the record contract's rule is
+  that a torn-down session keeps no secret-bearing state. The five orderly
+  close-completion sites now share one `finishClose()` helper that wipes the
+  bridge along with the queues. Mutation-validated: removing `bridge.deinit()`
+  from `finishClose` fails `encrypted stream close is terminal and idempotent
+  from every lifecycle state` under plain `zig build test-tls`.
+
+  Following the #493-A/B standard, the scripted corpus classes the issue
+  requires that a seed-corpus replay cannot reliably reach have named
+  deterministic companions next to the targets:
+
+  | Companion | Pins |
+  | --- | --- |
+  | `…delivers every byte across one-byte reads and writes` | full bidirectional exchange through single-byte carrier transfers |
+  | `…settles without spinning under repeated would-block and zero-progress carriers` | 64 repetitions: no progress claimed, no byte moved, queue unchanged, readiness stable, constant carrier work per drive |
+  | `…carrier EOF at every record boundary preserves truncation and delivery order` | EOF before a record, mid-header, mid-payload, one byte short, and exactly after a complete record; buffered plaintext delivered first, then the preserved `TruncatedStream` |
+  | `…partial carrier writes preserve the exact unwritten suffix` | written prefix and retained suffix compared byte for byte on every drive, then reassembled and opened at the peer |
+  | `…output saturation pauses plaintext writes and resumes below the low watermark` | one pause per crossing, a rejected retry consuming nothing, one resume, no byte lost across the cycle |
+  | `…inbound plaintext saturation pauses carrier reads and resumes after draining` | the same, for the read side |
+  | `…close is terminal and idempotent from every lifecycle state` | close during handshaking, open, closing, and failed; carrier released exactly once; the `finishClose` key wipe |
+
+  TLS-over-TCP KeyUpdate and key replacement remain #357: the bridge exposes
+  no such surface today, so the epoch target's operation set is the extension
+  point for it rather than a fabricated API. The stream targets' operation
+  sets are the corresponding extension point for any future post-handshake
+  record-layer operation.
 
 Ownership stays exactly as scoped above and in the issue: shared TLS
 message/negotiation/transcript fuzzing is #491; PKI fuzzing is #492;
@@ -797,7 +915,8 @@ pre-existing deterministic `record_codec.zig` test suite already pins most
 of them by name, and the #493 property targets promote them into generated
 properties rather than leaving them as fixed examples: exact parser
 consumption under fragmentation, sink retry behavior, and the
-legal/illegal initial-ClientHello `0x0301` window in #493-A, and epoch
+legal/illegal initial-ClientHello `0x0301` window in #493-A, epoch
 discard/transition ordering, sequence exhaustion, and key cleanup in
-#493-B. The encrypted-stream progression and terminal-error classes remain
-deterministic-only until #493-C.
+#493-B, and partial-record rejection at an epoch transition, terminal-error
+preservation across an alert flush, and byte-exact progression under
+fragmented carrier I/O in #493-C.

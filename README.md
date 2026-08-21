@@ -78,17 +78,23 @@ The fastest way to install the latest release is the official install script:
 curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
 ```
 
-The installer downloads the matching Linux release archive (`x86_64` or
-`aarch64`), verifies it against `tardigrade-checksums.txt`, and installs the
-`tardi` binary (with a `tardigrade` compatibility alias) into
-`$HOME/.local/bin` by default. Published archives currently cover Linux
-only; macOS is not yet built or published by the release workflow (see
-[packaging/README.md](packaging/README.md#current-status) for exact status).
+The installer downloads the matching release archive, verifies it against
+`tardigrade-checksums.txt`, and installs the `tardi` binary (with a
+`tardigrade` compatibility alias) into `$HOME/.local/bin` by default. The
+**currently published latest release still contains Linux x86_64/aarch64
+archives only**. PR #476 adds native Intel and Apple Silicon Darwin release
+rows; macOS becomes a supported `install.sh`/raw-archive path starting with
+the first release that contains that change. See
+[packaging/README.md](packaging/README.md#current-status) for exact status.
 
 Published release binaries use the default "general" TLS profile, which
 links OpenSSL at runtime — installing via this script or the raw archive
-requires OpenSSL 1.1/3.x already present on the target host, the same
-runtime dependency the DEB/RPM packages declare explicitly.
+requires OpenSSL already present on the target host. Linux package installs
+declare that dependency explicitly. Darwin archives produced by #476 use
+Homebrew OpenSSL 3; install it with `brew install openssl@3` before running a
+raw macOS archive. Those Darwin archives are unsigned and not notarized; see
+the Gatekeeper note in [packaging/README.md](packaging/README.md) before
+redistributing browser-downloaded artifacts.
 
 Other install paths:
 
@@ -109,6 +115,7 @@ Requirements:
 - [Zig](https://ziglang.org/) 0.16.0
 - OpenSSL development libraries on Linux, for example `libssl-dev` on Debian or
   Ubuntu
+- Homebrew `openssl@3` on macOS for the default general TLS profile
 - HTTP/3 is served by the built-in native Zig QUIC/H3 stack and requires no
   additional system libraries.
 

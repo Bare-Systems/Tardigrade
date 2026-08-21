@@ -30,11 +30,21 @@ Use this checklist before tagging and distributing a Tardigrade release.
 - [ ] Run `./scripts/test-install.sh` against a ReleaseFast build
 - [ ] Run `./scripts/test-deb-package.sh` on a Linux host with Docker
 - [ ] Run `./scripts/test-rpm-package.sh` on a Linux host with Docker
-- [ ] Verify release packaging paths and checksums, including the published
-      `.deb`/`.rpm` assets
-- [ ] Note in the release that Homebrew and launchd are not published release
-      assets; the Linux `.tar.gz` archives, `.deb`/`.rpm` packages, `install.sh`,
-      and checksums are
+- [ ] Verify release packaging paths and checksums, including the Linux
+      (`tardigrade-linux-x86_64.tar.gz`, `tardigrade-linux-aarch64.tar.gz`) and
+      Darwin (`tardigrade-darwin-x86_64.tar.gz`,
+      `tardigrade-darwin-arm64.tar.gz`) archives plus published `.deb`/`.rpm`
+      assets
+- [ ] Verify both Darwin archives have matching SPDX SBOMs and
+      `dependency-inventory-*.json` artifacts, and verify archive provenance
+      with `gh attestation verify <archive> --repo Bare-Systems/Tardigrade`
+- [ ] On the first release containing #463, exercise `scripts/install.sh`
+      against the published release on Intel and Apple Silicon macOS with
+      Homebrew `openssl@3` installed, then close #463 if the release assets,
+      checksums, inventories, SBOMs, and attestations are all correct
+- [ ] Note in the release that Homebrew tap publication and launchd lifecycle
+      validation are separate from the raw Darwin archives until #466/#467
+      close
 - [ ] Confirm changelog entries for operator-visible changes are complete
 
 ## Branch Hygiene

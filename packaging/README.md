@@ -10,12 +10,12 @@ versus what is a local-build-only tool.
 | Format | Status | Notes |
 | --- | --- | --- |
 | Linux release archives (`.tar.gz`, x86_64/aarch64) | **Supported, published** | Built and attached to every GitHub release by `.github/workflows/release.yml`, alongside `install.sh`, `tardigrade-checksums.txt`, and per-arch SPDX SBOMs. |
-| macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Planned, not published** | CI builds and tests Tardigrade on `macos-14`, but the release workflow's build matrix only packages Linux. `install.sh` and the Homebrew formula already expect `tardigrade-darwin-*.tar.gz` assets that do not yet exist. |
+| macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Implemented in #476; awaiting first release** | #476 adds `macos-15-intel` and `macos-15` release rows for `tardigrade-darwin-x86_64.tar.gz` and `tardigrade-darwin-arm64.tar.gz`, using the same archive/SBOM/inventory/provenance pipeline as Linux. A dedicated PR smoke runs native build, architecture, linkage-audit, packaging, extraction, and `tardi version` checks on both architectures. The currently published latest release still predates #476, so these assets are not public until the first intentional release containing it. |
 | DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder (`packaging/deb/build.sh`). Smoke-tested on every PR/push via the `packaging-smoke` CI job (`scripts/test-deb-package.sh`). |
 | RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Smoke-tested via `scripts/test-rpm-package.sh`. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and structurally validated (unit file text/layout, permissions) by both the DEB and RPM smoke tests. Neither test boots systemd or exercises a real start/status/reload/stop lifecycle — see [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#the-systemd-units-pidcontrol-path-contract) for the unit contract these assertions check. |
-| launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | Ships as a template for macOS host-native installs; there is no macOS packaging pipeline or smoke test exercising it. |
-| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present, tap not published, macOS blocked** | The `on_linux` blocks can resolve once real release checksums are filled in; the `on_macos` blocks cannot resolve until macOS archives are published (see above). No `Bare-Systems/homebrew-tap` repo exists yet. |
+| launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | The Darwin archive pipeline does not install or exercise launchd. #467 owns a real macOS `launchctl` bootstrap/health/bootout smoke and the final `tardi`/compatibility-alias service contract. |
+| Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present; public tap exists but is not usable yet** | `Bare-Systems/homebrew-tap` exists, but #466 owns seeding/automating it. The checked-in formula is not currently installable: its release version is stale, SHA-256 values are placeholders, and the macOS runtime dependency still needs to be represented truthfully. #476 only supplies the Darwin archive filenames the future formula will consume. |
 | Docker / OCI image | **Local build supported, not published** | Root [`Dockerfile`](../Dockerfile) and [`compose.yaml`](../compose.yaml) build a runtime image locally; smoke-tested via `scripts/test-docker-image.sh` in the `packaging-smoke` CI job. No registry-published image or container-publishing workflow exists. See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the full workflow. |
 
 ## Quick install (recommended)
@@ -26,7 +26,37 @@ Use the official install script which downloads the correct prebuilt binary and 
 curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
 ```
 
-This currently only resolves for Linux (`x86_64`/`aarch64`); see "Current status" above.
+The currently published latest release resolves only for Linux
+(`x86_64`/`aarch64`). After the first release containing #476, the same script
+will also resolve native Intel and Apple Silicon macOS archives. The release
+checklist requires verifying those first published Darwin assets before #463
+closes.
+
+Published general-profile Darwin binaries link Homebrew OpenSSL 3 at runtime.
+Install it first:
+
+```bash
+brew install openssl@3
+```
+
+### macOS Gatekeeper / unsigned binary note
+
+The initial Darwin archives are unsigned and not notarized. Command-line
+installation from GitHub Releases is supported once the first #476 release is
+published, but a browser-downloaded archive may carry Apple's quarantine
+attribute and trigger Gatekeeper. Signing/notarization is a separate future
+distribution concern; do not describe these archives as notarized.
+
+If an operator intentionally downloaded the official archive and Gatekeeper
+blocks the extracted binary because of quarantine, inspect the attribute first
+and remove it only from that trusted extracted binary when appropriate:
+
+```bash
+xattr -l ./tardi
+xattr -d com.apple.quarantine ./tardi
+```
+
+Do not apply recursive quarantine removal to unrelated files.
 
 ## DEB (Debian / Ubuntu)
 
@@ -191,32 +221,28 @@ isn't a complete pre-flight check on its own (it doesn't load
 
 ## Homebrew (macOS and Linux)
 
-The `on_macos` blocks in this formula cannot resolve today: the release
-workflow does not build or publish `tardigrade-darwin-*.tar.gz` archives (see
-"Current status" above). The `on_linux` blocks reference archives that are
-published, so a Linux install can work once real checksums are filled in.
+PR #476 supplies the Darwin **archive filenames** the formula is intended to
+consume after the first release containing that change. That does not make the
+current formula installable by itself.
 
-The formula at `packaging/homebrew/tardigrade.rb` can be installed locally:
+The checked-in `packaging/homebrew/tardigrade.rb` still needs #466 to reconcile
+its release version, replace placeholder checksums with values from one real
+release, declare/handle the macOS OpenSSL runtime dependency correctly, and
+publish/synchronize the formula into the existing public
+`Bare-Systems/homebrew-tap` repository. Do not advertise the tap as a working
+install path until #466's smoke succeeds.
 
-```bash
-brew install --formula packaging/homebrew/tardigrade.rb
-```
-
-To use the formula via a Homebrew tap:
+The intended eventual public shape is:
 
 ```bash
 brew tap Bare-Systems/tap
 brew install tardigrade
+
+tardi version
 ```
 
-> **Note**: The tap at `Bare-Systems/homebrew-tap` is not yet published. The formula is included here as the canonical source. Copy it to `Formula/tardigrade.rb` in the tap repo and update the `sha256` values from the release checksums file on each release.
-
-### Updating the formula for a new release
-
-1. Download the release checksums: `tardigrade-checksums.txt` from the release page.
-2. Update `version` in the formula.
-3. Replace the four `REPLACE_WITH_ACTUAL_SHA256_*` placeholders with the SHA-256 values from the checksums file.
-4. Commit and push the formula to the tap repo.
+Use #466 as the source of truth for formula ownership and release-to-tap update
+automation. Do not maintain two hand-edited canonical formulas.
 
 ## Service files
 
@@ -225,7 +251,7 @@ Pre-built service files for host-native installs:
 | File | Purpose |
 |---|---|
 | [`systemd/tardigrade.service`](systemd/tardigrade.service) | systemd service unit (Linux) |
-| [`launchd/io.baresystems.tardigrade.plist`](launchd/io.baresystems.tardigrade.plist) | launchd plist (macOS) — unverified, no macOS packaging pipeline exists yet |
+| [`launchd/io.baresystems.tardigrade.plist`](launchd/io.baresystems.tardigrade.plist) | launchd plist (macOS) — archive publication is handled by #476; real launchd lifecycle validation remains #467 |
 
 ## Related docs
 

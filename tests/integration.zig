@@ -17619,6 +17619,24 @@ fn expectInitProfileGeneratesCheckableConfig(allocator: std.mem.Allocator, profi
     defer allocator.free(checked.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, checked.term);
     try assertContains(checked.stdout, "configuration valid");
+    // Regression for #168: every canonical profile declares exactly two
+    // top-level `location` blocks (`= /health` and `/`), none of them
+    // wrapped in a `server { }` block. `check`'s summary previously
+    // undercounted these as "location blocks: 0" because it only summed
+    // server_blocks[].location_blocks, ignoring the config's own top-level
+    // location_blocks -- the field every `tardi init` profile actually
+    // populates.
+    try assertContains(checked.stdout, "location blocks: 2");
+
+    const printed = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "print-config", "-c", config_path },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(printed.stdout);
+    defer allocator.free(printed.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, printed.term);
+    try assertContains(printed.stdout, "location blocks: 2");
 }
 
 test "init static, proxy, and metrics profiles pass the real tardi check with no external prerequisites" {
@@ -17680,6 +17698,21 @@ fn expectInitTlsProfileGeneratesCheckableConfig(allocator: std.mem.Allocator, pr
     defer allocator.free(checked.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, checked.term);
     try assertContains(checked.stdout, "configuration valid");
+    // See the matching #168 regression comment in
+    // expectInitProfileGeneratesCheckableConfig above: both the `tls` and
+    // `prod` templates also declare exactly two top-level location blocks.
+    try assertContains(checked.stdout, "location blocks: 2");
+
+    const printed = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "print-config", "-c", config_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(printed.stdout);
+    defer allocator.free(printed.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, printed.term);
+    try assertContains(printed.stdout, "location blocks: 2");
 }
 
 test "init tls profile passes the real tardi check once real TLS fixtures are supplied" {

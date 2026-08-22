@@ -154,7 +154,7 @@ pub const MatchResult = struct {
     matched_path: []const u8,
 };
 
-pub fn matchLocation(request_uri: []const u8, blocks: []const LocationBlock) ?MatchResult {
+pub fn matchLocation(allocator: std.mem.Allocator, request_uri: []const u8, blocks: []const LocationBlock) ?MatchResult {
     const path = normalizeRequestPath(request_uri);
 
     var best_priority_prefix: ?usize = null;
@@ -193,12 +193,12 @@ pub fn matchLocation(request_uri: []const u8, blocks: []const LocationBlock) ?Ma
     for (blocks, 0..) |*block, idx| {
         switch (block.match_type) {
             .regex => {
-                if (rewrite.regexMatchesOptions(block.pattern, path, false)) {
+                if (rewrite.regexMatchesOptionsAlloc(allocator, block.pattern, path, false)) {
                     return .{ .index = idx, .block = block, .matched_path = path };
                 }
             },
             .regex_case_insensitive => {
-                if (rewrite.regexMatchesOptions(block.pattern, path, true)) {
+                if (rewrite.regexMatchesOptionsAlloc(allocator, block.pattern, path, true)) {
                     return .{ .index = idx, .block = block, .matched_path = path };
                 }
             },
@@ -255,7 +255,7 @@ test "exact match beats prefix match" {
         },
     };
 
-    const matched = matchLocation("/status", &blocks).?;
+    const matched = matchLocation(std.testing.allocator, "/status", &blocks).?;
     try std.testing.expectEqual(@as(usize, 1), matched.index);
 }
 
@@ -281,7 +281,7 @@ test "longest prefix priority beats regex and prefix" {
         },
     };
 
-    const matched = matchLocation("/api/private/users", &blocks).?;
+    const matched = matchLocation(std.testing.allocator, "/api/private/users", &blocks).?;
     try std.testing.expectEqual(@as(usize, 2), matched.index);
 }
 
@@ -301,7 +301,7 @@ test "first regex match wins when no priority prefix exists" {
         },
     };
 
-    const matched = matchLocation("/api/users/42", &blocks).?;
+    const matched = matchLocation(std.testing.allocator, "/api/users/42", &blocks).?;
     try std.testing.expectEqual(@as(usize, 0), matched.index);
 }
 
@@ -321,7 +321,7 @@ test "case insensitive regex matches request path without query" {
         },
     };
 
-    const matched = matchLocation("/Assets/SITE.css?v=1", &blocks).?;
+    const matched = matchLocation(std.testing.allocator, "/Assets/SITE.css?v=1", &blocks).?;
     try std.testing.expectEqual(@as(usize, 0), matched.index);
     try std.testing.expectEqualStrings("/Assets/SITE.css", matched.matched_path);
 }
@@ -354,7 +354,7 @@ test "longest plain prefix wins when no exact priority or regex matches" {
         },
     };
 
-    const matched = matchLocation("/images/logo.png", &blocks).?;
+    const matched = matchLocation(std.testing.allocator, "/images/logo.png", &blocks).?;
     try std.testing.expectEqual(@as(usize, 1), matched.index);
 }
 
@@ -374,7 +374,7 @@ test "equal length prefixes keep first configured block" {
         },
     };
 
-    const matched = matchLocation("/api/users", &blocks).?;
+    const matched = matchLocation(std.testing.allocator, "/api/users", &blocks).?;
     try std.testing.expectEqual(@as(usize, 0), matched.index);
 }
 
@@ -408,5 +408,5 @@ fn fuzzMatchLocation(_: void, smith: *std.testing.Smith) !void {
         .value(u8, '#', 1),
         .rangeAtMost(u8, 0x00, 0x1f, 1), // control characters
     });
-    _ = matchLocation(buf[0..len], &fuzz_router_blocks);
+    _ = matchLocation(std.testing.allocator, buf[0..len], &fuzz_router_blocks);
 }

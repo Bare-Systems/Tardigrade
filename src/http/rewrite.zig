@@ -123,7 +123,10 @@ pub fn regexMatches(pattern: []const u8, input: []const u8) bool {
 }
 
 pub fn regexMatchesOptions(pattern: []const u8, input: []const u8, case_insensitive: bool) bool {
-    const allocator = std.heap.page_allocator;
+    return regexMatchesOptionsAlloc(std.heap.page_allocator, pattern, input, case_insensitive);
+}
+
+pub fn regexMatchesOptionsAlloc(allocator: std.mem.Allocator, pattern: []const u8, input: []const u8, case_insensitive: bool) bool {
     var prepared = preparePattern(allocator, pattern) catch return false;
     defer prepared.deinit();
 

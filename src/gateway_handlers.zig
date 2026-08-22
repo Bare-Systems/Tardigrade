@@ -59,8 +59,8 @@ pub const RouteDecision = union(enum) {
 /// fall-through and change behavior. So it stays a pre-check in `routeRequest`
 /// until that matcher is split from its handler. Fold it in with the pre-route
 /// middleware stage (later #201 PR).
-pub fn resolveRoute(cfg: *const edge_config.EdgeConfig, request: *const http.Request) RouteDecision {
-    return resolveRoutePath(cfg.metrics_path, cfg.location_blocks, request.uri.path);
+pub fn resolveRoute(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, request: *const http.Request) RouteDecision {
+    return resolveRoutePath(allocator, cfg.metrics_path, cfg.location_blocks, request.uri.path);
 }
 
 /// Pure route-matching precedence — no I/O, no mutation of `state`/`request`.
@@ -70,13 +70,14 @@ pub fn resolveRoute(cfg: *const edge_config.EdgeConfig, request: *const http.Req
 /// Mirrors the order previously inlined in `routeRequest`: reload-status path,
 /// then the configured metrics path, then location blocks.
 pub fn resolveRoutePath(
+    allocator: std.mem.Allocator,
     metrics_path: []const u8,
     location_blocks: []const http.location_router.LocationBlock,
     path: []const u8,
 ) RouteDecision {
     if (std.mem.eql(u8, path, "/tardigrade/reload/status")) return .reload_status;
     if (metrics_path.len > 0 and std.mem.eql(u8, path, metrics_path)) return .metrics;
-    if (http.location_router.matchLocation(path, location_blocks)) |matched| {
+    if (http.location_router.matchLocation(allocator, path, location_blocks)) |matched| {
         return .{ .location = matched };
     }
     return .unmatched;
@@ -123,16 +124,18 @@ fn isTranscriptRoutePath(path: []const u8) bool {
 }
 
 pub fn earlyDataDecisionForRequest(
+    allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     early_ctx: http.request_context.EarlyDataContext,
     method: http.Method,
     path: []const u8,
     has_body_framing: bool,
 ) http.early_data.Decision {
-    return earlyDataDecisionForRawMethod(cfg, early_ctx, method.toString(), path, has_body_framing);
+    return earlyDataDecisionForRawMethod(allocator, cfg, early_ctx, method.toString(), path, has_body_framing);
 }
 
 pub fn earlyDataDecisionForRawMethod(
+    allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     early_ctx: http.request_context.EarlyDataContext,
     method: []const u8,
@@ -144,7 +147,7 @@ pub fn earlyDataDecisionForRawMethod(
     if (isTranscriptRoutePath(path)) return .too_early;
     if (hasMatchingMirrorRule(cfg.mirror_rules, method, path)) return .too_early;
 
-    return switch (resolveRoutePath(cfg.metrics_path, cfg.location_blocks, path)) {
+    return switch (resolveRoutePath(allocator, cfg.metrics_path, cfg.location_blocks, path)) {
         .reload_status, .metrics, .unmatched => .too_early,
         .location => |matched| locationEarlyDataDecision(early_ctx, http.early_data.methodSafe(method), matched.block),
     };
@@ -221,22 +224,22 @@ test "resolveRoutePath: reload-status and metrics precede location matching" {
     };
     const Tag = std.meta.Tag(RouteDecision);
     // reload-status wins over a configured metrics path and a catch-all location.
-    try std.testing.expectEqual(Tag.reload_status, std.meta.activeTag(resolveRoutePath("/metrics", &blocks, "/tardigrade/reload/status")));
+    try std.testing.expectEqual(Tag.reload_status, std.meta.activeTag(resolveRoutePath(std.testing.allocator, "/metrics", &blocks, "/tardigrade/reload/status")));
     // metrics path wins over a matching location.
-    try std.testing.expectEqual(Tag.metrics, std.meta.activeTag(resolveRoutePath("/metrics", &blocks, "/metrics")));
+    try std.testing.expectEqual(Tag.metrics, std.meta.activeTag(resolveRoutePath(std.testing.allocator, "/metrics", &blocks, "/metrics")));
     // an empty metrics_path disables the metrics route, falling to the location.
-    try std.testing.expectEqual(Tag.location, std.meta.activeTag(resolveRoutePath("", &blocks, "/metrics")));
+    try std.testing.expectEqual(Tag.location, std.meta.activeTag(resolveRoutePath(std.testing.allocator, "", &blocks, "/metrics")));
 }
 
 test "resolveRoutePath: location match carries the block, else unmatched" {
     const blocks = [_]http.location_router.LocationBlock{
         .{ .match_type = .exact, .pattern = "/app", .priority = 1, .action = .{ .proxy_pass = "" } },
     };
-    switch (resolveRoutePath("/status/metrics", &blocks, "/app")) {
+    switch (resolveRoutePath(std.testing.allocator, "/status/metrics", &blocks, "/app")) {
         .location => |m| try std.testing.expectEqualStrings("/app", m.block.pattern),
         else => try std.testing.expect(false),
     }
-    try std.testing.expectEqual(std.meta.Tag(RouteDecision).unmatched, std.meta.activeTag(resolveRoutePath("/status/metrics", &blocks, "/nope")));
+    try std.testing.expectEqual(std.meta.Tag(RouteDecision).unmatched, std.meta.activeTag(resolveRoutePath(std.testing.allocator, "/status/metrics", &blocks, "/nope")));
 }
 
 test "earlyDataDecisionForRequest gates H1 routes before side effects" {
@@ -283,19 +286,19 @@ test "earlyDataDecisionForRequest gates H1 routes before side effects" {
 
     const ordinary = http.request_context.EarlyDataContext{};
     const early = http.request_context.EarlyDataContext{ .transport_early = true };
-    try std.testing.expectEqual(http.early_data.Decision.ordinary, earlyDataDecisionForRequest(&cfg, ordinary, .GET, "/off", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/off", false));
-    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .GET, "/safe", false));
-    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .HEAD, "/safe", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/safe", true));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .HEAD, "/safe", true));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .POST, "/safe", false));
-    try std.testing.expectEqual(http.early_data.Decision.forward_rfc8470, earlyDataDecisionForRequest(&cfg, early, .GET, "/proxy", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/auth", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/rewrite", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, cfg.metrics_path, false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/transcripts", false));
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/missing", false));
+    try std.testing.expectEqual(http.early_data.Decision.ordinary, earlyDataDecisionForRequest(std.testing.allocator, &cfg, ordinary, .GET, "/off", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/off", false));
+    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .HEAD, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/safe", true));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .HEAD, "/safe", true));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .POST, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.forward_rfc8470, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/proxy", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/auth", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/rewrite", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, cfg.metrics_path, false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/transcripts", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/missing", false));
 }
 
 test "earlyDataDecisionForRequest rejects matching mirrors before side effects" {
@@ -316,8 +319,8 @@ test "earlyDataDecisionForRequest rejects matching mirrors before side effects" 
     cfg.mirror_rules = mirrors[0..];
 
     const early = http.request_context.EarlyDataContext{ .transport_early = true };
-    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(&cfg, early, .GET, "/safe", false));
-    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(&cfg, early, .HEAD, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/safe", false));
+    try std.testing.expectEqual(http.early_data.Decision.execute_local, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .HEAD, "/safe", false));
 }
 
 test "writeTooEarlyResponse emits no-store 425 without double-counting callers" {
@@ -662,7 +665,7 @@ pub fn routeRequest(
         return status;
     }
 
-    switch (resolveRoute(cfg, request)) {
+    switch (resolveRoute(allocator, cfg, request)) {
         .reload_status => {
             const status = try handleReloadStatusRoute(allocator, writer, state, correlation_id, keep_alive.*);
             state.metricsRecord(status);
@@ -778,7 +781,7 @@ test "enforceLocationAuth records invalid session rejection exactly once" {
     defer request.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks).?;
+    const matched = http.location_router.matchLocation(allocator, request.uri.path, cfg.location_blocks).?;
 
     const status = (try enforceLocationAuth(allocator, &output.writer, &cfg, &state, &ctx, &request, matched, "req-session", false, "127.0.0.1")).?;
 
@@ -812,7 +815,7 @@ test "enforceLocationAuth records invalid authorization rejection exactly once" 
     defer request.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks).?;
+    const matched = http.location_router.matchLocation(allocator, request.uri.path, cfg.location_blocks).?;
 
     const status = (try enforceLocationAuth(allocator, &output.writer, &cfg, &state, &ctx, &request, matched, "req-auth", false, "127.0.0.1")).?;
 
@@ -2533,7 +2536,7 @@ fn routeHttp3Location(
     // location routes today; the reload-status and metrics endpoints (which the
     // shared resolver ranks ahead of locations) fall through to the caller's 404
     // — h3 does not expose those operational endpoints yet.
-    const route_decision = resolveRoutePath(ctx.cfg.metrics_path, ctx.cfg.location_blocks, request_path);
+    const route_decision = resolveRoutePath(allocator, ctx.cfg.metrics_path, ctx.cfg.location_blocks, request_path);
 
     var early_ctx = http.request_context.EarlyDataContext{
         .transport_early = request.transport_early,
@@ -2549,6 +2552,7 @@ fn routeHttp3Location(
     }
 
     const decision = earlyDataDecisionForRawMethod(
+        allocator,
         ctx.cfg,
         early_ctx,
         request.method,

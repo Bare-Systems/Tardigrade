@@ -2571,7 +2571,7 @@ test "proxySuffixPathForLocation uses mount prefix for split upstream exact rout
         },
     };
 
-    const matched = http.location_router.matchLocation("/ursa/health", &blocks).?;
+    const matched = http.location_router.matchLocation(std.testing.allocator, "/ursa/health", &blocks).?;
     const suffix = proxySuffixPathForLocation("/ursa/health", matched, &blocks).?;
     try std.testing.expectEqualStrings("health", suffix);
 }
@@ -2592,7 +2592,7 @@ test "proxySuffixPathForLocation keeps mount prefix for split upstream longer pr
         },
     };
 
-    const matched = http.location_router.matchLocation("/ursa/download/file.bin", &blocks).?;
+    const matched = http.location_router.matchLocation(std.testing.allocator, "/ursa/download/file.bin", &blocks).?;
     const suffix = proxySuffixPathForLocation("/ursa/download/file.bin", matched, &blocks).?;
     try std.testing.expectEqualStrings("download/file.bin", suffix);
 }
@@ -2607,7 +2607,7 @@ test "proxySuffixPathForLocation maps split upstream mount root to slash" {
         },
     };
 
-    const matched = http.location_router.matchLocation("/ursa/", &blocks).?;
+    const matched = http.location_router.matchLocation(std.testing.allocator, "/ursa/", &blocks).?;
     const suffix = proxySuffixPathForLocation("/ursa/", matched, &blocks).?;
     try std.testing.expectEqualStrings("/", suffix);
 }

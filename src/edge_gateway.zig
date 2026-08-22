@@ -3189,7 +3189,7 @@ fn executeHttp2ProxyRoute(
         return .{ .local_rejection = rejection };
     }
 
-    const matched = http.location_router.matchLocation(request.uri.path, route_cfg.location_blocks) orelse return null;
+    const matched = http.location_router.matchLocation(allocator, request.uri.path, route_cfg.location_blocks) orelse return null;
     if (matched.block.auth == .required) return .{ .local_rejection = .{
         .status_code = @intFromEnum(http.Status.unauthorized),
         .code = "unauthorized",
@@ -3577,12 +3577,13 @@ fn targetStreamingFallbackReason(
 }
 
 fn streamingUploadEligibilityBeforeBodyRead(
+    allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     request: *const http.Request,
 ) RequestUploadStreamingEligibility {
     if (!request.method.hasRequestBody()) return .not_applicable;
 
-    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks) orelse return .{ .fallback = .unsupported_route_type };
+    const matched = http.location_router.matchLocation(allocator, request.uri.path, cfg.location_blocks) orelse return .{ .fallback = .unsupported_route_type };
     if (!matched.block.proxy_streaming_policy.requestStreamingEnabled(cfg.proxy_streaming_mode.requestStreamingEnabled())) return .{ .fallback = .policy_disabled };
 
     if (cfg.rewrite_rules.len > 0 or cfg.return_rules.len > 0 or
@@ -3627,11 +3628,13 @@ fn traceRejectionStatus(
 }
 
 fn earlyDataPreflightDecisionForH1(
+    allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     early_ctx: http.request_context.EarlyDataContext,
     request: *const http.Request,
 ) http.early_data.Decision {
     return ghandlers.earlyDataDecisionForRequest(
+        allocator,
         cfg,
         early_ctx,
         request.method,
@@ -3767,7 +3770,7 @@ fn executeH1PostPreflightOrchestration(
         state.metricsRecordEarlyDataRequest(.h1, source);
     }
 
-    const early_decision = earlyDataPreflightDecisionForH1(cfg, ctx.early_data, request);
+    const early_decision = earlyDataPreflightDecisionForH1(allocator, cfg, ctx.early_data, request);
     switch (early_decision) {
         .ordinary => {
             ctx.early_data_action = .ordinary;
@@ -3937,7 +3940,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         };
         var pre_effective_cfg_storage = cfg.*;
         const pre_effective_cfg = ga.resolveRequestConfig(cfg, head_parse.request.headers.get("host"), &pre_effective_cfg_storage) orelse cfg;
-        const upload_eligibility = streamingUploadEligibilityBeforeBodyRead(pre_effective_cfg, &head_parse.request);
+        const upload_eligibility = streamingUploadEligibilityBeforeBodyRead(allocator, pre_effective_cfg, &head_parse.request);
         switch (upload_eligibility) {
             .stream => {
                 streaming_request_body = streamingRequestBodyFromHead(pre_effective_cfg, &head_parse.request, pending_buf, head_read, head_parse.bytes_consumed);
@@ -5152,7 +5155,7 @@ test "streaming upload eligibility reports typed fallback reasons" {
         MAX_REQUEST_SIZE,
     );
     defer upload_head.request.deinit();
-    try std.testing.expectEqual(RequestUploadStreamingEligibility.stream, streamingUploadEligibilityBeforeBodyRead(&cfg, &upload_head.request));
+    try std.testing.expectEqual(RequestUploadStreamingEligibility.stream, streamingUploadEligibilityBeforeBodyRead(std.testing.allocator, &cfg, &upload_head.request));
 
     var chunked_head = try http.Request.parseHead(
         allocator,
@@ -5161,7 +5164,7 @@ test "streaming upload eligibility reports typed fallback reasons" {
     );
     defer chunked_head.request.deinit();
     // A chunked upload is re-framed incrementally rather than buffered (#139).
-    try std.testing.expectEqual(RequestUploadStreamingEligibility.stream, streamingUploadEligibilityBeforeBodyRead(&cfg, &chunked_head.request));
+    try std.testing.expectEqual(RequestUploadStreamingEligibility.stream, streamingUploadEligibilityBeforeBodyRead(std.testing.allocator, &cfg, &chunked_head.request));
 
     var compat_head = try http.Request.parseHead(
         allocator,
@@ -5169,7 +5172,7 @@ test "streaming upload eligibility reports typed fallback reasons" {
         MAX_REQUEST_SIZE,
     );
     defer compat_head.request.deinit();
-    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(&cfg, &compat_head.request));
+    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(std.testing.allocator, &cfg, &compat_head.request));
 
     var compat_chunked_head = try http.Request.parseHead(
         allocator,
@@ -5177,10 +5180,10 @@ test "streaming upload eligibility reports typed fallback reasons" {
         MAX_REQUEST_SIZE,
     );
     defer compat_chunked_head.request.deinit();
-    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(&cfg, &compat_chunked_head.request));
+    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(std.testing.allocator, &cfg, &compat_chunked_head.request));
 
     cfg.auth_request_url = "http://auth.example.test/check";
-    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .body_dependent_middleware }, streamingUploadEligibilityBeforeBodyRead(&cfg, &upload_head.request));
+    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .body_dependent_middleware }, streamingUploadEligibilityBeforeBodyRead(std.testing.allocator, &cfg, &upload_head.request));
 }
 
 test "streaming upload pre-read scan includes server block routes" {

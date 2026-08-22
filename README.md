@@ -189,6 +189,7 @@ operate without guessing which config file or pid file is active.
 | HTTP/3 rollout and lifecycle | [docs/HTTP3_ROLLOUT.md](docs/HTTP3_ROLLOUT.md) |
 | HTTP/3 validation evidence | [docs/HTTP3_VALIDATION_EVIDENCE.md](docs/HTTP3_VALIDATION_EVIDENCE.md) |
 | Concurrency & hot-path audit | [docs/CONCURRENCY.md](docs/CONCURRENCY.md) |
+| Hot-path allocation ownership | [docs/ALLOCATION_OWNERSHIP.md](docs/ALLOCATION_OWNERSHIP.md) |
 | Event-loop backend evaluation (epoll/kqueue vs libxev/std.Io/io_uring) | [docs/EVENT_LOOP_BACKENDS.md](docs/EVENT_LOOP_BACKENDS.md) |
 | Observability | [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
 | Reload, drain, and shutdown | [docs/RELOAD_SHUTDOWN.md](docs/RELOAD_SHUTDOWN.md) |

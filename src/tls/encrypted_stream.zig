@@ -5527,13 +5527,13 @@ fn expectStreamStateCleared(subject: *PureZigRecordStream) !void {
     try testing.expectEqual(@as(usize, 0), subject.ciphertext_parser.len);
 
     // No stale plaintext or ciphertext left behind in the backing storage.
-    try testing.expect(std.mem.allEqual(u8, &subject.inbound_carrier.buf, 0));
-    try testing.expect(std.mem.allEqual(u8, &subject.inbound_plaintext.buf, 0));
-    try testing.expect(std.mem.allEqual(u8, &subject.inbound_handshake.buf, 0));
-    try testing.expect(std.mem.allEqual(u8, &subject.outbound_ciphertext.buf, 0));
-    try testing.expect(std.mem.allEqual(u8, &subject.initial_parser.pending, 0));
-    try testing.expect(std.mem.allEqual(u8, &subject.ciphertext_parser.pending, 0));
-    try testing.expect(std.mem.allEqual(bool, &subject.inbound_plaintext_provenance.buf, false));
+    try testing.expect(allEqualUninstrumented(u8, &subject.inbound_carrier.buf, 0));
+    try testing.expect(allEqualUninstrumented(u8, &subject.inbound_plaintext.buf, 0));
+    try testing.expect(allEqualUninstrumented(u8, &subject.inbound_handshake.buf, 0));
+    try testing.expect(allEqualUninstrumented(u8, &subject.outbound_ciphertext.buf, 0));
+    try testing.expect(allEqualUninstrumented(u8, &subject.initial_parser.pending, 0));
+    try testing.expect(allEqualUninstrumented(u8, &subject.ciphertext_parser.pending, 0));
+    try testing.expect(allEqualUninstrumented(bool, &subject.inbound_plaintext_provenance.buf, false));
 
     // ...and no key material, at any epoch, in either direction.
     inline for (.{ events.EncryptionEpoch.zero_rtt, .handshake, .application }) |epoch| {
@@ -5541,6 +5541,15 @@ fn expectStreamStateCleared(subject: *PureZigRecordStream) !void {
         try testing.expect(!subject.bridge.hasWriteKeys(epoch));
     }
     try testing.expect(!subject.bridge.handshake_complete);
+}
+
+/// Zeroization assertions scan the complete fixed backing arrays (about 247 KiB
+/// per call). Coverage instrumentation on every scalar comparison makes those
+/// test-only scans dominate sustained fuzzing even though their internal loop
+/// carries no useful input-dependent coverage signal.
+fn allEqualUninstrumented(comptime T: type, slice: []const T, scalar: T) bool {
+    @disableInstrumentation();
+    return std.mem.allEqual(T, slice, scalar);
 }
 
 /// The extra state `fail()` and `deinit()` clear on top of

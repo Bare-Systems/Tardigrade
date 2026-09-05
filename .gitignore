@@ -46,12 +46,18 @@ PLAN-TEST*.md
 PLAN*.md
 ISSUES.md
 RESEARCH*
+AGENT-NOTES.md
 
 # Benchmarking documentation and evidence (uploaded to Google Drive)
 benchmarks/results/
 benchmarks/baselines/
 docs/evidence/
 benchmarks/competitive/results/
+log*.txt
+
+# #675 fuzz campaign evidence and cross-agent coordination notes — local-only,
+# multi-GB (VM source tarballs, crash inputs, logs); never committed.
+artifacts/hardening/fuzz/
 
 # Deployment symlink
 suite/

@@ -336,7 +336,17 @@ pub const Stream = struct {
     fn receive(self: *Stream, allocator: std.mem.Allocator, frame: StreamFrame) !u64 {
         const normalized = (try self.normalizeReceiveFrame(frame)) orelse {
             if (frame.fin) {
-                self.recv_final_size = frame.offset + @as(u64, @intCast(frame.data.len));
+                const end = frame.offset + @as(u64, @intCast(frame.data.len));
+                // RFC 9000 SS4.5: a FIN must not claim a final size smaller
+                // than data this stream has already buffered, even data
+                // that arrived out of order past `recv_offset` and hasn't
+                // been read yet. `end <= recv_offset` (why we're in this
+                // early-return branch at all) does not imply
+                // `end <= highestReceivedEnd()` -- unread buffered segments
+                // past `recv_offset` are exactly what `highestReceivedEnd`
+                // adds on top.
+                if (end < self.highestReceivedEnd()) return error.FinalSizeError;
+                self.recv_final_size = end;
                 self.recv_closed = self.recv_final_size == self.recv_offset;
             }
             return 0;
@@ -361,6 +371,15 @@ pub const Stream = struct {
             if (self.recv_final_size) |known| {
                 if (known != end) return error.FinalSizeError;
             }
+            // RFC 9000 SS4.5: reject a final size smaller than data already
+            // buffered for this stream -- symmetric with the identical
+            // check `StreamManager.receiveResetStream` already applies for
+            // RESET_STREAM's `final_size`. Without this, a short STREAM
+            // frame carrying FIN could shrink `recv_final_size` below
+            // `highestReceivedEnd()`; later draining that already-buffered
+            // out-of-order data through `Stream.read` would then push
+            // `recv_offset` past `recv_final_size`.
+            if (end < self.highestReceivedEnd()) return error.FinalSizeError;
         }
         if (self.recv_final_size) |known| {
             if (end > known) return error.FinalSizeError;
@@ -1213,6 +1232,50 @@ test "reset final size below buffered out of order data is rejected" {
     _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 10, .data = "abc" });
     try std.testing.expectError(error.FinalSizeError, manager.receiveResetStream(.{ .id = id, .app_error_code = 1, .final_size = 12 }));
     try std.testing.expectEqual(@as(u64, 3), manager.bytes_received);
+}
+
+test "FIN final size below buffered out of order data is rejected (#675 campaign finding)" {
+    // Sibling of "reset final size below buffered out of order data is
+    // rejected" above, but for a FIN carried on a STREAM frame instead of
+    // RESET_STREAM: `previewReceive` checked a new final size against an
+    // existing `recv_final_size` and against `recv_offset`, but never
+    // against data already buffered out of order past `recv_offset` --
+    // exactly what `highestReceivedEnd()` (already used by
+    // `receiveResetStream`) tracks. A short FIN could shrink
+    // `recv_final_size` below data the stream had already buffered;
+    // draining that data through `Stream.read` would then push
+    // `recv_offset` past `recv_final_size`, which the fuzz model's
+    // `expectStreamManagerInvariants` (recv_offset <= recv_final_size)
+    // caught (#675 campaign finding, quic__family, `.zig-cache/f/crash`
+    // sha256 a0c1636b...).
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 10, .data = "abc" });
+    try std.testing.expectError(error.FinalSizeError, manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = "hello", .fin = true }));
+    try std.testing.expectEqual(@as(u64, 3), manager.bytes_received);
+}
+
+test "FIN at recv_offset below buffered out of order data is rejected" {
+    // Same defect, the OTHER vulnerable path: `Stream.receive`'s early
+    // return (a FIN whose claimed end lands at-or-before `recv_offset`,
+    // e.g. a stale/duplicate FIN for already-consumed data) set
+    // `recv_final_size` without checking `highestReceivedEnd()` either.
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = "ab" });
+    var out: [8]u8 = undefined;
+    _ = try manager.read(id, &out); // recv_offset now 2
+
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 10, .data = "xyz" }); // highestReceivedEnd = 13
+
+    // end == recv_offset (2) so this hits Stream.receive's early-return
+    // branch rather than previewReceive, but 2 < highestReceivedEnd (13).
+    try std.testing.expectError(error.FinalSizeError, manager.receiveStreamFrame(.{ .id = id, .offset = 2, .data = "", .fin = true }));
+    try std.testing.expectEqual(@as(u64, 5), manager.bytes_received);
 }
 
 test "STOP_SENDING received blocks future sends" {

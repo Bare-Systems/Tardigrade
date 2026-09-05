@@ -90,6 +90,15 @@ owning family/filter/replay command. Exact crash input recovery, minimization,
 and regression promotion remain deliberate follow-up work under the existing
 fuzz contracts.
 
+`zig build --fuzz` exits 0 even when the fuzzer finds a failing input: it
+saves the input (usually to `.zig-cache/f/crash`), stops the session early,
+and the build summary still reports success. The runner therefore also scans
+the run output for a saved-crash report, records such a run as `fail` with a
+nonzero runner exit, and copies the saved input bytes plus their SHA-256 into
+the finding directory and manifest row when Zig persisted a non-empty file
+(replays of an already-saved corpus entry can leave the crash file empty; the
+preserved `.zig-cache` archive still holds the corpus in that case).
+
 ## Disposable Proxmox KVM
 
 The Proxmox wrapper packages the exact local Git commit with `git archive`,

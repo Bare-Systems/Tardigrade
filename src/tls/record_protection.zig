@@ -826,11 +826,21 @@ fn expectFailedOpen(
 
     if (zeroes_attempted_span) {
         const ciphertext_len = record.payload.len - read.keys.profile.aead.tagLength();
-        try std.testing.expect(std.mem.allEqual(u8, out[0..ciphertext_len], 0));
-        try std.testing.expect(std.mem.allEqual(u8, out[ciphertext_len..], fuzz_protection_sentinel));
+        try std.testing.expect(allEqualUninstrumented(u8, out[0..ciphertext_len], 0));
+        try std.testing.expect(allEqualUninstrumented(u8, out[ciphertext_len..], fuzz_protection_sentinel));
     } else {
-        try std.testing.expect(std.mem.allEqual(u8, out, fuzz_protection_sentinel));
+        try std.testing.expect(allEqualUninstrumented(u8, out, fuzz_protection_sentinel));
     }
+}
+
+/// Sentinel/zero scans over `out` (up to `max_ciphertext_record_len`) are
+/// test-only bulk equality checks with no input-dependent coverage signal;
+/// coverage instrumentation on their scalar loop otherwise dominates sampled
+/// execution time under sustained fuzzing (~52% of `expectFailedOpen` time,
+/// #675 campaign finding).
+fn allEqualUninstrumented(comptime T: type, slice: []const T, scalar: T) bool {
+    @disableInstrumentation();
+    return std.mem.allEqual(T, slice, scalar);
 }
 
 test "fuzz: TLS record: protection tamper and sequence boundaries preserve authentication state" {

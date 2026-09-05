@@ -262,10 +262,9 @@ pub const Parser = struct {
     /// into `sink`; incomplete headers/bodies stay buffered for the next feed.
     pub fn feed(self: *Parser, bytes: []const u8, sink: anytype) Error!void {
         try self.drain(sink);
-        for (bytes) |byte| {
-            if (self.len == self.pending.len) return error.RecordBufferOverflow;
-            self.pending[self.len] = byte;
-            self.len += 1;
+        var consumed: usize = 0;
+        while (consumed < bytes.len) {
+            consumed += try self.appendToNextBoundary(bytes[consumed..]);
             try self.drain(sink);
         }
     }
@@ -284,13 +283,36 @@ pub const Parser = struct {
 
         var consumed: usize = 0;
         while (consumed < bytes.len and sink.len == 0) {
-            if (self.len == self.pending.len) return error.RecordBufferOverflow;
-            self.pending[self.len] = bytes[consumed];
-            self.len += 1;
-            consumed += 1;
+            consumed += try self.appendToNextBoundary(bytes[consumed..]);
             try self.drainOne(sink);
         }
         return .{ .consumed = consumed, .emitted = sink.len > 0 };
+    }
+
+    /// Copy as much caller input as possible without crossing the next point
+    /// where parsing can change state: first the complete header, then the
+    /// complete record. The old byte-at-a-time loop reparsed an unchanged
+    /// header after every payload byte, making a maximum-sized record perform
+    /// roughly 16K redundant header parses.
+    fn appendToNextBoundary(self: *Parser, bytes: []const u8) Error!usize {
+        if (self.len == self.pending.len) return error.RecordBufferOverflow;
+
+        const boundary = if (self.len < header_len)
+            header_len
+        else boundary: {
+            const header = try parseHeader(
+                self.pending[0..header_len],
+                self.mode,
+                self.currentVersionPolicy(),
+            );
+            break :boundary header_len + header.payload_len;
+        };
+        std.debug.assert(boundary > self.len);
+
+        const copied = @min(bytes.len, boundary - self.len);
+        @memcpy(self.pending[self.len..][0..copied], bytes[0..copied]);
+        self.len += copied;
+        return copied;
     }
 
     /// Retry emission of already-buffered complete records after the caller has

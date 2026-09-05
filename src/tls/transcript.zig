@@ -334,6 +334,22 @@ test "rebindClientHello buffers the rebind boundary until selectFamily runs, mat
     try testing.expectEqual(@as(usize, Sha384.digest_length), deferred.peek().len);
 }
 
+test "selectFamily keeps the first active family when a later call names the other hash" {
+    // Found 2026-09-01 by the #675 campaign (t1-01, test-tls-protocol-fuzz
+    // --fuzz=10M): pins the documented sticky-selection contract — the first
+    // selected family remains authoritative and a later call naming a
+    // different hash neither rebinds the family nor perturbs the digest.
+    var transcript = Transcript{};
+    transcript.selectFamily(.sha384);
+    try transcript.update("client hello");
+    const before = transcript.peek();
+
+    transcript.selectFamily(.sha256);
+    try testing.expectEqual(@as(?Hash, .sha384), transcript.family());
+    try testing.expect(before.eql(&transcript.peek()));
+    try testing.expectEqual(@as(usize, Sha384.digest_length), transcript.peek().len);
+}
+
 test "selectFamily is idempotent once a family is active" {
     var transcript = Transcript{};
     transcript.selectFamily(.sha256);
@@ -355,12 +371,23 @@ test "an unselected transcript reports no family and a zero-length digest with a
 }
 
 test "fuzz: TLS protocol: transcript update select and HRR rebind sequences are bounded and deterministic" {
-    try testing.fuzz({}, fuzzTranscriptSequences, .{ .corpus = &.{
-        "",
-        &[_]u8{ 0, 1, 2, 3, 4 },
-        &[_]u8{ 2, 0, 0, 1, 0xaa },
-        &([_]u8{0xff} ** 128),
-    } });
+    try testing.fuzz({}, fuzzTranscriptSequences, .{
+        .corpus = &.{
+            "",
+            &[_]u8{ 0, 1, 2, 3, 4 },
+            &[_]u8{ 2, 0, 0, 1, 0xaa },
+            &([_]u8{0xff} ** 128),
+            // Found 2026-09-01, zig build test-tls-protocol-fuzz
+            // -Doptimize=ReleaseFast --fuzz=10M (#675 campaign row t1-01):
+            // selectFamily on an already-active transcript must keep the first
+            // family; the fuzz model previously expected it to adopt the new
+            // one. Minimized from the original 528-byte discovery input
+            // (was 781e24d2...) to 166 bytes via delta-debugging against the
+            // pre-fix model, preserving the exact "expected .sha256, found
+            // .sha384" failure.
+            @embedFile("vectors/fuzz/transcript/5f01f33d7fdcab9119a62339ac496951e958ba24d7c3a77f3093ba7e8fb66951.bin"),
+        },
+    });
 }
 
 fn fuzzTranscriptSequences(_: void, smith: *testing.Smith) !void {
@@ -387,9 +414,13 @@ fn fuzzTranscriptSequences(_: void, smith: *testing.Smith) !void {
             },
             1 => {
                 const family: Hash = if (smith.index(2) == 0) .sha256 else .sha384;
+                const active = transcript.family();
                 transcript.selectFamily(family);
                 mirrored.selectFamily(family);
-                try testing.expectEqual(family, transcript.family().?);
+                // selectFamily is a no-op once a family is active, so the
+                // first selected family stays authoritative — a later call
+                // naming the other family must not rebind it.
+                try testing.expectEqual(active orelse family, transcript.family().?);
                 try testing.expect(transcript.peek().eql(&mirrored.peek()));
             },
             2 => {

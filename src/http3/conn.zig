@@ -427,6 +427,14 @@ pub fn Conn(comptime Transport: type) type {
         /// Drain newly accepted and readable peer streams. Call after every
         /// network progress step.
         pub fn pump(self: *Self, transport: *Transport) H3Error!void {
+            // Once the connection has already failed, it must not keep
+            // accepting or tracking new peer-initiated state (streams,
+            // requests, pending uni entries): every field below this guard
+            // is inert until deinit. In production this stays unreachable
+            // in practice, since a QUIC-level close stops stream delivery
+            // to this layer first, but the H3 connection object itself
+            // must not depend on that upstream guarantee to stay bounded.
+            if (self.close_code != null) return;
             while (transport.acceptStream()) |id| {
                 if (id % 4 == 2 or id % 4 == 3) {
                     // Peer unidirectional stream: classify by type varint.
@@ -522,8 +530,17 @@ pub fn Conn(comptime Transport: type) type {
                     }
                     if (bytes.len > 0 and state.typ == .control) {
                         const had_settings = self.peer_control_view.saw_settings;
-                        _ = try self.ingestControlBytes(transport, bytes);
+                        // ingestControlBytes can observe a valid SETTINGS
+                        // frame (setting saw_settings) and then fail on a
+                        // later frame in the same buffer (e.g. a duplicate
+                        // SETTINGS, RFC 9114 §7.2.4) within the same call.
+                        // The metrics sync below must run against that
+                        // outcome unconditionally — deferred past the
+                        // `try` — or an error path leaves saw_settings and
+                        // settings_received permanently out of sync.
+                        const ingest_result = self.ingestControlBytes(transport, bytes);
                         if (self.peer_control_view.saw_settings) self.metrics.settings_received = true;
+                        _ = try ingest_result;
                         if (self.role == .client and !had_settings and self.peer_control_view.saw_settings) {
                             try self.publishEarlyTicketSnapshot(transport);
                         }
@@ -673,7 +690,24 @@ pub fn Conn(comptime Transport: type) type {
             while (it.next()) |entry| {
                 const id = entry.key_ptr.*;
                 const request = entry.value_ptr.*;
-                if (request.finished) continue;
+                if (request.finished) {
+                    // The peer must not send more stream data once we have
+                    // already observed its FIN (RFC 9114 §4.1: e.g. a
+                    // second HEADERS frame on a request stream is
+                    // malformed). A real QUIC transport is expected to
+                    // reject bytes received past the stream's final size
+                    // before they ever reach this layer, but this layer
+                    // must not silently trust and drop unexpected
+                    // post-finish bytes instead of treating them as the
+                    // message error they are.
+                    var post_finish_buf: [1]u8 = undefined;
+                    const result = transport.readStream(id, &post_finish_buf) catch |err| {
+                        if (err == error.StreamReset) reset_requests.append(self.allocator, id) catch return error.OutOfMemory;
+                        continue;
+                    };
+                    if (result.len > 0) return self.fail(.message_error);
+                    continue;
+                }
                 var buf: [2048]u8 = undefined;
                 var qpack_scratch: [4096]u8 = undefined;
                 while (true) {
@@ -2772,6 +2806,68 @@ fn requestWithTrailersThenDataBytes() [23]u8 {
     const h = requestHeadersBytes();
     const d = dataFrameBytes();
     return h ++ h ++ d;
+}
+
+test "H3 conn: pump stops accepting and tracking streams once already closed" {
+    // Found 2026-09-02 by the #675 campaign (test-quic --fuzz, "H3
+    // connection state command sequences" target): pump() had no guard
+    // against self.close_code already being set, so a peer stream opened
+    // after the connection failed was still accepted and tracked into
+    // conn.requests. Pins that a request opened strictly after close is
+    // never tracked and the sticky close_code is not disturbed.
+    const allocator = testing.allocator;
+    var peer_transport = MockTransport.init(allocator, true);
+    defer peer_transport.deinit();
+    var local_transport = MockTransport.init(allocator, false);
+    defer local_transport.deinit();
+    peer_transport.peer = &local_transport;
+    local_transport.peer = &peer_transport;
+
+    const H3 = Conn(MockTransport);
+    var conn = H3.init(allocator, .server);
+    defer conn.deinit();
+
+    var peer_control: ?u64 = null;
+    try writePeerUni(&peer_transport, .control, duplicateSettingsBytes()[0..], false, &peer_control);
+    try testing.expectError(error.ProtocolError, conn.pump(&local_transport));
+    try testing.expectEqual(ErrorCode.frame_unexpected, conn.close_code.?);
+
+    const id = try peer_transport.openStream(.bidi);
+    _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
+    try conn.pump(&local_transport);
+
+    try testing.expectEqual(ErrorCode.frame_unexpected, conn.close_code.?);
+    try testing.expectEqual(@as(u32, 0), conn.requests.count());
+}
+
+test "H3 conn: server rejects more data on a request stream after its FIN" {
+    // Found 2026-09-02 by the #675 campaign, same target: once a request
+    // reached request.finished (FIN observed), pumpRequests() permanently
+    // skipped reading its stream, so a second HEADERS frame sent after FIN
+    // (RFC 9114 SS4.1) was silently dropped instead of failing the
+    // connection with message_error.
+    const allocator = testing.allocator;
+    var peer_transport = MockTransport.init(allocator, true);
+    defer peer_transport.deinit();
+    var local_transport = MockTransport.init(allocator, false);
+    defer local_transport.deinit();
+    peer_transport.peer = &local_transport;
+    local_transport.peer = &peer_transport;
+
+    const H3 = Conn(MockTransport);
+    var conn = H3.init(allocator, .server);
+    defer conn.deinit();
+
+    const id = try peer_transport.openStream(.bidi);
+    _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
+    _ = try peer_transport.writeStream(id, dataFrameBytes()[0..], true);
+    try conn.pump(&local_transport);
+    try testing.expectEqual(@as(?ErrorCode, null), conn.close_code);
+    try testing.expectEqual(@as(u32, 1), conn.requests.count());
+
+    _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
+    try testing.expectError(error.ProtocolError, conn.pump(&local_transport));
+    try testing.expectEqual(ErrorCode.message_error, conn.close_code.?);
 }
 
 fn expectH3ConnInvariants(conn: anytype, role: Role, before_settings: bool, before_requests: u32) !void {

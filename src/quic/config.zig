@@ -97,7 +97,7 @@ pub const max_retained_closed_streams_per_direction: u64 = 4096;
 /// bytes.
 ///
 /// 256 segments bounds disjoint reassembly work tightly. Contiguous data
-/// is coalesced into existing ranges to prevent legitimate sequential 
+/// is coalesced into existing ranges to prevent legitimate sequential
 /// fragmentation from hitting this cap. A stream that hits this cap triggers
 /// `error.TooManySegments`, which falls through to `INTERNAL_ERROR` and
 /// immediately closes the QUIC connection.

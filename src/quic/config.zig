@@ -96,13 +96,12 @@ pub const max_retained_closed_streams_per_direction: u64 = 4096;
 /// insert, O(n²) total) — a quadratic-CPU DoS reachable from linear wire
 /// bytes.
 ///
-/// 4096 segments provably accommodates normal full-window buffering
-/// of the default 1 MiB stream receive window (which requires ~1024 
-/// packet-sized segments) while keeping worst-case insert cost provably 
-/// bounded to acceptable levels. A stream that hits this cap triggers
+/// 256 segments bounds disjoint reassembly work tightly. Contiguous data
+/// is coalesced into existing ranges to prevent legitimate sequential 
+/// fragmentation from hitting this cap. A stream that hits this cap triggers
 /// `error.TooManySegments`, which falls through to `INTERNAL_ERROR` and
 /// immediately closes the QUIC connection.
-pub const max_recv_segments: usize = 4096;
+pub const max_recv_segments: usize = 256;
 
 pub const Config = struct {
     enabled: bool = false,

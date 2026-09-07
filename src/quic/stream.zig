@@ -119,19 +119,19 @@ pub fn streamOrdinal(id: StreamId) u64 {
 
 const Segment = struct {
     offset: u64,
-    data: []u8,
+    data: std.ArrayListUnmanaged(u8),
     read_start: usize = 0,
 
     fn end(self: Segment) u64 {
         return self.offset + @as(u64, @intCast(self.remaining().len));
     }
 
-    fn remaining(self: Segment) []u8 {
-        return self.data[self.read_start..];
+    fn remaining(self: Segment) []const u8 {
+        return self.data.items[self.read_start..];
     }
 
-    fn deinit(self: Segment, allocator: std.mem.Allocator) void {
-        allocator.free(self.data);
+    fn deinit(self: *Segment, allocator: std.mem.Allocator) void {
+        self.data.deinit(allocator);
     }
 };
 
@@ -139,7 +139,7 @@ const ReceiveBuffer = struct {
     segments: std.ArrayList(Segment) = .empty,
 
     fn deinit(self: *ReceiveBuffer, allocator: std.mem.Allocator) void {
-        for (self.segments.items) |segment| {
+        for (self.segments.items) |*segment| {
             segment.deinit(allocator);
         }
         self.segments.deinit(allocator);
@@ -152,7 +152,7 @@ const ReceiveBuffer = struct {
         var pending: std.ArrayList(Segment) = .empty;
         defer pending.deinit(allocator);
         errdefer {
-            for (pending.items) |segment| {
+            for (pending.items) |*segment| {
                 segment.deinit(allocator);
             }
         }
@@ -173,18 +173,47 @@ const ReceiveBuffer = struct {
         }
 
         try self.segments.ensureUnusedCapacity(allocator, pending.items.len);
-        // Security: reject streams whose out-of-order segment count exceeds
-        // the per-stream cap. Without this, an attacker sending maximally
-        // interleaved 1-byte STREAM frames can create O(window) segments;
-        // every subsequent insert scans them all, yielding O(n²) total CPU.
-        // See `config.max_recv_segments` for the bound's rationale.
-        if (self.segments.items.len + pending.items.len > config.max_recv_segments) {
-            return error.TooManySegments;
-        }
         for (pending.items) |segment| {
             self.addSegmentAssumeCapacity(segment);
         }
+        // Ownership transferred, clear pending so errdefer doesn't free them
+        pending.clearRetainingCapacity();
+        self.coalesceSegments(allocator);
+
+        // Security: reject streams whose out-of-order disjoint segment count exceeds
+        // the per-stream cap. Because we coalesce contiguous data, this only bounds
+        // truly disjoint fragments. 
+        if (self.segments.items.len > config.max_recv_segments) {
+            return error.TooManySegments;
+        }
         return newly_buffered;
+    }
+
+    fn coalesceSegments(self: *ReceiveBuffer, allocator: std.mem.Allocator) void {
+        if (self.segments.items.len < 2) return;
+        var write_idx: usize = 0;
+        var read_idx: usize = 1;
+        while (read_idx < self.segments.items.len) : (read_idx += 1) {
+            var dst = &self.segments.items[write_idx];
+            var src = &self.segments.items[read_idx];
+            if (dst.end() == src.offset) {
+                dst.data.appendSlice(allocator, src.remaining()) catch {
+                    // Ignore OOM on coalesce: it just means we leave them disjoint.
+                    write_idx += 1;
+                    if (write_idx != read_idx) {
+                        self.segments.items[write_idx] = src.*;
+                    }
+                    continue;
+                };
+                src.deinit(allocator);
+            } else {
+                write_idx += 1;
+                if (write_idx != read_idx) {
+                    self.segments.items[write_idx] = src.*;
+                }
+            }
+        }
+        self.segments.items.len = write_idx + 1;
     }
 
     fn countNew(self: ReceiveBuffer, offset: u64, data: []const u8, final_size: ?u64) !u64 {
@@ -225,7 +254,8 @@ const ReceiveBuffer = struct {
     }
 
     fn makeSegment(allocator: std.mem.Allocator, offset: u64, data: []const u8) !Segment {
-        const owned = try allocator.dupe(u8, data);
+        var owned: std.ArrayListUnmanaged(u8) = .empty;
+        try owned.appendSlice(allocator, data);
         return .{ .offset = offset, .data = owned };
     }
 
@@ -252,8 +282,8 @@ const ReceiveBuffer = struct {
             segment.read_start += n;
             current_offset += @intCast(n);
             written += n;
-            if (segment.read_start == segment.data.len) {
-                const removed = self.segments.orderedRemove(index);
+            if (segment.read_start == segment.data.items.len) {
+                var removed = self.segments.orderedRemove(index);
                 removed.deinit(allocator);
             }
         }
@@ -1564,8 +1594,8 @@ test "segment cap accommodates unread full-window sequential delivery" {
     }
 
     const stream = manager.get(id).?;
-    // A 1 MiB window of 1 KiB chunks creates 1024 segments before coalescing.
-    try std.testing.expect(stream.recv.segments.items.len == 1024);
+    // A 1 MiB window of 1 KiB chunks creates exactly 1 segment due to coalescing!
+    try std.testing.expect(stream.recv.segments.items.len == 1);
     try std.testing.expect(stream.recv.segments.items.len <= config.max_recv_segments);
 }
 

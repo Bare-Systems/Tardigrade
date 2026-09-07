@@ -87,6 +87,22 @@ pub const max_initial_streams_transport_parameter: u64 = 1 << 60;
 /// much credit is granted, never how existing streams behave.
 pub const max_retained_closed_streams_per_direction: u64 = 4096;
 
+/// Per-stream cap on out-of-order receive-buffer segments. Each segment is
+/// a non-contiguous byte range that arrived before the bytes preceding it,
+/// so the count tracks how fragmented the peer's delivery is. Without a
+/// cap, an attacker sending maximally interleaved 1-byte STREAM frames
+/// can create up to `initial_max_stream_data / 1` segments per stream;
+/// every subsequent insert then scans all accumulated segments (O(n) per
+/// insert, O(n²) total) — a quadratic-CPU DoS reachable from linear wire
+/// bytes.
+///
+/// 256 segments bounds disjoint reassembly work tightly. Contiguous data
+/// is coalesced into existing ranges to prevent legitimate sequential
+/// fragmentation from hitting this cap. A stream that hits this cap triggers
+/// `error.TooManySegments`, which falls through to `INTERNAL_ERROR` and
+/// immediately closes the QUIC connection.
+pub const max_recv_segments: usize = 256;
+
 pub const Config = struct {
     enabled: bool = false,
     versions: VersionSet = .{},

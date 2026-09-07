@@ -475,6 +475,8 @@ pub fn Conn(comptime Transport: type) type {
         }
 
         fn pumpUniStreams(self: *Self, transport: *Transport) H3Error!void {
+            var finished_uni: std.ArrayList(u64) = .empty;
+            defer finished_uni.deinit(self.allocator);
             var it = self.pending_uni.iterator();
             while (it.next()) |entry| {
                 const id = entry.key_ptr.*;
@@ -484,8 +486,9 @@ pub fn Conn(comptime Transport: type) type {
                     const result = transport.readStream(id, &buf) catch |err| {
                         // A reset of a critical stream closes it just as a FIN
                         // does (RFC 9114 §6.2.1, RFC 9204 §4.2).
-                        if (err == error.StreamReset and isCriticalUniType(state.typ)) {
-                            return self.fail(.closed_critical_stream);
+                        if (err == error.StreamReset) {
+                            if (isCriticalUniType(state.typ)) return self.fail(.closed_critical_stream);
+                            finished_uni.append(self.allocator, id) catch return error.OutOfMemory;
                         }
                         break;
                     };
@@ -553,10 +556,12 @@ pub fn Conn(comptime Transport: type) type {
                         // connection error of type H3_CLOSED_CRITICAL_STREAM
                         // (RFC 9114 §6.2.1, RFC 9204 §4.2).
                         if (isCriticalUniType(state.typ)) return self.fail(.closed_critical_stream);
+                        finished_uni.append(self.allocator, id) catch return error.OutOfMemory;
                         break;
                     }
                 }
             }
+            for (finished_uni.items) |id| _ = self.pending_uni.remove(id);
         }
 
         fn ingestControlBytes(self: *Self, transport: *Transport, bytes: []const u8) H3Error!usize {
@@ -3191,6 +3196,83 @@ test "H3 conn: FIN on the peer control stream closes the connection" {
     try testing.expectEqual(ErrorCode.closed_critical_stream.wire(), client.closeCode());
     // SETTINGS were still processed before the close.
     try testing.expect(client.metrics.settings_received);
+}
+
+test "pending_uni entries are removed after stream FIN" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    // Open a non-critical uni stream (push) at the client.
+    // We do it manually on client_transport so the peer (server) receives it.
+    const unknown_id = try client_transport.openStream(.uni);
+    var unknown_type_buf: [16]u8 = undefined;
+    const len = try varint.encode(0x42, &unknown_type_buf);
+    _ = try client_transport.writeStream(unknown_id, unknown_type_buf[0..len], false);
+
+    // Pump to accept and classify the stream at the server
+    try server.pump(&server_transport);
+    try testing.expect(server.pending_uni.contains(unknown_id));
+
+    // Finish the unknown stream
+    _ = try client_transport.writeStream(unknown_id, "", true);
+    try server.pump(&server_transport);
+
+    // Ensure it was cleaned up
+    try testing.expect(!server.pending_uni.contains(unknown_id));
+}
+
+test "pending_uni entries are removed after StreamReset" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    // Open an unknown stream
+    const unknown_id = try client_transport.openStream(.uni);
+    var unknown_type_buf: [16]u8 = undefined;
+    const len = try varint.encode(0x42, &unknown_type_buf);
+    _ = try client_transport.writeStream(unknown_id, unknown_type_buf[0..len], false);
+
+    // Pump to accept and classify the stream at the server
+    try server.pump(&server_transport);
+    try testing.expect(server.pending_uni.contains(unknown_id));
+
+    // Reset the stream
+    try server_transport.resetStreamForTest(unknown_id);
+    try server.pump(&server_transport);
+
+    // Ensure it was cleaned up
+    try testing.expect(!server.pending_uni.contains(unknown_id));
 }
 
 test {

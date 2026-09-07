@@ -119,19 +119,43 @@ pub fn streamOrdinal(id: StreamId) u64 {
 
 const Segment = struct {
     offset: u64,
-    data: []u8,
+    data: std.ArrayListUnmanaged(u8),
     read_start: usize = 0,
 
     fn end(self: Segment) u64 {
         return self.offset + @as(u64, @intCast(self.remaining().len));
     }
 
-    fn remaining(self: Segment) []u8 {
-        return self.data[self.read_start..];
+    fn remaining(self: Segment) []const u8 {
+        return self.data.items[self.read_start..];
     }
 
-    fn deinit(self: Segment, allocator: std.mem.Allocator) void {
-        allocator.free(self.data);
+    fn deinit(self: *Segment, allocator: std.mem.Allocator) void {
+        self.data.deinit(allocator);
+    }
+
+    fn appendSlice(self: *Segment, allocator: std.mem.Allocator, new_data: []const u8) !void {
+        // Reclaim consumed prefix storage only when an append would otherwise
+        // grow the allocation *and* at least a quarter of the allocation is
+        // reclaimable. A capacity-aligned stream can therefore not force a
+        // near-window memmove for every tiny read/refill cycle: small prefixes
+        // let ArrayList grow once to create tail slack, while later compaction
+        // requires substantial additional consumption. Copy work is therefore
+        // amortized O(N), and backing storage stays within a constant factor of
+        // the active receive window.
+        const available = self.data.capacity - self.data.items.len;
+        const compact_threshold = @max(self.data.capacity / 4, @as(usize, 1));
+        if (available < new_data.len and self.read_start >= compact_threshold) {
+            const unread = self.remaining();
+            if (unread.len > 0) {
+                std.mem.copyForwards(u8, self.data.items[0..unread.len], unread);
+            }
+            self.data.items.len = unread.len;
+            self.read_start = 0;
+            // `self.offset` represents the stream offset of the first unread byte,
+            // which doesn't change when we shift the unread bytes to the front.
+        }
+        try self.data.appendSlice(allocator, new_data);
     }
 };
 
@@ -139,7 +163,7 @@ const ReceiveBuffer = struct {
     segments: std.ArrayList(Segment) = .empty,
 
     fn deinit(self: *ReceiveBuffer, allocator: std.mem.Allocator) void {
-        for (self.segments.items) |segment| {
+        for (self.segments.items) |*segment| {
             segment.deinit(allocator);
         }
         self.segments.deinit(allocator);
@@ -152,7 +176,7 @@ const ReceiveBuffer = struct {
         var pending: std.ArrayList(Segment) = .empty;
         defer pending.deinit(allocator);
         errdefer {
-            for (pending.items) |segment| {
+            for (pending.items) |*segment| {
                 segment.deinit(allocator);
             }
         }
@@ -176,7 +200,44 @@ const ReceiveBuffer = struct {
         for (pending.items) |segment| {
             self.addSegmentAssumeCapacity(segment);
         }
+        // Ownership transferred, clear pending so errdefer doesn't free them
+        pending.clearRetainingCapacity();
+        self.coalesceSegments(allocator);
+
+        // Security: reject streams whose out-of-order disjoint segment count exceeds
+        // the per-stream cap. Because we coalesce contiguous data, this only bounds
+        // truly disjoint fragments.
+        if (self.segments.items.len > config.max_recv_segments) {
+            return error.TooManySegments;
+        }
         return newly_buffered;
+    }
+
+    fn coalesceSegments(self: *ReceiveBuffer, allocator: std.mem.Allocator) void {
+        if (self.segments.items.len < 2) return;
+        var write_idx: usize = 0;
+        var read_idx: usize = 1;
+        while (read_idx < self.segments.items.len) : (read_idx += 1) {
+            var dst = &self.segments.items[write_idx];
+            var src = &self.segments.items[read_idx];
+            if (dst.end() == src.offset) {
+                dst.appendSlice(allocator, src.remaining()) catch {
+                    // Ignore OOM on coalesce: it just means we leave them disjoint.
+                    write_idx += 1;
+                    if (write_idx != read_idx) {
+                        self.segments.items[write_idx] = src.*;
+                    }
+                    continue;
+                };
+                src.deinit(allocator);
+            } else {
+                write_idx += 1;
+                if (write_idx != read_idx) {
+                    self.segments.items[write_idx] = src.*;
+                }
+            }
+        }
+        self.segments.items.len = write_idx + 1;
     }
 
     fn countNew(self: ReceiveBuffer, offset: u64, data: []const u8, final_size: ?u64) !u64 {
@@ -217,8 +278,9 @@ const ReceiveBuffer = struct {
     }
 
     fn makeSegment(allocator: std.mem.Allocator, offset: u64, data: []const u8) !Segment {
-        const owned = try allocator.dupe(u8, data);
-        return .{ .offset = offset, .data = owned };
+        var seg: Segment = .{ .offset = offset, .data = .empty };
+        try seg.appendSlice(allocator, data);
+        return seg;
     }
 
     fn addSegmentAssumeCapacity(self: *ReceiveBuffer, segment: Segment) void {
@@ -244,8 +306,8 @@ const ReceiveBuffer = struct {
             segment.read_start += n;
             current_offset += @intCast(n);
             written += n;
-            if (segment.read_start == segment.data.len) {
-                const removed = self.segments.orderedRemove(index);
+            if (segment.read_start == segment.data.items.len) {
+                var removed = self.segments.orderedRemove(index);
                 removed.deinit(allocator);
             }
         }
@@ -1464,6 +1526,165 @@ fn expectStreamManagerInvariants(manager: *StreamManager, before: StreamManagerS
     }
     try std.testing.expect(per_stream_unique >= manager.bytes_consumed);
     try std.testing.expect(per_stream_unique <= manager.bytes_received);
+}
+
+test "receive buffer rejects excessive segment fragmentation (CVE-style DoS)" {
+    // Proof: an attacker sending 1-byte STREAM frames at every-other-byte
+    // offset can create up to `max_recv_segments` segments. Once the cap
+    // is reached, the next insert returns `error.TooManySegments`.
+    var local = testParams();
+    var peer = testParams();
+    local.initial_max_data = 128 * 1024;
+    local.initial_max_stream_data_bidi_remote = 64 * 1024;
+    peer.initial_max_data = 128 * 1024;
+    peer.initial_max_stream_data_bidi_remote = 64 * 1024;
+
+    var manager = StreamManager.init(std.testing.allocator, .server, local, peer);
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+
+    // Send 1-byte frames at every-other-byte offset to maximize segments:
+    // offset 0, 2, 4, 6, ... — each creates a new non-contiguous segment.
+    var i: u64 = 0;
+    while (i < config.max_recv_segments) : (i += 1) {
+        const offset = i * 2;
+        _ = try manager.receiveStreamFrame(.{ .id = id, .offset = offset, .data = "x" });
+    }
+
+    // The next insert should be rejected: the stream has hit the segment cap.
+    try std.testing.expectError(
+        error.TooManySegments,
+        manager.receiveStreamFrame(.{ .id = id, .offset = config.max_recv_segments * 2, .data = "x" }),
+    );
+
+    // Filling the gaps (contiguous data) should NOT increase segment count:
+    // it merges with adjacent segments during read.
+}
+
+test "segment cap does not interfere with normal sequential delivery" {
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+
+    // Normal sequential delivery: each frame is contiguous with the previous.
+    // The receive buffer should never accumulate more than 1 segment because
+    // in-order data is consumed as it arrives.
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = "hello" });
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 5, .data = "world", .fin = true });
+
+    const stream = manager.get(id).?;
+    // At most 2 segments (both contiguous, before read drains them).
+    try std.testing.expect(stream.recv.segments.items.len <= 2);
+
+    var out: [16]u8 = undefined;
+    const read = try manager.read(id, &out);
+    try std.testing.expectEqual(@as(usize, 10), read.len);
+    try std.testing.expect(read.fin);
+    try std.testing.expectEqualStrings("helloworld", out[0..read.len]);
+}
+
+test "segment cap allows moderate out-of-order delivery" {
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+
+    // Moderately reordered: 3 non-contiguous segments is well under the cap.
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 8, .data = "!" });
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = "he" });
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 5, .data = "orl" });
+
+    const stream = manager.get(id).?;
+    try std.testing.expect(stream.recv.segments.items.len <= config.max_recv_segments);
+}
+
+test "segment cap accommodates unread full-window sequential delivery" {
+    // Proves that the cap accommodates a stream that fills its entire 1MiB
+    // receive window with packet-sized sequential frames without ever being
+    // read/drained by the application.
+    var local = testParams();
+    local.initial_max_data = 2 * 1024 * 1024;
+    local.initial_max_stream_data_bidi_remote = 1024 * 1024;
+    var manager = StreamManager.init(std.testing.allocator, .server, local, testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+    const chunk = [_]u8{0} ** 1024;
+    var offset: u64 = 0;
+    while (offset < 1024 * 1024) : (offset += chunk.len) {
+        _ = try manager.receiveStreamFrame(.{ .id = id, .offset = offset, .data = &chunk });
+    }
+
+    const stream = manager.get(id).?;
+    // A 1 MiB window of 1 KiB chunks creates exactly 1 segment due to coalescing!
+    try std.testing.expect(stream.recv.segments.items.len == 1);
+    try std.testing.expect(stream.recv.segments.items.len <= config.max_recv_segments);
+}
+
+test "segment append grows instead of compacting a tiny capacity-aligned prefix" {
+    const allocator = std.testing.allocator;
+    const capacity: usize = 64 * 1024;
+    const consumed: usize = 2048;
+    var seg: Segment = .{ .offset = @intCast(consumed), .data = .empty };
+    defer seg.deinit(allocator);
+
+    try seg.data.ensureTotalCapacityPrecise(allocator, capacity);
+    const initial = [_]u8{0x41} ** capacity;
+    try seg.data.appendSlice(allocator, &initial);
+    try std.testing.expectEqual(capacity, seg.data.capacity);
+
+    seg.read_start = consumed;
+    const refill = [_]u8{0x42} ** consumed;
+    try seg.appendSlice(allocator, &refill);
+
+    // A tiny consumed prefix must not trigger a near-window memmove. Growing
+    // once creates geometric tail slack; later compaction is allowed only
+    // after at least 25% of the resulting allocation has been consumed.
+    try std.testing.expect(seg.data.capacity > capacity);
+    try std.testing.expectEqual(consumed, seg.read_start);
+    try std.testing.expectEqual(capacity + refill.len, seg.data.items.len);
+    try std.testing.expectEqual(capacity, seg.remaining().len);
+}
+
+test "coalesced segment backing storage is bounded by active window via lazy compaction" {
+    var local = testParams();
+    local.initial_max_data = 64 * 1024;
+    local.initial_max_stream_data_bidi_remote = 64 * 1024;
+    var manager = StreamManager.init(std.testing.allocator, .server, local, testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+    const chunk = [_]u8{0x42} ** 4096;
+
+    // Stream 10 MB in a 64 KB window by constantly reading and re-crediting.
+    // By reading slightly less than we receive, the segment is never fully drained
+    // and thus never destroyed. If compaction ran on every read, this would cause
+    // O(N²) CPU amplification and timeout. By compacting only on append when
+    // capacity is exhausted, it remains amortized O(N) and completes instantly.
+    var offset: u64 = 0;
+    while (offset < 10 * 1024 * 1024) : (offset += chunk.len) {
+        _ = try manager.receiveStreamFrame(.{ .id = id, .offset = offset, .data = &chunk });
+        const stream = manager.get(id).?;
+
+        // Read 4095 bytes (leaves 1 unread byte, so segment stays alive)
+        var out_small: [4095]u8 = undefined;
+        const read = try stream.read(std.testing.allocator, &out_small);
+        try std.testing.expectEqual(out_small.len, read.len);
+
+        // Simulating flow control re-credit for bytes consumed
+        manager.max_data_recv += read.len;
+        stream.max_recv_data += read.len;
+    }
+
+    const stream = manager.get(id).?;
+    try std.testing.expectEqual(@as(usize, 1), stream.recv.segments.items.len);
+
+    // The backing capacity must be bounded by the window + slack (e.g. well under 128KB),
+    // rather than growing to the 1MB total traffic size.
+    const seg = stream.recv.segments.items[0];
+    try std.testing.expect(seg.data.capacity < 128 * 1024);
 }
 
 test {

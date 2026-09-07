@@ -134,20 +134,23 @@ const Segment = struct {
         self.data.deinit(allocator);
     }
 
-    fn compact(self: *Segment) void {
-        // Prevent unbounded prefix retention on long-lived streams.
-        // Once the consumed prefix reaches a slack threshold, slide unread bytes
-        // to the front of the allocation. The ArrayList capacity will naturally
-        // stabilize around `window + slack` without steady-state reallocation.
-        const slack_threshold = 32 * 1024;
-        if (self.read_start >= slack_threshold) {
+    fn appendSlice(self: *Segment, allocator: std.mem.Allocator, new_data: []const u8) !void {
+        // Prevent unbounded prefix retention and quadratic copy amplification.
+        // We only compact when `read_start > 0` and the current tail capacity
+        // cannot fit the incoming contiguous bytes. This keeps backing storage
+        // O(window) while ensuring total copying remains O(N).
+        const available = self.data.capacity - self.data.items.len;
+        if (available < new_data.len and self.read_start > 0) {
             const unread = self.remaining();
             if (unread.len > 0) {
                 std.mem.copyForwards(u8, self.data.items[0..unread.len], unread);
             }
             self.data.items.len = unread.len;
             self.read_start = 0;
+            // `self.offset` represents the stream offset of the first unread byte,
+            // which doesn't change when we shift the unread bytes to the front.
         }
+        try self.data.appendSlice(allocator, new_data);
     }
 };
 
@@ -213,7 +216,7 @@ const ReceiveBuffer = struct {
             var dst = &self.segments.items[write_idx];
             var src = &self.segments.items[read_idx];
             if (dst.end() == src.offset) {
-                dst.data.appendSlice(allocator, src.remaining()) catch {
+                dst.appendSlice(allocator, src.remaining()) catch {
                     // Ignore OOM on coalesce: it just means we leave them disjoint.
                     write_idx += 1;
                     if (write_idx != read_idx) {
@@ -270,9 +273,9 @@ const ReceiveBuffer = struct {
     }
 
     fn makeSegment(allocator: std.mem.Allocator, offset: u64, data: []const u8) !Segment {
-        var owned: std.ArrayListUnmanaged(u8) = .empty;
-        try owned.appendSlice(allocator, data);
-        return .{ .offset = offset, .data = owned };
+        var seg: Segment = .{ .offset = offset, .data = .empty };
+        try seg.appendSlice(allocator, data);
+        return seg;
     }
 
     fn addSegmentAssumeCapacity(self: *ReceiveBuffer, segment: Segment) void {
@@ -301,8 +304,6 @@ const ReceiveBuffer = struct {
             if (segment.read_start == segment.data.items.len) {
                 var removed = self.segments.orderedRemove(index);
                 removed.deinit(allocator);
-            } else {
-                segment.compact();
             }
         }
         return written;
@@ -1627,11 +1628,13 @@ test "coalesced segment backing storage is bounded by active window via lazy com
     const id = try makeStreamId(.client, .bidi, 0);
     const chunk = [_]u8{0x42} ** 4096;
 
-    // Stream 1 MB in a 64 KB window by constantly reading and re-crediting.
+    // Stream 10 MB in a 64 KB window by constantly reading and re-crediting.
     // By reading slightly less than we receive, the segment is never fully drained
-    // and thus never destroyed, forcing it to absorb all 1MB of traffic.
+    // and thus never destroyed. If compaction ran on every read, this would cause
+    // O(N²) CPU amplification and timeout. By compacting only on append when
+    // capacity is exhausted, it remains amortized O(N) and completes instantly.
     var offset: u64 = 0;
-    while (offset < 1024 * 1024) : (offset += chunk.len) {
+    while (offset < 10 * 1024 * 1024) : (offset += chunk.len) {
         _ = try manager.receiveStreamFrame(.{ .id = id, .offset = offset, .data = &chunk });
         const stream = manager.get(id).?;
 

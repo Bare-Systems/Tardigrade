@@ -2162,6 +2162,21 @@ const pure_zig_record_vtable = EncryptedStream.VTable{
     .currentReadEarlyPrefixLenFn = pureCurrentReadEarlyPrefixLen,
 };
 
+/// A fixed-capacity byte queue whose backing store holds plaintext or
+/// ciphertext (`inbound_plaintext`, `inbound_handshake`, `inbound_carrier`,
+/// `outbound_ciphertext`).
+///
+/// Every wipe here goes through `crypto.secrets.secureZero`, never a plain
+/// `@memset`. The bytes being wiped are, by construction, outside the
+/// queue's logical `slice()` at the moment they are cleared -- dead until
+/// some later append reuses them -- which is exactly the store an optimizer
+/// is entitled to discard in ReleaseFast. `secureZero`'s volatile stores are
+/// what makes the immediate-cleanup guarantee real rather than
+/// optimizer-dependent (raised in review on #741).
+///
+/// `PlaintextProvenanceQueue` deliberately does NOT do this: it is a
+/// parallel queue of `bool` provenance bookkeeping, not secret material, so
+/// an ordinary `@memset` is the correct tool there.
 fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
     return struct {
         buf: [capacity]u8 = undefined,
@@ -2188,7 +2203,7 @@ fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
                 const old_end = self.head + self.len;
                 std.mem.copyForwards(u8, self.buf[0..self.len], self.buf[self.head..][0..self.len]);
                 self.head = 0;
-                if (self.len < old_end) @memset(self.buf[self.len..old_end], 0);
+                if (self.len < old_end) crypto.secrets.secureZero(self.buf[self.len..old_end]);
             }
             @memcpy(self.buf[self.head + self.len ..][0..bytes.len], bytes);
             self.len += bytes.len;
@@ -2209,7 +2224,7 @@ fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
 
         fn discard(self: *Self, count: usize) Error!void {
             if (count > self.len) return error.WouldBlock;
-            @memset(self.buf[self.head..][0..count], 0);
+            crypto.secrets.secureZero(self.buf[self.head..][0..count]);
             self.head += count;
             self.len -= count;
             if (self.len == 0) self.head = 0;
@@ -2220,7 +2235,7 @@ fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
         }
 
         fn clear(self: *Self) void {
-            @memset(self.buf[0..], 0);
+            crypto.secrets.secureZero(self.buf[0..]);
             self.head = 0;
             self.len = 0;
         }

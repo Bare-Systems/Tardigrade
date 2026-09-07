@@ -160,7 +160,9 @@ pub const Transcript = struct {
             h.update(self.pending[0..self.pending_len]);
         }
         self.state = h;
-        std.crypto.secureZero(u8, self.pending[0..self.pending_len]);
+        // Canonical helper, not `std.crypto.secureZero`: since #675 the two
+        // are no longer the same primitive (see `crypto.secrets.secureZero`).
+        provider.secureZero(self.pending[0..self.pending_len]);
         self.pending_len = 0;
         self.rebind_at = null;
     }

@@ -415,7 +415,7 @@ pub const NativeTlsConnection = struct {
 
         const scratch = try self.allocator.alloc(u8, runtime.maxIdentityLen());
         defer {
-            std.crypto.secureZero(u8, scratch);
+            @import("crypto").secrets.secureZero(scratch);
             self.allocator.free(scratch);
         }
         var identity = try runtime.createIdentity(&prepared.state, now_unix_ms, scratch);

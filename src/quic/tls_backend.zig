@@ -443,7 +443,7 @@ pub const Tls13Backend = struct {
     pub fn deinit(self: *Tls13Backend) void {
         self.scratch.deinit();
         self.engine.deinit();
-        std.crypto.secureZero(u8, &self.local_transport_parameters);
+        crypto_provider.secureZero(&self.local_transport_parameters);
         self.cid_binding.deinit();
         self.peer_cid_binding.deinit();
     }

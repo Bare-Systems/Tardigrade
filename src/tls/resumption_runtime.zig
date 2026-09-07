@@ -424,7 +424,9 @@ pub const Runtime = struct {
         var key_id: ticket_protection.KeyId = undefined;
         var key: [16]u8 = undefined;
         var nonce_prefix: [4]u8 = undefined;
-        defer std.crypto.secureZero(u8, &key);
+        // Canonical helper, not `std.crypto.secureZero`: since #675 the two
+        // are no longer the same primitive (see `crypto.secrets.secureZero`).
+        defer crypto.secrets.secureZero(&key);
         self.provider.randomBytes(&key_id) catch return error.EntropyFailure;
         self.provider.randomBytes(&key) catch return error.EntropyFailure;
         self.provider.randomBytes(&nonce_prefix) catch return error.EntropyFailure;

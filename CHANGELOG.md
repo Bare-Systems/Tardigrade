@@ -6,6 +6,23 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Changed
 
+- **Secret zeroization is now materially faster on x86_64, and the
+  guarantee is now Tardigrade-owned (#675)** — `crypto.secrets.secureZero`
+  no longer wraps `std.crypto.secureZero`, which is `@memset` over a
+  volatile slice. LLVM drops the `volatile` there and lowers it to an
+  ordinary `memset` libcall; on x86_64-linux that binds to
+  `compiler_rt.memset`, a byte-at-a-time store loop, even with libc
+  linked. The clear was always performed, so this was never a correctness
+  or non-elision defect — but it made every bulk wipe roughly 22x more
+  expensive on x86_64 than on aarch64. `secureZero` now writes through
+  wide volatile vector stores, which cannot be merged, widened, or
+  dropped. A QUIC connection teardown (`QuicTlsAdapter.deinit`, 529,944
+  bytes of wipeable state, reachable by connection churn) drops from
+  ~414 µs to ~254 µs of CPU on x86_64. Every production secret wipe now
+  routes through the canonical helper, including
+  `encrypted_stream.ByteQueue`'s plaintext cleanup, which previously used
+  a plain `@memset`.
+
 - **HTTP/2 and HTTP/3/QUIC are promoted to stable (#389)** — the support
   matrix and public/operator docs now describe the stable native downstream
   protocol contract for HTTP/1.1, HTTP/2, and HTTP/3/QUIC. The promotion is

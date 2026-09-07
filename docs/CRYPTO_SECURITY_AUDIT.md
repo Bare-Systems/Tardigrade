@@ -50,12 +50,40 @@ eviction, snapshot release, and provider/credential destruction.
   changes; the same rule applies to any constant-time/zeroization claim in
   this document.
 - **Zeroization** is a project-code guarantee, not a toolchain or OS one:
-  `crypto.secrets.secureZero` wraps `std.crypto.secureZero(u8, buffer)`.
-  `std.crypto.secureZero` uses a compiler-recognized volatile-style clear
-  intended to survive dead-store elimination; this project does not layer
-  any additional guarantee (no `mlock`, no core-dump suppression, no
-  explicit compiler-barrier intrinsic) on top of what `std.crypto.secureZero`
-  itself provides. `crypto.secrets.secureZeroAndFree` exists specifically
+  `crypto.secrets.secureZero` is Tardigrade-owned. It writes zeros through
+  `*align(1) volatile @Vector(32, u8)` pointers, with a `*volatile u8` tail
+  for the trailing 0–31 bytes. LLVM may not merge, widen, reorder away, or
+  drop volatile stores, so the clear survives dead-store elimination in
+  `ReleaseFast` by construction rather than by the optimizer's goodwill.
+  This project does not layer any additional guarantee (no `mlock`, no
+  core-dump suppression, no explicit compiler-barrier intrinsic) on top of
+  those volatile stores.
+
+  It deliberately does **not** wrap `std.crypto.secureZero(u8, buffer)`,
+  which it used to. That function is `@memset` over a `[]volatile T`, and
+  LLVM discards the `volatile` qualifier on such a memset and lowers it to
+  an ordinary `memset` libcall. The resulting clear is still performed, so
+  this was not a correctness or non-elision defect — but *which* `memset`
+  gets linked is platform-dependent, and on x86_64-linux it binds to
+  `compiler_rt.memset`, a byte-at-a-time store loop that wins over libc's
+  optimised `memset` even with `link_libc = true`. (`compiler_rt.memcpy` is
+  size-dispatched and fast; only `memset` is naive.) On aarch64/macOS the
+  same source bound to libSystem's vectorised `_bzero`. Measured cost of one
+  265,408-byte wipe was 4.35 µs on aarch64 versus 95.9 µs on x86_64 — a 22×
+  gap that had nothing to do with CPU class — and 7.6 µs after this change.
+  Discovered while triaging a repeatedly-timing-out #675 QUIC fuzz row; see
+  that issue for the full measurements.
+
+  Consequence for reviewers and new code: a plain `@memset(buf, 0)` on
+  secret-bearing storage is **not** equivalent to `secureZero` and must not
+  be used for it. That distinction is now load-bearing rather than
+  stylistic. `src/tls/encrypted_stream.zig`'s `ByteQueue` routes all three
+  of its wipes (compaction stale-source tail, `discard`, `clear`) through
+  the canonical helper for exactly this reason; its sibling
+  `PlaintextProvenanceQueue` correctly keeps plain `@memset`, because it
+  holds `bool` provenance bookkeeping rather than secret material.
+
+  `crypto.secrets.secureZeroAndFree` exists specifically
   because plain `Allocator.free` is **not** sufficient on its own: safety
   builds run `@memset(bytes, undefined)` *after* any zeroing already done
   (re-poisoning the buffer, which trips allocator "was this zeroized"

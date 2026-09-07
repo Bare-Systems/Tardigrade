@@ -225,8 +225,13 @@ fn PlaintextProvenanceQueue(comptime capacity: usize) type {
         fn append(self: *Self, byte_len: usize, transport_early: bool) Error!void {
             if (byte_len > self.available()) return error.PlaintextBufferFull;
             if (self.head + self.len + byte_len > capacity) {
+                // See ByteQueue's identical fix: the old source extent past
+                // [0..len] isn't touched by copyForwards and must be wiped
+                // explicitly, not left as a stale duplicate.
+                const old_end = self.head + self.len;
                 std.mem.copyForwards(bool, self.buf[0..self.len], self.buf[self.head..][0..self.len]);
                 self.head = 0;
+                if (self.len < old_end) @memset(self.buf[self.len..old_end], false);
             }
             @memset(self.buf[self.head + self.len ..][0..byte_len], transport_early);
             self.len += byte_len;
@@ -2174,8 +2179,16 @@ fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
         fn append(self: *Self, bytes: []const u8) Error!void {
             if (bytes.len > self.available()) return full_error;
             if (self.head + self.len + bytes.len > capacity) {
+                // copyForwards only overwrites [0..len]; the old source
+                // extent past that (whatever the incoming append doesn't
+                // immediately reuse) still holds a stale duplicate of live
+                // plaintext until wiped here -- caught by review, this was
+                // the gap left by only zeroing at discard() time (#675
+                // campaign finding).
+                const old_end = self.head + self.len;
                 std.mem.copyForwards(u8, self.buf[0..self.len], self.buf[self.head..][0..self.len]);
                 self.head = 0;
+                if (self.len < old_end) @memset(self.buf[self.len..old_end], 0);
             }
             @memcpy(self.buf[self.head + self.len ..][0..bytes.len], bytes);
             self.len += bytes.len;
@@ -3127,6 +3140,22 @@ test "byte queues wipe discarded and cleared storage" {
     queue.clear();
     try testing.expectEqual(@as(usize, 0), queue.len);
     try testing.expect(std.mem.allEqual(u8, queue.buf[0..], 0));
+}
+
+test "byte queue compaction wipes the old source extent the new append doesn't reuse" {
+    // capacity 16: fill, discard most of it (head=8, len=4), then append
+    // enough to force compaction. The compacted-to region and the fresh
+    // append together only cover buf[0..9]; buf[9..12] is old source past
+    // that but was never overwritten by copyForwards, and is exactly the
+    // stale-duplicate-plaintext gap review caught (#675 campaign finding).
+    var queue = ByteQueue(16, error.PlaintextBufferFull){};
+    try queue.append("ABCDEFGHIJKL");
+    try queue.discard(8);
+    try testing.expectEqualStrings("IJKL", queue.slice());
+
+    try queue.append("MNOPQ");
+    try testing.expectEqualStrings("IJKLMNOPQ", queue.slice());
+    try testing.expect(std.mem.allEqual(u8, queue.buf[9..12], 0));
 }
 
 test "terminal cleanup clears parser-owned ciphertext and queued plaintext" {

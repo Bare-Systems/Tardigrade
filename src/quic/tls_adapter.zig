@@ -657,7 +657,14 @@ pub const CryptoStream = struct {
         const checked_relative_end = end - window_base;
         if (checked_relative_end > max_crypto_buffer) return error.CryptoBufferTooLarge;
 
-        self.compactConsumed();
+        // Re-anchoring the physical buffer to `consumed_offset` is only
+        // needed when the tail genuinely has no room left for this insert
+        // at the current anchor -- calling it unconditionally made every
+        // insert that followed any prior discard pay a full memmove of
+        // everything currently buffered (up to max_crypto_buffer, ~64KB),
+        // regardless of how little was actually consumed (#675 campaign
+        // finding, same pattern as ByteQueue's discard).
+        if (end - self.base_offset > max_crypto_buffer) self.compactConsumed();
         if (start < self.base_offset) return error.CryptoBufferTooLarge;
         const relative_start = start - self.base_offset;
         if (relative_start >= max_crypto_buffer) return error.CryptoBufferTooLarge;

@@ -133,6 +133,22 @@ const Segment = struct {
     fn deinit(self: *Segment, allocator: std.mem.Allocator) void {
         self.data.deinit(allocator);
     }
+
+    fn compact(self: *Segment) void {
+        // Prevent unbounded prefix retention on long-lived streams.
+        // Once the consumed prefix reaches a slack threshold, slide unread bytes
+        // to the front of the allocation. The ArrayList capacity will naturally
+        // stabilize around `window + slack` without steady-state reallocation.
+        const slack_threshold = 32 * 1024;
+        if (self.read_start >= slack_threshold) {
+            const unread = self.remaining();
+            if (unread.len > 0) {
+                std.mem.copyForwards(u8, self.data.items[0..unread.len], unread);
+            }
+            self.data.items.len = unread.len;
+            self.read_start = 0;
+        }
+    }
 };
 
 const ReceiveBuffer = struct {
@@ -182,7 +198,7 @@ const ReceiveBuffer = struct {
 
         // Security: reject streams whose out-of-order disjoint segment count exceeds
         // the per-stream cap. Because we coalesce contiguous data, this only bounds
-        // truly disjoint fragments. 
+        // truly disjoint fragments.
         if (self.segments.items.len > config.max_recv_segments) {
             return error.TooManySegments;
         }
@@ -285,6 +301,8 @@ const ReceiveBuffer = struct {
             if (segment.read_start == segment.data.items.len) {
                 var removed = self.segments.orderedRemove(index);
                 removed.deinit(allocator);
+            } else {
+                segment.compact();
             }
         }
         return written;
@@ -1577,8 +1595,8 @@ test "segment cap allows moderate out-of-order delivery" {
 }
 
 test "segment cap accommodates unread full-window sequential delivery" {
-    // Proves that the cap accommodates a stream that fills its entire 1MiB 
-    // receive window with packet-sized sequential frames without ever being 
+    // Proves that the cap accommodates a stream that fills its entire 1MiB
+    // receive window with packet-sized sequential frames without ever being
     // read/drained by the application.
     var local = testParams();
     local.initial_max_data = 2 * 1024 * 1024;
@@ -1597,6 +1615,43 @@ test "segment cap accommodates unread full-window sequential delivery" {
     // A 1 MiB window of 1 KiB chunks creates exactly 1 segment due to coalescing!
     try std.testing.expect(stream.recv.segments.items.len == 1);
     try std.testing.expect(stream.recv.segments.items.len <= config.max_recv_segments);
+}
+
+test "coalesced segment backing storage is bounded by active window via lazy compaction" {
+    var local = testParams();
+    local.initial_max_data = 64 * 1024;
+    local.initial_max_stream_data_bidi_remote = 64 * 1024;
+    var manager = StreamManager.init(std.testing.allocator, .server, local, testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+    const chunk = [_]u8{0x42} ** 4096;
+
+    // Stream 1 MB in a 64 KB window by constantly reading and re-crediting.
+    // By reading slightly less than we receive, the segment is never fully drained
+    // and thus never destroyed, forcing it to absorb all 1MB of traffic.
+    var offset: u64 = 0;
+    while (offset < 1024 * 1024) : (offset += chunk.len) {
+        _ = try manager.receiveStreamFrame(.{ .id = id, .offset = offset, .data = &chunk });
+        const stream = manager.get(id).?;
+
+        // Read 4095 bytes (leaves 1 unread byte, so segment stays alive)
+        var out_small: [4095]u8 = undefined;
+        const read = try stream.read(std.testing.allocator, &out_small);
+        try std.testing.expectEqual(out_small.len, read.len);
+
+        // Simulating flow control re-credit for bytes consumed
+        manager.max_data_recv += read.len;
+        stream.max_recv_data += read.len;
+    }
+
+    const stream = manager.get(id).?;
+    try std.testing.expectEqual(@as(usize, 1), stream.recv.segments.items.len);
+
+    // The backing capacity must be bounded by the window + slack (e.g. well under 128KB),
+    // rather than growing to the 1MB total traffic size.
+    const seg = stream.recv.segments.items[0];
+    try std.testing.expect(seg.data.capacity < 128 * 1024);
 }
 
 test {

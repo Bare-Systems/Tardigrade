@@ -1546,6 +1546,29 @@ test "segment cap allows moderate out-of-order delivery" {
     try std.testing.expect(stream.recv.segments.items.len <= config.max_recv_segments);
 }
 
+test "segment cap accommodates unread full-window sequential delivery" {
+    // Proves that the cap accommodates a stream that fills its entire 1MiB 
+    // receive window with packet-sized sequential frames without ever being 
+    // read/drained by the application.
+    var local = testParams();
+    local.initial_max_data = 2 * 1024 * 1024;
+    local.initial_max_stream_data_bidi_remote = 1024 * 1024;
+    var manager = StreamManager.init(std.testing.allocator, .server, local, testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+    const chunk = [_]u8{0} ** 1024;
+    var offset: u64 = 0;
+    while (offset < 1024 * 1024) : (offset += chunk.len) {
+        _ = try manager.receiveStreamFrame(.{ .id = id, .offset = offset, .data = &chunk });
+    }
+
+    const stream = manager.get(id).?;
+    // A 1 MiB window of 1 KiB chunks creates 1024 segments before coalescing.
+    try std.testing.expect(stream.recv.segments.items.len == 1024);
+    try std.testing.expect(stream.recv.segments.items.len <= config.max_recv_segments);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

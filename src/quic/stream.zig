@@ -135,12 +135,17 @@ const Segment = struct {
     }
 
     fn appendSlice(self: *Segment, allocator: std.mem.Allocator, new_data: []const u8) !void {
-        // Prevent unbounded prefix retention and quadratic copy amplification.
-        // We only compact when `read_start > 0` and the current tail capacity
-        // cannot fit the incoming contiguous bytes. This keeps backing storage
-        // O(window) while ensuring total copying remains O(N).
+        // Reclaim consumed prefix storage only when an append would otherwise
+        // grow the allocation *and* at least a quarter of the allocation is
+        // reclaimable. A capacity-aligned stream can therefore not force a
+        // near-window memmove for every tiny read/refill cycle: small prefixes
+        // let ArrayList grow once to create tail slack, while later compaction
+        // requires substantial additional consumption. Copy work is therefore
+        // amortized O(N), and backing storage stays within a constant factor of
+        // the active receive window.
         const available = self.data.capacity - self.data.items.len;
-        if (available < new_data.len and self.read_start > 0) {
+        const compact_threshold = @max(self.data.capacity / 4, @as(usize, 1));
+        if (available < new_data.len and self.read_start >= compact_threshold) {
             const unread = self.remaining();
             if (unread.len > 0) {
                 std.mem.copyForwards(u8, self.data.items[0..unread.len], unread);
@@ -1616,6 +1621,31 @@ test "segment cap accommodates unread full-window sequential delivery" {
     // A 1 MiB window of 1 KiB chunks creates exactly 1 segment due to coalescing!
     try std.testing.expect(stream.recv.segments.items.len == 1);
     try std.testing.expect(stream.recv.segments.items.len <= config.max_recv_segments);
+}
+
+test "segment append grows instead of compacting a tiny capacity-aligned prefix" {
+    const allocator = std.testing.allocator;
+    const capacity: usize = 64 * 1024;
+    const consumed: usize = 2048;
+    var seg: Segment = .{ .offset = @intCast(consumed), .data = .empty };
+    defer seg.deinit(allocator);
+
+    try seg.data.ensureTotalCapacityPrecise(allocator, capacity);
+    const initial = [_]u8{0x41} ** capacity;
+    try seg.data.appendSlice(allocator, &initial);
+    try std.testing.expectEqual(capacity, seg.data.capacity);
+
+    seg.read_start = consumed;
+    const refill = [_]u8{0x42} ** consumed;
+    try seg.appendSlice(allocator, &refill);
+
+    // A tiny consumed prefix must not trigger a near-window memmove. Growing
+    // once creates geometric tail slack; later compaction is allowed only
+    // after at least 25% of the resulting allocation has been consumed.
+    try std.testing.expect(seg.data.capacity > capacity);
+    try std.testing.expectEqual(consumed, seg.read_start);
+    try std.testing.expectEqual(capacity + refill.len, seg.data.items.len);
+    try std.testing.expectEqual(capacity, seg.remaining().len);
 }
 
 test "coalesced segment backing storage is bounded by active window via lazy compaction" {

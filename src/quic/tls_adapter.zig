@@ -794,8 +794,16 @@ pub const CryptoReassembler = struct {
     }
 
     pub fn deinit(self: *CryptoReassembler) void {
+        // No `self.* = .{}` afterwards: every default in `CryptoStream` is
+        // either zero (`range_count`, `base_offset`, `consumed_offset`) or
+        // `undefined` (`buffer`, `ranges`), so the wipe above already leaves
+        // exactly the default state. Re-assigning `.{}` only bought a second
+        // full-width memset of the same 265 KB -- and on x86_64 that second
+        // one is a plain (non-volatile) `@memset`, so it lowered to
+        // `compiler_rt.memset`'s byte loop no matter what `secureZero` does
+        // (#675). `crypto reassembler deinit leaves the default state`
+        // pins the equivalence.
         crypto_secrets.secureZero(std.mem.asBytes(self));
-        self.* = .{};
     }
 };
 
@@ -862,8 +870,11 @@ pub const CryptoOutput = struct {
     }
 
     pub fn deinit(self: *CryptoOutput) void {
+        // Same reasoning as `CryptoReassembler.deinit`: `start`, `end` and
+        // `next_offset` all default to zero and `buffer` is `undefined`, so
+        // the wipe already produces the default state and `self.* = .{}`
+        // would only pay for a second full-width memset (#675).
         crypto_secrets.secureZero(std.mem.asBytes(self));
-        self.* = .{};
     }
 };
 
@@ -2292,6 +2303,40 @@ test "adapter queues outbound TLS handshake bytes as CRYPTO stream data" {
     try testing.expectEqual(@as(u64, 0), handshake.offset);
     try testing.expectEqualStrings("server", handshake.bytes);
     try adapter.discardHandshakeOutput(.handshake, handshake.bytes.len);
+}
+
+test "crypto reassembler deinit leaves the default state" {
+    // `CryptoReassembler.deinit` relies on `secureZero` alone producing the
+    // same observable state as `.{}` -- dropping the redundant second
+    // full-width memset is only sound while that holds (#675). If a future
+    // field gains a non-zero default, this fails instead of silently
+    // leaving a deinitialized reassembler in a non-default state.
+    var reassembler = CryptoReassembler{};
+    try reassembler.insert(.initial, 0, "secret-crypto-bytes");
+    try reassembler.insert(.handshake, 4, "more-secret-bytes");
+    try reassembler.discardContiguous(.initial, 3);
+    reassembler.deinit();
+
+    const fresh = CryptoReassembler{};
+    for (&reassembler.streams, &fresh.streams) |*live, *expected| {
+        try testing.expectEqual(expected.range_count, live.range_count);
+        try testing.expectEqual(expected.base_offset, live.base_offset);
+        try testing.expectEqual(expected.consumed_offset, live.consumed_offset);
+        for (live.buffer) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    }
+}
+
+test "crypto output deinit leaves the default state" {
+    var out = CryptoOutput{};
+    try out.append("secret-output-bytes");
+    out.discardTaken(4);
+    out.deinit();
+
+    const fresh = CryptoOutput{};
+    try testing.expectEqual(fresh.start, out.start);
+    try testing.expectEqual(fresh.end, out.end);
+    try testing.expectEqual(fresh.next_offset, out.next_offset);
+    for (out.buffer) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "adapter wipes consumed CRYPTO input and drained output bytes" {

@@ -87,6 +87,23 @@ pub const max_initial_streams_transport_parameter: u64 = 1 << 60;
 /// much credit is granted, never how existing streams behave.
 pub const max_retained_closed_streams_per_direction: u64 = 4096;
 
+/// Per-stream cap on out-of-order receive-buffer segments. Each segment is
+/// a non-contiguous byte range that arrived before the bytes preceding it,
+/// so the count tracks how fragmented the peer's delivery is. Without a
+/// cap, an attacker sending maximally interleaved 1-byte STREAM frames
+/// can create up to `initial_max_stream_data / 1` segments per stream;
+/// every subsequent insert then scans all accumulated segments (O(n) per
+/// insert, O(n²) total) — a quadratic-CPU DoS reachable from linear wire
+/// bytes.
+///
+/// 256 segments is well above what any well-behaved sender produces
+/// (typical loss-driven reordering creates single-digit gaps) while
+/// keeping worst-case insert cost provably bounded. A stream that hits
+/// this cap is treated as a protocol violation; the connection returns
+/// `error.TooManySegments`, which the packet layer maps to a STREAM-level
+/// or connection-level close.
+pub const max_recv_segments: usize = 256;
+
 pub const Config = struct {
     enabled: bool = false,
     versions: VersionSet = .{},

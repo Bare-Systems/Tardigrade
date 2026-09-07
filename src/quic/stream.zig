@@ -173,6 +173,14 @@ const ReceiveBuffer = struct {
         }
 
         try self.segments.ensureUnusedCapacity(allocator, pending.items.len);
+        // Security: reject streams whose out-of-order segment count exceeds
+        // the per-stream cap. Without this, an attacker sending maximally
+        // interleaved 1-byte STREAM frames can create O(window) segments;
+        // every subsequent insert scans them all, yielding O(n²) total CPU.
+        // See `config.max_recv_segments` for the bound's rationale.
+        if (self.segments.items.len + pending.items.len > config.max_recv_segments) {
+            return error.TooManySegments;
+        }
         for (pending.items) |segment| {
             self.addSegmentAssumeCapacity(segment);
         }
@@ -1464,6 +1472,78 @@ fn expectStreamManagerInvariants(manager: *StreamManager, before: StreamManagerS
     }
     try std.testing.expect(per_stream_unique >= manager.bytes_consumed);
     try std.testing.expect(per_stream_unique <= manager.bytes_received);
+}
+
+test "receive buffer rejects excessive segment fragmentation (CVE-style DoS)" {
+    // Proof: an attacker sending 1-byte STREAM frames at every-other-byte
+    // offset can create up to `max_recv_segments` segments. Once the cap
+    // is reached, the next insert returns `error.TooManySegments`.
+    var local = testParams();
+    var peer = testParams();
+    local.initial_max_data = 128 * 1024;
+    local.initial_max_stream_data_bidi_remote = 64 * 1024;
+    peer.initial_max_data = 128 * 1024;
+    peer.initial_max_stream_data_bidi_remote = 64 * 1024;
+
+    var manager = StreamManager.init(std.testing.allocator, .server, local, peer);
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+
+    // Send 1-byte frames at every-other-byte offset to maximize segments:
+    // offset 0, 2, 4, 6, ... — each creates a new non-contiguous segment.
+    var i: u64 = 0;
+    while (i < config.max_recv_segments) : (i += 1) {
+        const offset = i * 2;
+        _ = try manager.receiveStreamFrame(.{ .id = id, .offset = offset, .data = "x" });
+    }
+
+    // The next insert should be rejected: the stream has hit the segment cap.
+    try std.testing.expectError(
+        error.TooManySegments,
+        manager.receiveStreamFrame(.{ .id = id, .offset = config.max_recv_segments * 2, .data = "x" }),
+    );
+
+    // Filling the gaps (contiguous data) should NOT increase segment count:
+    // it merges with adjacent segments during read.
+}
+
+test "segment cap does not interfere with normal sequential delivery" {
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+
+    // Normal sequential delivery: each frame is contiguous with the previous.
+    // The receive buffer should never accumulate more than 1 segment because
+    // in-order data is consumed as it arrives.
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = "hello" });
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 5, .data = "world", .fin = true });
+
+    const stream = manager.get(id).?;
+    // At most 2 segments (both contiguous, before read drains them).
+    try std.testing.expect(stream.recv.segments.items.len <= 2);
+
+    var out: [16]u8 = undefined;
+    const read = try manager.read(id, &out);
+    try std.testing.expectEqual(@as(usize, 10), read.len);
+    try std.testing.expect(read.fin);
+    try std.testing.expectEqualStrings("helloworld", out[0..read.len]);
+}
+
+test "segment cap allows moderate out-of-order delivery" {
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+
+    // Moderately reordered: 3 non-contiguous segments is well under the cap.
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 8, .data = "!" });
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = "he" });
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 5, .data = "orl" });
+
+    const stream = manager.get(id).?;
+    try std.testing.expect(stream.recv.segments.items.len <= config.max_recv_segments);
 }
 
 test {

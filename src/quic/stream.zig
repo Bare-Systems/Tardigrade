@@ -161,6 +161,23 @@ const Segment = struct {
 
 const ReceiveBuffer = struct {
     segments: std.ArrayList(Segment) = .empty,
+    /// Per-stream disjoint-segment cap (#749). Defaults to the production
+    /// policy value, so ordinary construction is unchanged; it is a field
+    /// rather than a direct read of `config.max_recv_segments` only so the
+    /// fuzz harness can lower it.
+    ///
+    /// Without that, the cap is unreachable under fuzzing: `previewReceive`
+    /// rejects any frame whose end exceeds `max_recv_data` *before* anything
+    /// is inserted here, so the number of live disjoint segments is bounded
+    /// by the outstanding receive window in bytes. The fuzz harness runs a
+    /// deliberately tiny window (8 bytes per stream) to reach flow-control
+    /// edges quickly, which bounds it at ~8 segments against a cap of 256 --
+    /// three orders of magnitude short. Raising the harness's window instead
+    /// would cost the flow-control coverage the small window exists for, and
+    /// reaching 257 disjoint segments needs 257 ops that the bounded fuzz
+    /// input cannot express anyway. Lowering the cap exercises identical
+    /// logic at no runtime cost (#675 campaign finding).
+    max_segments: usize = config.max_recv_segments,
 
     fn deinit(self: *ReceiveBuffer, allocator: std.mem.Allocator) void {
         for (self.segments.items) |*segment| {
@@ -207,7 +224,7 @@ const ReceiveBuffer = struct {
         // Security: reject streams whose out-of-order disjoint segment count exceeds
         // the per-stream cap. Because we coalesce contiguous data, this only bounds
         // truly disjoint fragments.
-        if (self.segments.items.len > config.max_recv_segments) {
+        if (self.segments.items.len > self.max_segments) {
             return error.TooManySegments;
         }
         return newly_buffered;
@@ -541,6 +558,10 @@ pub const StreamManager = struct {
     max_data_send: u64,
     max_data_recv: u64,
     metrics: Metrics = .{},
+    /// Per-stream disjoint-segment cap applied to every stream this manager
+    /// creates (#749). Defaults to the production policy value; see
+    /// `ReceiveBuffer.max_segments` for why the fuzz harness lowers it.
+    max_recv_segments: usize = config.max_recv_segments,
     // RFC 9000 §4.6 MAX_STREAMS replenishment (#247 soak finding): without
     // this, a long-lived connection whose peer opens and fully closes many
     // streams (e.g. a persistent HTTP/3 connection serving many requests)
@@ -833,6 +854,7 @@ pub const StreamManager = struct {
         const stream = try self.allocator.create(Stream);
         errdefer self.allocator.destroy(stream);
         stream.* = Stream.initStream(self.role, id, self.initialRecvWindow(id), self.initialSendWindow(id));
+        stream.recv.max_segments = self.max_recv_segments;
         try self.streams.put(id, stream);
         self.metrics.opened_streams += 1;
         self.metrics.active_streams += 1;
@@ -1416,6 +1438,12 @@ fn runStreamManagerCommands(input: []const u8, role: EndpointRole) !void {
 
     var manager = StreamManager.init(std.testing.allocator, role, local, peer);
     defer manager.deinit();
+    // #749's disjoint-segment cap is unreachable at its production value of
+    // 256 here: `previewReceive` rejects anything past `max_recv_data`
+    // before a segment is ever inserted, so the tiny 8-byte window above
+    // bounds live segments at ~8. Lowering the cap exercises the identical
+    // rejection path within that window (#675 campaign finding).
+    manager.max_recv_segments = fuzz_max_recv_segments;
 
     var remembered_local_bidi: ?StreamId = null;
     var remembered_peer_bidi: ?StreamId = null;
@@ -1442,7 +1470,7 @@ fn runStreamManagerCommands(input: []const u8, role: EndpointRole) !void {
                 const len = boundedPayloadLen(input, pos);
                 const data = input[pos..][0..len];
                 pos += len;
-                _ = manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = data, .fin = (op & 0x20) != 0 }) catch {};
+                if (try expectReceiveFrameOutcome(&manager, id, manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = data, .fin = (op & 0x20) != 0 }))) return;
                 if (manager.get(peer_bidi) != null) remembered_peer_bidi = peer_bidi;
             },
             3 => {
@@ -1452,7 +1480,7 @@ fn runStreamManagerCommands(input: []const u8, role: EndpointRole) !void {
                 const len = boundedPayloadLen(input, pos);
                 const data = input[pos..][0..len];
                 pos += len;
-                _ = manager.receiveStreamFrame(.{ .id = id, .offset = offset, .data = data, .fin = (op & 0x40) != 0 }) catch {};
+                if (try expectReceiveFrameOutcome(&manager, id, manager.receiveStreamFrame(.{ .id = id, .offset = offset, .data = data, .fin = (op & 0x40) != 0 }))) return;
                 if (manager.get(id) != null) remembered_peer_bidi = id;
             },
             4 => {
@@ -1492,6 +1520,46 @@ fn runStreamManagerCommands(input: []const u8, role: EndpointRole) !void {
         }
 
         try expectStreamManagerInvariants(&manager, before);
+    }
+}
+
+/// Segment cap the fuzz harness runs #749's rejection path at. The
+/// production value (256) is structurally unreachable here -- see
+/// `ReceiveBuffer.max_segments`. The harness's 8-byte receive window admits
+/// at most 4 disjoint segments (offsets 0,2,4,6 spanning 0..7), so the cap
+/// has to sit below that to be exercised at all.
+const fuzz_max_recv_segments: usize = 2;
+
+/// Checks a `receiveStreamFrame` outcome against #749's segment cap, and
+/// reports whether the frame tripped it.
+///
+/// This deliberately does not assert a whitelist of "legitimate" errors --
+/// guessing that set wrong would manufacture findings rather than find them.
+/// It asserts the two directions that matter for the cap specifically:
+/// accepted frames must leave the stream at or under the cap (a
+/// fragmentation bound that silently fails to fire is exactly the defect
+/// #749 exists to prevent), and a `TooManySegments` rejection must
+/// correspond to a stream that genuinely exceeded it.
+///
+/// Returns true when the cap fired. `config.max_recv_segments` documents
+/// that this becomes an `INTERNAL_ERROR` which immediately closes the QUIC
+/// connection, so the caller stops driving this manager instead of modelling
+/// states a real endpoint could never reach. `receiveStreamFrame` leaves the
+/// rejected frame's segments in the stream while skipping its own
+/// `bytes_received` accounting, so continuing past this point would drift
+/// connection-level and stream-level counters apart and invent invariant
+/// failures that no peer can actually cause.
+fn expectReceiveFrameOutcome(manager: *StreamManager, id: StreamId, result: anytype) !bool {
+    if (result) |_| {
+        if (manager.get(id)) |stream| {
+            try std.testing.expect(stream.recv.segments.items.len <= manager.max_recv_segments);
+        }
+        return false;
+    } else |err| {
+        if (err != error.TooManySegments) return false;
+        const stream = manager.get(id) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(stream.recv.segments.items.len > manager.max_recv_segments);
+        return true;
     }
 }
 
@@ -1560,6 +1628,35 @@ test "receive buffer rejects excessive segment fragmentation (CVE-style DoS)" {
 
     // Filling the gaps (contiguous data) should NOT increase segment count:
     // it merges with adjacent segments during read.
+}
+
+test "segment cap is honoured at a lowered per-manager value" {
+    // The fuzz harness cannot reach the production cap of 256: previewReceive
+    // rejects anything past `max_recv_data` before a segment is inserted, so
+    // live disjoint segments are bounded by the outstanding receive window in
+    // bytes, and the harness runs a deliberately tiny window. `max_recv_segments`
+    // exists so the identical rejection path is reachable at a lowered value
+    // (#675). This pins that the field is actually honoured -- without it the
+    // harness would silently exercise nothing.
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+    manager.max_recv_segments = 2;
+
+    const id = try makeStreamId(.client, .bidi, 0);
+
+    // Disjoint 1-byte frames at offsets 0, 2, 4: each opens a new segment.
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = "a" });
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 2, .data = "b" });
+    try std.testing.expectError(
+        error.TooManySegments,
+        manager.receiveStreamFrame(.{ .id = id, .offset = 4, .data = "c" }),
+    );
+
+    // And the default is still the production policy value, so ordinary
+    // construction is unaffected by the field existing.
+    var untouched = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer untouched.deinit();
+    try std.testing.expectEqual(config.max_recv_segments, untouched.max_recv_segments);
 }
 
 test "segment cap does not interfere with normal sequential delivery" {

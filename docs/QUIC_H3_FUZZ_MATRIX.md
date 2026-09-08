@@ -60,6 +60,20 @@ generates. The two command-sequence targets above are within ~8% of each other,
 which is why this is documented here as a shared property rather than filed
 against either one.
 
+The survival control makes the same point at campaign scale. On one host, same
+target, same fuzz runtime, changing *only* the allocator:
+
+| allocator | outcome |
+| --- | --- |
+| `std.testing.allocator` | `SIGKILL` at 397,458 runs; again at 518,799 |
+| `std.heap.smp_allocator` | **601,913 runs, clean exit** |
+
+The kills correlate with elapsed time (~13-15 minutes each) rather than with a
+run count, and the `.zig-cache/f/crash` artifact they leave is **zero bytes** --
+an external kill, not a finding. A row that ends this way must be recorded as
+`INTERRUPTED` and rerun on a host with headroom; it is not a reproducer and
+there is nothing to minimize.
+
 The footprint is **stable, not monotonic** — the ramp to ~1.9 GB is a cold-corpus
 warm-up transient, after which RSS oscillates in a band (90-480 MB observed) with
 no upward trend in its floor. There is no leak here to fix, and the leak

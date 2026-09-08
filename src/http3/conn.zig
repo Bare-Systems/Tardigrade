@@ -2516,7 +2516,6 @@ test "fuzz: H3 connection state command sequences preserve critical stream and r
         "\x06\x07\x08\x09",
         "\x0a\x0b\x0c\x0d",
         "\x0e\x0f\x10\x11",
-        "\x0c\x00\x00\x00\x1b\x64\x79\xb0\xa6\x0d\x4a\x76\x4a\xf7\xa1\x8e",
     } });
 }
 
@@ -2525,6 +2524,34 @@ fn fuzzH3ConnStateCommands(_: void, smith: *testing.Smith) !void {
     const len = smith.slice(&input);
     try runH3ConnStateCommands(input[0..len], .server);
     try runH3ConnStateCommands(input[0..len], .client);
+}
+
+/// Op 21's bookkeeping: reset the tracked peer request stream and forget its
+/// id.
+///
+/// A reset stream id is dead forever -- RFC 9000 stream ids are never reused
+/// after RESET_STREAM -- so forgetting it here mirrors the connection's own
+/// bookkeeping, which no longer tracks the id past the following `pump()`.
+/// The earlier model left `peer_request` pointing at the dead id, so later
+/// ops wrote to a stream the connection had already discarded and then
+/// expected reactions (e.g. op 13's `message_error`) it had no way to
+/// produce. That was FINDING F7: a fuzz-model defect, not a product defect
+/// -- a real peer can never reach it, because it would have to reuse a
+/// stream id RFC 9000 forbids reusing.
+///
+/// This is a named helper rather than inline op-21 code so the transition can
+/// be pinned directly by
+/// `"H3 conn-state fuzz model forgets a request id after RESET_STREAM"`,
+/// instead of retaining the raw discovery bytes as a permanent corpus
+/// fixture (#675 finding contract; raised in review on #741).
+fn resetTrackedPeerRequest(
+    local_transport: *MockTransport,
+    peer_transport: *MockTransport,
+    peer_request: *?u64,
+) !void {
+    const id = peer_request.* orelse try peer_transport.openStream(.bidi);
+    try local_transport.resetStreamForTest(id);
+    peer_request.* = null;
 }
 
 fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
@@ -2705,19 +2732,7 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                 break :blk conn.pump(&local_transport);
             },
             21 => blk: {
-                if (role == .server) {
-                    const id = peer_request orelse try peer_transport.openStream(.bidi);
-                    try local_transport.resetStreamForTest(id);
-                    // A reset stream id is dead forever (RFC 9000 stream ids
-                    // are never reused); forgetting it here mirrors the
-                    // connection's own bookkeeping, which no longer tracks
-                    // this id past this pump() call. Leaving `peer_request`
-                    // pointing at it made later ops reuse a stream the
-                    // connection has already discarded, so the harness
-                    // expected reactions (e.g. op 13's message_error) that
-                    // conn had no way to produce (#675 campaign finding).
-                    peer_request = null;
-                }
+                if (role == .server) try resetTrackedPeerRequest(&local_transport, &peer_transport, &peer_request);
                 break :blk conn.pump(&local_transport);
             },
             22 => blk: {
@@ -3196,6 +3211,43 @@ test "H3 conn: FIN on the peer control stream closes the connection" {
     try testing.expectEqual(ErrorCode.closed_critical_stream.wire(), client.closeCode());
     // SETTINGS were still processed before the close.
     try testing.expect(client.metrics.settings_received);
+}
+
+test "H3 conn-state fuzz model forgets a request id after RESET_STREAM" {
+    // Named replacement for FINDING F7's raw 16-byte discovery input, which
+    // used to sit in the fuzz corpus above as an opaque literal (#675's
+    // finding contract prefers a named deterministic regression when the
+    // failure has a clear semantic story, and F7's is clean).
+    //
+    // Fails against the pre-fix model, which left `peer_request` pointing at
+    // the reset id: `peer_request` would still hold `dead_id`, and the next
+    // request op would reuse a stream the connection had already discarded.
+    const allocator = testing.allocator;
+    var peer_transport = MockTransport.init(allocator, true);
+    defer peer_transport.deinit();
+    var local_transport = MockTransport.init(allocator, false);
+    defer local_transport.deinit();
+    peer_transport.peer = &local_transport;
+    local_transport.peer = &peer_transport;
+
+    const H3 = Conn(MockTransport);
+    var conn = H3.init(allocator, .server);
+    defer conn.deinit();
+
+    var peer_request: ?u64 = try peer_transport.openStream(.bidi);
+    const dead_id = peer_request.?;
+
+    try resetTrackedPeerRequest(&local_transport, &peer_transport, &peer_request);
+    try conn.pump(&local_transport);
+
+    // The model must forget the id, matching the connection's own bookkeeping.
+    try testing.expect(peer_request == null);
+
+    // And a later request op must allocate a fresh stream rather than reuse
+    // the dead one -- RFC 9000 ids are never reused after RESET_STREAM, so a
+    // real peer could never drive the state the old model constructed.
+    const next_id = peer_request orelse try peer_transport.openStream(.bidi);
+    try testing.expect(next_id != dead_id);
 }
 
 test "pending_uni entries are removed after stream FIN" {

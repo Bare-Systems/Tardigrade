@@ -41,6 +41,7 @@ CAMPAIGN_TARGET="${CAMPAIGN_TARGET:-}"
 CAMPAIGN_BUDGET="${CAMPAIGN_BUDGET:-1K}"
 CAMPAIGN_WATCHDOG="${CAMPAIGN_WATCHDOG:-}"
 CAMPAIGN_NONCANONICAL=false
+COLLECT_GUEST_CACHE=false
 CAMPAIGN_SKIP_PREFLIGHT=false
 LOCAL_OUT_DIR="${LOCAL_OUT_DIR:-$repo/artifacts/hardening/fuzz/proxmox-${timestamp}}"
 REMOTE_STAGE="${REMOTE_STAGE:-/tmp/tardigrade-proxmox-fuzz-${timestamp}}"
@@ -94,6 +95,10 @@ Evidence:
                              --collect reads it back and requires this flag.
 
 Lifecycle:
+  --collect-guest-cache     Also pull the guest's whole .zig-cache (build
+                            output + corpus, adds ~450MB per row). Off by
+                            default: a finding already preserves its own cache
+                            state inside artifacts/. For guest debugging only.
   --keep-guest              Always keep VM
   --destroy-on-failure      Destroy VM after failed campaign once artifacts copy
                             succeeds. Default keeps it for debugging.
@@ -128,6 +133,7 @@ while [[ $# -gt 0 ]]; do
     --campaign-target) CAMPAIGN_TARGET="$2"; shift 2 ;;
     --budget) CAMPAIGN_BUDGET="$2"; shift 2 ;;
     --watchdog) CAMPAIGN_WATCHDOG="$2"; shift 2 ;;
+    --collect-guest-cache) COLLECT_GUEST_CACHE=true; shift ;;
     --noncanonical-smoke) CAMPAIGN_NONCANONICAL=true; shift ;;
     --skip-preflight) CAMPAIGN_SKIP_PREFLIGHT=true; shift ;;
     --out-dir) LOCAL_OUT_DIR="$2"; shift 2 ;;
@@ -365,7 +371,25 @@ write_state() {
 }
 collect_artifacts() {
   [[ "$guest_reachable" == true ]] || return 1
-  run_guest 'tar -C /work -czf /root/tardigrade-fuzz-artifacts.tgz Tardigrade/artifacts Tardigrade/.zig-cache 2>/dev/null || tar -C /work -czf /root/tardigrade-fuzz-artifacts.tgz Tardigrade/artifacts'
+  # Evidence only by default. This used to tar the guest's whole
+  # `.zig-cache` alongside `artifacts/` for *every* row, pass or fail,
+  # which is where a 400-525 MB per-row pull came from -- ~20 GB across
+  # one campaign's rows, on top of the same bytes again once unpacked.
+  #
+  # That cache is build output plus the fuzz corpus, and it is redundant
+  # here: `run-fuzz-campaign.sh` already snapshots `.zig-cache` into the
+  # finding directory (`zig-cache-preserved.tgz`) whenever a row actually
+  # finds something, and that directory lives inside `Tardigrade/artifacts`
+  # -- so a finding's working state still comes back in full. A passing
+  # row's build cache is regenerable and proves nothing.
+  #
+  # `--collect-guest-cache` restores the old behaviour for deep debugging
+  # of the guest itself.
+  if [[ "$COLLECT_GUEST_CACHE" == true ]]; then
+    run_guest 'tar -C /work -czf /root/tardigrade-fuzz-artifacts.tgz Tardigrade/artifacts Tardigrade/.zig-cache 2>/dev/null || tar -C /work -czf /root/tardigrade-fuzz-artifacts.tgz Tardigrade/artifacts'
+  else
+    run_guest 'tar -C /work -czf /root/tardigrade-fuzz-artifacts.tgz Tardigrade/artifacts'
+  fi
   pull_guest /root/tardigrade-fuzz-artifacts.tgz "$artifact_tgz"
   [[ -s "$artifact_tgz" ]]
   qm config "$guest_id" >"$REMOTE_STAGE/guest-config.txt" 2>&1 || true

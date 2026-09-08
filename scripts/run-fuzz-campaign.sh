@@ -406,7 +406,16 @@ write_finding() {
       sha="$(shasum -a 256 "$dir/crash-input.bin" | awk '{print $1}')"
     fi
   fi
-  if [[ -d .zig-cache ]]; then
+  # Preserve the fuzzer's own state, not the build cache. `.zig-cache/f`
+  # is where Zig keeps the corpus and the saved crash input -- the working
+  # state #675's finding contract asks for. The rest of `.zig-cache` is
+  # compiled build output: regenerable from `source_commit_sha`, and it was
+  # dominating these tarballs at ~220 MB each against a few MB of actual
+  # fuzz state. Falls back to the whole cache if `f/` is absent, so a
+  # finding is never preserved with less than before.
+  if [[ -d .zig-cache/f ]]; then
+    tar -czf "$dir/zig-cache-preserved.tgz" .zig-cache/f 2>/dev/null || true
+  elif [[ -d .zig-cache ]]; then
     tar -czf "$dir/zig-cache-preserved.tgz" .zig-cache 2>/dev/null || true
   fi
   {
@@ -422,9 +431,9 @@ write_finding() {
     printf '\n'
     if [[ -n "$sha" ]]; then
       printf 'crash_input_sha256=%s\n' "$sha"
-      printf 'note=%s\n' 'crash-input.bin holds the exact saved fuzz input byte-for-byte; .zig-cache state was preserved alongside it.'
+      printf 'note=%s\n' 'crash-input.bin holds the exact saved fuzz input byte-for-byte; the fuzzer corpus/crash state (.zig-cache/f) was preserved alongside it. Build output is regenerable from source_commit_sha and is deliberately not retained.'
     else
-      printf 'note=%s\n' 'Exact Zig crash input path was not inferred automatically; complete logs and .zig-cache state were preserved for deliberate recovery.'
+      printf 'note=%s\n' 'Exact Zig crash input path was not inferred automatically; complete logs and the fuzzer corpus/crash state (.zig-cache/f) were preserved for deliberate recovery.'
     fi
   } >"$dir/provenance.txt"
   printf '%s' "$sha"

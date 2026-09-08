@@ -35,12 +35,20 @@ external peers out of these loops; ngtcp2/nghttp3, quiche, and aioquic remain un
 
 ## Host memory requirement for command-sequence targets
 
-Command-sequence targets need a host with **several GB of free RAM per fuzz
-process**, and a memory-saturated host will get the process `SIGKILL`ed
-mid-row. Budget roughly **2 GB of headroom per concurrent fuzz process** and do
-not run canonical rows on a machine already near its memory limit; a row killed
-this way is `INTERRUPTED`, not a finding, and must be rerun rather than
-recorded.
+Command-sequence targets need a host with several GB of free RAM per fuzz
+process, and a memory-saturated host will get the process `SIGKILL`ed mid-row.
+Provision **at least 4 GB of available RAM per active command-sequence fuzz
+process**, and prefer **6-8 GB of guest memory for a guest running one
+canonical fuzz process**. Do not run canonical rows on a machine already near
+its memory limit; a row killed this way is `INTERRUPTED`, not a finding, and
+must be rerun rather than recorded.
+
+Those figures are provisioning numbers, not the measurement. The measured
+warm-up transient below is ~1.87 GB, so sizing to ~2 GB would leave under 10%
+margin -- not enough to absorb allocator-metadata variance between hosts, the
+fuzz runtime's own corpus and coverage state, OS page cache, or a target that
+grows a little. The 4 GB floor is that transient plus real margin; the 6-8 GB
+guest recommendation additionally covers the guest OS.
 
 This is a property of `std.testing.allocator`, not of any target. Measured on
 one host, sampling process RSS every 5s under `-Doptimize=ReleaseFast`:
@@ -73,6 +81,38 @@ run count, and the `.zig-cache/f/crash` artifact they leave is **zero bytes** --
 an external kill, not a finding. A row that ends this way must be recorded as
 `INTERRUPTED` and rerun on a host with headroom; it is not a reproducer and
 there is nothing to minimize.
+
+### Guest memory preflight before a canonical long row
+
+Sizing a guest correctly on paper is not the same as confirming it. Before
+launching the H3 conn-state 50M row (or any other command-sequence row) on the
+real disposable campaign VM, run the **same canonical target for ~1M
+mutations in that VM** while sampling guest RSS and `MemAvailable` alongside
+host memory:
+
+```bash
+# In the campaign guest, alongside the row's own zig build invocation:
+while :; do
+  printf '%s rss_kb=%s mem_available_kb=%s\n' \
+    "$(date -u +%FT%TZ)" \
+    "$(ps -o rss= -C test 2>/dev/null | tr -d ' ' | head -1)" \
+    "$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
+  sleep 5
+done
+```
+
+Proceed to the 50M row, and then the required 100M finding-driven follow-up,
+only if that preflight **completes** with the warm-up transient staying under
+~2 GB and host headroom staying healthy. If it is killed, or the transient is
+materially larger than the table above, the guest is undersized -- fix the
+provisioning rather than starting a long row that will be interrupted hours in.
+
+This preflight is about the *execution environment*, so it is separate from and
+additional to #675's deterministic pre-campaign gate, which is about the source
+tree.
+
+**Do not substitute a non-instrumented allocator in the real campaign** to make
+a row fit. The leak detection is the point; see below.
 
 The footprint is **stable, not monotonic** — the ramp to ~1.9 GB is a cold-corpus
 warm-up transient, after which RSS oscillates in a band (90-480 MB observed) with

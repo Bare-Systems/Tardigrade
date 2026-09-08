@@ -983,10 +983,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_pki_tests.step);
 
     // DER/PEM/X.509/path-validation fuzz targets (#492, epic #324-K). The
-    // targets are inline `test "fuzz: PKI: ..."` blocks inside `pki_mod`, so
-    // their deterministic seed-corpus replay is already part of `test-pki`
-    // and `test`; this step only scopes them for `--fuzz=<N>` runs.
-    const pki_fuzz_tests = b.addTest(.{ .root_module = pki_mod, .filters = pki_test_filters });
+    // targets are inline `test "fuzz: PKI: ..."` blocks in der_tests.zig and
+    // x509_tests.zig, reached via the same `src/pki/root.zig` root as
+    // `test-pki` — so their deterministic seed-corpus replay is already part
+    // of `test-pki` and `test`; this step only scopes them for `--fuzz=<N>`
+    // runs. It must build from `pki_test_mod`, not `pki_mod`: those test
+    // files also reference the `pki_malformed_der`/`pki_reduced_corpus`
+    // test-only imports declared on `pki_test_mod` above, and `pki_mod`
+    // deliberately excludes them (see the "reachable from the installed
+    // tardi graph" comment above) since it feeds the production build graph
+    // (#675 campaign finding: every disposable-VM Tier-1 pki row failed to
+    // compile from a cold cache with "no module named 'pki_reduced_corpus'"
+    // / a missing-file error for `pki_malformed_der`, because this step used
+    // to build straight from `pki_mod`).
+    const pki_fuzz_tests = b.addTest(.{ .root_module = pki_test_mod, .filters = pki_test_filters });
     const run_pki_fuzz_tests = b.addRunArtifact(pki_fuzz_tests);
     const pki_fuzz_step = b.step("test-pki-fuzz", "Run PKI DER/PEM/X.509/path-validation fuzz targets (#492)");
     pki_fuzz_step.dependOn(&run_pki_fuzz_tests.step);

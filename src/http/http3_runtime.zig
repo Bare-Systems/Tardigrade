@@ -2320,7 +2320,7 @@ pub const Runtime = struct {
 
         const scratch = try allocator.alloc(u8, runtime.maxIdentityLen());
         defer {
-            std.crypto.secureZero(u8, scratch);
+            crypto_pkg.secrets.secureZero(scratch);
             allocator.free(scratch);
         }
         var identity = try runtime.createIdentity(&prepared.state, now_unix_ms, scratch);

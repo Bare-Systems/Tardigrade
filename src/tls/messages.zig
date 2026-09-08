@@ -225,7 +225,9 @@ pub fn Reassembler(comptime capacity: usize) type {
             const old_len = self.len;
             std.mem.copyForwards(u8, self.data[0 .. old_len - count], self.data[count..old_len]);
             self.len = old_len - count;
-            std.crypto.secureZero(u8, self.data[self.len..old_len]);
+            // Canonical helper, not `std.crypto.secureZero`: since #675 the two
+            // are no longer the same primitive, and these are handshake bytes.
+            @import("crypto").secrets.secureZero(self.data[self.len..old_len]);
         }
     };
 }

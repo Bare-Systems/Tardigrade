@@ -5144,7 +5144,12 @@ test "#484 server rejects a ClientHello2 that still lacks the requested share, v
     // actually stops a second HelloRetryRequest in practice.
     var buf2: [2048]u8 = undefined;
     const ch2_still_empty = try buildClientHello(&buf2, .{ .empty_key_share = true });
-    try std.testing.expectError(error.MalformedHandshake, server.backend().receive(.initial, ch2_still_empty, &sink));
+    // The empty share list is well-formed wire data violating RFC 8446
+    // §4.1.2's exactly-one-share rule, so the validator classifies it as
+    // IllegalParameter (illegal_parameter alert) — the same class as the
+    // omitted-extension variant below — not as a decode failure (#675
+    // campaign finding).
+    try std.testing.expectError(error.IllegalParameter, server.backend().receive(.initial, ch2_still_empty, &sink));
     // Still exactly one HRR in the whole exchange — the second attempt was
     // rejected, not answered with another one.
     try std.testing.expectEqual(@as(usize, 1), countCryptoEvents(&sink, .initial));

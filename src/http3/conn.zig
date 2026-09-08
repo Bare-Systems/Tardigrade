@@ -427,10 +427,23 @@ pub fn Conn(comptime Transport: type) type {
         /// Drain newly accepted and readable peer streams. Call after every
         /// network progress step.
         pub fn pump(self: *Self, transport: *Transport) H3Error!void {
+            // Once the connection has already failed, it must not keep
+            // accepting or tracking new peer-initiated state (streams,
+            // requests, pending uni entries): every field below this guard
+            // is inert until deinit. In production this stays unreachable
+            // in practice, since a QUIC-level close stops stream delivery
+            // to this layer first, but the H3 connection object itself
+            // must not depend on that upstream guarantee to stay bounded.
+            if (self.close_code != null) return;
             while (transport.acceptStream()) |id| {
                 if (id % 4 == 2 or id % 4 == 3) {
                     // Peer unidirectional stream: classify by type varint.
                     self.pending_uni.put(id, .{}) catch return error.OutOfMemory;
+                    // Local bound, per the note above about not depending on
+                    // the transport's own stream limit to stay bounded
+                    // (#753). H3_EXCESSIVE_LOAD is the RFC 9114 §8.1 code
+                    // for a peer driving more state than the endpoint is
+                    // willing to carry.
                 } else if (self.role == .server) {
                     if (!isClientRequestStream(id)) return self.fail(.stream_creation_error);
                     if (self.local_goaway_id) |limit| {
@@ -467,6 +480,8 @@ pub fn Conn(comptime Transport: type) type {
         }
 
         fn pumpUniStreams(self: *Self, transport: *Transport) H3Error!void {
+            var finished_uni: std.ArrayList(u64) = .empty;
+            defer finished_uni.deinit(self.allocator);
             var it = self.pending_uni.iterator();
             while (it.next()) |entry| {
                 const id = entry.key_ptr.*;
@@ -476,8 +491,9 @@ pub fn Conn(comptime Transport: type) type {
                     const result = transport.readStream(id, &buf) catch |err| {
                         // A reset of a critical stream closes it just as a FIN
                         // does (RFC 9114 §6.2.1, RFC 9204 §4.2).
-                        if (err == error.StreamReset and isCriticalUniType(state.typ)) {
-                            return self.fail(.closed_critical_stream);
+                        if (err == error.StreamReset) {
+                            if (isCriticalUniType(state.typ)) return self.fail(.closed_critical_stream);
+                            finished_uni.append(self.allocator, id) catch return error.OutOfMemory;
                         }
                         break;
                     };
@@ -522,8 +538,17 @@ pub fn Conn(comptime Transport: type) type {
                     }
                     if (bytes.len > 0 and state.typ == .control) {
                         const had_settings = self.peer_control_view.saw_settings;
-                        _ = try self.ingestControlBytes(transport, bytes);
+                        // ingestControlBytes can observe a valid SETTINGS
+                        // frame (setting saw_settings) and then fail on a
+                        // later frame in the same buffer (e.g. a duplicate
+                        // SETTINGS, RFC 9114 §7.2.4) within the same call.
+                        // The metrics sync below must run against that
+                        // outcome unconditionally — deferred past the
+                        // `try` — or an error path leaves saw_settings and
+                        // settings_received permanently out of sync.
+                        const ingest_result = self.ingestControlBytes(transport, bytes);
                         if (self.peer_control_view.saw_settings) self.metrics.settings_received = true;
+                        _ = try ingest_result;
                         if (self.role == .client and !had_settings and self.peer_control_view.saw_settings) {
                             try self.publishEarlyTicketSnapshot(transport);
                         }
@@ -536,10 +561,12 @@ pub fn Conn(comptime Transport: type) type {
                         // connection error of type H3_CLOSED_CRITICAL_STREAM
                         // (RFC 9114 §6.2.1, RFC 9204 §4.2).
                         if (isCriticalUniType(state.typ)) return self.fail(.closed_critical_stream);
+                        finished_uni.append(self.allocator, id) catch return error.OutOfMemory;
                         break;
                     }
                 }
             }
+            for (finished_uni.items) |id| _ = self.pending_uni.remove(id);
         }
 
         fn ingestControlBytes(self: *Self, transport: *Transport, bytes: []const u8) H3Error!usize {
@@ -673,7 +700,24 @@ pub fn Conn(comptime Transport: type) type {
             while (it.next()) |entry| {
                 const id = entry.key_ptr.*;
                 const request = entry.value_ptr.*;
-                if (request.finished) continue;
+                if (request.finished) {
+                    // The peer must not send more stream data once we have
+                    // already observed its FIN (RFC 9114 §4.1: e.g. a
+                    // second HEADERS frame on a request stream is
+                    // malformed). A real QUIC transport is expected to
+                    // reject bytes received past the stream's final size
+                    // before they ever reach this layer, but this layer
+                    // must not silently trust and drop unexpected
+                    // post-finish bytes instead of treating them as the
+                    // message error they are.
+                    var post_finish_buf: [1]u8 = undefined;
+                    const result = transport.readStream(id, &post_finish_buf) catch |err| {
+                        if (err == error.StreamReset) reset_requests.append(self.allocator, id) catch return error.OutOfMemory;
+                        continue;
+                    };
+                    if (result.len > 0) return self.fail(.message_error);
+                    continue;
+                }
                 var buf: [2048]u8 = undefined;
                 var qpack_scratch: [4096]u8 = undefined;
                 while (true) {
@@ -1220,6 +1264,14 @@ const MockStream = struct {
 
 /// Two mock transports joined back-to-back: writes on one side become reads
 /// on the other. Stream ids follow RFC 9000 §2.1 numbering.
+/// Peer-granted credit for unidirectional streams, mirroring RFC 9000 §4.6
+/// MAX_STREAMS accounting. Matches Tardigrade's own
+/// `initial_max_streams_uni` default; it is restated here rather than
+/// imported because `http3_mod` deliberately does not depend on the QUIC
+/// implementation's config module, and adding that dependency to source one
+/// constant would breach a layering boundary the build graph enforces.
+const mock_peer_max_uni_streams: u64 = 16;
+
 const MockTransport = struct {
     allocator: std.mem.Allocator,
     is_client: bool,
@@ -1231,6 +1283,17 @@ const MockTransport = struct {
     accepted: std.ArrayList(u64) = .empty,
     write_calls: usize = 0,
     fail_writes_after: ?usize = null,
+    /// Concurrent-unidirectional-stream credit this transport still holds.
+    /// Real QUIC does not let a peer open unbounded unidirectional streams:
+    /// credit is granted by MAX_STREAMS and replenished only as streams
+    /// close. The earlier mock modelled no limit at all, which let the fuzz
+    /// model drive H3 into peer states no conforming transport could
+    /// produce -- FINDING F9 (#753).
+    max_uni_streams: u64 = mock_peer_max_uni_streams,
+    /// Ids opened by this transport whose close has not yet been observed by
+    /// the peer. Credit is reclaimed from this set, not from a bare counter,
+    /// so replenishment tracks actual stream lifetime rather than a guess.
+    open_uni: std.ArrayList(u64) = .empty,
 
     fn init(allocator: std.mem.Allocator, is_client: bool) MockTransport {
         return .{
@@ -1250,6 +1313,7 @@ const MockTransport = struct {
         self.streams.deinit();
         self.scheduling_hints.deinit();
         self.accepted.deinit(self.allocator);
+        self.open_uni.deinit(self.allocator);
     }
 
     fn stream(self: *MockTransport, id: u64) !*MockStream {
@@ -1260,8 +1324,42 @@ const MockTransport = struct {
         return s;
     }
 
+    /// Release credit for unidirectional streams the peer has finished with.
+    ///
+    /// A stream is done once the receiving side has observed a reset, or has
+    /// read through a delivered FIN -- the same points at which a real
+    /// endpoint would raise MAX_STREAMS. Anything still open, or opened but
+    /// never written to, keeps holding its credit.
+    fn reclaimClosedUniCredit(self: *MockTransport) void {
+        const peer = self.peer orelse return;
+        var index: usize = 0;
+        while (index < self.open_uni.items.len) {
+            const id = self.open_uni.items[index];
+            const closed = if (peer.streams.get(id)) |s|
+                s.reset or (s.fin and s.read_pos == s.data.items.len)
+            else
+                false;
+            if (closed) {
+                _ = self.open_uni.orderedRemove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Unidirectional stream credit currently consumed, after reclaiming
+    /// anything the peer has finished with.
+    fn uniCreditInUse(self: *MockTransport) usize {
+        self.reclaimClosedUniCredit();
+        return self.open_uni.items.len;
+    }
+
     pub fn openStream(self: *MockTransport, typ: enum { bidi, uni }) !u64 {
         const base: u64 = if (self.is_client) 0 else 1;
+        if (typ == .uni) {
+            self.reclaimClosedUniCredit();
+            if (self.open_uni.items.len >= self.max_uni_streams) return error.StreamLimitReached;
+        }
         const id = switch (typ) {
             .bidi => blk: {
                 defer self.next_bidi += 1;
@@ -1273,6 +1371,7 @@ const MockTransport = struct {
             },
         };
         _ = try self.stream(id);
+        if (typ == .uni) try self.open_uni.append(self.allocator, id);
         if (self.peer) |peer| try peer.accepted.append(peer.allocator, id);
         return id;
     }
@@ -2487,6 +2586,40 @@ fn fuzzH3ConnStateCommands(_: void, smith: *testing.Smith) !void {
     try runH3ConnStateCommands(input[0..len], .client);
 }
 
+/// Op 21's bookkeeping: reset the tracked peer request stream and forget its
+/// id.
+///
+/// A reset stream id is dead forever -- RFC 9000 stream ids are never reused
+/// after RESET_STREAM -- so forgetting it here mirrors the connection's own
+/// bookkeeping, which no longer tracks the id past the following `pump()`.
+/// The earlier model left `peer_request` pointing at the dead id, so later
+/// ops wrote to a stream the connection had already discarded and then
+/// expected reactions (e.g. op 13's `message_error`) it had no way to
+/// produce. That was FINDING F7: a fuzz-model defect, not a product defect
+/// -- a real peer can never reach it, because it would have to reuse a
+/// stream id RFC 9000 forbids reusing.
+///
+/// This is a named helper rather than inline op-21 code so the transition can
+/// be pinned directly by
+/// `"H3 conn-state fuzz model forgets a request id after RESET_STREAM"`,
+/// instead of retaining the raw discovery bytes as a permanent corpus
+/// fixture (#675 finding contract; raised in review on #741).
+fn resetTrackedPeerRequest(
+    local_transport: *MockTransport,
+    peer_transport: *MockTransport,
+    peer_request: *?u64,
+) !void {
+    const id = peer_request.* orelse try peer_transport.openStream(.bidi);
+    try local_transport.resetStreamForTest(id);
+    peer_request.* = null;
+}
+
+/// Unidirectional stream credit the fuzz model holds back from op 3 so the
+/// critical/tracked streams (control, both QPACK streams, and the
+/// duplicate-detection slots) can always be opened. Six covers every slot
+/// the model tracks with one to spare.
+const reserved_uni_credit: usize = 6;
+
 fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
     const allocator = testing.allocator;
     var peer_transport = MockTransport.init(allocator, role == .server);
@@ -2515,19 +2648,42 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
 
         const result = switch (op % 25) {
             0 => blk: {
-                try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             1 => blk: {
-                try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             2 => blk: {
-                try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             3 => blk: {
-                const id = try peer_transport.openStream(.uni);
+                // Op 3 is the only unbounded opener in the model, so it
+                // stops short of the transport's full credit and leaves
+                // `reserved_uni_credit` for the critical/tracked streams
+                // (control, both QPACK streams, and the duplicate-detection
+                // slots). A real endpoint opens its critical unidirectional
+                // streams first for the same reason; without the reserve,
+                // op 3 could starve them and the model would stop
+                // exercising the paths that matter most. A denial here is
+                // the transport correctly refusing credit, not a finding.
+                if (peer_transport.uniCreditInUse() + reserved_uni_credit >= peer_transport.max_uni_streams)
+                    break :blk conn.pump(&local_transport);
+                const id = peer_transport.openStream(.uni) catch |err| switch (err) {
+                    error.StreamLimitReached => break :blk conn.pump(&local_transport),
+                    else => return err,
+                };
                 var bytes: [16]u8 = undefined;
                 const typ_len = try varint.encode(0x21, &bytes);
                 _ = try peer_transport.writeStream(id, bytes[0..typ_len], false);
@@ -2535,27 +2691,42 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
             },
             4 => blk: {
                 if (peer_control == null and before_close == null) {
-                    try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control);
+                    // A refusal here is the transport correctly withholding stream
+                    // credit, which a real peer would also hit; skip the op rather
+                    // than reporting the refusal as a finding (#753).
+                    if (!try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
                     try conn.pump(&local_transport);
                 }
                 expected_close = .stream_creation_error;
                 var duplicate: ?u64 = null;
-                try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &duplicate);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &duplicate)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             5 => blk: {
                 expected_close = if (before_settings) .frame_unexpected else .missing_settings;
-                try writePeerUni(&peer_transport, .control, forbiddenControlDataBytes()[0..], false, &peer_control);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .control, forbiddenControlDataBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             6 => blk: {
                 expected_close = .frame_unexpected;
-                try writePeerUni(&peer_transport, .control, duplicateSettingsBytes()[0..], false, &peer_control);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .control, duplicateSettingsBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             7 => blk: {
                 if (peer_control == null and before_close == null) {
-                    try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control);
+                    // A refusal here is the transport correctly withholding stream
+                    // credit, which a real peer would also hit; skip the op rather
+                    // than reporting the refusal as a finding (#753).
+                    if (!try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
                     try conn.pump(&local_transport);
                 }
                 expected_close = .closed_critical_stream;
@@ -2564,12 +2735,18 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
             },
             8 => blk: {
                 expected_close = .closed_critical_stream;
-                try writePeerUni(&peer_transport, .qpack_encoder, "", true, &peer_qpack_encoder);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .qpack_encoder, "", true, &peer_qpack_encoder)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             9 => blk: {
                 if (peer_control == null and before_close == null) {
-                    try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control);
+                    // A refusal here is the transport correctly withholding stream
+                    // credit, which a real peer would also hit; skip the op rather
+                    // than reporting the refusal as a finding (#753).
+                    if (!try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
                     try conn.pump(&local_transport);
                 }
                 expected_close = .closed_critical_stream;
@@ -2633,31 +2810,52 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
             },
             16 => blk: {
                 expected_close = if (before_settings) null else .missing_settings;
-                try writePeerUni(&peer_transport, .control, goawayBytes()[0..], false, &peer_control);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .control, goawayBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             17 => blk: {
                 expected_close = .stream_creation_error;
                 var duplicate: ?u64 = null;
-                try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder);
-                try writePeerUni(&peer_transport, .qpack_encoder, "", false, &duplicate);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder)) break :blk conn.pump(&local_transport);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .qpack_encoder, "", false, &duplicate)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             18 => blk: {
                 expected_close = .stream_creation_error;
                 var duplicate: ?u64 = null;
-                try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder);
-                try writePeerUni(&peer_transport, .qpack_decoder, "", false, &duplicate);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder)) break :blk conn.pump(&local_transport);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .qpack_decoder, "", false, &duplicate)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             19 => blk: {
                 expected_close = .closed_critical_stream;
-                try writePeerUni(&peer_transport, .qpack_decoder, "", true, &peer_qpack_decoder);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .qpack_decoder, "", true, &peer_qpack_decoder)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             20 => blk: {
                 if (peer_qpack_encoder == null and before_close == null) {
-                    try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder);
+                    // A refusal here is the transport correctly withholding stream
+                    // credit, which a real peer would also hit; skip the op rather
+                    // than reporting the refusal as a finding (#753).
+                    if (!try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder)) break :blk conn.pump(&local_transport);
                     try conn.pump(&local_transport);
                 }
                 expected_close = .closed_critical_stream;
@@ -2665,27 +2863,35 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                 break :blk conn.pump(&local_transport);
             },
             21 => blk: {
-                if (role == .server) {
-                    const id = peer_request orelse try peer_transport.openStream(.bidi);
-                    peer_request = id;
-                    try local_transport.resetStreamForTest(id);
-                }
+                if (role == .server) try resetTrackedPeerRequest(&local_transport, &peer_transport, &peer_request);
                 break :blk conn.pump(&local_transport);
             },
             22 => blk: {
                 expected_close = if (before_settings) .id_error else .missing_settings;
-                try writePeerUni(&peer_transport, .control, goawayBytes()[0..], false, &peer_control);
-                try writePeerUni(&peer_transport, .control, largerGoawayBytes()[0..], false, &peer_control);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .control, goawayBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .control, largerGoawayBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             23 => blk: {
                 expected_close = if (!before_settings) .missing_settings else if (role == .client) .id_error else null;
-                try writePeerUni(&peer_transport, .control, invalidClientGoawayBytes()[0..], false, &peer_control);
+                // A refusal here is the transport correctly withholding stream
+                // credit, which a real peer would also hit; skip the op rather
+                // than reporting the refusal as a finding (#753).
+                if (!try writePeerUni(&peer_transport, .control, invalidClientGoawayBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
             else => blk: {
                 if (peer_qpack_decoder == null and before_close == null) {
-                    try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder);
+                    // A refusal here is the transport correctly withholding stream
+                    // credit, which a real peer would also hit; skip the op rather
+                    // than reporting the refusal as a finding (#753).
+                    if (!try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder)) break :blk conn.pump(&local_transport);
                     try conn.pump(&local_transport);
                 }
                 expected_close = .closed_critical_stream;
@@ -2709,20 +2915,27 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
     }
 }
 
-fn writePeerUni(peer_transport: *MockTransport, typ: frame.StreamType, payload_after_type: []const u8, fin: bool, slot: *?u64) !void {
-    const id = slot.* orelse try peer_transport.openStream(.uni);
+/// Returns false when the peer holds no unidirectional stream credit, so the
+/// caller can skip the op instead of surfacing the transport's correct
+/// refusal as a fuzz finding (#753).
+fn writePeerUni(peer_transport: *MockTransport, typ: frame.StreamType, payload_after_type: []const u8, fin: bool, slot: *?u64) !bool {
+    const id = slot.* orelse peer_transport.openStream(.uni) catch |err| switch (err) {
+        error.StreamLimitReached => return false,
+        else => return err,
+    };
     slot.* = id;
     var prefix: [8]u8 = undefined;
     const stream_type = try frame.encodeStreamType(typ, &prefix);
     if (payload_after_type.len == 0 and typ != .control) {
         _ = try peer_transport.writeStream(id, stream_type, fin);
-        return;
+        return true;
     }
     if (peer_transport.peer) |target| {
         const s = try target.stream(id);
         if (s.data.items.len == 0) try s.data.appendSlice(target.allocator, stream_type);
     }
     _ = try peer_transport.writeStream(id, payload_after_type, fin);
+    return true;
 }
 
 fn validSettingsBytes() [2]u8 {
@@ -2774,6 +2987,68 @@ fn requestWithTrailersThenDataBytes() [23]u8 {
     return h ++ h ++ d;
 }
 
+test "H3 conn: pump stops accepting and tracking streams once already closed" {
+    // Found 2026-09-02 by the #675 campaign (test-quic --fuzz, "H3
+    // connection state command sequences" target): pump() had no guard
+    // against self.close_code already being set, so a peer stream opened
+    // after the connection failed was still accepted and tracked into
+    // conn.requests. Pins that a request opened strictly after close is
+    // never tracked and the sticky close_code is not disturbed.
+    const allocator = testing.allocator;
+    var peer_transport = MockTransport.init(allocator, true);
+    defer peer_transport.deinit();
+    var local_transport = MockTransport.init(allocator, false);
+    defer local_transport.deinit();
+    peer_transport.peer = &local_transport;
+    local_transport.peer = &peer_transport;
+
+    const H3 = Conn(MockTransport);
+    var conn = H3.init(allocator, .server);
+    defer conn.deinit();
+
+    var peer_control: ?u64 = null;
+    _ = try writePeerUni(&peer_transport, .control, duplicateSettingsBytes()[0..], false, &peer_control);
+    try testing.expectError(error.ProtocolError, conn.pump(&local_transport));
+    try testing.expectEqual(ErrorCode.frame_unexpected, conn.close_code.?);
+
+    const id = try peer_transport.openStream(.bidi);
+    _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
+    try conn.pump(&local_transport);
+
+    try testing.expectEqual(ErrorCode.frame_unexpected, conn.close_code.?);
+    try testing.expectEqual(@as(u32, 0), conn.requests.count());
+}
+
+test "H3 conn: server rejects more data on a request stream after its FIN" {
+    // Found 2026-09-02 by the #675 campaign, same target: once a request
+    // reached request.finished (FIN observed), pumpRequests() permanently
+    // skipped reading its stream, so a second HEADERS frame sent after FIN
+    // (RFC 9114 SS4.1) was silently dropped instead of failing the
+    // connection with message_error.
+    const allocator = testing.allocator;
+    var peer_transport = MockTransport.init(allocator, true);
+    defer peer_transport.deinit();
+    var local_transport = MockTransport.init(allocator, false);
+    defer local_transport.deinit();
+    peer_transport.peer = &local_transport;
+    local_transport.peer = &peer_transport;
+
+    const H3 = Conn(MockTransport);
+    var conn = H3.init(allocator, .server);
+    defer conn.deinit();
+
+    const id = try peer_transport.openStream(.bidi);
+    _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
+    _ = try peer_transport.writeStream(id, dataFrameBytes()[0..], true);
+    try conn.pump(&local_transport);
+    try testing.expectEqual(@as(?ErrorCode, null), conn.close_code);
+    try testing.expectEqual(@as(u32, 1), conn.requests.count());
+
+    _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
+    try testing.expectError(error.ProtocolError, conn.pump(&local_transport));
+    try testing.expectEqual(ErrorCode.message_error, conn.close_code.?);
+}
+
 fn expectH3ConnInvariants(conn: anytype, role: Role, before_settings: bool, before_requests: u32) !void {
     if (conn.peer_control) |id| {
         try testing.expect((id & 0x2) != 0);
@@ -2784,7 +3059,16 @@ fn expectH3ConnInvariants(conn: anytype, role: Role, before_settings: bool, befo
     if (conn.peer_qpack_decoder) |id| {
         try testing.expect((id & 0x2) != 0);
     }
-    try testing.expect(conn.pending_uni.count() <= 32);
+    // Derived from the transport's actual unidirectional stream credit, not
+    // a magic constant. A peer cannot hold more than `max_uni_streams`
+    // concurrent unidirectional streams, and `pending_uni` retains an entry
+    // until the connection observes that stream's FIN or reset. The 2x
+    // headroom covers the transient window where the mock has already
+    // reclaimed credit for a stream reset out-of-band (`resetStreamForTest`
+    // marks it immediately) but the connection has not yet pumped and
+    // retired its entry. The earlier bare `<= 32` asserted a bound nothing
+    // enforced, which is what FINDING F9 tripped over (#753).
+    try testing.expect(conn.pending_uni.count() <= mock_peer_max_uni_streams * 2);
     _ = before_requests;
     try testing.expect(conn.requests.count() <= 32 or role == .client);
     if (before_settings) try testing.expect(conn.peer_control_view.saw_settings);
@@ -3086,6 +3370,165 @@ test "H3 conn: FIN on the peer control stream closes the connection" {
     try testing.expectEqual(ErrorCode.closed_critical_stream.wire(), client.closeCode());
     // SETTINGS were still processed before the close.
     try testing.expect(client.metrics.settings_received);
+}
+
+test "H3 conn-state fuzz model forgets a request id after RESET_STREAM" {
+    // Named replacement for FINDING F7's raw 16-byte discovery input, which
+    // used to sit in the fuzz corpus above as an opaque literal (#675's
+    // finding contract prefers a named deterministic regression when the
+    // failure has a clear semantic story, and F7's is clean).
+    //
+    // Fails against the pre-fix model, which left `peer_request` pointing at
+    // the reset id: `peer_request` would still hold `dead_id`, and the next
+    // request op would reuse a stream the connection had already discarded.
+    const allocator = testing.allocator;
+    var peer_transport = MockTransport.init(allocator, true);
+    defer peer_transport.deinit();
+    var local_transport = MockTransport.init(allocator, false);
+    defer local_transport.deinit();
+    peer_transport.peer = &local_transport;
+    local_transport.peer = &peer_transport;
+
+    const H3 = Conn(MockTransport);
+    var conn = H3.init(allocator, .server);
+    defer conn.deinit();
+
+    var peer_request: ?u64 = try peer_transport.openStream(.bidi);
+    const dead_id = peer_request.?;
+
+    try resetTrackedPeerRequest(&local_transport, &peer_transport, &peer_request);
+    try conn.pump(&local_transport);
+
+    // The model must forget the id, matching the connection's own bookkeeping.
+    try testing.expect(peer_request == null);
+
+    // And a later request op must allocate a fresh stream rather than reuse
+    // the dead one -- RFC 9000 ids are never reused after RESET_STREAM, so a
+    // real peer could never drive the state the old model constructed.
+    const next_id = peer_request orelse try peer_transport.openStream(.bidi);
+    try testing.expect(next_id != dead_id);
+}
+
+test "mock transport enforces unidirectional stream credit and replenishes on close" {
+    // FINDING F9 (#753) was a fuzz-model fidelity defect: `MockTransport`
+    // let a peer open unbounded unidirectional streams, a state real QUIC
+    // never permits, and the H3 model then tripped an invariant no
+    // conforming peer could reach. This pins the credit accounting the mock
+    // now models, including that credit is genuinely replenished rather
+    // than merely capped.
+    const allocator = testing.allocator;
+    var opener = MockTransport.init(allocator, true);
+    defer opener.deinit();
+    var receiver = MockTransport.init(allocator, false);
+    defer receiver.deinit();
+    opener.peer = &receiver;
+    receiver.peer = &opener;
+
+    opener.max_uni_streams = 3;
+
+    const first = try opener.openStream(.uni);
+    _ = try opener.openStream(.uni);
+    _ = try opener.openStream(.uni);
+
+    // Credit exhausted: RFC 9000 §4.6 says the peer must not open more.
+    try testing.expectError(error.StreamLimitReached, opener.openStream(.uni));
+
+    // Bidirectional streams draw on separate credit and are unaffected.
+    _ = try opener.openStream(.bidi);
+
+    // A delivered-but-unread FIN does NOT replenish: the receiver has not
+    // finished with the stream yet.
+    _ = try opener.writeStream(first, "x", true);
+    try testing.expectError(error.StreamLimitReached, opener.openStream(.uni));
+
+    // Reading through the FIN closes it, and credit comes back.
+    var buf: [8]u8 = undefined;
+    const read = try receiver.readStream(first, &buf);
+    try testing.expect(read.fin);
+    const replenished = try opener.openStream(.uni);
+    try testing.expect(replenished != first);
+
+    // A reset also frees credit, without needing a read.
+    try testing.expectError(error.StreamLimitReached, opener.openStream(.uni));
+    try receiver.resetStreamForTest(replenished);
+    _ = try opener.openStream(.uni);
+}
+
+test "pending_uni entries are removed after stream FIN" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    // Open a non-critical uni stream (push) at the client.
+    // We do it manually on client_transport so the peer (server) receives it.
+    const unknown_id = try client_transport.openStream(.uni);
+    var unknown_type_buf: [16]u8 = undefined;
+    const len = try varint.encode(0x42, &unknown_type_buf);
+    _ = try client_transport.writeStream(unknown_id, unknown_type_buf[0..len], false);
+
+    // Pump to accept and classify the stream at the server
+    try server.pump(&server_transport);
+    try testing.expect(server.pending_uni.contains(unknown_id));
+
+    // Finish the unknown stream
+    _ = try client_transport.writeStream(unknown_id, "", true);
+    try server.pump(&server_transport);
+
+    // Ensure it was cleaned up
+    try testing.expect(!server.pending_uni.contains(unknown_id));
+}
+
+test "pending_uni entries are removed after StreamReset" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    // Open an unknown stream
+    const unknown_id = try client_transport.openStream(.uni);
+    var unknown_type_buf: [16]u8 = undefined;
+    const len = try varint.encode(0x42, &unknown_type_buf);
+    _ = try client_transport.writeStream(unknown_id, unknown_type_buf[0..len], false);
+
+    // Pump to accept and classify the stream at the server
+    try server.pump(&server_transport);
+    try testing.expect(server.pending_uni.contains(unknown_id));
+
+    // Reset the stream
+    try server_transport.resetStreamForTest(unknown_id);
+    try server.pump(&server_transport);
+
+    // Ensure it was cleaned up
+    try testing.expect(!server.pending_uni.contains(unknown_id));
 }
 
 test {

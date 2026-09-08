@@ -296,10 +296,25 @@ fn expectSingleKeyShare(group: algorithms.NamedGroup, data: []const u8) Error!vo
     var r = messages.Reader{ .bytes = data };
     var shares = messages.Reader{ .bytes = try r.slice(try r.u16_()) };
     try r.expectEnd();
-    if ((try shares.u16_()) != @intFromEnum(group)) return error.IllegalParameter;
-    const key_exchange = try shares.slice(try shares.u16_());
-    try shares.expectEnd();
-    if (key_exchange.len == 0) return error.IllegalParameter;
+    // RFC 9846 §4.2.2 (§4.3.8 for key_share): after an HRR that named a
+    // group, ClientHello2's key_share must contain solely one share for
+    // that group. A list that parses cleanly but is empty, holds extra
+    // shares, names a different group, or carries an empty key_exchange
+    // is a well-formed message violating that requirement —
+    // illegal_parameter, not decode_error
+    // (#675 campaign finding: the empty list previously surfaced as a
+    // Reader underflow and was misreported as MalformedHandshake).
+    // Structural truncation inside the list remains MalformedHandshake.
+    var count: usize = 0;
+    var single_share_matches = false;
+    while (shares.remaining() != 0) {
+        const share_group = try shares.u16_();
+        const key_exchange = try shares.slice(try shares.u16_());
+        count += 1;
+        if (count == 1 and share_group == @intFromEnum(group) and key_exchange.len != 0)
+            single_share_matches = true;
+    }
+    if (count != 1 or !single_share_matches) return error.IllegalParameter;
 }
 
 fn expectCookiePayload(expected: []const u8, data: []const u8) Error!void {
@@ -1009,6 +1024,44 @@ test "ClientHello2 validator rejects malformed PSK binder vectors" {
             .cookie = "cookie",
         }));
     }
+}
+
+test "ClientHello2 validator rejects a well-formed empty key share list with illegal_parameter" {
+    // Found 2026-09-01 by the #675 campaign (test-tls-protocol-fuzz --fuzz):
+    // a ClientHello2 whose key_share list parses cleanly but is empty
+    // violates RFC 8446 §4.1.2's exactly-one-share requirement. It was
+    // previously misclassified as MalformedHandshake (decode_error alert)
+    // via a Reader underflow; the wire bytes are well-formed, so the
+    // server must answer illegal_parameter.
+    var first_buf: [768]u8 = undefined;
+    var second_buf: [768]u8 = undefined;
+    const first = try clientHello(&first_buf, 0xaa, null, null, null);
+    const missing_share = try clientHello(&second_buf, 0xaa, null, "cookie", null);
+    try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, missing_share, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+        .cookie = "cookie",
+    }));
+}
+
+test "expectSingleKeyShare separates HRR share-rule violations from structural truncation" {
+    const x25519 = @intFromEnum(algorithms.NamedGroup.x25519);
+    const secp = @intFromEnum(algorithms.NamedGroup.secp256r1);
+
+    // Exactly one non-empty share for the selected group: accepted.
+    try expectSingleKeyShare(.x25519, &.{ 0, 7, @intCast(x25519 >> 8), @intCast(x25519 & 0xff), 0, 3, 'k', 'e', 'y' });
+    // Well-formed but empty list: illegal_parameter, not decode_error.
+    try testing.expectError(error.IllegalParameter, expectSingleKeyShare(.x25519, &.{ 0, 0 }));
+    // Well-formed list with the right share followed by a second share:
+    // violates "solely one share" — illegal_parameter.
+    try testing.expectError(error.IllegalParameter, expectSingleKeyShare(.x25519, &.{ 0, 14, @intCast(x25519 >> 8), @intCast(x25519 & 0xff), 0, 3, 'k', 'e', 'y', @intCast(secp >> 8), @intCast(secp & 0xff), 0, 3, 'k', 'e', 'y' }));
+    // Wrong group and empty key_exchange remain illegal_parameter.
+    try testing.expectError(error.IllegalParameter, expectSingleKeyShare(.x25519, &.{ 0, 7, @intCast(secp >> 8), @intCast(secp & 0xff), 0, 3, 'k', 'e', 'y' }));
+    try testing.expectError(error.IllegalParameter, expectSingleKeyShare(.x25519, &.{ 0, 4, @intCast(x25519 >> 8), @intCast(x25519 & 0xff), 0, 0 }));
+    // Structural truncation inside the list is still a decode failure.
+    try testing.expectError(error.MalformedHandshake, expectSingleKeyShare(.x25519, &.{ 0, 3, @intCast(x25519 >> 8), @intCast(x25519 & 0xff), 0 }));
+    try testing.expectError(error.MalformedHandshake, expectSingleKeyShare(.x25519, &.{ 0, 9, @intCast(x25519 >> 8), @intCast(x25519 & 0xff), 0, 3, 'k', 'e', 'y' }));
 }
 
 test "fuzz: TLS protocol: HRR decode and ClientHello2 validation reject malformed ordering deterministically" {

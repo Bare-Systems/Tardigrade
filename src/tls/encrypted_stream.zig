@@ -214,28 +214,44 @@ const BufferQueue = enum {
 fn PlaintextProvenanceQueue(comptime capacity: usize) type {
     return struct {
         buf: [capacity]bool = [_]bool{false} ** capacity,
+        // See ByteQueue's `head` for why: this keeps `discard` O(1) instead
+        // of O(remaining) per call, deferring the shift to `append` and
+        // only when the tail genuinely has no room left.
+        head: usize = 0,
         len: usize = 0,
 
         const Self = @This();
 
         fn append(self: *Self, byte_len: usize, transport_early: bool) Error!void {
             if (byte_len > self.available()) return error.PlaintextBufferFull;
-            @memset(self.buf[self.len..][0..byte_len], transport_early);
+            if (self.head + self.len + byte_len > capacity) {
+                // See ByteQueue's identical fix: the old source extent past
+                // [0..len] isn't touched by copyForwards and must be wiped
+                // explicitly, not left as a stale duplicate.
+                const old_end = self.head + self.len;
+                std.mem.copyForwards(bool, self.buf[0..self.len], self.buf[self.head..][0..self.len]);
+                self.head = 0;
+                if (self.len < old_end) @memset(self.buf[self.len..old_end], false);
+            }
+            @memset(self.buf[self.head + self.len ..][0..byte_len], transport_early);
             self.len += byte_len;
         }
 
         fn discard(self: *Self, byte_len: usize) usize {
             const n = @min(byte_len, self.len);
             var early_prefix_len: usize = 0;
-            while (early_prefix_len < n and self.buf[early_prefix_len]) {
+            while (early_prefix_len < n and self.buf[self.head + early_prefix_len]) {
                 early_prefix_len += 1;
             }
-            const old_len = self.len;
-            const remaining = old_len - n;
-            std.mem.copyForwards(bool, self.buf[0..remaining], self.buf[n..old_len]);
-            @memset(self.buf[remaining..old_len], false);
-            self.len = remaining;
+            @memset(self.buf[self.head..][0..n], false);
+            self.head += n;
+            self.len -= n;
+            if (self.len == 0) self.head = 0;
             return early_prefix_len;
+        }
+
+        fn slice(self: *const Self) []const bool {
+            return self.buf[self.head..][0..self.len];
         }
 
         fn available(self: *const Self) usize {
@@ -243,7 +259,8 @@ fn PlaintextProvenanceQueue(comptime capacity: usize) type {
         }
 
         fn clear(self: *Self) void {
-            @memset(self.buf[0..self.len], false);
+            @memset(self.buf[0..], false);
+            self.head = 0;
             self.len = 0;
         }
     };
@@ -2145,16 +2162,50 @@ const pure_zig_record_vtable = EncryptedStream.VTable{
     .currentReadEarlyPrefixLenFn = pureCurrentReadEarlyPrefixLen,
 };
 
+/// A fixed-capacity byte queue whose backing store holds plaintext or
+/// ciphertext (`inbound_plaintext`, `inbound_handshake`, `inbound_carrier`,
+/// `outbound_ciphertext`).
+///
+/// Every wipe here goes through `crypto.secrets.secureZero`, never a plain
+/// `@memset`. The bytes being wiped are, by construction, outside the
+/// queue's logical `slice()` at the moment they are cleared -- dead until
+/// some later append reuses them -- which is exactly the store an optimizer
+/// is entitled to discard in ReleaseFast. `secureZero`'s volatile stores are
+/// what makes the immediate-cleanup guarantee real rather than
+/// optimizer-dependent (raised in review on #741).
+///
+/// `PlaintextProvenanceQueue` deliberately does NOT do this: it is a
+/// parallel queue of `bool` provenance bookkeeping, not secret material, so
+/// an ordinary `@memset` is the correct tool there.
 fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
     return struct {
         buf: [capacity]u8 = undefined,
+        // `buf[head..][0..len]` is the valid region. `discard` used to
+        // shift that whole region down to index 0 on every call, making a
+        // partial-read drain of a full queue O(capacity) per call instead
+        // of per drain. Tracking `head` instead makes `discard` O(1); the
+        // shift is deferred to `append`, and only actually happens when
+        // the tail genuinely has no room left (#675 campaign finding).
+        head: usize = 0,
         len: usize = 0,
 
         const Self = @This();
 
         fn append(self: *Self, bytes: []const u8) Error!void {
             if (bytes.len > self.available()) return full_error;
-            @memcpy(self.buf[self.len..][0..bytes.len], bytes);
+            if (self.head + self.len + bytes.len > capacity) {
+                // copyForwards only overwrites [0..len]; the old source
+                // extent past that (whatever the incoming append doesn't
+                // immediately reuse) still holds a stale duplicate of live
+                // plaintext until wiped here -- caught by review, this was
+                // the gap left by only zeroing at discard() time (#675
+                // campaign finding).
+                const old_end = self.head + self.len;
+                std.mem.copyForwards(u8, self.buf[0..self.len], self.buf[self.head..][0..self.len]);
+                self.head = 0;
+                if (self.len < old_end) crypto.secrets.secureZero(self.buf[self.len..old_end]);
+            }
+            @memcpy(self.buf[self.head + self.len ..][0..bytes.len], bytes);
             self.len += bytes.len;
         }
 
@@ -2162,22 +2213,21 @@ fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
             if (self.len == 0) return null;
             const n = @min(out.len, self.len);
             if (n == 0) return 0;
-            @memcpy(out[0..n], self.buf[0..n]);
+            @memcpy(out[0..n], self.buf[self.head..][0..n]);
             self.discard(n) catch unreachable;
             return n;
         }
 
         fn slice(self: *const Self) []const u8 {
-            return self.buf[0..self.len];
+            return self.buf[self.head..][0..self.len];
         }
 
         fn discard(self: *Self, count: usize) Error!void {
             if (count > self.len) return error.WouldBlock;
-            const old_len = self.len;
-            const remaining = old_len - count;
-            std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[count..old_len]);
-            @memset(self.buf[remaining..old_len], 0);
-            self.len = remaining;
+            crypto.secrets.secureZero(self.buf[self.head..][0..count]);
+            self.head += count;
+            self.len -= count;
+            if (self.len == 0) self.head = 0;
         }
 
         fn available(self: *const Self) usize {
@@ -2185,7 +2235,8 @@ fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
         }
 
         fn clear(self: *Self) void {
-            @memset(self.buf[0..], 0);
+            crypto.secrets.secureZero(self.buf[0..]);
+            self.head = 0;
             self.len = 0;
         }
     };
@@ -3096,11 +3147,30 @@ test "byte queues wipe discarded and cleared storage" {
     try queue.append("secret");
     try queue.discard(3);
     try testing.expectEqualStrings("ret", queue.slice());
-    try testing.expect(std.mem.allEqual(u8, queue.buf[3..6], 0));
+    // The discarded "sec" prefix is wiped in place at its original offset
+    // (head now points past it into the still-live "ret"); nothing is
+    // shifted down until an append actually needs the reclaimed room.
+    try testing.expect(std.mem.allEqual(u8, queue.buf[0..3], 0));
 
     queue.clear();
     try testing.expectEqual(@as(usize, 0), queue.len);
     try testing.expect(std.mem.allEqual(u8, queue.buf[0..], 0));
+}
+
+test "byte queue compaction wipes the old source extent the new append doesn't reuse" {
+    // capacity 16: fill, discard most of it (head=8, len=4), then append
+    // enough to force compaction. The compacted-to region and the fresh
+    // append together only cover buf[0..9]; buf[9..12] is old source past
+    // that but was never overwritten by copyForwards, and is exactly the
+    // stale-duplicate-plaintext gap review caught (#675 campaign finding).
+    var queue = ByteQueue(16, error.PlaintextBufferFull){};
+    try queue.append("ABCDEFGHIJKL");
+    try queue.discard(8);
+    try testing.expectEqualStrings("IJKL", queue.slice());
+
+    try queue.append("MNOPQ");
+    try testing.expectEqualStrings("IJKLMNOPQ", queue.slice());
+    try testing.expect(std.mem.allEqual(u8, queue.buf[9..12], 0));
 }
 
 test "terminal cleanup clears parser-owned ciphertext and queued plaintext" {
@@ -5527,13 +5597,13 @@ fn expectStreamStateCleared(subject: *PureZigRecordStream) !void {
     try testing.expectEqual(@as(usize, 0), subject.ciphertext_parser.len);
 
     // No stale plaintext or ciphertext left behind in the backing storage.
-    try testing.expect(std.mem.allEqual(u8, &subject.inbound_carrier.buf, 0));
-    try testing.expect(std.mem.allEqual(u8, &subject.inbound_plaintext.buf, 0));
-    try testing.expect(std.mem.allEqual(u8, &subject.inbound_handshake.buf, 0));
-    try testing.expect(std.mem.allEqual(u8, &subject.outbound_ciphertext.buf, 0));
-    try testing.expect(std.mem.allEqual(u8, &subject.initial_parser.pending, 0));
-    try testing.expect(std.mem.allEqual(u8, &subject.ciphertext_parser.pending, 0));
-    try testing.expect(std.mem.allEqual(bool, &subject.inbound_plaintext_provenance.buf, false));
+    try testing.expect(allEqualUninstrumented(u8, &subject.inbound_carrier.buf, 0));
+    try testing.expect(allEqualUninstrumented(u8, &subject.inbound_plaintext.buf, 0));
+    try testing.expect(allEqualUninstrumented(u8, &subject.inbound_handshake.buf, 0));
+    try testing.expect(allEqualUninstrumented(u8, &subject.outbound_ciphertext.buf, 0));
+    try testing.expect(allEqualUninstrumented(u8, &subject.initial_parser.pending, 0));
+    try testing.expect(allEqualUninstrumented(u8, &subject.ciphertext_parser.pending, 0));
+    try testing.expect(allEqualUninstrumented(bool, &subject.inbound_plaintext_provenance.buf, false));
 
     // ...and no key material, at any epoch, in either direction.
     inline for (.{ events.EncryptionEpoch.zero_rtt, .handshake, .application }) |epoch| {
@@ -5541,6 +5611,15 @@ fn expectStreamStateCleared(subject: *PureZigRecordStream) !void {
         try testing.expect(!subject.bridge.hasWriteKeys(epoch));
     }
     try testing.expect(!subject.bridge.handshake_complete);
+}
+
+/// Zeroization assertions scan the complete fixed backing arrays (about 247 KiB
+/// per call). Coverage instrumentation on every scalar comparison makes those
+/// test-only scans dominate sustained fuzzing even though their internal loop
+/// carries no useful input-dependent coverage signal.
+fn allEqualUninstrumented(comptime T: type, slice: []const T, scalar: T) bool {
+    @disableInstrumentation();
+    return std.mem.allEqual(T, slice, scalar);
 }
 
 /// The extra state `fail()` and `deinit()` clear on top of
@@ -6233,7 +6312,7 @@ fn cleanupTeardownCase(smith: *std.testing.Smith, cp: provider.CryptoProvider, s
     // negation of the post-teardown check.
     try testing.expect(!std.mem.allEqual(
         bool,
-        subject.inbound_plaintext_provenance.buf[0..subject.inbound_plaintext_provenance.len],
+        subject.inbound_plaintext_provenance.slice(),
         false,
     ));
     try testing.expect(subject.inbound_handshake.len > 0);

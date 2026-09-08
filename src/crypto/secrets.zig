@@ -8,8 +8,52 @@ const std = @import("std");
 
 pub const Error = error{SecretTooLarge};
 
+/// Overwrite `buffer` with zeros in a way the optimiser may not elide.
+///
+/// This deliberately does NOT call `std.crypto.secureZero`, which is
+/// `@memset` over a `[]volatile T`. LLVM discards the `volatile` qualifier on
+/// that memset and lowers it to a plain `memset` libcall; on x86_64-linux
+/// that call binds to `compiler_rt.memset`, which in Zig 0.16 is a
+/// byte-at-a-time store loop -- and it wins over libc's optimised `memset`
+/// even with `link_libc = true`. (`compiler_rt.memcpy` is size-dispatched and
+/// fast; only `memset` is naive, so the asymmetry is easy to miss.) On
+/// aarch64/macOS the same source binds to libSystem's vectorised `_bzero`,
+/// which is why this only ever showed up on the x86_64 fuzz VMs: measured
+/// cost of one 265,408-byte wipe was 4.35 us on aarch64 vs 95.9 us on
+/// x86_64, and it made the #675 QUIC CRYPTO-reassembly row a >6 h job there
+/// versus ~12 min on an aarch64 dev machine.
+///
+/// Storing through wide *volatile* pointers keeps the "must not be elided"
+/// guarantee -- LLVM may not merge, widen, or drop volatile stores, so this
+/// can never decay back into a `memset` libcall -- while moving 32 bytes per
+/// store instead of one. Targets without 32-byte vector stores split the
+/// chunk into whatever native store width they do have, which is still far
+/// better than one byte at a time. Measured after this change: 7.6 us for
+/// the same 265,408-byte wipe on x86_64, i.e. within the ~2x general
+/// CPU-class gap between the two machines rather than 22x off it.
 pub fn secureZero(buffer: []u8) void {
-    std.crypto.secureZero(u8, buffer);
+    // Coverage instrumentation would put an atomic counter increment inside
+    // the chunk loop below. It costs nothing measurable, but it would grow
+    // the fuzzer's instrumented-edge count (8509 -> 8511 on the QUIC fuzz
+    // build) purely as a side effect of a performance fix, and the coverage
+    // it reports is noise: the only thing it varies on is how many bytes
+    // were wiped. The `@memset` path this replaces never had it either,
+    // because the wipe was a libcall into uninstrumented compiler_rt, so
+    // this keeps the coverage surface equivalent to before.
+    @disableInstrumentation();
+
+    const Chunk = @Vector(32, u8);
+    const chunk_len = @sizeOf(Chunk);
+
+    var index: usize = 0;
+    while (index + chunk_len <= buffer.len) : (index += chunk_len) {
+        const dest: *align(1) volatile Chunk = @ptrCast(buffer.ptr + index);
+        dest.* = @splat(0);
+    }
+    while (index < buffer.len) : (index += 1) {
+        const dest: *volatile u8 = @ptrCast(buffer.ptr + index);
+        dest.* = 0;
+    }
 }
 
 pub fn constantTimeEqual(a: []const u8, b: []const u8) bool {
@@ -288,6 +332,24 @@ test "bounded secret deinit hands the allocator zeroed bytes, not Allocator.free
 
     try testing.expect(std.mem.indexOfScalar(u8, &backing, 0xab) == null);
     for (backing[0..32]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "secureZero wipes every length class and respects slice bounds" {
+    // `secureZero` wipes in 32-byte chunks with a byte tail (#675), so cover
+    // lengths below, at, and above the chunk size, plus an unaligned start
+    // offset -- the chunk stores are `align(1)` precisely so a []u8 that does
+    // not begin on a 32-byte boundary is still handled.
+    var storage: [200]u8 = undefined;
+    for ([_]usize{ 0, 1, 7, 31, 32, 33, 63, 64, 65, 127 }) |len| {
+        for ([_]usize{ 0, 1, 3, 8 }) |offset| {
+            @memset(&storage, 0xAA);
+            secureZero(storage[offset..][0..len]);
+            for (storage[offset..][0..len]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+            // Bytes on either side of the wiped slice must be untouched.
+            for (storage[0..offset]) |byte| try testing.expectEqual(@as(u8, 0xAA), byte);
+            for (storage[offset + len ..]) |byte| try testing.expectEqual(@as(u8, 0xAA), byte);
+        }
+    }
 }
 
 test "secureZeroAndFree hands the allocator zeroed bytes, not Allocator.free's undefined-poison" {

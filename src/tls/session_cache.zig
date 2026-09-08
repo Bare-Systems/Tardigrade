@@ -4399,6 +4399,7 @@ const ClientLeaseTransition = struct {
     present: [pre_shared_key.max_offered_identities]bool = [_]bool{false} ** pre_shared_key.max_offered_identities,
     entry_ids: [pre_shared_key.max_offered_identities]u64 = [_]u64{0} ** pre_shared_key.max_offered_identities,
     single_use: [pre_shared_key.max_offered_identities]bool = [_]bool{false} ** pre_shared_key.max_offered_identities,
+    lease_epochs: [pre_shared_key.max_offered_identities]u64 = [_]u64{0} ** pre_shared_key.max_offered_identities,
     fingerprints: [pre_shared_key.max_offered_identities][32]u8 = undefined,
 };
 
@@ -4410,6 +4411,7 @@ fn captureClientLeaseTransition(cache: *ClientSessionCache, lease: *pre_shared_k
         const token = lease.tokens[i];
         out.entry_ids[i] = token.entry_id;
         out.single_use[i] = token.single_use;
+        out.lease_epochs[i] = token.lease_epoch;
         const idx = cache.findIndexByEntryId(token.entry_id) orelse {
             try testing.expect(!token.single_use);
             continue;
@@ -4424,7 +4426,26 @@ fn captureClientLeaseTransition(cache: *ClientSessionCache, lease: *pre_shared_k
     return out;
 }
 
-fn expectClientEntryState(cache: *ClientSessionCache, entry_id: u64, expected_fp: [32]u8, should_exist: bool, should_be_pinned: bool) !void {
+// A reusable ticket may legitimately be offered into more than one
+// concurrent lease (nothing pins it, unlike a single-use ticket), and
+// re-storing the same ticket identity can reclassify it single_use<->
+// reusable in place (storeDedup's guard only blocks reclassifying an
+// already-pinned single-use entry, not a reusable one). So a lease that
+// never itself held a pin on an entry (`.no_claim`) cannot assert
+// anything about that entry's current pin state — a different,
+// independently created lease may hold a legitimate, unrelated pin on
+// the very same (now-reclassified) entry. A lease that DID hold a pin
+// can only assert facts about its OWN epoch: that it is still exactly
+// that epoch (`.still_pinned`), or that it is no longer that epoch
+// (`.released_own` — a different, newer epoch belonging to another
+// lease is not evidence of a stuck release).
+const PinExpectation = union(enum) {
+    no_claim,
+    still_pinned: u64,
+    released_own: u64,
+};
+
+fn expectClientEntryState(cache: *ClientSessionCache, entry_id: u64, expected_fp: [32]u8, should_exist: bool, expect: PinExpectation) !void {
     const idx = cache.findIndexByEntryId(entry_id);
     if (!should_exist) {
         try testing.expect(idx == null);
@@ -4432,7 +4453,11 @@ fn expectClientEntryState(cache: *ClientSessionCache, entry_id: u64, expected_fp
     }
     const entry = cache.entries.items[idx orelse return error.ClientLeaseTransitionEntryMissing];
     try testing.expectEqualDeep(expected_fp, try fingerprintClientTicket(&entry.ticket));
-    try testing.expectEqual(should_be_pinned, entry.active_lease_epoch != null);
+    switch (expect) {
+        .no_claim => {},
+        .still_pinned => |epoch| try testing.expectEqual(@as(?u64, epoch), entry.active_lease_epoch),
+        .released_own => |epoch| try testing.expect(entry.active_lease_epoch != epoch),
+    }
 }
 
 fn expectClientLeaseTransition(cache: *ClientSessionCache, before: ClientLeaseTransition, outcome: pre_shared_key.ClientOfferOutcome) !void {
@@ -4448,7 +4473,11 @@ fn expectClientLeaseTransition(cache: *ClientSessionCache, before: ClientLeaseTr
             continue;
         }
         const consumed = selected_index != null and selected_index.? == i and before.single_use[i];
-        try expectClientEntryState(cache, before.entry_ids[i], before.fingerprints[i], !consumed, false);
+        const expect: PinExpectation = if (!before.single_use[i])
+            .no_claim
+        else
+            .{ .released_own = before.lease_epochs[i] };
+        try expectClientEntryState(cache, before.entry_ids[i], before.fingerprints[i], !consumed, expect);
     }
 }
 
@@ -4460,7 +4489,13 @@ fn expectClientDropOfferTransition(cache: *ClientSessionCache, before: ClientLea
             try testing.expect(cache.findIndexByEntryId(before.entry_ids[i]) == null);
             continue;
         }
-        try expectClientEntryState(cache, before.entry_ids[i], before.fingerprints[i], true, before.single_use[i] and i != dropped_index);
+        const expect: PinExpectation = if (!before.single_use[i])
+            .no_claim
+        else if (i == dropped_index)
+            .{ .released_own = before.lease_epochs[i] }
+        else
+            .{ .still_pinned = before.lease_epochs[i] };
+        try expectClientEntryState(cache, before.entry_ids[i], before.fingerprints[i], true, expect);
     }
 }
 
@@ -4526,7 +4561,25 @@ fn expectServerLeaseTransition(cache: *StatefulServerCache, before: ServerLeaseT
     try testing.expectEqualDeep(before.state_fingerprint, try fingerprintServerState(&live.state));
     try testing.expectEqual(@as(?u64, null), live.active_lease_epoch);
     if (action == .commit and !before.single_use) {
-        try testing.expect(live.lru_sequence != before.lru_sequence);
+        // Not `live.lru_sequence != before.lru_sequence`: `commitLease`'s
+        // `reserveFreshLruSequenceLocked()` call can trigger
+        // `renumberLruSequencesLocked()` first (when `next_lru_sequence`
+        // has saturated to `maxInt`), which resets the whole numbering
+        // scale to `0..liveCount()-1`. The freshly reserved value this
+        // entry gets can then coincidentally equal its OWN pre-renumber
+        // `before.lru_sequence` (#675 campaign FINDING F5: e.g. 3 live
+        // entries renumbered to 0/1/2 sets next_lru_sequence=3, and the
+        // entry being committed -- whose before-snapshot happened to be
+        // lru_sequence=3 from an earlier commit -- gets freshly reserved
+        // sequence 3 right back). That coincidence doesn't mean the
+        // commit failed to advance anything: `commitLease` always assigns
+        // the value `reserveFreshLruSequenceLocked()` just returned,
+        // which is unconditionally `cache.next_lru_sequence - 1` the
+        // instant this synchronous check runs (nothing else can reserve a
+        // sequence in between in this single-threaded fuzz model) --
+        // checking that directly is robust across a renumber and is what
+        // "this entry is now the freshest" actually means.
+        try testing.expectEqual(cache.next_lru_sequence - 1, live.lru_sequence);
     } else {
         try testing.expectEqual(before.lru_sequence, live.lru_sequence);
     }
@@ -5360,6 +5413,65 @@ fn runServerFuzzCase(smith: *std.testing.Smith) !void {
     expectDestroyDelta(before_destroy, 0, @intCast(remaining), 0) catch return error.ServerFuzzDestroyDelta;
 }
 
+test "dropping a stale lease's offer must not assert a reusable-then-reclassified entry is globally unpinned" {
+    // Found 2026-09-02 by the #675 campaign (test-tls-resumption-fuzz
+    // --fuzz=10M, "client session cache operation sequence" target).
+    // Reproduces the exact scenario that broke the old boolean
+    // expectClientDropOfferTransition assertion, rather than a minimized
+    // raw fuzzer input: this is a fuzz-*model* defect (see c7f5b675),
+    // and the compact hand-written scenario below documents it more
+    // durably than opaque delta-minimized Smith bytes would.
+    var cache = try ClientSessionCache.init(testing.allocator, Limits.client_default);
+    defer cache.deinit();
+
+    var reusable = try makeClient(testing.allocator, "shared", "example.test");
+    defer reusable.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.storeClone(&reusable, 0, .reusable));
+
+    // Lease A: offered while the entry is still reusable, so its own
+    // token correctly records single_use=false — it never held a pin.
+    var lease_a = cache.lookupOffers(testCandidate("example.test"), 1);
+    defer lease_a.deinit();
+    try testing.expect(lease_a == .hit);
+    const entry_id = lease_a.hit.tokens[0].entry_id;
+    try testing.expect(!lease_a.hit.tokens[0].single_use);
+
+    // Re-storing the same ticket identity reclassifies the entry in
+    // place (storeClone's replace path keeps entry_id stable) — a
+    // reusable entry is never pinned, so its own dedup guard does not
+    // block this.
+    var reclassified = try makeClient(testing.allocator, "shared", "example.test");
+    defer reclassified.deinit();
+    try testing.expectEqual(StoreResult.replaced, cache.storeClone(&reclassified, 2, .single_use));
+
+    // Lease B: an independent, later offer of the now-single_use entry
+    // legitimately pins it under a fresh epoch.
+    var lease_b = cache.lookupOffers(testCandidate("example.test"), 3);
+    defer lease_b.deinit();
+    try testing.expect(lease_b == .hit);
+    try testing.expectEqual(entry_id, lease_b.hit.tokens[0].entry_id);
+    try testing.expect(lease_b.hit.tokens[0].single_use);
+
+    const idx = cache.findIndexByEntryId(entry_id) orelse return error.TestUnexpectedResult;
+    try testing.expect(cache.entries.items[idx].active_lease_epoch != null);
+
+    // Drive the drop through the exact same helpers
+    // runClientFuzzCase's .drop_offer case uses. Before c7f5b675,
+    // expectClientDropOfferTransition asserted this entry must show
+    // active_lease_epoch == null after the drop — lease A's own token
+    // was never single_use, so per the old boolean model dropping it
+    // could not leave anything pinned. That assertion is exactly what
+    // failed against this scenario: dropping lease A's stale offer must
+    // not disturb, or be asserted to have cleared, lease B's unrelated,
+    // still-active pin.
+    const before = try captureClientLeaseTransition(&cache, &lease_a.hit);
+    lease_a.hit.dropOffer(0);
+    try expectClientDropOfferTransition(&cache, before, 0);
+
+    const still_idx = cache.findIndexByEntryId(entry_id) orelse return error.TestUnexpectedResult;
+    try testing.expect(cache.entries.items[still_idx].active_lease_epoch != null);
+}
+
 fn fuzzClientCacheSequenceInput(_: void, smith: *std.testing.Smith) !void {
     try runClientFuzzCase(smith);
 }
@@ -5415,6 +5527,87 @@ test "fuzz: TLS resumption: stateful server cache operation sequence preserves t
             &smithCorpusWords(&.{ 0, 12, 0, 21 }),
         },
     });
+}
+
+test "server LRU freshest-sequence check holds across a saturation-forced renumber (#675 campaign FINDING F5)" {
+    // FINDING F5: `commitLease`'s `reserveFreshLruSequenceLocked()` call
+    // can trigger `renumberLruSequencesLocked()` when `next_lru_sequence`
+    // has saturated to `maxInt(u64)` (forced here directly, exactly like
+    // the fuzz model's `.force_lru_renumber` op does to probe the
+    // boundary). Renumbering compacts every live entry into
+    // `0..liveCount()-1` and sets `next_lru_sequence` to that count. The
+    // freshly reserved value the entry being committed gets can then
+    // coincidentally equal its own PRE-renumber `lru_sequence` -- a
+    // numeric collision between two independently-scaled values, not a
+    // failure to advance anything -- which the old
+    // `live.lru_sequence != before.lru_sequence` check mistook for one.
+    // Reproduced directly (no raw fuzz bytes) with 3 live entries and an
+    // entry whose earlier commit happened to land on sequence 3, which a
+    // rejected insert (capacity) then a second commit of that same entry
+    // reproduces exactly: 3 live entries renumber to 0/1/2,
+    // next_lru_sequence becomes 3, and the entry gets that freshly
+    // reserved 3 right back.
+    var probe = try fuzzServerState(testing.allocator, 0);
+    defer probe.deinit();
+    var limits = Limits.stateful_server_default;
+    limits.max_entry_bytes = serverAccountedBytes(&probe) + 4;
+    var cache = try StatefulServerCache.init(testing.allocator, limits, system_random_source);
+    defer cache.deinit();
+
+    var handle_a: [stateful_identity_len]u8 = undefined;
+    var handle_b: [stateful_identity_len]u8 = undefined;
+    var handle_c: [stateful_identity_len]u8 = undefined;
+
+    var state_a = try fuzzServerState(testing.allocator, 0);
+    defer state_a.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&state_a, 0, .reusable, &handle_a));
+    var state_b = try fuzzServerState(testing.allocator, 1);
+    defer state_b.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&state_b, 0, .reusable, &handle_b));
+    var state_c = try fuzzServerState(testing.allocator, 2);
+    defer state_c.deinit();
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&state_c, 0, .reusable, &handle_c));
+
+    // A, B, C consumed fresh sequences 0, 1, 2 at insert time.
+    try testing.expectEqual(@as(u64, 3), cache.next_lru_sequence);
+
+    // Commit A once: it's handed the next fresh sequence, 3.
+    {
+        var result = try resolveStatefulServerPsk(&cache, testing.allocator, &handle_a, 1);
+        defer result.deinit();
+        try testing.expect(result.hit.on_selected != null);
+        result.hit.on_selected.?.complete();
+    }
+    try testing.expectEqual(@as(u64, 4), cache.next_lru_sequence);
+
+    // Force the saturation boundary the fuzz model's .force_lru_renumber
+    // probes.
+    cache.next_lru_sequence = std.math.maxInt(u64);
+
+    // A rejected insert (state too large for this cache's limits) must
+    // not touch next_lru_sequence -- pin that assumption explicitly so a
+    // future change to insertMove's rejection path that broke it would
+    // fail loudly here instead of silently invalidating the rest of this
+    // test.
+    var oversized = try fuzzServerStateWithCompat(testing.allocator, 3);
+    defer oversized.deinit();
+    var discard_handle: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.rejected_capacity, cache.insertMove(&oversized, 0, .reusable, &discard_handle));
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), cache.next_lru_sequence);
+
+    // Commit A again. `before`'s captured lru_sequence is its stale
+    // pre-renumber value (3); completing the hook renumbers the 3 live
+    // entries to 0/1/2, sets next_lru_sequence=3, and hands A that
+    // freshly reserved 3 right back -- the exact collision.
+    const before = try captureServerHandleTransition(&cache, &handle_a);
+    try testing.expectEqual(@as(u64, 3), before.lru_sequence);
+    {
+        var result = try resolveStatefulServerPsk(&cache, testing.allocator, &handle_a, 2);
+        defer result.deinit();
+        try testing.expect(result.hit.on_selected != null);
+        result.hit.on_selected.?.complete();
+    }
+    try expectServerLeaseTransition(&cache, before, .commit);
 }
 
 test "resolveStatefulServerPsk lease-box OOM releases an acquired single-use pin and permits retry" {

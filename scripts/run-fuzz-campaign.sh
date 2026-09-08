@@ -378,128 +378,353 @@ mkdir -p "$output/preflight" "$output/runs" "$output/findings"
 
 ensure_preflight
 
-filter="<family>"
-run_key="${family}__family__${budget}"
-if [[ -n "$target" ]]; then
-  filter="$target"
-  run_key="${family}__$(slugify "$target")__${budget}"
-fi
-
-manifest="$output/manifest.jsonl"
-if $resume && resume_has_pass "$manifest" "$head_sha" "$step" "$filter" "$budget_mutations"; then
-  say "==> resume: existing same-SHA pass satisfies $family $filter >= $budget"
-  exit 0
-fi
-
-attempt_id="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
-run_dir="$output/runs/$run_key/attempts/$attempt_id"
-mkdir -p "$run_dir"
-stdout_log="$run_dir/stdout.log"
-stderr_log="$run_dir/stderr.log"
-command_file="$run_dir/command.txt"
-result_file="$run_dir/result.json"
-finding_dir="$output/findings/${family}__$(slugify "$filter")/$attempt_id"
-
-cmd=(zig build "$step" -Doptimize=ReleaseFast "--fuzz=$budget" --summary all --error-style verbose)
-if [[ -n "$target" ]]; then
-  cmd+=("$(family_filter_option "$family" "$target")")
-fi
-printf '%q ' "${cmd[@]}" >"$command_file"
-printf '\n' >>"$command_file"
-
-say "==> running ${cmd[*]}"
-started_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-start_epoch="$(date +%s)"
-interrupted=false
-child_pid=""
-terminate_child() {
-  if [[ -n "$child_pid" ]]; then
-    if command -v pkill >/dev/null 2>&1; then
-      pkill -TERM -P "$child_pid" 2>/dev/null || true
-    fi
-    kill -TERM "$child_pid" 2>/dev/null || true
+crash_hash_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
   fi
 }
-on_interrupt() {
-  interrupted=true
-  terminate_child
-}
-trap on_interrupt INT TERM
-set +e
-if [[ -n "$watchdog_seconds" ]]; then
-  command -v timeout >/dev/null 2>&1 || die "--watchdog requires the timeout command"
-  timeout "$watchdog_seconds" "${cmd[@]}" >"$stdout_log" 2>"$stderr_log" &
-else
-  "${cmd[@]}" >"$stdout_log" 2>"$stderr_log" &
-fi
-child_pid=$!
-wait "$child_pid"
-exit_code=$?
-if $interrupted || [[ "$exit_code" -eq 130 || "$exit_code" -eq 143 ]]; then
-  terminate_child
-  wait "$child_pid" >/dev/null 2>&1 || true
-fi
-child_pid=""
-set -e
-trap - INT TERM
-end_epoch="$(date +%s)"
-ended_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-elapsed=$((end_epoch - start_epoch))
 
-status="pass"
-if $interrupted; then
-  status="interrupted"
-elif [[ "$exit_code" -eq 124 ]]; then
-  status="possible_hang"
-elif [[ "$exit_code" -eq 130 || "$exit_code" -eq 143 ]]; then
-  status="interrupted"
-elif [[ "$exit_code" -ne 0 ]]; then
-  status="fail"
-fi
-
-execs_per_sec="$(grep -Eho '[0-9]+(\.[0-9]+)?[[:space:]]+(exec|execs|executions)/s(ec)?' "$stdout_log" "$stderr_log" 2>/dev/null | tail -1 | awk '{print $1}' || true)"
-if [[ -z "$execs_per_sec" ]]; then
-  execs_per_sec="null"
-else
-  execs_per_sec="\"$(json_escape "$execs_per_sec")\""
-fi
-
-finding_sha_json="null"
-if [[ "$status" != "pass" ]]; then
-  mkdir -p "$finding_dir"
-  cp "$command_file" "$finding_dir/command.txt"
-  cp "$stdout_log" "$finding_dir/stdout.log"
-  cp "$stderr_log" "$finding_dir/stderr.log"
+# $1=dir $2=crash_input_path_or_empty $3=crashing_test_name_or_empty.
+# Reads $family/$step/$filter/$head_sha/$status/$exit_code/$target/
+# $command_file/$stdout_log/$stderr_log from the calling run_one_attempt
+# invocation via bash's dynamic scoping (they're all `local` there, but
+# still visible down the call stack while it's running). Prints the
+# crash's sha256 (or nothing) on stdout for the caller to capture.
+write_finding() {
+  local dir="$1" crash_input="$2" test_name="$3" sha=""
+  mkdir -p "$dir"
+  cp "$command_file" "$dir/command.txt"
+  cp "$stdout_log" "$dir/stdout.log"
+  cp "$stderr_log" "$dir/stderr.log"
+  if [[ -n "$crash_input" && -s "$crash_input" ]]; then
+    cp "$crash_input" "$dir/crash-input.bin"
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha="$(sha256sum "$dir/crash-input.bin" | awk '{print $1}')"
+    else
+      sha="$(shasum -a 256 "$dir/crash-input.bin" | awk '{print $1}')"
+    fi
+  fi
   if [[ -d .zig-cache ]]; then
-    tar -czf "$finding_dir/zig-cache-preserved.tgz" .zig-cache 2>/dev/null || true
+    tar -czf "$dir/zig-cache-preserved.tgz" .zig-cache 2>/dev/null || true
   fi
   {
     printf 'family=%s\n' "$family"
     printf 'build_step=%s\n' "$step"
     printf 'filter=%s\n' "$filter"
+    if [[ -n "$test_name" ]]; then printf 'crashing_test=%s\n' "$test_name"; fi
     printf 'source_commit_sha=%s\n' "$head_sha"
     printf 'status=%s\n' "$status"
     printf 'exit_code=%s\n' "$exit_code"
     printf 'replay_command='
-    printf '%q ' zig build "$step" --summary all --error-style verbose
-    if [[ -n "$target" ]]; then printf '%q ' "$(family_filter_option "$family" "$target")"; fi
+    printf '%q ' zig build "$step" --summary all --error-style verbose "$(family_filter_option "$family" "$target")"
     printf '\n'
-    printf 'note=%s\n' 'Exact Zig crash input path was not inferred automatically; complete logs and .zig-cache state were preserved for deliberate recovery.'
-  } >"$finding_dir/provenance.txt"
-fi
+    if [[ -n "$sha" ]]; then
+      printf 'crash_input_sha256=%s\n' "$sha"
+      printf 'note=%s\n' 'crash-input.bin holds the exact saved fuzz input byte-for-byte; .zig-cache state was preserved alongside it.'
+    else
+      printf 'note=%s\n' 'Exact Zig crash input path was not inferred automatically; complete logs and .zig-cache state were preserved for deliberate recovery.'
+    fi
+  } >"$dir/provenance.txt"
+  printf '%s' "$sha"
+}
 
-cat >"$result_file" <<EOF
+# $1=finding_dir_or_empty $2=finding_sha_json. Reads the rest
+# ($started_utc/$ended_utc/$elapsed/$execs_per_sec/$status/$exit_code/
+# $stdout_log/$stderr_log, plus $family/$step/$filter/$budget/
+# $budget_mutations/$head_sha) from run_one_attempt via dynamic scoping.
+append_manifest_line() {
+  local fdir="$1" fsha="$2" finding_path_json="null"
+  if [[ -n "$fdir" ]]; then finding_path_json="\"$(json_escape "$fdir")\""; fi
+  printf '{"campaign_id":"%s","started_utc":"%s","ended_utc":"%s","source_commit_sha":"%s","zig_version":"%s","os_arch":"%s/%s","cpu":"%s","family":"%s","build_step":"%s","filter":"%s","budget":"%s","budget_mutations":%s,"optimize":"ReleaseFast","elapsed_seconds":%s,"executions_per_second":%s,"status":"%s","exit_code":%s,"finding_path":%s,"finding_sha256":%s,"stdout_path":"%s","stderr_path":"%s"}\n' \
+    "$(json_escape "$campaign_id")" "$started_utc" "$ended_utc" "$head_sha" "$(json_escape "$(zig version)")" "$(json_escape "$(uname -s)")" "$(json_escape "$(uname -m)")" \
+    "$(json_escape "$(cpu_identity)")" \
+    "$(json_escape "$family")" "$(json_escape "$step")" "$(json_escape "$filter")" "$(json_escape "$budget")" "$budget_mutations" "$elapsed" "$execs_per_sec" "$status" "$exit_code" \
+    "$finding_path_json" "$fsha" "$(json_escape "$stdout_log")" "$(json_escape "$stderr_log")" >>"$manifest"
+}
+
+# Tier 1 "family-wide" rows historically ran every one of a family's fuzz
+# tests concurrently within one `zig build --fuzz` invocation (no
+# --target), sharing one combined budget. That has real problems: Zig
+# saves each crash to one fixed shared path (.zig-cache/f/crash, no
+# per-test subdirectory), so when more than one target crashes in the
+# same run, a later crash silently overwrites an earlier one's saved
+# bytes -- examining the log/cache only after the whole process exits
+# recovers nothing but the LAST crash (#675 campaign finding: a QUIC
+# family-wide run found two distinct crashes; only one survived
+# collection). Polling for new crashes DURING the run doesn't reliably
+# fix this either: a child process's stdout/stderr default to fully
+# buffered once redirected to a file, so a "test '...'; input saved to
+# '...'" line can sit unflushed for tens of seconds, and by the time a
+# batch of such lines does flush, the crash file has already cycled
+# through every target in that batch but the last.
+#
+# run_one_attempt runs exactly ONE target (never the ambiguous
+# "<family>" filter) and preserves its own dedicated finding/manifest
+# line, identical in shape to an explicit Tier 2/3 --target run. A
+# family-wide row (no --target given) discovers every current target in
+# the family below and calls this once per target, sequentially, each
+# at the row's full budget, stopping at the first non-pass so the
+# campaign's existing "a failure stops new rows by default until
+# triage" rule still applies. This makes the crash-collision problem
+# structurally impossible -- each invocation has its own Zig process
+# and therefore its own exclusive lifetime for the shared crash-file
+# path -- rather than something a watcher has to race.
+run_one_attempt() {
+  local target="$1"
+  local filter="$target"
+  local run_key
+  run_key="${family}__$(slugify "$target")__${budget}"
+
+  if $resume && resume_has_pass "$manifest" "$head_sha" "$step" "$filter" "$budget_mutations"; then
+    say "==> resume: existing same-SHA pass satisfies $family $filter >= $budget"
+    return 0
+  fi
+
+  local attempt_id run_dir stdout_log stderr_log command_file result_file finding_dir
+  attempt_id="$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
+  run_dir="$output/runs/$run_key/attempts/$attempt_id"
+  mkdir -p "$run_dir"
+  stdout_log="$run_dir/stdout.log"
+  stderr_log="$run_dir/stderr.log"
+  command_file="$run_dir/command.txt"
+  result_file="$run_dir/result.json"
+  finding_dir="$output/findings/${family}__$(slugify "$filter")/$attempt_id"
+
+  local cmd=(zig build "$step" -Doptimize=ReleaseFast "--fuzz=$budget" --summary all --error-style verbose "$(family_filter_option "$family" "$target")")
+  printf '%q ' "${cmd[@]}" >"$command_file"
+  printf '\n' >>"$command_file"
+
+  say "==> running ${cmd[*]}"
+  local started_utc start_epoch interrupted child_pid
+  started_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  start_epoch="$(date +%s)"
+  interrupted=false
+  child_pid=""
+
+  # Defense in depth, not the primary mechanism now that each attempt is
+  # single-target: a filtered build step can still in principle match
+  # more than one `test "fuzz: ..."` block, though
+  # target_selects_current_fuzz already rejects an ambiguous filter at
+  # the top of the script. Polls the crash file's CONTENT HASH directly
+  # rather than the log text, since the file is a direct, unbuffered
+  # write while the log can sit unflushed for a long time.
+  local crash_snapshots_dir crash_file crash_watch_last_hash crash_watch_stop crash_watcher_pid
+  crash_snapshots_dir="$run_dir/crash-snapshots"
+  mkdir -p "$crash_snapshots_dir"
+  crash_file=".zig-cache/f/crash"
+  # A crash file left over from an earlier attempt (a retry reusing
+  # .zig-cache, or a kept failed VM) must not be attributed to THIS
+  # attempt: starting the watcher before the new Zig process means it
+  # would otherwise hash/copy that stale file on its very first poll and
+  # force an otherwise-clean target to status=fail. Clearing it here
+  # (after the PREVIOUS attempt already preserved whatever it needed)
+  # makes any later appearance at this path unambiguously this attempt's.
+  rm -f "$crash_file"
+  crash_watch_last_hash=""
+  snapshot_new_crashes() {
+    local h next idx test_name
+    if [[ ! -s "$crash_file" ]]; then
+      return 0
+    fi
+    h="$(crash_hash_of "$crash_file" 2>/dev/null || true)"
+    if [[ -z "$h" || "$h" == "$crash_watch_last_hash" ]]; then
+      return 0
+    fi
+    crash_watch_last_hash="$h"
+    next=$(($(find "$crash_snapshots_dir" -maxdepth 1 -name '*.bin' 2>/dev/null | wc -l) + 1))
+    idx="$(printf '%03d' "$next")"
+    cp "$crash_file" "$crash_snapshots_dir/$idx.bin"
+    test_name="$(grep -Eho "error: test '[^']+'.*input saved to '[^']+'" "$stdout_log" "$stderr_log" 2>/dev/null | tail -1 | sed -E "s/^error: test '([^']+)'.*/\1/" || true)"
+    printf '%s\n' "${test_name:-$target}" >"$crash_snapshots_dir/$idx.test-name.txt"
+    return 0
+  }
+  # crash_watch_last_hash is a plain shell variable, not a file: the loop
+  # below runs in a backgrounded subshell (a separate process), so its
+  # updates to that variable are invisible to this parent shell. Calling
+  # snapshot_new_crashes a second time from the parent after the
+  # subshell exits would see the parent's original (empty) hash and
+  # treat an already-captured crash as new again, writing a duplicate
+  # snapshot/finding for the same crash. The fix is to never call it
+  # from two different processes: the loop checks the stop flag AFTER
+  # each snapshot attempt (not before), so stopping it still guarantees
+  # one last check happens -- inside the same process that owns the
+  # hash state -- instead of needing a separate final call out here.
+  crash_watch_stop="$run_dir/.crash-watch-stop"
+  rm -f "$crash_watch_stop"
+  (
+    while :; do
+      snapshot_new_crashes
+      if [[ -f "$crash_watch_stop" ]]; then
+        # The child could have written its final crash file and exited
+        # in the narrow gap between the poll just above returning and
+        # this check running (stop is only set after the child has
+        # already exited, so that write, if any, is already complete on
+        # disk by now) -- one more poll before exiting guarantees it
+        # isn't missed rather than relying on the 0.1s sleep window
+        # below to have already covered it.
+        snapshot_new_crashes
+        break
+      fi
+      sleep 0.1
+    done
+  ) &
+  crash_watcher_pid=$!
+
+  terminate_child() {
+    if [[ -n "$child_pid" ]]; then
+      if command -v pkill >/dev/null 2>&1; then
+        pkill -TERM -P "$child_pid" 2>/dev/null || true
+      fi
+      kill -TERM "$child_pid" 2>/dev/null || true
+    fi
+  }
+  on_interrupt() {
+    interrupted=true
+    terminate_child
+  }
+  trap on_interrupt INT TERM
+  set +e
+  # A child process's stdout/stderr default to fully buffered (not
+  # line-buffered) as soon as they're redirected to a file instead of a
+  # TTY. `stdbuf` forces line buffering on both streams; it ships with
+  # GNU coreutils (present on the Linux campaign hosts) but not on
+  # macOS, so this degrades gracefully to unbuffered-until-exit there.
+  local line_buffered_cmd=("${cmd[@]}")
+  if command -v stdbuf >/dev/null 2>&1; then
+    line_buffered_cmd=(stdbuf -oL -eL "${cmd[@]}")
+  fi
+  local exit_code
+  if [[ -n "$watchdog_seconds" ]]; then
+    command -v timeout >/dev/null 2>&1 || die "--watchdog requires the timeout command"
+    timeout "$watchdog_seconds" "${line_buffered_cmd[@]}" >"$stdout_log" 2>"$stderr_log" &
+  else
+    "${line_buffered_cmd[@]}" >"$stdout_log" 2>"$stderr_log" &
+  fi
+  child_pid=$!
+  wait "$child_pid"
+  exit_code=$?
+  if $interrupted || [[ "$exit_code" -eq 130 || "$exit_code" -eq 143 ]]; then
+    terminate_child
+    wait "$child_pid" >/dev/null 2>&1 || true
+  fi
+  child_pid=""
+  set -e
+  trap - INT TERM
+
+  touch "$crash_watch_stop"
+  wait "$crash_watcher_pid" 2>/dev/null || true
+  rm -f "$crash_watch_stop"
+
+  local end_epoch ended_utc elapsed
+  end_epoch="$(date +%s)"
+  ended_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  elapsed=$((end_epoch - start_epoch))
+
+  local status="pass"
+  if $interrupted; then
+    status="interrupted"
+  elif [[ "$exit_code" -eq 124 ]]; then
+    status="possible_hang"
+  elif [[ "$exit_code" -eq 130 || "$exit_code" -eq 143 ]]; then
+    status="interrupted"
+  elif [[ "$exit_code" -ne 0 ]]; then
+    status="fail"
+  fi
+
+  local crash_snapshot_count
+  crash_snapshot_count="$(find "$crash_snapshots_dir" -maxdepth 1 -name '*.bin' 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "$crash_snapshot_count" -eq 0 ]]; then
+    rmdir "$crash_snapshots_dir" 2>/dev/null || true
+  fi
+
+  # `zig build --fuzz` exits 0 even when the fuzzer finds a failing input
+  # (it saves the input and stops the session early), so a fuzz finding
+  # must be detected from the run output, never from the exit code alone.
+  local fuzz_crash_input=""
+  if [[ "$crash_snapshot_count" -eq 0 ]]; then
+    fuzz_crash_input="$(grep -Eho "input saved to '[^']+'" "$stdout_log" "$stderr_log" 2>/dev/null | tail -1 | sed -E "s/^input saved to '([^']+)'\$/\1/" || true)"
+  fi
+  if [[ "$status" == "pass" && ( "$crash_snapshot_count" -gt 0 || -n "$fuzz_crash_input" ) ]]; then
+    status="fail"
+  fi
+
+  local execs_per_sec
+  execs_per_sec="$(grep -Eho '[0-9]+(\.[0-9]+)?[[:space:]]+(exec|execs|executions)/s(ec)?' "$stdout_log" "$stderr_log" 2>/dev/null | tail -1 | awk '{print $1}' || true)"
+  if [[ -z "$execs_per_sec" ]]; then
+    execs_per_sec="null"
+  else
+    execs_per_sec="\"$(json_escape "$execs_per_sec")\""
+  fi
+
+  cat >"$result_file" <<EOF2
 {"status":"$status","exit_code":$exit_code,"started_utc":"$started_utc","ended_utc":"$ended_utc","elapsed_seconds":$elapsed}
-EOF
+EOF2
 
-printf '{"campaign_id":"%s","started_utc":"%s","ended_utc":"%s","source_commit_sha":"%s","zig_version":"%s","os_arch":"%s/%s","cpu":"%s","family":"%s","build_step":"%s","filter":"%s","budget":"%s","budget_mutations":%s,"optimize":"ReleaseFast","elapsed_seconds":%s,"executions_per_second":%s,"status":"%s","exit_code":%s,"finding_path":%s,"finding_sha256":%s,"stdout_path":"%s","stderr_path":"%s"}\n' \
-  "$(json_escape "$campaign_id")" "$started_utc" "$ended_utc" "$head_sha" "$(json_escape "$(zig version)")" "$(json_escape "$(uname -s)")" "$(json_escape "$(uname -m)")" \
-  "$(json_escape "$(cpu_identity)")" \
-  "$(json_escape "$family")" "$(json_escape "$step")" "$(json_escape "$filter")" "$(json_escape "$budget")" "$budget_mutations" "$elapsed" "$execs_per_sec" "$status" "$exit_code" \
-  "$([[ "$status" == pass ]] && echo null || printf '"%s"' "$(json_escape "$finding_dir")")" "$finding_sha_json" "$(json_escape "$stdout_log")" "$(json_escape "$stderr_log")" >>"$manifest"
+  local finding_sha finding_sha_json
+  if [[ "$crash_snapshot_count" -gt 0 ]]; then
+    local i idx snap_bin snap_name_file snap_test_name finding_slug this_finding_dir
+    i=1
+    while [[ "$i" -le "$crash_snapshot_count" ]]; do
+      idx="$(printf '%03d' "$i")"
+      snap_bin="$crash_snapshots_dir/$idx.bin"
+      snap_name_file="$crash_snapshots_dir/$idx.test-name.txt"
+      snap_test_name=""
+      if [[ -f "$snap_name_file" ]]; then snap_test_name="$(cat "$snap_name_file")"; fi
+      finding_slug="${snap_test_name:-$filter}"
+      this_finding_dir="$output/findings/${family}__$(slugify "$finding_slug")/${attempt_id}-${idx}"
+      finding_sha="$(write_finding "$this_finding_dir" "$snap_bin" "$snap_test_name")"
+      finding_sha_json="null"
+      if [[ -n "$finding_sha" ]]; then finding_sha_json="\"$(json_escape "$finding_sha")\""; fi
+      append_manifest_line "$this_finding_dir" "$finding_sha_json"
+      say "==> $status: finding $i/$crash_snapshot_count (${snap_test_name:-unknown test}) preserved under $this_finding_dir"
+      i=$((i + 1))
+    done
+  elif [[ "$status" != "pass" ]]; then
+    finding_sha="$(write_finding "$finding_dir" "$fuzz_crash_input" "")"
+    finding_sha_json="null"
+    if [[ -n "$finding_sha" ]]; then finding_sha_json="\"$(json_escape "$finding_sha")\""; fi
+    append_manifest_line "$finding_dir" "$finding_sha_json"
+    say "==> $status: preserved logs/state under $finding_dir"
+  else
+    append_manifest_line "" "null"
+  fi
 
-if [[ "$status" != "pass" ]]; then
-  say "==> $status: preserved logs/state under $finding_dir"
-  exit "$exit_code"
+  if [[ "$status" != "pass" ]]; then
+    if [[ "$exit_code" -ne 0 ]]; then
+      return "$exit_code"
+    fi
+    return 1
+  fi
+  say "==> pass ($target): evidence appended to $manifest"
+  return 0
+}
+
+manifest="$output/manifest.jsonl"
+
+if [[ -n "$target" ]]; then
+  set +e
+  run_one_attempt "$target"
+  rc=$?
+  set -e
+  exit "$rc"
 fi
-say "==> pass: evidence appended to $manifest"
+
+found_any=false
+while IFS= read -r discovered_target; do
+  [[ -n "$discovered_target" ]] || continue
+  found_any=true
+  set +e
+  run_one_attempt "$discovered_target"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    exit "$rc"
+  fi
+done < <(discover_targets | awk -F '\t' -v f="$family" '$1 == f { print $3 }')
+
+if ! $found_any; then
+  die "no current fuzz targets discovered for family: $family"
+fi
+say "==> pass: every discovered $family target passed at budget $budget"

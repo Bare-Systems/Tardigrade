@@ -1143,7 +1143,22 @@ const ResumptionWorker = struct {
             var lookup = self.client_resumption.lookupClientOffers(candidate);
             defer lookup.deinit();
             if (lookup != .hit) return error.ExpectedResumptionOffer;
-            try self.tls_backend.engine.setClientPskOfferLease(&lookup.hit, undefined, nowUnixMsForResumption);
+            // `now_ctx` is a required non-null `*anyopaque` that the engine
+            // stores verbatim in `psk_now_ctx` and unwraps later in
+            // `planPskOffer`. Passing `undefined` here was UB even though
+            // `nowUnixMsForResumption` ignores its context: once that
+            // undefined pointer is represented as `?*anyopaque`, a layout or
+            // codegen perturbation can materialize it as the null
+            // representation, producing `psk_now_fn != null` with
+            // `psk_now_ctx == null` and a "attempt to use null value" panic
+            // the backend's own writers can never create. `self` is the
+            // stable `ResumptionWorker` -- already in its permanent array
+            // slot before `beginRound`, and already used as the ticket
+            // consumer's context above. Found while implementing #753's H3
+            // `pending_uni` bound: adding any field to `http3.Conn` changed
+            // struct layout enough to make this deterministic. Test-harness
+            // UB, not a product defect.
+            try self.tls_backend.engine.setClientPskOfferLease(&lookup.hit, self, nowUnixMsForResumption);
         }
         self.path = .{
             .local = addressFromSockaddrIn(self.socket.addr),

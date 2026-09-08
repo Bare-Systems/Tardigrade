@@ -33,25 +33,50 @@ the test name and minimized input needed for deterministic reproduction. Keep
 external peers out of these loops; ngtcp2/nghttp3, quiche, and aioquic remain under
 `scripts/interop/run-interop.sh`.
 
-## Host memory requirement for command-sequence targets
+## Fuzz-process memory: a large macOS-only footprint
 
-Command-sequence targets need a host with several GB of free RAM per fuzz
-process, and a memory-saturated host will get the process `SIGKILL`ed mid-row.
-Provision **at least 4 GB of available RAM per active command-sequence fuzz
-process**, and prefer **6-8 GB of guest memory for a guest running one
-canonical fuzz process**. Do not run canonical rows on a machine already near
-its memory limit; a row killed this way is `INTERRUPTED`, not a finding, and
-must be rerun rather than recorded.
+**The command-sequence targets' large memory footprint is specific to macOS.**
+On a Linux guest the same target is tiny. Measured, rather than assumed, after
+an earlier revision of this section wrongly generalised the macOS number:
 
-Those figures are provisioning numbers, not the measurement. The measured
-warm-up transient below is ~1.87 GB, so sizing to ~2 GB would leave under 10%
-margin -- not enough to absorb allocator-metadata variance between hosts, the
-fuzz runtime's own corpus and coverage state, OS page cache, or a target that
-grows a little. The 4 GB floor is that transient plus real margin; the 6-8 GB
-guest recommendation additionally covers the guest OS.
+| platform | `fuzz: H3 connection state command sequences` RSS |
+| --- | --- |
+| Darwin/arm64 (Apple M4) | 286 MB steady, **1,867 MB** warm-up peak |
+| Linux/x86_64 (Debian 13 KVM guest, 3 vCPU) | **~4.2 MB**, flat |
 
-This is a property of `std.testing.allocator`, not of any target. Measured on
-one host, sampling process RSS every 5s under `-Doptimize=ReleaseFast`:
+The Linux figure is three consecutive samples at 99.7% CPU during a canonical
+1M row, with the whole guest using 441 MB of 5,932 MB. It matches what
+substituting `smp_allocator` produces on macOS (see below), which points at
+Darwin's page-return behaviour under `std.heap.DebugAllocator` rather than
+anything in the target or in the fuzz runtime.
+
+### Provisioning
+
+For **Linux** campaign guests, fuzz-process memory is not a meaningful
+constraint: budget for the *build* (concurrent `zig` compile processes were the
+largest consumers observed at 250-420 MB each) rather than for the fuzz
+process. A 3 GB guest is not obviously undersized on that evidence.
+
+For **macOS** local runs, do not start a command-sequence row on a machine
+already near its memory limit: the ~1.87 GB warm-up transient will be killed
+under memory pressure, and a row killed that way is `INTERRUPTED`, not a
+finding, so it must be rerun rather than recorded.
+
+**Do not read the macOS kills as explaining the historical campaign-guest
+kills.** Rows on Linux guests were reported dying around ~375k runs, and a
+4.2 MB process on a 3 GB guest cannot be a memory kill. That cause remains
+**unidentified**; `/tmp` tmpfs exhaustion on the Proxmox host (documented in
+`scripts/run-proxmox-fuzz-campaign.sh`'s own comments as having happened once),
+host-level pressure from co-resident guests, and the watchdog path are all
+still open candidates. For the record, a 1M row on a 6 GB guest at
+`2bca1c36` completed 1,018,516 mutations cleanly, past that reported ceiling,
+but that is one data point and not a diagnosis.
+
+### The macOS measurement
+
+This is a property of `std.testing.allocator` on Darwin, not of any target.
+Measured on one macOS host, sampling process RSS every 5s under
+`-Doptimize=ReleaseFast`:
 
 | target | warm-up peak | steady-state mean |
 | --- | --- | --- |
@@ -68,8 +93,8 @@ generates. The two command-sequence targets above are within ~8% of each other,
 which is why this is documented here as a shared property rather than filed
 against either one.
 
-The survival control makes the same point at campaign scale. On one host, same
-target, same fuzz runtime, changing *only* the allocator:
+The survival control makes the same point at campaign scale, still on macOS.
+Same host, same target, same fuzz runtime, changing *only* the allocator:
 
 | allocator | outcome |
 | --- | --- |
@@ -102,10 +127,12 @@ done
 ```
 
 Proceed to the 50M row, and then the required 100M finding-driven follow-up,
-only if that preflight **completes** with the warm-up transient staying under
-~2 GB and host headroom staying healthy. If it is killed, or the transient is
-materially larger than the table above, the guest is undersized -- fix the
-provisioning rather than starting a long row that will be interrupted hours in.
+only if that preflight **completes** and guest headroom stays healthy. On a
+Linux guest expect the fuzz process to sit in the single-digit MB; a materially
+larger figure there is itself worth investigating, since it would contradict the
+measurement above. If the row is killed, do not assume memory -- capture what
+the guest and host looked like and identify the actual cause, because the
+historical ceiling on these guests is still unexplained.
 
 This preflight is about the *execution environment*, so it is separate from and
 additional to #675's deterministic pre-campaign gate, which is about the source

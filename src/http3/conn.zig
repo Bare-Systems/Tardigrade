@@ -279,7 +279,9 @@ pub fn Conn(comptime Transport: type) type {
             pending_uni_rejections: u64 = 0,
             /// Peer-initiated streams `pump()` declined to track because the
             /// peer had already reset them before their first acceptance
-            /// (#742). Never surfaced as an `IncomingRequest`.
+            /// (#742) -- both request streams, which are never surfaced as an
+            /// `IncomingRequest`, and unidirectional ones, which never get a
+            /// `pending_uni` entry.
             reset_before_accept_rejections: u64 = 0,
         };
 
@@ -503,7 +505,23 @@ pub fn Conn(comptime Transport: type) type {
                 if (id % 4 == 2 or id % 4 == 3) {
                     // Peer unidirectional stream: classify by type varint.
                     //
-                    // Local bound first, per the note above about not
+                    // A stream the peer reset before we ever accepted it is
+                    // already dead at the transport layer and can never
+                    // deliver its type varint, so there is nothing to
+                    // classify and no reason to hold an entry for it (#742).
+                    // Skipping it here is not a behaviour change in the
+                    // outcome, only in the path: `pumpUniStreams` would read
+                    // it, take `error.StreamReset`, find `typ == .unknown`
+                    // (never classified, so never critical) and retire the
+                    // entry in this same `pump()`. Doing it at accept time
+                    // avoids the insert/remove round trip and, more to the
+                    // point, keeps a dead stream from consuming headroom
+                    // under the ceiling below.
+                    if (transportStreamResetByPeer(transport, id)) {
+                        self.metrics.reset_before_accept_rejections += 1;
+                        continue;
+                    }
+                    // Then the local bound, per the note above about not
                     // depending on the transport's own stream limit to stay
                     // bounded (#753). H3_EXCESSIVE_LOAD is the RFC 9114 §8.1
                     // code for a peer driving more state than the endpoint is
@@ -515,20 +533,6 @@ pub fn Conn(comptime Transport: type) type {
                     // §6.2.3 requires tolerating them, and `pumpUniStreams`
                     // still drains and ignores each one). Only holding more
                     // than `max_pending_uni` of them at once is.
-                    //
-                    // A stream the peer reset before we ever accepted it is
-                    // already dead at the transport layer and can never
-                    // deliver its type varint, so there is nothing to
-                    // classify and no reason to hold an entry for it (#742).
-                    // Skipping it here is not a behaviour change in the
-                    // outcome, only in the path: `pumpUniStreams` would read
-                    // it, take `error.StreamReset`, find `typ == .unknown`
-                    // (never classified, so never critical) and retire the
-                    // entry in this same `pump()`. Doing it at accept time
-                    // avoids the insert/remove round trip and, more to the
-                    // point, keeps a dead stream from consuming ceiling
-                    // headroom above.
-                    if (transportStreamResetByPeer(transport, id)) continue;
                     if (self.pending_uni.count() >= self.max_pending_uni) {
                         self.metrics.pending_uni_rejections += 1;
                         return self.fail(.excessive_load);
@@ -3371,11 +3375,52 @@ test "H3 conn: request stream reset before first acceptance is never tracked" {
     try testing.expectEqual(@as(u64, 1), server.metrics.reset_before_accept_rejections);
 }
 
+test "H3 conn: uni stream reset before first acceptance is never tracked" {
+    // The unidirectional half of #742's accept-time check. The outcome was
+    // already correct before the fix -- `pumpUniStreams` reads the stream,
+    // takes `error.StreamReset`, finds `typ == .unknown` (never classified,
+    // so never critical) and retires the entry within the same `pump()` --
+    // but the entry was created and destroyed on the way, which meant a dead
+    // stream transiently consumed headroom under the `pending_uni` ceiling.
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    const id = try client_transport.openStream(.uni);
+    try server_transport.resetStreamForTest(id);
+
+    try server.pump(&server_transport);
+
+    try testing.expectEqual(@as(?ErrorCode, null), server.close_code);
+    try testing.expectEqual(@as(u32, 0), server.pending_uni.count());
+    try testing.expectEqual(@as(u64, 1), server.metrics.reset_before_accept_rejections);
+    // Not counted as unknown-type traffic: it was never classified at all.
+    try testing.expectEqual(@as(u64, 0), server.metrics.unknown_uni_streams);
+}
+
 test "H3 conn: a reset does not launder an illegal peer stream into a silent skip" {
-    // The #742 check sits after the stream-id legality check, not before it.
-    // A server that opens a bidirectional stream has violated RFC 9114 §6.1
-    // whether or not it also reset the stream, so the client must still fail
-    // with H3_STREAM_CREATION_ERROR rather than quietly ignoring it.
+    // A reset must not turn a protocol violation into a silent skip. A server
+    // that opens a bidirectional stream has violated RFC 9114 §6.1 whether or
+    // not it also reset the stream, so the client must still fail with
+    // H3_STREAM_CREATION_ERROR rather than quietly ignoring it.
+    //
+    // Precisely what this covers: the client-role branch, which carries no
+    // #742 check at all, so the reset is simply irrelevant there -- which is
+    // the point. The server-role sibling, where the #742 check really does sit
+    // *after* `isClientRequestStream`, cannot be reached from `MockTransport`:
+    // a peer client can only open ids with `id & 0x3 == 0`, which
+    // `isClientRequestStream` accepts by definition. The ordering there is
+    // therefore load-bearing only against a future or non-conforming
+    // transport, and is documented at the call site rather than pinned by a
+    // test that would have to fake an id the mock cannot produce.
     const allocator = testing.allocator;
     var client_transport = MockTransport.init(allocator, true);
     defer client_transport.deinit();

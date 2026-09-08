@@ -165,6 +165,39 @@ pub const ErrorCode = enum(u64) {
 /// side; mirrors `session.RequestStream.max_frame_payload_len`.
 pub const max_response_len: usize = 1024 * 1024;
 
+/// Production ceiling on `Conn.pending_uni`, the map of peer unidirectional
+/// streams this connection is tracking: those whose type varint has not
+/// fully arrived, and those of an unknown/reserved type being drained and
+/// ignored. Exceeding it is a connection error of type H3_EXCESSIVE_LOAD
+/// (RFC 9114 §8.1) -- the code for a peer whose behaviour "might be
+/// generating excessive load".
+///
+/// The bound is on *quantity*, never on type. Unknown and reserved
+/// unidirectional stream types stay fully legal: RFC 9114 §6.2.3 requires an
+/// endpoint to tolerate them, and this connection still accepts, drains, and
+/// ignores each one. Only the number of them held at once is capped.
+///
+/// 512 is deliberately far above anything a conforming transport produces.
+/// Tardigrade's own `quic.config.Config.initial_max_streams_uni` defaults to
+/// 16 live peer unidirectional streams, of which HTTP/3 spends three on the
+/// control and two QPACK streams -- so this sits 32x above the transport's
+/// own live capacity and cannot fire in a default deployment. It is
+/// defense-in-depth for the case `pump()`'s guard comment already describes:
+/// the H3 connection object must stay bounded on its own, without depending
+/// on the transport upstream of it to enforce a stream limit. An embedder
+/// that raises `initial_max_streams_uni` above this must raise
+/// `Conn.max_pending_uni` with it.
+///
+/// Each entry costs a `u64` key plus a two-byte `PendingUni`, so the ceiling
+/// bounds the map at roughly 16 KiB rather than at the peer's discretion.
+///
+/// Added for #753 (FINDING F9). Note this is defense-in-depth hardening, not
+/// a fix for the failure that discovered it: F9's observed crash was a
+/// fuzz-model fidelity defect (`MockTransport` admitting a peer uni-stream
+/// population production QUIC would refuse), corrected separately. Triage of
+/// that defect is what exposed this independent missing bound.
+pub const default_max_pending_uni: usize = 512;
+
 pub const Response = struct {
     status: u16,
     /// Decoded header fields, backed by `Client.Pending.buffer`.
@@ -195,6 +228,14 @@ pub fn Conn(comptime Transport: type) type {
         /// Peer uni streams whose type varint has not fully arrived yet, and
         /// unknown-type streams we drain and ignore.
         pending_uni: std.AutoHashMap(u64, PendingUni),
+        /// Ceiling on `pending_uni`; see `default_max_pending_uni` for the
+        /// derivation of the default and for why the bound is on quantity
+        /// rather than on stream type. Overridable so tests and the fuzz
+        /// harness can lower it: at the production value no transport this
+        /// connection is wired to can reach the ceiling, which would leave
+        /// the control structurally unreachable under fuzzing the way #749's
+        /// receive-segment cap was (FINDING F8).
+        max_pending_uni: usize = default_max_pending_uni,
         /// Server: in-flight request decoding sessions by stream id.
         requests: std.AutoHashMap(u64, *ServerRequest),
         /// PRIORITY_UPDATE frames may overtake their request streams; retain
@@ -229,6 +270,13 @@ pub fn Conn(comptime Transport: type) type {
             /// `pollRequest()`. See `Metrics.goaway_request_rejections` at
             /// the call site in `pump()`.
             goaway_request_rejections: u64 = 0,
+            /// Times `pump()` refused a peer unidirectional stream because
+            /// `pending_uni` was already at `max_pending_uni`. Each one
+            /// fails the connection with H3_EXCESSIVE_LOAD, so in production
+            /// this is 0 or 1; it is a counter rather than a flag so the
+            /// fuzz model can tell "the ceiling fired during this op" from
+            /// "the connection was already failed".
+            pending_uni_rejections: u64 = 0,
         };
 
         const max_pending_priority_updates: usize = 64;
@@ -438,12 +486,24 @@ pub fn Conn(comptime Transport: type) type {
             while (transport.acceptStream()) |id| {
                 if (id % 4 == 2 or id % 4 == 3) {
                     // Peer unidirectional stream: classify by type varint.
+                    //
+                    // Local bound first, per the note above about not
+                    // depending on the transport's own stream limit to stay
+                    // bounded (#753). H3_EXCESSIVE_LOAD is the RFC 9114 §8.1
+                    // code for a peer driving more state than the endpoint is
+                    // willing to carry. Checked *before* the insert, so the
+                    // map never exceeds the ceiling even transiently.
+                    //
+                    // This bounds quantity, not type: an unknown or reserved
+                    // stream type is never itself an error here (RFC 9114
+                    // §6.2.3 requires tolerating them, and `pumpUniStreams`
+                    // still drains and ignores each one). Only holding more
+                    // than `max_pending_uni` of them at once is.
+                    if (self.pending_uni.count() >= self.max_pending_uni) {
+                        self.metrics.pending_uni_rejections += 1;
+                        return self.fail(.excessive_load);
+                    }
                     self.pending_uni.put(id, .{}) catch return error.OutOfMemory;
-                    // Local bound, per the note above about not depending on
-                    // the transport's own stream limit to stay bounded
-                    // (#753). H3_EXCESSIVE_LOAD is the RFC 9114 §8.1 code
-                    // for a peer driving more state than the endpoint is
-                    // willing to carry.
                 } else if (self.role == .server) {
                     if (!isClientRequestStream(id)) return self.fail(.stream_creation_error);
                     if (self.local_goaway_id) |limit| {
@@ -1270,6 +1330,19 @@ const MockStream = struct {
 /// imported because `http3_mod` deliberately does not depend on the QUIC
 /// implementation's config module, and adding that dependency to source one
 /// constant would breach a layering boundary the build graph enforces.
+///
+/// Terminology, because the earlier wording here was wrong: RFC 9000 §4.6
+/// MAX_STREAMS is a **cumulative lifetime** limit. It caps the count of
+/// streams of a given type the peer may ever open -- equivalently, the
+/// highest stream ID it may use -- not the number it may hold open at once.
+/// What produces an approximately stable *live* capacity is replenishment:
+/// as peer streams close, the endpoint raises the cumulative limit again
+/// (Tardigrade does this in `quic.stream.StreamManager.maybeClose`, additive
+/// from an `initial_max_streams_uni_floor` and itself capped at
+/// `config.max_retained_closed_streams_per_direction`). This mock models the
+/// same emergent behaviour with a live-stream ledger, which is the shape
+/// that matters for what H3 tracks; it is not a claim that MAX_STREAMS is
+/// itself a concurrency limit.
 const mock_peer_max_uni_streams: u64 = 16;
 
 const MockTransport = struct {
@@ -1283,12 +1356,14 @@ const MockTransport = struct {
     accepted: std.ArrayList(u64) = .empty,
     write_calls: usize = 0,
     fail_writes_after: ?usize = null,
-    /// Concurrent-unidirectional-stream credit this transport still holds.
+    /// Live unidirectional streams this transport may hold open at once.
     /// Real QUIC does not let a peer open unbounded unidirectional streams:
-    /// credit is granted by MAX_STREAMS and replenished only as streams
-    /// close. The earlier mock modelled no limit at all, which let the fuzz
-    /// model drive H3 into peer states no conforming transport could
-    /// produce -- FINDING F9 (#753).
+    /// MAX_STREAMS grants a cumulative lifetime allowance, and an endpoint
+    /// raises that allowance again as streams close, so live capacity stays
+    /// approximately stable (see `mock_peer_max_uni_streams`). The earlier
+    /// mock modelled no limit at all, which let the fuzz model drive H3 into
+    /// peer states no conforming transport could produce -- FINDING F9
+    /// (#753).
     max_uni_streams: u64 = mock_peer_max_uni_streams,
     /// Ids opened by this transport whose close has not yet been observed by
     /// the peer. Credit is reclaimed from this set, not from a bare counter,
@@ -1324,12 +1399,14 @@ const MockTransport = struct {
         return s;
     }
 
-    /// Release credit for unidirectional streams the peer has finished with.
+    /// Release capacity for unidirectional streams the peer has finished
+    /// with.
     ///
     /// A stream is done once the receiving side has observed a reset, or has
     /// read through a delivered FIN -- the same points at which a real
-    /// endpoint would raise MAX_STREAMS. Anything still open, or opened but
-    /// never written to, keeps holding its credit.
+    /// endpoint would raise its cumulative MAX_STREAMS limit, restoring the
+    /// live capacity this ledger models. Anything still open, or opened but
+    /// never written to, keeps holding its slot.
     fn reclaimClosedUniCredit(self: *MockTransport) void {
         const peer = self.peer orelse return;
         var index: usize = 0;
@@ -1347,8 +1424,8 @@ const MockTransport = struct {
         }
     }
 
-    /// Unidirectional stream credit currently consumed, after reclaiming
-    /// anything the peer has finished with.
+    /// Live unidirectional stream capacity currently consumed, after
+    /// reclaiming anything the peer has finished with.
     fn uniCreditInUse(self: *MockTransport) usize {
         self.reclaimClosedUniCredit();
         return self.open_uni.items.len;
@@ -2620,6 +2697,28 @@ fn resetTrackedPeerRequest(
 /// the model tracks with one to spare.
 const reserved_uni_credit: usize = 6;
 
+/// `Conn.max_pending_uni` the fuzz model runs at, far below
+/// `default_max_pending_uni`.
+///
+/// The production default sits 32x above the transport's own live
+/// unidirectional capacity precisely so it cannot fire in a conforming
+/// deployment -- which would leave the control structurally unreachable at
+/// any mutation budget, repeating FINDING F8, where #749's receive-segment
+/// cap could not be exercised because a different limit always bound first.
+/// Lowering it here keeps the ceiling reachable now that `MockTransport`
+/// models a realistic live-stream limit (the F9 part-B fix): the transport
+/// admits 16 live peer uni streams, op 3 may use all but `reserved_uni_credit`
+/// of them, so the model can drive `pending_uni` past 8 but not past 16.
+///
+/// Not lowered to 2. `pending_uni` holds *every* peer unidirectional stream
+/// the connection is tracking, including the three critical ones (control
+/// and both QPACK streams) -- it is not an unknown-types-only map -- so a
+/// ceiling of 2 would fail nearly every sequence on its third critical
+/// stream and stop the target exercising the request/control/QPACK paths
+/// that are the rest of its job. 8 clears the six slots the model tracks
+/// (`reserved_uni_credit`) and still leaves op 3 able to cross it.
+const fuzz_max_pending_uni: usize = 8;
+
 fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
     const allocator = testing.allocator;
     var peer_transport = MockTransport.init(allocator, role == .server);
@@ -2632,6 +2731,10 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
     const H3 = Conn(MockTransport);
     var conn = H3.init(allocator, role);
     defer conn.deinit();
+    // See `fuzz_max_pending_uni`: the production ceiling is unreachable
+    // against a conforming transport by design, so the model lowers it to
+    // keep the security control exercisable (#753 part A).
+    conn.max_pending_uni = fuzz_max_pending_uni;
 
     var peer_control: ?u64 = null;
     var peer_qpack_encoder: ?u64 = null;
@@ -2644,6 +2747,7 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
         const before_close = conn.close_code;
         const before_settings = conn.peer_control_view.saw_settings;
         const before_requests = conn.requests.count();
+        const before_uni_rejections = conn.metrics.pending_uni_rejections;
         var expected_close: ?ErrorCode = null;
 
         const result = switch (op % 25) {
@@ -2695,7 +2799,17 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                     // credit, which a real peer would also hit; skip the op rather
                     // than reporting the refusal as a finding (#753).
                     if (!try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
-                    try conn.pump(&local_transport);
+                    // This setup pump can now legitimately fail: lowering
+                    // `max_pending_uni` for the model (#753 part A) means the
+                    // `pending_uni` ceiling can fire here, which is the
+                    // security control working, not a finding. Route that
+                    // outcome into `result` so the ceiling's postconditions
+                    // are checked below. Any *other* failure escaping a setup
+                    // pump is still a finding and is still raised.
+                    conn.pump(&local_transport) catch |err| {
+                        if (conn.metrics.pending_uni_rejections == before_uni_rejections) return err;
+                        break :blk err;
+                    };
                 }
                 expected_close = .stream_creation_error;
                 var duplicate: ?u64 = null;
@@ -2727,7 +2841,17 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                     // credit, which a real peer would also hit; skip the op rather
                     // than reporting the refusal as a finding (#753).
                     if (!try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
-                    try conn.pump(&local_transport);
+                    // This setup pump can now legitimately fail: lowering
+                    // `max_pending_uni` for the model (#753 part A) means the
+                    // `pending_uni` ceiling can fire here, which is the
+                    // security control working, not a finding. Route that
+                    // outcome into `result` so the ceiling's postconditions
+                    // are checked below. Any *other* failure escaping a setup
+                    // pump is still a finding and is still raised.
+                    conn.pump(&local_transport) catch |err| {
+                        if (conn.metrics.pending_uni_rejections == before_uni_rejections) return err;
+                        break :blk err;
+                    };
                 }
                 expected_close = .closed_critical_stream;
                 if (peer_control) |id| _ = try peer_transport.writeStream(id, "", true);
@@ -2747,7 +2871,17 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                     // credit, which a real peer would also hit; skip the op rather
                     // than reporting the refusal as a finding (#753).
                     if (!try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
-                    try conn.pump(&local_transport);
+                    // This setup pump can now legitimately fail: lowering
+                    // `max_pending_uni` for the model (#753 part A) means the
+                    // `pending_uni` ceiling can fire here, which is the
+                    // security control working, not a finding. Route that
+                    // outcome into `result` so the ceiling's postconditions
+                    // are checked below. Any *other* failure escaping a setup
+                    // pump is still a finding and is still raised.
+                    conn.pump(&local_transport) catch |err| {
+                        if (conn.metrics.pending_uni_rejections == before_uni_rejections) return err;
+                        break :blk err;
+                    };
                 }
                 expected_close = .closed_critical_stream;
                 if (peer_control) |id| try local_transport.resetStreamForTest(id);
@@ -2856,7 +2990,17 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                     // credit, which a real peer would also hit; skip the op rather
                     // than reporting the refusal as a finding (#753).
                     if (!try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder)) break :blk conn.pump(&local_transport);
-                    try conn.pump(&local_transport);
+                    // This setup pump can now legitimately fail: lowering
+                    // `max_pending_uni` for the model (#753 part A) means the
+                    // `pending_uni` ceiling can fire here, which is the
+                    // security control working, not a finding. Route that
+                    // outcome into `result` so the ceiling's postconditions
+                    // are checked below. Any *other* failure escaping a setup
+                    // pump is still a finding and is still raised.
+                    conn.pump(&local_transport) catch |err| {
+                        if (conn.metrics.pending_uni_rejections == before_uni_rejections) return err;
+                        break :blk err;
+                    };
                 }
                 expected_close = .closed_critical_stream;
                 if (peer_qpack_encoder) |id| try local_transport.resetStreamForTest(id);
@@ -2892,7 +3036,17 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                     // credit, which a real peer would also hit; skip the op rather
                     // than reporting the refusal as a finding (#753).
                     if (!try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder)) break :blk conn.pump(&local_transport);
-                    try conn.pump(&local_transport);
+                    // This setup pump can now legitimately fail: lowering
+                    // `max_pending_uni` for the model (#753 part A) means the
+                    // `pending_uni` ceiling can fire here, which is the
+                    // security control working, not a finding. Route that
+                    // outcome into `result` so the ceiling's postconditions
+                    // are checked below. Any *other* failure escaping a setup
+                    // pump is still a finding and is still raised.
+                    conn.pump(&local_transport) catch |err| {
+                        if (conn.metrics.pending_uni_rejections == before_uni_rejections) return err;
+                        break :blk err;
+                    };
                 }
                 expected_close = .closed_critical_stream;
                 if (peer_qpack_decoder) |id| try local_transport.resetStreamForTest(id);
@@ -2900,7 +3054,26 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
             },
         };
 
-        if (result) |_| {
+        // Did `pump()`'s `pending_uni` ceiling fire during this op? The
+        // counter, rather than the close code, is the signal: `excessive_load`
+        // has a second raise site (`max_pending_priority_updates`), so keying
+        // off the code alone would let an unrelated failure masquerade as this
+        // control firing.
+        //
+        // When it does fire it *supersedes* the op's own `expected_close`, and
+        // legitimately so: `pump()` fails the connection at accept time,
+        // before it ever classifies or reads the stream the op was steering
+        // toward, so the outcome the op was set up to produce can no longer
+        // happen. This is an explicit part of the model contract, not a
+        // swallowed error -- the ceiling's own postconditions are asserted
+        // instead of the op's, and are strictly checked.
+        const uni_ceiling_fired = conn.metrics.pending_uni_rejections > before_uni_rejections;
+        if (uni_ceiling_fired) {
+            try testing.expect(before_close == null);
+            try testing.expectError(error.ProtocolError, result);
+            try testing.expectEqual(ErrorCode.excessive_load, conn.close_code.?);
+            try expectH3ConnInvariants(&conn, role, before_settings, before_requests);
+        } else if (result) |_| {
             if (expected_close) |code| if (before_close == null) {
                 try testing.expect(conn.close_code != null);
                 try testing.expectEqual(code.wire(), conn.closeCode());
@@ -3059,16 +3232,17 @@ fn expectH3ConnInvariants(conn: anytype, role: Role, before_settings: bool, befo
     if (conn.peer_qpack_decoder) |id| {
         try testing.expect((id & 0x2) != 0);
     }
-    // Derived from the transport's actual unidirectional stream credit, not
-    // a magic constant. A peer cannot hold more than `max_uni_streams`
-    // concurrent unidirectional streams, and `pending_uni` retains an entry
-    // until the connection observes that stream's FIN or reset. The 2x
-    // headroom covers the transient window where the mock has already
-    // reclaimed credit for a stream reset out-of-band (`resetStreamForTest`
-    // marks it immediately) but the connection has not yet pumped and
-    // retired its entry. The earlier bare `<= 32` asserted a bound nothing
-    // enforced, which is what FINDING F9 tripped over (#753).
-    try testing.expect(conn.pending_uni.count() <= mock_peer_max_uni_streams * 2);
+    // Asserted against the connection's own configured ceiling, which
+    // `pump()` now enforces before every insert (#753 part A). This is the
+    // bound the product commits to, not a property of the mock: the earlier
+    // bare `<= 32` asserted a bound nothing enforced anywhere, which is what
+    // FINDING F9 tripped over.
+    //
+    // With `pump()`'s check in place this holds by construction, so it is
+    // also the assertion the falsification check targets: disabling the
+    // ceiling makes the model violate it within a few thousand runs, which is
+    // what proves the control is reachable rather than decorative.
+    try testing.expect(conn.pending_uni.count() <= conn.max_pending_uni);
     _ = before_requests;
     try testing.expect(conn.requests.count() <= 32 or role == .client);
     if (before_settings) try testing.expect(conn.peer_control_view.saw_settings);
@@ -3083,6 +3257,117 @@ fn expectH3ConnInvariants(conn: anytype, role: Role, before_settings: bool, befo
             try testing.expect(!request.stream.finished or request.finished);
         }
     }
+}
+
+test "H3 conn: pending uni streams past max_pending_uni close with excessive load" {
+    // #753 part A. Defense-in-depth: the H3 connection must stay bounded on
+    // its own even when the transport below it is willing to admit more peer
+    // unidirectional streams than the connection is willing to track -- which
+    // is exactly the shape FINDING F9's fuzz model produced against a mock
+    // that enforced no limit at all.
+    //
+    // The transport here is deliberately permissive (`max_uni_streams` well
+    // above the H3 ceiling), so the only thing that can stop the peer is the
+    // H3-local bound. Fails before the bound existed: every open was accepted
+    // and `pending_uni` simply grew.
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+    client_transport.max_uni_streams = 64;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+    server.max_pending_uni = 3;
+
+    // Three unknown/reserved-type streams fill the ceiling exactly. Unknown
+    // types are legal (RFC 9114 §6.2.3) and must stay legal: each is accepted,
+    // drained, and ignored, and none of them fails the connection.
+    var index: usize = 0;
+    while (index < 3) : (index += 1) {
+        const id = try client_transport.openStream(.uni);
+        var bytes: [8]u8 = undefined;
+        const typ_len = try varint.encode(0x21, &bytes);
+        _ = try client_transport.writeStream(id, bytes[0..typ_len], false);
+        try server.pump(&server_transport);
+        try testing.expectEqual(@as(?ErrorCode, null), server.close_code);
+    }
+    try testing.expectEqual(@as(u32, 3), server.pending_uni.count());
+    try testing.expectEqual(@as(u64, 3), server.metrics.unknown_uni_streams);
+    try testing.expectEqual(@as(u64, 0), server.metrics.pending_uni_rejections);
+
+    // The transport still has ample capacity, so it opens a fourth without
+    // complaint. The H3 connection is what refuses it.
+    const excess = try client_transport.openStream(.uni);
+    var bytes: [8]u8 = undefined;
+    const typ_len = try varint.encode(0x21, &bytes);
+    _ = try client_transport.writeStream(excess, bytes[0..typ_len], false);
+
+    try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+    try testing.expectEqual(ErrorCode.excessive_load, server.close_code.?);
+    try testing.expectEqual(@as(u64, 0x0107), server.closeCode());
+    try testing.expectEqual(@as(u64, 1), server.metrics.pending_uni_rejections);
+    // Checked before the insert, so the map never exceeds the ceiling even
+    // transiently.
+    try testing.expectEqual(@as(u32, 3), server.pending_uni.count());
+}
+
+test "H3 conn: max_pending_uni counts every peer uni stream, not just unknown types" {
+    // The ceiling is on quantity of tracked peer unidirectional streams, and
+    // `pending_uni` retains the critical streams too (an entry is retired only
+    // on FIN or reset, not on classification). Pinning that here because it is
+    // the reason `fuzz_max_pending_uni` is 8 rather than 2: a ceiling at or
+    // below the three critical streams would fail almost every sequence before
+    // the model reached the paths it exists to exercise.
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+    server.max_pending_uni = 8;
+
+    var peer_control: ?u64 = null;
+    var peer_qpack_encoder: ?u64 = null;
+    var peer_qpack_decoder: ?u64 = null;
+    try testing.expect(try writePeerUni(&client_transport, .control, validSettingsBytes()[0..], false, &peer_control));
+    try testing.expect(try writePeerUni(&client_transport, .qpack_encoder, "", false, &peer_qpack_encoder));
+    try testing.expect(try writePeerUni(&client_transport, .qpack_decoder, "", false, &peer_qpack_decoder));
+    try server.pump(&server_transport);
+
+    try testing.expectEqual(@as(?ErrorCode, null), server.close_code);
+    try testing.expect(server.peer_control != null);
+    try testing.expect(server.peer_qpack_encoder != null);
+    try testing.expect(server.peer_qpack_decoder != null);
+    // Classified, but still held: all three still count against the ceiling.
+    try testing.expectEqual(@as(u32, 3), server.pending_uni.count());
+}
+
+test "H3 conn: default max_pending_uni is far above the transport's live uni capacity" {
+    // Pins the production posture the `default_max_pending_uni` doc comment
+    // claims: the ceiling is defense-in-depth against a transport that does
+    // not enforce a stream limit, not a limit that fires in normal operation.
+    // If someone lowers the default toward the mock's live capacity, this
+    // fails and forces the tradeoff to be re-argued.
+    const H3 = Conn(MockTransport);
+    var conn = H3.init(testing.allocator, .server);
+    defer conn.deinit();
+    try testing.expectEqual(default_max_pending_uni, conn.max_pending_uni);
+    try testing.expect(default_max_pending_uni > mock_peer_max_uni_streams * 8);
+    // And the fuzz model must stay below it, or the control goes unreachable
+    // under fuzzing the way #749's segment cap did (FINDING F8).
+    try testing.expect(fuzz_max_pending_uni < default_max_pending_uni);
+    try testing.expect(fuzz_max_pending_uni > reserved_uni_credit);
+    try testing.expect(fuzz_max_pending_uni < mock_peer_max_uni_streams);
 }
 
 test "H3 conn: PRIORITY_UPDATE on request stream closes with frame unexpected" {

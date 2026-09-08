@@ -33,6 +33,41 @@ the test name and minimized input needed for deterministic reproduction. Keep
 external peers out of these loops; ngtcp2/nghttp3, quiche, and aioquic remain under
 `scripts/interop/run-interop.sh`.
 
+## Host memory requirement for command-sequence targets
+
+Command-sequence targets need a host with **several GB of free RAM per fuzz
+process**, and a memory-saturated host will get the process `SIGKILL`ed
+mid-row. Budget roughly **2 GB of headroom per concurrent fuzz process** and do
+not run canonical rows on a machine already near its memory limit; a row killed
+this way is `INTERRUPTED`, not a finding, and must be rerun rather than
+recorded.
+
+This is a property of `std.testing.allocator`, not of any target. Measured on
+one host, sampling process RSS every 5s under `-Doptimize=ReleaseFast`:
+
+| target | warm-up peak | steady-state mean |
+| --- | --- | --- |
+| `fuzz: packet parser` (allocation-free) | 3 MB | 2 MB |
+| `fuzz: stream manager command sequences` | 1,669 MB | 265 MB |
+| `fuzz: H3 connection state command sequences` | 1,867 MB | 286 MB |
+| `fuzz: H3 connection state command sequences`, `smp_allocator` substituted | 4 MB | 4 MB |
+
+The last row is the control: changing *only* the allocator in the same target
+moves it from 1,867 MB to 4 MB. The footprint is `std.heap.DebugAllocator`'s
+per-allocation metadata and 10-frame stack traces, retained so the fuzz targets
+keep leak detection, under the allocation churn a command-sequence target
+generates. The two command-sequence targets above are within ~8% of each other,
+which is why this is documented here as a shared property rather than filed
+against either one.
+
+The footprint is **stable, not monotonic** — the ramp to ~1.9 GB is a cold-corpus
+warm-up transient, after which RSS oscillates in a band (90-480 MB observed) with
+no upward trend in its floor. There is no leak here to fix, and the leak
+detection that costs this memory is deliberately kept: #675 counts "allocator
+growth attributable to bounded command-sequence targets" as a real finding
+class, so substituting a non-instrumented allocator to save memory would blind
+the campaign to exactly the defects it is looking for.
+
 Use `-Doptimize=ReleaseFast` for coverage-guided runs with Zig 0.16.0; the
 ordinary deterministic smoke tests continue to run in the default Debug mode.
 

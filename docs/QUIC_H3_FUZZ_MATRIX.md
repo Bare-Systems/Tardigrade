@@ -62,15 +62,23 @@ already near its memory limit: the ~1.87 GB warm-up transient will be killed
 under memory pressure, and a row killed that way is `INTERRUPTED`, not a
 finding, so it must be rerun rather than recorded.
 
-**Do not read the macOS kills as explaining the historical campaign-guest
-kills.** Rows on Linux guests were reported dying around ~375k runs, and a
-4.2 MB process on a 3 GB guest cannot be a memory kill. That cause remains
-**unidentified**; `/tmp` tmpfs exhaustion on the Proxmox host (documented in
-`scripts/run-proxmox-fuzz-campaign.sh`'s own comments as having happened once),
-host-level pressure from co-resident guests, and the watchdog path are all
-still open candidates. For the record, a 1M row on a 6 GB guest at
-`2bca1c36` completed 1,018,516 mutations cleanly, past that reported ceiling,
-but that is one data point and not a diagnosis.
+**The ~375k SIGKILL is a macOS-local phenomenon and is fully explained by the
+table above. Linux campaign guests never exhibited it.** Auditing every
+`ledger.tsv` across all campaign epochs -- 80 rows -- the only non-zero wrapper
+exits are `1` (13 genuine findings), `143` (12 deliberate operator interrupts),
+and `124` (8 watchdog timeouts). **`137`/SIGKILL appears zero times**, and no
+collected guest log contains `signal KILL`, `Killed`, or an OOM message.
+
+This is worth stating explicitly because it was twice mis-stated in earlier
+revisions: first that undersized (3 GB) guests caused "the campaign kills" --
+there were no campaign kills -- and then, on measuring 4.2 MB on Linux, that the
+ceiling was of unknown cause. Neither holds. The original report was explicit
+that the kills were on *local* runs, and the macOS measurement accounts for
+those completely.
+
+Practical consequences: guest memory is not a campaign risk on Linux, and the
+watchdog (`--watchdog`, surfacing as exit `124`) is the failure mode that
+actually recurs on long rows -- 8 occurrences, the real thing to budget for.
 
 ### The macOS measurement
 

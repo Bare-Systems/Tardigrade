@@ -406,17 +406,46 @@ write_finding() {
       sha="$(shasum -a 256 "$dir/crash-input.bin" | awk '{print $1}')"
     fi
   fi
-  # Preserve the fuzzer's own state, not the build cache. `.zig-cache/f`
-  # is where Zig keeps the corpus and the saved crash input -- the working
-  # state #675's finding contract asks for. The rest of `.zig-cache` is
-  # compiled build output: regenerable from `source_commit_sha`, and it was
-  # dominating these tarballs at ~220 MB each against a few MB of actual
-  # fuzz state. Falls back to the whole cache if `f/` is absent, so a
-  # finding is never preserved with less than before.
-  if [[ -d .zig-cache/f ]]; then
-    tar -czf "$dir/zig-cache-preserved.tgz" .zig-cache/f 2>/dev/null || true
+  # Preserve the fuzzer's state. What counts as "the fuzzer's state" depends
+  # on whether the exact crash bytes were recovered, per #675/#739's failure
+  # contract:
+  #
+  #   * crash bytes captured -> `.zig-cache/f` (corpus + saved crash input)
+  #     AND `.zig-cache/v` (Zig's fuzz *coverage* state). An earlier revision
+  #     of this function kept only `f/` and claimed everything else was
+  #     compiled build output. That was wrong: `v/` is fuzzer state, not
+  #     build output, and dropping it loses coverage context a replay may
+  #     need.
+  #   * crash bytes NOT captured -> the WHOLE `.zig-cache`. #739 is explicit
+  #     that when the exact crash location cannot be reliably inferred, the
+  #     complete working state must be preserved for deliberate recovery.
+  #     Preserving less in exactly the case where we know least is backwards.
+  #
+  # Failure to archive is NOT ignored. It used to be `|| true`, which was
+  # survivable only while the Proxmox wrapper also shipped the whole guest
+  # cache; now that it does not (see run-proxmox-fuzz-campaign.sh), a silently
+  # failed archive can leave an apparently-collectible artifacts/ directory
+  # and let `--destroy-on-failure` destroy the only remaining fuzzer state. On
+  # failure we remove the partial archive and record the failure in
+  # provenance.txt so the row cannot be read as safely collected.
+  local preserve_paths=() preserve_scope="" preserve_status="ok"
+  if [[ -n "$sha" && -d .zig-cache/f ]]; then
+    preserve_paths=(.zig-cache/f)
+    [[ -d .zig-cache/v ]] && preserve_paths+=(.zig-cache/v)
+    preserve_scope="fuzzer state (${preserve_paths[*]})"
   elif [[ -d .zig-cache ]]; then
-    tar -czf "$dir/zig-cache-preserved.tgz" .zig-cache 2>/dev/null || true
+    preserve_paths=(.zig-cache)
+    preserve_scope="complete .zig-cache (exact crash bytes were not recovered)"
+  fi
+  if ((${#preserve_paths[@]} > 0)); then
+    if ! tar -czf "$dir/zig-cache-preserved.tgz" "${preserve_paths[@]}" 2>"$dir/zig-cache-preserved.err"; then
+      rm -f "$dir/zig-cache-preserved.tgz"
+      preserve_status="FAILED"
+    else
+      rm -f "$dir/zig-cache-preserved.err"
+    fi
+  else
+    preserve_scope="none (no .zig-cache present)"
   fi
   {
     printf 'family=%s\n' "$family"
@@ -429,11 +458,15 @@ write_finding() {
     printf 'replay_command='
     printf '%q ' zig build "$step" --summary all --error-style verbose "$(family_filter_option "$family" "$target")"
     printf '\n'
-    if [[ -n "$sha" ]]; then
+    printf 'preserved_scope=%s\n' "$preserve_scope"
+    printf 'preserved_archive=%s\n' "$preserve_status"
+    if [[ "$preserve_status" == "FAILED" ]]; then
+      printf 'note=%s\n' 'WARNING: preserving the fuzzer state FAILED (see zig-cache-preserved.err). This row must NOT be treated as safely collected and its guest must NOT be destroyed: the only remaining fuzzer state may be on the guest.'
+    elif [[ -n "$sha" ]]; then
       printf 'crash_input_sha256=%s\n' "$sha"
-      printf 'note=%s\n' 'crash-input.bin holds the exact saved fuzz input byte-for-byte; the fuzzer corpus/crash state (.zig-cache/f) was preserved alongside it. Build output is regenerable from source_commit_sha and is deliberately not retained.'
+      printf 'note=%s\n' 'crash-input.bin holds the exact saved fuzz input byte-for-byte; Zig fuzzer state (.zig-cache/f corpus+crash, and .zig-cache/v coverage when present) was preserved alongside it. Compiled build output is regenerable from source_commit_sha and is deliberately not retained.'
     else
-      printf 'note=%s\n' 'Exact Zig crash input path was not inferred automatically; complete logs and the fuzzer corpus/crash state (.zig-cache/f) were preserved for deliberate recovery.'
+      printf 'note=%s\n' 'Exact Zig crash input path was not inferred automatically, so the COMPLETE .zig-cache was preserved for deliberate recovery, per #739.'
     fi
   } >"$dir/provenance.txt"
   printf '%s' "$sha"

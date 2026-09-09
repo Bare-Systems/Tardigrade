@@ -177,19 +177,28 @@ pub const max_response_len: usize = 1024 * 1024;
 /// endpoint to tolerate them, and this connection still accepts, drains, and
 /// ignores each one. Only the number of them held at once is capped.
 ///
-/// 512 is deliberately far above anything a conforming transport produces.
-/// Tardigrade's own `quic.config.Config.initial_max_streams_uni` defaults to
-/// 16 live peer unidirectional streams, of which HTTP/3 spends three on the
-/// control and two QPACK streams -- so this sits 32x above the transport's
-/// own live capacity and cannot fire in a default deployment. It is
-/// defense-in-depth for the case `pump()`'s guard comment already describes:
-/// the H3 connection object must stay bounded on its own, without depending
-/// on the transport upstream of it to enforce a stream limit. An embedder
-/// that raises `initial_max_streams_uni` above this must raise
-/// `Conn.max_pending_uni` with it.
+/// **512 is a chosen policy ceiling, not a derived quantity.** Saying so
+/// plainly because an earlier revision of this comment implied it fell out of
+/// the transport's limits, and it does not (raised in review on #755).
 ///
-/// Each entry costs a `u64` key plus a two-byte `PendingUni`, so the ceiling
-/// bounds the map at roughly 16 KiB rather than at the peer's discretion.
+/// It is justified from the per-connection state budget this layer is willing
+/// to spend on peer streams it has not yet classified. Each entry costs a
+/// `u64` key plus a two-byte `PendingUni`, so 512 bounds the map at roughly
+/// 16 KiB per connection -- small enough to be uninteresting against the
+/// megabyte-scale buffers a live H3 connection already holds
+/// (`max_response_len` alone is 1 MiB), and large enough that the ceiling is
+/// a backstop rather than an operational limit.
+///
+/// For orientation, not derivation: Tardigrade's own
+/// `quic.config.Config.initial_max_streams_uni` defaults to 16 live peer
+/// unidirectional streams, three of which HTTP/3 spends on the control and
+/// QPACK streams. 512 therefore cannot fire in a default deployment. Nothing
+/// enforces that relationship, and it is deliberately not wired to the
+/// transport: this bound exists precisely for the case where the transport's
+/// own limit is absent, violated, or more permissive than assumed, so
+/// deriving it from that limit would defeat its purpose. An embedder that
+/// raises `initial_max_streams_uni` toward or past this must raise
+/// `Conn.max_pending_uni` with it.
 ///
 /// Added for #753 (FINDING F9). Note this is defense-in-depth hardening, not
 /// a fix for the failure that discovered it: F9's observed crash was a
@@ -506,17 +515,27 @@ pub fn Conn(comptime Transport: type) type {
                     // Peer unidirectional stream: classify by type varint.
                     //
                     // A stream the peer reset before we ever accepted it is
-                    // already dead at the transport layer and can never
-                    // deliver its type varint, so there is nothing to
-                    // classify and no reason to hold an entry for it (#742).
-                    // Skipping it here is not a behaviour change in the
-                    // outcome, only in the path: `pumpUniStreams` would read
-                    // it, take `error.StreamReset`, find `typ == .unknown`
-                    // (never classified, so never critical) and retire the
-                    // entry in this same `pump()`. Doing it at accept time
-                    // avoids the insert/remove round trip and, more to the
-                    // point, keeps a dead stream from consuming headroom
-                    // under the ceiling below.
+                    // already dead at the transport layer, so there is no
+                    // reason to hold an entry for it (#742).
+                    //
+                    // Careful about what this does and does not mean: type
+                    // bytes may well have *arrived*. QUIC can queue a stream
+                    // on a STREAM frame and then receive RESET_STREAM before
+                    // H3 ever pumps, and the read path surfaces
+                    // `error.StreamReset` ahead of any buffered bytes -- so
+                    // "reset before first acceptance" means we will never
+                    // *see* the type varint, not that it was never sent. That
+                    // silent-unclassified behaviour predates this change; the
+                    // guard only stops us building state around it.
+                    //
+                    // Skipping here is not a behaviour change in the outcome,
+                    // only in the path: `pumpUniStreams` would read it, take
+                    // `error.StreamReset`, find `typ == .unknown` (never
+                    // classified, so never critical) and retire the entry in
+                    // this same `pump()`. Doing it at accept time avoids the
+                    // insert/remove round trip and, more to the point, keeps a
+                    // dead stream from consuming headroom under the ceiling
+                    // below.
                     if (transportStreamResetByPeer(transport, id)) {
                         self.metrics.reset_before_accept_rejections += 1;
                         continue;
@@ -2814,6 +2833,13 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
         const before_settings = conn.peer_control_view.saw_settings;
         const before_requests = conn.requests.count();
         const before_uni_rejections = conn.metrics.pending_uni_rejections;
+        // Model-side witness, independent of anything the connection reports:
+        // `next_uni` is a monotonic count of peer unidirectional streams this
+        // transport has ever opened, so a change means *the model* really did
+        // open one during this op. Needed because a counter the connection
+        // increments cannot be evidence that the connection was right to
+        // increment it (raised in review on #755).
+        const before_peer_next_uni = peer_transport.next_uni;
         var expected_close: ?ErrorCode = null;
 
         const result = switch (op % 25) {
@@ -3121,20 +3147,37 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
         };
 
         // Did `pump()`'s `pending_uni` ceiling fire during this op? The
-        // counter, rather than the close code, is the signal: `excessive_load`
-        // has a second raise site (`max_pending_priority_updates`), so keying
-        // off the code alone would let an unrelated failure masquerade as this
-        // control firing.
+        // counter, rather than the close code, identifies *which* raise site
+        // fired: `excessive_load` has a second one
+        // (`max_pending_priority_updates`), so keying off the code alone would
+        // let an unrelated failure masquerade as this control.
         //
-        // When it does fire it *supersedes* the op's own `expected_close`, and
+        // When it fires it *supersedes* the op's own `expected_close`, and
         // legitimately so: `pump()` fails the connection at accept time,
         // before it ever classifies or reads the stream the op was steering
         // toward, so the outcome the op was set up to produce can no longer
-        // happen. This is an explicit part of the model contract, not a
-        // swallowed error -- the ceiling's own postconditions are asserted
-        // instead of the op's, and are strictly checked.
+        // happen. That is an explicit part of the model contract, not a
+        // swallowed error.
+        //
+        // But the counter alone must NOT be allowed to certify that the
+        // connection was *right* to fire (raised in review on #755): an
+        // off-by-one or premature guard could bump the counter, return
+        // H3_EXCESSIVE_LOAD, and have the model accept it while silently
+        // dropping whatever mismatch this op was built to detect. So every
+        // condition below is checked independently of the connection's own
+        // verdict:
+        //
+        //   * exactly ONE rejection this op -- not "at least one";
+        //   * the map is AT the configured ceiling, never below it, so a
+        //     guard that fires early fails here instead of being accepted;
+        //   * the model itself really opened a peer uni stream this op,
+        //     witnessed by the mock's monotonic `next_uni`, so a rejection
+        //     invented with no new stream to reject is a failure.
         const uni_ceiling_fired = conn.metrics.pending_uni_rejections > before_uni_rejections;
         if (uni_ceiling_fired) {
+            try testing.expectEqual(before_uni_rejections + 1, conn.metrics.pending_uni_rejections);
+            try testing.expect(peer_transport.next_uni > before_peer_next_uni);
+            try testing.expectEqual(conn.max_pending_uni, conn.pending_uni.count());
             try testing.expect(before_close == null);
             try testing.expectError(error.ProtocolError, result);
             try testing.expectEqual(ErrorCode.excessive_load, conn.close_code.?);
@@ -3476,6 +3519,80 @@ test "H3 conn: reset after acceptance still releases request state" {
     try testing.expectEqual(@as(u64, 0), server.metrics.reset_before_accept_rejections);
 }
 
+test "H3 conn-state fuzz model reaches the pending_uni ceiling deterministically" {
+    // Reachability of #753 part A's ceiling *through the fuzz model's own
+    // constraints*, pinned deterministically rather than left to a fuzz row
+    // wandering into it.
+    //
+    // Why this test exists: review on #755 rightly pushed on whether the
+    // superseding branch is load-bearing. Trying to answer that by inverting an
+    // assertion and fuzzing was inconclusive -- the driving macOS host kills the
+    // target near ~390k runs (see docs/QUIC_H3_FUZZ_MATRIX.md), and from a cold
+    // corpus the model needs more than that to stumble onto the ceiling. That
+    // latency is a property of random search, not of the control: the state is
+    // shallow and directly constructible, so it is pinned here instead.
+    //
+    // Arithmetic, from the model's own constants: op 3 opens one peer uni
+    // stream of reserved type 0x21 per invocation and stops once
+    // `uniCreditInUse() + reserved_uni_credit >= max_uni_streams`, i.e. at 10
+    // live uni streams (16 - 6). Each lands in `pending_uni` and is never
+    // retired -- no FIN, no reset -- so eight fill `fuzz_max_pending_uni` and
+    // the ninth open trips the ceiling, since `pump()` checks
+    // `count >= max_pending_uni` *before* inserting. 10 > 8, so the ceiling is
+    // reachable with room to spare.
+    try testing.expect(mock_peer_max_uni_streams - reserved_uni_credit > fuzz_max_pending_uni);
+
+    const allocator = testing.allocator;
+    var peer_transport = MockTransport.init(allocator, false);
+    defer peer_transport.deinit();
+    var local_transport = MockTransport.init(allocator, true);
+    defer local_transport.deinit();
+    peer_transport.peer = &local_transport;
+    local_transport.peer = &peer_transport;
+
+    const H3 = Conn(MockTransport);
+    var conn = H3.init(allocator, .server);
+    defer conn.deinit();
+    conn.max_pending_uni = fuzz_max_pending_uni;
+
+    // Replay op 3's exact body until the ceiling fires.
+    var opened: usize = 0;
+    while (opened < fuzz_max_pending_uni) : (opened += 1) {
+        const id = try peer_transport.openStream(.uni);
+        var bytes: [16]u8 = undefined;
+        const typ_len = try varint.encode(0x21, &bytes);
+        _ = try peer_transport.writeStream(id, bytes[0..typ_len], false);
+        try conn.pump(&local_transport);
+        try testing.expectEqual(@as(?ErrorCode, null), conn.close_code);
+    }
+    try testing.expectEqual(@as(u32, fuzz_max_pending_uni), conn.pending_uni.count());
+    try testing.expectEqual(@as(u64, 0), conn.metrics.pending_uni_rejections);
+
+    // The next one is the ninth: transport still has credit, H3 refuses.
+    const excess = try peer_transport.openStream(.uni);
+    var bytes: [16]u8 = undefined;
+    const typ_len = try varint.encode(0x21, &bytes);
+    _ = try peer_transport.writeStream(excess, bytes[0..typ_len], false);
+    try testing.expectError(error.ProtocolError, conn.pump(&local_transport));
+
+    // Exactly the postconditions the fuzz model's superseding branch asserts,
+    // so if those ever stop holding this fails deterministically instead of
+    // waiting on a probabilistic row.
+    try testing.expectEqual(@as(u64, 1), conn.metrics.pending_uni_rejections);
+    try testing.expectEqual(ErrorCode.excessive_load, conn.close_code.?);
+    try testing.expectEqual(conn.max_pending_uni, conn.pending_uni.count());
+}
+
+test "H3 conn-state fuzz model accepts a ceiling-tripping op sequence" {
+    // The companion to the above: drive the *real* model entry point with an
+    // input whose ops are all op 3 (`op % 25 == 3`), so the superseding branch
+    // and every assertion inside it execute. A false positive in that branch
+    // fails here, deterministically, in milliseconds.
+    const input = [_]u8{3} ** 16;
+    try runH3ConnStateCommands(&input, .server);
+    try runH3ConnStateCommands(&input, .client);
+}
+
 test "H3 conn: pending uni streams past max_pending_uni close with excessive load" {
     // #753 part A. Defense-in-depth: the H3 connection must stay bounded on
     // its own even when the transport below it is willing to admit more peer
@@ -3579,7 +3696,16 @@ test "H3 conn: default max_pending_uni is far above the transport's live uni cap
     var conn = H3.init(testing.allocator, .server);
     defer conn.deinit();
     try testing.expectEqual(default_max_pending_uni, conn.max_pending_uni);
-    try testing.expect(default_max_pending_uni > mock_peer_max_uni_streams * 8);
+    // Pins the two properties the policy actually rests on, rather than
+    // freezing an arbitrary ratio to the mock's limit (the previous
+    // `> mock_peer_max_uni_streams * 8` was just a second magic number):
+    //   1. the ceiling is unreachable by a default-configured transport, so it
+    //      is a backstop and not an operational limit; and
+    //   2. the state it admits stays within the per-connection budget its doc
+    //      comment claims -- ~16 KiB, i.e. far below one `max_response_len`.
+    try testing.expect(default_max_pending_uni > mock_peer_max_uni_streams);
+    const bytes_per_entry = @sizeOf(u64) + @sizeOf(Conn(MockTransport).PendingUni);
+    try testing.expect(default_max_pending_uni * bytes_per_entry < max_response_len);
     // And the fuzz model must stay below it, or the control goes unreachable
     // under fuzzing the way #749's segment cap did (FINDING F8).
     try testing.expect(fuzz_max_pending_uni < default_max_pending_uni);

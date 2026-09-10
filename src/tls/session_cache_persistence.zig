@@ -595,7 +595,7 @@ fn passthroughSeal(_: *anyopaque, plaintext: []const u8, out: []u8) ProtectError
     return out[0..plaintext.len];
 }
 fn passthroughOpen(_: *anyopaque, sealed: []const u8, out: []u8) ProtectError![]const u8 {
-    return passthroughSeal(undefined, sealed, out);
+    return passthroughSeal(&passthrough_dummy, sealed, out);
 }
 
 /// Single-slot in-memory backend for tests: `save` replaces the whole

@@ -3989,6 +3989,19 @@ pub const Connection = struct {
         return self.stream_transport_early.contains(id);
     }
 
+    /// Whether the peer has reset this stream (RESET_STREAM received).
+    ///
+    /// Consumed by `http3.Conn.pump()`'s accept loop so it does not create
+    /// request or pending-uni state for a stream that was already dead
+    /// before its first acceptance (#742). Reports `false` for an unknown
+    /// stream and before the handshake completes: neither is a stream this
+    /// endpoint has seen a reset for.
+    pub fn streamResetByPeer(self: *Connection, id: StreamId) bool {
+        var manager = self.streamManager() orelse return false;
+        const stream = manager.get(id) orelse return false;
+        return stream.reset_received;
+    }
+
     pub fn markStreamZeroRtt(self: *Connection, id: StreamId) !void {
         try self.stream_transport_early.put(id, {});
     }

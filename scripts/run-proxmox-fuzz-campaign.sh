@@ -25,6 +25,7 @@ PROXMOX_SSH_BIND="${PROXMOX_SSH_BIND:-10.250.250.1}"
 PROXMOX_VM_ID="${PROXMOX_VM_ID:-}"
 PROXMOX_VM_NAME="${PROXMOX_VM_NAME:-tardigrade-fuzz-${timestamp}}"
 PROXMOX_VM_IMAGE="${PROXMOX_VM_IMAGE:-https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2}"
+PROXMOX_VM_IMAGE_SHA256="${PROXMOX_VM_IMAGE_SHA256:-}"
 PROXMOX_STORAGE="${PROXMOX_STORAGE:-}"
 PROXMOX_BRIDGE="${PROXMOX_BRIDGE:-vmbr0}"
 PROXMOX_VM_IP="${PROXMOX_VM_IP:-dhcp}"
@@ -35,6 +36,7 @@ PROXMOX_MEMORY_MB="${PROXMOX_MEMORY_MB:-8192}"
 PROXMOX_DISK_GB="${PROXMOX_DISK_GB:-32}"
 TARDIGRADE_REF="${TARDIGRADE_REF:-HEAD}"
 ZIG_VERSION="${ZIG_VERSION:-0.16.0}"
+ZIG_SHA256="${ZIG_SHA256:-}"
 CAMPAIGN_TIER="${CAMPAIGN_TIER:-1}"
 CAMPAIGN_FAMILY="${CAMPAIGN_FAMILY:-quic}"
 CAMPAIGN_TARGET="${CAMPAIGN_TARGET:-}"
@@ -68,6 +70,7 @@ Proxmox:
   --vm-id ID                VMID (default: pvesh /cluster/nextid)
   --name NAME               VM name
   --vm-image PATH|URL       Debian cloud image
+  --vm-image-sha256 SHA256  Required expected digest for the cloud image
   --storage NAME            Proxmox image storage
   --bridge NAME             Network bridge
   --ip CIDR|dhcp            Guest IP config
@@ -80,6 +83,7 @@ Proxmox:
 Campaign (only meaningful with --start):
   --tardigrade-ref REF      Local ref to resolve and archive
   --zig-version VERSION     Expected Zig version
+  --zig-sha256 SHA256       Required expected digest for the Zig archive
   --tier 1|2|3
   --family FAMILY
   --campaign-target NAME    Exact fuzz target filter
@@ -118,6 +122,7 @@ while [[ $# -gt 0 ]]; do
     --vm-id) PROXMOX_VM_ID="$2"; shift 2 ;;
     --name) PROXMOX_VM_NAME="$2"; shift 2 ;;
     --vm-image) PROXMOX_VM_IMAGE="$2"; shift 2 ;;
+    --vm-image-sha256) PROXMOX_VM_IMAGE_SHA256="$2"; shift 2 ;;
     --storage) PROXMOX_STORAGE="$2"; shift 2 ;;
     --bridge) PROXMOX_BRIDGE="$2"; shift 2 ;;
     --ip) PROXMOX_VM_IP="$2"; shift 2 ;;
@@ -128,6 +133,7 @@ while [[ $# -gt 0 ]]; do
     --disk) PROXMOX_DISK_GB="$2"; shift 2 ;;
     --tardigrade-ref) TARDIGRADE_REF="$2"; shift 2 ;;
     --zig-version) ZIG_VERSION="$2"; shift 2 ;;
+    --zig-sha256) ZIG_SHA256="$2"; shift 2 ;;
     --tier) CAMPAIGN_TIER="$2"; shift 2 ;;
     --family) CAMPAIGN_FAMILY="$2"; shift 2 ;;
     --campaign-target) CAMPAIGN_TARGET="$2"; shift 2 ;;
@@ -175,6 +181,31 @@ rsync_from_pve() {
 }
 write_param() { printf '%s=' "$1" >>"$params_file"; printf '%q\n' "$2" >>"$params_file"; }
 
+collected_findings_are_complete() {
+  local campaign_status="$1" evidence_file
+  local preserved_failure_recorded=false
+  while IFS= read -r -d '' evidence_file; do
+    if grep -Eq '^(preserved_archive|finding_preservation)=FAILED$' "$evidence_file"; then
+      say "error: incomplete finding evidence recorded in $evidence_file" >&2
+      return 1
+    fi
+  done < <(find "$LOCAL_OUT_DIR" -type f -name provenance.txt -print0)
+  while IFS= read -r -d '' evidence_file; do
+    if grep -q '"preservation_status":"failed"' "$evidence_file"; then
+      say "error: failed finding preservation recorded in $evidence_file" >&2
+      return 1
+    fi
+    if grep -Eq '"status":"(fail|possible_hang)".*"preservation_status":"ok"' "$evidence_file"; then
+      preserved_failure_recorded=true
+    fi
+  done < <(find "$LOCAL_OUT_DIR" -type f -name manifest.jsonl -print0)
+  if [[ "$campaign_status" -ne 0 && "$preserved_failure_recorded" != true ]]; then
+    say "error: failed campaign has no manifest record proving its finding evidence was preserved" >&2
+    return 1
+  fi
+  return 0
+}
+
 if [[ "$MODE" == "collect" ]]; then
   [[ -n "$LOCAL_OUT_DIR" ]] || die "--out-dir is required for --collect"
   async_state="$LOCAL_OUT_DIR/async.env"
@@ -218,6 +249,7 @@ if [[ "$MODE" == "collect" ]]; then
   remote_status="$remote_exit_code"
 
   local_collection_ok=false
+  preservation_verified=false
   if [[ "${guest_allocated:-false}" == true && "${guest_reachable:-false}" == true ]]; then
     if rsync_from_pve "$REMOTE_STAGE/artifacts.tgz" "$artifact_tgz" &&
       scp_from_pve "$REMOTE_STAGE/proxmox-metadata.tgz" "$metadata_tgz" &&
@@ -225,11 +257,14 @@ if [[ "$MODE" == "collect" ]]; then
       tar -tzf "$artifact_tgz" >/dev/null &&
       tar -xzf "$artifact_tgz" -C "$LOCAL_OUT_DIR"; then
       local_collection_ok=true
+      if collected_findings_are_complete "$remote_status"; then
+        preservation_verified=true
+      fi
     fi
   fi
 
   destroy_guest=false
-  if [[ "${guest_allocated:-false}" == true && "$local_collection_ok" == true && "$KEEP_GUEST" != true ]]; then
+  if [[ "${guest_allocated:-false}" == true && "$local_collection_ok" == true && "$preservation_verified" == true && "$KEEP_GUEST" != true ]]; then
     if [[ "$remote_status" -eq 0 || "$KEEP_ON_FAILURE" != true ]]; then
       destroy_guest=true
     fi
@@ -244,7 +279,7 @@ if [[ "$MODE" == "collect" ]]; then
     fi
   fi
 
-  if [[ "$local_collection_ok" == true ]]; then
+  if [[ "$local_collection_ok" == true && "$preservation_verified" == true ]]; then
     # REMOTE_STAGE (source.tgz, orchestrate logs, and the collected
     # artifacts.tgz — potentially hundreds of MB, since it includes the
     # whole guest .zig-cache) is redundant once evidence is verified
@@ -256,6 +291,7 @@ if [[ "$MODE" == "collect" ]]; then
     ssh_pve "rm -rf $(printf '%q' "$REMOTE_STAGE")" || true
   fi
   [[ "$local_collection_ok" == true ]] || die "artifact collection failed before verified local copy; VM was left intact when allocated"
+  [[ "$preservation_verified" == true ]] || die "artifact collection contains an incompletely preserved finding; VM and remote stage were left intact"
   say "==> artifacts collected in $LOCAL_OUT_DIR"
   exit "$remote_status"
 fi
@@ -268,6 +304,8 @@ case "$REMOTE_STAGE" in
   *) die "unsafe REMOTE_STAGE" ;;
 esac
 [[ "$PROXMOX_VCPUS $PROXMOX_MEMORY_MB $PROXMOX_DISK_GB" =~ ^[0-9]+[[:space:]][0-9]+[[:space:]][0-9]+$ ]] || die "vcpus, memory, and disk must be positive integers"
+[[ "$PROXMOX_VM_IMAGE_SHA256" =~ ^[[:xdigit:]]{64}$ ]] || die "--vm-image-sha256 is required and must be exactly 64 hexadecimal characters"
+[[ "$ZIG_SHA256" =~ ^[[:xdigit:]]{64}$ ]] || die "--zig-sha256 is required and must be exactly 64 hexadecimal characters"
 
 mkdir -p "$LOCAL_OUT_DIR"
 src_tgz="$LOCAL_OUT_DIR/source.tgz"
@@ -287,6 +325,7 @@ fi
 write_param PROXMOX_VM_ID "$PROXMOX_VM_ID"
 write_param PROXMOX_VM_NAME "$PROXMOX_VM_NAME"
 write_param PROXMOX_VM_IMAGE "$PROXMOX_VM_IMAGE"
+write_param PROXMOX_VM_IMAGE_SHA256 "${PROXMOX_VM_IMAGE_SHA256,,}"
 write_param PROXMOX_STORAGE "$PROXMOX_STORAGE"
 write_param PROXMOX_BRIDGE "$PROXMOX_BRIDGE"
 write_param PROXMOX_VM_IP "$PROXMOX_VM_IP"
@@ -297,6 +336,7 @@ write_param PROXMOX_MEMORY_MB "$PROXMOX_MEMORY_MB"
 write_param PROXMOX_DISK_GB "$PROXMOX_DISK_GB"
 write_param TARDIGRADE_SHA "$TARDIGRADE_SHA"
 write_param ZIG_VERSION "$ZIG_VERSION"
+write_param ZIG_SHA256 "${ZIG_SHA256,,}"
 write_param CAMPAIGN_TIER "$CAMPAIGN_TIER"
 write_param CAMPAIGN_FAMILY "$CAMPAIGN_FAMILY"
 write_param CAMPAIGN_TARGET "$CAMPAIGN_TARGET"
@@ -401,6 +441,8 @@ collect_artifacts() {
     printf 'guest_ip=%s\n' "$guest_ip"
     printf 'tardigrade_sha=%s\n' "$TARDIGRADE_SHA"
     printf 'source_archive_sha256=%s\n' "$(awk '{print $1}' "$REMOTE_STAGE/source.tgz.sha256")"
+    printf 'vm_image_sha256=%s\n' "$image_sha256"
+    printf 'zig_archive_sha256=%s\n' "$ZIG_SHA256"
     printf 'pveversion<<EOF\n'; pveversion -v 2>&1 || true; printf 'EOF\n'
     printf 'host_uname<<EOF\n'; uname -a; printf 'EOF\n'
     printf 'host_lscpu<<EOF\n'; lscpu 2>&1 || true; printf 'EOF\n'
@@ -434,6 +476,7 @@ require_tool pvesm
 require_tool pvesh
 require_tool ssh-keygen
 require_tool curl
+require_tool sha256sum
 
 guest_id="$(next_guest_id)"
 [[ "$guest_id" =~ ^[0-9]+$ ]] || die "invalid VM id: $guest_id"
@@ -448,6 +491,8 @@ if [[ "$PROXMOX_VM_IMAGE" =~ ^https?:// ]]; then
 else
   image_path="$PROXMOX_VM_IMAGE"
 fi
+image_sha256="$(sha256sum "$image_path" | awk '{print $1}')"
+[[ "$image_sha256" == "$PROXMOX_VM_IMAGE_SHA256" ]] || die "cloud image sha256 mismatch: expected $PROXMOX_VM_IMAGE_SHA256, got $image_sha256"
 
 snippets_storage="$PROXMOX_SNIPPETS_STORAGE"
 if [[ -z "$snippets_storage" ]]; then
@@ -522,7 +567,9 @@ run_guest "set -euo pipefail
 mkdir -p /work/Tardigrade /opt/zig
 cd /root && sha256sum -c source.tgz.sha256
 tar -C /work/Tardigrade -xzf /root/source.tgz
-curl -fsSL https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz | tar -C /opt/zig --strip-components=1 -xJ
+curl -fsSL https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz -o /root/zig.tar.xz
+printf '%s  %s\n' '$ZIG_SHA256' /root/zig.tar.xz | sha256sum -c -
+tar -C /opt/zig --strip-components=1 -xJf /root/zig.tar.xz
 ln -sf /opt/zig/zig /usr/local/bin/zig
 cd /work/Tardigrade
 test \"\$(zig version)\" = \"$ZIG_VERSION\"

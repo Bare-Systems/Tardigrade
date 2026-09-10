@@ -7,6 +7,7 @@ repo="$(cd "$here/.." && pwd)"
 cd "$repo"
 
 EXPECTED_ZIG_VERSION="${EXPECTED_ZIG_VERSION:-0.16.0}"
+FUZZ_ARCHIVER="${FUZZ_ARCHIVER:-tar}"
 
 tier=""
 family=""
@@ -390,20 +391,35 @@ crash_hash_of() {
 # Reads $family/$step/$filter/$head_sha/$status/$exit_code/$target/
 # $command_file/$stdout_log/$stderr_log from the calling run_one_attempt
 # invocation via bash's dynamic scoping (they're all `local` there, but
-# still visible down the call stack while it's running). Prints the
-# crash's sha256 (or nothing) on stdout for the caller to capture.
+# still visible down the call stack while it's running). $4 names the caller
+# variable that receives the crash's sha256; avoiding command substitution is
+# security-significant because bash otherwise clears `errexit` inside the
+# function and can turn failed evidence copies into a successful assignment.
 write_finding() {
-  local dir="$1" crash_input="$2" test_name="$3" sha=""
-  mkdir -p "$dir"
-  cp "$command_file" "$dir/command.txt"
-  cp "$stdout_log" "$dir/stdout.log"
-  cp "$stderr_log" "$dir/stderr.log"
+  local dir="$1" crash_input="$2" test_name="$3" out_var="$4" sha=""
+  local finding_status="ok"
+  printf -v "$out_var" '%s' ""
+  mkdir -p "$dir" || return 1
+  cp "$command_file" "$dir/command.txt" || finding_status="FAILED"
+  cp "$stdout_log" "$dir/stdout.log" || finding_status="FAILED"
+  cp "$stderr_log" "$dir/stderr.log" || finding_status="FAILED"
   if [[ -n "$crash_input" && -s "$crash_input" ]]; then
-    cp "$crash_input" "$dir/crash-input.bin"
-    if command -v sha256sum >/dev/null 2>&1; then
-      sha="$(sha256sum "$dir/crash-input.bin" | awk '{print $1}')"
+    if cp "$crash_input" "$dir/crash-input.bin"; then
+      if command -v sha256sum >/dev/null 2>&1; then
+        if ! sha="$(sha256sum "$dir/crash-input.bin" | awk '{print $1}')"; then
+          finding_status="FAILED"
+        fi
+      else
+        if ! sha="$(shasum -a 256 "$dir/crash-input.bin" | awk '{print $1}')"; then
+          finding_status="FAILED"
+        fi
+      fi
+      if [[ ! "$sha" =~ ^[[:xdigit:]]{64}$ ]]; then
+        finding_status="FAILED"
+        sha=""
+      fi
     else
-      sha="$(shasum -a 256 "$dir/crash-input.bin" | awk '{print $1}')"
+      finding_status="FAILED"
     fi
   fi
   # Preserve the fuzzer's state. What counts as "the fuzzer's state" depends
@@ -438,7 +454,7 @@ write_finding() {
     preserve_scope="complete .zig-cache (exact crash bytes were not recovered)"
   fi
   if ((${#preserve_paths[@]} > 0)); then
-    if ! tar -czf "$dir/zig-cache-preserved.tgz" "${preserve_paths[@]}" 2>"$dir/zig-cache-preserved.err"; then
+    if ! "$FUZZ_ARCHIVER" -czf "$dir/zig-cache-preserved.tgz" "${preserve_paths[@]}" 2>"$dir/zig-cache-preserved.err"; then
       rm -f "$dir/zig-cache-preserved.tgz"
       preserve_status="FAILED"
     else
@@ -446,7 +462,9 @@ write_finding() {
     fi
   else
     preserve_scope="none (no .zig-cache present)"
+    preserve_status="FAILED"
   fi
+  if [[ "$preserve_status" == "FAILED" ]]; then finding_status="FAILED"; fi
   {
     printf 'family=%s\n' "$family"
     printf 'build_step=%s\n' "$step"
@@ -460,30 +478,32 @@ write_finding() {
     printf '\n'
     printf 'preserved_scope=%s\n' "$preserve_scope"
     printf 'preserved_archive=%s\n' "$preserve_status"
-    if [[ "$preserve_status" == "FAILED" ]]; then
-      printf 'note=%s\n' 'WARNING: preserving the fuzzer state FAILED (see zig-cache-preserved.err). This row must NOT be treated as safely collected and its guest must NOT be destroyed: the only remaining fuzzer state may be on the guest.'
+    printf 'finding_preservation=%s\n' "$finding_status"
+    if [[ "$finding_status" == "FAILED" ]]; then
+      printf 'note=%s\n' 'WARNING: preserving required finding evidence FAILED. This row must NOT be treated as safely collected and its guest must NOT be destroyed: the only remaining evidence may be on the guest. Check zig-cache-preserved.err and the runner stderr.'
     elif [[ -n "$sha" ]]; then
       printf 'crash_input_sha256=%s\n' "$sha"
       printf 'note=%s\n' 'crash-input.bin holds the exact saved fuzz input byte-for-byte; Zig fuzzer state (.zig-cache/f corpus+crash, and .zig-cache/v coverage when present) was preserved alongside it. Compiled build output is regenerable from source_commit_sha and is deliberately not retained.'
     else
       printf 'note=%s\n' 'Exact Zig crash input path was not inferred automatically, so the COMPLETE .zig-cache was preserved for deliberate recovery, per #739.'
     fi
-  } >"$dir/provenance.txt"
-  printf '%s' "$sha"
+  } >"$dir/provenance.txt" || return 1
+  printf -v "$out_var" '%s' "$sha"
+  [[ "$finding_status" == "ok" ]]
 }
 
-# $1=finding_dir_or_empty $2=finding_sha_json. Reads the rest
+# $1=finding_dir_or_empty $2=finding_sha_json $3=preservation_status. Reads the rest
 # ($started_utc/$ended_utc/$elapsed/$execs_per_sec/$status/$exit_code/
 # $stdout_log/$stderr_log, plus $family/$step/$filter/$budget/
 # $budget_mutations/$head_sha) from run_one_attempt via dynamic scoping.
 append_manifest_line() {
-  local fdir="$1" fsha="$2" finding_path_json="null"
+  local fdir="$1" fsha="$2" preservation_status="$3" finding_path_json="null"
   if [[ -n "$fdir" ]]; then finding_path_json="\"$(json_escape "$fdir")\""; fi
-  printf '{"campaign_id":"%s","started_utc":"%s","ended_utc":"%s","source_commit_sha":"%s","zig_version":"%s","os_arch":"%s/%s","cpu":"%s","family":"%s","build_step":"%s","filter":"%s","budget":"%s","budget_mutations":%s,"optimize":"ReleaseFast","elapsed_seconds":%s,"executions_per_second":%s,"status":"%s","exit_code":%s,"finding_path":%s,"finding_sha256":%s,"stdout_path":"%s","stderr_path":"%s"}\n' \
+  printf '{"campaign_id":"%s","started_utc":"%s","ended_utc":"%s","source_commit_sha":"%s","zig_version":"%s","os_arch":"%s/%s","cpu":"%s","family":"%s","build_step":"%s","filter":"%s","budget":"%s","budget_mutations":%s,"optimize":"ReleaseFast","elapsed_seconds":%s,"executions_per_second":%s,"status":"%s","exit_code":%s,"finding_path":%s,"finding_sha256":%s,"preservation_status":"%s","stdout_path":"%s","stderr_path":"%s"}\n' \
     "$(json_escape "$campaign_id")" "$started_utc" "$ended_utc" "$head_sha" "$(json_escape "$(zig version)")" "$(json_escape "$(uname -s)")" "$(json_escape "$(uname -m)")" \
     "$(json_escape "$(cpu_identity)")" \
     "$(json_escape "$family")" "$(json_escape "$step")" "$(json_escape "$filter")" "$(json_escape "$budget")" "$budget_mutations" "$elapsed" "$execs_per_sec" "$status" "$exit_code" \
-    "$finding_path_json" "$fsha" "$(json_escape "$stdout_log")" "$(json_escape "$stderr_log")" >>"$manifest"
+    "$finding_path_json" "$fsha" "$preservation_status" "$(json_escape "$stdout_log")" "$(json_escape "$stderr_log")" >>"$manifest"
 }
 
 # Tier 1 "family-wide" rows historically ran every one of a family's fuzz
@@ -705,6 +725,7 @@ run_one_attempt() {
 EOF2
 
   local finding_sha finding_sha_json
+  local preservation_failed=false
   if [[ "$crash_snapshot_count" -gt 0 ]]; then
     local i idx snap_bin snap_name_file snap_test_name finding_slug this_finding_dir
     i=1
@@ -716,21 +737,36 @@ EOF2
       if [[ -f "$snap_name_file" ]]; then snap_test_name="$(cat "$snap_name_file")"; fi
       finding_slug="${snap_test_name:-$filter}"
       this_finding_dir="$output/findings/${family}__$(slugify "$finding_slug")/${attempt_id}-${idx}"
-      finding_sha="$(write_finding "$this_finding_dir" "$snap_bin" "$snap_test_name")"
+      finding_sha=""
+      local finding_preservation_status="ok"
+      if ! write_finding "$this_finding_dir" "$snap_bin" "$snap_test_name" finding_sha; then
+        finding_preservation_status="failed"
+        preservation_failed=true
+      fi
       finding_sha_json="null"
       if [[ -n "$finding_sha" ]]; then finding_sha_json="\"$(json_escape "$finding_sha")\""; fi
-      append_manifest_line "$this_finding_dir" "$finding_sha_json"
-      say "==> $status: finding $i/$crash_snapshot_count (${snap_test_name:-unknown test}) preserved under $this_finding_dir"
+      append_manifest_line "$this_finding_dir" "$finding_sha_json" "$finding_preservation_status"
+      say "==> $status: finding $i/$crash_snapshot_count (${snap_test_name:-unknown test}) preservation=$finding_preservation_status under $this_finding_dir"
       i=$((i + 1))
     done
   elif [[ "$status" != "pass" ]]; then
-    finding_sha="$(write_finding "$finding_dir" "$fuzz_crash_input" "")"
+    finding_sha=""
+    local finding_preservation_status="ok"
+    if ! write_finding "$finding_dir" "$fuzz_crash_input" "" finding_sha; then
+      finding_preservation_status="failed"
+      preservation_failed=true
+    fi
     finding_sha_json="null"
     if [[ -n "$finding_sha" ]]; then finding_sha_json="\"$(json_escape "$finding_sha")\""; fi
-    append_manifest_line "$finding_dir" "$finding_sha_json"
-    say "==> $status: preserved logs/state under $finding_dir"
+    append_manifest_line "$finding_dir" "$finding_sha_json" "$finding_preservation_status"
+    say "==> $status: preservation=$finding_preservation_status under $finding_dir"
   else
-    append_manifest_line "" "null"
+    append_manifest_line "" "null" "not_required"
+  fi
+
+  if $preservation_failed; then
+    say "error: required finding evidence could not be preserved; leaving the campaign environment intact" >&2
+    return 125
   fi
 
   if [[ "$status" != "pass" ]]; then

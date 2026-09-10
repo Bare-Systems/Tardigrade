@@ -220,6 +220,7 @@ pub const Response = struct {
 ///   writeStream(id, bytes, fin) !usize
 ///   readStream(id, buf) !{ len: usize, fin: bool, ... }
 ///   acceptStream() ?u64
+///   streamResetByPeer(id) bool
 pub fn Conn(comptime Transport: type) type {
     return struct {
         const Self = @This();
@@ -316,16 +317,15 @@ pub fn Conn(comptime Transport: type) type {
             return false;
         }
 
-        /// Whether the peer has already reset this stream (#742).
-        ///
-        /// Optional on the transport, like `streamTransportEarly`: a
-        /// transport that cannot answer reports `false`, which preserves the
-        /// previous behaviour exactly rather than silently changing it.
+        /// Whether the peer has already reset this stream (#742). This is a
+        /// required part of `Conn`'s transport contract: silently defaulting
+        /// to false would disable the accept-loop hardening for a future
+        /// transport while leaving that transport apparently compatible.
         fn transportStreamResetByPeer(transport: *Transport, stream_id: u64) bool {
-            if (comptime @hasDecl(Transport, "streamResetByPeer")) {
-                return transport.streamResetByPeer(stream_id);
+            if (comptime !@hasDecl(Transport, "streamResetByPeer")) {
+                @compileError("http3.Conn transport must implement streamResetByPeer(id) bool");
             }
-            return false;
+            return transport.streamResetByPeer(stream_id);
         }
 
         fn rejectRequestStream(transport: *Transport, stream_id: u64) void {
@@ -2804,6 +2804,45 @@ const reserved_uni_credit: usize = 6;
 /// (`reserved_uni_credit`) and still leaves op 3 able to cross it.
 const fuzz_max_pending_uni: usize = 8;
 
+const ModelPendingUni = struct {
+    ids: [fuzz_max_pending_uni]u64 = undefined,
+    len: usize = 0,
+
+    fn contains(self: *const ModelPendingUni, id: u64) bool {
+        for (self.ids[0..self.len]) |candidate| {
+            if (candidate == id) return true;
+        }
+        return false;
+    }
+
+    fn add(self: *ModelPendingUni, id: u64) !void {
+        try testing.expect(!self.contains(id));
+        try testing.expect(self.len < self.ids.len);
+        self.ids[self.len] = id;
+        self.len += 1;
+    }
+
+    fn remove(self: *ModelPendingUni, id: u64) !void {
+        for (self.ids[0..self.len], 0..) |candidate, index| {
+            if (candidate != id) continue;
+            self.len -= 1;
+            self.ids[index] = self.ids[self.len];
+            return;
+        }
+        try testing.expect(false);
+    }
+};
+
+fn modelPeerUniId(is_client: bool, ordinal: u64) u64 {
+    const base: u64 = if (is_client) 0 else 1;
+    return base + 2 + ordinal * 4;
+}
+
+fn expectPendingUniMatchesModel(conn: anytype, model: *const ModelPendingUni) !void {
+    try testing.expectEqual(model.len, @as(usize, conn.pending_uni.count()));
+    for (model.ids[0..model.len]) |id| try testing.expect(conn.pending_uni.contains(id));
+}
+
 fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
     const allocator = testing.allocator;
     var peer_transport = MockTransport.init(allocator, role == .server);
@@ -2825,6 +2864,10 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
     var peer_qpack_encoder: ?u64 = null;
     var peer_qpack_decoder: ?u64 = null;
     var peer_request: ?u64 = null;
+    // Independent occupancy oracle for `pending_uni`. This is deliberately
+    // model-owned: the SUT's map may confirm the model after an operation, but
+    // it may not justify superseding that operation's expected result.
+    var model_pending_uni = ModelPendingUni{};
     var pos: usize = 0;
     while (pos < input.len) {
         const op = input[pos];
@@ -2833,6 +2876,10 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
         const before_settings = conn.peer_control_view.saw_settings;
         const before_requests = conn.requests.count();
         const before_uni_rejections = conn.metrics.pending_uni_rejections;
+        const before_model_pending_uni = model_pending_uni;
+        if (before_close == null) {
+            try expectPendingUniMatchesModel(&conn, &model_pending_uni);
+        }
         // Model-side witness, independent of anything the connection reports:
         // `next_uni` is a monotonic count of peer unidirectional streams this
         // transport has ever opened, so a change means *the model* really did
@@ -2840,9 +2887,11 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
         // increments cannot be evidence that the connection was right to
         // increment it (raised in review on #755).
         const before_peer_next_uni = peer_transport.next_uni;
+        var model_uni_ignored_before_accept: ?u64 = null;
+        var model_uni_retired_after_accept: ?u64 = null;
         var expected_close: ?ErrorCode = null;
 
-        const result = switch (op % 25) {
+        const result = switch (op % 27) {
             0 => blk: {
                 // A refusal here is the transport correctly withholding stream
                 // credit, which a real peer would also hit; skip the op rather
@@ -3122,7 +3171,7 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                 if (!try writePeerUni(&peer_transport, .control, invalidClientGoawayBytes()[0..], false, &peer_control)) break :blk conn.pump(&local_transport);
                 break :blk conn.pump(&local_transport);
             },
-            else => blk: {
+            24 => blk: {
                 if (peer_qpack_decoder == null and before_close == null) {
                     // A refusal here is the transport correctly withholding stream
                     // credit, which a real peer would also hit; skip the op rather
@@ -3142,6 +3191,39 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                 }
                 expected_close = .closed_critical_stream;
                 if (peer_qpack_decoder) |id| try local_transport.resetStreamForTest(id);
+                break :blk conn.pump(&local_transport);
+            },
+            25 => blk: {
+                // A non-critical uni stream that reaches FIN in this pump is
+                // inserted, drained, and retired. Keeping this lifecycle in
+                // the fuzz model prevents its independent occupancy count from
+                // degenerating into a monotonic-open counter.
+                if (peer_transport.uniCreditInUse() + reserved_uni_credit >= peer_transport.max_uni_streams)
+                    break :blk conn.pump(&local_transport);
+                const id = peer_transport.openStream(.uni) catch |err| switch (err) {
+                    error.StreamLimitReached => break :blk conn.pump(&local_transport),
+                    else => return err,
+                };
+                var bytes: [16]u8 = undefined;
+                const typ_len = try varint.encode(0x21, &bytes);
+                _ = try peer_transport.writeStream(id, bytes[0..typ_len], true);
+                model_uni_retired_after_accept = id;
+                break :blk conn.pump(&local_transport);
+            },
+            else => blk: {
+                // Reset-before-accept streams never become pending H3 state and
+                // therefore are not candidates for the ceiling calculation.
+                if (peer_transport.uniCreditInUse() + reserved_uni_credit >= peer_transport.max_uni_streams)
+                    break :blk conn.pump(&local_transport);
+                const id = peer_transport.openStream(.uni) catch |err| switch (err) {
+                    error.StreamLimitReached => break :blk conn.pump(&local_transport),
+                    else => return err,
+                };
+                var bytes: [16]u8 = undefined;
+                const typ_len = try varint.encode(0x21, &bytes);
+                _ = try peer_transport.writeStream(id, bytes[0..typ_len], false);
+                try local_transport.resetStreamForTest(id);
+                model_uni_ignored_before_accept = id;
                 break :blk conn.pump(&local_transport);
             },
         };
@@ -3164,20 +3246,41 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
         // off-by-one or premature guard could bump the counter, return
         // H3_EXCESSIVE_LOAD, and have the model accept it while silently
         // dropping whatever mismatch this op was built to detect. So every
-        // condition below is checked independently of the connection's own
-        // verdict:
+        // model must first predict the close independently of the connection's
+        // own verdict:
         //
         //   * exactly ONE rejection this op -- not "at least one";
-        //   * the map is AT the configured ceiling, never below it, so a
-        //     guard that fires early fails here instead of being accepted;
-        //   * the model itself really opened a peer uni stream this op,
-        //     witnessed by the mock's monotonic `next_uni`, so a rejection
-        //     invented with no new stream to reject is a failure.
+        //   * model-owned pending occupancy plus model-opened eligible streams
+        //     must cross the model's ceiling;
+        //   * the SUT map is then checked at the configured ceiling as a
+        //     consistency postcondition, not as evidence that the close was
+        //     justified.
         const uni_ceiling_fired = conn.metrics.pending_uni_rejections > before_uni_rejections;
+        const model_opened_uni_this_op: usize = @intCast(peer_transport.next_uni - before_peer_next_uni);
+        var model_ceiling_candidates: usize = 0;
+        for (0..model_opened_uni_this_op) |offset| {
+            const id = modelPeerUniId(peer_transport.is_client, before_peer_next_uni + @as(u64, @intCast(offset)));
+            if (id != model_uni_ignored_before_accept) model_ceiling_candidates += 1;
+        }
         if (uni_ceiling_fired) {
             try testing.expectEqual(before_uni_rejections + 1, conn.metrics.pending_uni_rejections);
-            try testing.expect(peer_transport.next_uni > before_peer_next_uni);
-            try testing.expectEqual(conn.max_pending_uni, conn.pending_uni.count());
+            // The model, not the SUT, must predict that the newly opened
+            // streams cross the ceiling. This rejects a SUT that reaches the
+            // configured count early through a leak, duplicate, or phantom
+            // entry and then tries to use that count to certify its own close.
+            try testing.expect(modelExpectsPendingUniCeiling(
+                before_model_pending_uni.len,
+                model_ceiling_candidates,
+                fuzz_max_pending_uni,
+            ));
+            var model_at_ceiling = before_model_pending_uni;
+            for (0..model_opened_uni_this_op) |offset| {
+                if (model_at_ceiling.len == fuzz_max_pending_uni) break;
+                const id = modelPeerUniId(peer_transport.is_client, before_peer_next_uni + @as(u64, @intCast(offset)));
+                if (id == model_uni_ignored_before_accept) continue;
+                try model_at_ceiling.add(id);
+            }
+            try expectPendingUniMatchesModel(&conn, &model_at_ceiling);
             try testing.expect(before_close == null);
             try testing.expectError(error.ProtocolError, result);
             try testing.expectEqual(ErrorCode.excessive_load, conn.close_code.?);
@@ -3187,6 +3290,15 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                 try testing.expect(conn.close_code != null);
                 try testing.expectEqual(code.wire(), conn.closeCode());
             };
+            if (conn.close_code == null) {
+                for (0..model_opened_uni_this_op) |offset| {
+                    const id = modelPeerUniId(peer_transport.is_client, before_peer_next_uni + @as(u64, @intCast(offset)));
+                    if (id == model_uni_ignored_before_accept) continue;
+                    try model_pending_uni.add(id);
+                }
+                if (model_uni_retired_after_accept) |id| try model_pending_uni.remove(id);
+                try expectPendingUniMatchesModel(&conn, &model_pending_uni);
+            }
             try expectH3ConnInvariants(&conn, role, before_settings, before_requests);
         } else |err| {
             try testing.expect(err == error.ProtocolError or err == error.OutOfMemory);
@@ -3195,6 +3307,11 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
             if (expected_close) |code| if (before_close == null) try testing.expectEqual(code.wire(), conn.closeCode());
         }
     }
+}
+
+fn modelExpectsPendingUniCeiling(before_count: usize, opened_this_op: usize, ceiling: usize) bool {
+    if (opened_this_op == 0 or before_count > ceiling) return false;
+    return opened_this_op > ceiling - before_count;
 }
 
 /// Returns false when the peer holds no unidirectional stream credit, so the
@@ -3589,6 +3706,26 @@ test "H3 conn-state fuzz model accepts a ceiling-tripping op sequence" {
     // and every assertion inside it execute. A false positive in that branch
     // fails here, deterministically, in milliseconds.
     const input = [_]u8{3} ** 16;
+    try runH3ConnStateCommands(&input, .server);
+    try runH3ConnStateCommands(&input, .client);
+}
+
+test "H3 conn-state ceiling oracle rejects SUT-only occupancy" {
+    // A correct close is predicted from model occupancy plus model-opened
+    // streams, including an op that queues two streams and crosses the limit
+    // on the second one.
+    try testing.expect(modelExpectsPendingUniCeiling(8, 1, 8));
+    try testing.expect(modelExpectsPendingUniCeiling(7, 2, 8));
+
+    // A SUT map that claims it is full after only four model-owned entries may
+    // not supersede the op's expected result. The previous oracle accepted
+    // this whenever the SUT also reported count == 8.
+    try testing.expect(!modelExpectsPendingUniCeiling(4, 1, 8));
+    try testing.expect(!modelExpectsPendingUniCeiling(8, 0, 8));
+}
+
+test "H3 conn-state model tracks finished and reset-before-accept uni streams" {
+    const input = [_]u8{ 25, 26 } ** 8;
     try runH3ConnStateCommands(&input, .server);
     try runH3ConnStateCommands(&input, .client);
 }

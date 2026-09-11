@@ -21,7 +21,19 @@ All notable user-facing changes to Tardigrade are documented here.
   out-of-range hours, and device request authentication uses the documented
   HMAC-SHA256 construction with constant-time MAC verification. Policy regex
   compilation/execution failures and invalid approval booleans also deny the
-  request instead of silently skipping the affected rule.
+  request instead of silently skipping the affected rule. Configured ACL and
+  HSTS state is now prepared transactionally for startup/reload rather than
+  being disabled on parse/allocation failure. Policy enforcement now runs on
+  the production H1, H2, and H3 paths; denied H1 bodies are never mirrored,
+  valid identities satisfy H2/H3 required-auth locations, and H3 ACL/rate-limit
+  decisions use the QUIC transport peer rather than a spoofable `X-Real-IP`.
+  Malformed policy/scope/approval mappings fail configuration validation.
+  SMTP/IMAP upstream TLS now verifies hostname and CA without permitting
+  truncation, mail replies are bounded, UDP proxy reads have deadlines, and
+  memcached JSON/TTL parsing rejects invalid input without traps or leaks.
+  Failed session/approval persistence also removes its owner-only temporary
+  credential file instead of leaving secret material behind after sync/rename
+  errors.
 
 - **Secret zeroization is now materially faster on x86_64, and the
   guarantee is now Tardigrade-owned (#675)** — `crypto.secrets.secureZero`

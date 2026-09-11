@@ -56,6 +56,7 @@ pub fn persist(
     }
 
     std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
+    errdefer std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
     {
         const f = try std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{
             .truncate = true,
@@ -194,4 +195,24 @@ test "approval persistence creates owner-only credential storage" {
     defer file.close(compat.io());
     const stat = try file.stat(compat.io());
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+}
+
+test "approval persistence removes credential temp file when rename fails" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const path = try std.fmt.allocPrint(allocator, "{s}/destination", .{tmp_abs});
+    defer allocator.free(path);
+    try std.Io.Dir.createDirAbsolute(compat.io(), path, .default_dir);
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}.{d}.tmp", .{ path, std.c.getpid() });
+    defer allocator.free(temp_path);
+
+    var failed = false;
+    persist(allocator, path, &.{}) catch {
+        failed = true;
+    };
+    try std.testing.expect(failed);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(compat.io(), temp_path, .{}));
 }

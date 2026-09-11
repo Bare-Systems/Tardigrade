@@ -520,6 +520,11 @@ fn minimalAuthConfig(blocks: []http.location_router.LocationBlock, token_hashes:
     cfg.location_blocks = blocks;
     cfg.metrics_path = "/status/metrics";
     cfg.mirror_rules = &.{};
+    cfg.geo_blocked_countries = &.{};
+    cfg.geo_country_header = "x-country-code";
+    cfg.policy_rules_raw = "";
+    cfg.policy_user_scopes_raw = "";
+    cfg.policy_approval_routes_raw = "";
     return cfg;
 }
 
@@ -565,6 +570,9 @@ fn minimalHttp3ProxyConfig(blocks: []http.location_router.LocationBlock) edge_co
 
 fn initHttp3ProxyTestState(state: *GatewayState, allocator: std.mem.Allocator, add_headers: []const edge_config.EdgeConfig.HeaderPair) void {
     initHandlerTestState(state, allocator, add_headers);
+    state.rate_limiter_mutex = .{};
+    state.rate_limiter = null;
+    state.access_control = null;
     state.circuit_mutex = .{};
     state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{});
     state.upstream_mutex = .{};
@@ -1731,6 +1739,8 @@ pub const Http3DispatchContext = struct {
     cfg: *const edge_config.EdgeConfig,
     cfg_lease: ?*gs.ConfigLease = null,
     state: *GatewayState,
+    client_ip: []const u8 = "unknown",
+    authenticated: bool = false,
 };
 
 const Http3LocationOutcome = union(enum) {
@@ -2390,7 +2400,7 @@ fn handleHttp3LocationProxyPass(
         .headers = &request.headers,
         .body = request.body,
         .correlation_id = correlation_id,
-        .client_ip = request.headers.get("x-real-ip") orelse "unknown",
+        .client_ip = ctx.client_ip,
         .forwarded_proto = if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
         .incoming_host = request.headers.get(":authority") orelse request.headers.get("host"),
         .selection_base_url = ctx.cfg.upstream_base_url,
@@ -3098,7 +3108,7 @@ fn routeHttp3Location(
 
     const split = splitHttp3PathAndQuery(request.path);
     const request_query = split[1];
-    if (matched.block.auth == .required) {
+    if (matched.block.auth == .required and !ctx.authenticated) {
         try rejectHttp3AuthRequiredLocation(allocator, response, ctx, correlation_id);
         return .handled;
     }
@@ -3749,6 +3759,132 @@ test "h3 proxy early 425 parks and resumes exact ordinary continuation" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"success\"} 1") != null);
 }
 
+test "H3 ACL uses the transport peer address instead of spoofable X-Real-IP" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/private",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "must-not-run" } },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    state.access_control = try http.access_control.AccessControl.fromConfig(
+        allocator,
+        "deny 127.0.0.1/32, allow 0.0.0.0/0",
+        .allow,
+    );
+    defer if (state.access_control) |*acl| acl.deinit();
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/private"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+    };
+    defer request.deinit();
+    try request.headers.append("x-real-ip", "203.0.113.9");
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.find(u8, response.body orelse "", "Access denied") != null);
+}
+
+test "H3 production dispatch enforces configured scope policy" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/sensitive",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "must-not-run" } },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.policy_rules_raw = "POST|^/sensitive$|commands.execute|false||";
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "POST"),
+        .path = try allocator.dupe(u8, "/sensitive"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.dupe(u8, "secret"),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.find(u8, response.body orelse "", "Missing required scope") != null);
+}
+
+test "H3 production dispatch accepts valid bearer auth for required location" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/private",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "authenticated-h3-ok" } },
+        .auth = .required,
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    var token_hashes = [_][]const u8{"521bc8ca01307d0189b55a19da738e39c7204f7077e0076e803026e32b2f9383"};
+    cfg.auth_token_hashes = token_hashes[0..];
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/private"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+    };
+    defer request.deinit();
+    try request.headers.append("authorization", "Bearer integration-token");
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("authenticated-h3-ok", response.body orelse "");
+}
+
 test "h3 proxy parked early 425 forwards second 425 without third delivery" {
     const allocator = std.testing.allocator;
     var origin = try H3ProxyOrigin.start(allocator, &.{ 425, 425, 200 });
@@ -4201,6 +4337,68 @@ pub fn handleHttp3Request(
     var effective_ctx = ctx.*;
     effective_ctx.cfg = effective_cfg;
     effective_ctx.cfg_lease = &cfg_lease;
+    effective_ctx.client_ip = request.client_ip orelse "unknown";
+
+    // Preserve the H1 invariant that replay rejection happens before auth,
+    // rate-limit, approval, or upstream side effects. The normal H3 router
+    // owns response shaping and metrics for this decision, so hand rejected
+    // requests to it immediately; accepted/ordinary requests continue into
+    // the shared security gates below.
+    const preflight_path = splitHttp3PathAndQuery(request.path)[0];
+    const preflight_early = http.request_context.EarlyDataContext{
+        .transport_early = request.transport_early,
+        .inbound_marker = request.headers.hasEarlyDataMarker(),
+        .downstream_handshake = .{
+            .ctx = @constCast(request),
+            .is_complete_fn = h3RequestHandshakeComplete,
+            .wait_or_drive_fn = h3RequestDriveHandshake,
+        },
+    };
+    const preflight_decision = earlyDataDecisionForRawMethod(
+        allocator,
+        effective_cfg,
+        preflight_early,
+        request.method,
+        preflight_path,
+        request.body.len != 0,
+    );
+    if (preflight_decision == .too_early or preflight_decision == .defer_until_handshake) {
+        return handleHttp3Connection(allocator, request, response, &effective_ctx);
+    }
+
+    const correlation_id = request.headers.get(http.correlation.REQUEST_HEADER_NAME) orelse request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+    var request_ctx = http.request_context.RequestContext.init(allocator, correlation_id, request.client_ip orelse "unknown");
+    defer {
+        if (request_ctx.identity) |value| allocator.free(value);
+        if (request_ctx.user_id) |value| allocator.free(value);
+        if (request_ctx.device_id) |value| allocator.free(value);
+        if (request_ctx.scopes) |value| allocator.free(value);
+    }
+    try primeRequestAuthContext(allocator, effective_cfg, ctx.state, &request_ctx, &request.headers);
+    effective_ctx.client_ip = request_ctx.client_ip;
+    effective_ctx.authenticated = request_ctx.authenticated or request_ctx.identity != null;
+
+    if (effective_cfg.geo_blocked_countries.len > 0 and isGeoBlocked(effective_cfg.geo_blocked_countries, request.headers.get(effective_cfg.geo_country_header))) {
+        try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, "forbidden", "Geo access denied", correlation_id);
+        return;
+    }
+    if (ctx.state.access_control) |*acl| {
+        if (acl.check(request_ctx.client_ip) == .denied) {
+            try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, "forbidden", "Access denied", correlation_id);
+            return;
+        }
+    }
+    var rate_limit_buf: [192]u8 = undefined;
+    if (!ctx.state.rateLimitAllow(rateLimitDescriptor(request_ctx.identity, request_ctx.client_ip, &rate_limit_buf))) {
+        try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .too_many_requests, "rate_limited", "Rate limit exceeded", correlation_id);
+        _ = response.setHeader("retry-after", "1");
+        return;
+    }
+    const policy_path = splitHttp3PathAndQuery(request.path)[0];
+    if (ga.evaluatePolicy(ctx.state, effective_cfg, request.method, policy_path, request_ctx.identity, request_ctx.device_id, &request.headers)) |reason| {
+        try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, "forbidden", reason, correlation_id);
+        return;
+    }
     try handleHttp3Connection(allocator, request, response, &effective_ctx);
 }
 

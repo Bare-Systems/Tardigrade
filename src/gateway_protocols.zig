@@ -7,6 +7,7 @@ const GatewayState = gs.GatewayState;
 const gp = @import("gateway_proxy.zig");
 const sendApiError = gp.sendApiError;
 const applyResponseHeaders = gp.applyResponseHeaders;
+const max_mail_reply_bytes: usize = 1024 * 1024;
 
 fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) !void {
     const recv_tv = std.posix.timeval{
@@ -655,14 +656,12 @@ fn executeSmtpTlsRequest(
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
-    _ = host;
-    var tls_client = try std.crypto.tls.Client.init(stream, .{
-        .host = .no_verification,
-        .ca = .no_verification,
+    var tls_client = try http.upstream_tls.UpstreamTlsConn.connect(stream.handle, host, .{
+        .alpn_policy = .non_http_no_alpn,
     });
-    tls_client.allow_truncation_attacks = true;
-    try tls_client.writeAll(stream, payload);
-    return readSmtpReplyTls(allocator, &tls_client, stream);
+    defer tls_client.deinit();
+    try tls_client.writeAll(payload);
+    return readSmtpReplyTls(allocator, &tls_client);
 }
 
 fn executeSmtpStartTlsRequest(
@@ -671,7 +670,6 @@ fn executeSmtpStartTlsRequest(
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
-    _ = host;
     const greeting = try readSmtpReplyPlain(allocator, stream);
     defer allocator.free(greeting);
     if (!smtpReplyContainsCode(greeting, "220")) return error.ProtocolError;
@@ -686,19 +684,18 @@ fn executeSmtpStartTlsRequest(
     defer allocator.free(starttls_reply);
     if (!smtpReplyContainsCode(starttls_reply, "220")) return error.ProtocolError;
 
-    var tls_client = try std.crypto.tls.Client.init(stream, .{
-        .host = .no_verification,
-        .ca = .no_verification,
+    var tls_client = try http.upstream_tls.UpstreamTlsConn.connect(stream.handle, host, .{
+        .alpn_policy = .non_http_no_alpn,
     });
-    tls_client.allow_truncation_attacks = true;
+    defer tls_client.deinit();
 
-    try tls_client.writeAll(stream, "EHLO tardigrade.local\r\n");
-    const post_tls_ehlo = try readSmtpReplyTls(allocator, &tls_client, stream);
+    try tls_client.writeAll("EHLO tardigrade.local\r\n");
+    const post_tls_ehlo = try readSmtpReplyTls(allocator, &tls_client);
     defer allocator.free(post_tls_ehlo);
     if (!smtpReplyContainsCode(post_tls_ehlo, "250")) return error.ProtocolError;
 
-    try tls_client.writeAll(stream, payload);
-    return readSmtpReplyTls(allocator, &tls_client, stream);
+    try tls_client.writeAll(payload);
+    return readSmtpReplyTls(allocator, &tls_client);
 }
 
 fn executeImapTlsRequest(
@@ -707,19 +704,17 @@ fn executeImapTlsRequest(
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
-    _ = host;
-    var tls_client = try std.crypto.tls.Client.init(stream, .{
-        .host = .no_verification,
-        .ca = .no_verification,
+    var tls_client = try http.upstream_tls.UpstreamTlsConn.connect(stream.handle, host, .{
+        .alpn_policy = .non_http_no_alpn,
     });
-    tls_client.allow_truncation_attacks = true;
+    defer tls_client.deinit();
 
-    const greeting = try readImapReplyTls(allocator, &tls_client, stream, null);
+    const greeting = try readImapReplyTls(allocator, &tls_client, null);
     defer allocator.free(greeting);
     if (!imapReplyContainsOk(greeting)) return error.ProtocolError;
 
-    try tls_client.writeAll(stream, payload);
-    return readImapReplyTls(allocator, &tls_client, stream, imapPayloadTag(payload));
+    try tls_client.writeAll(payload);
+    return readImapReplyTls(allocator, &tls_client, imapPayloadTag(payload));
 }
 
 fn executeImapStartTlsRequest(
@@ -728,7 +723,6 @@ fn executeImapStartTlsRequest(
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
-    _ = host;
     const greeting = try readImapReplyPlain(allocator, stream, null);
     defer allocator.free(greeting);
     if (!imapReplyContainsOk(greeting)) return error.ProtocolError;
@@ -738,14 +732,18 @@ fn executeImapStartTlsRequest(
     defer allocator.free(starttls_reply);
     if (!imapTaggedReplyContainsOk(starttls_reply, "a001")) return error.ProtocolError;
 
-    var tls_client = try std.crypto.tls.Client.init(stream, .{
-        .host = .no_verification,
-        .ca = .no_verification,
+    var tls_client = try http.upstream_tls.UpstreamTlsConn.connect(stream.handle, host, .{
+        .alpn_policy = .non_http_no_alpn,
     });
-    tls_client.allow_truncation_attacks = true;
+    defer tls_client.deinit();
 
-    try tls_client.writeAll(stream, payload);
-    return readImapReplyTls(allocator, &tls_client, stream, imapPayloadTag(payload));
+    try tls_client.writeAll(payload);
+    return readImapReplyTls(allocator, &tls_client, imapPayloadTag(payload));
+}
+
+fn appendMailReply(out: *std.array_list.Managed(u8), bytes: []const u8) !void {
+    if (bytes.len > max_mail_reply_bytes -| out.items.len) return error.ResponseTooLarge;
+    try out.appendSlice(bytes);
 }
 
 fn readSmtpReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream) ![]u8 {
@@ -755,21 +753,21 @@ fn readSmtpReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream) ![
     while (true) {
         const n = try stream.read(&buf);
         if (n == 0) break;
-        try out.appendSlice(buf[0..n]);
+        try appendMailReply(&out, buf[0..n]);
         if (smtpReplyComplete(out.items)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
     return out.toOwnedSlice();
 }
 
-fn readSmtpReplyTls(allocator: std.mem.Allocator, tls_client: *std.crypto.tls.Client, stream: compat.NetStream) ![]u8 {
+fn readSmtpReplyTls(allocator: std.mem.Allocator, tls_client: *http.upstream_tls.UpstreamTlsConn) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
-        const n = try tls_client.read(stream, &buf);
+        const n = try tls_client.read(&buf);
         if (n == 0) break;
-        try out.appendSlice(buf[0..n]);
+        try appendMailReply(&out, buf[0..n]);
         if (smtpReplyComplete(out.items)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
@@ -783,7 +781,7 @@ fn readImapReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream, ta
     while (true) {
         const n = try stream.read(&buf);
         if (n == 0) break;
-        try out.appendSlice(buf[0..n]);
+        try appendMailReply(&out, buf[0..n]);
         if (imapReplyComplete(out.items, tag)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
@@ -792,17 +790,16 @@ fn readImapReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream, ta
 
 fn readImapReplyTls(
     allocator: std.mem.Allocator,
-    tls_client: *std.crypto.tls.Client,
-    stream: compat.NetStream,
+    tls_client: *http.upstream_tls.UpstreamTlsConn,
     tag: ?[]const u8,
 ) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
-        const n = try tls_client.read(stream, &buf);
+        const n = try tls_client.read(&buf);
         if (n == 0) break;
-        try out.appendSlice(buf[0..n]);
+        try appendMailReply(&out, buf[0..n]);
         if (imapReplyComplete(out.items, tag)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
@@ -906,8 +903,9 @@ fn executeUdpDatagramRequest(allocator: std.mem.Allocator, endpoint: []const u8,
     const sock = std.c.socket(sock_family, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
     if (sock < 0) return error.SocketFailed;
     defer _ = std.c.close(sock);
+    try setSocketTimeoutMs(sock, 2_000, 2_000);
     const sent = std.c.sendto(sock, payload.ptr, payload.len, 0, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in));
-    if (sent < 0) return error.SendFailed;
+    if (sent < 0 or sent != payload.len) return error.SendFailed;
     var buf: [16 * 1024]u8 = undefined;
     const n = std.c.recv(sock, &buf, buf.len, 0);
     if (n < 0) return error.RecvFailed;
@@ -919,27 +917,53 @@ const MemcachedPayload = struct {
     key: []u8,
     value: ?[]u8 = null,
     ttl: u32 = 60,
+
+    fn deinit(self: *MemcachedPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.op);
+        allocator.free(self.key);
+        if (self.value) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 
 fn parseMemcachedPayload(allocator: std.mem.Allocator, body: []const u8) !MemcachedPayload {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
     const obj = parsed.value.object;
     const op_val = obj.get("op") orelse return error.InvalidPayload;
     const key_val = obj.get("key") orelse return error.InvalidPayload;
     if (op_val != .string or key_val != .string) return error.InvalidPayload;
-    const val = if (obj.get("value")) |v| blk: {
+    const value = if (obj.get("value")) |v| blk: {
         if (v != .string) break :blk null;
         break :blk try allocator.dupe(u8, v.string);
     } else null;
+    errdefer if (value) |owned| allocator.free(owned);
     const ttl = if (obj.get("ttl")) |t|
-        if (t == .integer and t.integer >= 0) @as(u32, @intCast(t.integer)) else 60
+        if (t == .integer and t.integer >= 0 and t.integer <= std.math.maxInt(u32)) @as(u32, @intCast(t.integer)) else return error.InvalidPayload
     else
         60;
+    const op = try allocator.dupe(u8, op_val.string);
+    errdefer allocator.free(op);
+    const key = try allocator.dupe(u8, key_val.string);
     return .{
-        .op = try allocator.dupe(u8, op_val.string),
-        .key = try allocator.dupe(u8, key_val.string),
-        .value = val,
+        .op = op,
+        .key = key,
+        .value = value,
         .ttl = ttl,
     };
+}
+
+test "mail replies and memcached payloads fail closed at parser limits" {
+    const allocator = std.testing.allocator;
+    var out = std.array_list.Managed(u8).init(allocator);
+    defer out.deinit();
+    try out.resize(max_mail_reply_bytes);
+    try std.testing.expectError(error.ResponseTooLarge, appendMailReply(&out, "x"));
+
+    try std.testing.expectError(error.InvalidPayload, parseMemcachedPayload(allocator, "[]"));
+    try std.testing.expectError(error.InvalidPayload, parseMemcachedPayload(allocator, "{\"op\":\"get\",\"key\":\"k\",\"ttl\":4294967296}"));
+    var payload = try parseMemcachedPayload(allocator, "{\"op\":\"set\",\"key\":\"k\",\"value\":\"v\",\"ttl\":30}");
+    defer payload.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 30), payload.ttl);
 }

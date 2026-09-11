@@ -36,6 +36,7 @@ pub fn persist(allocator: std.mem.Allocator, path: []const u8, store: *const ses
     }
 
     std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
+    errdefer std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
     {
         const file = try std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{
             .truncate = true,
@@ -194,4 +195,27 @@ test "session store persistence round trips active and revoked entries" {
 
     try std.testing.expect(restored.validate(active) != null);
     try std.testing.expect(restored.validate(revoked) == null);
+}
+
+test "session persistence removes credential temp file when rename fails" {
+    const allocator = std.testing.allocator;
+    var store = session.SessionStore.init(allocator, 300, 0);
+    defer store.deinit();
+    _ = try store.create("identity", "127.0.0.1", null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const path = try std.fmt.allocPrint(allocator, "{s}/destination", .{tmp_abs});
+    defer allocator.free(path);
+    try std.Io.Dir.createDirAbsolute(compat.io(), path, .default_dir);
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}.{d}.tmp", .{ path, std.c.getpid() });
+    defer allocator.free(temp_path);
+
+    var failed = false;
+    persist(allocator, path, &store) catch {
+        failed = true;
+    };
+    try std.testing.expect(failed);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(compat.io(), temp_path, .{}));
 }

@@ -3088,6 +3088,15 @@ pub fn validate(cfg: *const EdgeConfig) !void {
     }
     try validateListenerProtocolPolicy(cfg.http1_enabled, cfg.http2_enabled, hasTlsFiles(cfg), true);
 
+    validateAccessControlConfig(cfg.access_control_rules) catch |err| {
+        std.log.err("config validation failed: TARDIGRADE_ACCESS_CONTROL contains an invalid rule: {}", .{err});
+        return error.InvalidConfigValue;
+    };
+    validatePolicyConfig(cfg.policy_rules_raw, cfg.policy_user_scopes_raw, cfg.policy_approval_routes_raw) catch |err| {
+        std.log.err("config validation failed: policy configuration contains an invalid entry: {}", .{err});
+        return error.InvalidConfigValue;
+    };
+
     if (std.mem.eql(u8, cfg.tls_min_version, "1.0") or std.mem.eql(u8, cfg.tls_min_version, "1.1") or
         std.mem.eql(u8, cfg.tls_max_version, "1.0") or std.mem.eql(u8, cfg.tls_max_version, "1.1"))
     {
@@ -3248,6 +3257,70 @@ fn validateTlsCertKeyPair(cert_path: []const u8, key_path: []const u8) !void {
 
 fn validateMtlsConsistency(client_verify: bool, ca_path: []const u8) !void {
     if (client_verify and ca_path.len == 0) return error.InvalidConfigPath;
+}
+
+fn validateAccessControlConfig(rules: []const u8) !void {
+    http.access_control.AccessControl.validateConfig(rules) catch return error.InvalidConfigValue;
+}
+
+fn validatePolicyConfig(rules_raw: []const u8, scopes_raw: []const u8, approval_routes_raw: []const u8) !void {
+    if (std.mem.trim(u8, rules_raw, " \t\r\n").len > 0) {
+        var rules = std.mem.splitScalar(u8, rules_raw, ';');
+        while (rules.next()) |entry_raw| {
+            const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+            if (entry.len == 0) return error.InvalidPolicyRule;
+            var parts = std.mem.splitScalar(u8, entry, '|');
+            const method = std.mem.trim(u8, parts.next() orelse return error.InvalidPolicyRule, " \t");
+            const pattern = std.mem.trim(u8, parts.next() orelse return error.InvalidPolicyRule, " \t");
+            _ = parts.next() orelse return error.InvalidPolicyRule; // required scope (may be empty)
+            const approval = std.mem.trim(u8, parts.next() orelse return error.InvalidPolicyRule, " \t");
+            const hours = std.mem.trim(u8, parts.next() orelse return error.InvalidPolicyRule, " \t");
+            const device_pattern = std.mem.trim(u8, parts.next() orelse return error.InvalidPolicyRule, " \t");
+            if (parts.next() != null or method.len == 0 or pattern.len == 0) return error.InvalidPolicyRule;
+            _ = http.rewrite.regexMatchesChecked(pattern, "/") catch return error.InvalidPolicyRule;
+            if (!std.ascii.eqlIgnoreCase(approval, "true") and !std.ascii.eqlIgnoreCase(approval, "false")) return error.InvalidPolicyRule;
+            if (hours.len > 0) try validatePolicyHours(hours);
+            if (device_pattern.len > 0) _ = http.rewrite.regexMatchesChecked(device_pattern, "device") catch return error.InvalidPolicyRule;
+        }
+    }
+
+    if (std.mem.trim(u8, scopes_raw, " \t\r\n").len > 0) {
+        var mappings = std.mem.splitScalar(u8, scopes_raw, ';');
+        while (mappings.next()) |entry_raw| {
+            const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+            if (entry.len == 0) return error.InvalidPolicyScopeMapping;
+            const colon = std.mem.findScalar(u8, entry, ':') orelse return error.InvalidPolicyScopeMapping;
+            if (std.mem.trim(u8, entry[0..colon], " \t").len == 0) return error.InvalidPolicyScopeMapping;
+            var scopes = std.mem.splitScalar(u8, entry[colon + 1 ..], ',');
+            var count: usize = 0;
+            while (scopes.next()) |scope| {
+                if (std.mem.trim(u8, scope, " \t").len == 0) return error.InvalidPolicyScopeMapping;
+                count += 1;
+            }
+            if (count == 0) return error.InvalidPolicyScopeMapping;
+        }
+    }
+
+    if (std.mem.trim(u8, approval_routes_raw, " \t\r\n").len > 0) {
+        var routes = std.mem.splitScalar(u8, approval_routes_raw, ';');
+        while (routes.next()) |entry_raw| {
+            const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+            if (entry.len == 0) return error.InvalidApprovalRoute;
+            var parts = std.mem.splitScalar(u8, entry, '|');
+            const method = std.mem.trim(u8, parts.next() orelse return error.InvalidApprovalRoute, " \t");
+            const pattern = std.mem.trim(u8, parts.next() orelse return error.InvalidApprovalRoute, " \t");
+            if (parts.next() != null or method.len == 0 or pattern.len == 0) return error.InvalidApprovalRoute;
+            _ = http.rewrite.regexMatchesChecked(pattern, "/") catch return error.InvalidApprovalRoute;
+        }
+    }
+}
+
+fn validatePolicyHours(raw: []const u8) !void {
+    const dash = std.mem.findScalar(u8, raw, '-') orelse return error.InvalidPolicyHours;
+    if (std.mem.findScalar(u8, raw[dash + 1 ..], '-') != null) return error.InvalidPolicyHours;
+    const start = std.fmt.parseInt(u8, std.mem.trim(u8, raw[0..dash], " \t"), 10) catch return error.InvalidPolicyHours;
+    const stop = std.fmt.parseInt(u8, std.mem.trim(u8, raw[dash + 1 ..], " \t"), 10) catch return error.InvalidPolicyHours;
+    if (start > 23 or stop > 24) return error.InvalidPolicyHours;
 }
 
 fn validateOtelSampleRate(rate: u32) !void {
@@ -4414,6 +4487,29 @@ test "validate mTLS consistency requires CA path when verify is enabled" {
     try validateMtlsConsistency(false, "/ca.pem");
     try validateMtlsConsistency(true, "/ca.pem");
     try std.testing.expectError(error.InvalidConfigPath, validateMtlsConsistency(true, ""));
+}
+
+test "validate rejects malformed access control policy" {
+    try validateAccessControlConfig("allow 10.0.0.0/8, deny 0.0.0.0/0");
+    try std.testing.expectError(error.InvalidConfigValue, validateAccessControlConfig("allow 10.0.0.0/8, permit all"));
+}
+
+test "policy configuration validation rejects silently skipped rules" {
+    try validatePolicyConfig("", "", "");
+    try validatePolicyConfig(
+        "POST|^/deploy$|admin|true|8-18|^managed-;GET|^/status$||false||",
+        "alice:admin,deploy;bob:read",
+        "POST|^/deploy$;DELETE|^/tokens/[a-z]+$",
+    );
+
+    try std.testing.expectError(error.InvalidPolicyRule, validatePolicyConfig("role:admin=allow:*", "", ""));
+    try std.testing.expectError(error.InvalidPolicyRule, validatePolicyConfig("POST|[|admin|false||", "", ""));
+    try std.testing.expectError(error.InvalidPolicyRule, validatePolicyConfig("POST|^/deploy$|admin|sometimes||", "", ""));
+    try std.testing.expectError(error.InvalidPolicyHours, validatePolicyConfig("POST|^/deploy$|admin|false|25-26|", "", ""));
+    try std.testing.expectError(error.InvalidPolicyScopeMapping, validatePolicyConfig("", "alice=admin", ""));
+    try std.testing.expectError(error.InvalidPolicyScopeMapping, validatePolicyConfig("", "alice:admin,", ""));
+    try std.testing.expectError(error.InvalidApprovalRoute, validatePolicyConfig("", "", "POST:/deploy=required"));
+    try std.testing.expectError(error.InvalidApprovalRoute, validatePolicyConfig("", "", "POST|["));
 }
 
 test "validate OTEL sample rate rejects values above 100" {

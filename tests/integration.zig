@@ -5033,6 +5033,76 @@ test "interop.openssl.h2.auth_required_proxy_fails_closed" {
     try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
 }
 
+test "interop.h2.valid_auth_is_forwarded_and_policy_denial_stays_local" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "authenticated-h2-ok" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-auth {{
+        \\    proxy_pass http://{s}:{d}/h2-auth;
+        \\    auth required;
+        \\}}
+        \\
+        \\location = /h2-policy {{
+        \\    proxy_pass http://{s}:{d}/h2-policy;
+        \\}}
+    , .{ test_host, upstream.port(), test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            // sha256("integration-token")
+            .{ .name = "TARDIGRADE_AUTH_TOKEN_HASHES", .value = "521bc8ca01307d0189b55a19da738e39c7204f7077e0076e803026e32b2f9383" },
+            .{ .name = "TARDIGRADE_POLICY_RULES", .value = "GET|^/h2-policy$|admin|false||" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const authenticated_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-auth" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+        .{ .name = "authorization", .value = "Bearer integration-token" },
+    };
+    const authenticated_body = try pureZigH2GetBody(allocator, tardigrade.port, authenticated_headers[0..]);
+    defer allocator.free(authenticated_body);
+    try assertContains(authenticated_body, "authenticated-h2-ok");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+
+    const policy_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-policy?attempt=query-bypass" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const denied_body = try pureZigH2GetBody(allocator, tardigrade.port, policy_headers[0..]);
+    defer allocator.free(denied_body);
+    try assertContains(denied_body, "\"code\":\"forbidden\"");
+    try assertContains(denied_body, "Missing required scope");
+    compat.sleepNs(200 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+}
+
 test "interop.h2.proxy_malformed_authority_rejected_before_upstream" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;

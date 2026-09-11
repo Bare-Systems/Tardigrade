@@ -88,7 +88,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             null,
         .session_store_path = cfg.session_store_path,
         .access_control = if (cfg.access_control_rules.len > 0)
-            http.access_control.AccessControl.fromConfig(state_allocator, cfg.access_control_rules, .allow) catch null
+            try http.access_control.AccessControl.fromConfig(state_allocator, cfg.access_control_rules, .allow)
         else
             null,
         .logger = http.logger.Logger.init(cfg.log_level, "gateway"),
@@ -3551,13 +3551,21 @@ fn executeHttp2ProxyRoute(
         return .{ .local_rejection = rejection };
     }
 
+    if (ga.evaluatePolicy(state, route_cfg, method, request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |reason| {
+        return .{ .local_rejection = .{
+            .status_code = @intFromEnum(http.Status.forbidden),
+            .code = "forbidden",
+            .message = reason,
+        } };
+    }
+
     const matched = http.location_router.matchLocation(allocator, request.uri.path, route_cfg.location_blocks) orelse {
         if (try buildHttp2StaticResponse(allocator, route_cfg, request)) |static_response| {
             return .{ .static_response = static_response };
         }
         return null;
     };
-    if (matched.block.auth == .required) return .{ .local_rejection = .{
+    if (matched.block.auth == .required and !ctx.authenticated and ctx.identity == null) return .{ .local_rejection = .{
         .status_code = @intFromEnum(http.Status.unauthorized),
         .code = "unauthorized",
         .message = "Unauthorized",
@@ -4245,10 +4253,17 @@ fn executeH1PostPreflightOrchestration(
         },
     }
 
-    try hooks.mirror(allocator, cfg, request, correlation_id, client_ip);
     try hooks.auth(allocator, cfg, state, ctx, &request.headers);
 
     if (try hooks.middleware(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*)) {
+        return .logged_terminal;
+    }
+
+    if (ga.evaluatePolicy(state, cfg, request.method.toString(), request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |reason| {
+        try gp.sendApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive.*, state);
+        state.metricsRecord(403);
+        state.metricsRecordErrorCode("forbidden");
+        ghandlers.logAccessForRequest(state, ctx, request, 403);
         return .logged_terminal;
     }
 
@@ -4260,7 +4275,12 @@ fn executeH1PostPreflightOrchestration(
         return .logged_terminal;
     }
 
-    return .{ .route_status = try hooks.route(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body) };
+    const route_status = try hooks.route(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body);
+    // Mirror only after the primary route's own authorization has accepted
+    // the request. Running this before location auth or policy evaluation
+    // leaks denied request bodies to the mirror target.
+    try hooks.mirror(allocator, cfg, request, correlation_id, client_ip);
+    return .{ .route_status = route_status };
 }
 
 fn mayNeedStreamingRequestBodyPreRead(cfg: *const edge_config.EdgeConfig) bool {
@@ -5038,6 +5058,67 @@ test "H1 early proxy with origin capability off never reaches upstream side effe
     try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
 }
 
+test "H1 policy denial occurs before route and mirror side effects" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/sensitive",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+    }};
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{.{
+        .method = "POST",
+        .pattern = "^/sensitive$",
+        .target_url = "http://127.0.0.1:2/mirror",
+    }};
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+    cfg.policy_rules_raw = "POST|^/sensitive$|commands.execute|false||";
+    cfg.policy_user_scopes_raw = "";
+    cfg.policy_approval_routes_raw = "";
+
+    var request = try http.Request.parseHead(allocator, "POST /sensitive HTTP/1.1\r\nHost: example.test\r\nContent-Length: 6\r\n\r\nsecret", MAX_REQUEST_SIZE);
+    defer request.request.deinit();
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.security_headers = http.security_headers.SecurityHeaders.default;
+    state.add_headers = &.{};
+    state.http3_alt_svc = null;
+    var ctx = http.request_context.RequestContext.init(allocator, "req-policy", "127.0.0.1");
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-policy", 0);
+    var keep_alive = false;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    const outcome = try executeH1PostPreflightOrchestration(
+        {},
+        allocator,
+        &output.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-policy",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1CountingPostPreflightHooks{ .effects = &effects },
+    );
+
+    try std.testing.expect(outcome == .logged_terminal);
+    try std.testing.expectEqual(@as(usize, 1), effects.auth_calls);
+    try std.testing.expectEqual(@as(usize, 1), effects.rate_limit_mutations);
+    try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
+    try std.testing.expect(std.mem.find(u8, output.written(), "403 Forbidden") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "Missing required scope") != null);
+}
+
 test "#369 Slice 2 rt0.reject.unsafe_request: an unsafe method carrying current-hop early data is rejected by the real H1 orchestration before any route dispatch" {
     // Drives the real, private `executeH1PostPreflightOrchestration` this
     // file's own dispatch uses in production (see `H1ProductionPostPreflightHooks`
@@ -5141,6 +5222,9 @@ test "#510 H1 request context derives transport early provenance from connection
     cfg.metrics_path = "/status/metrics";
     cfg.location_blocks = blocks[0..];
     cfg.mirror_rules = &.{};
+    cfg.policy_rules_raw = "";
+    cfg.policy_user_scopes_raw = "";
+    cfg.policy_approval_routes_raw = "";
     var effects = H1PreflightSideEffectProbe{};
     var state: GatewayState = undefined;
     state.metrics_mutex = .{};
@@ -5208,6 +5292,9 @@ test "#510 H1 streaming pre-read fallback preserves head-read early provenance b
     cfg.metrics_path = "/status/metrics";
     cfg.location_blocks = blocks[0..];
     cfg.mirror_rules = &.{};
+    cfg.policy_rules_raw = "";
+    cfg.policy_user_scopes_raw = "";
+    cfg.policy_approval_routes_raw = "";
     var effects = H1PreflightSideEffectProbe{};
     var state: GatewayState = undefined;
     state.metrics_mutex = .{};
@@ -5388,6 +5475,9 @@ test "#510 H1 pending buffer does not extend early provenance over later 1-RTT b
     cfg.metrics_path = "/status/metrics";
     cfg.location_blocks = blocks[0..];
     cfg.mirror_rules = &.{};
+    cfg.policy_rules_raw = "";
+    cfg.policy_user_scopes_raw = "";
+    cfg.policy_approval_routes_raw = "";
     var effects = H1PreflightSideEffectProbe{};
     var state: GatewayState = undefined;
     state.metrics_mutex = .{};

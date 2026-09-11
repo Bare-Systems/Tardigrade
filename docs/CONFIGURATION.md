@@ -513,9 +513,9 @@ DCID steering is outside the current support promise.
 | `TARDIGRADE_SESSION_MAX` | u32 | `128` | Max sessions retained. | `TARDIGRADE_SESSION_MAX=1024` |
 | `TARDIGRADE_SESSION_STORE_PATH` | path | `""` | File-backed session store. Path changes on reload require restart. | `TARDIGRADE_SESSION_STORE_PATH=/var/lib/tardigrade/sessions.json` |
 | `TARDIGRADE_DEVICE_REGISTRY_PATH` | path | `""` | Device registry used by device-signature auth. | `TARDIGRADE_DEVICE_REGISTRY_PATH=/var/lib/tardigrade/devices.registry` |
-| `TARDIGRADE_POLICY_RULES` | encoded string | `""` | Raw policy rules. | `TARDIGRADE_POLICY_RULES=role:admin=allow:*` |
-| `TARDIGRADE_POLICY_USER_SCOPES` | encoded string | `""` | Raw user scope mapping. | `TARDIGRADE_POLICY_USER_SCOPES=alice=admin` |
-| `TARDIGRADE_POLICY_APPROVAL_ROUTES` | encoded string | `""` | Raw approval-route mapping. | `TARDIGRADE_POLICY_APPROVAL_ROUTES=POST:/deploy=required` |
+| `TARDIGRADE_POLICY_RULES` | semicolon-separated `method\|path_regex\|required_scope\|approval_required\|UTC_hours\|device_regex` | `""` | Request authorization rules. All six fields are required; optional constraints are empty fields. | `TARDIGRADE_POLICY_RULES=POST\|^/deploy$\|admin\|true\|8-18\|^managed-` |
+| `TARDIGRADE_POLICY_USER_SCOPES` | semicolon-separated `identity:scope,scope` | `""` | Scope grants used by policy rules. | `TARDIGRADE_POLICY_USER_SCOPES=alice:admin,deploy` |
+| `TARDIGRADE_POLICY_APPROVAL_ROUTES` | semicolon-separated `method\|path_regex` | `""` | Routes that require an approval token. | `TARDIGRADE_POLICY_APPROVAL_ROUTES=POST\|^/deploy$` |
 | `TARDIGRADE_APPROVAL_STORE_PATH` | path | `""` | Approval store. Path changes on reload require restart. | `TARDIGRADE_APPROVAL_STORE_PATH=/var/lib/tardigrade/approvals.json` |
 | `TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK` | URL | `""` | Approval escalation webhook. Changes on reload require restart. | `TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK=https://hooks.example.com/tardi` |
 | `TARDIGRADE_APPROVAL_TTL_MS` | i64 ms | `300000` | Positive values set the approval token TTL; `<= 0` uses the `300000` ms fallback. | `TARDIGRADE_APPROVAL_TTL_MS=600000` |

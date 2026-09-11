@@ -27,6 +27,9 @@ pub const StreamRequest = struct {
     authority: ?[]u8,
     headers: Headers,
     body: []u8,
+    /// Authenticated transport peer address supplied by the QUIC runtime.
+    /// Never derived from request headers.
+    client_ip: ?[]u8 = null,
     transport_early: bool = false,
     downstream_handshake_complete: bool = true,
     downstream_handshake: ?request_context.DownstreamHandshakeBarrier = null,
@@ -61,6 +64,7 @@ pub const StreamRequest = struct {
         if (self.authority) |authority| self.allocator.free(authority);
         self.headers.deinit();
         self.allocator.free(self.body);
+        if (self.client_ip) |client_ip| self.allocator.free(client_ip);
         self.* = undefined;
     }
 

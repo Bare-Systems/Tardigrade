@@ -2016,6 +2016,10 @@ pub const Runtime = struct {
             return;
         };
         defer request.deinit();
+        request.client_ip = formatAddressHostAlloc(allocator, entry.conn.activePathKey().remote) catch {
+            self.sendInternalErrorResponse(entry, incoming.stream_id, now);
+            return;
+        };
         request.stream_id = incoming.stream_id;
         request.transport_early = incoming.transport_early;
         request.downstream_handshake_complete = entry.conn.isEstablished();
@@ -2997,6 +3001,24 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
         else => {},
     }
     return assembler.finish();
+}
+
+fn formatAddressHostAlloc(allocator: std.mem.Allocator, address: quic.udp.Address) ![]u8 {
+    return switch (address.family) {
+        .ip4 => std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{
+            address.bytes[0], address.bytes[1], address.bytes[2], address.bytes[3],
+        }),
+        .ip6 => std.fmt.allocPrint(allocator, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+            std.mem.readInt(u16, address.bytes[0..2], .big),
+            std.mem.readInt(u16, address.bytes[2..4], .big),
+            std.mem.readInt(u16, address.bytes[4..6], .big),
+            std.mem.readInt(u16, address.bytes[6..8], .big),
+            std.mem.readInt(u16, address.bytes[8..10], .big),
+            std.mem.readInt(u16, address.bytes[10..12], .big),
+            std.mem.readInt(u16, address.bytes[12..14], .big),
+            std.mem.readInt(u16, address.bytes[14..16], .big),
+        }),
+    };
 }
 
 /// Map the operator-facing runtime config onto the native QUIC transport

@@ -3073,6 +3073,11 @@ fn validateApplianceTlsProfile(cfg: *const EdgeConfig) !void {
     }
 }
 
+fn validateGeoTrustConfig(blocked_country_count: usize, trust_required: bool, trusted_source_count: usize) !void {
+    if (blocked_country_count == 0) return;
+    if (!trust_required or trusted_source_count == 0) return error.InvalidGeoTrustConfig;
+}
+
 pub fn validate(cfg: *const EdgeConfig) !void {
     if (cfg.listen_port == 0) {
         std.log.err("config validation failed: listen_port must be between 1 and 65535", .{});
@@ -3094,6 +3099,10 @@ pub fn validate(cfg: *const EdgeConfig) !void {
     };
     validatePolicyConfig(cfg.policy_rules_raw, cfg.policy_user_scopes_raw, cfg.policy_approval_routes_raw) catch |err| {
         std.log.err("config validation failed: policy configuration contains an invalid entry: {}", .{err});
+        return error.InvalidConfigValue;
+    };
+    validateGeoTrustConfig(cfg.geo_blocked_countries.len, cfg.trust_require_upstream_identity, cfg.trusted_upstream_identities.len) catch {
+        std.log.err("config validation failed: TARDIGRADE_GEO_BLOCKED_COUNTRIES requires TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true and at least one TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES entry", .{});
         return error.InvalidConfigValue;
     };
 
@@ -4492,6 +4501,13 @@ test "validate mTLS consistency requires CA path when verify is enabled" {
 test "validate rejects malformed access control policy" {
     try validateAccessControlConfig("allow 10.0.0.0/8, deny 0.0.0.0/0");
     try std.testing.expectError(error.InvalidConfigValue, validateAccessControlConfig("allow 10.0.0.0/8, permit all"));
+}
+
+test "geo blocking requires an explicit trusted country-header source" {
+    try validateGeoTrustConfig(0, false, 0);
+    try std.testing.expectError(error.InvalidGeoTrustConfig, validateGeoTrustConfig(1, false, 1));
+    try std.testing.expectError(error.InvalidGeoTrustConfig, validateGeoTrustConfig(1, true, 0));
+    try validateGeoTrustConfig(1, true, 1);
 }
 
 test "policy configuration validation rejects silently skipped rules" {

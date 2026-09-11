@@ -9,12 +9,15 @@ const edge_config = @import("edge_config.zig");
 const ga = @import("gateway_auth.zig");
 const gcp = @import("gateway_control_plane_proxy.zig");
 const gp = @import("gateway_proxy.zig");
+const gph = @import("gateway_proxy_headers.zig");
 const gpr = @import("gateway_protocols.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
 const gs = @import("gateway_state.zig");
 const gstatic = @import("gateway_static_runtime.zig");
 
 const JSON_CONTENT_TYPE = "application/json";
+const MIRROR_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+const MIRROR_TIMEOUT_FALLBACK_MS: u32 = 5_000;
 const GatewayState = gs.GatewayState;
 const ReloadableConfigStore = gs.ReloadableConfigStore;
 const MAX_REQUEST_SIZE = gs.MAX_REQUEST_SIZE;
@@ -1646,7 +1649,7 @@ fn resolveNamedLocation(name: []const u8, named_locations: []const edge_config.E
 
 pub fn spawnMirrorRequests(
     allocator: std.mem.Allocator,
-    rules: []const edge_config.EdgeConfig.MirrorRule,
+    cfg: *const edge_config.EdgeConfig,
     method: []const u8,
     path: []const u8,
     body: []const u8,
@@ -1654,27 +1657,73 @@ pub fn spawnMirrorRequests(
     client_ip: []const u8,
     content_type: ?[]const u8,
 ) void {
-    for (rules) |rule| {
+    for (cfg.mirror_rules) |rule| {
         if (!http.rewrite.methodMatches(rule.method, method)) continue;
         if (!http.rewrite.regexMatches(rule.pattern, path)) continue;
-        var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
-        defer client.deinit();
-        const uri = std.Uri.parse(rule.target_url) catch continue;
-        var header_buf: [1024]u8 = undefined;
-        var headers = [_]std.http.Header{
-            .{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id },
-            .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
-            .{ .name = "X-Mirror-Client-IP", .value = client_ip },
-            .{ .name = "Content-Type", .value = content_type orelse "application/octet-stream" },
-        };
-        var req = client.request(.POST, uri, .{
-            .extra_headers = headers[0..],
-            .headers = .{ .content_type = .{ .override = content_type orelse "application/octet-stream" } },
-        }) catch continue;
-        defer req.deinit();
-        req.sendBodyComplete(@constCast(body)) catch continue;
-        _ = req.receiveHead(&header_buf) catch {}; // subrequest response is intentionally ignored; fire-and-forget
+        executeMirrorRequest(allocator, cfg, rule.target_url, body, correlation_id, client_ip, content_type) catch continue;
     }
+}
+
+fn executeMirrorRequest(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    target_url: []const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    content_type: ?[]const u8,
+) !void {
+    const uri = try std.Uri.parse(target_url);
+    const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    const host = if (uri.host) |value| gp.uriComponentBytes(value) else return error.UpstreamProtocolError;
+    const port: u16 = uri.port orelse (if (is_https) 443 else 80);
+    const tls_options: ?http.upstream_tls.UpstreamTlsOptions = if (is_https) .{
+        .skip_verify = !cfg.upstream_tls_verify,
+        .ca_bundle_path = cfg.upstream_tls_ca_bundle,
+        .sni_override = cfg.upstream_tls_server_name,
+        .client_cert_path = cfg.upstream_tls_client_cert,
+        .client_key_path = cfg.upstream_tls_client_key,
+        .alpn_policy = .require_http1,
+    } else null;
+    const connect_timeout_ms = mirrorPhaseTimeoutMs(cfg.upstream_connect_timeout_ms, cfg.upstream_timeout_ms);
+    const response_timeout_ms = mirrorPhaseTimeoutMs(cfg.upstream_response_timeout_ms, cfg.upstream_timeout_ms);
+
+    const headers = [_]std.http.Header{
+        .{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id },
+        .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
+        .{ .name = "X-Mirror-Client-IP", .value = client_ip },
+        .{ .name = "Content-Type", .value = content_type orelse "application/octet-stream" },
+    };
+    var response = try gp.executeBoundedBufferedTcpHttpRequest(
+        allocator,
+        host,
+        port,
+        tls_options,
+        uri,
+        "POST",
+        &headers,
+        body,
+        null,
+        MIRROR_MAX_RESPONSE_BYTES,
+        connect_timeout_ms,
+        response_timeout_ms,
+        null,
+        null,
+        false,
+    );
+    response.deinit(allocator);
+}
+
+fn mirrorPhaseTimeoutMs(phase_timeout_ms: u32, overall_timeout_ms: u32) u32 {
+    if (phase_timeout_ms > 0) return phase_timeout_ms;
+    if (overall_timeout_ms > 0) return overall_timeout_ms;
+    return MIRROR_TIMEOUT_FALLBACK_MS;
+}
+
+test "mirror delivery stays bounded when general upstream timeouts are disabled" {
+    try std.testing.expectEqual(@as(u32, 250), mirrorPhaseTimeoutMs(250, 500));
+    try std.testing.expectEqual(@as(u32, 500), mirrorPhaseTimeoutMs(0, 500));
+    try std.testing.expectEqual(MIRROR_TIMEOUT_FALLBACK_MS, mirrorPhaseTimeoutMs(0, 0));
 }
 
 const SubrequestPayload = struct {
@@ -3804,6 +3853,51 @@ test "H3 ACL uses the transport peer address instead of spoofable X-Real-IP" {
     try std.testing.expect(std.mem.find(u8, response.body orelse "", "Access denied") != null);
 }
 
+test "H3 geo policy rejects a forged country header from an untrusted peer" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/geo",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "must-not-run" } },
+    }};
+    var blocked = [_][]const u8{"RU"};
+    var trusted = [_][]const u8{"192.0.2.10"};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.geo_blocked_countries = blocked[0..];
+    cfg.geo_country_header = "cf-ipcountry";
+    cfg.trust_require_upstream_identity = true;
+    cfg.trusted_upstream_identities = trusted[0..];
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/geo"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "198.51.100.20"),
+    };
+    defer request.deinit();
+    try request.headers.append("cf-ipcountry", "US");
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.find(u8, response.body orelse "", "Geo identity source is not trusted") != null);
+}
+
 test "H3 production dispatch enforces configured scope policy" {
     const allocator = std.testing.allocator;
     var blocks = [_]http.location_router.LocationBlock{.{
@@ -4378,9 +4472,15 @@ pub fn handleHttp3Request(
     effective_ctx.client_ip = request_ctx.client_ip;
     effective_ctx.authenticated = request_ctx.authenticated or request_ctx.identity != null;
 
-    if (effective_cfg.geo_blocked_countries.len > 0 and isGeoBlocked(effective_cfg.geo_blocked_countries, request.headers.get(effective_cfg.geo_country_header))) {
-        try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, "forbidden", "Geo access denied", correlation_id);
-        return;
+    if (effective_cfg.geo_blocked_countries.len > 0) {
+        if (!gph.isTrustedGeoSource(effective_cfg, request.client_ip orelse "")) {
+            try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, "forbidden", "Geo identity source is not trusted", correlation_id);
+            return;
+        }
+        if (isGeoBlocked(effective_cfg.geo_blocked_countries, request.headers.get(effective_cfg.geo_country_header))) {
+            try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, "forbidden", "Geo access denied", correlation_id);
+            return;
+        }
     }
     if (ctx.state.access_control) |*acl| {
         if (acl.check(request_ctx.client_ip) == .denied) {

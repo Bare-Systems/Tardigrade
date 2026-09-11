@@ -557,6 +557,7 @@ fn injectSmtpAuthIdentity(
 ) ![]const u8 {
     const identity = auth_identity orelse return payload;
     if (identity.len == 0) return payload;
+    if (!http.headers.isValidHeaderValue(identity)) return error.InvalidHeaderValue;
 
     const data_start = findSmtpDataStart(payload) orelse return payload;
     if (std.mem.findPos(u8, payload, data_start, "X-Tardigrade-Auth-Identity:")) |_| return payload;
@@ -966,4 +967,9 @@ test "mail replies and memcached payloads fail closed at parser limits" {
     var payload = try parseMemcachedPayload(allocator, "{\"op\":\"set\",\"key\":\"k\",\"value\":\"v\",\"ttl\":30}");
     defer payload.deinit(allocator);
     try std.testing.expectEqual(@as(u32, 30), payload.ttl);
+
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        injectSmtpAuthIdentity(allocator, "DATA\r\nbody\r\n.\r\n", "user\r\nX-Injected: yes"),
+    );
 }

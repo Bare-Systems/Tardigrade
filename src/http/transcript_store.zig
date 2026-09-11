@@ -2,6 +2,8 @@ const builtin = @import("builtin");
 const std = @import("std");
 const compat = @import("zig_compat");
 
+const owner_only_permissions: std.Io.File.Permissions = .fromMode(0o600);
+
 pub const Entry = struct {
     ts_ms: i64,
     scope: []const u8,
@@ -91,7 +93,15 @@ pub fn append(allocator: std.mem.Allocator, path: []const u8, entry: Entry, reda
         };
     }
 
-    var file = try compat.cwd().createFile(path, .{ .read = true, .truncate = false });
+    // Transcripts can contain request/response bodies and identities. Apply
+    // restrictive permissions in the create syscall itself; chmod-after-open
+    // leaves a race where a default-0644 file can be opened by another local
+    // user before ensureOwnerOnlyPermissions tightens it.
+    var file = try compat.cwd().createFile(path, .{
+        .read = true,
+        .truncate = false,
+        .permissions = owner_only_permissions,
+    });
     defer file.close();
     try ensureOwnerOnlyPermissions(file);
     _ = std.c.lseek(file.file.handle, 0, std.c.SEEK.END);

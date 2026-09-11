@@ -282,7 +282,7 @@ listener contracts:
 | `TARDIGRADE_LOCATION_ERROR_PAGES` | encoded list | `""` | Internal error-page representation. Prefer `error_page` in locations. | <code>TARDIGRADE_LOCATION_ERROR_PAGES=prefix&#124;/api/&#124;502,503&#124;/50x.html</code> |
 | `TARDIGRADE_INTERNAL_REDIRECT_RULES` | encoded list | `""` | <code>method&#124;pattern&#124;target;...</code>; target can be a path or named location. | <code>TARDIGRADE_INTERNAL_REDIRECT_RULES=GET&#124;^/old$&#124;/new</code> |
 | `TARDIGRADE_NAMED_LOCATIONS` | encoded list | `""` | <code>name&#124;path;...</code>. | <code>TARDIGRADE_NAMED_LOCATIONS=fallback&#124;/index.html</code> |
-| `TARDIGRADE_MIRROR_RULES` | encoded list | `""` | <code>method&#124;pattern&#124;target_url;...</code>; best-effort async copies. | <code>TARDIGRADE_MIRROR_RULES=POST&#124;^/api/&#124;http://127.0.0.1:9000</code> |
+| `TARDIGRADE_MIRROR_RULES` | encoded list | `""` | <code>method&#124;pattern&#124;target_url;...</code>; best-effort bounded copies after the primary route completes. Mirror connect/response waits use the upstream timeout settings and never become unbounded when those settings are zero. | <code>TARDIGRADE_MIRROR_RULES=POST&#124;^/api/&#124;http://127.0.0.1:9000</code> |
 | `TARDIGRADE_REWRITE_RULES` | encoded list | `""` | <code>method&#124;pattern&#124;replacement&#124;flag;...</code>; config-file `rewrite` is preferred. | <code>TARDIGRADE_REWRITE_RULES=*&#124;^/old/(.*)$&#124;/new/$1&#124;last</code> |
 | `TARDIGRADE_RETURN_RULES` | encoded list | `""` | <code>method&#124;pattern&#124;status&#124;body;...</code>; config-file `return` is preferred. | <code>TARDIGRADE_RETURN_RULES=*&#124;^/health$&#124;200&#124;ok</code> |
 | `TARDIGRADE_CONDITIONAL_RULES` | encoded list | `""` | Encoded inline <code>if (...) return&#124;rewrite</code> rules. Variables are `request_uri`, `http_host`, `args`; sensitivity is `cs` or `ci`. | <code>TARDIGRADE_CONDITIONAL_RULES=request_uri&#124;ci&#124;^/admin&#124;return&#124;403&#124;blocked</code> |
@@ -523,14 +523,14 @@ DCID steering is outside the current support promise.
 | `TARDIGRADE_TRANSCRIPT_STORE_PATH` | path | `""` | Transcript store. Path changes on reload require restart. | `TARDIGRADE_TRANSCRIPT_STORE_PATH=/var/lib/tardigrade/transcripts` |
 | `TARDIGRADE_TRUST_GATEWAY_ID` | string | `tardigrade-edge` | Gateway identity for signed upstream trust headers. | `TARDIGRADE_TRUST_GATEWAY_ID=edge-us-east-1` |
 | `TARDIGRADE_TRUST_SHARED_SECRET` | secret | `""` | Signs outbound `X-Tardigrade-Gateway-Id`, timestamp, and signature headers sent to upstreams. Empty disables outbound trust-header signing. | `TARDIGRADE_TRUST_SHARED_SECRET=change-me` |
-| `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` | CSV strings | `[]` | Allowed upstream host/authority identities used by control-plane proxy trust enforcement. | `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES=app-a,app-b` |
-| `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY` | bool | `false` | When true, trusted control-plane proxying requires a shared secret and an allowed upstream target; it does not currently verify signed response headers. | `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true` |
+| `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` | CSV strings | `[]` | Trusted peer hosts/addresses allowed to supply inbound forwarded-client and geo metadata; also used by control-plane proxy trust enforcement. | `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES=192.0.2.10,192.0.2.11` |
+| `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY` | bool | `false` | When true, inbound forwarded-client and geo metadata is accepted only from a listed trusted peer. Trusted control-plane proxying also requires its shared secret and an allowed upstream target; signed response headers are not currently verified. | `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true` |
 | `TARDIGRADE_SECURITY_HEADERS` | bool | `true` | Adds default security headers. | `TARDIGRADE_SECURITY_HEADERS=true` |
 | `TARDIGRADE_HSTS_ENABLED` | bool | `false` | Emits HSTS on HTTPS responses. | `TARDIGRADE_HSTS_ENABLED=true` |
 | `TARDIGRADE_HSTS_MAX_AGE` | u32 seconds | `31536000` | HSTS max-age. | `TARDIGRADE_HSTS_MAX_AGE=63072000` |
 | `TARDIGRADE_HSTS_INCLUDE_SUBDOMAINS` | bool | `true` | Adds `includeSubDomains`. | `TARDIGRADE_HSTS_INCLUDE_SUBDOMAINS=true` |
 | `TARDIGRADE_HSTS_PRELOAD` | bool | `false` | Adds `preload`. | `TARDIGRADE_HSTS_PRELOAD=false` |
-| `TARDIGRADE_GEO_BLOCKED_COUNTRIES` | CSV country codes | `[]` | Alphabetic ISO-style country codes from external country header. | `TARDIGRADE_GEO_BLOCKED_COUNTRIES=RU,KP` |
+| `TARDIGRADE_GEO_BLOCKED_COUNTRIES` | CSV country codes | `[]` | Alphabetic ISO-style country codes from an external proxy/CDN header. Enabling this requires the trusted-source enforcement settings so direct clients cannot forge their country. | `TARDIGRADE_GEO_BLOCKED_COUNTRIES=RU,KP` |
 | `TARDIGRADE_GEO_COUNTRY_HEADER` | header name | `CF-IPCountry` | Header supplying country code. | `TARDIGRADE_GEO_COUNTRY_HEADER=X-Country-Code` |
 | `TARDIGRADE_ACCESS_CONTROL` | string | `""` | IP access control rules, e.g. `allow 10.0.0.0/8, deny 0.0.0.0/0`. | `TARDIGRADE_ACCESS_CONTROL=deny 203.0.113.0/24` |
 | `TARDIGRADE_ADD_HEADERS` | encoded list | `""` | <code>Name: value&#124;Name2: value2</code>; appended response headers. | `TARDIGRADE_ADD_HEADERS=X-Frame-Options: DENY` |

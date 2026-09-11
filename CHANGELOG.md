@@ -31,9 +31,17 @@ All notable user-facing changes to Tardigrade are documented here.
   SMTP/IMAP upstream TLS now verifies hostname and CA without permitting
   truncation, mail replies are bounded, UDP proxy reads have deadlines, and
   memcached JSON/TTL parsing rejects invalid input without traps or leaks.
-  Failed session/approval persistence also removes its owner-only temporary
-  credential file instead of leaving secret material behind after sync/rename
-  errors.
+  Failed session, approval, and TLS ticket-key persistence also removes its
+  owner-only temporary credential file instead of leaving secret/key material
+  behind after write, sync, or rename errors. Transcript files are created
+  owner-only atomically, closing the prior create-then-chmod exposure window.
+  JWT and session-derived identity fields are validated at asserted-header
+  boundaries, preventing CR/LF-bearing claims from injecting upstream HTTP or
+  SMTP headers. Geo-blocking configurations now require an explicit trusted
+  proxy/CDN source and reject country headers received from any other peer.
+  Best-effort mirror delivery now uses bounded native HTTP/TLS transport and a
+  bounded ignored response, preventing a stalled mirror from holding a worker
+  indefinitely.
 
 - **Secret zeroization is now materially faster on x86_64, and the
   guarantee is now Tardigrade-owned (#675)** — `crypto.secrets.secureZero`

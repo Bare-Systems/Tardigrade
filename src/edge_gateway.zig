@@ -3645,6 +3645,9 @@ fn h2EvaluateRequestPolicy(
     identity: ?[]const u8,
 ) ?Http2LocalRejection {
     if (cfg.geo_blocked_countries.len > 0) {
+        if (!gph.isTrustedGeoSource(cfg, client_ip)) {
+            return .{ .status_code = 403, .code = "forbidden", .message = "Geo identity source is not trusted" };
+        }
         const country = request.headers.get(cfg.geo_country_header);
         if (h2IsGeoBlocked(cfg.geo_blocked_countries, country)) {
             return .{ .status_code = 403, .code = "forbidden", .message = "Geo access denied" };
@@ -4157,7 +4160,7 @@ const H1ProductionPostPreflightHooks = struct {
         if (cfg.mirror_rules.len > 0) {
             ghandlers.spawnMirrorRequests(
                 allocator,
-                cfg.mirror_rules,
+                cfg,
                 request.method.toString(),
                 request.uri.path,
                 request.body orelse "",
@@ -4552,6 +4555,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
     ctx.early_data.transport_early = request_transport_early;
     ctx.early_data.inbound_marker = request.headers.hasEarlyDataMarker();
+
+    if (!gph.isTrustedGeoSource(cfg, connection_ip)) {
+        try gp.sendApiError(allocator, writer, .forbidden, "forbidden", "Geo identity source is not trusted", correlation_id, keep_alive, state);
+        ghandlers.logAccessForRequest(state, &ctx, &request, 403);
+        return;
+    }
 
     // --- RFC 7231 §4.3.8 / ASVS-14.5.1: Reject TRACE globally ---
     // TRACE echoes the request back to the client, enabling Cross-Site

@@ -227,6 +227,13 @@ pub fn isTrustedUpstream(cfg: *const edge_config.EdgeConfig, upstream_host: []co
     return false;
 }
 
+/// Geo policy is meaningful only when the country header arrived from the
+/// explicitly trusted proxy/CDN tier. Direct clients must not be able to pick
+/// their own country by supplying the configured header name.
+pub fn isTrustedGeoSource(cfg: *const edge_config.EdgeConfig, peer_host: []const u8) bool {
+    return cfg.geo_blocked_countries.len == 0 or isTrustedUpstream(cfg, peer_host);
+}
+
 /// Append HMAC-signed gateway-identity headers so an internal upstream can
 /// verify the request originated from a trusted Tardigrade instance.
 pub fn appendTrustedUpstreamHeaders(
@@ -289,16 +296,28 @@ pub fn appendAssertedIdentityHeaders(
     auth_scopes: ?[]const u8,
 ) !void {
     if (auth_identity) |identity| {
-        if (identity.len > 0) try headers.append(.{ .name = "X-Tardigrade-Auth-Identity", .value = identity });
+        if (identity.len > 0) {
+            try validateAssertedHeaderValue(identity);
+            try headers.append(.{ .name = "X-Tardigrade-Auth-Identity", .value = identity });
+        }
     }
     if (auth_user_id) |user_id| {
-        if (user_id.len > 0) try headers.append(.{ .name = "X-Tardigrade-User-ID", .value = user_id });
+        if (user_id.len > 0) {
+            try validateAssertedHeaderValue(user_id);
+            try headers.append(.{ .name = "X-Tardigrade-User-ID", .value = user_id });
+        }
     }
     if (auth_device_id) |device_id| {
-        if (device_id.len > 0) try headers.append(.{ .name = "X-Tardigrade-Device-ID", .value = device_id });
+        if (device_id.len > 0) {
+            try validateAssertedHeaderValue(device_id);
+            try headers.append(.{ .name = "X-Tardigrade-Device-ID", .value = device_id });
+        }
     }
     if (auth_scopes) |scopes| {
-        if (scopes.len > 0) try headers.append(.{ .name = "X-Tardigrade-Scopes", .value = scopes });
+        if (scopes.len > 0) {
+            try validateAssertedHeaderValue(scopes);
+            try headers.append(.{ .name = "X-Tardigrade-Scopes", .value = scopes });
+        }
     }
 }
 
@@ -311,17 +330,33 @@ pub fn writeAssertedIdentityHeaders(
     auth_scopes: ?[]const u8,
 ) !void {
     if (auth_identity) |identity| {
-        if (identity.len > 0) try writer.print("X-Tardigrade-Auth-Identity: {s}\r\n", .{identity});
+        if (identity.len > 0) {
+            try validateAssertedHeaderValue(identity);
+            try writer.print("X-Tardigrade-Auth-Identity: {s}\r\n", .{identity});
+        }
     }
     if (auth_user_id) |user_id| {
-        if (user_id.len > 0) try writer.print("X-Tardigrade-User-ID: {s}\r\n", .{user_id});
+        if (user_id.len > 0) {
+            try validateAssertedHeaderValue(user_id);
+            try writer.print("X-Tardigrade-User-ID: {s}\r\n", .{user_id});
+        }
     }
     if (auth_device_id) |device_id| {
-        if (device_id.len > 0) try writer.print("X-Tardigrade-Device-ID: {s}\r\n", .{device_id});
+        if (device_id.len > 0) {
+            try validateAssertedHeaderValue(device_id);
+            try writer.print("X-Tardigrade-Device-ID: {s}\r\n", .{device_id});
+        }
     }
     if (auth_scopes) |scopes| {
-        if (scopes.len > 0) try writer.print("X-Tardigrade-Scopes: {s}\r\n", .{scopes});
+        if (scopes.len > 0) {
+            try validateAssertedHeaderValue(scopes);
+            try writer.print("X-Tardigrade-Scopes: {s}\r\n", .{scopes});
+        }
     }
+}
+
+fn validateAssertedHeaderValue(value: []const u8) !void {
+    if (!http.headers.isValidHeaderValue(value)) return error.InvalidHeaderValue;
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +394,24 @@ test "shouldSkipUpstreamRequestHeader strips inbound X-Tardigrade headers" {
     try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Custom-Header", null));
     try std.testing.expect(!shouldSkipUpstreamRequestHeader("Authorization", null));
     try std.testing.expect(!shouldSkipUpstreamRequestHeader("Content-Type", null));
+}
+
+test "asserted identity headers reject CR LF and NUL values" {
+    const allocator = std.testing.allocator;
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
+    defer headers.deinit();
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        appendAssertedIdentityHeaders(&headers, "user\r\nX-Injected: yes", null, null, null),
+    );
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        writeAssertedIdentityHeaders(&output.writer, null, "user\x00suffix", null, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
 }
 
 test "shouldSkipUpstreamRequestHeader strips standard hop-by-hop headers" {
@@ -714,6 +767,18 @@ test "isTrustedUpstream strips port before matching" {
     });
     try std.testing.expect(isTrustedUpstream(&cfg, "trusted.internal:8080"));
     try std.testing.expect(!isTrustedUpstream(&cfg, "untrusted.internal:8080"));
+}
+
+test "geo country identity requires the configured trusted proxy source" {
+    var blocked = [_][]const u8{"RU"};
+    var identities = [_][]const u8{"192.0.2.10"};
+    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .geo_blocked_countries = blocked[0..],
+        .trust_require_upstream_identity = true,
+        .trusted_upstream_identities = identities[0..],
+    });
+    try std.testing.expect(isTrustedGeoSource(&cfg, "192.0.2.10"));
+    try std.testing.expect(!isTrustedGeoSource(&cfg, "198.51.100.20"));
 }
 
 test "stripPort handles bare hostname" {

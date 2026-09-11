@@ -79,6 +79,13 @@ pub fn authorizeRequest(allocator: std.mem.Allocator, cfg: *const edge_config.Ed
                         .failure_reason = .invalid,
                     };
                 }
+                if (!authClaimsHeaderSafe(claims.subject.?, claims.scope, claims.device_id)) {
+                    claims.deinit(allocator);
+                    return .{
+                        .ok = false,
+                        .failure_reason = .invalid,
+                    };
+                }
 
                 const subject = claims.subject.?;
                 claims.subject = null;
@@ -112,6 +119,12 @@ pub fn hashBearerToken(token: []const u8) [64]u8 {
     var digest_hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&digest_hex, "{f}", .{compat.fmtSliceHexLower(&digest)}) catch unreachable;
     return digest_hex;
+}
+
+fn authClaimsHeaderSafe(subject: []const u8, scope: ?[]const u8, device_id: ?[]const u8) bool {
+    return http.headers.isValidHeaderValue(subject) and
+        (scope == null or http.headers.isValidHeaderValue(scope.?)) and
+        (device_id == null or http.headers.isValidHeaderValue(device_id.?));
 }
 
 fn isJsonContentType(content_type: ?[]const u8) bool {
@@ -644,6 +657,13 @@ test "parseChatMessage validates payload" {
     try std.testing.expectEqualStrings("hello", message);
 
     try std.testing.expectError(error.MessageTooLarge, parseChatMessage(allocator, "{\"message\":\"hello\"}", 2));
+}
+
+test "asserted JWT claims reject upstream header delimiters" {
+    try std.testing.expect(authClaimsHeaderSafe("user-1", "read write", "device-1"));
+    try std.testing.expect(!authClaimsHeaderSafe("user-1\r\nX-Injected: yes", null, null));
+    try std.testing.expect(!authClaimsHeaderSafe("user-1", "read\nX-Injected: yes", null));
+    try std.testing.expect(!authClaimsHeaderSafe("user-1", null, "device\x00suffix"));
 }
 
 test "routeRequiresApprovalRule detects approval requirement" {

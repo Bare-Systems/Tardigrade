@@ -16,6 +16,7 @@ const StaticEntry = struct {
 };
 
 const DYNAMIC_TABLE_ENTRY_OVERHEAD: usize = 32;
+pub const DEFAULT_MAX_DYNAMIC_TABLE_SIZE: usize = 4096;
 
 /// HPACK dynamic table per RFC 7541 §2.3.2.
 ///
@@ -29,9 +30,15 @@ pub const DynamicTable = struct {
     entries: std.Deque(HeaderField),
     size: usize,
     max_size: usize,
+    max_allowed_size: usize,
 
     pub fn init() DynamicTable {
-        return .{ .entries = .empty, .size = 0, .max_size = 4096 };
+        return .{
+            .entries = .empty,
+            .size = 0,
+            .max_size = DEFAULT_MAX_DYNAMIC_TABLE_SIZE,
+            .max_allowed_size = DEFAULT_MAX_DYNAMIC_TABLE_SIZE,
+        };
     }
 
     pub fn deinit(self: *DynamicTable, allocator: std.mem.Allocator) void {
@@ -59,7 +66,13 @@ pub const DynamicTable = struct {
         self.size += cost;
     }
 
-    pub fn setMaxSize(self: *DynamicTable, allocator: std.mem.Allocator, new_max: usize) void {
+    pub fn setMaxSize(self: *DynamicTable, allocator: std.mem.Allocator, new_max: usize) !void {
+        // The peer's encoder may only shrink and regrow the table within the
+        // SETTINGS_HEADER_TABLE_SIZE limit advertised by this decoder. We do
+        // not advertise an override, so RFC 7541's 4096-byte default is the
+        // hard ceiling. Accepting an arbitrary update lets a peer retain an
+        // unbounded table across a sequence of individually-small requests.
+        if (new_max > self.max_allowed_size) return error.InvalidHpackTableSizeUpdate;
         self.max_size = new_max;
         while (self.size > self.max_size) self.evictOldest(allocator);
     }
@@ -195,6 +208,7 @@ fn decodeWithTable(allocator: std.mem.Allocator, block: []const u8, dyn: ?*Dynam
     }
 
     var i: usize = 0;
+    var saw_header_field = false;
     while (i < block.len) {
         const b = block[i];
 
@@ -206,13 +220,20 @@ fn decodeWithTable(allocator: std.mem.Allocator, block: []const u8, dyn: ?*Dynam
                 .name = try allocator.dupe(u8, entry.name),
                 .value = try allocator.dupe(u8, entry.value),
             });
+            saw_header_field = true;
             continue;
         }
 
         if ((b & 0xE0) == 0x20) {
             // Dynamic table size update (RFC 7541 §6.3).
+            // Updates are only legal at the beginning of a header block.
+            if (saw_header_field) return error.InvalidHpackTableSizeUpdate;
             const new_max = try decodeInteger(block, &i, 5);
-            if (dyn) |d| d.setMaxSize(allocator, new_max);
+            if (dyn) |d| {
+                try d.setMaxSize(allocator, new_max);
+            } else if (new_max > DEFAULT_MAX_DYNAMIC_TABLE_SIZE) {
+                return error.InvalidHpackTableSizeUpdate;
+            }
             continue;
         }
 
@@ -230,6 +251,7 @@ fn decodeWithTable(allocator: std.mem.Allocator, block: []const u8, dyn: ?*Dynam
             errdefer allocator.free(value);
             if (dyn) |d| try d.insert(allocator, name, value);
             try out.append(allocator, .{ .name = name, .value = value });
+            saw_header_field = true;
             continue;
         }
 
@@ -247,6 +269,7 @@ fn decodeWithTable(allocator: std.mem.Allocator, block: []const u8, dyn: ?*Dynam
             const value = try decodeStringAlloc(allocator, block, &i);
             errdefer allocator.free(value);
             try out.append(allocator, .{ .name = name, .value = value });
+            saw_header_field = true;
             continue;
         }
 
@@ -296,10 +319,14 @@ fn decodeInteger(buf: []const u8, idx: *usize, prefix_bits: u3) !usize {
         if (idx.* >= buf.len) return error.TruncatedHpack;
         const b = buf[idx.*];
         idx.* += 1;
-        value += @as(usize, b & 0x7F) << @intCast(m);
+        const chunk: usize = b & 0x7F;
+        const bit_size = @bitSizeOf(usize);
+        if (m >= bit_size) return error.InvalidHpackInteger;
+        const remaining = std.math.maxInt(usize) - value;
+        if (chunk > (remaining >> @intCast(m))) return error.InvalidHpackInteger;
+        value += chunk << @intCast(m);
         if ((b & 0x80) == 0) break;
         m += 7;
-        if (m > 56) return error.InvalidHpackInteger;
     }
     return value;
 }
@@ -308,7 +335,7 @@ fn decodeStringAlloc(allocator: std.mem.Allocator, buf: []const u8, idx: *usize)
     if (idx.* >= buf.len) return error.TruncatedHpack;
     const is_huffman = (buf[idx.*] & 0x80) != 0;
     const len = try decodeInteger(buf, idx, 7);
-    if (idx.* + len > buf.len) return error.TruncatedHpack;
+    if (len > buf.len - idx.*) return error.TruncatedHpack;
     const raw = buf[idx.* .. idx.* + len];
     idx.* += len;
     if (is_huffman) return huffman.decodeAlloc(allocator, raw);
@@ -403,7 +430,7 @@ test "DynamicTable evicts oldest entries to stay within max_size" {
     const name = "a";
     const val = "b";
     const entry_cost = name.len + val.len + DYNAMIC_TABLE_ENTRY_OVERHEAD;
-    table.setMaxSize(allocator, entry_cost); // room for exactly one entry
+    try table.setMaxSize(allocator, entry_cost); // room for exactly one entry
 
     try table.insert(allocator, name, val);
     try std.testing.expectEqual(@as(usize, 1), table.entries.len);
@@ -422,7 +449,7 @@ test "DynamicTable setMaxSize zero evicts everything" {
     try table.insert(allocator, "key", "val");
     try std.testing.expectEqual(@as(usize, 1), table.entries.len);
 
-    table.setMaxSize(allocator, 0);
+    try table.setMaxSize(allocator, 0);
     try std.testing.expectEqual(@as(usize, 0), table.entries.len);
     try std.testing.expectEqual(@as(usize, 0), table.size);
 }
@@ -461,6 +488,31 @@ test "Decoder accumulates dynamic table across calls" {
     try std.testing.expectEqual(@as(usize, 1), r2.headers.len);
     try std.testing.expectEqualStrings("x-hdr", r2.headers[0].name);
     try std.testing.expectEqualStrings("hello", r2.headers[0].value);
+}
+
+test "HPACK rejects table growth above the advertised default and late updates" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init();
+    defer dec.deinit(allocator);
+
+    var oversized = std.ArrayList(u8).empty;
+    defer oversized.deinit(allocator);
+    try encodeInteger(allocator, &oversized, DEFAULT_MAX_DYNAMIC_TABLE_SIZE + 1, 5, 0x20);
+    try std.testing.expectError(error.InvalidHpackTableSizeUpdate, dec.decode(allocator, oversized.items));
+    try std.testing.expectEqual(DEFAULT_MAX_DYNAMIC_TABLE_SIZE, dec.dynamic.max_size);
+
+    // An update after an indexed field is forbidden even when its value is
+    // within the negotiated limit.
+    const late_update = [_]u8{ 0x82, 0x20 };
+    try std.testing.expectError(error.InvalidHpackTableSizeUpdate, dec.decode(allocator, &late_update));
+}
+
+test "HPACK integer overflow is a parse error rather than an arithmetic trap" {
+    // A saturated prefix followed by more than usize can represent used to
+    // overflow the shift/add expression in safe builds.
+    const encoded = [_]u8{ 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02 };
+    var index: usize = 0;
+    try std.testing.expectError(error.InvalidHpackInteger, decodeInteger(&encoded, &index, 7));
 }
 
 test "fuzz: decode never panics on arbitrary HPACK header blocks" {

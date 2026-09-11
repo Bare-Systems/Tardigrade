@@ -171,6 +171,36 @@ given code path happens to read.
 Implementation: `src/http/request.zig`, `Request.parse()` and
 `Request.parseHead()`.
 
+## 4b. Routing Authority Ambiguity
+
+HTTP/1 requests carrying more than one `Host` field are rejected with
+`error.DuplicateHostHeader` (mapped to `400 Bad Request`) before routing,
+authentication, or proxying. This applies even when the values are identical:
+accepting either the first or last value would let different intermediaries
+disagree about the request's routing authority.
+
+Host values are syntax-checked, and an absolute-form request target retains
+its authority until it can be compared with Host (including default-port
+normalization). A mismatch is rejected before virtual-host selection.
+
+HTTP/2 applies the equivalent rule to its entire request-header envelope.
+Initial header blocks reject duplicated or unknown pseudo-headers,
+pseudo-headers appearing after regular fields, and uppercase header names.
+Ordinary requests require exactly one `:method`, `:scheme`, and `:path`;
+CONNECT uses the RFC-specific `:method`/`:authority` form. Trailer blocks may
+contain only lowercase regular fields. Violations terminate the connection
+with `PROTOCOL_ERROR` before a route or upstream is selected.
+
+HTTP/3 applies the same uniqueness, ordering, lowercase-name,
+connection-specific-field, authority, and pseudo-value rules before a request
+is dispatched. Both multiplexed protocols also enforce the configured
+per-request body ceiling and an aggregate request-assembly ceiling across all
+concurrent streams on one connection.
+
+Implementation: `src/http/request.zig`, `Request.parse()` and
+`Request.parseHead()`; `src/edge_gateway.zig`,
+`h2RequestHeaderBlockIsValid()` and `h2ProcessHeaderBlock()`.
+
 ## 5. Header Casing and Normalization
 
 All header names stored by Tardigrade's `Headers` collection are lowercased on
@@ -213,8 +243,9 @@ to upstream response headers in `parseBufferedUpstreamResponse()` and
 Clients may send requests in either origin-form (`GET /path HTTP/1.1`) or
 absolute-form (`GET http://example.com/path HTTP/1.1`). Tardigrade's request
 parser normalizes absolute-form targets by extracting the path component and
-discarding the scheme and authority. The `Host` header value is not overridden
-by the absolute-form authority; host-based routing still uses the `Host` header.
+retaining the scheme and authority for validation. Host-based routing still
+uses the `Host` field, but only after it is proven equivalent to the target
+authority; disagreement is rejected with `400 Bad Request`.
 
 Absolute-form URIs with no explicit path component (e.g., `http://example.com`
 with no trailing slash) are rejected with `400 Bad Request` (`error.InvalidUri`).

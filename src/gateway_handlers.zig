@@ -717,7 +717,7 @@ pub fn routeRequest(
         },
     }
 
-    if (serveTryFilesFallback(allocator, conn, cfg, request, correlation_id, keep_alive.*, state)) |status| {
+    if (serveTryFilesFallback(allocator, conn, cfg, request, correlation_id, keep_alive.*, state, ctx)) |status| {
         state.metricsRecord(status);
         return status;
     } else |_| {}
@@ -909,7 +909,7 @@ fn executeLocationAction(
             return null;
         },
         .static_root => |root_cfg| {
-            if (try handleStaticLocation(allocator, conn, request, matched, root_cfg, correlation_id, keep_alive.*, state)) |status| {
+            if (try handleStaticLocation(allocator, conn, request, matched, root_cfg, correlation_id, keep_alive.*, state, ctx)) |status| {
                 return status;
             }
             return null;
@@ -1376,7 +1376,10 @@ fn spawnAsyncCommandExecution(
         api_version,
         incoming_host,
         incoming_x_forwarded_for,
-    ) catch return;
+    ) catch {
+        state.commandLifecycleSetFailed(command_id, "async_job_allocation_failed");
+        return;
+    };
     const t = std.Thread.spawn(.{}, runAsyncCommandJob, .{job}) catch {
         destroyAsyncCommandJob(job);
         state.commandLifecycleSetFailed(command_id, "async_spawn_failed");
@@ -1402,26 +1405,40 @@ fn createAsyncCommandJob(
 ) !*AsyncCommandJob {
     const job = try allocator.create(AsyncCommandJob);
     errdefer allocator.destroy(job);
+    const owned_command_id = try allocator.dupe(u8, command_id);
+    errdefer allocator.free(owned_command_id);
+    const owned_command_name = try allocator.dupe(u8, command_name);
+    errdefer allocator.free(owned_command_name);
+    const owned_upstream_path = try allocator.dupe(u8, upstream_path);
+    errdefer allocator.free(owned_upstream_path);
+    const owned_envelope = try allocator.dupe(u8, envelope);
+    errdefer allocator.free(owned_envelope);
+    const owned_correlation_id = try allocator.dupe(u8, correlation_id);
+    errdefer allocator.free(owned_correlation_id);
+    const owned_client_ip = try allocator.dupe(u8, client_ip);
+    errdefer allocator.free(owned_client_ip);
+    const owned_identity = if (identity) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_identity) |value| allocator.free(value);
+    const owned_incoming_host = if (incoming_host) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_incoming_host) |value| allocator.free(value);
+    const owned_incoming_xff = if (incoming_x_forwarded_for) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_incoming_xff) |value| allocator.free(value);
     job.* = .{
         .allocator = allocator,
         .cfg = cfg,
         .state = state,
-        .command_id = dupeOrEmpty(allocator, command_id),
-        .command_name = dupeOrEmpty(allocator, command_name),
-        .upstream_path = dupeOrEmpty(allocator, upstream_path),
-        .envelope = dupeOrEmpty(allocator, envelope),
-        .correlation_id = dupeOrEmpty(allocator, correlation_id),
-        .client_ip = dupeOrEmpty(allocator, client_ip),
-        .identity = if (identity) |id| allocator.dupe(u8, id) catch null else null,
-        .incoming_host = if (incoming_host) |h| allocator.dupe(u8, h) catch null else null,
-        .incoming_x_forwarded_for = if (incoming_x_forwarded_for) |xff| allocator.dupe(u8, xff) catch null else null,
+        .command_id = owned_command_id,
+        .command_name = owned_command_name,
+        .upstream_path = owned_upstream_path,
+        .envelope = owned_envelope,
+        .correlation_id = owned_correlation_id,
+        .client_ip = owned_client_ip,
+        .identity = owned_identity,
+        .incoming_host = owned_incoming_host,
+        .incoming_x_forwarded_for = owned_incoming_xff,
         .api_version = api_version,
     };
     return job;
-}
-
-fn dupeOrEmpty(allocator: std.mem.Allocator, src: []const u8) []u8 {
-    return allocator.dupe(u8, src) catch allocator.alloc(u8, 0) catch unreachable;
 }
 
 fn destroyAsyncCommandJob(job: *AsyncCommandJob) void {

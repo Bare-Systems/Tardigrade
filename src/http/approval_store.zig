@@ -6,6 +6,8 @@
 const std = @import("std");
 const compat = @import("zig_compat");
 
+const owner_only_permissions: std.Io.File.Permissions = .fromMode(0o600);
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -44,16 +46,25 @@ pub fn persist(
     path: []const u8,
     entries: []const StoredApproval,
 ) !void {
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{d}.tmp", .{ path, std.c.getpid() });
     defer allocator.free(tmp_path);
 
     const json_bytes = try compat.stringifyAlloc(allocator, StoreEnvelope{ .version = 1, .entries = entries }, .{});
-    defer allocator.free(json_bytes);
+    defer {
+        @memset(json_bytes, 0);
+        allocator.free(json_bytes);
+    }
 
+    std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
     {
-        const f = try std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{ .truncate = true });
+        const f = try std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{
+            .truncate = true,
+            .exclusive = true,
+            .permissions = owner_only_permissions,
+        });
         defer f.close(compat.io());
         try f.writeStreamingAll(compat.io(), json_bytes);
+        try f.sync(compat.io());
     }
     try std.Io.Dir.renameAbsolute(tmp_path, path, compat.io());
 }
@@ -78,7 +89,10 @@ pub fn load(
         var reader = f.reader(compat.io(), &file_buf);
         break :blk try reader.interface.readAlloc(allocator, 64 * 1024 * 1024);
     };
-    defer allocator.free(data);
+    defer {
+        @memset(data, 0);
+        allocator.free(data);
+    }
 
     const parsed = try std.json.parseFromSlice(
         StoreEnvelope,
@@ -164,4 +178,20 @@ fn doFireWebhook(
             .{ .name = "Content-Type", .value = "application/json" },
         },
     });
+}
+
+test "approval persistence creates owner-only credential storage" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const path = try std.fmt.allocPrint(allocator, "{s}/approvals.json", .{tmp_abs});
+    defer allocator.free(path);
+
+    try persist(allocator, path, &.{});
+    const file = try std.Io.Dir.openFileAbsolute(compat.io(), path, .{});
+    defer file.close(compat.io());
+    const stat = try file.stat(compat.io());
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
 }

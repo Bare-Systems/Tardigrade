@@ -47,7 +47,11 @@ pub fn authorizeRequest(allocator: std.mem.Allocator, cfg: *const edge_config.Ed
             if (cfg.auth_token_hashes.len > 0) {
                 const token_hash = hashBearerToken(token);
                 for (cfg.auth_token_hashes) |allowed| {
-                    if (std.mem.eql(u8, allowed, token_hash[0..])) {
+                    // The configured digest and the request-derived digest
+                    // are secret-derived authentication material. Keep the
+                    // public length check ordinary, then compare all digest
+                    // bytes in constant time like Basic/JWT verification.
+                    if (allowed.len == token_hash.len and compat.timingSafeEql([64]u8, allowed[0..64].*, token_hash)) {
                         return .{
                             .ok = true,
                             .identity = try allocator.dupe(u8, token_hash[0..]),
@@ -378,13 +382,21 @@ fn validateDeviceRequest(
     const allocator = std.heap.page_allocator;
     const key = loadRegisteredDeviceKey(allocator, cfg.device_registry_path, device_id) orelse return false;
     defer allocator.free(key);
-    const signed = std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n{s}\n{s}", .{ key, method, path, ts_str, body }) catch return false;
-    defer allocator.free(signed);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(signed, &digest, .{});
-    var digest_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&digest_hex, "{f}", .{compat.fmtSliceHexLower(&digest)}) catch return false;
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, provided_sig, " \t\r\n"), digest_hex[0..]);
+    const signing_input = std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n{s}", .{ method, path, ts_str, body }) catch return false;
+    defer allocator.free(signing_input);
+    return verifyDeviceRequestSignature(key, signing_input, provided_sig);
+}
+
+fn verifyDeviceRequestSignature(key: []const u8, signing_input: []const u8, provided_raw: []const u8) bool {
+    const provided = std.mem.trim(u8, provided_raw, " \t\r\n");
+    if (provided.len != 64) return false;
+
+    var provided_mac: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&provided_mac, provided) catch return false;
+
+    var expected_mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected_mac, signing_input, key);
+    return compat.timingSafeEql([32]u8, provided_mac, expected_mac);
 }
 
 fn extractIdentityForPolicy(
@@ -452,10 +464,18 @@ pub fn evaluatePolicy(
         const device_pattern = std.mem.trim(u8, parts.next() orelse "", " \t");
         if (rule_method.len == 0 or rule_pattern.len == 0) continue;
         if (!http.rewrite.methodMatches(rule_method, method)) continue;
-        if (!http.rewrite.regexMatches(rule_pattern, path)) continue;
+        const pattern_matches = http.rewrite.regexMatchesChecked(rule_pattern, path) catch return "Invalid policy rule";
+        if (!pattern_matches) continue;
+
+        const approval_required = if (std.ascii.eqlIgnoreCase(req_approval, "true"))
+            true
+        else if (std.ascii.eqlIgnoreCase(req_approval, "false"))
+            false
+        else
+            return "Invalid policy rule";
 
         if (req_scope.len > 0 and !identityHasScope(cfg.policy_user_scopes_raw, identity, req_scope)) return "Missing required scope";
-        if (std.ascii.eqlIgnoreCase(req_approval, "true")) {
+        if (approval_required) {
             if (approvalPolicyError(state, method, path, identity, headers)) |reason| return reason;
         }
         if (allowed_hours.len > 0 and !timeWindowAllows(allowed_hours)) return "Route not allowed at this time";
@@ -480,8 +500,9 @@ pub fn routeRequiresApprovalRule(method: []const u8, path: []const u8, policy_ru
         const req_approval = std.mem.trim(u8, parts.next() orelse "false", " \t");
         if (rule_method.len == 0 or rule_pattern.len == 0) continue;
         if (!http.rewrite.methodMatches(rule_method, method)) continue;
-        if (!http.rewrite.regexMatches(rule_pattern, path)) continue;
-        if (std.ascii.eqlIgnoreCase(req_approval, "true")) return true;
+        if (!std.ascii.eqlIgnoreCase(req_approval, "true")) continue;
+        const pattern_matches = http.rewrite.regexMatchesChecked(rule_pattern, path) catch return true;
+        if (pattern_matches) return true;
     }
     return false;
 }
@@ -495,7 +516,9 @@ fn routeNeedsApproval(method: []const u8, path: []const u8, raw: []const u8) boo
         const rm = std.mem.trim(u8, parts.next() orelse "", " \t");
         const rp = std.mem.trim(u8, parts.next() orelse "", " \t");
         if (rm.len == 0 or rp.len == 0) continue;
-        if (http.rewrite.methodMatches(rm, method) and http.rewrite.regexMatches(rp, path)) return true;
+        if (!http.rewrite.methodMatches(rm, method)) continue;
+        const pattern_matches = http.rewrite.regexMatchesChecked(rp, path) catch return true;
+        if (pattern_matches) return true;
     }
     return false;
 }
@@ -518,9 +541,12 @@ fn identityHasScope(scopes_raw: []const u8, identity: ?[]const u8, required: []c
 }
 
 fn timeWindowAllows(raw: []const u8) bool {
-    const dash = std.mem.findScalar(u8, raw, '-') orelse return true;
-    const start = std.fmt.parseInt(u8, std.mem.trim(u8, raw[0..dash], " \t"), 10) catch return true;
-    const stop = std.fmt.parseInt(u8, std.mem.trim(u8, raw[dash + 1 ..], " \t"), 10) catch return true;
+    const dash = std.mem.findScalar(u8, raw, '-') orelse return false;
+    const start = std.fmt.parseInt(u8, std.mem.trim(u8, raw[0..dash], " \t"), 10) catch return false;
+    const stop = std.fmt.parseInt(u8, std.mem.trim(u8, raw[dash + 1 ..], " \t"), 10) catch return false;
+    // Start is an actual UTC hour. Stop may be 24 so `0-24` can represent
+    // the full day; zero remains valid for overnight windows such as `22-0`.
+    if (start > 23 or stop > 24) return false;
     const now = compat.unixTimestamp();
     const hour = @as(u8, @intCast(@mod(@divFloor(now, 3600), 24)));
     if (start <= stop) return hour >= start and hour < stop;
@@ -623,6 +649,45 @@ test "parseChatMessage validates payload" {
 test "routeRequiresApprovalRule detects approval requirement" {
     try std.testing.expect(routeRequiresApprovalRule("POST", "/api/tasks", "POST|/api/tasks|ops|true||"));
     try std.testing.expect(!routeRequiresApprovalRule("POST", "/api/messages", "POST|/api/tasks|ops|true||"));
+}
+
+test "time windows fail closed on malformed and out-of-range policy values" {
+    try std.testing.expect(!timeWindowAllows("all-day"));
+    try std.testing.expect(!timeWindowAllows("0-255"));
+    try std.testing.expect(!timeWindowAllows("24-1"));
+    try std.testing.expect(!timeWindowAllows("0-25"));
+    try std.testing.expect(!timeWindowAllows("1-2-3"));
+    try std.testing.expect(timeWindowAllows("0-24"));
+}
+
+test "policy evaluation denies invalid regex and approval boolean" {
+    const allocator = std.testing.allocator;
+    var headers = http.Headers.init(allocator);
+    defer headers.deinit();
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var state: GatewayState = undefined;
+
+    cfg.policy_rules_raw = "POST|[|commands.execute|false||";
+    try std.testing.expectEqualStrings("Invalid policy rule", evaluatePolicy(&state, &cfg, "POST", "/v1/commands", null, null, &headers).?);
+
+    cfg.policy_rules_raw = "POST|^/v1/commands$||tru||";
+    try std.testing.expectEqualStrings("Invalid policy rule", evaluatePolicy(&state, &cfg, "POST", "/v1/commands", null, null, &headers).?);
+}
+
+test "device request signatures use HMAC-SHA256 and exact constant-time MAC comparison" {
+    const key = "device-secret";
+    const signing_input = "POST\n/v1/commands\n1700000000\n{\"command\":\"status\"}";
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, signing_input, key);
+    var encoded: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&encoded, "{f}", .{compat.fmtSliceHexLower(&mac)}) catch unreachable;
+
+    try std.testing.expect(verifyDeviceRequestSignature(key, signing_input, &encoded));
+    encoded[63] = if (encoded[63] == '0') '1' else '0';
+    try std.testing.expect(!verifyDeviceRequestSignature(key, signing_input, &encoded));
+    try std.testing.expect(!verifyDeviceRequestSignature(key, signing_input, encoded[0..63]));
+    try std.testing.expect(!verifyDeviceRequestSignature(key, signing_input, "not-hex-not-a-mac"));
 }
 
 test "evaluatePolicy bypasses approval management endpoints" {

@@ -455,7 +455,14 @@ fn parseStatus(raw: []const u8) !u16 {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0) return 200;
     const end = std.mem.findScalar(u8, trimmed, ' ') orelse trimmed.len;
-    return std.fmt.parseInt(u16, trimmed[0..end], 10) catch error.InvalidStatusHeader;
+    const status = std.fmt.parseInt(u16, trimmed[0..end], 10) catch return error.InvalidStatusHeader;
+    if (status < 100 or status > 599) return error.InvalidStatusHeader;
+    return status;
+}
+
+test "parseStatus rejects invalid upstream status instead of certifying 200" {
+    try std.testing.expectError(error.InvalidStatusHeader, parseStatus("not-a-status"));
+    try std.testing.expectError(error.InvalidStatusHeader, parseStatus("999 Invalid"));
 }
 
 test "connect poll-bounds the TCP connect against a saturated backlog (#171)" {

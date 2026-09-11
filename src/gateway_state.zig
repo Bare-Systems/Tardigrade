@@ -60,6 +60,21 @@ pub const Http2PendingStream = struct {
         self.body.deinit();
         self.* = undefined;
     }
+
+    /// Logical request bytes retained while an HTTP/2 stream is awaiting
+    /// dispatch.  Include headers and pseudo-header routing state as well as
+    /// the body so many header-heavy held streams cannot bypass the
+    /// connection memory ceiling.
+    pub fn retainedBytes(self: *const Http2PendingStream) usize {
+        var total = self.body.items.len;
+        if (self.method) |value| total +|= value.len;
+        if (self.path) |value| total +|= value.len;
+        if (self.authority) |value| total +|= value.len;
+        for (self.headers.iterator()) |header| {
+            total +|= header.name.len +| header.value.len +| 4;
+        }
+        return total;
+    }
 };
 
 pub const UpstreamScope = enum {

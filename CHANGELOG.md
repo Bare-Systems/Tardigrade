@@ -6,6 +6,23 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Changed
 
+- **Release security hardening closes cross-protocol ambiguity, memory, and
+  origin-crash paths** — HTTP/1 now rejects duplicate/malformed Host fields
+  and absolute-form/Host authority disagreement. HTTP/2 validates the complete
+  pseudo-header envelope and values before its HTTP/1 adapter, strips padding,
+  ignores extension frames safely, validates SETTINGS, bounds HPACK state, and
+  enforces concurrent-stream plus aggregate request-memory limits. HTTP/3 now
+  applies equivalent header/framing checks and per-request plus aggregate
+  request-memory ceilings. Valid unregistered origin status codes no longer
+  trap response conversion, while malformed FastCGI/SCGI/uWSGI statuses fail
+  closed instead of becoming 200. Persistent session and approval credentials
+  are atomically written with owner-only permissions and temporary plaintext
+  buffers are wiped. Authorization policy time windows now reject malformed or
+  out-of-range hours, and device request authentication uses the documented
+  HMAC-SHA256 construction with constant-time MAC verification. Policy regex
+  compilation/execution failures and invalid approval booleans also deny the
+  request instead of silently skipping the affected rule.
+
 - **Secret zeroization is now materially faster on x86_64, and the
   guarantee is now Tardigrade-owned (#675)** — `crypto.secrets.secureZero`
   no longer wraps `std.crypto.secureZero`, which is `@memset` over a

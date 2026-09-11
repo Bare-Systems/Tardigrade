@@ -2,6 +2,8 @@ const std = @import("std");
 const compat = @import("zig_compat");
 const session = @import("session.zig");
 
+const owner_only_permissions: std.Io.File.Permissions = .fromMode(0o600);
+
 pub const StoredSession = struct {
     token: []const u8,
     identity: []const u8,
@@ -21,19 +23,28 @@ pub fn persist(allocator: std.mem.Allocator, path: []const u8, store: *const ses
     const entries = try snapshot(allocator, store);
     defer freeLoaded(allocator, entries);
 
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{d}.tmp", .{ path, std.c.getpid() });
     defer allocator.free(tmp_path);
 
     const buf = try compat.stringifyAlloc(allocator, StoreEnvelope{
         .version = 1,
         .entries = entries,
     }, .{});
-    defer allocator.free(buf);
+    defer {
+        @memset(buf, 0);
+        allocator.free(buf);
+    }
 
+    std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
     {
-        const file = try std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{ .truncate = true });
+        const file = try std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{
+            .truncate = true,
+            .exclusive = true,
+            .permissions = owner_only_permissions,
+        });
         defer file.close(compat.io());
         try file.writeStreamingAll(compat.io(), buf);
+        try file.sync(compat.io());
     }
     try std.Io.Dir.renameAbsolute(tmp_path, path, compat.io());
 }
@@ -47,7 +58,10 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) ![]StoredSession {
     var file_buf: [8192]u8 = undefined;
     var reader = file.reader(compat.io(), &file_buf);
     const data = try reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
-    defer allocator.free(data);
+    defer {
+        @memset(data, 0);
+        allocator.free(data);
+    }
 
     const parsed = try std.json.parseFromSlice(StoreEnvelope, allocator, data, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
@@ -164,6 +178,11 @@ test "session store persistence round trips active and revoked entries" {
     defer allocator.free(path);
 
     try persist(allocator, path, &base);
+
+    const persisted = try std.Io.Dir.openFileAbsolute(compat.io(), path, .{});
+    defer persisted.close(compat.io());
+    const stat = try persisted.stat(compat.io());
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
 
     const loaded = try load(allocator, path);
     defer freeLoaded(allocator, loaded);

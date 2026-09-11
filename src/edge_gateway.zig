@@ -6,11 +6,13 @@ const edge_config = @import("edge_config.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
 const build_options = @import("build_options");
 const tls_core = @import("tls_core");
+const http3_wire = @import("http3");
 
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
 const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_MAX_FRAME_SIZE: usize = 16 * 1024;
+const HTTP2_MAX_CONCURRENT_STREAMS: usize = 100;
 const WS_MUX_MAX_CHANNELS: usize = 32;
 const ACTIVE_DRIVE_POLL_INTERVAL_MS: u64 = 250;
 /// Fallback approval TTL when no config value is provided (5 minutes).
@@ -462,6 +464,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .tls_min_version = "1.3",
             .tls_max_version = "1.3",
             .enable_0rtt = cfg.http3_enable_0rtt,
+            .max_request_body_bytes = cfg.request_limits.effectiveMaxBodySize(),
+            .max_buffered_request_bytes = if (cfg.max_connection_memory_bytes > 0)
+                cfg.max_connection_memory_bytes
+            else
+                http3_wire.conn.default_max_buffered_request_bytes,
             .connection_migration = cfg.http3_connection_migration,
             .retry_policy = cfg.http3_retry_policy,
             .max_datagram_size = cfg.http3_max_datagram_size,
@@ -2391,7 +2398,7 @@ fn h2ResetStreamState(
     _ = streams.remove(stream_id);
     if (pending.fetchRemove(stream_id)) |removed| {
         var tmp = removed.value;
-        buffered_request_bytes.* -= @min(buffered_request_bytes.*, tmp.body.items.len);
+        buffered_request_bytes.* -= @min(buffered_request_bytes.*, tmp.retainedBytes());
         tmp.deinit(allocator);
     }
     if (pending_responses.fetchRemove(stream_id)) |removed| {
@@ -2410,6 +2417,132 @@ fn h2EncodedHeaderBlockLimit(cfg: *const edge_config.EdgeConfig, buffered_reques
     return limit;
 }
 
+/// Validate the HTTP/2 request pseudo-header envelope before copying any
+/// values into routing state. RFC 9113 § 8.3 requires pseudo-headers to
+/// precede regular fields, forbids duplicates and unknown pseudo-headers,
+/// and requires the ordinary request tuple. Silently replacing an earlier
+/// `:authority` (or `:path`) makes different hops disagree about which
+/// virtual host or authorization boundary the request addresses.
+fn h2RequestHeaderBlockIsValid(fields: []const http.hpack.HeaderField, initial: bool) bool {
+    var saw_regular = false;
+    var saw_method = false;
+    var saw_scheme = false;
+    var saw_authority = false;
+    var saw_path = false;
+    var method: ?[]const u8 = null;
+    var scheme: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
+    var authority: ?[]const u8 = null;
+    var host: ?[]const u8 = null;
+
+    for (fields) |field| {
+        if (field.name.len == 0) return false;
+        for (field.name) |c| {
+            if (std.ascii.isUpper(c)) return false;
+        }
+
+        if (field.name[0] != ':') {
+            saw_regular = true;
+            if (initial and std.mem.eql(u8, field.name, "host")) {
+                if (host != null) return false;
+                host = field.value;
+            }
+            continue;
+        }
+        // Trailer blocks are regular fields only.
+        if (!initial) return false;
+        if (saw_regular) return false;
+
+        if (std.mem.eql(u8, field.name, ":method")) {
+            if (saw_method) return false;
+            saw_method = true;
+            method = field.value;
+        } else if (std.mem.eql(u8, field.name, ":scheme")) {
+            if (saw_scheme) return false;
+            saw_scheme = true;
+            scheme = field.value;
+        } else if (std.mem.eql(u8, field.name, ":authority")) {
+            if (saw_authority) return false;
+            saw_authority = true;
+            authority = field.value;
+        } else if (std.mem.eql(u8, field.name, ":path")) {
+            if (saw_path) return false;
+            saw_path = true;
+            path = field.value;
+        } else {
+            return false;
+        }
+    }
+
+    if (!initial) return true;
+    if (!saw_method) return false;
+    if (http.Method.parse(method.?) == null) return false;
+    if (std.mem.eql(u8, method.?, "CONNECT")) {
+        return saw_authority and !saw_scheme and !saw_path and http.request.isValidAuthority(authority.?);
+    }
+    if (!saw_scheme or !saw_path) return false;
+    if (!(std.mem.eql(u8, scheme.?, "http") or std.mem.eql(u8, scheme.?, "https"))) return false;
+    if (!h2RequestPathIsValid(path.?)) return false;
+    // Routing authority has one meaning across the native H2 path and the
+    // synthesized H1 request used by shared routing/auth code. Multiple Host
+    // fields or a Host that disagrees with :authority create the same
+    // cross-hop ambiguity as duplicate Host in HTTP/1.
+    if (authority) |a| {
+        if (!http.request.isValidAuthority(a)) return false;
+        if (host) |h| {
+            if (!http.request.isValidAuthority(h) or !std.ascii.eqlIgnoreCase(a, h)) return false;
+        }
+    } else if (host) |h| {
+        if (!http.request.isValidAuthority(h)) return false;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+fn h2RequestPathIsValid(path: []const u8) bool {
+    if (!(std.mem.eql(u8, path, "*") or (path.len > 0 and path[0] == '/'))) return false;
+    for (path) |c| {
+        if (c <= 0x20 or c == 0x7f or c == '#') return false;
+    }
+    return true;
+}
+
+const H2HeadersPayload = struct {
+    fragment: []const u8,
+    priority: ?[]const u8,
+};
+
+/// Remove HEADERS padding and the optional priority tuple before HPACK sees
+/// the fragment. Padding bytes are transport framing, never request data.
+fn h2HeadersPayload(payload: []const u8, flags: u8) !H2HeadersPayload {
+    var start: usize = 0;
+    var end = payload.len;
+    if ((flags & http.http2_frame.Flags.PADDED) != 0) {
+        if (payload.len == 0) return error.InvalidHttp2Padding;
+        const padding_len: usize = payload[0];
+        start = 1;
+        if (padding_len > end - start) return error.InvalidHttp2Padding;
+        end -= padding_len;
+    }
+    var priority: ?[]const u8 = null;
+    if ((flags & http.http2_frame.Flags.PRIORITY) != 0) {
+        if (end - start < 5) return error.InvalidPriorityFrame;
+        priority = payload[start .. start + 5];
+        start += 5;
+    }
+    return .{ .fragment = payload[start..end], .priority = priority };
+}
+
+/// Return the application DATA bytes after removing HTTP/2 padding.
+fn h2DataPayload(payload: []const u8, flags: u8) ![]const u8 {
+    if ((flags & http.http2_frame.Flags.PADDED) == 0) return payload;
+    if (payload.len == 0) return error.InvalidHttp2Padding;
+    const padding_len: usize = payload[0];
+    if (padding_len > payload.len - 1) return error.InvalidHttp2Padding;
+    return payload[1 .. payload.len - padding_len];
+}
+
 fn h2ProcessHeaderBlock(
     allocator: std.mem.Allocator,
     decoder: *http.hpack.Decoder,
@@ -2422,6 +2555,8 @@ fn h2ProcessHeaderBlock(
     transport_early: bool,
     writer: anytype,
     last_client_stream_id: u31,
+    max_connection_memory_bytes: usize,
+    buffered_request_bytes: *usize,
 ) !void {
     var decoded = decoder.decode(allocator, header_block) catch {
         try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
@@ -2429,31 +2564,135 @@ fn h2ProcessHeaderBlock(
     };
     defer http.hpack.deinitDecoded(allocator, &decoded);
 
-    var ps = pending.get(stream_id) orelse Http2PendingStream.init(allocator);
+    const initial_headers = !pending.contains(stream_id);
+    if (!h2RequestHeaderBlockIsValid(decoded.headers, initial_headers)) {
+        try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+        return error.InvalidHttp2Request;
+    }
+    if (!initial_headers and !end_stream) {
+        // A trailing field section terminates the request. Accepting DATA
+        // after it creates two different message boundaries across hops.
+        try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+        return error.InvalidHttp2Request;
+    }
+
+    if (!initial_headers) {
+        // Trailers are validated above but deliberately not retained or
+        // folded into the routing/authentication header set.
+        if (streams.getPtr(stream_id)) |s| s.remoteEndStream() catch {};
+        try h2AppendReadyStream(ready_streams, stream_id);
+        return;
+    }
+
+    var ps = Http2PendingStream.init(allocator);
     var committed = false;
     errdefer if (!committed) ps.deinit(allocator);
     ps.transport_early = ps.transport_early or transport_early;
     if (streams.get(stream_id)) |s| ps.priority_weight = s.priority_weight;
     for (decoded.headers) |h| {
         if (std.mem.eql(u8, h.name, ":method")) {
-            if (ps.method) |m| allocator.free(m);
             ps.method = try allocator.dupe(u8, h.value);
         } else if (std.mem.eql(u8, h.name, ":path")) {
-            if (ps.path) |p| allocator.free(p);
             ps.path = try allocator.dupe(u8, h.value);
         } else if (std.mem.eql(u8, h.name, ":authority")) {
-            if (ps.authority) |a| allocator.free(a);
             ps.authority = try allocator.dupe(u8, h.value);
-        } else if (h.name.len > 0 and h.name[0] != ':') {
+        } else if (initial_headers and h.name.len > 0 and h.name[0] != ':') {
+            // This proxy does not forward request trailers. In particular,
+            // never fold them into the initial field collection used for
+            // routing or authentication (Host/Authorization trailers must
+            // not become initial request metadata).
             try ps.headers.append(h.name, h.value);
         }
     }
+    const retained = ps.retainedBytes();
+    if (max_connection_memory_bytes > 0 and retained > max_connection_memory_bytes -| buffered_request_bytes.*) {
+        try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.enhance_your_calm.value());
+        return error.Http2ConnectionMemoryLimitExceeded;
+    }
     try pending.put(stream_id, ps);
+    buffered_request_bytes.* += retained;
     committed = true;
     if (end_stream) {
         if (streams.getPtr(stream_id)) |s| s.remoteEndStream() catch {};
         try h2AppendReadyStream(ready_streams, stream_id);
     }
+}
+
+test "HTTP/2 request header validation rejects ambiguous pseudo-header envelopes" {
+    try std.testing.expect(h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "accept", .value = "*/*" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "trusted.test" },
+        .{ .name = ":authority", .value = "attacker.test" },
+        .{ .name = ":path", .value = "/" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = "accept", .value = "*/*" },
+        .{ .name = ":path", .value = "/after-regular" },
+        .{ .name = ":scheme", .value = "https" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":unknown", .value = "ignored-before" },
+        .{ .name = ":path", .value = "/" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "X-Uppercase", .value = "invalid-in-h2" },
+    }, true));
+    try std.testing.expect(h2RequestHeaderBlockIsValid(&.{
+        .{ .name = "x-checksum", .value = "abc" },
+    }, false));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":path", .value = "/pseudo-in-trailers" },
+    }, false));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "trusted.test" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "host", .value = "attacker.test" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "host", .value = "one.test" },
+        .{ .name = "host", .value = "two.test" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "trusted.test" },
+        .{ .name = ":path", .value = "/private HTTP/1.1\r\nX-Injected: yes" },
+    }, true));
+}
+
+test "HTTP/2 padded payload parsing excludes transport padding" {
+    const padded_data = [_]u8{ 3, 'o', 'k', 0, 0, 0 };
+    try std.testing.expectEqualStrings("ok", try h2DataPayload(&padded_data, http.http2_frame.Flags.PADDED));
+    try std.testing.expectError(error.InvalidHttp2Padding, h2DataPayload(&.{ 2, 0 }, http.http2_frame.Flags.PADDED));
+
+    const padded_headers = [_]u8{ 2, 1, 2, 3, 0, 0 };
+    const parsed = try h2HeadersPayload(&padded_headers, http.http2_frame.Flags.PADDED);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, parsed.fragment);
+    try std.testing.expect(parsed.priority == null);
+
+    const priority_headers = [_]u8{ 1, 0, 0, 0, 0, 15, 0x82, 0 };
+    const with_priority = try h2HeadersPayload(&priority_headers, http.http2_frame.Flags.PADDED | http.http2_frame.Flags.PRIORITY);
+    try std.testing.expectEqualSlices(u8, &.{0x82}, with_priority.fragment);
+    try std.testing.expectEqual(@as(usize, 5), with_priority.priority.?.len);
 }
 
 /// Outbound response body parked on a stream while HTTP/2 send credit is
@@ -2604,7 +2843,7 @@ fn h2DispatchReadyStreams(
         ps.dispatch_count += 1;
         if (pending.fetchRemove(sid)) |removed| {
             var tmp = removed.value;
-            buffered_request_bytes.* -= @min(buffered_request_bytes.*, tmp.body.items.len);
+            buffered_request_bytes.* -= @min(buffered_request_bytes.*, tmp.retainedBytes());
             tmp.deinit(allocator);
         }
         // If the response is still parked on send-credit exhaustion, its
@@ -2626,7 +2865,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     const allocator = state.allocator;
 
     try http.http2_frame.writeSettings(allocator, conn.writer(), &[_][2]u32{
-        .{ 0x3, 100 }, // max concurrent streams
+        .{ 0x3, HTTP2_MAX_CONCURRENT_STREAMS }, // max concurrent streams
         .{ 0x4, 1024 * 1024 }, // initial window size
     });
 
@@ -2741,6 +2980,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     const new_initial_window = http.http2_frame.parseSettingsInitialWindowSize(frame.payload) catch |err| {
                         const code = switch (err) {
                             error.Http2FlowControlError => http.http2_stream.ErrorCode.flow_control_error,
+                            error.InvalidSettingsValue => http.http2_stream.ErrorCode.protocol_error,
                             else => http.http2_stream.ErrorCode.frame_size_error,
                         };
                         try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, code.value());
@@ -2778,10 +3018,22 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 }
             },
             .ping => {
+                if (frame.stream_id != 0) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return error.InvalidHttp2StreamId;
+                }
+                if (frame.payload.len != 8) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    return error.InvalidPingPayload;
+                }
                 if ((frame.flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writePingAck(conn.writer(), frame.payload);
             },
             .headers => {
                 if (frame.stream_id == 0) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return error.InvalidHttp2StreamId;
+                }
+                if ((frame.stream_id & 1) == 0) {
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
@@ -2791,16 +3043,26 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 }
                 last_client_stream_id = @max(last_client_stream_id, frame.stream_id);
                 if (!streams.contains(frame.stream_id)) {
+                    if (streams.count() >= HTTP2_MAX_CONCURRENT_STREAMS) {
+                        // Bound all per-stream maps and header/body ownership.
+                        // Close the connection on a peer that exceeds the
+                        // limit so we never skip a header block and desync the
+                        // connection-scoped HPACK dynamic table.
+                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.enhance_your_calm.value());
+                        return error.Http2ConcurrentStreamLimitExceeded;
+                    }
                     try streams.put(frame.stream_id, http.http2_stream.Stream.init(frame.stream_id, @intCast(peer_initial_window)));
                 }
-                var payload_offset: usize = 0;
-                if ((frame.flags & http.http2_frame.Flags.PRIORITY) != 0) {
-                    const pr = try http.http2_frame.parsePriority(frame.payload);
+                const headers_payload = h2HeadersPayload(frame.payload, frame.flags) catch |err| {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return err;
+                };
+                if (headers_payload.priority) |priority_payload| {
+                    const pr = try http.http2_frame.parsePriority(priority_payload);
                     if (streams.getPtr(frame.stream_id)) |s| s.priority_weight = pr.weight;
-                    payload_offset = 5;
                 }
                 if ((frame.flags & http.http2_frame.Flags.END_HEADERS) == 0) {
-                    const fragment = frame.payload[payload_offset..];
+                    const fragment = headers_payload.fragment;
                     if (fragment.len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
                         try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
                         return error.Http2CompressionError;
@@ -2812,7 +3074,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     try continuation_block.appendSlice(fragment);
                     continue;
                 }
-                if (frame.payload[payload_offset..].len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
+                if (headers_payload.fragment.len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
                     return error.Http2CompressionError;
                 }
@@ -2823,11 +3085,13 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     &streams,
                     &ready_streams,
                     frame.stream_id,
-                    frame.payload[payload_offset..],
+                    headers_payload.fragment,
                     (frame.flags & http.http2_frame.Flags.END_STREAM) != 0,
                     frame_transport_early,
                     conn.writer(),
                     last_client_stream_id,
+                    cfg.max_connection_memory_bytes,
+                    &buffered_request_bytes,
                 );
             },
             .data => {
@@ -2835,12 +3099,16 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
+                const data_payload = h2DataPayload(frame.payload, frame.flags) catch |err| {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return err;
+                };
                 if (pending.getPtr(frame.stream_id)) |ps| {
                     ps.transport_early = ps.transport_early or frame_transport_early;
                     const max_body = cfg.request_limits.effectiveMaxBodySize();
                     const max_conn_mem = cfg.max_connection_memory_bytes;
-                    const over_stream_limit = ps.body_limit_exceeded or ps.body.items.len +| frame.payload.len > max_body;
-                    const over_conn_limit = max_conn_mem > 0 and buffered_request_bytes +| frame.payload.len > max_conn_mem;
+                    const over_stream_limit = ps.body_limit_exceeded or ps.body.items.len +| data_payload.len > max_body;
+                    const over_conn_limit = max_conn_mem > 0 and buffered_request_bytes +| data_payload.len > max_conn_mem;
                     if (over_stream_limit or over_conn_limit) {
                         // Reject the excess before it is ever appended: do not
                         // buffer it and do not credit it back, so an attacker
@@ -2856,14 +3124,15 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         // would starve every response on the connection.
                         ps.body_limit_exceeded = true;
                     } else {
-                        if (streams.getPtr(frame.stream_id)) |s| s.send_window -= @intCast(frame.payload.len);
-                        conn_send_window -= @intCast(frame.payload.len);
-                        try ps.body.appendSlice(frame.payload);
-                        buffered_request_bytes += frame.payload.len;
-                        try http.http2_frame.writeWindowUpdate(conn.writer(), frame.stream_id, @intCast(frame.payload.len));
-                        try http.http2_frame.writeWindowUpdate(conn.writer(), 0, @intCast(frame.payload.len));
-                        if (streams.getPtr(frame.stream_id)) |s| s.send_window += @intCast(frame.payload.len);
-                        conn_send_window += @intCast(frame.payload.len);
+                        try ps.body.appendSlice(data_payload);
+                        buffered_request_bytes += data_payload.len;
+                        // Flow control counts the full DATA payload including
+                        // Pad Length and padding, even though only the data
+                        // octets belong to the application body.
+                        if (frame.payload.len > 0) {
+                            try http.http2_frame.writeWindowUpdate(conn.writer(), frame.stream_id, @intCast(frame.payload.len));
+                            try http.http2_frame.writeWindowUpdate(conn.writer(), 0, @intCast(frame.payload.len));
+                        }
                     }
                     if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
                         if (streams.getPtr(frame.stream_id)) |s| s.remoteEndStream() catch {};
@@ -2878,6 +3147,10 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 if (frame.stream_id == 0) {
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
+                }
+                if (frame.payload.len != 5) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    return error.InvalidPriorityFrame;
                 }
                 const pr = try http.http2_frame.parsePriority(frame.payload);
                 if (streams.getPtr(frame.stream_id)) |s| s.priority_weight = pr.weight;
@@ -2967,6 +3240,8 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         continuation_transport_early,
                         conn.writer(),
                         last_client_stream_id,
+                        cfg.max_connection_memory_bytes,
+                        &buffered_request_bytes,
                     );
                     continuation_block.clearRetainingCapacity();
                     continuation_stream_id = null;
@@ -2978,6 +3253,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                 return error.InvalidHttp2FrameSequence;
             },
+            else => {}, // Unknown extension frame types are ignored by RFC 9113 §5.5.
         }
 
         try h2DispatchReadyStreams(

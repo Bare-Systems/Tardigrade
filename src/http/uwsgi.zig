@@ -162,7 +162,7 @@ fn parseHttpResponse(allocator: std.mem.Allocator, raw: []const u8) !Response {
     var parts = std.mem.splitScalar(u8, status_line, ' ');
     _ = parts.next() orelse return error.InvalidResponse;
     const status_text = parts.next() orelse return error.InvalidResponse;
-    const status = try std.fmt.parseInt(u16, status_text, 10);
+    const status = try parseStatus(status_text);
     const header_slice = raw[status_end + 2 .. header_end + 4];
     const headers_block = try allocator.alloc(u8, header_slice.len);
     errdefer allocator.free(headers_block);
@@ -214,7 +214,7 @@ fn parseCgiLikeResponse(allocator: std.mem.Allocator, raw: []const u8) !Response
     const headers_text = try normalizeHeaderBlock(allocator, raw[0..split.headers_end]);
     defer allocator.free(headers_text);
     const parsed_headers = try headers_mod.parseHeaders(allocator, headers_text);
-    const status = parseStatus(parsed_headers.headers.get("status") orelse "");
+    const status = try parseStatus(parsed_headers.headers.get("status") orelse "");
     const body = try allocator.dupe(u8, raw[split.body_start..]);
     errdefer allocator.free(body);
     return .{
@@ -262,11 +262,18 @@ fn normalizeHeaderBlock(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn parseStatus(raw: []const u8) u16 {
+fn parseStatus(raw: []const u8) !u16 {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0) return 200;
     const end = std.mem.findScalar(u8, trimmed, ' ') orelse trimmed.len;
-    return std.fmt.parseInt(u16, trimmed[0..end], 10) catch 200;
+    const status = std.fmt.parseInt(u16, trimmed[0..end], 10) catch return error.InvalidResponse;
+    if (status < 100 or status > 599) return error.InvalidResponse;
+    return status;
+}
+
+test "parseStatus rejects malformed upstream status instead of defaulting to 200" {
+    try std.testing.expectError(error.InvalidResponse, parseStatus("bogus"));
+    try std.testing.expectError(error.InvalidResponse, parseStatus("999 Invalid"));
 }
 
 fn appendKv(allocator: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {

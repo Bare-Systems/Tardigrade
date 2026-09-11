@@ -129,16 +129,27 @@ pub fn regexMatchesOptions(pattern: []const u8, input: []const u8, case_insensit
 pub fn regexMatchesOptionsAlloc(allocator: std.mem.Allocator, pattern: []const u8, input: []const u8, case_insensitive: bool) bool {
     if (anchoredLiteralPrefixCannotMatch(pattern, input, case_insensitive)) return false;
 
-    var prepared = preparePattern(allocator, pattern) catch return false;
+    return regexMatchesOptionsCheckedAlloc(allocator, pattern, input, case_insensitive) catch false;
+}
+
+/// Unlike `regexMatches`, this preserves invalid-pattern, allocation, and
+/// regex-engine errors so security policy callers can fail closed instead of
+/// confusing them with an ordinary non-match.
+pub fn regexMatchesChecked(pattern: []const u8, input: []const u8) !bool {
+    return regexMatchesOptionsCheckedAlloc(std.heap.page_allocator, pattern, input, false);
+}
+
+fn regexMatchesOptionsCheckedAlloc(allocator: std.mem.Allocator, pattern: []const u8, input: []const u8, case_insensitive: bool) !bool {
+    var prepared = try preparePattern(allocator, pattern);
     defer prepared.deinit();
 
-    const pattern_z = allocator.alloc(u8, prepared.normalized_pattern.len + 1) catch return false;
+    const pattern_z = try allocator.alloc(u8, prepared.normalized_pattern.len + 1);
     defer allocator.free(pattern_z);
     @memcpy(pattern_z[0..prepared.normalized_pattern.len], prepared.normalized_pattern);
     pattern_z[prepared.normalized_pattern.len] = 0;
     const pattern_z_ptr: [*:0]const u8 = @ptrCast(pattern_z.ptr);
 
-    const input_z = allocator.alloc(u8, input.len + 1) catch return false;
+    const input_z = try allocator.alloc(u8, input.len + 1);
     defer allocator.free(input_z);
     @memcpy(input_z[0..input.len], input);
     input_z[input.len] = 0;
@@ -147,9 +158,12 @@ pub fn regexMatchesOptionsAlloc(allocator: std.mem.Allocator, pattern: []const u
     var regex: Regex = undefined;
     const compile_flags = c.REG_EXTENDED | c.REG_NOSUB | if (case_insensitive) @as(c_int, c.REG_ICASE) else 0;
     const compile_rc = regcomp(&regex, pattern_z_ptr, compile_flags);
-    if (compile_rc != 0) return false;
+    if (compile_rc != 0) return error.InvalidRegex;
     defer regfree(&regex);
-    return regexec(&regex, input_z_ptr, 0, null, 0) == 0;
+    const exec_rc = regexec(&regex, input_z_ptr, 0, null, 0);
+    if (exec_rc == 0) return true;
+    if (exec_rc == c.REG_NOMATCH) return false;
+    return error.RegexExecutionFailed;
 }
 
 fn anchoredLiteralPrefixCannotMatch(pattern: []const u8, input: []const u8, case_insensitive: bool) bool {

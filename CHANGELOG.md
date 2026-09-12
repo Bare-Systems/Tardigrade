@@ -41,7 +41,28 @@ All notable user-facing changes to Tardigrade are documented here.
   proxy/CDN source and reject country headers received from any other peer.
   Best-effort mirror delivery now uses bounded native HTTP/TLS transport and a
   bounded ignored response, preventing a stalled mirror from holding a worker
-  indefinitely.
+  indefinitely. The SMTP asserted-identity boundary rejects any inbound
+  `X-Tardigrade-*` field in the message-header section — whether or not the
+  request is authenticated — so a client can neither forge an identity nor
+  suppress the authoritative one, with case-insensitive `DATA` and header
+  matching. Trusted-peer matching compares parsed IP addresses instead of
+  truncated text, closing a bypass where two IPv6 addresses differing only in
+  the final hextet compared equal. Mirror targets must name `http` or `https`
+  explicitly, rejected at startup/reload rather than silently downgraded to
+  cleartext. IP access-control policy is now owned by the configuration
+  generation a request leased, so a reload can neither free rules underneath an
+  in-flight request nor let an older request skip a denial its own configuration
+  requires. Approval persistence serializes snapshot and write under one lock so
+  a delayed writer cannot overwrite newer approval state, and approval restore
+  works at all (it previously failed on every non-empty store). Approval,
+  session, and device-HMAC credential copies are wiped through the canonical
+  `secureZero` path, and the device registry is created owner-only and refuses
+  to append to a group/world-accessible file. Location `auth required` denials
+  no longer mirror the denied request body. HTTP/2 gates inbound HEADERS and
+  DATA on the stream state machine rather than request-assembly bookkeeping, so
+  a peer cannot open a second request on a stream whose response is still
+  outstanding, and CONNECT is refused at stream scope instead of failing inside
+  the shared HTTP/1 adapter.
 
 - **Secret zeroization is now materially faster on x86_64, and the
   guarantee is now Tardigrade-owned (#675)** — `crypto.secrets.secureZero`

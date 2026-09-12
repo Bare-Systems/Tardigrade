@@ -201,6 +201,69 @@ Implementation: `src/http/request.zig`, `Request.parse()` and
 `Request.parseHead()`; `src/edge_gateway.zig`,
 `h2RequestHeaderBlockIsValid()` and `h2ProcessHeaderBlock()`.
 
+## 4c. HTTP/2 Stream Lifecycle as the Authority
+
+Inbound HEADERS and DATA are gated on the RFC 7540 §5.1 stream state, not on
+whether request-assembly state happens to exist. A dispatched request is removed
+from the pending-assembly map while its stream entry stays alive (a response can
+be parked on send-credit exhaustion), so "absent from pending" must never be
+read as "this is a new request": that would let a peer open a second request on
+one stream and duplicate route, auth, and handler execution while the first
+response is still outstanding. Frames arriving on a stream the remote has closed
+for sending are answered with `RST_STREAM(STREAM_CLOSED)`.
+
+CONNECT is accepted by the header validator as syntactically valid HTTP/2 (RFC
+9113 §8.5 authority-form) but is deliberately **not implemented**: tunneling has
+no representation in the shared HTTP/1 adapter, and synthesizing an origin-form
+`:path` would route a tunnel request at an unrelated path. Such a stream is
+refused with `RST_STREAM(REFUSED_STREAM)`, leaving the connection and its other
+streams intact.
+
+Implementation: `src/edge_gateway.zig`, `h2StreamAcceptsInboundFrame()` and
+`h2HeaderBlockRequestsConnect()`.
+
+## 4d. Inbound Asserted-Identity Headers
+
+`X-Tardigrade-*` request headers are reserved for Tardigrade's own assertions
+about an authenticated principal. On the HTTP path they are stripped from
+inbound requests (`shouldSkipUpstreamRequestHeader`). The SMTP proxy applies the
+same boundary inside the message-header section carried by `DATA`: the `DATA`
+command is matched case-insensitively, only the header section (through the
+first blank line) is inspected, and any reserved field there is rejected
+regardless of whether the request carries an authenticated identity. This closes
+both forgery (supplying an identity) and suppression (pre-supplying the header
+so the authoritative value is not injected). Body text resembling the header is
+not treated as a header.
+
+Implementation: `src/gateway_protocols.zig`, `injectSmtpAuthIdentity()`.
+
+## 4e. Trusted-Peer Matching
+
+Decisions that depend on "did this come from a trusted proxy tier" — inbound
+forwarded-client metadata and geo country headers — compare parsed IP addresses
+rather than textual spellings. A bare IPv6 literal has no `:port` suffix to
+strip (RFC 3986 §3.2.2 requires brackets for that), so truncating its last group
+would make different addresses compare equal; HTTP/3 supplies peers in exactly
+that unbracketed form. Hostnames still compare case-insensitively, and an IP
+literal never matches a hostname.
+
+Implementation: `src/gateway_proxy_headers.zig`, `stripPort()`,
+`trustHostsEqual()`, and `isTrustedUpstream()`.
+
+## 4f. Access-Control Policy Generations
+
+The parsed IP access-control list is owned by the configuration version a
+request leased, not by shared gateway state. Authorization state must not
+outlive or under-live the configuration it belongs to: a single mutable global
+both races reload (freeing rules while a worker is inside `check()`) and lets a
+request holding an older lease observe a newer or absent policy, skipping a
+denial its own configuration still requires. A reload attaches its ACL to the
+new generation before publishing it, and an old generation's ACL is freed only
+when its last lease is released.
+
+Implementation: `src/gateway_state.zig`, `ManagedConfigVersion.access_control`;
+`src/edge_config.zig`, `EdgeConfig.parsed_access_control`.
+
 ## 5. Header Casing and Normalization
 
 All header names stored by Tardigrade's `Headers` collection are lowercased on

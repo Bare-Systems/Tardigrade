@@ -90,10 +90,10 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         else
             null,
         .session_store_path = cfg.session_store_path,
-        // Ownership lives on the configuration version (see
-        // `ManagedConfigVersion.access_control`), not here: an ACL must not
-        // outlive or under-live the configuration generation a request leased.
-        .access_control = null,
+        // No ACL field here on purpose: access-control policy is owned by the
+        // configuration version a request leases (see
+        // `ManagedConfigVersion.access_control`), so it can neither outlive nor
+        // under-live the configuration generation that request is using.
         .logger = http.logger.Logger.init(cfg.log_level, "gateway"),
         .metrics = http.metrics.Metrics.init(),
         .compression_config = .{
@@ -2550,6 +2550,31 @@ fn h2DataPayload(payload: []const u8, flags: u8) ![]const u8 {
     return payload[1 .. payload.len - padding_len];
 }
 
+/// Whether an inbound HEADERS/DATA frame may be processed for `stream_id`.
+///
+/// The HTTP/2 stream state machine — not the `pending` request-assembly map —
+/// is the lifecycle authority. `h2DispatchReadyStreams` removes an entry from
+/// `pending` the moment it dispatches, while keeping the `streams` entry alive
+/// when a response is parked on send-credit exhaustion. Inferring "new request"
+/// from `!pending.contains(id)` therefore lets a peer open a second request on a
+/// stream it already closed for sending, duplicating route/auth/handler
+/// execution while the first response is still outstanding.
+///
+/// An unknown stream is allowed: that is a genuinely new stream, validated by
+/// the id and concurrency checks at the call site.
+/// True when an initial header block requests the CONNECT method.
+fn h2HeaderBlockRequestsConnect(fields: []const http.hpack.HeaderField) bool {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, ":method")) return std.mem.eql(u8, field.value, "CONNECT");
+    }
+    return false;
+}
+
+fn h2StreamAcceptsInboundFrame(streams: *std.AutoHashMap(u31, http.http2_stream.Stream), stream_id: u31) bool {
+    const existing = streams.get(stream_id) orelse return true;
+    return existing.canReceive();
+}
+
 fn h2ProcessHeaderBlock(
     allocator: std.mem.Allocator,
     decoder: *http.hpack.Decoder,
@@ -2581,6 +2606,23 @@ fn h2ProcessHeaderBlock(
         // after it creates two different message boundaries across hops.
         try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
         return error.InvalidHttp2Request;
+    }
+
+    if (initial_headers and h2HeaderBlockRequestsConnect(decoded.headers)) {
+        // CONNECT (RFC 9113 §8.5 authority-form) is syntactically valid HTTP/2
+        // and the validator above accepts it as such, but Tardigrade does not
+        // implement tunneling: the shared HTTP/1 adapter has no authority-form
+        // representation, and synthesizing an origin-form `:path` would route a
+        // tunnel request at some unrelated path.
+        //
+        // So refuse it deliberately and visibly, at stream scope. Letting it
+        // through reached `respondHttp2Stream`'s `ps.path orelse
+        // error.InvalidHttp2Request`, which tore down the whole connection with
+        // a generic error instead of answering the one stream. Other streams on
+        // this connection are unaffected.
+        try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.refused_stream.value());
+        if (streams.getPtr(stream_id)) |s| s.close();
+        return;
     }
 
     if (!initial_headers) {
@@ -3049,6 +3091,24 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     continue;
                 }
                 last_client_stream_id = @max(last_client_stream_id, frame.stream_id);
+                // The stream state machine is the lifecycle authority, NOT
+                // `pending`. `h2DispatchReadyStreams` removes a request from
+                // `pending` as soon as it dispatches, while deliberately
+                // keeping the `streams` entry alive when a response is parked
+                // on send-credit exhaustion. If the client already sent
+                // END_STREAM, that stream is half_closed_remote: treating
+                // "absent from pending" as "this is a new request" would let
+                // another HEADERS frame on the same id be constructed as a
+                // SECOND request, duplicating route/auth/handler execution
+                // while the first response is still outstanding.
+                if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
+                    try http.http2_frame.writeRstStream(
+                        conn.writer(),
+                        frame.stream_id,
+                        http.http2_stream.ErrorCode.stream_closed.value(),
+                    );
+                    continue;
+                }
                 if (!streams.contains(frame.stream_id)) {
                     if (streams.count() >= HTTP2_MAX_CONCURRENT_STREAMS) {
                         // Bound all per-stream maps and header/body ownership.
@@ -3105,6 +3165,17 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 if (frame.stream_id == 0) {
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
+                }
+                // Same lifecycle rule as HEADERS: DATA after the remote's
+                // END_STREAM is a stream error (RFC 7540 §5.1,
+                // half_closed_remote), not new body for a dispatched request.
+                if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
+                    try http.http2_frame.writeRstStream(
+                        conn.writer(),
+                        frame.stream_id,
+                        http.http2_stream.ErrorCode.stream_closed.value(),
+                    );
+                    continue;
                 }
                 const data_payload = h2DataPayload(frame.payload, frame.flags) catch |err| {
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
@@ -7133,4 +7204,167 @@ test "H1 authorized route still mirrors" {
 
     try std.testing.expectEqual(@as(u16, 200), outcome.route_status);
     try std.testing.expectEqual(@as(usize, 1), effects.mirror_calls);
+}
+
+test "H2 duplicate HEADERS on a dispatched stream is refused, not re-dispatched" {
+    // Regression for the stream-lifecycle finding. The exploit sequence is:
+    //   1. client sends HEADERS+END_STREAM  -> stream half_closed_remote
+    //   2. the request dispatches; its response parks on send-credit
+    //      exhaustion, so `pending` no longer holds the stream but `streams`
+    //      still does
+    //   3. client sends a second HEADERS block on the SAME stream id
+    // Step 3 used to look like `initial_headers == true` (because the gate was
+    // `pending.contains(id)`) and built a second request on one stream,
+    // duplicating route/auth/handler execution.
+    const allocator = std.testing.allocator;
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer pending.deinit();
+
+    // A fresh stream accepts its first header block.
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 1));
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 1));
+
+    // Trailers are still legal while the remote half is open.
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 1));
+
+    // END_STREAM from the client.
+    try streams.getPtr(1).?.remoteEndStream();
+    try std.testing.expectEqual(http.http2_stream.StreamState.half_closed_remote, streams.get(1).?.state);
+
+    // Dispatch removes request-assembly state but keeps the stream alive for a
+    // parked response — exactly the window the old `pending`-based check missed.
+    try std.testing.expect(!pending.contains(1));
+    try std.testing.expect(streams.contains(1));
+
+    // The second HEADERS block must be refused on stream state alone.
+    try std.testing.expect(!h2StreamAcceptsInboundFrame(&streams, 1));
+    // DATA after END_STREAM is the same class of error.
+    try std.testing.expect(!h2StreamAcceptsInboundFrame(&streams, 1));
+
+    // A reset/closed stream is likewise refused, while other streams are
+    // unaffected.
+    try streams.put(3, http.http2_stream.Stream.init(3, 65_535));
+    streams.getPtr(3).?.close();
+    try std.testing.expect(!h2StreamAcceptsInboundFrame(&streams, 3));
+    try streams.put(5, http.http2_stream.Stream.init(5, 65_535));
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 5));
+
+    // half_closed_local (we finished responding, client may still send) stays
+    // receivable, so request bodies are not broken by this gate.
+    try streams.put(7, http.http2_stream.Stream.init(7, 65_535));
+    try streams.getPtr(7).?.localEndStream();
+    try std.testing.expectEqual(http.http2_stream.StreamState.half_closed_local, streams.get(7).?.state);
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 7));
+}
+
+test "H2 CONNECT is refused at stream scope instead of failing in the H1 adapter" {
+    // The validator accepts syntactically valid CONNECT (it is legal HTTP/2),
+    // so the contract has to be made explicit somewhere. Tardigrade does not
+    // implement tunneling, and the shared H1 adapter requires a `:path`, so
+    // CONNECT is refused on its own stream rather than reaching
+    // `respondHttp2Stream` and tearing down the connection with a generic
+    // `error.InvalidHttp2Request`.
+    try std.testing.expect(h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    }, true));
+    try std.testing.expect(h2HeaderBlockRequestsConnect(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    }));
+
+    // A malformed CONNECT is still a protocol error, not a refusal: scheme and
+    // path must be absent and the authority must be valid.
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+        .{ .name = ":path", .value = "/" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+    }, true));
+
+    // Ordinary methods are not mistaken for CONNECT.
+    try std.testing.expect(!h2HeaderBlockRequestsConnect(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/" },
+    }));
+    // Nor is a header that merely carries the text.
+    try std.testing.expect(!h2HeaderBlockRequestsConnect(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = "x-upstream-method", .value = "CONNECT" },
+    }));
+}
+
+test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
+    const allocator = std.testing.allocator;
+    var decoder = http.hpack.Decoder.init();
+    defer decoder.deinit(allocator);
+
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer {
+        var it = pending.iterator();
+        while (it.next()) |entry| {
+            var ps = entry.value_ptr.*;
+            ps.deinit(allocator);
+        }
+        pending.deinit();
+    }
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try streams.put(3, http.http2_stream.Stream.init(3, 65_535));
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+
+    const block = try http.hpack.encodeLiteralHeaderBlock(allocator, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    });
+    defer allocator.free(block);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var buffered: usize = 0;
+
+    try h2ProcessHeaderBlock(
+        allocator,
+        &decoder,
+        &pending,
+        &streams,
+        &ready,
+        1,
+        block,
+        true,
+        false,
+        &out.writer,
+        1,
+        0,
+        &buffered,
+    );
+
+    // No request was assembled and nothing was queued for dispatch.
+    try std.testing.expect(!pending.contains(1));
+    try std.testing.expectEqual(@as(usize, 0), ready.items.len);
+    try std.testing.expectEqual(@as(usize, 0), buffered);
+    // The stream is closed, so the new lifecycle gate refuses follow-up frames
+    // on it, while an unrelated stream keeps working.
+    try std.testing.expectEqual(http.http2_stream.StreamState.closed, streams.get(1).?.state);
+    try std.testing.expect(!h2StreamAcceptsInboundFrame(&streams, 1));
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 3));
+    // A RST_STREAM frame (type 0x3) for stream 1 was written, not a GOAWAY
+    // (type 0x7): the connection survives.
+    const written = out.written();
+    try std.testing.expect(written.len >= 9);
+    try std.testing.expectEqual(@as(u8, 0x3), written[3]);
+    const rst_stream_id: u32 = std.mem.readInt(u32, written[5..9], .big) & 0x7fff_ffff;
+    try std.testing.expectEqual(@as(u32, 1), rst_stream_id);
 }

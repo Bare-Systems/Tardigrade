@@ -16,6 +16,7 @@ const corpus_cases = [_]CorpusCase{
     .{ .path = "tests/corpus/http/request/valid_get.http", .expected = .ok },
     .{ .path = "tests/corpus/http/request/duplicate_content_length.http", .expected = .{ .err = error.ConflictingHeaders } },
     .{ .path = "tests/corpus/http/request/conflicting_transfer_encoding.http", .expected = .{ .err = error.ConflictingHeaders } },
+    .{ .path = "tests/corpus/http/request/duplicate_host.http", .expected = .{ .err = error.DuplicateHostHeader } },
     .{ .path = "tests/corpus/http/request/obs_fold_header.http", .expected = .{ .err = error.InvalidHeader } },
     .{ .path = "tests/corpus/http/request/malformed_chunked.http", .expected = .{ .err = error.InvalidChunkedBody } },
     // Parser accepts a Host-less HTTP/1.1 request (syntax is valid); the
@@ -25,10 +26,10 @@ const corpus_cases = [_]CorpusCase{
     // TRACE globally with 405 before routing to prevent XST attacks
     // (RFC 7231 §4.3.8, ASVS-14.5.1).
     .{ .path = "tests/corpus/http/request/trace_method.http", .expected = .ok },
-    // Absolute-form request target (RFC 7230 §5.3.2): parser extracts the
-    // path component and discards the scheme/authority.  The Host header is
-    // still used for virtual-host routing.
+    // Absolute-form request target: parser extracts the path and retains the
+    // authority long enough to require agreement with Host before routing.
     .{ .path = "tests/corpus/http/request/absolute_form_request.http", .expected = .ok },
+    .{ .path = "tests/corpus/http/request/absolute_form_mismatched_host.http", .expected = .{ .err = error.InvalidHostHeader } },
     // Connection header naming custom hop-by-hop headers (RFC 7230 §6.1):
     // parser accepts the request; the gateway layer strips the listed headers
     // before forwarding to the upstream.
@@ -101,6 +102,8 @@ fn assertMutationsDoNotCrash(allocator: std.mem.Allocator, path: []const u8) !vo
                 error.ConflictingHeaders,
                 error.InvalidChunkedBody,
                 error.DuplicateAuthorizationHeader,
+                error.DuplicateHostHeader,
+                error.InvalidHostHeader,
                 => continue,
                 error.OutOfMemory => return err,
             };

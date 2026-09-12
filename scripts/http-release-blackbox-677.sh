@@ -216,6 +216,8 @@ TARDIGRADE_HTTP3_ENABLED=true \
 TARDIGRADE_QUIC_PORT="$udp_port" \
 TARDIGRADE_HTTP3_ALT_SVC=auto \
 TARDIGRADE_HTTP3_ALT_SVC_MAX_AGE_SECONDS=60 \
+TARDIGRADE_RATE_LIMIT_RPS=10000 \
+TARDIGRADE_RATE_LIMIT_BURST=10000 \
 TARDIGRADE_ERROR_LOG_PATH="$logs/tardi-app.log" \
 TARDIGRADE_UPSTREAM_TIMEOUT_MS=25000 \
 "$tardi_bin" run -c "$config" >"$logs/tardi.stdout" 2>"$logs/tardi.stderr" &
@@ -415,25 +417,49 @@ else
 fi
 
 cycles="${HTTP_SWEEP_RESOURCE_CYCLES:-20}"
+resource_failures=0
 for i in $(seq 1 "$cycles"); do
   if command -v nghttp >/dev/null 2>&1; then
-    nghttp -y -n "https://127.0.0.1:$tcp_port/healthz" >/dev/null 2>>"$logs/resource-nghttp.err" || status=1
+    printf 'cycle=%s\n' "$i" >>"$logs/resource-nghttp.log"
+    if ! nghttp -y -n "https://127.0.0.1:$tcp_port/healthz" >>"$logs/resource-nghttp.log" 2>&1; then
+      say "FAIL resource cycle $i: nghttp H2 request"
+      printf 'resource_cycle_%s_h2=FAIL\n' "$i" >>"$summary"
+      resource_failures=$((resource_failures + 1))
+      status=1
+    fi
   fi
   # connect/request/cancel/close, not just connect/request/close: each cycle
   # exercises the real RESET_STREAM/STOP_SENDING + same-connection-recovery
   # path (like the dedicated cancellation row above) rather than only ever
   # closing streams cleanly.
   if [ -n "${AIOQUIC_PYTHON:-}" ] && [ -x "${AIOQUIC_PYTHON:-}" ]; then
-    "$AIOQUIC_PYTHON" "$here/interop/aioquic_cancel_client.py" 127.0.0.1 "$udp_port" tardigrade.test /healthz \
-      >/dev/null 2>>"$logs/resource-aioquic-cancel.err" || status=1
+    printf 'cycle=%s\n' "$i" >>"$logs/resource-aioquic-cancel.log"
+    if ! "$AIOQUIC_PYTHON" "$here/interop/aioquic_cancel_client.py" 127.0.0.1 "$udp_port" tardigrade.test /healthz \
+      >>"$logs/resource-aioquic-cancel.log" 2>&1; then
+      say "FAIL resource cycle $i: aioquic H3 cancellation/recovery"
+      printf 'resource_cycle_%s_h3_cancel=FAIL\n' "$i" >>"$summary"
+      resource_failures=$((resource_failures + 1))
+      status=1
+    fi
   elif [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]; then
-    "$NGTCP2_EXAMPLES_DIR/gtlsclient" 127.0.0.1 "$udp_port" "https://tardigrade.test:$udp_port/healthz" \
-      --exit-on-first-stream-close >/dev/null 2>>"$logs/resource-gtlsclient.err" || status=1
+    printf 'cycle=%s\n' "$i" >>"$logs/resource-gtlsclient.log"
+    if ! "$NGTCP2_EXAMPLES_DIR/gtlsclient" 127.0.0.1 "$udp_port" "https://tardigrade.test:$udp_port/healthz" \
+      --exit-on-first-stream-close >>"$logs/resource-gtlsclient.log" 2>&1; then
+      say "FAIL resource cycle $i: ngtcp2 H3 request"
+      printf 'resource_cycle_%s_h3_ngtcp2=FAIL\n' "$i" >>"$summary"
+      resource_failures=$((resource_failures + 1))
+      status=1
+    fi
   fi
   if [ "$i" = "$((cycles / 2))" ] || [ "$i" = "$cycles" ]; then
     record_sample "cycle_$i" "$tardi_pid" >>"$summary"
   fi
 done
+if [ "$resource_failures" -eq 0 ]; then
+  printf 'resource_cycles=PASS cycles=%s\n' "$cycles" >>"$summary"
+else
+  printf 'resource_cycles=FAIL cycles=%s failures=%s\n' "$cycles" "$resource_failures" >>"$summary"
+fi
 sleep 1
 record_sample after_settle "$tardi_pid" >>"$summary"
 
@@ -494,6 +520,8 @@ TARDIGRADE_TLS_SNI_CERTS="localhost:$repo/tests/fixtures/tls/native_ed25519.crt:
 TARDIGRADE_HTTP2_ENABLED=true \
 TARDIGRADE_HTTP3_ENABLED=false \
 TARDIGRADE_HTTP3_ALT_SVC=auto \
+TARDIGRADE_RATE_LIMIT_RPS=10000 \
+TARDIGRADE_RATE_LIMIT_BURST=10000 \
 TARDIGRADE_ERROR_LOG_PATH="$logs/tardi-disabled-app.log" \
 "$tardi_bin" run -c "$config" >"$logs/tardi-disabled.stdout" 2>"$logs/tardi-disabled.stderr" &
 tardi_pid=$!

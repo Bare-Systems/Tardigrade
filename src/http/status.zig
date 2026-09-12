@@ -75,6 +75,12 @@ pub const Status = enum(u16) {
     not_extended = 510,
     network_authentication_required = 511,
 
+    // Preserve valid extension/unregistered HTTP status codes.  Reverse
+    // proxies must not trap merely because an origin returns (for example)
+    // 299 or 599, both of which are valid three-digit status codes even
+    // though they have no registered reason phrase.
+    _,
+
     /// Get the numeric status code
     pub fn code(self: Status) u16 {
         return @intFromEnum(self);
@@ -154,6 +160,7 @@ pub const Status = enum(u16) {
             .loop_detected => "Loop Detected",
             .not_extended => "Not Extended",
             .network_authentication_required => "Network Authentication Required",
+            else => "",
         };
     }
 
@@ -194,9 +201,17 @@ pub const Status = enum(u16) {
 
     /// Create a Status from a numeric code
     pub fn fromCode(code_num: u16) ?Status {
+        if (code_num < 100 or code_num > 599) return null;
         return compat.intToEnum(Status, code_num);
     }
 };
+
+test "unregistered status codes remain representable" {
+    const status: Status = @enumFromInt(299);
+    try std.testing.expectEqual(@as(u16, 299), status.code());
+    try std.testing.expectEqualStrings("", status.phrase());
+    try std.testing.expect(status.isSuccess());
+}
 
 // Tests
 test "status code values" {
@@ -256,5 +271,6 @@ test "status from code" {
 
     try testing.expectEqual(Status.ok, Status.fromCode(200).?);
     try testing.expectEqual(Status.not_found, Status.fromCode(404).?);
+    try testing.expectEqual(@as(u16, 299), Status.fromCode(299).?.code());
     try testing.expect(Status.fromCode(999) == null);
 }

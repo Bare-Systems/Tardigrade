@@ -25,6 +25,11 @@ pub const StaticErrorPageResult = union(enum) {
     }
 };
 
+pub const StaticWriteResult = struct {
+    status_code: u16,
+    response_bytes: usize,
+};
+
 pub fn wantsHtmlErrorPage(request_path: []const u8, headers: *const http.Headers) bool {
     if (std.mem.startsWith(u8, request_path, "/v1/")) return false;
     const accept = headers.get("accept") orelse return false;
@@ -85,6 +90,7 @@ pub fn handleStaticLocation(
     correlation_id: []const u8,
     keep_alive: bool,
     state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
 ) !?u16 {
     if (!(request.method == .GET or request.method == .HEAD)) return null;
     const writer = conn.writer();
@@ -124,6 +130,7 @@ pub fn handleStaticLocation(
                 } else {
                     try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
                 }
+                ctx.response_bytes = 0;
                 state.metricsRecord(302);
                 return 302;
             },
@@ -152,6 +159,7 @@ pub fn handleStaticLocation(
                     } else {
                         try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
                     }
+                    ctx.response_bytes = 0;
                     state.metricsRecord(302);
                     return 302;
                 },
@@ -163,9 +171,10 @@ pub fn handleStaticLocation(
         }
     }
 
-    const status_code = try writeStaticServedResponse(allocator, conn, request.method == .HEAD, keep_alive, correlation_id, state, &served, request.headers.get("accept-encoding"));
-    state.metricsRecord(status_code);
-    return status_code;
+    const result = try writeStaticServedResponse(allocator, conn, request.method == .HEAD, keep_alive, correlation_id, state, &served, request.headers.get("accept-encoding"));
+    ctx.response_bytes = result.response_bytes;
+    state.metricsRecord(result.status_code);
+    return result.status_code;
 }
 
 pub fn serveTryFilesFallback(
@@ -176,6 +185,7 @@ pub fn serveTryFilesFallback(
     correlation_id: []const u8,
     keep_alive: bool,
     state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
 ) !u16 {
     const method = request.method.toString();
     const request_path = request.uri.path;
@@ -200,7 +210,9 @@ pub fn serveTryFilesFallback(
     })) orelse return error.NoTryFiles;
     defer served.deinit(allocator);
 
-    return writeStaticServedResponse(allocator, conn, std.ascii.eqlIgnoreCase(method, "HEAD"), keep_alive, correlation_id, state, &served, request.headers.get("accept-encoding"));
+    const result = try writeStaticServedResponse(allocator, conn, std.ascii.eqlIgnoreCase(method, "HEAD"), keep_alive, correlation_id, state, &served, request.headers.get("accept-encoding"));
+    ctx.response_bytes = result.response_bytes;
+    return result.status_code;
 }
 
 pub fn writeStaticServedResponse(
@@ -214,7 +226,7 @@ pub fn writeStaticServedResponse(
     /// Value of the request's `Accept-Encoding` header, or null if absent.
     /// Used to compress the buffered body when the client and config allow it.
     accept_encoding: ?[]const u8,
-) !u16 {
+) !StaticWriteResult {
     const writer = conn.writer();
 
     // Compress the body before building the response so Content-Length is
@@ -269,7 +281,10 @@ pub fn writeStaticServedResponse(
         } else {
             state.logger.debug(correlation_id, "served static file via buffered path", .{});
         }
-        return @intFromEnum(served.status_code);
+        return .{
+            .status_code = @intFromEnum(served.status_code),
+            .response_bytes = if (out_body) |body| body.len else 0,
+        };
     }
 
     try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
@@ -280,7 +295,7 @@ pub fn writeStaticServedResponse(
         } else {
             state.logger.debug(correlation_id, "served static file headers from buffered path", .{});
         }
-        return @intFromEnum(served.status_code);
+        return .{ .status_code = @intFromEnum(served.status_code), .response_bytes = 0 };
     }
 
     if (served.file_path) |file_path| {
@@ -298,7 +313,10 @@ pub fn writeStaticServedResponse(
         }
     }
 
-    return @intFromEnum(served.status_code);
+    return .{
+        .status_code = @intFromEnum(served.status_code),
+        .response_bytes = served.content_length,
+    };
 }
 
 /// Transfer `len` bytes from `file_fd` (starting at `offset`) to `sock_fd`.

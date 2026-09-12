@@ -107,8 +107,8 @@ Required request headers by auth mode:
 | `Authorization` | `Bearer <hs256-jwt>` | JWT auth for BearClawWeb |
 | `X-Session-Token` | `<64-lowercase-hex>` | Session auth |
 | `X-Device-ID` | device identifier | Device auth with signed request metadata |
-| `X-Device-Timestamp` | Unix ms timestamp | Device auth replay prevention |
-| `X-Device-Signature` | HMAC-SHA256 signature | Device auth integrity |
+| `X-Device-Timestamp` | Unix-seconds timestamp | Device auth replay prevention |
+| `X-Device-Signature` | Lowercase hex HMAC-SHA256 | Device auth integrity |
 
 ### Identity Header Stripping
 
@@ -161,9 +161,14 @@ Session store:
 Device registry:
 
 - `TARDIGRADE_DEVICE_REGISTRY_PATH`: line-oriented flat file
-- Format: one `device_id|public_key` entry per line
+- Format: one legacy `device_id|public_key` entry per line; the second field is
+  the HMAC signing secret, despite the historical field name
 - File permissions: service account owned, `chmod 600`
 - Treat it like a credential file because it authorizes device signatures
+
+The device signature is HMAC-SHA256 over
+`METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + BODY`, keyed by the
+registry secret and encoded as 64 hexadecimal characters.
 
 Transcript store:
 

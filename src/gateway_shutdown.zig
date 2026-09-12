@@ -21,6 +21,29 @@ const unixSocketPathFromEndpoint = gp.unixSocketPathFromEndpoint;
 const uriComponentBytes = gp.uriComponentBytes;
 const setSocketTimeoutMs = gc.setSocketTimeoutMs;
 
+const PreparedReloadSecurity = struct {
+    access_control: ?http.access_control.AccessControl,
+    hsts_value: ?[]u8,
+
+    fn init(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !PreparedReloadSecurity {
+        var access_control: ?http.access_control.AccessControl = null;
+        errdefer if (access_control) |*acl| acl.deinit();
+        if (cfg.access_control_rules.len > 0) {
+            access_control = try http.access_control.AccessControl.fromConfig(allocator, cfg.access_control_rules, .allow);
+        }
+        return .{
+            .access_control = access_control,
+            .hsts_value = try computeHstsValue(allocator, cfg),
+        };
+    }
+
+    fn deinit(self: *PreparedReloadSecurity, allocator: std.mem.Allocator) void {
+        if (self.access_control) |*acl| acl.deinit();
+        if (self.hsts_value) |value| allocator.free(value);
+        self.* = .{ .access_control = null, .hsts_value = null };
+    }
+};
+
 pub fn hotReloadConfig(
     allocator: std.mem.Allocator,
     worker_ctx: *WorkerContext,
@@ -69,6 +92,20 @@ pub fn hotReloadConfig(
         return;
     };
     cfg_ptr.* = loaded;
+    var prepared_security = PreparedReloadSecurity.init(allocator, cfg_ptr) catch |err| {
+        cfg_ptr.deinit(allocator);
+        allocator.destroy(cfg_ptr);
+        const msg = std.fmt.bufPrint(&state.last_reload_error, "security policy preparation failed: {}", .{err}) catch "security policy preparation failed";
+        state.reload_mutex.lock();
+        state.last_reload_ok = false;
+        state.last_reload_at_ms = now_ms;
+        state.last_reload_error_len = msg.len;
+        state.reload_mutex.unlock();
+        state.metricsRecordReloadFailure();
+        state.logger.warn(null, "config reload rejected while preparing access control and HSTS: {}", .{err});
+        return;
+    };
+    defer prepared_security.deinit(allocator);
     const prepared_version = worker_ctx.config_store.prepareOwned(cfg_ptr) catch {
         cfg_ptr.deinit(allocator);
         allocator.destroy(cfg_ptr);
@@ -322,7 +359,12 @@ pub fn hotReloadConfig(
         }
     }
 
-    applyReloadedRuntimeConfig(cfg_ptr, state);
+    applyReloadedRuntimeConfig(cfg_ptr, state, &prepared_security);
+    // Transfer ACL ownership to the generation it belongs to BEFORE publishing
+    // that generation, so no lease can ever observe the new config without its
+    // matching ACL.
+    gs.ReloadableConfigStore.setPreparedAccessControl(prepared_version, prepared_security.access_control);
+    prepared_security.access_control = null;
     worker_ctx.config_store.installPrepared(prepared_version);
     http3_dispatch_ctx.cfg = cfg_ptr;
     http.access_log.deinit();
@@ -642,7 +684,11 @@ test "applianceCredentialConfigChanged rejects plaintext-to-TLS and TLS-to-plain
 // the scenario they proved (stable TCP and native HTTP/3 serving from two
 // independent credential owners) can no longer occur.
 
-pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
+fn applyReloadedRuntimeConfig(
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    prepared_security: *PreparedReloadSecurity,
+) void {
     // Warn when restart-only path/URL fields differ; they are NOT rebound here.
     if (!std.mem.eql(u8, state.session_store_path, cfg.session_store_path))
         state.logger.warn(null, "TARDIGRADE_SESSION_STORE_PATH changed on reload; restart required for new path to take effect (active: '{s}', new: '{s}')", .{ state.session_store_path, cfg.session_store_path });
@@ -671,6 +717,15 @@ pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Ga
     state.proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds;
     state.proxy_cache_mutex.unlock();
 
+    // HSTS is prepared before any reload mutation and swapped only on the
+    // successful commit path, preserving the old value if parsing or allocation
+    // failed.
+    //
+    // The ACL is deliberately NOT swapped here. It is owned by the new
+    // configuration version and handed over in `installReloadedAccessControl`,
+    // so in-flight requests keep enforcing the ACL of the generation they
+    // leased until that lease is released.
+
     state.runtime_mutex.lock();
     state.add_headers = cfg.add_headers;
     const previous_h3_advertisement_state = state.http3_advertisement_state;
@@ -685,7 +740,8 @@ pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Ga
     state.http3_alt_svc = http.http3_handler.formatAdvertisement(state.allocator, advertisement) catch null;
     state.http3_advertisement_state = stateForHttp3Advertisement(cfg.http3_enabled, runtime_ready, advertisement);
     if (state.hsts_value.len > 0) state.allocator.free(state.hsts_value);
-    state.hsts_value = computeHstsValue(state.allocator, cfg) catch &.{};
+    state.hsts_value = prepared_security.hsts_value.?;
+    prepared_security.hsts_value = null;
     state.security_headers = blk: {
         var s = if (cfg.security_headers_enabled)
             http.security_headers.SecurityHeaders.api
@@ -829,7 +885,20 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
     state.approval_escalation_webhook = "";
     state.transcript_store_path = "";
 
-    applyReloadedRuntimeConfig(&cfg, &state);
+    allocator.free(cfg.access_control_rules);
+    cfg.access_control_rules = try allocator.dupe(u8, "deny 203.0.113.0/24");
+    var prepared_security = try PreparedReloadSecurity.init(allocator, &cfg);
+    defer prepared_security.deinit(allocator);
+    applyReloadedRuntimeConfig(&cfg, &state, &prepared_security);
+    defer if (state.hsts_value.len > 0) allocator.free(state.hsts_value);
+
+    // The ACL now belongs to the configuration version rather than to
+    // `GatewayState`; `applyReloadedRuntimeConfig` leaves `prepared_security`
+    // holding it until the new generation is installed.
+    try std.testing.expectEqual(
+        http.access_control.AccessResult.denied,
+        prepared_security.access_control.?.check("203.0.113.4"),
+    );
 
     const prom = try state.metricsToPrometheus(allocator);
     defer allocator.free(prom);

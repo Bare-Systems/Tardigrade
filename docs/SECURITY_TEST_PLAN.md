@@ -17,9 +17,12 @@ a release gate, not a best-effort activity.
 ### Request parser abuse
 
 - Unit coverage lives in `src/http/request.zig` and `src/http/headers.zig`.
-- Focus areas: duplicate `Content-Length`, `Transfer-Encoding` conflicts,
+- Focus areas: duplicate `Host`/`Content-Length`, `Transfer-Encoding` conflicts,
   malformed chunked bodies, premature EOF, oversized request lines, header line
-  limits, aggregate header limits, header-count limits, obs-fold rejection.
+  limits, aggregate header limits, header-count limits, obs-fold rejection, and
+  HTTP/2/HTTP/3 pseudo-header ordering, uniqueness, value syntax, casing,
+  padding, dynamic compression-state limits, and multiplexed aggregate-memory
+  limits.
 - Live edge coverage lives in `tests/integration.zig` to verify malformed input
   is rejected before routing or proxying.
 
@@ -184,8 +187,8 @@ Coverage (164 live cases):
 - method-change bypass across GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS/TRACE/CONNECT;
 - path/Host canonicalization variants (trailing slash, duplicate/encoded
   slashes, dot segments, single/double percent-encoding, absolute-form
-  target, a genuine duplicate `Host` field) cannot move a request off the
-  protected boundary;
+  target, a genuine duplicate `Host` field carrying otherwise-valid
+  authorization) cannot move a request off the protected boundary;
 - positive control plus sequential and concurrent bearer/JWT reuse;
 - the issue's own TE+CL and duplicate-conflicting-`Content-Length` smuggling
   probes, plus the wider CL/TE/duplicate-TE/chunked matrix -- every

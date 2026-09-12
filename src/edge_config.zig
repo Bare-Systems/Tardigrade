@@ -359,6 +359,14 @@ pub const EdgeConfig = struct {
     /// IP access control rules (empty = disabled).
     /// Format: "allow 10.0.0.0/8, deny 0.0.0.0/0"
     access_control_rules: []const u8,
+    /// Parsed form of `access_control_rules`, borrowed from the configuration
+    /// version that owns this `EdgeConfig` (see `ManagedConfigVersion`).
+    ///
+    /// Carried on the config — not on `GatewayState` — so a request enforces the
+    /// ACL belonging to the exact configuration generation it leased, and so the
+    /// rules cannot be freed while that lease is alive. Never owned or freed
+    /// here; `deinit` deliberately ignores it.
+    parsed_access_control: ?*const http.access_control.AccessControl = null,
     /// Request validation limits.
     request_limits: http.request_limits.RequestLimits,
     /// Basic auth credential hashes (SHA-256 of "user:password", empty = disabled).
@@ -3073,6 +3081,11 @@ fn validateApplianceTlsProfile(cfg: *const EdgeConfig) !void {
     }
 }
 
+fn validateGeoTrustConfig(blocked_country_count: usize, trust_required: bool, trusted_source_count: usize) !void {
+    if (blocked_country_count == 0) return;
+    if (!trust_required or trusted_source_count == 0) return error.InvalidGeoTrustConfig;
+}
+
 pub fn validate(cfg: *const EdgeConfig) !void {
     if (cfg.listen_port == 0) {
         std.log.err("config validation failed: listen_port must be between 1 and 65535", .{});
@@ -3087,6 +3100,19 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         return error.InvalidConfigValue;
     }
     try validateListenerProtocolPolicy(cfg.http1_enabled, cfg.http2_enabled, hasTlsFiles(cfg), true);
+
+    validateAccessControlConfig(cfg.access_control_rules) catch |err| {
+        std.log.err("config validation failed: TARDIGRADE_ACCESS_CONTROL contains an invalid rule: {}", .{err});
+        return error.InvalidConfigValue;
+    };
+    validatePolicyConfig(cfg.policy_rules_raw, cfg.policy_user_scopes_raw, cfg.policy_approval_routes_raw) catch |err| {
+        std.log.err("config validation failed: policy configuration contains an invalid entry: {}", .{err});
+        return error.InvalidConfigValue;
+    };
+    validateGeoTrustConfig(cfg.geo_blocked_countries.len, cfg.trust_require_upstream_identity, cfg.trusted_upstream_identities.len) catch {
+        std.log.err("config validation failed: TARDIGRADE_GEO_BLOCKED_COUNTRIES requires TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true and at least one TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES entry", .{});
+        return error.InvalidConfigValue;
+    };
 
     if (std.mem.eql(u8, cfg.tls_min_version, "1.0") or std.mem.eql(u8, cfg.tls_min_version, "1.1") or
         std.mem.eql(u8, cfg.tls_max_version, "1.0") or std.mem.eql(u8, cfg.tls_max_version, "1.1"))
@@ -3157,7 +3183,7 @@ pub fn validate(cfg: *const EdgeConfig) !void {
     try validateUpstreamBaseUrlList(cfg.upstream_base_urls, "upstream_base_urls");
     try validateUpstreamBaseUrlList(cfg.upstream_backup_base_urls, "upstream_backup_base_urls");
     try validateOptionalAbsoluteUrl(cfg.grpc_upstream, "grpc_upstream");
-    for (cfg.mirror_rules) |rule| try validateOptionalAbsoluteUrl(rule.target_url, "mirror_rule.target_url");
+    for (cfg.mirror_rules) |rule| try validateMirrorTargetUrl(rule.target_url);
     for (cfg.location_blocks) |block| {
         switch (block.action) {
             .proxy_pass => |target| if (isAbsoluteHttpUrl(target) or isUnixEndpoint(target)) try validateOptionalUpstreamBaseUrl(target, "location.proxy_pass"),
@@ -3248,6 +3274,70 @@ fn validateTlsCertKeyPair(cert_path: []const u8, key_path: []const u8) !void {
 
 fn validateMtlsConsistency(client_verify: bool, ca_path: []const u8) !void {
     if (client_verify and ca_path.len == 0) return error.InvalidConfigPath;
+}
+
+fn validateAccessControlConfig(rules: []const u8) !void {
+    http.access_control.AccessControl.validateConfig(rules) catch return error.InvalidConfigValue;
+}
+
+fn validatePolicyConfig(rules_raw: []const u8, scopes_raw: []const u8, approval_routes_raw: []const u8) !void {
+    if (std.mem.trim(u8, rules_raw, " \t\r\n").len > 0) {
+        var rules = std.mem.splitScalar(u8, rules_raw, ';');
+        while (rules.next()) |entry_raw| {
+            const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+            if (entry.len == 0) return error.InvalidPolicyRule;
+            var parts = std.mem.splitScalar(u8, entry, '|');
+            const method = std.mem.trim(u8, parts.next() orelse return error.InvalidPolicyRule, " \t");
+            const pattern = std.mem.trim(u8, parts.next() orelse return error.InvalidPolicyRule, " \t");
+            _ = parts.next() orelse return error.InvalidPolicyRule; // required scope (may be empty)
+            const approval = std.mem.trim(u8, parts.next() orelse return error.InvalidPolicyRule, " \t");
+            const hours = std.mem.trim(u8, parts.next() orelse return error.InvalidPolicyRule, " \t");
+            const device_pattern = std.mem.trim(u8, parts.next() orelse return error.InvalidPolicyRule, " \t");
+            if (parts.next() != null or method.len == 0 or pattern.len == 0) return error.InvalidPolicyRule;
+            _ = http.rewrite.regexMatchesChecked(pattern, "/") catch return error.InvalidPolicyRule;
+            if (!std.ascii.eqlIgnoreCase(approval, "true") and !std.ascii.eqlIgnoreCase(approval, "false")) return error.InvalidPolicyRule;
+            if (hours.len > 0) try validatePolicyHours(hours);
+            if (device_pattern.len > 0) _ = http.rewrite.regexMatchesChecked(device_pattern, "device") catch return error.InvalidPolicyRule;
+        }
+    }
+
+    if (std.mem.trim(u8, scopes_raw, " \t\r\n").len > 0) {
+        var mappings = std.mem.splitScalar(u8, scopes_raw, ';');
+        while (mappings.next()) |entry_raw| {
+            const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+            if (entry.len == 0) return error.InvalidPolicyScopeMapping;
+            const colon = std.mem.findScalar(u8, entry, ':') orelse return error.InvalidPolicyScopeMapping;
+            if (std.mem.trim(u8, entry[0..colon], " \t").len == 0) return error.InvalidPolicyScopeMapping;
+            var scopes = std.mem.splitScalar(u8, entry[colon + 1 ..], ',');
+            var count: usize = 0;
+            while (scopes.next()) |scope| {
+                if (std.mem.trim(u8, scope, " \t").len == 0) return error.InvalidPolicyScopeMapping;
+                count += 1;
+            }
+            if (count == 0) return error.InvalidPolicyScopeMapping;
+        }
+    }
+
+    if (std.mem.trim(u8, approval_routes_raw, " \t\r\n").len > 0) {
+        var routes = std.mem.splitScalar(u8, approval_routes_raw, ';');
+        while (routes.next()) |entry_raw| {
+            const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+            if (entry.len == 0) return error.InvalidApprovalRoute;
+            var parts = std.mem.splitScalar(u8, entry, '|');
+            const method = std.mem.trim(u8, parts.next() orelse return error.InvalidApprovalRoute, " \t");
+            const pattern = std.mem.trim(u8, parts.next() orelse return error.InvalidApprovalRoute, " \t");
+            if (parts.next() != null or method.len == 0 or pattern.len == 0) return error.InvalidApprovalRoute;
+            _ = http.rewrite.regexMatchesChecked(pattern, "/") catch return error.InvalidApprovalRoute;
+        }
+    }
+}
+
+fn validatePolicyHours(raw: []const u8) !void {
+    const dash = std.mem.findScalar(u8, raw, '-') orelse return error.InvalidPolicyHours;
+    if (std.mem.findScalar(u8, raw[dash + 1 ..], '-') != null) return error.InvalidPolicyHours;
+    const start = std.fmt.parseInt(u8, std.mem.trim(u8, raw[0..dash], " \t"), 10) catch return error.InvalidPolicyHours;
+    const stop = std.fmt.parseInt(u8, std.mem.trim(u8, raw[dash + 1 ..], " \t"), 10) catch return error.InvalidPolicyHours;
+    if (start > 23 or stop > 24) return error.InvalidPolicyHours;
 }
 
 fn validateOtelSampleRate(rate: u32) !void {
@@ -3404,6 +3494,36 @@ fn validateOptionalAbsoluteUrl(raw: []const u8, label: []const u8) !void {
         }
         return err;
     };
+}
+
+/// A mirror target must name a transport explicitly.
+///
+/// Mirror rules replay the original request body, so an unsupported or missing
+/// scheme has to prevent startup/reload rather than be silently treated as
+/// cleartext HTTP at request time. Only `http://` and `https://` are supported.
+fn validateMirrorTargetUrl(raw: []const u8) !void {
+    validateMirrorTargetUrlChecked(raw) catch |err| {
+        std.log.err(
+            "config validation failed: mirror_rule.target_url must be an absolute http:// or https:// URL: {s}",
+            .{raw},
+        );
+        return err;
+    };
+}
+
+fn validateMirrorTargetUrlChecked(raw: []const u8) !void {
+    if (raw.len == 0) return error.InvalidConfigUrl;
+    if (!isAbsoluteHttpUrl(raw)) return error.InvalidConfigUrl;
+    const uri = std.Uri.parse(raw) catch return error.InvalidConfigUrl;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
+        return error.InvalidConfigUrl;
+    }
+    const host = uri.host orelse return error.InvalidConfigUrl;
+    const host_bytes = switch (host) {
+        .raw => |value| value,
+        .percent_encoded => |value| value,
+    };
+    if (host_bytes.len == 0) return error.InvalidConfigUrl;
 }
 
 fn validateOptionalUpstreamBaseUrl(raw: []const u8, label: []const u8) !void {
@@ -4414,6 +4534,53 @@ test "validate mTLS consistency requires CA path when verify is enabled" {
     try validateMtlsConsistency(false, "/ca.pem");
     try validateMtlsConsistency(true, "/ca.pem");
     try std.testing.expectError(error.InvalidConfigPath, validateMtlsConsistency(true, ""));
+}
+
+test "validate rejects malformed access control policy" {
+    try validateAccessControlConfig("allow 10.0.0.0/8, deny 0.0.0.0/0");
+    try std.testing.expectError(error.InvalidConfigValue, validateAccessControlConfig("allow 10.0.0.0/8, permit all"));
+}
+
+test "mirror targets accept only explicit http and https schemes" {
+    try validateMirrorTargetUrlChecked("http://127.0.0.1:9000/mirror");
+    try validateMirrorTargetUrlChecked("https://mirror.example/ingest");
+
+    // Unsupported schemes must fail closed instead of being treated as
+    // cleartext HTTP on port 80 while carrying the original request body.
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("ftp://mirror.example/path"));
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("file:///etc/passwd"));
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("gopher://mirror.example"));
+    // Schemeless and empty targets.
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("mirror.example/path"));
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("//mirror.example/path"));
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked(""));
+    // A scheme with no host cannot be connected to.
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("http://"));
+}
+
+test "geo blocking requires an explicit trusted country-header source" {
+    try validateGeoTrustConfig(0, false, 0);
+    try std.testing.expectError(error.InvalidGeoTrustConfig, validateGeoTrustConfig(1, false, 1));
+    try std.testing.expectError(error.InvalidGeoTrustConfig, validateGeoTrustConfig(1, true, 0));
+    try validateGeoTrustConfig(1, true, 1);
+}
+
+test "policy configuration validation rejects silently skipped rules" {
+    try validatePolicyConfig("", "", "");
+    try validatePolicyConfig(
+        "POST|^/deploy$|admin|true|8-18|^managed-;GET|^/status$||false||",
+        "alice:admin,deploy;bob:read",
+        "POST|^/deploy$;DELETE|^/tokens/[a-z]+$",
+    );
+
+    try std.testing.expectError(error.InvalidPolicyRule, validatePolicyConfig("role:admin=allow:*", "", ""));
+    try std.testing.expectError(error.InvalidPolicyRule, validatePolicyConfig("POST|[|admin|false||", "", ""));
+    try std.testing.expectError(error.InvalidPolicyRule, validatePolicyConfig("POST|^/deploy$|admin|sometimes||", "", ""));
+    try std.testing.expectError(error.InvalidPolicyHours, validatePolicyConfig("POST|^/deploy$|admin|false|25-26|", "", ""));
+    try std.testing.expectError(error.InvalidPolicyScopeMapping, validatePolicyConfig("", "alice=admin", ""));
+    try std.testing.expectError(error.InvalidPolicyScopeMapping, validatePolicyConfig("", "alice:admin,", ""));
+    try std.testing.expectError(error.InvalidApprovalRoute, validatePolicyConfig("", "", "POST:/deploy=required"));
+    try std.testing.expectError(error.InvalidApprovalRoute, validatePolicyConfig("", "", "POST|["));
 }
 
 test "validate OTEL sample rate rejects values above 100" {

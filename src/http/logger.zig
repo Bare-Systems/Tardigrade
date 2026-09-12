@@ -126,7 +126,11 @@ fn appendJsonLine(writer: anytype, self: Logger, level: Level, correlation_id: ?
     });
 
     if (correlation_id) |cid| {
-        try writer.print(",\"request_id\":\"{s}\",\"correlation_id\":\"{s}\"", .{ cid, cid });
+        try writer.writeAll(",\"request_id\":\"");
+        try writeJsonEscaped(writer, cid);
+        try writer.writeAll("\",\"correlation_id\":\"");
+        try writeJsonEscaped(writer, cid);
+        try writer.writeByte('"');
     }
 
     try writer.writeAll(",\"msg\":\"");
@@ -223,4 +227,18 @@ test "appendJsonLine escapes message content and includes correlation id" {
     try std.testing.expect(std.mem.find(u8, line, "\"request_id\":\"cid-1\"") != null);
     try std.testing.expect(std.mem.find(u8, line, "\"correlation_id\":\"cid-1\"") != null);
     try std.testing.expect(std.mem.find(u8, line, "\"msg\":\"quote\\\"\\nslash\\\\tab\\t\"") != null);
+}
+
+test "appendJsonLine cannot inject fields through correlation id" {
+    const log = Logger.init(.info, "gateway");
+    var buf: [512]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    const cid = "cid\"},\"forged\":true,\n\"tail\":\"";
+    try appendJsonLine(fbs.writer(), log, .warn, cid, "2026-05-11T00:00:00Z", "message");
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, std.mem.trimEnd(u8, fbs.getWritten(), "\n"), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(cid, parsed.value.object.get("request_id").?.string);
+    try std.testing.expectEqualStrings(cid, parsed.value.object.get("correlation_id").?.string);
+    try std.testing.expect(parsed.value.object.get("forged") == null);
 }

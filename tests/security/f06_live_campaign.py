@@ -485,18 +485,28 @@ def run_path_canonicalization(up: Upstream, port: int) -> None:
         assert_denied(up, name, cat, port, req("GET", path, []))
 
     up.reset()
-    raw = send_raw(port, req("GET", "http://attacker.example/protected", [], host="localhost"))
+    raw = send_raw(port, req(
+        "GET",
+        "http://attacker.example/protected",
+        [("Authorization", f"Bearer {VALID_TOKEN}")],
+        host="localhost",
+    ))
     status = first_status_code(raw)
     hits = up.hits()
     ok = (status is None or status >= 400) and len(hits) == 0
     record("absolute_form_request_target_still_requires_auth", cat, ok, f"status={status} hits={len(hits)}")
 
-    # A genuine second Host field (not just one non-matching value -- the
-    # `req()` helper suppresses its default Host whenever the caller already
-    # supplies one, so a naive single-Host call here would not actually
-    # test duplication at all, #673 review).
+    # Use otherwise-valid authentication so the duplicate Host field itself
+    # is the only reason this request can be denied. The old probe omitted
+    # auth, so it passed even when the parser accepted both Host fields and
+    # routing simply rejected the request later for missing credentials.
     up.reset()
-    raw = send_raw(port, b"GET /protected HTTP/1.1\r\nHost: localhost\r\nHost: evil.example\r\n\r\n")
+    raw = send_raw(port, (
+        b"GET /protected HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Host: evil.example\r\n"
+        b"Authorization: Bearer " + VALID_TOKEN.encode() + b"\r\n\r\n"
+    ))
     status = first_status_code(raw)
     hits = up.hits()
     ok = (status is None or status >= 400) and len(hits) == 0

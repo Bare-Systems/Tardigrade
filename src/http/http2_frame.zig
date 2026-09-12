@@ -12,6 +12,10 @@ pub const Type = enum(u8) {
     goaway = 0x7,
     window_update = 0x8,
     continuation = 0x9,
+    // HTTP/2 extension frame types are explicitly allowed. Keep the wire
+    // enum non-exhaustive so an unknown type can be represented and ignored
+    // instead of trapping in @enumFromInt on attacker-controlled input.
+    _,
 };
 
 pub const Flags = struct {
@@ -135,11 +139,11 @@ pub fn parseWindowUpdateIncrement(payload: []const u8) !u31 {
     return @intCast(raw);
 }
 
-/// Scan a non-ACK SETTINGS frame payload for the last SETTINGS_INITIAL_WINDOW_SIZE
-/// (id 0x4) entry, per RFC 9113 §6.5.2 ("the value of the last setting for the
-/// same identifier ... prevails"). Returns null if the frame carries no such
-/// entry. Errors on a malformed payload length or a value exceeding 2^31-1,
-/// which callers must treat as a connection-level FLOW_CONTROL_ERROR.
+/// Validate a peer SETTINGS payload and return the last
+/// SETTINGS_INITIAL_WINDOW_SIZE value. RFC 9113 requires bounds for
+/// ENABLE_PUSH, INITIAL_WINDOW_SIZE, and MAX_FRAME_SIZE even when this
+/// implementation does not otherwise use a setting; silently ignoring an
+/// invalid value leaves peers with contradictory protocol state.
 pub fn parseSettingsInitialWindowSize(payload: []const u8) !?u32 {
     if (payload.len % 6 != 0) return error.InvalidSettingsFrame;
     var value: ?u32 = null;
@@ -147,12 +151,28 @@ pub fn parseSettingsInitialWindowSize(payload: []const u8) !?u32 {
     while (i < payload.len) : (i += 6) {
         const id = std.mem.readInt(u16, payload[i..][0..2], .big);
         const v = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
-        if (id == 0x4) {
-            if (v > 0x7FFF_FFFF) return error.Http2FlowControlError;
-            value = v;
+        switch (id) {
+            0x2 => if (v > 1) return error.InvalidSettingsValue,
+            0x4 => {
+                if (v > 0x7FFF_FFFF) return error.Http2FlowControlError;
+                value = v;
+            },
+            0x5 => if (v < 16_384 or v > 16_777_215) return error.InvalidSettingsValue,
+            else => {},
         }
     }
     return value;
+}
+
+test "peer settings validation rejects invalid enable push and frame size" {
+    var payload: [6]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], 0x2, .big);
+    std.mem.writeInt(u32, payload[2..6], 2, .big);
+    try std.testing.expectError(error.InvalidSettingsValue, parseSettingsInitialWindowSize(&payload));
+
+    std.mem.writeInt(u16, payload[0..2], 0x5, .big);
+    std.mem.writeInt(u32, payload[2..6], 16_383, .big);
+    try std.testing.expectError(error.InvalidSettingsValue, parseSettingsInitialWindowSize(&payload));
 }
 
 fn readExact(conn: anytype, out: []u8) !void {
@@ -193,6 +213,26 @@ test "write and parse frame header values" {
     try std.testing.expectEqual(@as(u8, 0), out[1]);
     try std.testing.expectEqual(@as(u8, 3), out[2]);
     try std.testing.expectEqual(@as(u8, 0x4), out[3]);
+}
+
+test "readFrame preserves unknown extension types without trapping" {
+    const TestReader = struct {
+        bytes: []const u8,
+        pos: usize = 0,
+
+        fn read(self: *@This(), out: []u8) !usize {
+            const n = @min(out.len, self.bytes.len - self.pos);
+            @memcpy(out[0..n], self.bytes[self.pos..][0..n]);
+            self.pos += n;
+            return n;
+        }
+    };
+    const raw = [_]u8{ 0, 0, 0, 0xfe, 0, 0, 0, 0, 0 };
+    var reader = TestReader{ .bytes = &raw };
+    var frame = try readFrame(&reader, std.testing.allocator, 16 * 1024);
+    defer deinitFrame(std.testing.allocator, &frame);
+    try std.testing.expectEqual(@as(u8, 0xfe), @intFromEnum(frame.typ));
+    try std.testing.expectEqual(@as(usize, 0), frame.payload.len);
 }
 
 test "writeSettings encodes entries as big-endian id/value pairs" {

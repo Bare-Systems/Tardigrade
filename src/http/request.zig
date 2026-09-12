@@ -17,6 +17,8 @@ pub const Uri = struct {
     raw: []const u8,
     path: []const u8,
     query: ?[]const u8,
+    scheme: ?[]const u8 = null,
+    authority: ?[]const u8 = null,
 };
 
 /// HTTP Request parsing errors
@@ -44,6 +46,14 @@ pub const ParseError = error{
     /// duplicate `Content-Length` (WSTG-ATHZ-01/02, #673 F-06) -- reject
     /// outright rather than silently preferring one field.
     DuplicateAuthorizationHeader,
+    /// More than one `Host` header field was present. RFC 9112 § 3.2
+    /// requires a server to reject this even when the values are identical:
+    /// different HTTP hops choosing different occurrences creates virtual
+    /// host, authorization, and cache-routing ambiguity.
+    DuplicateHostHeader,
+    /// Host is empty/malformed or disagrees with an absolute-form request
+    /// target's authority. Routing must have one canonical authority.
+    InvalidHostHeader,
     OutOfMemory,
 };
 
@@ -123,6 +133,8 @@ pub const Request = struct {
         if (has_te and has_cl) return error.ConflictingHeaders;
 
         if (headers.countByName("authorization") > 1) return error.DuplicateAuthorizationHeader;
+        if (headers.countByName("host") > 1) return error.DuplicateHostHeader;
+        try validateRoutingAuthority(&headers, uri);
 
         var body: ?[]const u8 = null;
         var total_bytes = body_start;
@@ -220,6 +232,8 @@ pub const Request = struct {
         if (cl_count > 1 or te_count > 1) return error.ConflictingHeaders;
         if (te_count > 0 and cl_count > 0) return error.ConflictingHeaders;
         if (headers.countByName("authorization") > 1) return error.DuplicateAuthorizationHeader;
+        if (headers.countByName("host") > 1) return error.DuplicateHostHeader;
+        try validateRoutingAuthority(&headers, uri);
         if (cl_count == 1) {
             _ = std.fmt.parseInt(usize, headers.get("content-length").?, 10) catch {
                 return error.InvalidContentLength;
@@ -318,13 +332,24 @@ fn parseRequestLine(line: []const u8) ?struct { method: []const u8, uri: []const
 /// Parse URI into path and query components
 fn parseUri(uri: []const u8) ?Uri {
     if (uri.len == 0) return null;
+    if (std.mem.findScalar(u8, uri, '#') != null) return null;
 
     // URI must start with / for absolute path (or be *)
     if (uri[0] != '/' and !std.mem.eql(u8, uri, "*")) {
-        // Could be absolute URI, just take the path portion
+        // Absolute-form is accepted only for HTTP(S), and retains its
+        // authority so it can be checked against Host after header parsing.
         if (std.mem.find(u8, uri, "://")) |proto_end| {
+            const scheme = uri[0..proto_end];
+            if (!(std.ascii.eqlIgnoreCase(scheme, "http") or std.ascii.eqlIgnoreCase(scheme, "https"))) return null;
+            const authority_start = proto_end + 3;
             if (std.mem.findPos(u8, uri, proto_end + 3, "/")) |path_start| {
-                return parseUri(uri[path_start..]);
+                const authority = uri[authority_start..path_start];
+                if (parseAuthority(authority) == null) return null;
+                var parsed = parseUri(uri[path_start..]) orelse return null;
+                parsed.raw = uri;
+                parsed.scheme = scheme;
+                parsed.authority = authority;
+                return parsed;
             }
         }
         return null;
@@ -344,6 +369,63 @@ fn parseUri(uri: []const u8) ?Uri {
         .path = uri,
         .query = null,
     };
+}
+
+const ParsedAuthority = struct {
+    host: []const u8,
+    port: ?u16,
+};
+
+fn parseAuthority(raw: []const u8) ?ParsedAuthority {
+    if (raw.len == 0 or !isAuthorityValueSafe(raw)) return null;
+    if (raw[0] == '[') {
+        const close = std.mem.findScalar(u8, raw, ']') orelse return null;
+        if (close == 1) return null;
+        const suffix = raw[close + 1 ..];
+        const port = if (suffix.len == 0)
+            null
+        else blk: {
+            if (suffix[0] != ':' or suffix.len == 1) return null;
+            break :blk std.fmt.parseInt(u16, suffix[1..], 10) catch return null;
+        };
+        return .{ .host = raw[1..close], .port = port };
+    }
+
+    const colon = std.mem.findScalarLast(u8, raw, ':');
+    if (colon) |index| {
+        if (std.mem.findScalar(u8, raw[0..index], ':') != null) return null; // IPv6 requires brackets.
+        if (index == 0 or index + 1 == raw.len) return null;
+        const port = std.fmt.parseInt(u16, raw[index + 1 ..], 10) catch return null;
+        return .{ .host = raw[0..index], .port = port };
+    }
+    return .{ .host = raw, .port = null };
+}
+
+/// Public syntax check for protocol adapters (HTTP/2 and HTTP/3) before they
+/// map `:authority` into the shared HTTP/1-shaped request representation.
+pub fn isValidAuthority(raw: []const u8) bool {
+    return parseAuthority(raw) != null;
+}
+
+fn isAuthorityValueSafe(raw: []const u8) bool {
+    for (raw) |c| {
+        if (c <= 0x20 or c == 0x7f) return false;
+        if (std.mem.indexOfScalar(u8, "/\\?#@,;", c) != null) return false;
+    }
+    return true;
+}
+
+fn validateRoutingAuthority(headers: *const Headers, uri: Uri) ParseError!void {
+    const raw_host = headers.get("host");
+    const host = if (raw_host) |value| parseAuthority(value) orelse return error.InvalidHostHeader else null;
+    if (uri.authority) |target_raw| {
+        const target = parseAuthority(target_raw) orelse return error.InvalidHostHeader;
+        if (host) |host_value| {
+            if (!std.ascii.eqlIgnoreCase(target.host, host_value.host)) return error.InvalidHostHeader;
+            const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme.?, "https")) 443 else 80;
+            if ((target.port orelse default_port) != (host_value.port orelse default_port)) return error.InvalidHostHeader;
+        }
+    }
 }
 
 /// Decoded chunked-body payload plus how many leading bytes of `data` the
@@ -630,6 +712,52 @@ test "reject duplicate Authorization headers even when one occurrence is well-fo
         try std.testing.expectError(error.DuplicateAuthorizationHeader, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
         try std.testing.expectError(error.DuplicateAuthorizationHeader, Request.parseHead(allocator, raw, DEFAULT_MAX_BODY_SIZE));
     }
+}
+
+test "reject duplicate Host headers before virtual-host routing" {
+    const allocator = std.testing.allocator;
+
+    // Identical duplicates are invalid too. Rejecting only conflicting values
+    // still leaves downstream hops free to combine or select fields
+    // differently from Tardigrade.
+    const identical = "GET / HTTP/1.1\r\nHost: example.test\r\nHost: example.test\r\n\r\n";
+    try std.testing.expectError(error.DuplicateHostHeader, Request.parse(allocator, identical, DEFAULT_MAX_BODY_SIZE));
+    try std.testing.expectError(error.DuplicateHostHeader, Request.parseHead(allocator, identical, DEFAULT_MAX_BODY_SIZE));
+
+    const conflicting = "GET /protected HTTP/1.1\r\nHost: trusted.example\r\nHost: attacker.example\r\n\r\n";
+    try std.testing.expectError(error.DuplicateHostHeader, Request.parse(allocator, conflicting, DEFAULT_MAX_BODY_SIZE));
+    try std.testing.expectError(error.DuplicateHostHeader, Request.parseHead(allocator, conflicting, DEFAULT_MAX_BODY_SIZE));
+}
+
+test "reject empty or malformed Host authority" {
+    const allocator = std.testing.allocator;
+    const invalid = [_][]const u8{
+        "GET / HTTP/1.1\r\nHost:\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: example.test:\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: user@example.test\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: example.test/path\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: 2001:db8::1\r\n\r\n",
+    };
+    for (invalid) |raw| {
+        try std.testing.expectError(error.InvalidHostHeader, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+        try std.testing.expectError(error.InvalidHostHeader, Request.parseHead(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+    }
+}
+
+test "absolute-form authority must agree with Host" {
+    const allocator = std.testing.allocator;
+    const mismatched = "GET http://trusted.test/private HTTP/1.1\r\nHost: attacker.test\r\n\r\n";
+    try std.testing.expectError(error.InvalidHostHeader, Request.parse(allocator, mismatched, DEFAULT_MAX_BODY_SIZE));
+    try std.testing.expectError(error.InvalidHostHeader, Request.parseHead(allocator, mismatched, DEFAULT_MAX_BODY_SIZE));
+
+    var parsed = try Request.parse(
+        allocator,
+        "GET https://Example.test/private HTTP/1.1\r\nHost: example.test:443\r\n\r\n",
+        DEFAULT_MAX_BODY_SIZE,
+    );
+    defer parsed.request.deinit();
+    try std.testing.expectEqualStrings("/private", parsed.request.uri.path);
+    try std.testing.expectEqualStrings("Example.test", parsed.request.uri.authority.?);
 }
 
 test "parse chunked body correctly" {

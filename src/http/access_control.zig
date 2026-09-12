@@ -107,6 +107,7 @@ pub const AccessControl = struct {
     /// Format: comma-separated rules, each is "allow <CIDR>" or "deny <CIDR>".
     /// Example: "allow 10.0.0.0/8, deny 192.168.1.0/24, allow 0.0.0.0/0"
     pub fn fromConfig(allocator: Allocator, config: []const u8, default_action: Action) !AccessControl {
+        try validateConfig(config);
         var rules = std.ArrayList(Rule).empty;
         errdefer rules.deinit(allocator);
 
@@ -126,12 +127,27 @@ pub const AccessControl = struct {
         };
     }
 
+    /// Validate an ACL without allocating or constructing live runtime state.
+    /// Configuration loading uses this to reject malformed security policy
+    /// before a listener is started or a reload is published.
+    pub fn validateConfig(config: []const u8) !void {
+        if (std.mem.trim(u8, config, " \t\r\n").len == 0) return;
+        var it = std.mem.splitScalar(u8, config, ',');
+        while (it.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t\r\n");
+            if (trimmed.len == 0) return error.InvalidRule;
+            _ = try parseRule(trimmed);
+        }
+    }
+
     /// Check if the given IP string is allowed.
     pub fn check(self: *const AccessControl, ip_str: []const u8) AccessResult {
-        const ip = parseIp(ip_str) orelse return switch (self.default_action) {
-            .allow => .allowed,
-            .deny => .denied,
-        };
+        // A configured ACL must never turn address lookup/allocation failure,
+        // an unsupported textual representation, or corrupted PROXY metadata
+        // into an authorization bypass. Real peer addresses are parseable;
+        // an unparseable value is therefore denied regardless of the default
+        // action used for valid addresses that match no rule.
+        const ip = parseIp(ip_str) orelse return .denied;
 
         for (self.rules) |rule| {
             if (rule.cidr.contains(ip)) {
@@ -411,11 +427,18 @@ test "AccessControl first match wins" {
     try std.testing.expectEqual(AccessResult.denied, acl.check("10.0.0.2"));
 }
 
-test "AccessControl handles unparseable IP" {
+test "AccessControl denies unparseable IP even with allow default" {
     const allocator = std.testing.allocator;
     var acl = try AccessControl.fromConfig(allocator, "deny 10.0.0.0/8", .allow);
     defer acl.deinit();
 
-    // Unparseable IP falls through to default
-    try std.testing.expectEqual(AccessResult.allowed, acl.check("not-an-ip"));
+    try std.testing.expectEqual(AccessResult.denied, acl.check("not-an-ip"));
+}
+
+test "AccessControl validateConfig rejects malformed security policy" {
+    try AccessControl.validateConfig("allow 10.0.0.0/8, deny ::1");
+    try std.testing.expectError(error.InvalidAction, AccessControl.validateConfig("permit 10.0.0.0/8"));
+    try std.testing.expectError(error.InvalidCidr, AccessControl.validateConfig("allow not-an-address"));
+    try std.testing.expectError(error.InvalidRule, AccessControl.validateConfig("allow"));
+    try std.testing.expectError(error.InvalidRule, AccessControl.validateConfig("allow 10.0.0.0/8,"));
 }

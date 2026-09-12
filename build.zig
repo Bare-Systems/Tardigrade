@@ -487,6 +487,10 @@ pub fn build(b: *std.Build) void {
     tls_core_mod.addImport("crypto", crypto_mod);
     exe_mod.addImport("crypto", crypto_mod);
     exe_test_mod.addImport("crypto", crypto_mod);
+    // allocation_regression imports the same gateway state as the production
+    // root. Keep its module graph complete when gateway state uses the crypto
+    // package for credential zeroization.
+    allocation_regression_mod.addImport("crypto", crypto_mod);
 
     // Test-only QUIC/H3 crypto provider composition (#490): owns concrete
     // `pure_zig.Provider` construction so `src/quic/` and the native HTTP/3

@@ -92,6 +92,11 @@ pub const Config = struct {
     tls_max_version: []const u8 = "1.3",
     enable_0rtt: bool = false,
     h3_settings: http3.frame.Settings = .{},
+    /// Per-request application body ceiling enforced while HTTP/3 DATA is
+    /// ingested, before the complete request is handed to gateway middleware.
+    max_request_body_bytes: usize = http3.session.RequestStream.default_max_body_len,
+    /// Aggregate dynamic request-assembly budget across concurrent streams.
+    max_buffered_request_bytes: usize = http3.conn.default_max_buffered_request_bytes,
     connection_migration: bool = false,
     retry_policy: quic.config.RetryPolicy = .off,
     /// Operator-facing ceiling on the size of datagrams this listener
@@ -1120,6 +1125,8 @@ pub const Runtime = struct {
     secrets: RuntimeSecrets,
     quic_config: quic.config.Config,
     h3_settings: http3.frame.Settings,
+    max_request_body_bytes: usize = http3.session.RequestStream.default_max_body_len,
+    max_buffered_request_bytes: usize = http3.conn.default_max_buffered_request_bytes,
     h3_application_compat: [http3.early_data.encoded_snapshot_len]u8 = undefined,
     h3_application_compat_len: usize = 0,
     early_data_compat_metrics_ctx: ?*anyopaque = null,
@@ -1242,6 +1249,8 @@ pub const Runtime = struct {
             .quic_config = quicConfigFrom(cfg, no_fragment, ecn_receive),
             .ecn_send_enabled = ecn_receive,
             .h3_settings = cfg.h3_settings,
+            .max_request_body_bytes = cfg.max_request_body_bytes,
+            .max_buffered_request_bytes = cfg.max_buffered_request_bytes,
             .early_data_compat_metrics_ctx = cfg.early_data_compat_metrics_ctx,
             .early_data_compat_metrics_cb = cfg.early_data_compat_metrics_cb,
             .quic_early_data_decision_metrics_ctx = cfg.quic_early_data_decision_metrics_ctx,
@@ -1659,7 +1668,9 @@ pub const Runtime = struct {
             factory(self.quic_qlog_sink_factory_ctx, handle)
         else
             self.quic_qlog_sink;
-        const h3 = H3.initWithSettings(allocator, .server, self.h3_settings);
+        var h3 = H3.initWithSettings(allocator, .server, self.h3_settings);
+        h3.max_request_body_bytes = self.max_request_body_bytes;
+        h3.max_buffered_request_bytes = self.max_buffered_request_bytes;
         entry.* = .{
             .backend = backend,
             .conn = conn,
@@ -2005,6 +2016,10 @@ pub const Runtime = struct {
             return;
         };
         defer request.deinit();
+        request.client_ip = formatAddressHostAlloc(allocator, entry.conn.activePathKey().remote) catch {
+            self.sendInternalErrorResponse(entry, incoming.stream_id, now);
+            return;
+        };
         request.stream_id = incoming.stream_id;
         request.transport_early = incoming.transport_early;
         request.downstream_handshake_complete = entry.conn.isEstablished();
@@ -2970,13 +2985,13 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
     var assembler = http3_session.StreamAssembler.init(allocator);
     defer assembler.deinit();
 
-    var fields: [72]http3_session.HeaderField = undefined;
+    var fields: [131]http3_session.HeaderField = undefined;
     fields[0] = .{ .name = ":method", .value = exchange.request.method };
     fields[1] = .{ .name = ":path", .value = exchange.request.path };
     fields[2] = .{ .name = ":authority", .value = exchange.request.authority };
     var count: usize = 3;
     for (exchange.request.headers) |header| {
-        if (count == fields.len) break;
+        if (count == fields.len) return error.TooManyHeaders;
         fields[count] = .{ .name = header.name, .value = header.value };
         count += 1;
     }
@@ -2986,6 +3001,29 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
         else => {},
     }
     return assembler.finish();
+}
+
+/// Render a transport peer as the `client_ip` string upper layers consume.
+///
+/// IPv6 peers are emitted unbracketed and fully expanded, so any consumer that
+/// compares this against operator-configured identities must treat it as an
+/// address, not as an `authority` that can be split on its last colon.
+pub fn formatAddressHostAlloc(allocator: std.mem.Allocator, address: quic.udp.Address) ![]u8 {
+    return switch (address.family) {
+        .ip4 => std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{
+            address.bytes[0], address.bytes[1], address.bytes[2], address.bytes[3],
+        }),
+        .ip6 => std.fmt.allocPrint(allocator, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+            std.mem.readInt(u16, address.bytes[0..2], .big),
+            std.mem.readInt(u16, address.bytes[2..4], .big),
+            std.mem.readInt(u16, address.bytes[4..6], .big),
+            std.mem.readInt(u16, address.bytes[6..8], .big),
+            std.mem.readInt(u16, address.bytes[8..10], .big),
+            std.mem.readInt(u16, address.bytes[10..12], .big),
+            std.mem.readInt(u16, address.bytes[12..14], .big),
+            std.mem.readInt(u16, address.bytes[14..16], .big),
+        }),
+    };
 }
 
 /// Map the operator-facing runtime config onto the native QUIC transport

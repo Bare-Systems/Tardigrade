@@ -52,6 +52,8 @@ Two principles, from the #196/#141 arc:
 | SCGI / uWSGI exchange | `UPSTREAM_TIMEOUT_MS` | 10000 | `SO_*TIMEO` set in `execute()` (#171) | 502 | ✅ *(new — same unbounded-exchange gap as FastCGI)* |
 | FastCGI/SCGI/uWSGI TCP connect | `UPSTREAM_CONNECT_TIMEOUT_MS` | 5000 | `compat.connectBoundedTcp` (non-blocking connect + `poll` + `SO_ERROR`) (#171) | `error.Timeout` → 502 | ✅ *(Unix-socket endpoints stay on the local blocking connect — no SYN-blackhole exposure)* |
 | Active health probes | `UPSTREAM_PROBE_TIMEOUT_MS` (alias `UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS`) | 2000 | raw probes with `SO_RCVTIMEO`, unix + TCP (#138) | probe fails → backend marked | ✅ |
+| Authentication subrequest | upstream connect/response knobs, with a 5000 ms safety fallback when both relevant knobs are disabled | 5000 fallback | bounded native HTTP/TLS transport; response capped at 64 KiB; TLS always verifies the URL host and cannot inherit an origin verification bypass/SNI override | authentication fails closed | ✅ |
+| Approval escalation webhook | fixed connect/write/response-head deadline | 5000 | bounded native HTTP/TLS transport; request and response head capped at 64 KiB; TLS verifies certificate and hostname | warning logged; request continues | ✅ |
 | Pool idle / lifetime | `UPSTREAM_POOL_IDLE_TIMEOUT_MS` / `…_MAX_LIFETIME_MS` | 90000 / 0 | maintenance-tick reapers (h1 + h2 pools) | idle conn closed | ✅ (housekeeping, not a request deadline) |
 | Passive-health / breaker windows | `UPSTREAM_FAIL_TIMEOUT_MS`, `CB_TIMEOUT_MS` | 10000 / 30000 | policy timers | backend skipped / breaker half-open | ✅ (policy windows, not I/O deadlines) |
 | Mail/memcached protocol proxies | — (hardcoded) | 10000 / 2000 | `SO_*TIMEO` after connect | 502 | 🟡 bounded but not configurable |

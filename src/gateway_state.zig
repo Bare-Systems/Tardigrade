@@ -293,6 +293,15 @@ pub const MuxMetricsSnapshot = struct {
     device_counts: []MuxDeviceCount,
 };
 
+fn appendPrometheusLabelValue(out: *std.array_list.Managed(u8), value: []const u8) !void {
+    for (value) |byte| switch (byte) {
+        '\\' => try out.appendSlice("\\\\"),
+        '"' => try out.appendSlice("\\\""),
+        '\n' => try out.appendSlice("\\n"),
+        else => try out.append(byte),
+    };
+}
+
 fn deinitMuxMetricsSnapshot(allocator: std.mem.Allocator, device_counts: []MuxDeviceCount) void {
     for (device_counts) |entry| allocator.free(entry.device_id);
     allocator.free(device_counts);
@@ -1068,6 +1077,7 @@ pub const GatewayState = struct {
     pub fn commandLifecycleCreate(self: *GatewayState, command_id: []const u8, command_type: []const u8, correlation_id: []const u8, identity: []const u8) !void {
         self.command_mutex.lock();
         defer self.command_mutex.unlock();
+        if (self.command_lifecycle.contains(command_id)) return error.CommandAlreadyExists;
         const now = compat.milliTimestamp();
         const owned_id = try self.allocator.dupe(u8, command_id);
         errdefer self.allocator.free(owned_id);
@@ -1077,6 +1087,12 @@ pub const GatewayState = struct {
         errdefer self.allocator.free(owned_corr);
         const owned_ident = try self.allocator.dupe(u8, identity);
         errdefer self.allocator.free(owned_ident);
+        const response_body = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(response_body);
+        const response_content_type = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(response_content_type);
+        const error_message = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(error_message);
         const entry = CommandLifecycleEntry{
             .status = .pending,
             .command_type = owned_cmd,
@@ -1085,11 +1101,11 @@ pub const GatewayState = struct {
             .created_ms = now,
             .updated_ms = now,
             .response_status = 0,
-            .response_body = try self.allocator.dupe(u8, ""),
-            .response_content_type = try self.allocator.dupe(u8, ""),
-            .error_message = try self.allocator.dupe(u8, ""),
+            .response_body = response_body,
+            .response_content_type = response_content_type,
+            .error_message = error_message,
         };
-        try self.command_lifecycle.put(owned_id, entry);
+        try self.command_lifecycle.putNoClobber(owned_id, entry);
     }
 
     pub fn commandLifecycleSetRunning(self: *GatewayState, command_id: []const u8) void {
@@ -1105,15 +1121,28 @@ pub const GatewayState = struct {
         self.command_mutex.lock();
         defer self.command_mutex.unlock();
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
+            // Allocate the entire replacement before changing live state. An
+            // allocation failure must leave the old, fully owned snapshot in
+            // place rather than dangling pointers to buffers we already freed.
+            const new_body = self.allocator.dupe(u8, body) catch return;
+            const new_content_type = self.allocator.dupe(u8, content_type) catch {
+                self.allocator.free(new_body);
+                return;
+            };
+            const new_error = self.allocator.dupe(u8, "") catch {
+                self.allocator.free(new_body);
+                self.allocator.free(new_content_type);
+                return;
+            };
             self.allocator.free(entry.response_body);
             self.allocator.free(entry.response_content_type);
             self.allocator.free(entry.error_message);
             entry.status = .completed;
             entry.updated_ms = compat.milliTimestamp();
             entry.response_status = status;
-            entry.response_body = self.allocator.dupe(u8, body) catch self.allocator.dupe(u8, "") catch return;
-            entry.response_content_type = self.allocator.dupe(u8, content_type) catch self.allocator.dupe(u8, "") catch return;
-            entry.error_message = self.allocator.dupe(u8, "") catch self.allocator.dupe(u8, "") catch return;
+            entry.response_body = new_body;
+            entry.response_content_type = new_content_type;
+            entry.error_message = new_error;
         }
     }
 
@@ -1121,10 +1150,11 @@ pub const GatewayState = struct {
         self.command_mutex.lock();
         defer self.command_mutex.unlock();
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
+            const new_error = self.allocator.dupe(u8, message) catch return;
             self.allocator.free(entry.error_message);
             entry.status = .failed;
             entry.updated_ms = compat.milliTimestamp();
-            entry.error_message = self.allocator.dupe(u8, message) catch self.allocator.dupe(u8, "command_failed") catch return;
+            entry.error_message = new_error;
         }
     }
 
@@ -1132,20 +1162,30 @@ pub const GatewayState = struct {
         self.command_mutex.lock();
         defer self.command_mutex.unlock();
         const entry = self.command_lifecycle.get(command_id) orelse return null;
-        const status_name = @tagName(entry.status);
-        return std.fmt.allocPrint(allocator, "{{\"command_id\":\"{s}\",\"status\":\"{s}\",\"command\":\"{s}\",\"correlation_id\":\"{s}\",\"identity\":\"{s}\",\"created_ms\":{d},\"updated_ms\":{d},\"response_status\":{d},\"response_content_type\":\"{s}\",\"response_body\":{s},\"error\":\"{s}\"}}", .{
-            command_id,
-            status_name,
-            entry.command_type,
-            entry.correlation_id,
-            entry.identity,
-            entry.created_ms,
-            entry.updated_ms,
-            entry.response_status,
-            entry.response_content_type,
-            if (entry.response_body.len > 0 and (std.mem.startsWith(u8, entry.response_body, "{") or std.mem.startsWith(u8, entry.response_body, "["))) entry.response_body else "\"\"",
-            entry.error_message,
-        }) catch null;
+        var parsed_body = if (entry.response_body.len > 0 and
+            (std.mem.startsWith(u8, entry.response_body, "{") or std.mem.startsWith(u8, entry.response_body, "[")))
+            std.json.parseFromSlice(std.json.Value, allocator, entry.response_body, .{}) catch null
+        else
+            null;
+        defer if (parsed_body) |*parsed| parsed.deinit();
+
+        const response_body: std.json.Value = if (parsed_body) |parsed| switch (parsed.value) {
+            .object, .array => parsed.value,
+            else => .{ .string = "" },
+        } else .{ .string = "" };
+        return compat.stringifyAlloc(allocator, .{
+            .command_id = command_id,
+            .status = @tagName(entry.status),
+            .command = entry.command_type,
+            .correlation_id = entry.correlation_id,
+            .identity = entry.identity,
+            .created_ms = entry.created_ms,
+            .updated_ms = entry.updated_ms,
+            .response_status = entry.response_status,
+            .response_content_type = entry.response_content_type,
+            .response_body = response_body,
+            .@"error" = entry.error_message,
+        }, .{}) catch null;
     }
 
     pub fn commandLifecycleGet(self: *GatewayState, allocator: std.mem.Allocator, command_id: []const u8) ?CommandLifecycleSnapshot {
@@ -1187,20 +1227,35 @@ pub const GatewayState = struct {
             errdefer self.allocator.free(token);
             const now = compat.milliTimestamp();
             const expires_ms = now + self.approval_ttl_ms;
+            const owned_method = try self.allocator.dupe(u8, method);
+            errdefer self.allocator.free(owned_method);
+            const owned_path = try self.allocator.dupe(u8, path);
+            errdefer self.allocator.free(owned_path);
+            const owned_identity = try self.allocator.dupe(u8, identity);
+            errdefer self.allocator.free(owned_identity);
+            const owned_command_id = try self.allocator.dupe(u8, command_id orelse "");
+            errdefer self.allocator.free(owned_command_id);
+            const owned_decided_by = try self.allocator.dupe(u8, "");
+            errdefer self.allocator.free(owned_decided_by);
+            // Allocate the caller's result before publishing the map entry. If
+            // this allocation failed after insertion, errdefer would otherwise
+            // free the map's newly owned key and leave a dangling credential.
+            const result_token = try allocator.dupe(u8, token);
+            errdefer allocator.free(result_token);
             const entry = ApprovalEntry{
-                .method = try self.allocator.dupe(u8, method),
-                .path = try self.allocator.dupe(u8, path),
-                .identity = try self.allocator.dupe(u8, identity),
-                .command_id = try self.allocator.dupe(u8, command_id orelse ""),
+                .method = owned_method,
+                .path = owned_path,
+                .identity = owned_identity,
+                .command_id = owned_command_id,
                 .status = .pending,
                 .created_ms = now,
                 .expires_ms = expires_ms,
                 .decided_ms = 0,
-                .decided_by = try self.allocator.dupe(u8, ""),
+                .decided_by = owned_decided_by,
             };
-            try self.approvals.put(token, entry);
+            try self.approvals.putNoClobber(token, entry);
             break :blk ApprovalCreateResult{
-                .token = try allocator.dupe(u8, token),
+                .token = result_token,
                 .expires_ms = expires_ms,
             };
         };
@@ -1222,10 +1277,11 @@ pub const GatewayState = struct {
                 webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
             }
             if (entry.status != .pending) break :blk false;
+            const decided_by = self.allocator.dupe(u8, actor) catch break :blk false;
+            self.allocator.free(entry.decided_by);
             entry.status = if (decision == .approve) .approved else .denied;
             entry.decided_ms = compat.milliTimestamp();
-            self.allocator.free(entry.decided_by);
-            entry.decided_by = self.allocator.dupe(u8, actor) catch self.allocator.dupe(u8, "") catch break :blk false;
+            entry.decided_by = decided_by;
             break :blk true;
         };
 
@@ -1248,11 +1304,20 @@ pub const GatewayState = struct {
                 entry.escalation_fired = true;
                 webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
             }
-            if (!http.rewrite.methodMatches(entry.method, method)) break :blk ApprovalValidation.invalid;
-            if (!http.rewrite.regexMatches(entry.path, path)) break :blk ApprovalValidation.invalid;
-            if (identity) |id| {
-                if (entry.identity.len > 0 and !std.mem.eql(u8, entry.identity, id)) break :blk ApprovalValidation.invalid;
+            // The configured policy route is a regex, but an issued approval
+            // is a bearer credential for one concrete request scope. Treating
+            // its stored path as another regex let metacharacters broaden the
+            // approval, and methodMatches made a caller-supplied `*` universal.
+            if (!std.ascii.eqlIgnoreCase(entry.method, method)) break :blk ApprovalValidation.invalid;
+            if (!std.mem.eql(u8, entry.path, path)) break :blk ApprovalValidation.invalid;
+            if (entry.identity.len > 0) {
+                const request_identity = identity orelse break :blk ApprovalValidation.invalid;
+                if (!std.mem.eql(u8, entry.identity, request_identity)) break :blk ApprovalValidation.invalid;
             }
+            // TTL applies to the approval token, not merely to how long a
+            // reviewer has to decide. Previously an approved persisted token
+            // remained reusable forever because only pending entries expired.
+            if (compat.milliTimestamp() >= entry.expires_ms and entry.status != .escalated) break :blk ApprovalValidation.invalid;
             break :blk switch (entry.status) {
                 .pending => ApprovalValidation.pending,
                 .approved => ApprovalValidation.approved,
@@ -1279,28 +1344,20 @@ pub const GatewayState = struct {
                 entry.escalation_fired = true;
                 webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
             }
-            const command_id_json = if (entry.command_id.len > 0)
-                std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.command_id}) catch break :blk @as(?[]const u8, null)
-            else
-                allocator.dupe(u8, "null") catch break :blk @as(?[]const u8, null);
-            defer allocator.free(command_id_json);
-            const decided_by_json = if (entry.decided_by.len > 0)
-                std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.decided_by}) catch break :blk @as(?[]const u8, null)
-            else
-                allocator.dupe(u8, "null") catch break :blk @as(?[]const u8, null);
-            defer allocator.free(decided_by_json);
-            break :blk std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d},\"decided_ms\":{d},\"decided_by\":{s}}}", .{
-                token,
-                @tagName(entry.status),
-                entry.method,
-                entry.path,
-                entry.identity,
-                command_id_json,
-                entry.created_ms,
-                entry.expires_ms,
-                entry.decided_ms,
-                decided_by_json,
-            }) catch null;
+            const command_id: ?[]const u8 = if (entry.command_id.len > 0) entry.command_id else null;
+            const decided_by: ?[]const u8 = if (entry.decided_by.len > 0) entry.decided_by else null;
+            break :blk compat.stringifyAlloc(allocator, .{
+                .approval_token = token,
+                .status = @tagName(entry.status),
+                .method = entry.method,
+                .path = entry.path,
+                .identity = entry.identity,
+                .command_id = command_id,
+                .created_ms = entry.created_ms,
+                .expires_ms = entry.expires_ms,
+                .decided_ms = entry.decided_ms,
+                .decided_by = decided_by,
+            }, .{}) catch null;
         };
 
         if (webhook_payload) |p| {
@@ -1338,16 +1395,17 @@ pub const GatewayState = struct {
     /// Build a JSON payload for the escalation webhook. Must be called with approval_mutex held.
     /// Returns an allocator-owned slice or null on OOM.
     pub fn buildApprovalWebhookPayloadLocked(self: *GatewayState, token: []const u8, entry: *const ApprovalEntry) ?[]u8 {
-        const command_id_part = if (entry.command_id.len > 0)
-            std.fmt.allocPrint(self.allocator, "\"{s}\"", .{entry.command_id}) catch return null
-        else
-            self.allocator.dupe(u8, "null") catch return null;
-        defer self.allocator.free(command_id_part);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"event\":\"escalated\",\"approval_token\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d}}}",
-            .{ token, entry.method, entry.path, entry.identity, command_id_part, entry.created_ms, entry.expires_ms },
-        ) catch null;
+        const command_id: ?[]const u8 = if (entry.command_id.len > 0) entry.command_id else null;
+        return compat.stringifyAlloc(self.allocator, .{
+            .event = "escalated",
+            .approval_token = token,
+            .method = entry.method,
+            .path = entry.path,
+            .identity = entry.identity,
+            .command_id = command_id,
+            .created_ms = entry.created_ms,
+            .expires_ms = entry.expires_ms,
+        }, .{}) catch null;
     }
 
     /// Snapshot all approval entries into a slice suitable for persistence.
@@ -2092,9 +2150,9 @@ pub const GatewayState = struct {
                 \\
             );
             for (mux_snapshot.device_counts) |entry| {
-                const line = try std.fmt.allocPrint(allocator, "tardigrade_mux_device_channels{{device_id=\"{s}\"}} {d}\n", .{ entry.device_id, entry.count });
-                defer allocator.free(line);
-                try combined.appendSlice(line);
+                try combined.appendSlice("tardigrade_mux_device_channels{device_id=\"");
+                try appendPrometheusLabelValue(&combined, entry.device_id);
+                try combined.print("\"}} {d}\n", .{entry.count});
             }
         }
         try self.appendUpstreamPoolPrometheus(&combined);
@@ -2813,10 +2871,12 @@ pub const GatewayState = struct {
             const url = entry.key_ptr.*;
             const h = entry.value_ptr.*;
             const healthy = (h.unhealthy_until_ms == 0 or h.unhealthy_until_ms <= now_ms) and h.probe.isRoutable();
-            try out.writer().print(
-                "{{\"url\":\"{s}\",\"healthy\":{},\"unhealthy_until_ms\":{d},\"active_status\":\"{s}\"}}",
-                .{ url, healthy, h.unhealthy_until_ms, h.probe.status.asString() },
-            );
+            try out.print("{f}", .{std.json.fmt(.{
+                .url = url,
+                .healthy = healthy,
+                .unhealthy_until_ms = h.unhealthy_until_ms,
+                .active_status = h.probe.status.asString(),
+            }, .{})});
         }
         try out.appendSlice("]}");
         return out.toOwnedSlice();
@@ -3910,6 +3970,25 @@ test "gateway circuit breaker opens under upstream failure pressure" {
     try std.testing.expectEqualStrings("open", gs.circuitStateName());
 }
 
+test "upstream health JSON escapes configured origin URLs" {
+    var gs: GatewayState = undefined;
+    initUpstreamTestState(&gs, std.testing.allocator);
+    defer deinitUpstreamTestState(&gs);
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.upstream_max_fails = 1;
+    cfg.upstream_fail_timeout_ms = 30_000;
+    const url = "http://origin/\"}],\"forged\":true";
+    gs.recordUpstreamFailure(&cfg, url);
+
+    const payload = try gs.upstreamHealthJson(std.testing.allocator);
+    defer std.testing.allocator.free(payload);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const first = parsed.value.object.get("upstreams").?.array.items[0].object;
+    try std.testing.expectEqualStrings(url, first.get("url").?.string);
+    try std.testing.expect(first.get("forged") == null);
+}
+
 test "gateway circuit breaker recovers through a half-open probe" {
     var gs: GatewayState = undefined;
     initUpstreamTestState(&gs, std.testing.allocator);
@@ -4016,6 +4095,7 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     defer gs.mux_subscriptions_by_device.deinit();
 
     gs.upstream_pool.recordH2StreamingUploadFallback();
+    try gs.mux_subscriptions_by_device.put("device\"}\\metric=\"forged", 3);
 
     const prom = try gs.metricsToPrometheus(std.testing.allocator);
     defer std.testing.allocator.free(prom);
@@ -4026,6 +4106,205 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 786432\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_config_limit_bytes{queue=\"outbound_ciphertext\",limit=\"hard\"}") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_effective_state{state=\"disabled\"} 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_mux_device_channels{device_id=\"device\\\"}\\\\metric=\\\"forged\"} 3\n") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "metric=\"forged\"") == null);
+}
+
+fn deinitCommandLifecycleTestMap(gs: *GatewayState) void {
+    var it = gs.command_lifecycle.iterator();
+    while (it.next()) |entry| {
+        gs.allocator.free(entry.key_ptr.*);
+        gs.allocator.free(entry.value_ptr.command_type);
+        gs.allocator.free(entry.value_ptr.correlation_id);
+        gs.allocator.free(entry.value_ptr.identity);
+        gs.allocator.free(entry.value_ptr.response_body);
+        gs.allocator.free(entry.value_ptr.response_content_type);
+        gs.allocator.free(entry.value_ptr.error_message);
+    }
+    gs.command_lifecycle.deinit();
+}
+
+fn deinitApprovalTestMap(gs: *GatewayState) void {
+    var it = gs.approvals.iterator();
+    while (it.next()) |entry| {
+        gs.allocator.free(entry.key_ptr.*);
+        entry.value_ptr.deinit(gs.allocator);
+    }
+    gs.approvals.deinit();
+}
+
+test "command lifecycle JSON escapes fields and validates embedded upstream JSON" {
+    var gs: GatewayState = undefined;
+    gs.allocator = std.testing.allocator;
+    gs.command_mutex = .{};
+    gs.command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(gs.allocator);
+    defer deinitCommandLifecycleTestMap(&gs);
+
+    const command_id = "cmd-\"quoted\n";
+    try gs.commandLifecycleCreate(command_id, "run\"}],\"forged\":true", "corr\r\nquoted", "identity\\\"");
+    try std.testing.expectError(
+        error.CommandAlreadyExists,
+        gs.commandLifecycleCreate(command_id, "duplicate", "duplicate", "duplicate"),
+    );
+    gs.commandLifecycleSetCompleted(command_id, 200, "{\"nested\":[1,true]}", "application/json\r\nx-forged: yes");
+
+    const json = gs.commandLifecycleSnapshotJson(std.testing.allocator, command_id) orelse return error.TestExpectedJson;
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings(command_id, object.get("command_id").?.string);
+    try std.testing.expectEqualStrings("run\"}],\"forged\":true", object.get("command").?.string);
+    try std.testing.expectEqualStrings("corr\r\nquoted", object.get("correlation_id").?.string);
+    try std.testing.expectEqualStrings("identity\\\"", object.get("identity").?.string);
+    try std.testing.expectEqualStrings("application/json\r\nx-forged: yes", object.get("response_content_type").?.string);
+    try std.testing.expectEqual(@as(i64, 1), object.get("response_body").?.object.get("nested").?.array.items[0].integer);
+
+    // A body which merely starts like JSON is data, not permission to splice
+    // arbitrary bytes into the lifecycle response.
+    gs.commandLifecycleSetCompleted(command_id, 502, "{\"closed\":true} trailing", "application/json");
+    const invalid_json_body = gs.commandLifecycleSnapshotJson(std.testing.allocator, command_id) orelse return error.TestExpectedJson;
+    defer std.testing.allocator.free(invalid_json_body);
+    var invalid_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, invalid_json_body, .{});
+    defer invalid_parsed.deinit();
+    try std.testing.expectEqualStrings("", invalid_parsed.value.object.get("response_body").?.string);
+    try std.testing.expect(invalid_parsed.value.object.get("forged") == null);
+}
+
+test "approval JSON and escalation webhook escape untrusted fields" {
+    var gs: GatewayState = undefined;
+    gs.allocator = std.testing.allocator;
+    gs.approval_mutex = .{};
+    gs.approval_persist_mutex = .{};
+    gs.approvals = std.StringHashMap(ApprovalEntry).init(gs.allocator);
+    gs.approval_store_path = "";
+    gs.approval_escalation_webhook = "";
+    gs.approval_ttl_ms = 60_000;
+    gs.approval_max_pending_per_identity = 0;
+    defer deinitApprovalTestMap(&gs);
+
+    const identity = "alice\"},\"approved\":true,\n\"tail\":\"";
+    const command_id = "cmd-\"quoted";
+    const created = try gs.approvalCreate(std.testing.allocator, "POST", "/deploy?x=\"quoted\"", identity, command_id);
+    defer std.testing.allocator.free(created.token);
+    try std.testing.expect(gs.approvalRespond(created.token, .approve, "reviewer\r\n\"quoted\""));
+
+    const snapshot = gs.approvalSnapshotJson(std.testing.allocator, created.token) orelse return error.TestExpectedJson;
+    defer std.testing.allocator.free(snapshot);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, snapshot, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings(identity, object.get("identity").?.string);
+    try std.testing.expectEqualStrings(command_id, object.get("command_id").?.string);
+    try std.testing.expectEqualStrings("reviewer\r\n\"quoted\"", object.get("decided_by").?.string);
+    try std.testing.expect(object.get("approved") == null);
+
+    const entry = gs.approvals.getPtr(created.token).?;
+    const webhook = gs.buildApprovalWebhookPayloadLocked(created.token, entry) orelse return error.TestExpectedJson;
+    defer std.testing.allocator.free(webhook);
+    var webhook_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, webhook, .{});
+    defer webhook_parsed.deinit();
+    try std.testing.expectEqualStrings(identity, webhook_parsed.value.object.get("identity").?.string);
+    try std.testing.expect(webhook_parsed.value.object.get("approved") == null);
+}
+
+test "approved tokens remain exact-scoped, identity-bound, and time-bounded" {
+    var gs: GatewayState = undefined;
+    gs.allocator = std.testing.allocator;
+    gs.approval_mutex = .{};
+    gs.approval_persist_mutex = .{};
+    gs.approvals = std.StringHashMap(ApprovalEntry).init(gs.allocator);
+    gs.approval_store_path = "";
+    gs.approval_escalation_webhook = "";
+    gs.approval_ttl_ms = 60_000;
+    gs.approval_max_pending_per_identity = 0;
+    defer deinitApprovalTestMap(&gs);
+
+    const created = try gs.approvalCreate(std.testing.allocator, "POST", "/deploy/.*", "alice", null);
+    defer std.testing.allocator.free(created.token);
+    try std.testing.expect(gs.approvalRespond(created.token, .approve, "reviewer"));
+    try std.testing.expectEqual(ApprovalValidation.approved, gs.approvalValidate(created.token, "POST", "/deploy/.*", "alice"));
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(created.token, "POST", "/deploy/admin", "alice"));
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(created.token, "GET", "/deploy/.*", "alice"));
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(created.token, "POST", "/deploy/.*", null));
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(created.token, "POST", "/deploy/.*", "mallory"));
+
+    gs.approvals.getPtr(created.token).?.expires_ms = compat.milliTimestamp() - 1;
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(created.token, "POST", "/deploy/.*", "alice"));
+
+    const wildcard = try gs.approvalCreate(std.testing.allocator, "*", "/deploy", "", null);
+    defer std.testing.allocator.free(wildcard.token);
+    try std.testing.expect(gs.approvalRespond(wildcard.token, .approve, "reviewer"));
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(wildcard.token, "POST", "/deploy", null));
+}
+
+test "command and approval mutations remain atomic on allocation failure" {
+    var gs: GatewayState = undefined;
+    gs.allocator = std.testing.allocator;
+    gs.command_mutex = .{};
+    gs.command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(gs.allocator);
+    defer deinitCommandLifecycleTestMap(&gs);
+    try gs.commandLifecycleCreate("cmd", "run", "corr", "identity");
+
+    var command_fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    gs.allocator = command_fail.allocator();
+    gs.commandLifecycleSetCompleted("cmd", 200, "{\"ok\":true}", "application/json");
+    gs.allocator = std.testing.allocator;
+    const command = gs.command_lifecycle.get("cmd").?;
+    try std.testing.expectEqual(CommandLifecycleStatus.pending, command.status);
+    try std.testing.expectEqual(@as(u16, 0), command.response_status);
+    try std.testing.expectEqualStrings("", command.response_body);
+
+    gs.approval_mutex = .{};
+    gs.approval_persist_mutex = .{};
+    gs.approvals = std.StringHashMap(ApprovalEntry).init(gs.allocator);
+    gs.approval_store_path = "";
+    gs.approval_escalation_webhook = "";
+    gs.approval_ttl_ms = 60_000;
+    gs.approval_max_pending_per_identity = 0;
+    defer deinitApprovalTestMap(&gs);
+    const created = try gs.approvalCreate(std.testing.allocator, "POST", "/deploy", "identity", null);
+    defer std.testing.allocator.free(created.token);
+
+    var approval_fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    gs.allocator = approval_fail.allocator();
+    try std.testing.expect(!gs.approvalRespond(created.token, .approve, "reviewer"));
+    gs.allocator = std.testing.allocator;
+    const approval = gs.approvals.get(created.token).?;
+    try std.testing.expectEqual(ApprovalStatus.pending, approval.status);
+    try std.testing.expectEqualStrings("", approval.decided_by);
+}
+
+test "command lifecycle creation releases every partial allocation on OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var gs: GatewayState = undefined;
+            gs.allocator = allocator;
+            gs.command_mutex = .{};
+            gs.command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(allocator);
+            defer deinitCommandLifecycleTestMap(&gs);
+            try gs.commandLifecycleCreate("cmd", "run", "corr", "identity");
+        }
+    }.run, .{});
+}
+
+test "approval creation releases every partial allocation on OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var gs: GatewayState = undefined;
+            gs.allocator = allocator;
+            gs.approval_mutex = .{};
+            gs.approval_persist_mutex = .{};
+            gs.approvals = std.StringHashMap(ApprovalEntry).init(allocator);
+            gs.approval_store_path = "";
+            gs.approval_escalation_webhook = "";
+            gs.approval_ttl_ms = 60_000;
+            gs.approval_max_pending_per_identity = 0;
+            defer deinitApprovalTestMap(&gs);
+            const created = try gs.approvalCreate(allocator, "POST", "/deploy", "identity", "cmd");
+            defer allocator.free(created.token);
+        }
+    }.run, .{});
 }
 
 test "#256-G: served Prometheus metrics overlay the attached H3 runtime's transport snapshot" {

@@ -1043,12 +1043,14 @@ fn handleReloadStatusRoute(
     const err_slice = state.last_reload_error[0..state.last_reload_error_len];
     state.reload_mutex.unlock();
 
-    const payload = if (at_ms == 0)
-        try std.fmt.allocPrint(allocator, "{{\"ok\":null,\"at_ms\":null,\"error\":null}}", .{})
-    else if (ok)
-        try std.fmt.allocPrint(allocator, "{{\"ok\":true,\"at_ms\":{d},\"error\":null}}", .{at_ms})
-    else
-        try std.fmt.allocPrint(allocator, "{{\"ok\":false,\"at_ms\":{d},\"error\":\"{s}\"}}", .{ at_ms, err_slice });
+    const ok_value: ?bool = if (at_ms == 0) null else ok;
+    const at_ms_value: ?i64 = if (at_ms == 0) null else at_ms;
+    const error_value: ?[]const u8 = if (at_ms == 0 or ok) null else err_slice;
+    const payload = try compat.stringifyAlloc(allocator, .{
+        .ok = ok_value,
+        .at_ms = at_ms_value,
+        .@"error" = error_value,
+    }, .{});
     defer allocator.free(payload);
 
     var response = http.Response.init(allocator);

@@ -799,10 +799,24 @@ pub fn responseBodyAllowed(method: []const u8, status_code: u16) bool {
 }
 
 pub fn buildApiErrorJson(allocator: std.mem.Allocator, code: []const u8, message: []const u8, request_id: ?[]const u8) ![]u8 {
-    if (request_id) |rid| {
-        return std.fmt.allocPrint(allocator, "{{\"code\":\"{s}\",\"message\":\"{s}\",\"request_id\":\"{s}\"}}", .{ code, message, rid });
-    }
-    return std.fmt.allocPrint(allocator, "{{\"code\":\"{s}\",\"message\":\"{s}\",\"request_id\":null}}", .{ code, message });
+    return compat.stringifyAlloc(allocator, .{
+        .code = code,
+        .message = message,
+        .request_id = request_id,
+    }, .{});
+}
+
+test "API error JSON escapes untrusted request metadata" {
+    const request_id = "req\"},\"forged\":true,\n\"tail\":\"";
+    const payload = try buildApiErrorJson(std.testing.allocator, "bad\"code", "line 1\r\nline 2", request_id);
+    defer std.testing.allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("bad\"code", parsed.value.object.get("code").?.string);
+    try std.testing.expectEqualStrings("line 1\r\nline 2", parsed.value.object.get("message").?.string);
+    try std.testing.expectEqualStrings(request_id, parsed.value.object.get("request_id").?.string);
+    try std.testing.expect(parsed.value.object.get("forged") == null);
 }
 
 pub fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Status, code: []const u8, message: []const u8, request_id: ?[]const u8, keep_alive: bool, state: *GatewayState) !void {

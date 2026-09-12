@@ -6,8 +6,12 @@
 const std = @import("std");
 const compat = @import("zig_compat");
 const secrets = @import("crypto").secrets;
+const upstream_tls = @import("upstream_tls.zig");
 
 const owner_only_permissions: std.Io.File.Permissions = .fromMode(0o600);
+const webhook_timeout_ms: u32 = 5_000;
+const webhook_max_payload_bytes: usize = 64 * 1024;
+const webhook_max_response_head_bytes: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -180,18 +184,153 @@ fn doFireWebhook(
     webhook_url: []const u8,
     body: []const u8,
 ) !void {
+    if (body.len > webhook_max_payload_bytes) return error.WebhookPayloadTooLarge;
     const uri = try std.Uri.parse(webhook_url);
-    var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
-    defer client.deinit();
-    _ = try client.fetch(.{
-        .location = .{ .uri = uri },
-        .method = .POST,
-        .payload = body,
-        .keep_alive = false,
-        .extra_headers = &.{
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
+    const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    if (!is_https and !std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.UnsupportedUriScheme;
+    if (uri.user != null or uri.password != null or uri.fragment != null) return error.UnsupportedWebhookUrl;
+
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host_name = try uri.getHost(&host_buf);
+    const host = unbracketUriHost(host_name.bytes);
+    if (!httpFieldSafe(host)) return error.UnsafeWebhookUrl;
+    const port = uri.port orelse if (is_https) @as(u16, 443) else @as(u16, 80);
+    const fd = try compat.connectBoundedTcp(host, port, webhook_timeout_ms);
+    defer _ = std.c.close(fd);
+    compat.setSocketTimeoutsMs(fd, webhook_timeout_ms, webhook_timeout_ms);
+
+    var request: std.Io.Writer.Allocating = .init(allocator);
+    defer request.deinit();
+    try request.writer.writeAll("POST ");
+    try writeUriComponent(&request.writer, uri.path);
+    if (uri.query) |query| {
+        try request.writer.writeByte('?');
+        try writeUriComponent(&request.writer, query);
+    }
+    try request.writer.writeAll(" HTTP/1.1\r\nHost: ");
+    if (std.mem.findScalar(u8, host, ':') != null) {
+        try request.writer.print("[{s}]", .{host});
+    } else {
+        try request.writer.writeAll(host);
+    }
+    const default_port: u16 = if (is_https) 443 else 80;
+    if (port != default_port) try request.writer.print(":{d}", .{port});
+    try request.writer.print(
+        "\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    if (is_https) {
+        var tls = try upstream_tls.UpstreamTlsConn.connect(fd, host, .{});
+        defer tls.deinit();
+        try tls.writeAll(request.written());
+        try readWebhookResponseHead(&tls, fd, webhook_timeout_ms);
+    } else {
+        const stream = compat.netStreamFromFd(fd);
+        try stream.writeAll(request.written());
+        try readWebhookResponseHead(stream, fd, webhook_timeout_ms);
+    }
+}
+
+fn httpFieldSafe(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| {
+        if (byte == '\r' or byte == '\n' or byte == 0) return false;
+    }
+    return true;
+}
+
+fn unbracketUriHost(host: []const u8) []const u8 {
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') return host[1 .. host.len - 1];
+    return host;
+}
+
+fn writeUriComponent(writer: *std.Io.Writer, component: std.Uri.Component) !void {
+    const bytes = switch (component) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (!httpFieldSafe(if (bytes.len == 0) "/" else bytes)) return error.UnsafeWebhookUrl;
+    if (bytes.len == 0) {
+        try writer.writeByte('/');
+    } else {
+        try writer.writeAll(bytes);
+    }
+}
+
+fn readWebhookResponseHead(transport: anytype, fd: std.posix.fd_t, timeout_ms: u32) !void {
+    const start_ms = compat.milliTimestamp();
+    var response_head: [webhook_max_response_head_bytes]u8 = undefined;
+    var used: usize = 0;
+    while (std.mem.find(u8, response_head[0..used], "\r\n\r\n") == null) {
+        const elapsed: u64 = @intCast(@max(0, compat.milliTimestamp() - start_ms));
+        if (elapsed >= timeout_ms) return error.Timeout;
+        const remaining: u32 = @intCast(timeout_ms - elapsed);
+        if (!transportReadReady(transport) and !try pollReadable(fd, remaining)) return error.Timeout;
+        const n = try transport.read(response_head[used..]);
+        if (n == 0) return error.UpstreamConnectionClosed;
+        used += n;
+        if (used == response_head.len and std.mem.find(u8, response_head[0..used], "\r\n\r\n") == null) {
+            return error.WebhookResponseHeadTooLarge;
+        }
+    }
+}
+
+fn transportReadReady(transport: anytype) bool {
+    const T = @TypeOf(transport);
+    const info = @typeInfo(T);
+    const Target = if (info == .pointer) info.pointer.child else T;
+    if (@hasDecl(Target, "readReady")) return transport.readReady();
+    if (@hasDecl(Target, "pending")) return transport.pending() > 0;
+    return false;
+}
+
+fn pollReadable(fd: std.posix.fd_t, timeout_ms: u32) !bool {
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+        .revents = 0,
+    }};
+    const ready = std.posix.poll(&poll_fds, @intCast(@min(timeout_ms, std.math.maxInt(i32)))) catch return error.Timeout;
+    return ready != 0;
+}
+
+test "approval webhook response head read has an absolute timeout" {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    const start_ms = compat.milliTimestamp();
+    try std.testing.expectError(
+        error.Timeout,
+        readWebhookResponseHead(compat.netStreamFromFd(fds[0]), fds[0], 25),
+    );
+    const elapsed_ms = compat.milliTimestamp() - start_ms;
+    try std.testing.expect(elapsed_ms >= 15);
+    try std.testing.expect(elapsed_ms < 2_000);
+}
+
+test "approval webhook response head accepts a complete bounded response" {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const response = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+    try compat.netStreamFromFd(fds[1]).writeAll(response);
+    try readWebhookResponseHead(compat.netStreamFromFd(fds[0]), fds[0], 250);
+}
+
+test "approval webhook rejects header delimiters in URL-derived fields" {
+    try std.testing.expect(httpFieldSafe("example.test"));
+    try std.testing.expect(!httpFieldSafe(""));
+    try std.testing.expect(!httpFieldSafe("example.test\r\nHost: attacker"));
+    try std.testing.expect(!httpFieldSafe("example\x00test"));
+    try std.testing.expectEqualStrings("::1", unbracketUriHost("[::1]"));
+    try std.testing.expectEqualStrings("example.test", unbracketUriHost("example.test"));
 }
 
 test "approval persistence creates owner-only credential storage" {

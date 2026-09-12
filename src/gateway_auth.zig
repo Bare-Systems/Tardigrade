@@ -4,6 +4,7 @@ const std = @import("std");
 const secrets = @import("crypto").secrets;
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
+const gp = @import("gateway_proxy.zig");
 const gs = @import("gateway_state.zig");
 const GatewayState = gs.GatewayState;
 const ApprovalDecision = gs.ApprovalDecision;
@@ -359,7 +360,9 @@ fn parseDeviceRegistration(allocator: std.mem.Allocator, body: []const u8) !Devi
     if (did_val != .string or key_val != .string) return error.InvalidDeviceRegistration;
     const device_id = std.mem.trim(u8, did_val.string, " \t\r\n");
     const hmac_key = std.mem.trim(u8, key_val.string, " \t\r\n");
-    if (device_id.len == 0 or hmac_key.len == 0) return error.InvalidDeviceRegistration;
+    if (!deviceRegistryFieldSafe(device_id, 256) or !deviceRegistryFieldSafe(hmac_key, 4096)) {
+        return error.InvalidDeviceRegistration;
+    }
     return .{
         .device_id = try allocator.dupe(u8, device_id),
         .hmac_key = try allocator.dupe(u8, hmac_key),
@@ -374,6 +377,12 @@ fn parseDeviceRegistration(allocator: std.mem.Allocator, body: []const u8) !Devi
 /// registry that is group/world accessible is refused rather than appended to,
 /// because writing a new secret into a readable file is the same exposure.
 fn registerDeviceIdentity(path: []const u8, device_id: []const u8, hmac_key: []const u8) !void {
+    // The on-disk representation is `device_id|key\n`. Validate again at the
+    // persistence boundary so a future non-JSON caller cannot inject another
+    // credential record or change which key a lookup returns.
+    if (!deviceRegistryFieldSafe(device_id, 256) or !deviceRegistryFieldSafe(hmac_key, 4096)) {
+        return error.InvalidDeviceRegistration;
+    }
     var file = try compat.cwd().createFile(path, .{
         .read = true,
         .truncate = false,
@@ -388,14 +397,21 @@ fn registerDeviceIdentity(path: []const u8, device_id: []const u8, hmac_key: []c
     try file.writeAll(line);
 }
 
+fn deviceRegistryFieldSafe(value: []const u8, max_len: usize) bool {
+    if (value.len == 0 or value.len > max_len) return false;
+    for (value) |byte| {
+        if (byte == '|' or byte == '\r' or byte == '\n' or byte == 0) return false;
+    }
+    return true;
+}
+
 /// Reject a device registry that any account other than the owner can read or
 /// write. Returns `error.InsecureDeviceRegistryPermissions` so the caller fails
 /// closed instead of appending a secret to a readable file.
 fn requireOwnerOnlyRegistry(file: compat.FileCompat) !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(file.file.handle, &st) != 0) return error.FileOpenFailed;
-    if (st.mode & 0o077 != 0) return error.InsecureDeviceRegistryPermissions;
+    const stat = file.file.stat(compat.io()) catch return error.FileOpenFailed;
+    if (stat.permissions.toMode() & 0o077 != 0) return error.InsecureDeviceRegistryPermissions;
 }
 
 /// Look up one device's HMAC key.
@@ -620,10 +636,15 @@ pub fn authorizeViaSubrequest(
 ) bool {
     if (cfg.auth_request_url.len == 0) return true;
     const uri = std.Uri.parse(cfg.auth_request_url) catch return false;
-    var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
-    defer client.deinit();
+    const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    if (!is_https and !std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
+    if (!authSubrequestUriSafe(uri)) return false;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const decoded_host = (uri.getHost(&host_buf) catch return false).bytes;
+    if (!authSubrequestBytesSafe(decoded_host, false)) return false;
+    const host = unbracketUriHost(decoded_host);
+    const port = uri.port orelse if (is_https) @as(u16, 443) else @as(u16, 80);
 
-    var header_buf: [4 * 1024]u8 = undefined;
     var headers_buf: [8]std.http.Header = undefined;
     var header_count: usize = 0;
     headers_buf[header_count] = .{ .name = "X-Original-Method", .value = request.method.toString() };
@@ -645,14 +666,91 @@ pub fn authorizeViaSubrequest(
         header_count += 1;
     }
 
-    var req = client.request(.GET, uri, .{
-        .extra_headers = headers_buf[0..header_count],
-    }) catch return false;
-    defer req.deinit();
-    req.sendBodiless() catch return false;
-    const resp = req.receiveHead(&header_buf) catch return false;
-    const status = @intFromEnum(resp.head.status);
+    const tls_options: ?http.upstream_tls.UpstreamTlsOptions = if (is_https) authSubrequestTlsOptions(cfg) else null;
+    const connect_timeout_ms = if (cfg.upstream_connect_timeout_ms > 0)
+        cfg.upstream_connect_timeout_ms
+    else if (cfg.upstream_timeout_ms > 0)
+        cfg.upstream_timeout_ms
+    else
+        5_000;
+    const response_timeout_ms = if (cfg.upstream_response_timeout_ms > 0)
+        cfg.upstream_response_timeout_ms
+    else if (cfg.upstream_timeout_ms > 0)
+        cfg.upstream_timeout_ms
+    else
+        5_000;
+    var response = gp.executeBoundedBufferedTcpHttpRequest(
+        allocator,
+        host,
+        port,
+        tls_options,
+        uri,
+        "GET",
+        headers_buf[0..header_count],
+        "",
+        null,
+        64 * 1024,
+        connect_timeout_ms,
+        response_timeout_ms,
+        null,
+        null,
+        false,
+    ) catch return false;
+    defer response.deinit(allocator);
+    const status = response.status_code;
     return status >= 200 and status < 300;
+}
+
+fn authSubrequestTlsOptions(cfg: *const edge_config.EdgeConfig) http.upstream_tls.UpstreamTlsOptions {
+    return .{
+        // The authorization service is a separate trust boundary from the
+        // normal reverse-proxy origin. An operator may deliberately disable
+        // verification or override SNI for that origin; inheriting either
+        // setting here would silently weaken (or redirect) the decision that
+        // gates every protected request. Keep verification and URL-host
+        // identity mandatory while still allowing private roots and mTLS.
+        .skip_verify = false,
+        .ca_bundle_path = cfg.upstream_tls_ca_bundle,
+        .sni_override = "",
+        .client_cert_path = cfg.upstream_tls_client_cert,
+        .client_key_path = cfg.upstream_tls_client_key,
+        .alpn_policy = .require_http1,
+    };
+}
+
+fn authSubrequestUriSafe(uri: std.Uri) bool {
+    // Userinfo is not forwarded by the bounded transport, so reject it rather
+    // than accidentally changing the authentication contract. Fragments are
+    // never part of an HTTP request target and are likewise configuration
+    // errors here.
+    if (uri.user != null or uri.password != null or uri.fragment != null) return false;
+    const host = uri.host orelse return false;
+    if (!authSubrequestUriComponentSafe(host, false)) return false;
+    if (!authSubrequestUriComponentSafe(uri.path, true)) return false;
+    if (uri.query) |query| {
+        if (!authSubrequestUriComponentSafe(query, true)) return false;
+    }
+    return true;
+}
+
+fn authSubrequestUriComponentSafe(component: std.Uri.Component, allow_empty: bool) bool {
+    return authSubrequestBytesSafe(gp.uriComponentBytes(component), allow_empty);
+}
+
+fn authSubrequestBytesSafe(value: []const u8, allow_empty: bool) bool {
+    if (value.len == 0) return allow_empty;
+    for (value) |byte| {
+        // Parsed Uri components are marked percent-encoded even when the
+        // configuration contains raw bytes. The native request builder writes
+        // them verbatim, so reject request-line/header delimiters explicitly.
+        if (byte <= 0x20 or byte == 0x7f) return false;
+    }
+    return true;
+}
+
+fn unbracketUriHost(host: []const u8) []const u8 {
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') return host[1 .. host.len - 1];
+    return host;
 }
 
 fn parseDeviceId(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
@@ -709,6 +807,32 @@ test "asserted JWT claims reject upstream header delimiters" {
     try std.testing.expect(!authClaimsHeaderSafe("user-1\r\nX-Injected: yes", null, null));
     try std.testing.expect(!authClaimsHeaderSafe("user-1", "read\nX-Injected: yes", null));
     try std.testing.expect(!authClaimsHeaderSafe("user-1", null, "device\x00suffix"));
+}
+
+test "auth subrequest URL rejects request injection and unsupported authority fields" {
+    try std.testing.expect(authSubrequestUriSafe(try std.Uri.parse("https://auth.example.test/check?mode=strict")));
+    try std.testing.expect(!authSubrequestUriSafe(try std.Uri.parse("https://auth.example.test/check\r\nX-Injected:%20yes")));
+    try std.testing.expect(!authSubrequestUriSafe(try std.Uri.parse("https://user:secret@auth.example.test/check")));
+    try std.testing.expect(!authSubrequestUriSafe(try std.Uri.parse("https://auth.example.test/check#fragment")));
+    try std.testing.expectEqualStrings("::1", unbracketUriHost("[::1]"));
+    try std.testing.expectEqualStrings("auth.example.test", unbracketUriHost("auth.example.test"));
+    try std.testing.expect(!authSubrequestBytesSafe("auth.example.test\r\nX-Injected: yes", false));
+}
+
+test "auth subrequest TLS cannot inherit an insecure origin policy" {
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.upstream_tls_verify = false;
+    cfg.upstream_tls_server_name = "unrelated-origin.example.test";
+    cfg.upstream_tls_ca_bundle = "/private/ca.pem";
+    cfg.upstream_tls_client_cert = "/private/client.pem";
+    cfg.upstream_tls_client_key = "/private/client.key";
+
+    const options = authSubrequestTlsOptions(&cfg);
+    try std.testing.expect(!options.skip_verify);
+    try std.testing.expectEqualStrings("", options.sni_override);
+    try std.testing.expectEqualStrings(cfg.upstream_tls_ca_bundle, options.ca_bundle_path);
+    try std.testing.expectEqualStrings(cfg.upstream_tls_client_cert, options.client_cert_path);
+    try std.testing.expectEqualStrings(cfg.upstream_tls_client_key, options.client_key_path);
 }
 
 test "routeRequiresApprovalRule detects approval requirement" {
@@ -863,5 +987,17 @@ test "device registration accepts the hmac_key name and the legacy spelling" {
     try std.testing.expectError(
         error.InvalidDeviceRegistration,
         parseDeviceRegistration(allocator, "{\"device_id\":\"d1\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDeviceRegistration,
+        parseDeviceRegistration(allocator, "{\"device_id\":\"victim|forged\",\"hmac_key\":\"key\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDeviceRegistration,
+        parseDeviceRegistration(allocator, "{\"device_id\":\"victim\\nforged\",\"hmac_key\":\"key\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDeviceRegistration,
+        parseDeviceRegistration(allocator, "{\"device_id\":\"victim\",\"hmac_key\":\"key|forged\"}"),
     );
 }

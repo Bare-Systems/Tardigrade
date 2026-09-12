@@ -57,12 +57,25 @@ All notable user-facing changes to Tardigrade are documented here.
   works at all (it previously failed on every non-empty store). Approval,
   session, and device-HMAC credential copies are wiped through the canonical
   `secureZero` path, and the device registry is created owner-only and refuses
-  to append to a group/world-accessible file. Location `auth required` denials
-  no longer mirror the denied request body. HTTP/2 gates inbound HEADERS and
+  to append to a group/world-accessible file or serialize delimiter-bearing
+  credential fields. Approved tokens now expire at their configured TTL and
+  bind exactly to their issued method, path, and identity rather than treating
+  request paths or `*` methods as patterns. Location `auth required` denials no
+  longer mirror the denied request body. HTTP/2 gates inbound HEADERS and
   DATA on the stream state machine rather than request-assembly bookkeeping, so
   a peer cannot open a second request on a stream whose response is still
   outstanding, and CONNECT is refused at stream scope instead of failing inside
-  the shared HTTP/1 adapter.
+  the shared HTTP/1 adapter. Approval and command state mutations now remain
+  atomic on allocation failure instead of retaining dangling pointers, and all
+  related JSON — including command envelopes sent upstream — uses structural
+  encoding rather than interpolating identities, paths, actors, errors, IDs,
+  params, or upstream bodies. Structured/application logs,
+  health/status responses, and Prometheus device labels likewise escape
+  request-controlled data, preventing forged audit records and metrics.
+  Authentication subrequests and approval webhooks now use bounded native
+  transports; webhook payloads and response heads are capped, and both trust
+  boundaries require certificate/URL-host verification. Auth subrequests cannot
+  inherit a normal origin's verification bypass or SNI override.
 
 - **Secret zeroization is now materially faster on x86_64, and the
   guarantee is now Tardigrade-owned (#675)** — `crypto.secrets.secureZero`

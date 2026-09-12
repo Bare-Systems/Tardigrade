@@ -1,12 +1,18 @@
+const builtin = @import("builtin");
 const compat = @import("zig_compat");
 const std = @import("std");
+const secrets = @import("crypto").secrets;
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
+const gp = @import("gateway_proxy.zig");
 const gs = @import("gateway_state.zig");
 const GatewayState = gs.GatewayState;
 const ApprovalDecision = gs.ApprovalDecision;
 
 const JSON_CONTENT_TYPE = "application/json";
+
+/// Device registry entries are HMAC shared secrets, so the file is owner-only.
+const owner_only_permissions: std.Io.File.Permissions = .fromMode(0o600);
 
 pub const AuthResult = struct {
     ok: bool,
@@ -47,7 +53,11 @@ pub fn authorizeRequest(allocator: std.mem.Allocator, cfg: *const edge_config.Ed
             if (cfg.auth_token_hashes.len > 0) {
                 const token_hash = hashBearerToken(token);
                 for (cfg.auth_token_hashes) |allowed| {
-                    if (std.mem.eql(u8, allowed, token_hash[0..])) {
+                    // The configured digest and the request-derived digest
+                    // are secret-derived authentication material. Keep the
+                    // public length check ordinary, then compare all digest
+                    // bytes in constant time like Basic/JWT verification.
+                    if (allowed.len == token_hash.len and compat.timingSafeEql([64]u8, allowed[0..64].*, token_hash)) {
                         return .{
                             .ok = true,
                             .identity = try allocator.dupe(u8, token_hash[0..]),
@@ -69,6 +79,13 @@ pub fn authorizeRequest(allocator: std.mem.Allocator, cfg: *const edge_config.Ed
                     };
                 };
                 if (claims.subject == null) {
+                    claims.deinit(allocator);
+                    return .{
+                        .ok = false,
+                        .failure_reason = .invalid,
+                    };
+                }
+                if (!authClaimsHeaderSafe(claims.subject.?, claims.scope, claims.device_id)) {
                     claims.deinit(allocator);
                     return .{
                         .ok = false,
@@ -108,6 +125,12 @@ pub fn hashBearerToken(token: []const u8) [64]u8 {
     var digest_hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&digest_hex, "{f}", .{compat.fmtSliceHexLower(&digest)}) catch unreachable;
     return digest_hex;
+}
+
+fn authClaimsHeaderSafe(subject: []const u8, scope: ?[]const u8, device_id: ?[]const u8) bool {
+    return http.headers.isValidHeaderValue(subject) and
+        (scope == null or http.headers.isValidHeaderValue(scope.?)) and
+        (device_id == null or http.headers.isValidHeaderValue(device_id.?));
 }
 
 fn isJsonContentType(content_type: ?[]const u8) bool {
@@ -261,9 +284,19 @@ const ApprovalResponsePayload = struct {
     }
 };
 
+/// A device registration. `hmac_key` is a SHARED SECRET, not public material:
+/// device request authentication is HMAC-SHA256 over the request, so whoever
+/// holds this value can sign as the device. The legacy `public_key` JSON field
+/// name is accepted for compatibility but is a misnomer.
 const DeviceRegistration = struct {
     device_id: []const u8,
-    public_key: []const u8,
+    hmac_key: []const u8,
+
+    fn deinit(self: *DeviceRegistration, allocator: std.mem.Allocator) void {
+        allocator.free(self.device_id);
+        secrets.secureZeroAndFree(allocator, @constCast(self.hmac_key));
+        self.* = undefined;
+    }
 };
 
 pub fn parseApprovalRequestBody(allocator: std.mem.Allocator, body: []const u8) !ApprovalRequestBody {
@@ -321,32 +354,75 @@ fn parseDeviceRegistration(allocator: std.mem.Allocator, body: []const u8) !Devi
     if (root != .object) return error.InvalidDeviceRegistration;
     const obj = root.object;
     const did_val = obj.get("device_id") orelse return error.InvalidDeviceRegistration;
-    const pk_val = obj.get("public_key") orelse return error.InvalidDeviceRegistration;
-    if (did_val != .string or pk_val != .string) return error.InvalidDeviceRegistration;
+    // `hmac_key` is the accurate name; `public_key` is accepted because it is
+    // the field this payload shipped with before the protocol moved to HMAC.
+    const key_val = obj.get("hmac_key") orelse obj.get("public_key") orelse return error.InvalidDeviceRegistration;
+    if (did_val != .string or key_val != .string) return error.InvalidDeviceRegistration;
     const device_id = std.mem.trim(u8, did_val.string, " \t\r\n");
-    const public_key = std.mem.trim(u8, pk_val.string, " \t\r\n");
-    if (device_id.len == 0 or public_key.len == 0) return error.InvalidDeviceRegistration;
+    const hmac_key = std.mem.trim(u8, key_val.string, " \t\r\n");
+    if (!deviceRegistryFieldSafe(device_id, 256) or !deviceRegistryFieldSafe(hmac_key, 4096)) {
+        return error.InvalidDeviceRegistration;
+    }
     return .{
         .device_id = try allocator.dupe(u8, device_id),
-        .public_key = try allocator.dupe(u8, public_key),
+        .hmac_key = try allocator.dupe(u8, hmac_key),
     };
 }
 
-fn registerDeviceIdentity(path: []const u8, device_id: []const u8, public_key: []const u8) !void {
-    const path_z = try std.heap.page_allocator.dupeZ(u8, path);
-    defer std.heap.page_allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, std.c.O.WRONLY | std.c.O.CREAT | std.c.O.APPEND, 0o644);
-    if (fd < 0) return error.FileOpenFailed;
-    defer _ = std.c.close(fd);
-    const line = try std.fmt.allocPrint(std.heap.page_allocator, "{s}|{s}\n", .{ device_id, public_key });
-    defer std.heap.page_allocator.free(line);
-    const stream = compat.netStreamFromFd(fd);
-    try stream.writeAll(line);
+/// Append a device's HMAC key to the registry.
+///
+/// The registry holds shared secrets for every registered device, so it is
+/// created owner-only (0600) in the `open` syscall itself — a later `chmod`
+/// would leave a window where another local user could read it. An existing
+/// registry that is group/world accessible is refused rather than appended to,
+/// because writing a new secret into a readable file is the same exposure.
+fn registerDeviceIdentity(path: []const u8, device_id: []const u8, hmac_key: []const u8) !void {
+    // The on-disk representation is `device_id|key\n`. Validate again at the
+    // persistence boundary so a future non-JSON caller cannot inject another
+    // credential record or change which key a lookup returns.
+    if (!deviceRegistryFieldSafe(device_id, 256) or !deviceRegistryFieldSafe(hmac_key, 4096)) {
+        return error.InvalidDeviceRegistration;
+    }
+    var file = try compat.cwd().createFile(path, .{
+        .read = true,
+        .truncate = false,
+        .permissions = owner_only_permissions,
+    });
+    defer file.close();
+    try requireOwnerOnlyRegistry(file);
+    _ = std.c.lseek(file.file.handle, 0, std.c.SEEK.END);
+
+    const line = try std.fmt.allocPrint(std.heap.page_allocator, "{s}|{s}\n", .{ device_id, hmac_key });
+    defer secrets.secureZeroAndFree(std.heap.page_allocator, line);
+    try file.writeAll(line);
 }
 
+fn deviceRegistryFieldSafe(value: []const u8, max_len: usize) bool {
+    if (value.len == 0 or value.len > max_len) return false;
+    for (value) |byte| {
+        if (byte == '|' or byte == '\r' or byte == '\n' or byte == 0) return false;
+    }
+    return true;
+}
+
+/// Reject a device registry that any account other than the owner can read or
+/// write. Returns `error.InsecureDeviceRegistryPermissions` so the caller fails
+/// closed instead of appending a secret to a readable file.
+fn requireOwnerOnlyRegistry(file: compat.FileCompat) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    const stat = file.file.stat(compat.io()) catch return error.FileOpenFailed;
+    if (stat.permissions.toMode() & 0o077 != 0) return error.InsecureDeviceRegistryPermissions;
+}
+
+/// Look up one device's HMAC key.
+///
+/// The registry file holds every device's shared secret, so the raw buffer is
+/// wiped before release rather than left in freed heap memory. The returned key
+/// is secret material too: callers must release it with
+/// `secrets.secureZeroAndFree`.
 fn loadRegisteredDeviceKey(allocator: std.mem.Allocator, registry_path: []const u8, device_id: []const u8) ?[]const u8 {
     const raw = compat.cwd().readFileAlloc(allocator, registry_path, 2 * 1024 * 1024) catch return null;
-    defer allocator.free(raw);
+    defer secrets.secureZeroAndFree(allocator, raw);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r\n");
@@ -377,14 +453,24 @@ fn validateDeviceRequest(
 
     const allocator = std.heap.page_allocator;
     const key = loadRegisteredDeviceKey(allocator, cfg.device_registry_path, device_id) orelse return false;
-    defer allocator.free(key);
-    const signed = std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n{s}\n{s}", .{ key, method, path, ts_str, body }) catch return false;
-    defer allocator.free(signed);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(signed, &digest, .{});
-    var digest_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&digest_hex, "{f}", .{compat.fmtSliceHexLower(&digest)}) catch return false;
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, provided_sig, " \t\r\n"), digest_hex[0..]);
+    defer secrets.secureZeroAndFree(allocator, @constCast(key));
+    const signing_input = std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n{s}", .{ method, path, ts_str, body }) catch return false;
+    // The signing input embeds the request body, which can carry credentials of
+    // its own, so it is wiped alongside the key.
+    defer secrets.secureZeroAndFree(allocator, signing_input);
+    return verifyDeviceRequestSignature(key, signing_input, provided_sig);
+}
+
+fn verifyDeviceRequestSignature(key: []const u8, signing_input: []const u8, provided_raw: []const u8) bool {
+    const provided = std.mem.trim(u8, provided_raw, " \t\r\n");
+    if (provided.len != 64) return false;
+
+    var provided_mac: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&provided_mac, provided) catch return false;
+
+    var expected_mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected_mac, signing_input, key);
+    return compat.timingSafeEql([32]u8, provided_mac, expected_mac);
 }
 
 fn extractIdentityForPolicy(
@@ -452,10 +538,18 @@ pub fn evaluatePolicy(
         const device_pattern = std.mem.trim(u8, parts.next() orelse "", " \t");
         if (rule_method.len == 0 or rule_pattern.len == 0) continue;
         if (!http.rewrite.methodMatches(rule_method, method)) continue;
-        if (!http.rewrite.regexMatches(rule_pattern, path)) continue;
+        const pattern_matches = http.rewrite.regexMatchesChecked(rule_pattern, path) catch return "Invalid policy rule";
+        if (!pattern_matches) continue;
+
+        const approval_required = if (std.ascii.eqlIgnoreCase(req_approval, "true"))
+            true
+        else if (std.ascii.eqlIgnoreCase(req_approval, "false"))
+            false
+        else
+            return "Invalid policy rule";
 
         if (req_scope.len > 0 and !identityHasScope(cfg.policy_user_scopes_raw, identity, req_scope)) return "Missing required scope";
-        if (std.ascii.eqlIgnoreCase(req_approval, "true")) {
+        if (approval_required) {
             if (approvalPolicyError(state, method, path, identity, headers)) |reason| return reason;
         }
         if (allowed_hours.len > 0 and !timeWindowAllows(allowed_hours)) return "Route not allowed at this time";
@@ -480,8 +574,9 @@ pub fn routeRequiresApprovalRule(method: []const u8, path: []const u8, policy_ru
         const req_approval = std.mem.trim(u8, parts.next() orelse "false", " \t");
         if (rule_method.len == 0 or rule_pattern.len == 0) continue;
         if (!http.rewrite.methodMatches(rule_method, method)) continue;
-        if (!http.rewrite.regexMatches(rule_pattern, path)) continue;
-        if (std.ascii.eqlIgnoreCase(req_approval, "true")) return true;
+        if (!std.ascii.eqlIgnoreCase(req_approval, "true")) continue;
+        const pattern_matches = http.rewrite.regexMatchesChecked(rule_pattern, path) catch return true;
+        if (pattern_matches) return true;
     }
     return false;
 }
@@ -495,7 +590,9 @@ fn routeNeedsApproval(method: []const u8, path: []const u8, raw: []const u8) boo
         const rm = std.mem.trim(u8, parts.next() orelse "", " \t");
         const rp = std.mem.trim(u8, parts.next() orelse "", " \t");
         if (rm.len == 0 or rp.len == 0) continue;
-        if (http.rewrite.methodMatches(rm, method) and http.rewrite.regexMatches(rp, path)) return true;
+        if (!http.rewrite.methodMatches(rm, method)) continue;
+        const pattern_matches = http.rewrite.regexMatchesChecked(rp, path) catch return true;
+        if (pattern_matches) return true;
     }
     return false;
 }
@@ -518,9 +615,12 @@ fn identityHasScope(scopes_raw: []const u8, identity: ?[]const u8, required: []c
 }
 
 fn timeWindowAllows(raw: []const u8) bool {
-    const dash = std.mem.findScalar(u8, raw, '-') orelse return true;
-    const start = std.fmt.parseInt(u8, std.mem.trim(u8, raw[0..dash], " \t"), 10) catch return true;
-    const stop = std.fmt.parseInt(u8, std.mem.trim(u8, raw[dash + 1 ..], " \t"), 10) catch return true;
+    const dash = std.mem.findScalar(u8, raw, '-') orelse return false;
+    const start = std.fmt.parseInt(u8, std.mem.trim(u8, raw[0..dash], " \t"), 10) catch return false;
+    const stop = std.fmt.parseInt(u8, std.mem.trim(u8, raw[dash + 1 ..], " \t"), 10) catch return false;
+    // Start is an actual UTC hour. Stop may be 24 so `0-24` can represent
+    // the full day; zero remains valid for overnight windows such as `22-0`.
+    if (start > 23 or stop > 24) return false;
     const now = compat.unixTimestamp();
     const hour = @as(u8, @intCast(@mod(@divFloor(now, 3600), 24)));
     if (start <= stop) return hour >= start and hour < stop;
@@ -536,10 +636,15 @@ pub fn authorizeViaSubrequest(
 ) bool {
     if (cfg.auth_request_url.len == 0) return true;
     const uri = std.Uri.parse(cfg.auth_request_url) catch return false;
-    var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
-    defer client.deinit();
+    const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    if (!is_https and !std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
+    if (!authSubrequestUriSafe(uri)) return false;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const decoded_host = (uri.getHost(&host_buf) catch return false).bytes;
+    if (!authSubrequestBytesSafe(decoded_host, false)) return false;
+    const host = unbracketUriHost(decoded_host);
+    const port = uri.port orelse if (is_https) @as(u16, 443) else @as(u16, 80);
 
-    var header_buf: [4 * 1024]u8 = undefined;
     var headers_buf: [8]std.http.Header = undefined;
     var header_count: usize = 0;
     headers_buf[header_count] = .{ .name = "X-Original-Method", .value = request.method.toString() };
@@ -561,14 +666,91 @@ pub fn authorizeViaSubrequest(
         header_count += 1;
     }
 
-    var req = client.request(.GET, uri, .{
-        .extra_headers = headers_buf[0..header_count],
-    }) catch return false;
-    defer req.deinit();
-    req.sendBodiless() catch return false;
-    const resp = req.receiveHead(&header_buf) catch return false;
-    const status = @intFromEnum(resp.head.status);
+    const tls_options: ?http.upstream_tls.UpstreamTlsOptions = if (is_https) authSubrequestTlsOptions(cfg) else null;
+    const connect_timeout_ms = if (cfg.upstream_connect_timeout_ms > 0)
+        cfg.upstream_connect_timeout_ms
+    else if (cfg.upstream_timeout_ms > 0)
+        cfg.upstream_timeout_ms
+    else
+        5_000;
+    const response_timeout_ms = if (cfg.upstream_response_timeout_ms > 0)
+        cfg.upstream_response_timeout_ms
+    else if (cfg.upstream_timeout_ms > 0)
+        cfg.upstream_timeout_ms
+    else
+        5_000;
+    var response = gp.executeBoundedBufferedTcpHttpRequest(
+        allocator,
+        host,
+        port,
+        tls_options,
+        uri,
+        "GET",
+        headers_buf[0..header_count],
+        "",
+        null,
+        64 * 1024,
+        connect_timeout_ms,
+        response_timeout_ms,
+        null,
+        null,
+        false,
+    ) catch return false;
+    defer response.deinit(allocator);
+    const status = response.status_code;
     return status >= 200 and status < 300;
+}
+
+fn authSubrequestTlsOptions(cfg: *const edge_config.EdgeConfig) http.upstream_tls.UpstreamTlsOptions {
+    return .{
+        // The authorization service is a separate trust boundary from the
+        // normal reverse-proxy origin. An operator may deliberately disable
+        // verification or override SNI for that origin; inheriting either
+        // setting here would silently weaken (or redirect) the decision that
+        // gates every protected request. Keep verification and URL-host
+        // identity mandatory while still allowing private roots and mTLS.
+        .skip_verify = false,
+        .ca_bundle_path = cfg.upstream_tls_ca_bundle,
+        .sni_override = "",
+        .client_cert_path = cfg.upstream_tls_client_cert,
+        .client_key_path = cfg.upstream_tls_client_key,
+        .alpn_policy = .require_http1,
+    };
+}
+
+fn authSubrequestUriSafe(uri: std.Uri) bool {
+    // Userinfo is not forwarded by the bounded transport, so reject it rather
+    // than accidentally changing the authentication contract. Fragments are
+    // never part of an HTTP request target and are likewise configuration
+    // errors here.
+    if (uri.user != null or uri.password != null or uri.fragment != null) return false;
+    const host = uri.host orelse return false;
+    if (!authSubrequestUriComponentSafe(host, false)) return false;
+    if (!authSubrequestUriComponentSafe(uri.path, true)) return false;
+    if (uri.query) |query| {
+        if (!authSubrequestUriComponentSafe(query, true)) return false;
+    }
+    return true;
+}
+
+fn authSubrequestUriComponentSafe(component: std.Uri.Component, allow_empty: bool) bool {
+    return authSubrequestBytesSafe(gp.uriComponentBytes(component), allow_empty);
+}
+
+fn authSubrequestBytesSafe(value: []const u8, allow_empty: bool) bool {
+    if (value.len == 0) return allow_empty;
+    for (value) |byte| {
+        // Parsed Uri components are marked percent-encoded even when the
+        // configuration contains raw bytes. The native request builder writes
+        // them verbatim, so reject request-line/header delimiters explicitly.
+        if (byte <= 0x20 or byte == 0x7f) return false;
+    }
+    return true;
+}
+
+fn unbracketUriHost(host: []const u8) []const u8 {
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') return host[1 .. host.len - 1];
+    return host;
 }
 
 fn parseDeviceId(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
@@ -620,9 +802,81 @@ test "parseChatMessage validates payload" {
     try std.testing.expectError(error.MessageTooLarge, parseChatMessage(allocator, "{\"message\":\"hello\"}", 2));
 }
 
+test "asserted JWT claims reject upstream header delimiters" {
+    try std.testing.expect(authClaimsHeaderSafe("user-1", "read write", "device-1"));
+    try std.testing.expect(!authClaimsHeaderSafe("user-1\r\nX-Injected: yes", null, null));
+    try std.testing.expect(!authClaimsHeaderSafe("user-1", "read\nX-Injected: yes", null));
+    try std.testing.expect(!authClaimsHeaderSafe("user-1", null, "device\x00suffix"));
+}
+
+test "auth subrequest URL rejects request injection and unsupported authority fields" {
+    try std.testing.expect(authSubrequestUriSafe(try std.Uri.parse("https://auth.example.test/check?mode=strict")));
+    try std.testing.expect(!authSubrequestUriSafe(try std.Uri.parse("https://auth.example.test/check\r\nX-Injected:%20yes")));
+    try std.testing.expect(!authSubrequestUriSafe(try std.Uri.parse("https://user:secret@auth.example.test/check")));
+    try std.testing.expect(!authSubrequestUriSafe(try std.Uri.parse("https://auth.example.test/check#fragment")));
+    try std.testing.expectEqualStrings("::1", unbracketUriHost("[::1]"));
+    try std.testing.expectEqualStrings("auth.example.test", unbracketUriHost("auth.example.test"));
+    try std.testing.expect(!authSubrequestBytesSafe("auth.example.test\r\nX-Injected: yes", false));
+}
+
+test "auth subrequest TLS cannot inherit an insecure origin policy" {
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.upstream_tls_verify = false;
+    cfg.upstream_tls_server_name = "unrelated-origin.example.test";
+    cfg.upstream_tls_ca_bundle = "/private/ca.pem";
+    cfg.upstream_tls_client_cert = "/private/client.pem";
+    cfg.upstream_tls_client_key = "/private/client.key";
+
+    const options = authSubrequestTlsOptions(&cfg);
+    try std.testing.expect(!options.skip_verify);
+    try std.testing.expectEqualStrings("", options.sni_override);
+    try std.testing.expectEqualStrings(cfg.upstream_tls_ca_bundle, options.ca_bundle_path);
+    try std.testing.expectEqualStrings(cfg.upstream_tls_client_cert, options.client_cert_path);
+    try std.testing.expectEqualStrings(cfg.upstream_tls_client_key, options.client_key_path);
+}
+
 test "routeRequiresApprovalRule detects approval requirement" {
     try std.testing.expect(routeRequiresApprovalRule("POST", "/api/tasks", "POST|/api/tasks|ops|true||"));
     try std.testing.expect(!routeRequiresApprovalRule("POST", "/api/messages", "POST|/api/tasks|ops|true||"));
+}
+
+test "time windows fail closed on malformed and out-of-range policy values" {
+    try std.testing.expect(!timeWindowAllows("all-day"));
+    try std.testing.expect(!timeWindowAllows("0-255"));
+    try std.testing.expect(!timeWindowAllows("24-1"));
+    try std.testing.expect(!timeWindowAllows("0-25"));
+    try std.testing.expect(!timeWindowAllows("1-2-3"));
+    try std.testing.expect(timeWindowAllows("0-24"));
+}
+
+test "policy evaluation denies invalid regex and approval boolean" {
+    const allocator = std.testing.allocator;
+    var headers = http.Headers.init(allocator);
+    defer headers.deinit();
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var state: GatewayState = undefined;
+
+    cfg.policy_rules_raw = "POST|[|commands.execute|false||";
+    try std.testing.expectEqualStrings("Invalid policy rule", evaluatePolicy(&state, &cfg, "POST", "/v1/commands", null, null, &headers).?);
+
+    cfg.policy_rules_raw = "POST|^/v1/commands$||tru||";
+    try std.testing.expectEqualStrings("Invalid policy rule", evaluatePolicy(&state, &cfg, "POST", "/v1/commands", null, null, &headers).?);
+}
+
+test "device request signatures use HMAC-SHA256 and exact constant-time MAC comparison" {
+    const key = "device-secret";
+    const signing_input = "POST\n/v1/commands\n1700000000\n{\"command\":\"status\"}";
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, signing_input, key);
+    var encoded: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&encoded, "{f}", .{compat.fmtSliceHexLower(&mac)}) catch unreachable;
+
+    try std.testing.expect(verifyDeviceRequestSignature(key, signing_input, &encoded));
+    encoded[63] = if (encoded[63] == '0') '1' else '0';
+    try std.testing.expect(!verifyDeviceRequestSignature(key, signing_input, &encoded));
+    try std.testing.expect(!verifyDeviceRequestSignature(key, signing_input, encoded[0..63]));
+    try std.testing.expect(!verifyDeviceRequestSignature(key, signing_input, "not-hex-not-a-mac"));
 }
 
 test "evaluatePolicy bypasses approval management endpoints" {
@@ -660,4 +914,90 @@ test "parseApprovalRequestBody parses command scoped request" {
     try std.testing.expectEqualStrings("/api/tasks", req.path);
     try std.testing.expect(req.command_id != null);
     try std.testing.expectEqualStrings("cmd-123", req.command_id.?);
+}
+
+test "device registry is created owner-only and refuses insecure permissions" {
+    // The registry holds HMAC shared secrets for every device, so Tardigrade
+    // must not create it 0644 (the pre-HMAC default) and must not append a new
+    // secret to a registry other local accounts can read.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+
+    const path = try std.fmt.allocPrint(allocator, "{s}/devices.registry", .{tmp_abs});
+    defer allocator.free(path);
+    try registerDeviceIdentity(path, "device-1", "s3cret-hmac-key");
+
+    {
+        const created = try std.Io.Dir.openFileAbsolute(compat.io(), path, .{});
+        defer created.close(compat.io());
+        const stat = try created.stat(compat.io());
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    }
+
+    // A registry loosened out-of-band must fail closed rather than gain
+    // another device secret.
+    {
+        var loosened = try compat.cwd().openFile(path, .{ .mode = .read_write });
+        defer loosened.close();
+        try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(loosened.file.handle, 0o644));
+    }
+    try std.testing.expectError(
+        error.InsecureDeviceRegistryPermissions,
+        registerDeviceIdentity(path, "device-2", "another-secret"),
+    );
+}
+
+test "device HMAC key material is wiped after verification" {
+    // Regression: the registry read buffer holds every device's secret and the
+    // returned key is secret material; both were previously freed unwiped.
+    var detector = secrets.CredentialWipeDetector.init(std.testing.allocator);
+    const allocator = detector.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const path = try std.fmt.allocPrint(allocator, "{s}/devices.registry", .{tmp_abs});
+    defer allocator.free(path);
+    try registerDeviceIdentity(path, "device-1", "s3cret-hmac-key");
+
+    const key = loadRegisteredDeviceKey(allocator, path, "device-1").?;
+    try std.testing.expectEqualStrings("s3cret-hmac-key", key);
+    detector.watch(key);
+    secrets.secureZeroAndFree(allocator, @constCast(key));
+    try std.testing.expect(detector.allWatchedWiped());
+
+    // An unknown device yields no key at all.
+    try std.testing.expect(loadRegisteredDeviceKey(allocator, path, "device-absent") == null);
+}
+
+test "device registration accepts the hmac_key name and the legacy spelling" {
+    const allocator = std.testing.allocator;
+    var current = try parseDeviceRegistration(allocator, "{\"device_id\":\"d1\",\"hmac_key\":\"k1\"}");
+    defer current.deinit(allocator);
+    try std.testing.expectEqualStrings("k1", current.hmac_key);
+
+    var legacy = try parseDeviceRegistration(allocator, "{\"device_id\":\"d1\",\"public_key\":\"k2\"}");
+    defer legacy.deinit(allocator);
+    try std.testing.expectEqualStrings("k2", legacy.hmac_key);
+
+    try std.testing.expectError(
+        error.InvalidDeviceRegistration,
+        parseDeviceRegistration(allocator, "{\"device_id\":\"d1\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDeviceRegistration,
+        parseDeviceRegistration(allocator, "{\"device_id\":\"victim|forged\",\"hmac_key\":\"key\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDeviceRegistration,
+        parseDeviceRegistration(allocator, "{\"device_id\":\"victim\\nforged\",\"hmac_key\":\"key\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDeviceRegistration,
+        parseDeviceRegistration(allocator, "{\"device_id\":\"victim\",\"hmac_key\":\"key|forged\"}"),
+    );
 }

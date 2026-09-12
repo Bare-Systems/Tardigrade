@@ -143,6 +143,7 @@ pub fn reserveNonceLeasesInFile(allocator: std.mem.Allocator, path: []const u8, 
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{d}.tmp", .{ path, std.c.getpid() });
     defer allocator.free(tmp_path);
     compat.cwd().deleteFile(tmp_path) catch {};
+    errdefer compat.cwd().deleteFile(tmp_path) catch {};
     const replacement_permissions = try restrictiveReplacementPermissions(path);
     {
         var file = compat.cwd().createFile(tmp_path, .{

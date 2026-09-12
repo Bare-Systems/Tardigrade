@@ -1,5 +1,6 @@
 const compat = @import("zig_compat");
 const std = @import("std");
+const secrets = @import("crypto").secrets;
 const http = @import("http.zig");
 const tls_core = @import("tls_core");
 const edge_config = @import("edge_config.zig");
@@ -59,6 +60,21 @@ pub const Http2PendingStream = struct {
         self.headers.deinit();
         self.body.deinit();
         self.* = undefined;
+    }
+
+    /// Logical request bytes retained while an HTTP/2 stream is awaiting
+    /// dispatch.  Include headers and pseudo-header routing state as well as
+    /// the body so many header-heavy held streams cannot bypass the
+    /// connection memory ceiling.
+    pub fn retainedBytes(self: *const Http2PendingStream) usize {
+        var total = self.body.items.len;
+        if (self.method) |value| total +|= value.len;
+        if (self.path) |value| total +|= value.len;
+        if (self.authority) |value| total +|= value.len;
+        for (self.headers.iterator()) |header| {
+            total +|= header.name.len +| header.value.len +| 4;
+        }
+        return total;
     }
 };
 
@@ -277,6 +293,15 @@ pub const MuxMetricsSnapshot = struct {
     device_counts: []MuxDeviceCount,
 };
 
+fn appendPrometheusLabelValue(out: *std.array_list.Managed(u8), value: []const u8) !void {
+    for (value) |byte| switch (byte) {
+        '\\' => try out.appendSlice("\\\\"),
+        '"' => try out.appendSlice("\\\""),
+        '\n' => try out.appendSlice("\\n"),
+        else => try out.append(byte),
+    };
+}
+
 fn deinitMuxMetricsSnapshot(allocator: std.mem.Allocator, device_counts: []MuxDeviceCount) void {
     for (device_counts) |entry| allocator.free(entry.device_id);
     allocator.free(device_counts);
@@ -378,6 +403,11 @@ fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeSta
 /// - `command_mutex` → `command_lifecycle`.
 /// - `approval_mutex` → `approvals` (and the per-identity pending count derived
 ///   from it).
+/// - `approval_persist_mutex` → serializes approval snapshot+write pairs to the
+///   `approval_store_path` file. Acquired BEFORE `approval_mutex` and held
+///   across the snapshot and the write, so the durable file cannot be
+///   overwritten by an older snapshot. Never take `approval_mutex` first and
+///   then this one.
 /// - `runtime_mutex` → `mux_resume_state`, and the reload-time rebinding of the
 ///   hot config-derived fields (`add_headers`, `http3_alt_svc`, `hsts_value`,
 ///   `security_headers`, the `max_*` limits, `compression_config`, log level).
@@ -407,7 +437,7 @@ fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeSta
 ///   the duped IP values in `fd_to_ip`; the nested allocations owned by
 ///   `command_lifecycle`, `approvals`, and `mux_resume_state` entries; and the
 ///   self-managed sub-stores (`rate_limiter`, `idempotency_store`,
-///   `proxy_cache_store`, `session_store`, `access_control`, `acme_challenge_store`,
+///   `proxy_cache_store`, `session_store`, `acme_challenge_store`,
 ///   `event_hub`, `request_buffer_pool`, `relay_buffer_pool`, `upstream_client`,
 ///   `dns_discovery`), each of which owns and frees its own internal state.
 ///
@@ -461,6 +491,7 @@ pub const GatewayState = struct {
     transcript_mutex: compat.Mutex = .{}, // transcript file appends
     command_mutex: compat.Mutex = .{}, // command_lifecycle
     approval_mutex: compat.Mutex = .{}, // approvals + pending-per-identity count
+    approval_persist_mutex: compat.Mutex = .{}, // serializes approval snapshot+write ordering
     circuit_mutex: compat.Mutex = .{}, // [HOT] circuit_breaker
     metrics_mutex: compat.Mutex = .{}, // [HOT] metrics — priority candidate for atomic counters
     upstream_mutex: compat.Mutex = .{}, // [HOT] upstream_health/active_requests + LB selection state
@@ -480,7 +511,7 @@ pub const GatewayState = struct {
     http3_runtime: ?*http.http3_runtime.Runtime, // owned pointer; main-event-loop-only
     session_store: ?http.session.SessionStore, // owned [session_mutex]
     session_store_path: []const u8, // borrowed from startup cfg; restart-only (warns on change at reload)
-    access_control: ?http.access_control.AccessControl, // owned; main-loop-only
+
     logger: http.logger.Logger, // owned; min_level updated on reload [runtime_mutex]
     metrics: http.metrics.Metrics, // shared counters [metrics_mutex]
     compression_config: http.compression.CompressionConfig, // cfg snapshot; updated on reload [runtime_mutex]
@@ -566,7 +597,6 @@ pub const GatewayState = struct {
         if (self.idempotency_store) |*is| is.deinit();
         if (self.proxy_cache_store) |*pc| pc.deinit();
         if (self.session_store) |*ss| ss.deinit();
-        if (self.access_control) |*acl| acl.deinit();
         self.upstream_client.deinit();
         if (self.acme_challenge_store) |*store| store.deinit();
         self.event_hub.deinit();
@@ -1047,6 +1077,7 @@ pub const GatewayState = struct {
     pub fn commandLifecycleCreate(self: *GatewayState, command_id: []const u8, command_type: []const u8, correlation_id: []const u8, identity: []const u8) !void {
         self.command_mutex.lock();
         defer self.command_mutex.unlock();
+        if (self.command_lifecycle.contains(command_id)) return error.CommandAlreadyExists;
         const now = compat.milliTimestamp();
         const owned_id = try self.allocator.dupe(u8, command_id);
         errdefer self.allocator.free(owned_id);
@@ -1056,6 +1087,12 @@ pub const GatewayState = struct {
         errdefer self.allocator.free(owned_corr);
         const owned_ident = try self.allocator.dupe(u8, identity);
         errdefer self.allocator.free(owned_ident);
+        const response_body = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(response_body);
+        const response_content_type = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(response_content_type);
+        const error_message = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(error_message);
         const entry = CommandLifecycleEntry{
             .status = .pending,
             .command_type = owned_cmd,
@@ -1064,11 +1101,11 @@ pub const GatewayState = struct {
             .created_ms = now,
             .updated_ms = now,
             .response_status = 0,
-            .response_body = try self.allocator.dupe(u8, ""),
-            .response_content_type = try self.allocator.dupe(u8, ""),
-            .error_message = try self.allocator.dupe(u8, ""),
+            .response_body = response_body,
+            .response_content_type = response_content_type,
+            .error_message = error_message,
         };
-        try self.command_lifecycle.put(owned_id, entry);
+        try self.command_lifecycle.putNoClobber(owned_id, entry);
     }
 
     pub fn commandLifecycleSetRunning(self: *GatewayState, command_id: []const u8) void {
@@ -1084,15 +1121,28 @@ pub const GatewayState = struct {
         self.command_mutex.lock();
         defer self.command_mutex.unlock();
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
+            // Allocate the entire replacement before changing live state. An
+            // allocation failure must leave the old, fully owned snapshot in
+            // place rather than dangling pointers to buffers we already freed.
+            const new_body = self.allocator.dupe(u8, body) catch return;
+            const new_content_type = self.allocator.dupe(u8, content_type) catch {
+                self.allocator.free(new_body);
+                return;
+            };
+            const new_error = self.allocator.dupe(u8, "") catch {
+                self.allocator.free(new_body);
+                self.allocator.free(new_content_type);
+                return;
+            };
             self.allocator.free(entry.response_body);
             self.allocator.free(entry.response_content_type);
             self.allocator.free(entry.error_message);
             entry.status = .completed;
             entry.updated_ms = compat.milliTimestamp();
             entry.response_status = status;
-            entry.response_body = self.allocator.dupe(u8, body) catch self.allocator.dupe(u8, "") catch return;
-            entry.response_content_type = self.allocator.dupe(u8, content_type) catch self.allocator.dupe(u8, "") catch return;
-            entry.error_message = self.allocator.dupe(u8, "") catch self.allocator.dupe(u8, "") catch return;
+            entry.response_body = new_body;
+            entry.response_content_type = new_content_type;
+            entry.error_message = new_error;
         }
     }
 
@@ -1100,10 +1150,11 @@ pub const GatewayState = struct {
         self.command_mutex.lock();
         defer self.command_mutex.unlock();
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
+            const new_error = self.allocator.dupe(u8, message) catch return;
             self.allocator.free(entry.error_message);
             entry.status = .failed;
             entry.updated_ms = compat.milliTimestamp();
-            entry.error_message = self.allocator.dupe(u8, message) catch self.allocator.dupe(u8, "command_failed") catch return;
+            entry.error_message = new_error;
         }
     }
 
@@ -1111,20 +1162,30 @@ pub const GatewayState = struct {
         self.command_mutex.lock();
         defer self.command_mutex.unlock();
         const entry = self.command_lifecycle.get(command_id) orelse return null;
-        const status_name = @tagName(entry.status);
-        return std.fmt.allocPrint(allocator, "{{\"command_id\":\"{s}\",\"status\":\"{s}\",\"command\":\"{s}\",\"correlation_id\":\"{s}\",\"identity\":\"{s}\",\"created_ms\":{d},\"updated_ms\":{d},\"response_status\":{d},\"response_content_type\":\"{s}\",\"response_body\":{s},\"error\":\"{s}\"}}", .{
-            command_id,
-            status_name,
-            entry.command_type,
-            entry.correlation_id,
-            entry.identity,
-            entry.created_ms,
-            entry.updated_ms,
-            entry.response_status,
-            entry.response_content_type,
-            if (entry.response_body.len > 0 and (std.mem.startsWith(u8, entry.response_body, "{") or std.mem.startsWith(u8, entry.response_body, "["))) entry.response_body else "\"\"",
-            entry.error_message,
-        }) catch null;
+        var parsed_body = if (entry.response_body.len > 0 and
+            (std.mem.startsWith(u8, entry.response_body, "{") or std.mem.startsWith(u8, entry.response_body, "[")))
+            std.json.parseFromSlice(std.json.Value, allocator, entry.response_body, .{}) catch null
+        else
+            null;
+        defer if (parsed_body) |*parsed| parsed.deinit();
+
+        const response_body: std.json.Value = if (parsed_body) |parsed| switch (parsed.value) {
+            .object, .array => parsed.value,
+            else => .{ .string = "" },
+        } else .{ .string = "" };
+        return compat.stringifyAlloc(allocator, .{
+            .command_id = command_id,
+            .status = @tagName(entry.status),
+            .command = entry.command_type,
+            .correlation_id = entry.correlation_id,
+            .identity = entry.identity,
+            .created_ms = entry.created_ms,
+            .updated_ms = entry.updated_ms,
+            .response_status = entry.response_status,
+            .response_content_type = entry.response_content_type,
+            .response_body = response_body,
+            .@"error" = entry.error_message,
+        }, .{}) catch null;
     }
 
     pub fn commandLifecycleGet(self: *GatewayState, allocator: std.mem.Allocator, command_id: []const u8) ?CommandLifecycleSnapshot {
@@ -1166,20 +1227,35 @@ pub const GatewayState = struct {
             errdefer self.allocator.free(token);
             const now = compat.milliTimestamp();
             const expires_ms = now + self.approval_ttl_ms;
+            const owned_method = try self.allocator.dupe(u8, method);
+            errdefer self.allocator.free(owned_method);
+            const owned_path = try self.allocator.dupe(u8, path);
+            errdefer self.allocator.free(owned_path);
+            const owned_identity = try self.allocator.dupe(u8, identity);
+            errdefer self.allocator.free(owned_identity);
+            const owned_command_id = try self.allocator.dupe(u8, command_id orelse "");
+            errdefer self.allocator.free(owned_command_id);
+            const owned_decided_by = try self.allocator.dupe(u8, "");
+            errdefer self.allocator.free(owned_decided_by);
+            // Allocate the caller's result before publishing the map entry. If
+            // this allocation failed after insertion, errdefer would otherwise
+            // free the map's newly owned key and leave a dangling credential.
+            const result_token = try allocator.dupe(u8, token);
+            errdefer allocator.free(result_token);
             const entry = ApprovalEntry{
-                .method = try self.allocator.dupe(u8, method),
-                .path = try self.allocator.dupe(u8, path),
-                .identity = try self.allocator.dupe(u8, identity),
-                .command_id = try self.allocator.dupe(u8, command_id orelse ""),
+                .method = owned_method,
+                .path = owned_path,
+                .identity = owned_identity,
+                .command_id = owned_command_id,
                 .status = .pending,
                 .created_ms = now,
                 .expires_ms = expires_ms,
                 .decided_ms = 0,
-                .decided_by = try self.allocator.dupe(u8, ""),
+                .decided_by = owned_decided_by,
             };
-            try self.approvals.put(token, entry);
+            try self.approvals.putNoClobber(token, entry);
             break :blk ApprovalCreateResult{
-                .token = try allocator.dupe(u8, token),
+                .token = result_token,
                 .expires_ms = expires_ms,
             };
         };
@@ -1201,10 +1277,11 @@ pub const GatewayState = struct {
                 webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
             }
             if (entry.status != .pending) break :blk false;
+            const decided_by = self.allocator.dupe(u8, actor) catch break :blk false;
+            self.allocator.free(entry.decided_by);
             entry.status = if (decision == .approve) .approved else .denied;
             entry.decided_ms = compat.milliTimestamp();
-            self.allocator.free(entry.decided_by);
-            entry.decided_by = self.allocator.dupe(u8, actor) catch self.allocator.dupe(u8, "") catch break :blk false;
+            entry.decided_by = decided_by;
             break :blk true;
         };
 
@@ -1227,11 +1304,20 @@ pub const GatewayState = struct {
                 entry.escalation_fired = true;
                 webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
             }
-            if (!http.rewrite.methodMatches(entry.method, method)) break :blk ApprovalValidation.invalid;
-            if (!http.rewrite.regexMatches(entry.path, path)) break :blk ApprovalValidation.invalid;
-            if (identity) |id| {
-                if (entry.identity.len > 0 and !std.mem.eql(u8, entry.identity, id)) break :blk ApprovalValidation.invalid;
+            // The configured policy route is a regex, but an issued approval
+            // is a bearer credential for one concrete request scope. Treating
+            // its stored path as another regex let metacharacters broaden the
+            // approval, and methodMatches made a caller-supplied `*` universal.
+            if (!std.ascii.eqlIgnoreCase(entry.method, method)) break :blk ApprovalValidation.invalid;
+            if (!std.mem.eql(u8, entry.path, path)) break :blk ApprovalValidation.invalid;
+            if (entry.identity.len > 0) {
+                const request_identity = identity orelse break :blk ApprovalValidation.invalid;
+                if (!std.mem.eql(u8, entry.identity, request_identity)) break :blk ApprovalValidation.invalid;
             }
+            // TTL applies to the approval token, not merely to how long a
+            // reviewer has to decide. Previously an approved persisted token
+            // remained reusable forever because only pending entries expired.
+            if (compat.milliTimestamp() >= entry.expires_ms and entry.status != .escalated) break :blk ApprovalValidation.invalid;
             break :blk switch (entry.status) {
                 .pending => ApprovalValidation.pending,
                 .approved => ApprovalValidation.approved,
@@ -1258,28 +1344,20 @@ pub const GatewayState = struct {
                 entry.escalation_fired = true;
                 webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
             }
-            const command_id_json = if (entry.command_id.len > 0)
-                std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.command_id}) catch break :blk @as(?[]const u8, null)
-            else
-                allocator.dupe(u8, "null") catch break :blk @as(?[]const u8, null);
-            defer allocator.free(command_id_json);
-            const decided_by_json = if (entry.decided_by.len > 0)
-                std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.decided_by}) catch break :blk @as(?[]const u8, null)
-            else
-                allocator.dupe(u8, "null") catch break :blk @as(?[]const u8, null);
-            defer allocator.free(decided_by_json);
-            break :blk std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d},\"decided_ms\":{d},\"decided_by\":{s}}}", .{
-                token,
-                @tagName(entry.status),
-                entry.method,
-                entry.path,
-                entry.identity,
-                command_id_json,
-                entry.created_ms,
-                entry.expires_ms,
-                entry.decided_ms,
-                decided_by_json,
-            }) catch null;
+            const command_id: ?[]const u8 = if (entry.command_id.len > 0) entry.command_id else null;
+            const decided_by: ?[]const u8 = if (entry.decided_by.len > 0) entry.decided_by else null;
+            break :blk compat.stringifyAlloc(allocator, .{
+                .approval_token = token,
+                .status = @tagName(entry.status),
+                .method = entry.method,
+                .path = entry.path,
+                .identity = entry.identity,
+                .command_id = command_id,
+                .created_ms = entry.created_ms,
+                .expires_ms = entry.expires_ms,
+                .decided_ms = entry.decided_ms,
+                .decided_by = decided_by,
+            }, .{}) catch null;
         };
 
         if (webhook_payload) |p| {
@@ -1317,16 +1395,17 @@ pub const GatewayState = struct {
     /// Build a JSON payload for the escalation webhook. Must be called with approval_mutex held.
     /// Returns an allocator-owned slice or null on OOM.
     pub fn buildApprovalWebhookPayloadLocked(self: *GatewayState, token: []const u8, entry: *const ApprovalEntry) ?[]u8 {
-        const command_id_part = if (entry.command_id.len > 0)
-            std.fmt.allocPrint(self.allocator, "\"{s}\"", .{entry.command_id}) catch return null
-        else
-            self.allocator.dupe(u8, "null") catch return null;
-        defer self.allocator.free(command_id_part);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"event\":\"escalated\",\"approval_token\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d}}}",
-            .{ token, entry.method, entry.path, entry.identity, command_id_part, entry.created_ms, entry.expires_ms },
-        ) catch null;
+        const command_id: ?[]const u8 = if (entry.command_id.len > 0) entry.command_id else null;
+        return compat.stringifyAlloc(self.allocator, .{
+            .event = "escalated",
+            .approval_token = token,
+            .method = entry.method,
+            .path = entry.path,
+            .identity = entry.identity,
+            .command_id = command_id,
+            .created_ms = entry.created_ms,
+            .expires_ms = entry.expires_ms,
+        }, .{}) catch null;
     }
 
     /// Snapshot all approval entries into a slice suitable for persistence.
@@ -1335,14 +1414,17 @@ pub const GatewayState = struct {
         var out = try allocator.alloc(http.approval_store.StoredApproval, self.approvals.count());
         var i: usize = 0;
         errdefer {
+            // Match `approval_store.freeEntry`'s disposition even on this
+            // allocation-failure path: the partially built snapshot already
+            // holds real approval tokens.
             for (out[0..i]) |e| {
-                allocator.free(e.token);
+                secrets.secureZeroAndFree(allocator, @constCast(e.token));
+                secrets.secureZeroAndFree(allocator, @constCast(e.identity));
+                secrets.secureZeroAndFree(allocator, @constCast(e.decided_by));
                 allocator.free(e.method);
                 allocator.free(e.path);
-                allocator.free(e.identity);
                 allocator.free(e.command_id);
                 allocator.free(e.status);
-                allocator.free(e.decided_by);
             }
             allocator.free(out);
         }
@@ -1368,8 +1450,26 @@ pub const GatewayState = struct {
     }
 
     /// Persist all approvals to disk (no-op when store path is unconfigured).
+    /// Write the approval store to disk.
+    ///
+    /// Two orderings matter here, and a unique temp filename gives neither:
+    ///
+    ///  1. Only one persist may be in flight at a time. Concurrent writers
+    ///     otherwise race on the same temp path, where one can unlink the
+    ///     other's still-open file and fail its rename.
+    ///  2. The durable file must end up holding the NEWEST state. Snapshotting
+    ///     before serializing writes lets a delayed older snapshot land after a
+    ///     newer one and resurrect stale approvals.
+    ///
+    /// `approval_persist_mutex` is therefore acquired FIRST and held across both
+    /// the snapshot and the write, so a caller that waits for it snapshots the
+    /// state as of when it won the lock rather than when it was called.
     pub fn persistApprovals(self: *GatewayState) void {
         if (self.approval_store_path.len == 0) return;
+
+        self.approval_persist_mutex.lock();
+        defer self.approval_persist_mutex.unlock();
+
         const snapshot = blk: {
             self.approval_mutex.lock();
             defer self.approval_mutex.unlock();
@@ -2050,9 +2150,9 @@ pub const GatewayState = struct {
                 \\
             );
             for (mux_snapshot.device_counts) |entry| {
-                const line = try std.fmt.allocPrint(allocator, "tardigrade_mux_device_channels{{device_id=\"{s}\"}} {d}\n", .{ entry.device_id, entry.count });
-                defer allocator.free(line);
-                try combined.appendSlice(line);
+                try combined.appendSlice("tardigrade_mux_device_channels{device_id=\"");
+                try appendPrometheusLabelValue(&combined, entry.device_id);
+                try combined.print("\"}} {d}\n", .{entry.count});
             }
         }
         try self.appendUpstreamPoolPrometheus(&combined);
@@ -2771,10 +2871,12 @@ pub const GatewayState = struct {
             const url = entry.key_ptr.*;
             const h = entry.value_ptr.*;
             const healthy = (h.unhealthy_until_ms == 0 or h.unhealthy_until_ms <= now_ms) and h.probe.isRoutable();
-            try out.writer().print(
-                "{{\"url\":\"{s}\",\"healthy\":{},\"unhealthy_until_ms\":{d},\"active_status\":\"{s}\"}}",
-                .{ url, healthy, h.unhealthy_until_ms, h.probe.status.asString() },
-            );
+            try out.print("{f}", .{std.json.fmt(.{
+                .url = url,
+                .healthy = healthy,
+                .unhealthy_until_ms = h.unhealthy_until_ms,
+                .active_status = h.probe.status.asString(),
+            }, .{})});
         }
         try out.appendSlice("]}");
         return out.toOwnedSlice();
@@ -3048,12 +3150,33 @@ pub const ManagedConfigVersion = struct {
     owned_cfg: ?*edge_config.EdgeConfig,
     ref_count: usize,
     generation: u64,
+    /// Parsed IP access-control policy for THIS configuration generation.
+    ///
+    /// The ACL lives here, not on `GatewayState`, because authorization state
+    /// must share the lifetime and generation of the configuration a request is
+    /// leasing. A single global ACL has two defects that a mutex cannot fix:
+    /// reload frees the rule slice while a worker may be inside `check()`, and a
+    /// request holding an older config lease can observe a newer (or absent)
+    /// ACL and skip a denial its own configuration still requires. Owned by the
+    /// version and destroyed only when the last lease releases it.
+    access_control: ?http.access_control.AccessControl = null,
+
+    /// The ACL to enforce for a request holding this version, if any.
+    pub fn accessControl(self: *ManagedConfigVersion) ?*http.access_control.AccessControl {
+        if (self.access_control) |*acl| return acl;
+        return null;
+    }
 };
 
 pub const ConfigLease = struct {
     store: *ReloadableConfigStore,
     version: *ManagedConfigVersion,
     cfg: *const edge_config.EdgeConfig,
+
+    /// ACL paired with this lease's configuration generation.
+    pub fn accessControl(self: ConfigLease) ?*http.access_control.AccessControl {
+        return self.version.accessControl();
+    }
 
     pub fn retain(self: *ConfigLease) ConfigLease {
         return self.store.retain(self.version);
@@ -3113,6 +3236,34 @@ pub const ReloadableConfigStore = struct {
         };
     }
 
+    /// Attach the startup generation's parsed ACL. Called once, before any
+    /// worker is accepting, so it needs no synchronization.
+    ///
+    /// `cfg_ptr` must be the same configuration this store was initialized with;
+    /// publishing the borrowed pointer is what lets request paths reach the ACL
+    /// paired with their lease.
+    pub fn setInitialAccessControl(
+        self: *ReloadableConfigStore,
+        cfg_ptr: *edge_config.EdgeConfig,
+        acl: ?http.access_control.AccessControl,
+    ) void {
+        std.debug.assert(self.current.cfg == cfg_ptr);
+        self.current.access_control = acl;
+        cfg_ptr.parsed_access_control = self.current.accessControl();
+    }
+
+    /// Attach a reload generation's parsed ACL to a prepared-but-not-installed
+    /// version. The version owns the ACL from here on, so it stays alive for
+    /// every request that later leases this generation and is freed only when
+    /// the last of those leases is released.
+    pub fn setPreparedAccessControl(
+        version: *ManagedConfigVersion,
+        acl: ?http.access_control.AccessControl,
+    ) void {
+        version.access_control = acl;
+        if (version.owned_cfg) |owned| owned.parsed_access_control = version.accessControl();
+    }
+
     pub fn prepareOwned(self: *ReloadableConfigStore, cfg_ptr: *edge_config.EdgeConfig) !*ManagedConfigVersion {
         const version = try createOwnedVersion(self.allocator, cfg_ptr);
         self.mutex.lock();
@@ -3165,6 +3316,9 @@ pub const ReloadableConfigStore = struct {
     }
 
     pub fn destroyVersion(self: *ReloadableConfigStore, version: *ManagedConfigVersion) void {
+        // Safe precisely because this runs only at ref_count == 0: no request
+        // can still be inside `check()` on these rules.
+        if (version.access_control) |*acl| acl.deinit();
         if (version.owned_cfg) |owned_cfg| {
             owned_cfg.deinit(self.allocator);
             self.allocator.destroy(owned_cfg);
@@ -3816,6 +3970,25 @@ test "gateway circuit breaker opens under upstream failure pressure" {
     try std.testing.expectEqualStrings("open", gs.circuitStateName());
 }
 
+test "upstream health JSON escapes configured origin URLs" {
+    var gs: GatewayState = undefined;
+    initUpstreamTestState(&gs, std.testing.allocator);
+    defer deinitUpstreamTestState(&gs);
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.upstream_max_fails = 1;
+    cfg.upstream_fail_timeout_ms = 30_000;
+    const url = "http://origin/\"}],\"forged\":true";
+    gs.recordUpstreamFailure(&cfg, url);
+
+    const payload = try gs.upstreamHealthJson(std.testing.allocator);
+    defer std.testing.allocator.free(payload);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const first = parsed.value.object.get("upstreams").?.array.items[0].object;
+    try std.testing.expectEqualStrings(url, first.get("url").?.string);
+    try std.testing.expect(first.get("forged") == null);
+}
+
 test "gateway circuit breaker recovers through a half-open probe" {
     var gs: GatewayState = undefined;
     initUpstreamTestState(&gs, std.testing.allocator);
@@ -3922,6 +4095,7 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     defer gs.mux_subscriptions_by_device.deinit();
 
     gs.upstream_pool.recordH2StreamingUploadFallback();
+    try gs.mux_subscriptions_by_device.put("device\"}\\metric=\"forged", 3);
 
     const prom = try gs.metricsToPrometheus(std.testing.allocator);
     defer std.testing.allocator.free(prom);
@@ -3932,6 +4106,205 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 786432\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_config_limit_bytes{queue=\"outbound_ciphertext\",limit=\"hard\"}") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_effective_state{state=\"disabled\"} 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_mux_device_channels{device_id=\"device\\\"}\\\\metric=\\\"forged\"} 3\n") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "metric=\"forged\"") == null);
+}
+
+fn deinitCommandLifecycleTestMap(gs: *GatewayState) void {
+    var it = gs.command_lifecycle.iterator();
+    while (it.next()) |entry| {
+        gs.allocator.free(entry.key_ptr.*);
+        gs.allocator.free(entry.value_ptr.command_type);
+        gs.allocator.free(entry.value_ptr.correlation_id);
+        gs.allocator.free(entry.value_ptr.identity);
+        gs.allocator.free(entry.value_ptr.response_body);
+        gs.allocator.free(entry.value_ptr.response_content_type);
+        gs.allocator.free(entry.value_ptr.error_message);
+    }
+    gs.command_lifecycle.deinit();
+}
+
+fn deinitApprovalTestMap(gs: *GatewayState) void {
+    var it = gs.approvals.iterator();
+    while (it.next()) |entry| {
+        gs.allocator.free(entry.key_ptr.*);
+        entry.value_ptr.deinit(gs.allocator);
+    }
+    gs.approvals.deinit();
+}
+
+test "command lifecycle JSON escapes fields and validates embedded upstream JSON" {
+    var gs: GatewayState = undefined;
+    gs.allocator = std.testing.allocator;
+    gs.command_mutex = .{};
+    gs.command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(gs.allocator);
+    defer deinitCommandLifecycleTestMap(&gs);
+
+    const command_id = "cmd-\"quoted\n";
+    try gs.commandLifecycleCreate(command_id, "run\"}],\"forged\":true", "corr\r\nquoted", "identity\\\"");
+    try std.testing.expectError(
+        error.CommandAlreadyExists,
+        gs.commandLifecycleCreate(command_id, "duplicate", "duplicate", "duplicate"),
+    );
+    gs.commandLifecycleSetCompleted(command_id, 200, "{\"nested\":[1,true]}", "application/json\r\nx-forged: yes");
+
+    const json = gs.commandLifecycleSnapshotJson(std.testing.allocator, command_id) orelse return error.TestExpectedJson;
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings(command_id, object.get("command_id").?.string);
+    try std.testing.expectEqualStrings("run\"}],\"forged\":true", object.get("command").?.string);
+    try std.testing.expectEqualStrings("corr\r\nquoted", object.get("correlation_id").?.string);
+    try std.testing.expectEqualStrings("identity\\\"", object.get("identity").?.string);
+    try std.testing.expectEqualStrings("application/json\r\nx-forged: yes", object.get("response_content_type").?.string);
+    try std.testing.expectEqual(@as(i64, 1), object.get("response_body").?.object.get("nested").?.array.items[0].integer);
+
+    // A body which merely starts like JSON is data, not permission to splice
+    // arbitrary bytes into the lifecycle response.
+    gs.commandLifecycleSetCompleted(command_id, 502, "{\"closed\":true} trailing", "application/json");
+    const invalid_json_body = gs.commandLifecycleSnapshotJson(std.testing.allocator, command_id) orelse return error.TestExpectedJson;
+    defer std.testing.allocator.free(invalid_json_body);
+    var invalid_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, invalid_json_body, .{});
+    defer invalid_parsed.deinit();
+    try std.testing.expectEqualStrings("", invalid_parsed.value.object.get("response_body").?.string);
+    try std.testing.expect(invalid_parsed.value.object.get("forged") == null);
+}
+
+test "approval JSON and escalation webhook escape untrusted fields" {
+    var gs: GatewayState = undefined;
+    gs.allocator = std.testing.allocator;
+    gs.approval_mutex = .{};
+    gs.approval_persist_mutex = .{};
+    gs.approvals = std.StringHashMap(ApprovalEntry).init(gs.allocator);
+    gs.approval_store_path = "";
+    gs.approval_escalation_webhook = "";
+    gs.approval_ttl_ms = 60_000;
+    gs.approval_max_pending_per_identity = 0;
+    defer deinitApprovalTestMap(&gs);
+
+    const identity = "alice\"},\"approved\":true,\n\"tail\":\"";
+    const command_id = "cmd-\"quoted";
+    const created = try gs.approvalCreate(std.testing.allocator, "POST", "/deploy?x=\"quoted\"", identity, command_id);
+    defer std.testing.allocator.free(created.token);
+    try std.testing.expect(gs.approvalRespond(created.token, .approve, "reviewer\r\n\"quoted\""));
+
+    const snapshot = gs.approvalSnapshotJson(std.testing.allocator, created.token) orelse return error.TestExpectedJson;
+    defer std.testing.allocator.free(snapshot);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, snapshot, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings(identity, object.get("identity").?.string);
+    try std.testing.expectEqualStrings(command_id, object.get("command_id").?.string);
+    try std.testing.expectEqualStrings("reviewer\r\n\"quoted\"", object.get("decided_by").?.string);
+    try std.testing.expect(object.get("approved") == null);
+
+    const entry = gs.approvals.getPtr(created.token).?;
+    const webhook = gs.buildApprovalWebhookPayloadLocked(created.token, entry) orelse return error.TestExpectedJson;
+    defer std.testing.allocator.free(webhook);
+    var webhook_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, webhook, .{});
+    defer webhook_parsed.deinit();
+    try std.testing.expectEqualStrings(identity, webhook_parsed.value.object.get("identity").?.string);
+    try std.testing.expect(webhook_parsed.value.object.get("approved") == null);
+}
+
+test "approved tokens remain exact-scoped, identity-bound, and time-bounded" {
+    var gs: GatewayState = undefined;
+    gs.allocator = std.testing.allocator;
+    gs.approval_mutex = .{};
+    gs.approval_persist_mutex = .{};
+    gs.approvals = std.StringHashMap(ApprovalEntry).init(gs.allocator);
+    gs.approval_store_path = "";
+    gs.approval_escalation_webhook = "";
+    gs.approval_ttl_ms = 60_000;
+    gs.approval_max_pending_per_identity = 0;
+    defer deinitApprovalTestMap(&gs);
+
+    const created = try gs.approvalCreate(std.testing.allocator, "POST", "/deploy/.*", "alice", null);
+    defer std.testing.allocator.free(created.token);
+    try std.testing.expect(gs.approvalRespond(created.token, .approve, "reviewer"));
+    try std.testing.expectEqual(ApprovalValidation.approved, gs.approvalValidate(created.token, "POST", "/deploy/.*", "alice"));
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(created.token, "POST", "/deploy/admin", "alice"));
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(created.token, "GET", "/deploy/.*", "alice"));
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(created.token, "POST", "/deploy/.*", null));
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(created.token, "POST", "/deploy/.*", "mallory"));
+
+    gs.approvals.getPtr(created.token).?.expires_ms = compat.milliTimestamp() - 1;
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(created.token, "POST", "/deploy/.*", "alice"));
+
+    const wildcard = try gs.approvalCreate(std.testing.allocator, "*", "/deploy", "", null);
+    defer std.testing.allocator.free(wildcard.token);
+    try std.testing.expect(gs.approvalRespond(wildcard.token, .approve, "reviewer"));
+    try std.testing.expectEqual(ApprovalValidation.invalid, gs.approvalValidate(wildcard.token, "POST", "/deploy", null));
+}
+
+test "command and approval mutations remain atomic on allocation failure" {
+    var gs: GatewayState = undefined;
+    gs.allocator = std.testing.allocator;
+    gs.command_mutex = .{};
+    gs.command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(gs.allocator);
+    defer deinitCommandLifecycleTestMap(&gs);
+    try gs.commandLifecycleCreate("cmd", "run", "corr", "identity");
+
+    var command_fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    gs.allocator = command_fail.allocator();
+    gs.commandLifecycleSetCompleted("cmd", 200, "{\"ok\":true}", "application/json");
+    gs.allocator = std.testing.allocator;
+    const command = gs.command_lifecycle.get("cmd").?;
+    try std.testing.expectEqual(CommandLifecycleStatus.pending, command.status);
+    try std.testing.expectEqual(@as(u16, 0), command.response_status);
+    try std.testing.expectEqualStrings("", command.response_body);
+
+    gs.approval_mutex = .{};
+    gs.approval_persist_mutex = .{};
+    gs.approvals = std.StringHashMap(ApprovalEntry).init(gs.allocator);
+    gs.approval_store_path = "";
+    gs.approval_escalation_webhook = "";
+    gs.approval_ttl_ms = 60_000;
+    gs.approval_max_pending_per_identity = 0;
+    defer deinitApprovalTestMap(&gs);
+    const created = try gs.approvalCreate(std.testing.allocator, "POST", "/deploy", "identity", null);
+    defer std.testing.allocator.free(created.token);
+
+    var approval_fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    gs.allocator = approval_fail.allocator();
+    try std.testing.expect(!gs.approvalRespond(created.token, .approve, "reviewer"));
+    gs.allocator = std.testing.allocator;
+    const approval = gs.approvals.get(created.token).?;
+    try std.testing.expectEqual(ApprovalStatus.pending, approval.status);
+    try std.testing.expectEqualStrings("", approval.decided_by);
+}
+
+test "command lifecycle creation releases every partial allocation on OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var gs: GatewayState = undefined;
+            gs.allocator = allocator;
+            gs.command_mutex = .{};
+            gs.command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(allocator);
+            defer deinitCommandLifecycleTestMap(&gs);
+            try gs.commandLifecycleCreate("cmd", "run", "corr", "identity");
+        }
+    }.run, .{});
+}
+
+test "approval creation releases every partial allocation on OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var gs: GatewayState = undefined;
+            gs.allocator = allocator;
+            gs.approval_mutex = .{};
+            gs.approval_persist_mutex = .{};
+            gs.approvals = std.StringHashMap(ApprovalEntry).init(allocator);
+            gs.approval_store_path = "";
+            gs.approval_escalation_webhook = "";
+            gs.approval_ttl_ms = 60_000;
+            gs.approval_max_pending_per_identity = 0;
+            defer deinitApprovalTestMap(&gs);
+            const created = try gs.approvalCreate(allocator, "POST", "/deploy", "identity", "cmd");
+            defer allocator.free(created.token);
+        }
+    }.run, .{});
 }
 
 test "#256-G: served Prometheus metrics overlay the attached H3 runtime's transport snapshot" {
@@ -4033,4 +4406,242 @@ test "served Prometheus metrics reflect updated proxy buffer limit snapshot" {
 
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 393216\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"downstream_to_upstream\",scope=\"global\",limit=\"hard\"} 4194304\n") != null);
+}
+
+fn initApprovalTestState(gs: *GatewayState, allocator: std.mem.Allocator, store_path: []const u8) void {
+    gs.allocator = allocator;
+    gs.approval_mutex = .{};
+    gs.approval_persist_mutex = .{};
+    gs.approvals = std.StringHashMap(ApprovalEntry).init(allocator);
+    gs.approval_store_path = store_path;
+    gs.approval_escalation_webhook = "";
+    gs.approval_ttl_ms = 300_000;
+    gs.approval_max_pending_per_identity = 0;
+    gs.logger = http.logger.Logger.init(.err, "test");
+}
+
+/// Insert a pending approval WITHOUT triggering persistence.
+///
+/// `approvalCreate` persists as part of its contract, which would re-enter
+/// `approval_persist_mutex`; these tests drive persistence explicitly.
+fn insertApprovalForTest(gs: *GatewayState, token: []const u8, path: []const u8, identity: []const u8) !void {
+    gs.approval_mutex.lock();
+    defer gs.approval_mutex.unlock();
+    const now = compat.milliTimestamp();
+    try gs.approvals.put(try gs.allocator.dupe(u8, token), .{
+        .method = try gs.allocator.dupe(u8, "POST"),
+        .path = try gs.allocator.dupe(u8, path),
+        .identity = try gs.allocator.dupe(u8, identity),
+        .command_id = try gs.allocator.dupe(u8, ""),
+        .status = .pending,
+        .created_ms = now,
+        .expires_ms = now + 300_000,
+        .decided_ms = 0,
+        .decided_by = try gs.allocator.dupe(u8, ""),
+    });
+}
+
+fn deinitApprovalTestState(gs: *GatewayState) void {
+    var it = gs.approvals.iterator();
+    while (it.next()) |kv| {
+        gs.allocator.free(kv.key_ptr.*);
+        var entry = kv.value_ptr.*;
+        entry.deinit(gs.allocator);
+    }
+    gs.approvals.deinit();
+}
+
+test "approval persistence snapshots after winning the persist lock, not before" {
+    // Regression for the stale-snapshot ordering bug: a unique temp filename
+    // serializes nothing. A persist that was called early but ran late used to
+    // write the state it observed at call time, overwriting newer approvals.
+    //
+    // The race is made deterministic by holding the persistence lock while a
+    // second mutation lands: the blocked writer must publish the state as of
+    // when it acquires the lock, so the newer approval has to be in the file.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const path = try std.fmt.allocPrint(allocator, "{s}/approvals.json", .{tmp_abs});
+    defer allocator.free(path);
+
+    var gs: GatewayState = undefined;
+    initApprovalTestState(&gs, allocator, path);
+    defer deinitApprovalTestState(&gs);
+
+    try insertApprovalForTest(&gs, "apr-first", "/first", "alice");
+
+    // Block persistence, then start a writer that must wait for the lock.
+    gs.approval_persist_mutex.lock();
+    const Runner = struct {
+        fn run(state: *GatewayState) void {
+            state.persistApprovals();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&gs});
+
+    // While that writer is queued, a newer approval is accepted. A snapshot
+    // taken at call time would not contain it.
+    try insertApprovalForTest(&gs, "apr-second", "/second", "bob");
+
+    gs.approval_persist_mutex.unlock();
+    thread.join();
+
+    const loaded = try http.approval_store.load(allocator, path);
+    defer http.approval_store.freeLoaded(allocator, loaded);
+
+    var saw_first = false;
+    var saw_second = false;
+    for (loaded) |entry| {
+        if (std.mem.eql(u8, entry.path, "/first")) saw_first = true;
+        if (std.mem.eql(u8, entry.path, "/second")) saw_second = true;
+    }
+    try std.testing.expect(saw_first);
+    // The durable file holds the newest complete state, not a stale snapshot.
+    try std.testing.expect(saw_second);
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+}
+
+test "concurrent approval persists do not lose the final state" {
+    // Companion to the ordering test: many interleaved persists must leave a
+    // complete, parseable file rather than one writer's temp file unlinked by
+    // another's, or a torn/partial store.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const path = try std.fmt.allocPrint(allocator, "{s}/approvals.json", .{tmp_abs});
+    defer allocator.free(path);
+
+    var gs: GatewayState = undefined;
+    initApprovalTestState(&gs, allocator, path);
+    defer deinitApprovalTestState(&gs);
+
+    const Worker = struct {
+        fn run(state: *GatewayState, prefix: []const u8, label: []const u8) void {
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                var token_buf: [32]u8 = undefined;
+                const token = std.fmt.bufPrint(&token_buf, "{s}-{d}", .{ prefix, i }) catch return;
+                insertApprovalForTest(state, token, label, "alice") catch return;
+                // Every mutation persists, exactly as the request paths do, so
+                // the writers genuinely contend on the same store file.
+                state.persistApprovals();
+            }
+        }
+    };
+    const a = try std.Thread.spawn(.{}, Worker.run, .{ &gs, "apr-a", "/a" });
+    const b = try std.Thread.spawn(.{}, Worker.run, .{ &gs, "apr-b", "/b" });
+    a.join();
+    b.join();
+
+    // A final persist publishes the terminal state; it must match memory
+    // exactly, proving no earlier writer clobbered it with a stale snapshot.
+    gs.persistApprovals();
+    const loaded = try http.approval_store.load(allocator, path);
+    defer http.approval_store.freeLoaded(allocator, loaded);
+    try std.testing.expectEqual(@as(usize, 16), loaded.len);
+}
+
+test "an in-flight config lease keeps enforcing its own ACL across a reload" {
+    // Regression for the ACL hot-reload finding. Two defects are covered:
+    //
+    //  1. Use-after-free: reload used to `deinit()` the live ACL while a worker
+    //     could be inside `check()` on its rule slice.
+    //  2. Mixed generations: a request holding an older config lease could
+    //     observe the NEWER (or absent) ACL and skip a denial that its own
+    //     leased configuration still required.
+    //
+    // A mutex alone fixes only the first. Pairing ACL lifetime with the config
+    // generation fixes both, which is what this asserts.
+    const allocator = std.testing.allocator;
+
+    var old_cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    old_cfg.access_control_rules = "deny 203.0.113.0/24, allow 0.0.0.0/0";
+
+    var store = try ReloadableConfigStore.initBorrowed(allocator, &old_cfg);
+    defer store.deinit();
+    store.setInitialAccessControl(&old_cfg, try http.access_control.AccessControl.fromConfig(
+        allocator,
+        old_cfg.access_control_rules,
+        .allow,
+    ));
+
+    // A request begins under the old generation and holds its lease.
+    var in_flight = store.acquire();
+    try std.testing.expect(in_flight.cfg.parsed_access_control != null);
+    try std.testing.expectEqual(
+        http.access_control.AccessResult.denied,
+        in_flight.cfg.parsed_access_control.?.check("203.0.113.7"),
+    );
+
+    // Meanwhile a reload installs a generation with NO access control at all.
+    const new_cfg = try allocator.create(edge_config.EdgeConfig);
+    new_cfg.* = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    new_cfg.access_control_rules = "";
+    const prepared = try store.prepareOwned(new_cfg);
+    ReloadableConfigStore.setPreparedAccessControl(prepared, null);
+    store.installPrepared(prepared);
+
+    // The in-flight request still enforces the ACL it leased. Previously this
+    // request would have seen `state.access_control == null` and allowed the
+    // very address its own configuration denies.
+    try std.testing.expect(in_flight.cfg.parsed_access_control != null);
+    try std.testing.expectEqual(
+        http.access_control.AccessResult.denied,
+        in_flight.cfg.parsed_access_control.?.check("203.0.113.7"),
+    );
+
+    // A request that starts after the reload sees the new policy.
+    var fresh = store.acquire();
+    try std.testing.expect(fresh.cfg.parsed_access_control == null);
+    fresh.release();
+
+    // Releasing the last old lease is what retires the old generation and frees
+    // its ACL — never while a request could still be inside `check()`.
+    in_flight.release();
+}
+
+test "a reloaded ACL is published atomically with its own generation" {
+    // The inverse direction: a reload that ADDS an ACL must not leave a window
+    // where the new configuration is live but its ACL is not, and old leases
+    // must not start enforcing rules their generation never had.
+    const allocator = std.testing.allocator;
+
+    var old_cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    old_cfg.access_control_rules = "";
+    var store = try ReloadableConfigStore.initBorrowed(allocator, &old_cfg);
+    defer store.deinit();
+    store.setInitialAccessControl(&old_cfg, null);
+
+    var permissive_lease = store.acquire();
+    try std.testing.expect(permissive_lease.cfg.parsed_access_control == null);
+
+    const new_cfg = try allocator.create(edge_config.EdgeConfig);
+    new_cfg.* = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    // The version owns this config, so `destroyVersion` frees its fields: the
+    // rules must be a real allocation, not a literal.
+    new_cfg.access_control_rules = try allocator.dupe(u8, "deny 198.51.100.0/24, allow 0.0.0.0/0");
+    const prepared = try store.prepareOwned(new_cfg);
+    ReloadableConfigStore.setPreparedAccessControl(prepared, try http.access_control.AccessControl.fromConfig(
+        allocator,
+        new_cfg.access_control_rules,
+        .allow,
+    ));
+    store.installPrepared(prepared);
+
+    // New generation: ACL is already attached the moment it becomes current.
+    var strict_lease = store.acquire();
+    try std.testing.expectEqual(
+        http.access_control.AccessResult.denied,
+        strict_lease.cfg.parsed_access_control.?.check("198.51.100.5"),
+    );
+    // Old generation: unchanged, still permissive.
+    try std.testing.expect(permissive_lease.cfg.parsed_access_control == null);
+
+    strict_lease.release();
+    permissive_lease.release();
 }

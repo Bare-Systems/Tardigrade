@@ -9,12 +9,15 @@ const edge_config = @import("edge_config.zig");
 const ga = @import("gateway_auth.zig");
 const gcp = @import("gateway_control_plane_proxy.zig");
 const gp = @import("gateway_proxy.zig");
+const gph = @import("gateway_proxy_headers.zig");
 const gpr = @import("gateway_protocols.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
 const gs = @import("gateway_state.zig");
 const gstatic = @import("gateway_static_runtime.zig");
 
 const JSON_CONTENT_TYPE = "application/json";
+const MIRROR_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+const MIRROR_TIMEOUT_FALLBACK_MS: u32 = 5_000;
 const GatewayState = gs.GatewayState;
 const ReloadableConfigStore = gs.ReloadableConfigStore;
 const MAX_REQUEST_SIZE = gs.MAX_REQUEST_SIZE;
@@ -511,6 +514,8 @@ fn initHandlerTestState(state: *GatewayState, allocator: std.mem.Allocator, add_
 
 fn minimalAuthConfig(blocks: []http.location_router.LocationBlock, token_hashes: [][]const u8) edge_config.EdgeConfig {
     var cfg: edge_config.EdgeConfig = undefined;
+    cfg.access_control_rules = "";
+    cfg.parsed_access_control = null;
     cfg.basic_auth_hashes = &.{};
     cfg.auth_token_hashes = token_hashes;
     cfg.jwt_secret = "";
@@ -520,6 +525,11 @@ fn minimalAuthConfig(blocks: []http.location_router.LocationBlock, token_hashes:
     cfg.location_blocks = blocks;
     cfg.metrics_path = "/status/metrics";
     cfg.mirror_rules = &.{};
+    cfg.geo_blocked_countries = &.{};
+    cfg.geo_country_header = "x-country-code";
+    cfg.policy_rules_raw = "";
+    cfg.policy_user_scopes_raw = "";
+    cfg.policy_approval_routes_raw = "";
     return cfg;
 }
 
@@ -565,6 +575,8 @@ fn minimalHttp3ProxyConfig(blocks: []http.location_router.LocationBlock) edge_co
 
 fn initHttp3ProxyTestState(state: *GatewayState, allocator: std.mem.Allocator, add_headers: []const edge_config.EdgeConfig.HeaderPair) void {
     initHandlerTestState(state, allocator, add_headers);
+    state.rate_limiter_mutex = .{};
+    state.rate_limiter = null;
     state.circuit_mutex = .{};
     state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{});
     state.upstream_mutex = .{};
@@ -665,6 +677,20 @@ test "writeReturnResponsePlan reports 405 metrics ownership to caller" {
     try std.testing.expectEqual(@as(u64, 1), state.metrics.err_invalid_request);
 }
 
+/// The result of routing a request.
+///
+/// `status` alone cannot tell a caller whether authorization succeeded: a fully
+/// authorized route may legitimately return 401/403 from its own handler or
+/// upstream. `mirror_allowed` therefore carries the authorization decision
+/// explicitly, so side effects that must not observe a denied request body
+/// (mirroring) key off the decision rather than guessing from a number.
+pub const RouteOutcome = struct {
+    status: u16,
+    /// False when Tardigrade itself denied the request before handing it to a
+    /// route action — currently location `auth required` rejections.
+    mirror_allowed: bool = true,
+};
+
 pub fn routeRequest(
     conn: anytype,
     allocator: std.mem.Allocator,
@@ -676,28 +702,31 @@ pub fn routeRequest(
     keep_alive: *bool,
     client_ip: []const u8,
     streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
-) !u16 {
+) !RouteOutcome {
     const writer = conn.writer();
     if (try handleTranscriptRoute(allocator, writer, state, request, correlation_id, keep_alive.*)) |status| {
         state.metricsRecord(status);
-        return status;
+        return .{ .status = status };
     }
 
     switch (resolveRoute(allocator, cfg, request)) {
         .reload_status => {
             const status = try handleReloadStatusRoute(allocator, writer, state, correlation_id, keep_alive.*);
             state.metricsRecord(status);
-            return status;
+            return .{ .status = status };
         },
         .metrics => {
             const status = try handleMetricsRoute(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*);
             state.metricsRecord(status);
-            return status;
+            return .{ .status = status };
         },
         .unmatched => {},
         .location => |matched| {
             if (try enforceLocationAuth(allocator, writer, cfg, state, ctx, request, matched, correlation_id, keep_alive.*, client_ip)) |status| {
-                return status;
+                // Tardigrade denied this request itself. The body must not
+                // reach a mirror target, so say so explicitly instead of
+                // leaving the caller to infer it from `status`.
+                return .{ .status = status, .mirror_allowed = false };
             }
             if (try executeLocationAction(
                 conn,
@@ -712,19 +741,19 @@ pub fn routeRequest(
                 client_ip,
                 streaming_request_body,
             )) |status| {
-                return status;
+                return .{ .status = status };
             }
         },
     }
 
-    if (serveTryFilesFallback(allocator, conn, cfg, request, correlation_id, keep_alive.*, state)) |status| {
+    if (serveTryFilesFallback(allocator, conn, cfg, request, correlation_id, keep_alive.*, state, ctx)) |status| {
         state.metricsRecord(status);
-        return status;
+        return .{ .status = status };
     } else |_| {}
 
     try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive.*, state);
     state.metricsRecord(404);
-    return 404;
+    return .{ .status = 404 };
 }
 
 fn enforceLocationAuth(
@@ -909,7 +938,7 @@ fn executeLocationAction(
             return null;
         },
         .static_root => |root_cfg| {
-            if (try handleStaticLocation(allocator, conn, request, matched, root_cfg, correlation_id, keep_alive.*, state)) |status| {
+            if (try handleStaticLocation(allocator, conn, request, matched, root_cfg, correlation_id, keep_alive.*, state, ctx)) |status| {
                 return status;
             }
             return null;
@@ -1014,12 +1043,14 @@ fn handleReloadStatusRoute(
     const err_slice = state.last_reload_error[0..state.last_reload_error_len];
     state.reload_mutex.unlock();
 
-    const payload = if (at_ms == 0)
-        try std.fmt.allocPrint(allocator, "{{\"ok\":null,\"at_ms\":null,\"error\":null}}", .{})
-    else if (ok)
-        try std.fmt.allocPrint(allocator, "{{\"ok\":true,\"at_ms\":{d},\"error\":null}}", .{at_ms})
-    else
-        try std.fmt.allocPrint(allocator, "{{\"ok\":false,\"at_ms\":{d},\"error\":\"{s}\"}}", .{ at_ms, err_slice });
+    const ok_value: ?bool = if (at_ms == 0) null else ok;
+    const at_ms_value: ?i64 = if (at_ms == 0) null else at_ms;
+    const error_value: ?[]const u8 = if (at_ms == 0 or ok) null else err_slice;
+    const payload = try compat.stringifyAlloc(allocator, .{
+        .ok = ok_value,
+        .at_ms = at_ms_value,
+        .@"error" = error_value,
+    }, .{});
     defer allocator.free(payload);
 
     var response = http.Response.init(allocator);
@@ -1212,7 +1243,9 @@ pub fn runMiddlewarePipeline(
         }
     }
 
-    if (state.access_control) |*acl| {
+    // Paired with the leased configuration generation, not a global: see
+    // `ManagedConfigVersion.access_control`.
+    if (cfg.parsed_access_control) |acl| {
         if (acl.check(client_ip) == .denied) {
             try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, keep_alive, state);
             logAccessForRequest(state, ctx, request, 403);
@@ -1376,7 +1409,10 @@ fn spawnAsyncCommandExecution(
         api_version,
         incoming_host,
         incoming_x_forwarded_for,
-    ) catch return;
+    ) catch {
+        state.commandLifecycleSetFailed(command_id, "async_job_allocation_failed");
+        return;
+    };
     const t = std.Thread.spawn(.{}, runAsyncCommandJob, .{job}) catch {
         destroyAsyncCommandJob(job);
         state.commandLifecycleSetFailed(command_id, "async_spawn_failed");
@@ -1402,26 +1438,40 @@ fn createAsyncCommandJob(
 ) !*AsyncCommandJob {
     const job = try allocator.create(AsyncCommandJob);
     errdefer allocator.destroy(job);
+    const owned_command_id = try allocator.dupe(u8, command_id);
+    errdefer allocator.free(owned_command_id);
+    const owned_command_name = try allocator.dupe(u8, command_name);
+    errdefer allocator.free(owned_command_name);
+    const owned_upstream_path = try allocator.dupe(u8, upstream_path);
+    errdefer allocator.free(owned_upstream_path);
+    const owned_envelope = try allocator.dupe(u8, envelope);
+    errdefer allocator.free(owned_envelope);
+    const owned_correlation_id = try allocator.dupe(u8, correlation_id);
+    errdefer allocator.free(owned_correlation_id);
+    const owned_client_ip = try allocator.dupe(u8, client_ip);
+    errdefer allocator.free(owned_client_ip);
+    const owned_identity = if (identity) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_identity) |value| allocator.free(value);
+    const owned_incoming_host = if (incoming_host) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_incoming_host) |value| allocator.free(value);
+    const owned_incoming_xff = if (incoming_x_forwarded_for) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_incoming_xff) |value| allocator.free(value);
     job.* = .{
         .allocator = allocator,
         .cfg = cfg,
         .state = state,
-        .command_id = dupeOrEmpty(allocator, command_id),
-        .command_name = dupeOrEmpty(allocator, command_name),
-        .upstream_path = dupeOrEmpty(allocator, upstream_path),
-        .envelope = dupeOrEmpty(allocator, envelope),
-        .correlation_id = dupeOrEmpty(allocator, correlation_id),
-        .client_ip = dupeOrEmpty(allocator, client_ip),
-        .identity = if (identity) |id| allocator.dupe(u8, id) catch null else null,
-        .incoming_host = if (incoming_host) |h| allocator.dupe(u8, h) catch null else null,
-        .incoming_x_forwarded_for = if (incoming_x_forwarded_for) |xff| allocator.dupe(u8, xff) catch null else null,
+        .command_id = owned_command_id,
+        .command_name = owned_command_name,
+        .upstream_path = owned_upstream_path,
+        .envelope = owned_envelope,
+        .correlation_id = owned_correlation_id,
+        .client_ip = owned_client_ip,
+        .identity = owned_identity,
+        .incoming_host = owned_incoming_host,
+        .incoming_x_forwarded_for = owned_incoming_xff,
         .api_version = api_version,
     };
     return job;
-}
-
-fn dupeOrEmpty(allocator: std.mem.Allocator, src: []const u8) []u8 {
-    return allocator.dupe(u8, src) catch allocator.alloc(u8, 0) catch unreachable;
 }
 
 fn destroyAsyncCommandJob(job: *AsyncCommandJob) void {
@@ -1621,7 +1671,7 @@ fn resolveNamedLocation(name: []const u8, named_locations: []const edge_config.E
 
 pub fn spawnMirrorRequests(
     allocator: std.mem.Allocator,
-    rules: []const edge_config.EdgeConfig.MirrorRule,
+    cfg: *const edge_config.EdgeConfig,
     method: []const u8,
     path: []const u8,
     body: []const u8,
@@ -1629,27 +1679,80 @@ pub fn spawnMirrorRequests(
     client_ip: []const u8,
     content_type: ?[]const u8,
 ) void {
-    for (rules) |rule| {
+    for (cfg.mirror_rules) |rule| {
         if (!http.rewrite.methodMatches(rule.method, method)) continue;
         if (!http.rewrite.regexMatches(rule.pattern, path)) continue;
-        var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
-        defer client.deinit();
-        const uri = std.Uri.parse(rule.target_url) catch continue;
-        var header_buf: [1024]u8 = undefined;
-        var headers = [_]std.http.Header{
-            .{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id },
-            .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
-            .{ .name = "X-Mirror-Client-IP", .value = client_ip },
-            .{ .name = "Content-Type", .value = content_type orelse "application/octet-stream" },
-        };
-        var req = client.request(.POST, uri, .{
-            .extra_headers = headers[0..],
-            .headers = .{ .content_type = .{ .override = content_type orelse "application/octet-stream" } },
-        }) catch continue;
-        defer req.deinit();
-        req.sendBodyComplete(@constCast(body)) catch continue;
-        _ = req.receiveHead(&header_buf) catch {}; // subrequest response is intentionally ignored; fire-and-forget
+        executeMirrorRequest(allocator, cfg, rule.target_url, body, correlation_id, client_ip, content_type) catch continue;
     }
+}
+
+fn executeMirrorRequest(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    target_url: []const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    content_type: ?[]const u8,
+) !void {
+    const uri = try std.Uri.parse(target_url);
+    // Mirror requests copy the original request body, so an unsupported scheme
+    // must fail closed rather than fall through to the cleartext-HTTP default.
+    // `edge_config.validateMirrorTargetUrl` rejects these at startup/reload;
+    // this is the defense-in-depth layer for any future path that reaches here
+    // without that gate.
+    const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+    if (!is_http and !is_https) return error.UnsupportedMirrorScheme;
+    const host = if (uri.host) |value| gp.uriComponentBytes(value) else return error.UpstreamProtocolError;
+    const port: u16 = uri.port orelse (if (is_https) 443 else 80);
+    const tls_options: ?http.upstream_tls.UpstreamTlsOptions = if (is_https) .{
+        .skip_verify = !cfg.upstream_tls_verify,
+        .ca_bundle_path = cfg.upstream_tls_ca_bundle,
+        .sni_override = cfg.upstream_tls_server_name,
+        .client_cert_path = cfg.upstream_tls_client_cert,
+        .client_key_path = cfg.upstream_tls_client_key,
+        .alpn_policy = .require_http1,
+    } else null;
+    const connect_timeout_ms = mirrorPhaseTimeoutMs(cfg.upstream_connect_timeout_ms, cfg.upstream_timeout_ms);
+    const response_timeout_ms = mirrorPhaseTimeoutMs(cfg.upstream_response_timeout_ms, cfg.upstream_timeout_ms);
+
+    const headers = [_]std.http.Header{
+        .{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id },
+        .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
+        .{ .name = "X-Mirror-Client-IP", .value = client_ip },
+        .{ .name = "Content-Type", .value = content_type orelse "application/octet-stream" },
+    };
+    var response = try gp.executeBoundedBufferedTcpHttpRequest(
+        allocator,
+        host,
+        port,
+        tls_options,
+        uri,
+        "POST",
+        &headers,
+        body,
+        null,
+        MIRROR_MAX_RESPONSE_BYTES,
+        connect_timeout_ms,
+        response_timeout_ms,
+        null,
+        null,
+        false,
+    );
+    response.deinit(allocator);
+}
+
+fn mirrorPhaseTimeoutMs(phase_timeout_ms: u32, overall_timeout_ms: u32) u32 {
+    if (phase_timeout_ms > 0) return phase_timeout_ms;
+    if (overall_timeout_ms > 0) return overall_timeout_ms;
+    return MIRROR_TIMEOUT_FALLBACK_MS;
+}
+
+test "mirror delivery stays bounded when general upstream timeouts are disabled" {
+    try std.testing.expectEqual(@as(u32, 250), mirrorPhaseTimeoutMs(250, 500));
+    try std.testing.expectEqual(@as(u32, 500), mirrorPhaseTimeoutMs(0, 500));
+    try std.testing.expectEqual(MIRROR_TIMEOUT_FALLBACK_MS, mirrorPhaseTimeoutMs(0, 0));
 }
 
 const SubrequestPayload = struct {
@@ -1714,6 +1817,8 @@ pub const Http3DispatchContext = struct {
     cfg: *const edge_config.EdgeConfig,
     cfg_lease: ?*gs.ConfigLease = null,
     state: *GatewayState,
+    client_ip: []const u8 = "unknown",
+    authenticated: bool = false,
 };
 
 const Http3LocationOutcome = union(enum) {
@@ -2373,7 +2478,7 @@ fn handleHttp3LocationProxyPass(
         .headers = &request.headers,
         .body = request.body,
         .correlation_id = correlation_id,
-        .client_ip = request.headers.get("x-real-ip") orelse "unknown",
+        .client_ip = ctx.client_ip,
         .forwarded_proto = if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
         .incoming_host = request.headers.get(":authority") orelse request.headers.get("host"),
         .selection_base_url = ctx.cfg.upstream_base_url,
@@ -3081,7 +3186,7 @@ fn routeHttp3Location(
 
     const split = splitHttp3PathAndQuery(request.path);
     const request_query = split[1];
-    if (matched.block.auth == .required) {
+    if (matched.block.auth == .required and !ctx.authenticated) {
         try rejectHttp3AuthRequiredLocation(allocator, response, ctx, correlation_id);
         return .handled;
     }
@@ -3732,6 +3837,181 @@ test "h3 proxy early 425 parks and resumes exact ordinary continuation" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"success\"} 1") != null);
 }
 
+test "H3 ACL uses the transport peer address instead of spoofable X-Real-IP" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/private",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "must-not-run" } },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    // The ACL is owned by the configuration generation, so the test attaches
+    // it the same way production does.
+    var acl = try http.access_control.AccessControl.fromConfig(
+        allocator,
+        "deny 127.0.0.1/32, allow 0.0.0.0/0",
+        .allow,
+    );
+    defer acl.deinit();
+    cfg.access_control_rules = "deny 127.0.0.1/32, allow 0.0.0.0/0";
+    cfg.parsed_access_control = &acl;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/private"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+    };
+    defer request.deinit();
+    try request.headers.append("x-real-ip", "203.0.113.9");
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.find(u8, response.body orelse "", "Access denied") != null);
+}
+
+test "H3 geo policy rejects a forged country header from an untrusted peer" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/geo",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "must-not-run" } },
+    }};
+    var blocked = [_][]const u8{"RU"};
+    var trusted = [_][]const u8{"192.0.2.10"};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.geo_blocked_countries = blocked[0..];
+    cfg.geo_country_header = "cf-ipcountry";
+    cfg.trust_require_upstream_identity = true;
+    cfg.trusted_upstream_identities = trusted[0..];
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/geo"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "198.51.100.20"),
+    };
+    defer request.deinit();
+    try request.headers.append("cf-ipcountry", "US");
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.find(u8, response.body orelse "", "Geo identity source is not trusted") != null);
+}
+
+test "H3 production dispatch enforces configured scope policy" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/sensitive",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "must-not-run" } },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.policy_rules_raw = "POST|^/sensitive$|commands.execute|false||";
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "POST"),
+        .path = try allocator.dupe(u8, "/sensitive"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.dupe(u8, "secret"),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.find(u8, response.body orelse "", "Missing required scope") != null);
+}
+
+test "H3 production dispatch accepts valid bearer auth for required location" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/private",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "authenticated-h3-ok" } },
+        .auth = .required,
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    var token_hashes = [_][]const u8{"521bc8ca01307d0189b55a19da738e39c7204f7077e0076e803026e32b2f9383"};
+    cfg.auth_token_hashes = token_hashes[0..];
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/private"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+    };
+    defer request.deinit();
+    try request.headers.append("authorization", "Bearer integration-token");
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("authenticated-h3-ok", response.body orelse "");
+}
+
 test "h3 proxy parked early 425 forwards second 425 without third delivery" {
     const allocator = std.testing.allocator;
     var origin = try H3ProxyOrigin.start(allocator, &.{ 425, 425, 200 });
@@ -4184,6 +4464,74 @@ pub fn handleHttp3Request(
     var effective_ctx = ctx.*;
     effective_ctx.cfg = effective_cfg;
     effective_ctx.cfg_lease = &cfg_lease;
+    effective_ctx.client_ip = request.client_ip orelse "unknown";
+
+    // Preserve the H1 invariant that replay rejection happens before auth,
+    // rate-limit, approval, or upstream side effects. The normal H3 router
+    // owns response shaping and metrics for this decision, so hand rejected
+    // requests to it immediately; accepted/ordinary requests continue into
+    // the shared security gates below.
+    const preflight_path = splitHttp3PathAndQuery(request.path)[0];
+    const preflight_early = http.request_context.EarlyDataContext{
+        .transport_early = request.transport_early,
+        .inbound_marker = request.headers.hasEarlyDataMarker(),
+        .downstream_handshake = .{
+            .ctx = @constCast(request),
+            .is_complete_fn = h3RequestHandshakeComplete,
+            .wait_or_drive_fn = h3RequestDriveHandshake,
+        },
+    };
+    const preflight_decision = earlyDataDecisionForRawMethod(
+        allocator,
+        effective_cfg,
+        preflight_early,
+        request.method,
+        preflight_path,
+        request.body.len != 0,
+    );
+    if (preflight_decision == .too_early or preflight_decision == .defer_until_handshake) {
+        return handleHttp3Connection(allocator, request, response, &effective_ctx);
+    }
+
+    const correlation_id = request.headers.get(http.correlation.REQUEST_HEADER_NAME) orelse request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+    var request_ctx = http.request_context.RequestContext.init(allocator, correlation_id, request.client_ip orelse "unknown");
+    defer {
+        if (request_ctx.identity) |value| allocator.free(value);
+        if (request_ctx.user_id) |value| allocator.free(value);
+        if (request_ctx.device_id) |value| allocator.free(value);
+        if (request_ctx.scopes) |value| allocator.free(value);
+    }
+    try primeRequestAuthContext(allocator, effective_cfg, ctx.state, &request_ctx, &request.headers);
+    effective_ctx.client_ip = request_ctx.client_ip;
+    effective_ctx.authenticated = request_ctx.authenticated or request_ctx.identity != null;
+
+    if (effective_cfg.geo_blocked_countries.len > 0) {
+        if (!gph.isTrustedGeoSource(effective_cfg, request.client_ip orelse "")) {
+            try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, "forbidden", "Geo identity source is not trusted", correlation_id);
+            return;
+        }
+        if (isGeoBlocked(effective_cfg.geo_blocked_countries, request.headers.get(effective_cfg.geo_country_header))) {
+            try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, "forbidden", "Geo access denied", correlation_id);
+            return;
+        }
+    }
+    if (effective_cfg.parsed_access_control) |acl| {
+        if (acl.check(request_ctx.client_ip) == .denied) {
+            try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, "forbidden", "Access denied", correlation_id);
+            return;
+        }
+    }
+    var rate_limit_buf: [192]u8 = undefined;
+    if (!ctx.state.rateLimitAllow(rateLimitDescriptor(request_ctx.identity, request_ctx.client_ip, &rate_limit_buf))) {
+        try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .too_many_requests, "rate_limited", "Rate limit exceeded", correlation_id);
+        _ = response.setHeader("retry-after", "1");
+        return;
+    }
+    const policy_path = splitHttp3PathAndQuery(request.path)[0];
+    if (ga.evaluatePolicy(ctx.state, effective_cfg, request.method, policy_path, request_ctx.identity, request_ctx.device_id, &request.headers)) |reason| {
+        try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, "forbidden", reason, correlation_id);
+        return;
+    }
     try handleHttp3Connection(allocator, request, response, &effective_ctx);
 }
 

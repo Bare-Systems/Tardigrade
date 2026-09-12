@@ -187,53 +187,75 @@ fn formatEntryInto(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cfg: C
 fn appendEntry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cfg: Config, entry: AccessLogEntry) !void {
     var ts_buf: [32]u8 = undefined;
     const ts = logger.formatTimestamp(&ts_buf);
-    var upstream_status_buf: [16]u8 = undefined;
-    const upstream_status_text = if (entry.upstream_status) |status|
-        std.fmt.bufPrint(&upstream_status_buf, "{d}", .{status}) catch "null"
-    else
-        "null";
 
     switch (cfg.format) {
-        .json => try out.print(
-            allocator,
-            "{{\"type\":\"access\",\"ts\":\"{s}\",\"request_id\":\"{s}\",\"correlation_id\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"status\":{d},\"latency_ms\":{d},\"client_ip\":\"{s}\",\"upstream_addr\":\"{s}\",\"upstream_status\":{s},\"identity\":\"{s}\",\"user_agent\":\"{s}\",\"bytes_sent\":{d},\"response_bytes\":{d},\"error_category\":\"{s}\",\"cancel_reason\":\"{s}\",\"early_data_source\":\"{s}\",\"early_data_action\":\"{s}\",\"early_data_retry_result\":\"{s}\",\"early_data_replay_exposed\":{s}}}\n",
-            .{
-                ts,
-                entry.correlation_id,
-                entry.correlation_id,
-                entry.method,
-                entry.path,
-                entry.status,
-                entry.latency_ms,
-                entry.client_ip,
-                entry.upstream_addr,
-                upstream_status_text,
-                entry.identity,
-                entry.user_agent,
-                entry.bytes_sent,
-                entry.response_bytes,
-                entry.error_category,
-                entry.cancel_reason,
-                entry.early_data_source,
-                entry.early_data_action,
-                entry.early_data_retry_result,
-                if (entry.early_data_replay_exposed) "true" else "false",
-            },
-        ),
-        .plain => if (entry.cancel_reason.len > 0)
-            try out.print(
-                allocator,
-                "{s} {s} {d} {d}ms ip={s} req={s} upstream={s} upstream_status={?d} bytes={d} ua=\"{s}\" err={s} cancel={s} early_source={s} early_action={s} early_retry={s} replay_exposed={}\n",
-                .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.upstream_addr, entry.upstream_status, entry.response_bytes, entry.user_agent, entry.error_category, entry.cancel_reason, entry.early_data_source, entry.early_data_action, entry.early_data_retry_result, entry.early_data_replay_exposed },
-            )
-        else
-            try out.print(
-                allocator,
-                "{s} {s} {d} {d}ms ip={s} req={s} upstream={s} upstream_status={?d} bytes={d} ua=\"{s}\" err={s} early_source={s} early_action={s} early_retry={s} replay_exposed={}\n",
-                .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.upstream_addr, entry.upstream_status, entry.response_bytes, entry.user_agent, entry.error_category, entry.early_data_source, entry.early_data_action, entry.early_data_retry_result, entry.early_data_replay_exposed },
-            ),
+        .json => try out.print(allocator, "{f}\n", .{std.json.fmt(.{
+            .type = "access",
+            .ts = ts,
+            .request_id = entry.correlation_id,
+            .correlation_id = entry.correlation_id,
+            .method = entry.method,
+            .path = entry.path,
+            .status = entry.status,
+            .latency_ms = entry.latency_ms,
+            .client_ip = entry.client_ip,
+            .upstream_addr = entry.upstream_addr,
+            .upstream_status = entry.upstream_status,
+            .identity = entry.identity,
+            .user_agent = entry.user_agent,
+            .bytes_sent = entry.bytes_sent,
+            .response_bytes = entry.response_bytes,
+            .error_category = entry.error_category,
+            .cancel_reason = entry.cancel_reason,
+            .early_data_source = entry.early_data_source,
+            .early_data_action = entry.early_data_action,
+            .early_data_retry_result = entry.early_data_retry_result,
+            .early_data_replay_exposed = entry.early_data_replay_exposed,
+        }, .{})}),
+        .plain => try appendPlainEntry(allocator, out, entry),
         .custom => try appendTemplate(allocator, out, if (cfg.custom_template.len > 0) cfg.custom_template else "{method} {path} {status}", ts, entry),
     }
+}
+
+fn appendLogValue(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    for (value) |byte| switch (byte) {
+        '\\' => try out.appendSlice(allocator, "\\\\"),
+        '"' => try out.appendSlice(allocator, "\\\""),
+        '\n' => try out.appendSlice(allocator, "\\n"),
+        '\r' => try out.appendSlice(allocator, "\\r"),
+        '\t' => try out.appendSlice(allocator, "\\t"),
+        else => if (byte < 0x20)
+            try out.print(allocator, "\\x{x:0>2}", .{byte})
+        else
+            try out.append(allocator, byte),
+    };
+}
+
+fn appendPlainEntry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), entry: AccessLogEntry) !void {
+    try appendLogValue(allocator, out, entry.method);
+    try out.append(allocator, ' ');
+    try appendLogValue(allocator, out, entry.path);
+    try out.print(allocator, " {d} {d}ms ip=", .{ entry.status, entry.latency_ms });
+    try appendLogValue(allocator, out, entry.client_ip);
+    try out.appendSlice(allocator, " req=");
+    try appendLogValue(allocator, out, entry.correlation_id);
+    try out.appendSlice(allocator, " upstream=");
+    try appendLogValue(allocator, out, entry.upstream_addr);
+    try out.print(allocator, " upstream_status={?d} bytes={d} ua=\"", .{ entry.upstream_status, entry.response_bytes });
+    try appendLogValue(allocator, out, entry.user_agent);
+    try out.appendSlice(allocator, "\" err=");
+    try appendLogValue(allocator, out, entry.error_category);
+    if (entry.cancel_reason.len > 0) {
+        try out.appendSlice(allocator, " cancel=");
+        try appendLogValue(allocator, out, entry.cancel_reason);
+    }
+    try out.appendSlice(allocator, " early_source=");
+    try appendLogValue(allocator, out, entry.early_data_source);
+    try out.appendSlice(allocator, " early_action=");
+    try appendLogValue(allocator, out, entry.early_data_action);
+    try out.appendSlice(allocator, " early_retry=");
+    try appendLogValue(allocator, out, entry.early_data_retry_result);
+    try out.print(allocator, " replay_exposed={}\n", .{entry.early_data_replay_exposed});
 }
 
 fn appendTemplate(allocator: std.mem.Allocator, out: *std.ArrayList(u8), template: []const u8, ts: []const u8, entry: AccessLogEntry) !void {
@@ -291,7 +313,7 @@ fn appendTemplate(allocator: std.mem.Allocator, out: *std.ArrayList(u8), templat
                     if (entry.early_data_replay_exposed) "true" else "false"
                 else
                     "";
-                try out.appendSlice(allocator, replacement);
+                try appendLogValue(allocator, out, replacement);
             }
             i = close + 1;
             continue;
@@ -484,6 +506,52 @@ test "formatEntry json encodes null upstream_status as literal null" {
     const line = try formatEntry(std.testing.allocator, .{}, entry);
     defer std.testing.allocator.free(line);
     try std.testing.expect(std.mem.find(u8, line, "\"upstream_status\":null") != null);
+}
+
+test "access log formats cannot be forged by request-controlled fields" {
+    const injected = "value\"},\"forged\":true,\nsecond-line";
+    const entry = AccessLogEntry{
+        .method = "GET",
+        .path = "/path\nforged-line",
+        .status = 400,
+        .latency_ms = 1,
+        .client_ip = "127.0.0.1",
+        .correlation_id = injected,
+        .upstream_addr = "http://origin/\"quoted",
+        .upstream_status = null,
+        .identity = injected,
+        .user_agent = "agent\r\nforged-line",
+        .bytes_sent = 0,
+        .response_bytes = 0,
+        .error_category = injected,
+    };
+
+    const json_line = try formatEntry(std.testing.allocator, .{ .format = .json }, entry);
+    defer std.testing.allocator.free(json_line);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        std.mem.trimEnd(u8, json_line, "\n"),
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(injected, parsed.value.object.get("request_id").?.string);
+    try std.testing.expectEqualStrings("/path\nforged-line", parsed.value.object.get("path").?.string);
+    try std.testing.expect(parsed.value.object.get("forged") == null);
+
+    const plain = try formatEntry(std.testing.allocator, .{ .format = .plain }, entry);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plain, "\n"));
+    try std.testing.expect(std.mem.find(u8, plain, "\\nforged-line") != null);
+    try std.testing.expect(std.mem.find(u8, plain, "\\r\\nforged-line") != null);
+
+    const custom = try formatEntry(std.testing.allocator, .{
+        .format = .custom,
+        .custom_template = "{request_id} {path}",
+    }, entry);
+    defer std.testing.allocator.free(custom);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, custom, "\n"));
+    try std.testing.expect(std.mem.find(u8, custom, "\\nsecond-line") != null);
 }
 
 test "formatEntryInto reuses a scratch buffer and matches formatEntry" {

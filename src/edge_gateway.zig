@@ -6,11 +6,13 @@ const edge_config = @import("edge_config.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
 const build_options = @import("build_options");
 const tls_core = @import("tls_core");
+const http3_wire = @import("http3");
 
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
 const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_MAX_FRAME_SIZE: usize = 16 * 1024;
+const HTTP2_MAX_CONCURRENT_STREAMS: usize = 100;
 const WS_MUX_MAX_CHANNELS: usize = 32;
 const ACTIVE_DRIVE_POLL_INTERVAL_MS: u64 = 250;
 /// Fallback approval TTL when no config value is provided (5 minutes).
@@ -45,7 +47,10 @@ const MuxResumeState = gs.MuxResumeState;
 const ActiveDrivePollRemoveFn = *const fn (*anyopaque, std.posix.fd_t) anyerror!void;
 const ActiveDrivePollSubmitFn = *const fn (*anyopaque, std.posix.fd_t) anyerror!void;
 
-pub fn run(cfg: *const edge_config.EdgeConfig) !void {
+/// Takes a mutable config because the startup generation publishes its parsed
+/// ACL back onto it (`EdgeConfig.parsed_access_control`), which is what pairs
+/// authorization state with the configuration generation a request leases.
+pub fn run(cfg: *edge_config.EdgeConfig) !void {
     const state_allocator = runtime_allocator.runtimeAllocator();
 
     const initial_hsts = try gp.computeHstsValue(state_allocator, cfg);
@@ -85,10 +90,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         else
             null,
         .session_store_path = cfg.session_store_path,
-        .access_control = if (cfg.access_control_rules.len > 0)
-            http.access_control.AccessControl.fromConfig(state_allocator, cfg.access_control_rules, .allow) catch null
-        else
-            null,
+        // No ACL field here on purpose: access-control policy is owned by the
+        // configuration version a request leases (see
+        // `ManagedConfigVersion.access_control`), so it can neither outlive nor
+        // under-live the configuration generation that request is using.
         .logger = http.logger.Logger.init(cfg.log_level, "gateway"),
         .metrics = http.metrics.Metrics.init(),
         .compression_config = .{
@@ -309,6 +314,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var timer = http.event_loop.TimerManager.init(250);
     var config_store = try ReloadableConfigStore.initBorrowed(state_allocator, cfg);
     defer config_store.deinit();
+    config_store.setInitialAccessControl(cfg, if (cfg.access_control_rules.len > 0)
+        try http.access_control.AccessControl.fromConfig(state_allocator, cfg.access_control_rules, .allow)
+    else
+        null);
     var http3_runtime: ?http.http3_runtime.Runtime = null;
     var native_credentials: ?http.native_tls_connection.NativeCredentialStore = null;
     // #488: one process-scoped native resumption runtime, shared by every
@@ -462,6 +471,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .tls_min_version = "1.3",
             .tls_max_version = "1.3",
             .enable_0rtt = cfg.http3_enable_0rtt,
+            .max_request_body_bytes = cfg.request_limits.effectiveMaxBodySize(),
+            .max_buffered_request_bytes = if (cfg.max_connection_memory_bytes > 0)
+                cfg.max_connection_memory_bytes
+            else
+                http3_wire.conn.default_max_buffered_request_bytes,
             .connection_migration = cfg.http3_connection_migration,
             .retry_policy = cfg.http3_retry_policy,
             .max_datagram_size = cfg.http3_max_datagram_size,
@@ -591,7 +605,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (state.session_store != null) {
         state.logger.info(null, "Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });
     }
-    if (state.access_control != null) {
+    if (cfg.access_control_rules.len > 0) {
         state.logger.info(null, "IP access control enabled", .{});
     }
     if (cfg.basic_auth_hashes.len > 0) {
@@ -2391,7 +2405,7 @@ fn h2ResetStreamState(
     _ = streams.remove(stream_id);
     if (pending.fetchRemove(stream_id)) |removed| {
         var tmp = removed.value;
-        buffered_request_bytes.* -= @min(buffered_request_bytes.*, tmp.body.items.len);
+        buffered_request_bytes.* -= @min(buffered_request_bytes.*, tmp.retainedBytes());
         tmp.deinit(allocator);
     }
     if (pending_responses.fetchRemove(stream_id)) |removed| {
@@ -2410,6 +2424,157 @@ fn h2EncodedHeaderBlockLimit(cfg: *const edge_config.EdgeConfig, buffered_reques
     return limit;
 }
 
+/// Validate the HTTP/2 request pseudo-header envelope before copying any
+/// values into routing state. RFC 9113 § 8.3 requires pseudo-headers to
+/// precede regular fields, forbids duplicates and unknown pseudo-headers,
+/// and requires the ordinary request tuple. Silently replacing an earlier
+/// `:authority` (or `:path`) makes different hops disagree about which
+/// virtual host or authorization boundary the request addresses.
+fn h2RequestHeaderBlockIsValid(fields: []const http.hpack.HeaderField, initial: bool) bool {
+    var saw_regular = false;
+    var saw_method = false;
+    var saw_scheme = false;
+    var saw_authority = false;
+    var saw_path = false;
+    var method: ?[]const u8 = null;
+    var scheme: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
+    var authority: ?[]const u8 = null;
+    var host: ?[]const u8 = null;
+
+    for (fields) |field| {
+        if (field.name.len == 0) return false;
+        for (field.name) |c| {
+            if (std.ascii.isUpper(c)) return false;
+        }
+
+        if (field.name[0] != ':') {
+            saw_regular = true;
+            if (initial and std.mem.eql(u8, field.name, "host")) {
+                if (host != null) return false;
+                host = field.value;
+            }
+            continue;
+        }
+        // Trailer blocks are regular fields only.
+        if (!initial) return false;
+        if (saw_regular) return false;
+
+        if (std.mem.eql(u8, field.name, ":method")) {
+            if (saw_method) return false;
+            saw_method = true;
+            method = field.value;
+        } else if (std.mem.eql(u8, field.name, ":scheme")) {
+            if (saw_scheme) return false;
+            saw_scheme = true;
+            scheme = field.value;
+        } else if (std.mem.eql(u8, field.name, ":authority")) {
+            if (saw_authority) return false;
+            saw_authority = true;
+            authority = field.value;
+        } else if (std.mem.eql(u8, field.name, ":path")) {
+            if (saw_path) return false;
+            saw_path = true;
+            path = field.value;
+        } else {
+            return false;
+        }
+    }
+
+    if (!initial) return true;
+    if (!saw_method) return false;
+    if (http.Method.parse(method.?) == null) return false;
+    if (std.mem.eql(u8, method.?, "CONNECT")) {
+        return saw_authority and !saw_scheme and !saw_path and http.request.isValidAuthority(authority.?);
+    }
+    if (!saw_scheme or !saw_path) return false;
+    if (!(std.mem.eql(u8, scheme.?, "http") or std.mem.eql(u8, scheme.?, "https"))) return false;
+    if (!h2RequestPathIsValid(path.?)) return false;
+    // Routing authority has one meaning across the native H2 path and the
+    // synthesized H1 request used by shared routing/auth code. Multiple Host
+    // fields or a Host that disagrees with :authority create the same
+    // cross-hop ambiguity as duplicate Host in HTTP/1.
+    if (authority) |a| {
+        if (!http.request.isValidAuthority(a)) return false;
+        if (host) |h| {
+            if (!http.request.isValidAuthority(h) or !std.ascii.eqlIgnoreCase(a, h)) return false;
+        }
+    } else if (host) |h| {
+        if (!http.request.isValidAuthority(h)) return false;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+fn h2RequestPathIsValid(path: []const u8) bool {
+    if (!(std.mem.eql(u8, path, "*") or (path.len > 0 and path[0] == '/'))) return false;
+    for (path) |c| {
+        if (c <= 0x20 or c == 0x7f or c == '#') return false;
+    }
+    return true;
+}
+
+const H2HeadersPayload = struct {
+    fragment: []const u8,
+    priority: ?[]const u8,
+};
+
+/// Remove HEADERS padding and the optional priority tuple before HPACK sees
+/// the fragment. Padding bytes are transport framing, never request data.
+fn h2HeadersPayload(payload: []const u8, flags: u8) !H2HeadersPayload {
+    var start: usize = 0;
+    var end = payload.len;
+    if ((flags & http.http2_frame.Flags.PADDED) != 0) {
+        if (payload.len == 0) return error.InvalidHttp2Padding;
+        const padding_len: usize = payload[0];
+        start = 1;
+        if (padding_len > end - start) return error.InvalidHttp2Padding;
+        end -= padding_len;
+    }
+    var priority: ?[]const u8 = null;
+    if ((flags & http.http2_frame.Flags.PRIORITY) != 0) {
+        if (end - start < 5) return error.InvalidPriorityFrame;
+        priority = payload[start .. start + 5];
+        start += 5;
+    }
+    return .{ .fragment = payload[start..end], .priority = priority };
+}
+
+/// Return the application DATA bytes after removing HTTP/2 padding.
+fn h2DataPayload(payload: []const u8, flags: u8) ![]const u8 {
+    if ((flags & http.http2_frame.Flags.PADDED) == 0) return payload;
+    if (payload.len == 0) return error.InvalidHttp2Padding;
+    const padding_len: usize = payload[0];
+    if (padding_len > payload.len - 1) return error.InvalidHttp2Padding;
+    return payload[1 .. payload.len - padding_len];
+}
+
+/// Whether an inbound HEADERS/DATA frame may be processed for `stream_id`.
+///
+/// The HTTP/2 stream state machine — not the `pending` request-assembly map —
+/// is the lifecycle authority. `h2DispatchReadyStreams` removes an entry from
+/// `pending` the moment it dispatches, while keeping the `streams` entry alive
+/// when a response is parked on send-credit exhaustion. Inferring "new request"
+/// from `!pending.contains(id)` therefore lets a peer open a second request on a
+/// stream it already closed for sending, duplicating route/auth/handler
+/// execution while the first response is still outstanding.
+///
+/// An unknown stream is allowed: that is a genuinely new stream, validated by
+/// the id and concurrency checks at the call site.
+/// True when an initial header block requests the CONNECT method.
+fn h2HeaderBlockRequestsConnect(fields: []const http.hpack.HeaderField) bool {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, ":method")) return std.mem.eql(u8, field.value, "CONNECT");
+    }
+    return false;
+}
+
+fn h2StreamAcceptsInboundFrame(streams: *std.AutoHashMap(u31, http.http2_stream.Stream), stream_id: u31) bool {
+    const existing = streams.get(stream_id) orelse return true;
+    return existing.canReceive();
+}
+
 fn h2ProcessHeaderBlock(
     allocator: std.mem.Allocator,
     decoder: *http.hpack.Decoder,
@@ -2422,6 +2587,8 @@ fn h2ProcessHeaderBlock(
     transport_early: bool,
     writer: anytype,
     last_client_stream_id: u31,
+    max_connection_memory_bytes: usize,
+    buffered_request_bytes: *usize,
 ) !void {
     var decoded = decoder.decode(allocator, header_block) catch {
         try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
@@ -2429,31 +2596,152 @@ fn h2ProcessHeaderBlock(
     };
     defer http.hpack.deinitDecoded(allocator, &decoded);
 
-    var ps = pending.get(stream_id) orelse Http2PendingStream.init(allocator);
+    const initial_headers = !pending.contains(stream_id);
+    if (!h2RequestHeaderBlockIsValid(decoded.headers, initial_headers)) {
+        try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+        return error.InvalidHttp2Request;
+    }
+    if (!initial_headers and !end_stream) {
+        // A trailing field section terminates the request. Accepting DATA
+        // after it creates two different message boundaries across hops.
+        try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+        return error.InvalidHttp2Request;
+    }
+
+    if (initial_headers and h2HeaderBlockRequestsConnect(decoded.headers)) {
+        // CONNECT (RFC 9113 §8.5 authority-form) is syntactically valid HTTP/2
+        // and the validator above accepts it as such, but Tardigrade does not
+        // implement tunneling: the shared HTTP/1 adapter has no authority-form
+        // representation, and synthesizing an origin-form `:path` would route a
+        // tunnel request at some unrelated path.
+        //
+        // So refuse it deliberately and visibly, at stream scope. Letting it
+        // through reached `respondHttp2Stream`'s `ps.path orelse
+        // error.InvalidHttp2Request`, which tore down the whole connection with
+        // a generic error instead of answering the one stream. Other streams on
+        // this connection are unaffected.
+        try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.refused_stream.value());
+        if (streams.getPtr(stream_id)) |s| s.close();
+        return;
+    }
+
+    if (!initial_headers) {
+        // Trailers are validated above but deliberately not retained or
+        // folded into the routing/authentication header set.
+        if (streams.getPtr(stream_id)) |s| s.remoteEndStream() catch {};
+        try h2AppendReadyStream(ready_streams, stream_id);
+        return;
+    }
+
+    var ps = Http2PendingStream.init(allocator);
     var committed = false;
     errdefer if (!committed) ps.deinit(allocator);
     ps.transport_early = ps.transport_early or transport_early;
     if (streams.get(stream_id)) |s| ps.priority_weight = s.priority_weight;
     for (decoded.headers) |h| {
         if (std.mem.eql(u8, h.name, ":method")) {
-            if (ps.method) |m| allocator.free(m);
             ps.method = try allocator.dupe(u8, h.value);
         } else if (std.mem.eql(u8, h.name, ":path")) {
-            if (ps.path) |p| allocator.free(p);
             ps.path = try allocator.dupe(u8, h.value);
         } else if (std.mem.eql(u8, h.name, ":authority")) {
-            if (ps.authority) |a| allocator.free(a);
             ps.authority = try allocator.dupe(u8, h.value);
-        } else if (h.name.len > 0 and h.name[0] != ':') {
+        } else if (initial_headers and h.name.len > 0 and h.name[0] != ':') {
+            // This proxy does not forward request trailers. In particular,
+            // never fold them into the initial field collection used for
+            // routing or authentication (Host/Authorization trailers must
+            // not become initial request metadata).
             try ps.headers.append(h.name, h.value);
         }
     }
+    const retained = ps.retainedBytes();
+    if (max_connection_memory_bytes > 0 and retained > max_connection_memory_bytes -| buffered_request_bytes.*) {
+        try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.enhance_your_calm.value());
+        return error.Http2ConnectionMemoryLimitExceeded;
+    }
     try pending.put(stream_id, ps);
+    buffered_request_bytes.* += retained;
     committed = true;
     if (end_stream) {
         if (streams.getPtr(stream_id)) |s| s.remoteEndStream() catch {};
         try h2AppendReadyStream(ready_streams, stream_id);
     }
+}
+
+test "HTTP/2 request header validation rejects ambiguous pseudo-header envelopes" {
+    try std.testing.expect(h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "accept", .value = "*/*" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "trusted.test" },
+        .{ .name = ":authority", .value = "attacker.test" },
+        .{ .name = ":path", .value = "/" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = "accept", .value = "*/*" },
+        .{ .name = ":path", .value = "/after-regular" },
+        .{ .name = ":scheme", .value = "https" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":unknown", .value = "ignored-before" },
+        .{ .name = ":path", .value = "/" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "X-Uppercase", .value = "invalid-in-h2" },
+    }, true));
+    try std.testing.expect(h2RequestHeaderBlockIsValid(&.{
+        .{ .name = "x-checksum", .value = "abc" },
+    }, false));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":path", .value = "/pseudo-in-trailers" },
+    }, false));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "trusted.test" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "host", .value = "attacker.test" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "host", .value = "one.test" },
+        .{ .name = "host", .value = "two.test" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "trusted.test" },
+        .{ .name = ":path", .value = "/private HTTP/1.1\r\nX-Injected: yes" },
+    }, true));
+}
+
+test "HTTP/2 padded payload parsing excludes transport padding" {
+    const padded_data = [_]u8{ 3, 'o', 'k', 0, 0, 0 };
+    try std.testing.expectEqualStrings("ok", try h2DataPayload(&padded_data, http.http2_frame.Flags.PADDED));
+    try std.testing.expectError(error.InvalidHttp2Padding, h2DataPayload(&.{ 2, 0 }, http.http2_frame.Flags.PADDED));
+
+    const padded_headers = [_]u8{ 2, 1, 2, 3, 0, 0 };
+    const parsed = try h2HeadersPayload(&padded_headers, http.http2_frame.Flags.PADDED);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, parsed.fragment);
+    try std.testing.expect(parsed.priority == null);
+
+    const priority_headers = [_]u8{ 1, 0, 0, 0, 0, 15, 0x82, 0 };
+    const with_priority = try h2HeadersPayload(&priority_headers, http.http2_frame.Flags.PADDED | http.http2_frame.Flags.PRIORITY);
+    try std.testing.expectEqualSlices(u8, &.{0x82}, with_priority.fragment);
+    try std.testing.expectEqual(@as(usize, 5), with_priority.priority.?.len);
 }
 
 /// Outbound response body parked on a stream while HTTP/2 send credit is
@@ -2604,7 +2892,7 @@ fn h2DispatchReadyStreams(
         ps.dispatch_count += 1;
         if (pending.fetchRemove(sid)) |removed| {
             var tmp = removed.value;
-            buffered_request_bytes.* -= @min(buffered_request_bytes.*, tmp.body.items.len);
+            buffered_request_bytes.* -= @min(buffered_request_bytes.*, tmp.retainedBytes());
             tmp.deinit(allocator);
         }
         // If the response is still parked on send-credit exhaustion, its
@@ -2626,7 +2914,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     const allocator = state.allocator;
 
     try http.http2_frame.writeSettings(allocator, conn.writer(), &[_][2]u32{
-        .{ 0x3, 100 }, // max concurrent streams
+        .{ 0x3, HTTP2_MAX_CONCURRENT_STREAMS }, // max concurrent streams
         .{ 0x4, 1024 * 1024 }, // initial window size
     });
 
@@ -2741,6 +3029,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     const new_initial_window = http.http2_frame.parseSettingsInitialWindowSize(frame.payload) catch |err| {
                         const code = switch (err) {
                             error.Http2FlowControlError => http.http2_stream.ErrorCode.flow_control_error,
+                            error.InvalidSettingsValue => http.http2_stream.ErrorCode.protocol_error,
                             else => http.http2_stream.ErrorCode.frame_size_error,
                         };
                         try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, code.value());
@@ -2778,10 +3067,22 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 }
             },
             .ping => {
+                if (frame.stream_id != 0) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return error.InvalidHttp2StreamId;
+                }
+                if (frame.payload.len != 8) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    return error.InvalidPingPayload;
+                }
                 if ((frame.flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writePingAck(conn.writer(), frame.payload);
             },
             .headers => {
                 if (frame.stream_id == 0) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return error.InvalidHttp2StreamId;
+                }
+                if ((frame.stream_id & 1) == 0) {
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
@@ -2790,17 +3091,45 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     continue;
                 }
                 last_client_stream_id = @max(last_client_stream_id, frame.stream_id);
+                // The stream state machine is the lifecycle authority, NOT
+                // `pending`. `h2DispatchReadyStreams` removes a request from
+                // `pending` as soon as it dispatches, while deliberately
+                // keeping the `streams` entry alive when a response is parked
+                // on send-credit exhaustion. If the client already sent
+                // END_STREAM, that stream is half_closed_remote: treating
+                // "absent from pending" as "this is a new request" would let
+                // another HEADERS frame on the same id be constructed as a
+                // SECOND request, duplicating route/auth/handler execution
+                // while the first response is still outstanding.
+                if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
+                    try http.http2_frame.writeRstStream(
+                        conn.writer(),
+                        frame.stream_id,
+                        http.http2_stream.ErrorCode.stream_closed.value(),
+                    );
+                    continue;
+                }
                 if (!streams.contains(frame.stream_id)) {
+                    if (streams.count() >= HTTP2_MAX_CONCURRENT_STREAMS) {
+                        // Bound all per-stream maps and header/body ownership.
+                        // Close the connection on a peer that exceeds the
+                        // limit so we never skip a header block and desync the
+                        // connection-scoped HPACK dynamic table.
+                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.enhance_your_calm.value());
+                        return error.Http2ConcurrentStreamLimitExceeded;
+                    }
                     try streams.put(frame.stream_id, http.http2_stream.Stream.init(frame.stream_id, @intCast(peer_initial_window)));
                 }
-                var payload_offset: usize = 0;
-                if ((frame.flags & http.http2_frame.Flags.PRIORITY) != 0) {
-                    const pr = try http.http2_frame.parsePriority(frame.payload);
+                const headers_payload = h2HeadersPayload(frame.payload, frame.flags) catch |err| {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return err;
+                };
+                if (headers_payload.priority) |priority_payload| {
+                    const pr = try http.http2_frame.parsePriority(priority_payload);
                     if (streams.getPtr(frame.stream_id)) |s| s.priority_weight = pr.weight;
-                    payload_offset = 5;
                 }
                 if ((frame.flags & http.http2_frame.Flags.END_HEADERS) == 0) {
-                    const fragment = frame.payload[payload_offset..];
+                    const fragment = headers_payload.fragment;
                     if (fragment.len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
                         try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
                         return error.Http2CompressionError;
@@ -2812,7 +3141,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     try continuation_block.appendSlice(fragment);
                     continue;
                 }
-                if (frame.payload[payload_offset..].len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
+                if (headers_payload.fragment.len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
                     return error.Http2CompressionError;
                 }
@@ -2823,11 +3152,13 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     &streams,
                     &ready_streams,
                     frame.stream_id,
-                    frame.payload[payload_offset..],
+                    headers_payload.fragment,
                     (frame.flags & http.http2_frame.Flags.END_STREAM) != 0,
                     frame_transport_early,
                     conn.writer(),
                     last_client_stream_id,
+                    cfg.max_connection_memory_bytes,
+                    &buffered_request_bytes,
                 );
             },
             .data => {
@@ -2835,12 +3166,27 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
+                // Same lifecycle rule as HEADERS: DATA after the remote's
+                // END_STREAM is a stream error (RFC 7540 §5.1,
+                // half_closed_remote), not new body for a dispatched request.
+                if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
+                    try http.http2_frame.writeRstStream(
+                        conn.writer(),
+                        frame.stream_id,
+                        http.http2_stream.ErrorCode.stream_closed.value(),
+                    );
+                    continue;
+                }
+                const data_payload = h2DataPayload(frame.payload, frame.flags) catch |err| {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    return err;
+                };
                 if (pending.getPtr(frame.stream_id)) |ps| {
                     ps.transport_early = ps.transport_early or frame_transport_early;
                     const max_body = cfg.request_limits.effectiveMaxBodySize();
                     const max_conn_mem = cfg.max_connection_memory_bytes;
-                    const over_stream_limit = ps.body_limit_exceeded or ps.body.items.len +| frame.payload.len > max_body;
-                    const over_conn_limit = max_conn_mem > 0 and buffered_request_bytes +| frame.payload.len > max_conn_mem;
+                    const over_stream_limit = ps.body_limit_exceeded or ps.body.items.len +| data_payload.len > max_body;
+                    const over_conn_limit = max_conn_mem > 0 and buffered_request_bytes +| data_payload.len > max_conn_mem;
                     if (over_stream_limit or over_conn_limit) {
                         // Reject the excess before it is ever appended: do not
                         // buffer it and do not credit it back, so an attacker
@@ -2856,14 +3202,15 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         // would starve every response on the connection.
                         ps.body_limit_exceeded = true;
                     } else {
-                        if (streams.getPtr(frame.stream_id)) |s| s.send_window -= @intCast(frame.payload.len);
-                        conn_send_window -= @intCast(frame.payload.len);
-                        try ps.body.appendSlice(frame.payload);
-                        buffered_request_bytes += frame.payload.len;
-                        try http.http2_frame.writeWindowUpdate(conn.writer(), frame.stream_id, @intCast(frame.payload.len));
-                        try http.http2_frame.writeWindowUpdate(conn.writer(), 0, @intCast(frame.payload.len));
-                        if (streams.getPtr(frame.stream_id)) |s| s.send_window += @intCast(frame.payload.len);
-                        conn_send_window += @intCast(frame.payload.len);
+                        try ps.body.appendSlice(data_payload);
+                        buffered_request_bytes += data_payload.len;
+                        // Flow control counts the full DATA payload including
+                        // Pad Length and padding, even though only the data
+                        // octets belong to the application body.
+                        if (frame.payload.len > 0) {
+                            try http.http2_frame.writeWindowUpdate(conn.writer(), frame.stream_id, @intCast(frame.payload.len));
+                            try http.http2_frame.writeWindowUpdate(conn.writer(), 0, @intCast(frame.payload.len));
+                        }
                     }
                     if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
                         if (streams.getPtr(frame.stream_id)) |s| s.remoteEndStream() catch {};
@@ -2878,6 +3225,10 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 if (frame.stream_id == 0) {
                     try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
+                }
+                if (frame.payload.len != 5) {
+                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    return error.InvalidPriorityFrame;
                 }
                 const pr = try http.http2_frame.parsePriority(frame.payload);
                 if (streams.getPtr(frame.stream_id)) |s| s.priority_weight = pr.weight;
@@ -2967,6 +3318,8 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         continuation_transport_early,
                         conn.writer(),
                         last_client_stream_id,
+                        cfg.max_connection_memory_bytes,
+                        &buffered_request_bytes,
                     );
                     continuation_block.clearRetainingCapacity();
                     continuation_stream_id = null;
@@ -2978,6 +3331,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                 return error.InvalidHttp2FrameSequence;
             },
+            else => {}, // Unknown extension frame types are ignored by RFC 9113 §5.5.
         }
 
         try h2DispatchReadyStreams(
@@ -3275,13 +3629,21 @@ fn executeHttp2ProxyRoute(
         return .{ .local_rejection = rejection };
     }
 
+    if (ga.evaluatePolicy(state, route_cfg, method, request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |reason| {
+        return .{ .local_rejection = .{
+            .status_code = @intFromEnum(http.Status.forbidden),
+            .code = "forbidden",
+            .message = reason,
+        } };
+    }
+
     const matched = http.location_router.matchLocation(allocator, request.uri.path, route_cfg.location_blocks) orelse {
         if (try buildHttp2StaticResponse(allocator, route_cfg, request)) |static_response| {
             return .{ .static_response = static_response };
         }
         return null;
     };
-    if (matched.block.auth == .required) return .{ .local_rejection = .{
+    if (matched.block.auth == .required and !ctx.authenticated and ctx.identity == null) return .{ .local_rejection = .{
         .status_code = @intFromEnum(http.Status.unauthorized),
         .code = "unauthorized",
         .message = "Unauthorized",
@@ -3361,6 +3723,9 @@ fn h2EvaluateRequestPolicy(
     identity: ?[]const u8,
 ) ?Http2LocalRejection {
     if (cfg.geo_blocked_countries.len > 0) {
+        if (!gph.isTrustedGeoSource(cfg, client_ip)) {
+            return .{ .status_code = 403, .code = "forbidden", .message = "Geo identity source is not trusted" };
+        }
         const country = request.headers.get(cfg.geo_country_header);
         if (h2IsGeoBlocked(cfg.geo_blocked_countries, country)) {
             return .{ .status_code = 403, .code = "forbidden", .message = "Geo access denied" };
@@ -3391,11 +3756,12 @@ fn h2EvaluateRequestPolicy(
         }
     }
 
-    if (cfg.access_control_rules.len > 0) {
-        if (state.access_control) |*acl| {
-            if (acl.check(client_ip) == .denied) {
-                return .{ .status_code = 403, .code = "forbidden", .message = "Access denied" };
-            }
+    // Enforce the ACL belonging to THIS request's configuration generation.
+    // Reading a global ACL here could both race a reload freeing the rules and
+    // let an older lease skip a denial its own config still requires.
+    if (cfg.parsed_access_control) |acl| {
+        if (acl.check(client_ip) == .denied) {
+            return .{ .status_code = 403, .code = "forbidden", .message = "Access denied" };
         }
     }
 
@@ -3873,7 +4239,7 @@ const H1ProductionPostPreflightHooks = struct {
         if (cfg.mirror_rules.len > 0) {
             ghandlers.spawnMirrorRequests(
                 allocator,
-                cfg.mirror_rules,
+                cfg,
                 request.method.toString(),
                 request.uri.path,
                 request.body orelse "",
@@ -3923,7 +4289,7 @@ const H1ProductionPostPreflightHooks = struct {
         keep_alive: *bool,
         client_ip: []const u8,
         streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
-    ) !u16 {
+    ) !ghandlers.RouteOutcome {
         _ = self;
         return try ghandlers.routeRequest(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body);
     }
@@ -3969,10 +4335,17 @@ fn executeH1PostPreflightOrchestration(
         },
     }
 
-    try hooks.mirror(allocator, cfg, request, correlation_id, client_ip);
     try hooks.auth(allocator, cfg, state, ctx, &request.headers);
 
     if (try hooks.middleware(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*)) {
+        return .logged_terminal;
+    }
+
+    if (ga.evaluatePolicy(state, cfg, request.method.toString(), request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |reason| {
+        try gp.sendApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive.*, state);
+        state.metricsRecord(403);
+        state.metricsRecordErrorCode("forbidden");
+        ghandlers.logAccessForRequest(state, ctx, request, 403);
         return .logged_terminal;
     }
 
@@ -3984,7 +4357,16 @@ fn executeH1PostPreflightOrchestration(
         return .logged_terminal;
     }
 
-    return .{ .route_status = try hooks.route(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body) };
+    const outcome = try hooks.route(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body);
+    // Mirror only when routing reports that authorization actually accepted the
+    // request. Ordering after `route()` is not enough on its own: location
+    // `auth required` rejections are returned as an ordinary route status, so
+    // the decision has to be carried explicitly or a denied body still leaks to
+    // the mirror target.
+    if (outcome.mirror_allowed) {
+        try hooks.mirror(allocator, cfg, request, correlation_id, client_ip);
+    }
+    return .{ .route_status = outcome.status };
 }
 
 fn mayNeedStreamingRequestBodyPreRead(cfg: *const edge_config.EdgeConfig) bool {
@@ -4256,6 +4638,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
     ctx.early_data.transport_early = request_transport_early;
     ctx.early_data.inbound_marker = request.headers.hasEarlyDataMarker();
+
+    if (!gph.isTrustedGeoSource(cfg, connection_ip)) {
+        try gp.sendApiError(allocator, writer, .forbidden, "forbidden", "Geo identity source is not trusted", correlation_id, keep_alive, state);
+        ghandlers.logAccessForRequest(state, &ctx, &request, 403);
+        return;
+    }
 
     // --- RFC 7231 §4.3.8 / ASVS-14.5.1: Reject TRACE globally ---
     // TRACE echoes the request back to the client, enabling Cross-Site
@@ -4643,7 +5031,7 @@ const H1CountingPostPreflightHooks = struct {
         keep_alive: *bool,
         client_ip: []const u8,
         streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
-    ) !u16 {
+    ) !ghandlers.RouteOutcome {
         _ = conn;
         _ = allocator;
         _ = cfg;
@@ -4656,7 +5044,7 @@ const H1CountingPostPreflightHooks = struct {
         _ = streaming_request_body;
         self.effects.upstream_calls += 1;
         self.effects.handler_calls += 1;
-        return @intFromEnum(http.Status.ok);
+        return .{ .status = @intFromEnum(http.Status.ok) };
     }
 };
 
@@ -4762,6 +5150,67 @@ test "H1 early proxy with origin capability off never reaches upstream side effe
     try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
 }
 
+test "H1 policy denial occurs before route and mirror side effects" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/sensitive",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+    }};
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{.{
+        .method = "POST",
+        .pattern = "^/sensitive$",
+        .target_url = "http://127.0.0.1:2/mirror",
+    }};
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+    cfg.policy_rules_raw = "POST|^/sensitive$|commands.execute|false||";
+    cfg.policy_user_scopes_raw = "";
+    cfg.policy_approval_routes_raw = "";
+
+    var request = try http.Request.parseHead(allocator, "POST /sensitive HTTP/1.1\r\nHost: example.test\r\nContent-Length: 6\r\n\r\nsecret", MAX_REQUEST_SIZE);
+    defer request.request.deinit();
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.security_headers = http.security_headers.SecurityHeaders.default;
+    state.add_headers = &.{};
+    state.http3_alt_svc = null;
+    var ctx = http.request_context.RequestContext.init(allocator, "req-policy", "127.0.0.1");
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-policy", 0);
+    var keep_alive = false;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    const outcome = try executeH1PostPreflightOrchestration(
+        {},
+        allocator,
+        &output.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-policy",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1CountingPostPreflightHooks{ .effects = &effects },
+    );
+
+    try std.testing.expect(outcome == .logged_terminal);
+    try std.testing.expectEqual(@as(usize, 1), effects.auth_calls);
+    try std.testing.expectEqual(@as(usize, 1), effects.rate_limit_mutations);
+    try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
+    try std.testing.expect(std.mem.find(u8, output.written(), "403 Forbidden") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "Missing required scope") != null);
+}
+
 test "#369 Slice 2 rt0.reject.unsafe_request: an unsafe method carrying current-hop early data is rejected by the real H1 orchestration before any route dispatch" {
     // Drives the real, private `executeH1PostPreflightOrchestration` this
     // file's own dispatch uses in production (see `H1ProductionPostPreflightHooks`
@@ -4865,6 +5314,9 @@ test "#510 H1 request context derives transport early provenance from connection
     cfg.metrics_path = "/status/metrics";
     cfg.location_blocks = blocks[0..];
     cfg.mirror_rules = &.{};
+    cfg.policy_rules_raw = "";
+    cfg.policy_user_scopes_raw = "";
+    cfg.policy_approval_routes_raw = "";
     var effects = H1PreflightSideEffectProbe{};
     var state: GatewayState = undefined;
     state.metrics_mutex = .{};
@@ -4932,6 +5384,9 @@ test "#510 H1 streaming pre-read fallback preserves head-read early provenance b
     cfg.metrics_path = "/status/metrics";
     cfg.location_blocks = blocks[0..];
     cfg.mirror_rules = &.{};
+    cfg.policy_rules_raw = "";
+    cfg.policy_user_scopes_raw = "";
+    cfg.policy_approval_routes_raw = "";
     var effects = H1PreflightSideEffectProbe{};
     var state: GatewayState = undefined;
     state.metrics_mutex = .{};
@@ -5112,6 +5567,9 @@ test "#510 H1 pending buffer does not extend early provenance over later 1-RTT b
     cfg.metrics_path = "/status/metrics";
     cfg.location_blocks = blocks[0..];
     cfg.mirror_rules = &.{};
+    cfg.policy_rules_raw = "";
+    cfg.policy_user_scopes_raw = "";
+    cfg.policy_approval_routes_raw = "";
     var effects = H1PreflightSideEffectProbe{};
     var state: GatewayState = undefined;
     state.metrics_mutex = .{};
@@ -5899,6 +6357,10 @@ const H2DispatchTestConn = struct {
         pub fn writeAll(self: Writer, bytes: []const u8) !void {
             try self.conn.out.writer.writeAll(bytes);
         }
+
+        pub fn print(self: Writer, comptime fmt: []const u8, args: anytype) !void {
+            try self.conn.out.writer.print(fmt, args);
+        }
     };
 
     fn init(allocator: std.mem.Allocator) H2DispatchTestConn {
@@ -5912,7 +6374,7 @@ const H2DispatchTestConn = struct {
         self.out.deinit();
     }
 
-    fn writer(self: *H2DispatchTestConn) Writer {
+    pub fn writer(self: *H2DispatchTestConn) Writer {
         return .{ .conn = self };
     }
 
@@ -6529,4 +6991,380 @@ test {
     _ = @import("gateway_handlers.zig");
     _ = @import("gateway_shutdown.zig");
     _ = @import("process_early_data_integration_tests.zig");
+}
+
+/// Hooks that run the REAL router while counting mirror deliveries.
+///
+/// The location-auth mirror leak lives in the seam between `routeRequest`'s
+/// authorization decision and the orchestration's mirror call, so a probe that
+/// stubs out routing cannot observe it.
+const H1RealRouteMirrorProbeHooks = struct {
+    effects: *H1PreflightSideEffectProbe,
+
+    fn rejectEarly(
+        self: H1RealRouteMirrorProbeHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !u16 {
+        _ = .{ self, allocator, writer, state, ctx, request, correlation_id, keep_alive };
+        return @intFromEnum(http.Status.too_early);
+    }
+
+    fn mirror(
+        self: H1RealRouteMirrorProbeHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        client_ip: []const u8,
+    ) !void {
+        _ = .{ allocator, cfg, request, correlation_id, client_ip };
+        self.effects.mirror_calls += 1;
+    }
+
+    fn auth(
+        self: H1RealRouteMirrorProbeHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        headers: *const http.Headers,
+    ) !void {
+        self.effects.auth_calls += 1;
+        try ghandlers.primeRequestAuthContext(allocator, cfg, state, ctx, headers);
+    }
+
+    fn middleware(
+        self: H1RealRouteMirrorProbeHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !bool {
+        _ = .{ self, allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive };
+        return false;
+    }
+
+    fn route(
+        self: H1RealRouteMirrorProbeHooks,
+        conn: anytype,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *http.Request,
+        correlation_id: []const u8,
+        keep_alive: *bool,
+        client_ip: []const u8,
+        streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
+    ) !ghandlers.RouteOutcome {
+        self.effects.handler_calls += 1;
+        return try ghandlers.routeRequest(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body);
+    }
+};
+
+test "H1 location auth denial never mirrors the denied request body" {
+    // Regression: moving `mirror()` after `route()` did not fix the leak,
+    // because `routeRequest()` returns a location-auth 401/403 as an ordinary
+    // route status. A POST to an `auth required` location with no credentials
+    // must reach no mirror target at all.
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/private",
+            .priority = 0,
+            .action = .{ .return_response = .{ .status = 200, .body = "secret" } },
+            .auth = .required,
+        },
+    };
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{
+        .{ .method = "POST", .pattern = "^/private$", .target_url = "http://127.0.0.1:9002/mirror" },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+
+    var request = try http.Request.parseHead(
+        allocator,
+        "POST /private HTTP/1.1\r\nHost: example.test\r\nContent-Length: 11\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    defer request.request.deinit();
+    // `Request.deinit` owns the body, so it must be a real allocation.
+    request.request.body = try allocator.dupe(u8, "sensitive-payload");
+
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.session_mutex = .{};
+    state.session_store = null;
+    state.logger = http.logger.Logger.init(.err, "test");
+    state.security_headers = .{};
+    state.add_headers = &.{};
+    state.http3_alt_svc = null;
+    var ctx = http.request_context.RequestContext.init(allocator, "req-mirror", "127.0.0.1");
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-mirror", 0);
+    var keep_alive = false;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try executeH1PostPreflightOrchestration(
+        &conn,
+        allocator,
+        &conn.out.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-mirror",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1RealRouteMirrorProbeHooks{ .effects = &effects },
+    );
+
+    // Denied locally...
+    try std.testing.expectEqual(@as(u16, 401), outcome.route_status);
+    // ...and the body never left the process.
+    try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
+    try std.testing.expect(std.mem.find(u8, conn.out.written(), "sensitive-payload") == null);
+}
+
+test "H1 authorized route still mirrors" {
+    // Positive control for the regression above: the fix must not disable
+    // mirroring for requests that were actually allowed.
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/open",
+            .priority = 0,
+            .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+        },
+    };
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{
+        .{ .method = "GET", .pattern = "^/open$", .target_url = "http://127.0.0.1:9002/mirror" },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+
+    var request = try http.Request.parseHead(
+        allocator,
+        "GET /open HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    defer request.request.deinit();
+
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.session_mutex = .{};
+    state.session_store = null;
+    state.logger = http.logger.Logger.init(.err, "test");
+    state.security_headers = .{};
+    state.add_headers = &.{};
+    state.http3_alt_svc = null;
+    var ctx = http.request_context.RequestContext.init(allocator, "req-open", "127.0.0.1");
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-open", 0);
+    var keep_alive = false;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try executeH1PostPreflightOrchestration(
+        &conn,
+        allocator,
+        &conn.out.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-open",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1RealRouteMirrorProbeHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, 200), outcome.route_status);
+    try std.testing.expectEqual(@as(usize, 1), effects.mirror_calls);
+}
+
+test "H2 duplicate HEADERS on a dispatched stream is refused, not re-dispatched" {
+    // Regression for the stream-lifecycle finding. The exploit sequence is:
+    //   1. client sends HEADERS+END_STREAM  -> stream half_closed_remote
+    //   2. the request dispatches; its response parks on send-credit
+    //      exhaustion, so `pending` no longer holds the stream but `streams`
+    //      still does
+    //   3. client sends a second HEADERS block on the SAME stream id
+    // Step 3 used to look like `initial_headers == true` (because the gate was
+    // `pending.contains(id)`) and built a second request on one stream,
+    // duplicating route/auth/handler execution.
+    const allocator = std.testing.allocator;
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer pending.deinit();
+
+    // A fresh stream accepts its first header block.
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 1));
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 1));
+
+    // Trailers are still legal while the remote half is open.
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 1));
+
+    // END_STREAM from the client.
+    try streams.getPtr(1).?.remoteEndStream();
+    try std.testing.expectEqual(http.http2_stream.StreamState.half_closed_remote, streams.get(1).?.state);
+
+    // Dispatch removes request-assembly state but keeps the stream alive for a
+    // parked response — exactly the window the old `pending`-based check missed.
+    try std.testing.expect(!pending.contains(1));
+    try std.testing.expect(streams.contains(1));
+
+    // The second HEADERS block must be refused on stream state alone.
+    try std.testing.expect(!h2StreamAcceptsInboundFrame(&streams, 1));
+    // DATA after END_STREAM is the same class of error.
+    try std.testing.expect(!h2StreamAcceptsInboundFrame(&streams, 1));
+
+    // A reset/closed stream is likewise refused, while other streams are
+    // unaffected.
+    try streams.put(3, http.http2_stream.Stream.init(3, 65_535));
+    streams.getPtr(3).?.close();
+    try std.testing.expect(!h2StreamAcceptsInboundFrame(&streams, 3));
+    try streams.put(5, http.http2_stream.Stream.init(5, 65_535));
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 5));
+
+    // half_closed_local (we finished responding, client may still send) stays
+    // receivable, so request bodies are not broken by this gate.
+    try streams.put(7, http.http2_stream.Stream.init(7, 65_535));
+    try streams.getPtr(7).?.localEndStream();
+    try std.testing.expectEqual(http.http2_stream.StreamState.half_closed_local, streams.get(7).?.state);
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 7));
+}
+
+test "H2 CONNECT is refused at stream scope instead of failing in the H1 adapter" {
+    // The validator accepts syntactically valid CONNECT (it is legal HTTP/2),
+    // so the contract has to be made explicit somewhere. Tardigrade does not
+    // implement tunneling, and the shared H1 adapter requires a `:path`, so
+    // CONNECT is refused on its own stream rather than reaching
+    // `respondHttp2Stream` and tearing down the connection with a generic
+    // `error.InvalidHttp2Request`.
+    try std.testing.expect(h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    }, true));
+    try std.testing.expect(h2HeaderBlockRequestsConnect(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    }));
+
+    // A malformed CONNECT is still a protocol error, not a refusal: scheme and
+    // path must be absent and the authority must be valid.
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+        .{ .name = ":path", .value = "/" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    }, true));
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+    }, true));
+
+    // Ordinary methods are not mistaken for CONNECT.
+    try std.testing.expect(!h2HeaderBlockRequestsConnect(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/" },
+    }));
+    // Nor is a header that merely carries the text.
+    try std.testing.expect(!h2HeaderBlockRequestsConnect(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = "x-upstream-method", .value = "CONNECT" },
+    }));
+}
+
+test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
+    const allocator = std.testing.allocator;
+    var decoder = http.hpack.Decoder.init();
+    defer decoder.deinit(allocator);
+
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer {
+        var it = pending.iterator();
+        while (it.next()) |entry| {
+            var ps = entry.value_ptr.*;
+            ps.deinit(allocator);
+        }
+        pending.deinit();
+    }
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try streams.put(3, http.http2_stream.Stream.init(3, 65_535));
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+
+    const block = try http.hpack.encodeLiteralHeaderBlock(allocator, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    });
+    defer allocator.free(block);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var buffered: usize = 0;
+
+    try h2ProcessHeaderBlock(
+        allocator,
+        &decoder,
+        &pending,
+        &streams,
+        &ready,
+        1,
+        block,
+        true,
+        false,
+        &out.writer,
+        1,
+        0,
+        &buffered,
+    );
+
+    // No request was assembled and nothing was queued for dispatch.
+    try std.testing.expect(!pending.contains(1));
+    try std.testing.expectEqual(@as(usize, 0), ready.items.len);
+    try std.testing.expectEqual(@as(usize, 0), buffered);
+    // The stream is closed, so the new lifecycle gate refuses follow-up frames
+    // on it, while an unrelated stream keeps working.
+    try std.testing.expectEqual(http.http2_stream.StreamState.closed, streams.get(1).?.state);
+    try std.testing.expect(!h2StreamAcceptsInboundFrame(&streams, 1));
+    try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 3));
+    // A RST_STREAM frame (type 0x3) for stream 1 was written, not a GOAWAY
+    // (type 0x7): the connection survives.
+    const written = out.written();
+    try std.testing.expect(written.len >= 9);
+    try std.testing.expectEqual(@as(u8, 0x3), written[3]);
+    const rst_stream_id: u32 = std.mem.readInt(u32, written[5..9], .big) & 0x7fff_ffff;
+    try std.testing.expectEqual(@as(u32, 1), rst_stream_id);
 }

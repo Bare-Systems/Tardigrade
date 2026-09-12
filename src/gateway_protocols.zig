@@ -7,6 +7,7 @@ const GatewayState = gs.GatewayState;
 const gp = @import("gateway_proxy.zig");
 const sendApiError = gp.sendApiError;
 const applyResponseHeaders = gp.applyResponseHeaders;
+const max_mail_reply_bytes: usize = 1024 * 1024;
 
 fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) !void {
     const recv_tv = std.posix.timeval{
@@ -515,7 +516,16 @@ pub fn handleSmtpProxyRoute(
         try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Upstream not configured", correlation_id, keep_alive, state);
         return;
     }
-    const upstream_payload = try injectSmtpAuthIdentity(allocator, body, auth_identity);
+    const upstream_payload = injectSmtpAuthIdentity(allocator, body, auth_identity) catch |err| switch (err) {
+        // A client-supplied reserved identity field is an attempt to forge or
+        // suppress the asserted identity; fail the request rather than
+        // forwarding either value upstream.
+        error.ReservedIdentityHeader, error.InvalidHeaderValue => {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Reserved identity header is not permitted", correlation_id, keep_alive, state);
+            return;
+        },
+        else => return err,
+    };
     defer if (upstream_payload.ptr != body.ptr) allocator.free(upstream_payload);
     const resp = blk: {
         const maybe_mail_endpoint = parseMailProxyEndpoint(endpoint) catch |err| {
@@ -549,16 +559,37 @@ pub fn handleSmtpProxyRoute(
     state.metricsRecord(200);
 }
 
+/// Reserved header-name prefix that only Tardigrade may assert upstream. The
+/// HTTP boundary strips these from inbound requests
+/// (`shouldSkipUpstreamRequestHeader`); the SMTP boundary must do the same for
+/// the message-header section carried inside DATA.
+const RESERVED_SMTP_HEADER_PREFIX = "X-Tardigrade-";
+
+/// Rewrite an SMTP payload so the asserted identity upstream is exactly the one
+/// Tardigrade authenticated.
+///
+/// This is a trust boundary, not a convenience: a client-supplied
+/// `X-Tardigrade-*` field inside DATA is rejected regardless of whether this
+/// request is authenticated, so a caller can neither forge an identity nor
+/// suppress the authoritative one by pre-supplying the header. Only the
+/// message-header section is inspected, so body text that merely looks like a
+/// reserved field is not mistaken for one.
 fn injectSmtpAuthIdentity(
     allocator: std.mem.Allocator,
     payload: []const u8,
     auth_identity: ?[]const u8,
 ) ![]const u8 {
+    const data_start = findSmtpDataStart(payload) orelse {
+        // No DATA command: there is no message-header section to assert into,
+        // and nothing downstream will read one.
+        return payload;
+    };
+    const header_section = smtpHeaderSection(payload, data_start);
+    if (smtpReservedHeaderPresent(header_section)) return error.ReservedIdentityHeader;
+
     const identity = auth_identity orelse return payload;
     if (identity.len == 0) return payload;
-
-    const data_start = findSmtpDataStart(payload) orelse return payload;
-    if (std.mem.findPos(u8, payload, data_start, "X-Tardigrade-Auth-Identity:")) |_| return payload;
+    if (!http.headers.isValidHeaderValue(identity)) return error.InvalidHeaderValue;
 
     const header_line = try std.fmt.allocPrint(allocator, "X-Tardigrade-Auth-Identity: {s}\r\n", .{identity});
     defer allocator.free(header_line);
@@ -578,9 +609,56 @@ fn injectSmtpAuthIdentity(
     );
 }
 
+/// The message-header section is everything from the end of the DATA command
+/// through the blank line that ends the headers. When no blank line exists the
+/// whole remainder is treated as header space, which fails closed: a reserved
+/// field anywhere in it is still rejected.
+fn smtpHeaderSection(payload: []const u8, data_start: usize) []const u8 {
+    const end = std.mem.findPos(u8, payload, data_start, "\r\n\r\n") orelse payload.len;
+    return payload[data_start..end];
+}
+
+/// True when the header section contains a field whose name starts with the
+/// reserved prefix. Field names are matched case-insensitively (RFC 5322 header
+/// names are case-insensitive) and only at the start of a field line, so
+/// continuation lines and body-like text cannot trigger or evade this.
+fn smtpReservedHeaderPresent(header_section: []const u8) bool {
+    var it = std.mem.splitSequence(u8, header_section, "\r\n");
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        // Obs-fold continuation: part of the previous field's value, never a
+        // new field name.
+        if (line[0] == ' ' or line[0] == '\t') continue;
+        if (line.len < RESERVED_SMTP_HEADER_PREFIX.len) continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..RESERVED_SMTP_HEADER_PREFIX.len], RESERVED_SMTP_HEADER_PREFIX)) continue;
+        // Only a real field (`name:`) counts; tolerate whitespace before the
+        // colon so a lenient upstream parser cannot be played against us.
+        var idx = RESERVED_SMTP_HEADER_PREFIX.len;
+        while (idx < line.len and line[idx] != ':') : (idx += 1) {
+            if (line[idx] == ' ' or line[idx] == '\t') {
+                // Whitespace may only appear immediately before the colon.
+                var probe = idx;
+                while (probe < line.len and (line[probe] == ' ' or line[probe] == '\t')) : (probe += 1) {}
+                if (probe < line.len and line[probe] == ':') return true;
+                break;
+            }
+        }
+        if (idx < line.len and line[idx] == ':') return true;
+    }
+    return false;
+}
+
+/// SMTP command verbs are case-insensitive (RFC 5321 §2.4), so `data\r\n` must
+/// start the message the same way `DATA\r\n` does.
 fn findSmtpDataStart(payload: []const u8) ?usize {
-    if (std.mem.startsWith(u8, payload, "DATA\r\n")) return "DATA\r\n".len;
-    if (std.mem.find(u8, payload, "\r\nDATA\r\n")) |idx| return idx + "\r\nDATA\r\n".len;
+    var offset: usize = 0;
+    while (offset < payload.len) {
+        const line_end = std.mem.findPos(u8, payload, offset, "\r\n") orelse return null;
+        const line = payload[offset..line_end];
+        const verb = std.mem.trim(u8, line, " \t");
+        if (std.ascii.eqlIgnoreCase(verb, "DATA")) return line_end + 2;
+        offset = line_end + 2;
+    }
     return null;
 }
 
@@ -655,14 +733,12 @@ fn executeSmtpTlsRequest(
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
-    _ = host;
-    var tls_client = try std.crypto.tls.Client.init(stream, .{
-        .host = .no_verification,
-        .ca = .no_verification,
+    var tls_client = try http.upstream_tls.UpstreamTlsConn.connect(stream.handle, host, .{
+        .alpn_policy = .non_http_no_alpn,
     });
-    tls_client.allow_truncation_attacks = true;
-    try tls_client.writeAll(stream, payload);
-    return readSmtpReplyTls(allocator, &tls_client, stream);
+    defer tls_client.deinit();
+    try tls_client.writeAll(payload);
+    return readSmtpReplyTls(allocator, &tls_client);
 }
 
 fn executeSmtpStartTlsRequest(
@@ -671,7 +747,6 @@ fn executeSmtpStartTlsRequest(
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
-    _ = host;
     const greeting = try readSmtpReplyPlain(allocator, stream);
     defer allocator.free(greeting);
     if (!smtpReplyContainsCode(greeting, "220")) return error.ProtocolError;
@@ -686,19 +761,18 @@ fn executeSmtpStartTlsRequest(
     defer allocator.free(starttls_reply);
     if (!smtpReplyContainsCode(starttls_reply, "220")) return error.ProtocolError;
 
-    var tls_client = try std.crypto.tls.Client.init(stream, .{
-        .host = .no_verification,
-        .ca = .no_verification,
+    var tls_client = try http.upstream_tls.UpstreamTlsConn.connect(stream.handle, host, .{
+        .alpn_policy = .non_http_no_alpn,
     });
-    tls_client.allow_truncation_attacks = true;
+    defer tls_client.deinit();
 
-    try tls_client.writeAll(stream, "EHLO tardigrade.local\r\n");
-    const post_tls_ehlo = try readSmtpReplyTls(allocator, &tls_client, stream);
+    try tls_client.writeAll("EHLO tardigrade.local\r\n");
+    const post_tls_ehlo = try readSmtpReplyTls(allocator, &tls_client);
     defer allocator.free(post_tls_ehlo);
     if (!smtpReplyContainsCode(post_tls_ehlo, "250")) return error.ProtocolError;
 
-    try tls_client.writeAll(stream, payload);
-    return readSmtpReplyTls(allocator, &tls_client, stream);
+    try tls_client.writeAll(payload);
+    return readSmtpReplyTls(allocator, &tls_client);
 }
 
 fn executeImapTlsRequest(
@@ -707,19 +781,17 @@ fn executeImapTlsRequest(
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
-    _ = host;
-    var tls_client = try std.crypto.tls.Client.init(stream, .{
-        .host = .no_verification,
-        .ca = .no_verification,
+    var tls_client = try http.upstream_tls.UpstreamTlsConn.connect(stream.handle, host, .{
+        .alpn_policy = .non_http_no_alpn,
     });
-    tls_client.allow_truncation_attacks = true;
+    defer tls_client.deinit();
 
-    const greeting = try readImapReplyTls(allocator, &tls_client, stream, null);
+    const greeting = try readImapReplyTls(allocator, &tls_client, null);
     defer allocator.free(greeting);
     if (!imapReplyContainsOk(greeting)) return error.ProtocolError;
 
-    try tls_client.writeAll(stream, payload);
-    return readImapReplyTls(allocator, &tls_client, stream, imapPayloadTag(payload));
+    try tls_client.writeAll(payload);
+    return readImapReplyTls(allocator, &tls_client, imapPayloadTag(payload));
 }
 
 fn executeImapStartTlsRequest(
@@ -728,7 +800,6 @@ fn executeImapStartTlsRequest(
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
-    _ = host;
     const greeting = try readImapReplyPlain(allocator, stream, null);
     defer allocator.free(greeting);
     if (!imapReplyContainsOk(greeting)) return error.ProtocolError;
@@ -738,14 +809,18 @@ fn executeImapStartTlsRequest(
     defer allocator.free(starttls_reply);
     if (!imapTaggedReplyContainsOk(starttls_reply, "a001")) return error.ProtocolError;
 
-    var tls_client = try std.crypto.tls.Client.init(stream, .{
-        .host = .no_verification,
-        .ca = .no_verification,
+    var tls_client = try http.upstream_tls.UpstreamTlsConn.connect(stream.handle, host, .{
+        .alpn_policy = .non_http_no_alpn,
     });
-    tls_client.allow_truncation_attacks = true;
+    defer tls_client.deinit();
 
-    try tls_client.writeAll(stream, payload);
-    return readImapReplyTls(allocator, &tls_client, stream, imapPayloadTag(payload));
+    try tls_client.writeAll(payload);
+    return readImapReplyTls(allocator, &tls_client, imapPayloadTag(payload));
+}
+
+fn appendMailReply(out: *std.array_list.Managed(u8), bytes: []const u8) !void {
+    if (bytes.len > max_mail_reply_bytes -| out.items.len) return error.ResponseTooLarge;
+    try out.appendSlice(bytes);
 }
 
 fn readSmtpReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream) ![]u8 {
@@ -755,21 +830,21 @@ fn readSmtpReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream) ![
     while (true) {
         const n = try stream.read(&buf);
         if (n == 0) break;
-        try out.appendSlice(buf[0..n]);
+        try appendMailReply(&out, buf[0..n]);
         if (smtpReplyComplete(out.items)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
     return out.toOwnedSlice();
 }
 
-fn readSmtpReplyTls(allocator: std.mem.Allocator, tls_client: *std.crypto.tls.Client, stream: compat.NetStream) ![]u8 {
+fn readSmtpReplyTls(allocator: std.mem.Allocator, tls_client: *http.upstream_tls.UpstreamTlsConn) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
-        const n = try tls_client.read(stream, &buf);
+        const n = try tls_client.read(&buf);
         if (n == 0) break;
-        try out.appendSlice(buf[0..n]);
+        try appendMailReply(&out, buf[0..n]);
         if (smtpReplyComplete(out.items)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
@@ -783,7 +858,7 @@ fn readImapReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream, ta
     while (true) {
         const n = try stream.read(&buf);
         if (n == 0) break;
-        try out.appendSlice(buf[0..n]);
+        try appendMailReply(&out, buf[0..n]);
         if (imapReplyComplete(out.items, tag)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
@@ -792,17 +867,16 @@ fn readImapReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream, ta
 
 fn readImapReplyTls(
     allocator: std.mem.Allocator,
-    tls_client: *std.crypto.tls.Client,
-    stream: compat.NetStream,
+    tls_client: *http.upstream_tls.UpstreamTlsConn,
     tag: ?[]const u8,
 ) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
-        const n = try tls_client.read(stream, &buf);
+        const n = try tls_client.read(&buf);
         if (n == 0) break;
-        try out.appendSlice(buf[0..n]);
+        try appendMailReply(&out, buf[0..n]);
         if (imapReplyComplete(out.items, tag)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
@@ -906,8 +980,9 @@ fn executeUdpDatagramRequest(allocator: std.mem.Allocator, endpoint: []const u8,
     const sock = std.c.socket(sock_family, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
     if (sock < 0) return error.SocketFailed;
     defer _ = std.c.close(sock);
+    try setSocketTimeoutMs(sock, 2_000, 2_000);
     const sent = std.c.sendto(sock, payload.ptr, payload.len, 0, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in));
-    if (sent < 0) return error.SendFailed;
+    if (sent < 0 or sent != payload.len) return error.SendFailed;
     var buf: [16 * 1024]u8 = undefined;
     const n = std.c.recv(sock, &buf, buf.len, 0);
     if (n < 0) return error.RecvFailed;
@@ -919,27 +994,145 @@ const MemcachedPayload = struct {
     key: []u8,
     value: ?[]u8 = null,
     ttl: u32 = 60,
+
+    fn deinit(self: *MemcachedPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.op);
+        allocator.free(self.key);
+        if (self.value) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 
 fn parseMemcachedPayload(allocator: std.mem.Allocator, body: []const u8) !MemcachedPayload {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
     const obj = parsed.value.object;
     const op_val = obj.get("op") orelse return error.InvalidPayload;
     const key_val = obj.get("key") orelse return error.InvalidPayload;
     if (op_val != .string or key_val != .string) return error.InvalidPayload;
-    const val = if (obj.get("value")) |v| blk: {
+    const value = if (obj.get("value")) |v| blk: {
         if (v != .string) break :blk null;
         break :blk try allocator.dupe(u8, v.string);
     } else null;
+    errdefer if (value) |owned| allocator.free(owned);
     const ttl = if (obj.get("ttl")) |t|
-        if (t == .integer and t.integer >= 0) @as(u32, @intCast(t.integer)) else 60
+        if (t == .integer and t.integer >= 0 and t.integer <= std.math.maxInt(u32)) @as(u32, @intCast(t.integer)) else return error.InvalidPayload
     else
         60;
+    const op = try allocator.dupe(u8, op_val.string);
+    errdefer allocator.free(op);
+    const key = try allocator.dupe(u8, key_val.string);
     return .{
-        .op = try allocator.dupe(u8, op_val.string),
-        .key = try allocator.dupe(u8, key_val.string),
-        .value = val,
+        .op = op,
+        .key = key,
+        .value = value,
         .ttl = ttl,
     };
+}
+
+test "mail replies and memcached payloads fail closed at parser limits" {
+    const allocator = std.testing.allocator;
+    var out = std.array_list.Managed(u8).init(allocator);
+    defer out.deinit();
+    try out.resize(max_mail_reply_bytes);
+    try std.testing.expectError(error.ResponseTooLarge, appendMailReply(&out, "x"));
+
+    try std.testing.expectError(error.InvalidPayload, parseMemcachedPayload(allocator, "[]"));
+    try std.testing.expectError(error.InvalidPayload, parseMemcachedPayload(allocator, "{\"op\":\"get\",\"key\":\"k\",\"ttl\":4294967296}"));
+    var payload = try parseMemcachedPayload(allocator, "{\"op\":\"set\",\"key\":\"k\",\"value\":\"v\",\"ttl\":30}");
+    defer payload.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 30), payload.ttl);
+
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        injectSmtpAuthIdentity(allocator, "DATA\r\nbody\r\n.\r\n", "user\r\nX-Injected: yes"),
+    );
+}
+
+test "SMTP asserted identity is a trust boundary, not a client-supplied hint" {
+    const allocator = std.testing.allocator;
+    const authoritative = "alice@example.com";
+
+    // Exact-case forgery by an authenticated client must not suppress or
+    // override the authoritative identity.
+    try std.testing.expectError(error.ReservedIdentityHeader, injectSmtpAuthIdentity(
+        allocator,
+        "MAIL FROM:<a@b>\r\nDATA\r\nX-Tardigrade-Auth-Identity: attacker\r\nSubject: hi\r\n\r\nbody\r\n.\r\n",
+        authoritative,
+    ));
+
+    // Header names are case-insensitive; a lowercase spelling must not slip
+    // past and coexist with the injected canonical field.
+    try std.testing.expectError(error.ReservedIdentityHeader, injectSmtpAuthIdentity(
+        allocator,
+        "DATA\r\nx-tardigrade-auth-identity: attacker\r\n\r\nbody\r\n.\r\n",
+        authoritative,
+    ));
+
+    // An UNAUTHENTICATED client must not be able to smuggle a reserved field
+    // upstream: with no authoritative identity the payload was previously
+    // forwarded untouched.
+    try std.testing.expectError(error.ReservedIdentityHeader, injectSmtpAuthIdentity(
+        allocator,
+        "DATA\r\nX-Tardigrade-Auth-Identity: attacker\r\n\r\nbody\r\n.\r\n",
+        null,
+    ));
+
+    // Sibling reserved fields are the same boundary.
+    try std.testing.expectError(error.ReservedIdentityHeader, injectSmtpAuthIdentity(
+        allocator,
+        "DATA\r\nX-Tardigrade-User-ID: 7\r\n\r\nbody\r\n.\r\n",
+        authoritative,
+    ));
+    // Whitespace before the colon must not evade detection.
+    try std.testing.expectError(error.ReservedIdentityHeader, injectSmtpAuthIdentity(
+        allocator,
+        "DATA\r\nX-Tardigrade-Auth-Identity : attacker\r\n\r\nbody\r\n.\r\n",
+        authoritative,
+    ));
+
+    // SMTP verbs are case-insensitive: lowercase `data` must still be found,
+    // so injection cannot be bypassed by changing the command's case.
+    {
+        const out = try injectSmtpAuthIdentity(allocator, "data\r\nSubject: hi\r\n\r\nbody\r\n.\r\n", authoritative);
+        defer allocator.free(out);
+        try std.testing.expect(std.mem.find(u8, out, "X-Tardigrade-Auth-Identity: alice@example.com\r\n") != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "X-Tardigrade-Auth-Identity:"));
+    }
+
+    // Body text that merely looks like the reserved field is NOT a header and
+    // must not suppress injection.
+    {
+        const out = try injectSmtpAuthIdentity(
+            allocator,
+            "DATA\r\nSubject: hi\r\n\r\nX-Tardigrade-Auth-Identity: not-a-header\r\n.\r\n",
+            authoritative,
+        );
+        defer allocator.free(out);
+        const injected_at = std.mem.find(u8, out, "X-Tardigrade-Auth-Identity: alice@example.com\r\n");
+        try std.testing.expect(injected_at != null);
+        // The authoritative field lands in the header section, ahead of the
+        // blank line that starts the body.
+        try std.testing.expect(injected_at.? < std.mem.find(u8, out, "\r\n\r\n").?);
+    }
+
+    // A continuation (obs-fold) line is part of the previous value, not a new
+    // field name, and must not be misread as a reserved field.
+    {
+        const out = try injectSmtpAuthIdentity(
+            allocator,
+            "DATA\r\nSubject: see\r\n X-Tardigrade-Auth-Identity: folded\r\n\r\nbody\r\n.\r\n",
+            authoritative,
+        );
+        defer allocator.free(out);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "X-Tardigrade-Auth-Identity: alice@example.com"));
+    }
+
+    // No DATA command at all: nothing to assert into, payload is untouched.
+    {
+        const payload = "NOOP\r\n";
+        const out = try injectSmtpAuthIdentity(allocator, payload, authoritative);
+        try std.testing.expectEqual(payload.ptr, out.ptr);
+    }
 }

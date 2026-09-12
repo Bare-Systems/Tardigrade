@@ -148,24 +148,22 @@ pub fn buildUpstreamEnvelope(
     client_ip: []const u8,
     api_version: ?u16,
 ) ![]u8 {
-    const version_str = if (api_version) |v|
-        try std.fmt.allocPrint(allocator, "{d}", .{v})
-    else
-        try allocator.dupe(u8, "null");
-    defer allocator.free(version_str);
+    var params = std.json.parseFromSlice(std.json.Value, allocator, params_raw, .{}) catch return error.InvalidParams;
+    defer params.deinit();
+    if (params.value != .object) return error.InvalidParams;
 
-    return std.fmt.allocPrint(allocator,
-        \\{{"command":"{s}","command_id":"{s}","params":{s},"context":{{"correlation_id":"{s}","identity":"{s}","client_ip":"{s}","api_version":{s},"timestamp":{d}}}}}
-    , .{
-        command_type.toString(),
-        command_id,
-        params_raw,
-        correlation_id,
-        identity,
-        client_ip,
-        version_str,
-        compat.unixTimestamp(),
-    });
+    return compat.stringifyAlloc(allocator, .{
+        .command = command_type.toString(),
+        .command_id = command_id,
+        .params = params.value,
+        .context = .{
+            .correlation_id = correlation_id,
+            .identity = identity,
+            .client_ip = client_ip,
+            .api_version = api_version,
+            .timestamp = compat.unixTimestamp(),
+        },
+    }, .{});
 }
 
 /// Audit record for a processed command.
@@ -290,6 +288,41 @@ test "buildUpstreamEnvelope produces valid JSON" {
     try std.testing.expectEqualStrings("user-abc", ctx.get("identity").?.string);
     try std.testing.expectEqualStrings("10.0.0.1", ctx.get("client_ip").?.string);
     try std.testing.expectEqual(@as(i64, 1), ctx.get("api_version").?.integer);
+}
+
+test "buildUpstreamEnvelope cannot be reshaped by caller metadata or params" {
+    const allocator = std.testing.allocator;
+    const command_id = "cmd\"},\"forged\":true,\"tail\":\"";
+    const correlation_id = "corr\r\nquoted";
+    const identity = "alice\"},\"admin\":true,\"tail\":\"";
+    const envelope = try buildUpstreamEnvelope(
+        allocator,
+        .tool_run,
+        "{\"nested\":{\"ok\":true},\"text\":\"} trailing-looking\"}",
+        command_id,
+        correlation_id,
+        identity,
+        "2001:db8::1",
+        null,
+    );
+    defer allocator.free(envelope);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, envelope, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings(command_id, object.get("command_id").?.string);
+    try std.testing.expect(object.get("forged") == null);
+    try std.testing.expect(object.get("admin") == null);
+    try std.testing.expect(object.get("params").?.object.get("nested").?.object.get("ok").?.bool);
+    const context = object.get("context").?.object;
+    try std.testing.expectEqualStrings(correlation_id, context.get("correlation_id").?.string);
+    try std.testing.expectEqualStrings(identity, context.get("identity").?.string);
+    try std.testing.expect(context.get("admin") == null);
+
+    try std.testing.expectError(
+        error.InvalidParams,
+        buildUpstreamEnvelope(allocator, .status, "{} trailing", "cmd", "corr", "identity", "127.0.0.1", null),
+    );
 }
 
 test "buildUpstreamEnvelope null api_version" {

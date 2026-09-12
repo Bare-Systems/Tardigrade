@@ -70,9 +70,13 @@ pub const UpstreamAlpnPolicy = enum {
     require_http1,
     require_h2,
     prefer_h2_allow_http1,
+    /// TLS for protocols such as SMTP and IMAP that do not negotiate an
+    /// application protocol with ALPN. The connection is still fully
+    /// certificate- and hostname-verified.
+    non_http_no_alpn,
 
     pub fn offersH2(self: UpstreamAlpnPolicy) bool {
-        return self != .require_http1;
+        return self == .require_h2 or self == .prefer_h2_allow_http1;
     }
 
     /// The ALPN protocol names this policy offers in the ClientHello, most
@@ -82,6 +86,7 @@ pub const UpstreamAlpnPolicy = enum {
             .require_http1 => &http1_only_alpns,
             .require_h2 => &h2_only_alpns,
             .prefer_h2_allow_http1 => &h2_and_http1_alpns,
+            .non_http_no_alpn => &.{},
         };
     }
 
@@ -94,17 +99,25 @@ pub const UpstreamAlpnPolicy = enum {
     /// ALPN enforcement can never silently downgrade a `require_h2`
     /// upstream to HTTP/1.1 or vice versa.
     pub fn select(self: UpstreamAlpnPolicy, selected_alpn: ?[]const u8) TlsError!NegotiatedProtocol {
+        if (self == .non_http_no_alpn) {
+            if (selected_alpn != null) return error.NoApplicationProtocol;
+            // `protocol` is only observed by HTTP callers. Keep the existing
+            // storage type while non-HTTP callers deliberately ignore it.
+            return .http1_1;
+        }
         const selected = selected_alpn orelse return error.NoApplicationProtocol;
         if (std.mem.eql(u8, selected, "h2")) {
             return switch (self) {
                 .require_http1 => error.NoApplicationProtocol,
                 .require_h2, .prefer_h2_allow_http1 => .http2,
+                .non_http_no_alpn => error.NoApplicationProtocol,
             };
         }
         if (std.mem.eql(u8, selected, "http/1.1")) {
             return switch (self) {
                 .require_http1, .prefer_h2_allow_http1 => .http1_1,
                 .require_h2 => error.NoApplicationProtocol,
+                .non_http_no_alpn => error.NoApplicationProtocol,
             };
         }
         return error.NoApplicationProtocol;
@@ -119,6 +132,7 @@ test "upstream ALPN policy validates selected protocol strictly" {
     try std.testing.expect(!UpstreamAlpnPolicy.require_http1.offersH2());
     try std.testing.expect(UpstreamAlpnPolicy.require_h2.offersH2());
     try std.testing.expect(UpstreamAlpnPolicy.prefer_h2_allow_http1.offersH2());
+    try std.testing.expect(!UpstreamAlpnPolicy.non_http_no_alpn.offersH2());
 
     try std.testing.expectEqual(NegotiatedProtocol.http1_1, try UpstreamAlpnPolicy.require_http1.select("http/1.1"));
     try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.require_http1.select("h2"));
@@ -132,6 +146,8 @@ test "upstream ALPN policy validates selected protocol strictly" {
     try std.testing.expectEqual(NegotiatedProtocol.http1_1, try UpstreamAlpnPolicy.prefer_h2_allow_http1.select("http/1.1"));
     try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.prefer_h2_allow_http1.select("spdy/3"));
     try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.prefer_h2_allow_http1.select(null));
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try UpstreamAlpnPolicy.non_http_no_alpn.select(null));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.non_http_no_alpn.select("http/1.1"));
 }
 
 /// A native (pure-Zig) TLS client connection to a TCP stream, used for
@@ -224,7 +240,7 @@ pub const UpstreamTlsConn = struct {
                 .named_groups = tls_core.tls13_backend.native_capabilities.named_groups,
                 .signature_schemes = tls_core.tls13_backend.native_capabilities.signature_schemes,
                 .alpn_protocols = opts.alpn_policy.alpnProtocols(),
-                .allow_absent_alpn = false,
+                .allow_absent_alpn = opts.alpn_policy == .non_http_no_alpn,
             },
         };
         const client_options = tls_core.tls13_backend.Tls13Backend.ClientOptions{

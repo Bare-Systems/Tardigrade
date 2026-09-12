@@ -206,6 +206,7 @@ pub const max_response_len: usize = 1024 * 1024;
 /// population production QUIC would refuse), corrected separately. Triage of
 /// that defect is what exposed this independent missing bound.
 pub const default_max_pending_uni: usize = 512;
+pub const default_max_buffered_request_bytes: usize = 2 * 1024 * 1024;
 
 pub const Response = struct {
     status: u16,
@@ -246,6 +247,14 @@ pub fn Conn(comptime Transport: type) type {
         /// the control structurally unreachable under fuzzing the way #749's
         /// receive-segment cap was (FINDING F8).
         max_pending_uni: usize = default_max_pending_uni,
+        /// Application request-body ceiling supplied by the embedding
+        /// gateway. RequestStream enforces it while DATA frames arrive.
+        max_request_body_bytes: usize = session.RequestStream.default_max_body_len,
+        /// Aggregate dynamic memory retained by all in-flight request
+        /// assemblers.  This closes the multiplicative gap left by a
+        /// per-request body limit when many streams are held concurrently.
+        max_buffered_request_bytes: usize = default_max_buffered_request_bytes,
+        buffered_request_bytes: usize = 0,
         /// Server: in-flight request decoding sessions by stream id.
         requests: std.AutoHashMap(u64, *ServerRequest),
         /// PRIORITY_UPDATE frames may overtake their request streams; retain
@@ -593,7 +602,7 @@ pub fn Conn(comptime Transport: type) type {
                     }
                     const request = self.allocator.create(ServerRequest) catch return error.OutOfMemory;
                     request.* = .{
-                        .stream = session.RequestStream.init(self.allocator, id),
+                        .stream = session.RequestStream.initWithBodyLimit(self.allocator, id, self.max_request_body_bytes),
                         .transport_early = transportStreamTransportEarly(transport, id),
                     };
                     self.events.emit(.{ .stream_type_set = .{ .stream_id = id, .stream_type = .request } });
@@ -869,7 +878,15 @@ pub fn Conn(comptime Transport: type) type {
                     if (result.len > 0) {
                         var observer = RequestFrameObserver{ .conn = self, .stream_id = id };
                         const frame_observer = if (self.events.emitFn != null) observer.observer() else null;
-                        _ = request.stream.ingestBytesWithObserver(buf[0..result.len], &qpack_scratch, frame_observer) catch |err| {
+                        const retained_before = request.stream.retainedBytes();
+                        const ingest_result = request.stream.ingestBytesWithObserver(buf[0..result.len], &qpack_scratch, frame_observer);
+                        const retained_after = request.stream.retainedBytes();
+                        self.buffered_request_bytes -= @min(self.buffered_request_bytes, retained_before);
+                        if (retained_after > self.max_buffered_request_bytes -| self.buffered_request_bytes) {
+                            return self.fail(.excessive_load);
+                        }
+                        self.buffered_request_bytes += retained_after;
+                        _ = ingest_result catch |err| {
                             if (err == error.UnexpectedFrame) return self.fail(.frame_unexpected);
                             return self.fail(.message_error);
                         };
@@ -1271,6 +1288,7 @@ pub fn Conn(comptime Transport: type) type {
 
         pub fn finishRequest(self: *Self, stream_id: u64) void {
             if (self.requests.fetchRemove(stream_id)) |entry| {
+                self.buffered_request_bytes -= @min(self.buffered_request_bytes, entry.value.stream.retainedBytes());
                 entry.value.stream.deinit();
                 self.allocator.destroy(entry.value);
             }
@@ -2431,6 +2449,49 @@ test "H3 conn: polls completed requests by urgency and reports priority" {
     try testing.expectEqualStrings("/slow", second.exchange.request.path);
     try testing.expectEqual(priority.Priority{ .urgency = 6, .incremental = false }, second.priority);
     server.finishRequest(second.stream_id);
+}
+
+test "H3 conn: aggregate request memory is bounded across concurrent streams" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+    server.max_request_body_bytes = 1024;
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    _ = try client.sendRequest(&client_transport, .{
+        .authority = "tardigrade.test",
+        .path = "/held-one",
+        .body = "a" ** 256,
+    });
+    try server.pump(&server_transport);
+    const first_retained = server.buffered_request_bytes;
+    try testing.expect(first_retained > 0);
+
+    // Leave the first completed request retained and admit a second request
+    // whose own body is below the per-stream limit.  The aggregate ceiling,
+    // not the per-stream ceiling, must terminate the connection.
+    server.max_buffered_request_bytes = first_retained + 1;
+    _ = try client.sendRequest(&client_transport, .{
+        .authority = "tardigrade.test",
+        .path = "/held-two",
+        .body = "b" ** 256,
+    });
+    try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+    try testing.expectEqual(ErrorCode.excessive_load.wire(), server.closeCode());
 }
 
 test "H3 conn: PRIORITY_UPDATE on control stream updates request priority" {

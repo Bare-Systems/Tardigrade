@@ -32,6 +32,9 @@ pub const SessionError = error{
     UnexpectedFrame,
     InvalidStatus,
     QpackDecodeFailed,
+    InvalidHeader,
+    InvalidContentLength,
+    BodyTooLarge,
     OutputOverflow,
     OutOfMemory,
 };
@@ -47,6 +50,7 @@ pub const Metrics = struct {
 
 pub const RequestStream = struct {
     pub const max_frame_payload_len: usize = 1024 * 1024;
+    pub const default_max_body_len: usize = 1024 * 1024;
 
     allocator: std.mem.Allocator,
     stream_id: u64,
@@ -64,9 +68,14 @@ pub const RequestStream = struct {
     saw_headers: bool = false,
     saw_data: bool = false,
     finished: bool = false,
+    max_body_len: usize = default_max_body_len,
 
     pub fn init(allocator: std.mem.Allocator, stream_id: u64) RequestStream {
         return .{ .allocator = allocator, .stream_id = stream_id };
+    }
+
+    pub fn initWithBodyLimit(allocator: std.mem.Allocator, stream_id: u64, max_body_len: usize) RequestStream {
+        return .{ .allocator = allocator, .stream_id = stream_id, .max_body_len = max_body_len };
     }
 
     pub fn deinit(self: *RequestStream) void {
@@ -82,6 +91,24 @@ pub const RequestStream = struct {
         self.headers.deinit(self.allocator);
         self.body.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Dynamic bytes retained for this in-flight request.  The HTTP/3
+    /// connection uses this to enforce an aggregate per-connection budget;
+    /// a per-stream body limit alone still permits many concurrent streams to
+    /// multiply memory use.
+    pub fn retainedBytes(self: *const RequestStream) usize {
+        var total = self.pending.capacity +| self.body.capacity;
+        total +|= self.headers.capacity *| @sizeOf(stream_transport.Header);
+        if (self.method) |value| total +|= value.len;
+        if (self.scheme) |value| total +|= value.len;
+        if (self.authority) |value| total +|= value.len;
+        if (self.path) |value| total +|= value.len;
+        for (self.headers.items) |header| {
+            total +|= header.name.len;
+            total +|= header.value.len;
+        }
+        return total;
     }
 
     pub fn ingestBytes(self: *RequestStream, bytes: []const u8, qpack_scratch: []u8) SessionError!usize {
@@ -120,6 +147,7 @@ pub const RequestStream = struct {
             .data => {
                 if (!self.saw_headers) return error.InvalidRequestFrame;
                 self.saw_data = true;
+                if (raw.payload.len > self.max_body_len -| self.body.items.len) return error.BodyTooLarge;
                 try self.body.appendSlice(self.allocator, raw.payload);
             },
             .goaway => return error.InvalidRequestFrame,
@@ -133,6 +161,9 @@ pub const RequestStream = struct {
         var fields: [128]qpack.HeaderField = undefined;
         const count = qpack.decode(payload, &fields, qpack_scratch) catch return error.QpackDecodeFailed;
         var regular_seen = false;
+        var host: ?[]const u8 = null;
+        var authorization_seen = false;
+        var content_length_seen = false;
         var priority_seen = false;
         var priority_value: std.ArrayList(u8) = .empty;
         defer priority_value.deinit(self.allocator);
@@ -142,12 +173,32 @@ pub const RequestStream = struct {
                 try self.applyPseudoHeader(field);
             } else {
                 regular_seen = true;
+                if (!validH3HeaderName(field.name) or !validH3HeaderValue(field.value)) return error.InvalidHeader;
+                if (std.mem.eql(u8, field.name, "host")) {
+                    if (host != null) return error.InvalidHeader;
+                    host = field.value;
+                }
+                if (std.mem.eql(u8, field.name, "authorization")) {
+                    if (authorization_seen) return error.InvalidHeader;
+                    authorization_seen = true;
+                }
+                if (std.mem.eql(u8, field.name, "content-length")) {
+                    if (content_length_seen) return error.InvalidContentLength;
+                    content_length_seen = true;
+                }
+                if (h3ConnectionSpecificHeader(field.name, field.value)) return error.InvalidHeader;
                 if (std.ascii.eqlIgnoreCase(field.name, "priority")) {
                     if (priority_seen) try priority_value.appendSlice(self.allocator, ", ");
                     try priority_value.appendSlice(self.allocator, field.value);
                     priority_seen = true;
                 }
                 try self.appendHeader(field.name, field.value);
+            }
+        }
+        if (self.authority) |authority| {
+            if (!validH3HeaderValue(authority)) return error.InvalidHeader;
+            if (host) |host_value| {
+                if (!std.ascii.eqlIgnoreCase(authority, host_value)) return error.InvalidHeader;
             }
         }
         if (priority_seen) {
@@ -167,6 +218,7 @@ pub const RequestStream = struct {
     }
 
     fn applyPseudoHeader(self: *RequestStream, field: qpack.HeaderField) SessionError!void {
+        if (!validH3HeaderValue(field.value)) return error.InvalidHeader;
         if (std.mem.eql(u8, field.name, ":method")) return replaceOnce(self.allocator, &self.method, field.value);
         if (std.mem.eql(u8, field.name, ":scheme")) return replaceOnce(self.allocator, &self.scheme, field.value);
         if (std.mem.eql(u8, field.name, ":authority")) return replaceOnce(self.allocator, &self.authority, field.value);
@@ -188,6 +240,19 @@ pub const RequestStream = struct {
         const scheme = self.scheme orelse return error.MissingRequiredPseudoHeader;
         const authority = self.authority orelse return error.MissingRequiredPseudoHeader;
         const path = self.path orelse return error.MissingRequiredPseudoHeader;
+        if (!validH3Method(method) or
+            !(std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https")) or
+            !validH3Path(path) or
+            !validH3Authority(authority))
+        {
+            return error.InvalidHeader;
+        }
+        for (self.headers.items) |header| {
+            if (std.mem.eql(u8, header.name, "content-length")) {
+                const declared = std.fmt.parseInt(usize, header.value, 10) catch return error.InvalidContentLength;
+                if (declared != self.body.items.len) return error.InvalidContentLength;
+            }
+        }
         self.finished = true;
         return .{
             .request = .{
@@ -201,6 +266,72 @@ pub const RequestStream = struct {
         };
     }
 };
+
+fn validH3HeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        // HTTP/3 field names are lowercase. This tchar subset also rejects
+        // separators and controls before the gateway's shared Headers owner.
+        if (std.ascii.isUpper(c)) return false;
+        if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) != null)) return false;
+    }
+    return true;
+}
+
+fn validH3HeaderValue(value: []const u8) bool {
+    for (value) |c| {
+        if ((c < 0x20 and c != '\t') or c == 0x7f) return false;
+    }
+    return true;
+}
+
+fn validH3Method(method: []const u8) bool {
+    if (method.len == 0) return false;
+    for (method) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) != null)) return false;
+    }
+    return true;
+}
+
+fn validH3Path(path: []const u8) bool {
+    if (!(std.mem.eql(u8, path, "*") or (path.len > 0 and path[0] == '/'))) return false;
+    for (path) |c| {
+        if (c <= 0x20 or c == 0x7f or c == '#') return false;
+    }
+    return true;
+}
+
+fn validH3Authority(authority: []const u8) bool {
+    if (authority.len == 0) return false;
+    for (authority) |c| {
+        if (c <= 0x20 or c == 0x7f) return false;
+        if (std.mem.indexOfScalar(u8, "/\\?#@,;", c) != null) return false;
+    }
+    if (authority[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return false;
+        if (close == 1) return false;
+        const suffix = authority[close + 1 ..];
+        if (suffix.len == 0) return true;
+        if (suffix[0] != ':' or suffix.len == 1) return false;
+        _ = std.fmt.parseInt(u16, suffix[1..], 10) catch return false;
+        return true;
+    }
+    if (std.mem.findScalarLast(u8, authority, ':')) |colon| {
+        if (colon == 0 or colon + 1 == authority.len) return false;
+        if (std.mem.indexOfScalar(u8, authority[0..colon], ':') != null) return false;
+        _ = std.fmt.parseInt(u16, authority[colon + 1 ..], 10) catch return false;
+    }
+    return true;
+}
+
+fn h3ConnectionSpecificHeader(name: []const u8, value: []const u8) bool {
+    if (std.mem.eql(u8, name, "connection") or
+        std.mem.eql(u8, name, "proxy-connection") or
+        std.mem.eql(u8, name, "keep-alive") or
+        std.mem.eql(u8, name, "transfer-encoding") or
+        std.mem.eql(u8, name, "upgrade")) return true;
+    return std.mem.eql(u8, name, "te") and !std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "trailers");
+}
 
 fn discardPrefix(list: *std.ArrayList(u8), len: usize) void {
     if (len == 0) return;
@@ -584,6 +715,87 @@ test "request stream validates pseudo headers" {
     }, &qpack_buf);
     var scratch: [256]u8 = undefined;
     try testing.expectError(error.DuplicatePseudoHeader, req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = duplicate_method, .len = duplicate_method.len + 2 }, &scratch));
+}
+
+test "request stream rejects authority and authentication ambiguity" {
+    var qpack_buf: [1024]u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+
+    {
+        var req = RequestStream.init(testing.allocator, 0);
+        defer req.deinit();
+        const conflicting_host = try qpack.encode(&.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "trusted.test" },
+            .{ .name = ":path", .value = "/private" },
+            .{ .name = "host", .value = "attacker.test" },
+        }, &qpack_buf);
+        try testing.expectError(error.InvalidHeader, req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = conflicting_host, .len = conflicting_host.len + 2 }, &scratch));
+    }
+
+    {
+        var req = RequestStream.init(testing.allocator, 4);
+        defer req.deinit();
+        const duplicate_auth = try qpack.encode(&.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "trusted.test" },
+            .{ .name = ":path", .value = "/private" },
+            .{ .name = "authorization", .value = "Bearer first" },
+            .{ .name = "authorization", .value = "Bearer second" },
+        }, &qpack_buf);
+        try testing.expectError(error.InvalidHeader, req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = duplicate_auth, .len = duplicate_auth.len + 2 }, &scratch));
+    }
+}
+
+test "request stream enforces body and content-length while ingesting" {
+    var req = RequestStream.initWithBodyLimit(testing.allocator, 0, 2);
+    defer req.deinit();
+    var qpack_buf: [512]u8 = undefined;
+    const block = try qpack.encode(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/upload" },
+        .{ .name = "content-length", .value = "1" },
+    }, &qpack_buf);
+    var scratch: [512]u8 = undefined;
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch);
+    try req.ingestFrame(.{ .typ = .data, .type_value = 0, .payload = "ab", .len = 4 }, &scratch);
+    try testing.expectError(error.InvalidContentLength, req.finish());
+    try testing.expectError(error.BodyTooLarge, req.ingestFrame(.{ .typ = .data, .type_value = 0, .payload = "c", .len = 3 }, &scratch));
+}
+
+test "request stream rejects uppercase and connection-specific fields" {
+    var qpack_buf: [1024]u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+    const base = [_]qpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "X-Upper", .value = "bad" },
+    };
+    const block = try qpack.encode(&base, &qpack_buf);
+    var req = RequestStream.init(testing.allocator, 0);
+    defer req.deinit();
+    try testing.expectError(error.InvalidHeader, req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch));
+}
+
+test "request stream rejects unsafe pseudo-header syntax before dispatch" {
+    var qpack_buf: [1024]u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+    const block = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "user@example.test" },
+        .{ .name = ":path", .value = "/private\tspoof" },
+    }, &qpack_buf);
+    var req = RequestStream.init(testing.allocator, 0);
+    defer req.deinit();
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch);
+    try testing.expectError(error.InvalidHeader, req.finish());
 }
 
 test "request stream maps static-only QPACK dynamic references to protocol error" {

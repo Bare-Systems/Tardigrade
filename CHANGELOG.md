@@ -6,6 +6,77 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Changed
 
+- **Release security hardening closes cross-protocol ambiguity, memory, and
+  origin-crash paths** — HTTP/1 now rejects duplicate/malformed Host fields
+  and absolute-form/Host authority disagreement. HTTP/2 validates the complete
+  pseudo-header envelope and values before its HTTP/1 adapter, strips padding,
+  ignores extension frames safely, validates SETTINGS, bounds HPACK state, and
+  enforces concurrent-stream plus aggregate request-memory limits. HTTP/3 now
+  applies equivalent header/framing checks and per-request plus aggregate
+  request-memory ceilings. Valid unregistered origin status codes no longer
+  trap response conversion, while malformed FastCGI/SCGI/uWSGI statuses fail
+  closed instead of becoming 200. Persistent session and approval credentials
+  are atomically written with owner-only permissions and temporary plaintext
+  buffers are wiped. Authorization policy time windows now reject malformed or
+  out-of-range hours, and device request authentication uses the documented
+  HMAC-SHA256 construction with constant-time MAC verification. Policy regex
+  compilation/execution failures and invalid approval booleans also deny the
+  request instead of silently skipping the affected rule. Configured ACL and
+  HSTS state is now prepared transactionally for startup/reload rather than
+  being disabled on parse/allocation failure. Policy enforcement now runs on
+  the production H1, H2, and H3 paths; denied H1 bodies are never mirrored,
+  valid identities satisfy H2/H3 required-auth locations, and H3 ACL/rate-limit
+  decisions use the QUIC transport peer rather than a spoofable `X-Real-IP`.
+  Malformed policy/scope/approval mappings fail configuration validation.
+  SMTP/IMAP upstream TLS now verifies hostname and CA without permitting
+  truncation, mail replies are bounded, UDP proxy reads have deadlines, and
+  memcached JSON/TTL parsing rejects invalid input without traps or leaks.
+  Failed session, approval, and TLS ticket-key persistence also removes its
+  owner-only temporary credential file instead of leaving secret/key material
+  behind after write, sync, or rename errors. Transcript files are created
+  owner-only atomically, closing the prior create-then-chmod exposure window.
+  JWT and session-derived identity fields are validated at asserted-header
+  boundaries, preventing CR/LF-bearing claims from injecting upstream HTTP or
+  SMTP headers. Geo-blocking configurations now require an explicit trusted
+  proxy/CDN source and reject country headers received from any other peer.
+  Best-effort mirror delivery now uses bounded native HTTP/TLS transport and a
+  bounded ignored response, preventing a stalled mirror from holding a worker
+  indefinitely. The SMTP asserted-identity boundary rejects any inbound
+  `X-Tardigrade-*` field in the message-header section — whether or not the
+  request is authenticated — so a client can neither forge an identity nor
+  suppress the authoritative one, with case-insensitive `DATA` and header
+  matching. Trusted-peer matching compares parsed IP addresses instead of
+  truncated text, closing a bypass where two IPv6 addresses differing only in
+  the final hextet compared equal. Mirror targets must name `http` or `https`
+  explicitly, rejected at startup/reload rather than silently downgraded to
+  cleartext. IP access-control policy is now owned by the configuration
+  generation a request leased, so a reload can neither free rules underneath an
+  in-flight request nor let an older request skip a denial its own configuration
+  requires. Approval persistence serializes snapshot and write under one lock so
+  a delayed writer cannot overwrite newer approval state, and approval restore
+  works at all (it previously failed on every non-empty store). Approval,
+  session, and device-HMAC credential copies are wiped through the canonical
+  `secureZero` path, and the device registry is created owner-only and refuses
+  to append to a group/world-accessible file or serialize delimiter-bearing
+  credential fields. Approved tokens now expire at their configured TTL and
+  bind exactly to their issued method, path, and identity rather than treating
+  request paths or `*` methods as patterns. Location `auth required` denials no
+  longer mirror the denied request body. HTTP/2 gates inbound HEADERS and
+  DATA on the stream state machine rather than request-assembly bookkeeping, so
+  a peer cannot open a second request on a stream whose response is still
+  outstanding, and CONNECT is refused at stream scope instead of failing inside
+  the shared HTTP/1 adapter. Approval and command state mutations now remain
+  atomic on allocation failure instead of retaining dangling pointers, and all
+  related JSON — including command envelopes sent upstream — uses structural
+  encoding rather than interpolating identities, paths, actors, errors, IDs,
+  params, or upstream bodies. Structured/application logs,
+  health/status responses, and Prometheus device labels likewise escape
+  request-controlled data, preventing forged audit records and metrics.
+  Authentication subrequests and approval webhooks now use bounded native
+  transports; webhook payloads and response heads are capped, and both trust
+  boundaries require certificate/URL-host verification. Auth subrequests cannot
+  inherit a normal origin's verification bypass or SNI override.
+
 - **Secret zeroization is now materially faster on x86_64, and the
   guarantee is now Tardigrade-owned (#675)** — `crypto.secrets.secureZero`
   no longer wraps `std.crypto.secureZero`, which is `@memset` over a

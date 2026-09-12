@@ -1,6 +1,9 @@
 const std = @import("std");
 const compat = @import("zig_compat");
+const secrets = @import("crypto").secrets;
 const session = @import("session.zig");
+
+const owner_only_permissions: std.Io.File.Permissions = .fromMode(0o600);
 
 pub const StoredSession = struct {
     token: []const u8,
@@ -21,19 +24,28 @@ pub fn persist(allocator: std.mem.Allocator, path: []const u8, store: *const ses
     const entries = try snapshot(allocator, store);
     defer freeLoaded(allocator, entries);
 
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{d}.tmp", .{ path, std.c.getpid() });
     defer allocator.free(tmp_path);
 
     const buf = try compat.stringifyAlloc(allocator, StoreEnvelope{
         .version = 1,
         .entries = entries,
     }, .{});
-    defer allocator.free(buf);
+    // Serialized live/revoked session tokens: wipe through the canonical
+    // helper, not `@memset` + ordinary free (#750).
+    defer secrets.secureZeroAndFree(allocator, buf);
 
+    std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
+    errdefer std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
     {
-        const file = try std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{ .truncate = true });
+        const file = try std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{
+            .truncate = true,
+            .exclusive = true,
+            .permissions = owner_only_permissions,
+        });
         defer file.close(compat.io());
         try file.writeStreamingAll(compat.io(), buf);
+        try file.sync(compat.io());
     }
     try std.Io.Dir.renameAbsolute(tmp_path, path, compat.io());
 }
@@ -47,10 +59,15 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) ![]StoredSession {
     var file_buf: [8192]u8 = undefined;
     var reader = file.reader(compat.io(), &file_buf);
     const data = try reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
-    defer allocator.free(data);
+    defer secrets.secureZeroAndFree(allocator, data);
 
     const parsed = try std.json.parseFromSlice(StoreEnvelope, allocator, data, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
+    defer {
+        // The parser arena can hold its own copies of the tokens; we own that
+        // memory until `deinit()`, so wipe the credential field first.
+        for (parsed.value.entries) |entry| secrets.secureZero(@constCast(entry.token));
+        parsed.deinit();
+    }
 
     var out = try allocator.alloc(StoredSession, parsed.value.entries.len);
     var i: usize = 0;
@@ -132,8 +149,11 @@ fn snapshot(allocator: std.mem.Allocator, store: *const session.SessionStore) ![
 }
 
 fn freeEntry(allocator: std.mem.Allocator, entry: StoredSession) void {
-    allocator.free(entry.token);
-    allocator.free(entry.identity);
+    // `token` is the session credential and `identity` the principal it
+    // authenticates, so both heap copies are wiped rather than merely freed.
+    // `client_ip`/`device_id` are request metadata and carry no secret.
+    secrets.secureZeroAndFree(allocator, @constCast(entry.token));
+    secrets.secureZeroAndFree(allocator, @constCast(entry.identity));
     allocator.free(entry.client_ip);
     allocator.free(entry.device_id);
 }
@@ -165,6 +185,11 @@ test "session store persistence round trips active and revoked entries" {
 
     try persist(allocator, path, &base);
 
+    const persisted = try std.Io.Dir.openFileAbsolute(compat.io(), path, .{});
+    defer persisted.close(compat.io());
+    const stat = try persisted.stat(compat.io());
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+
     const loaded = try load(allocator, path);
     defer freeLoaded(allocator, loaded);
     try std.testing.expectEqual(@as(usize, 2), loaded.len);
@@ -175,4 +200,53 @@ test "session store persistence round trips active and revoked entries" {
 
     try std.testing.expect(restored.validate(active) != null);
     try std.testing.expect(restored.validate(revoked) == null);
+}
+
+test "session persistence removes credential temp file when rename fails" {
+    const allocator = std.testing.allocator;
+    var store = session.SessionStore.init(allocator, 300, 0);
+    defer store.deinit();
+    _ = try store.create("identity", "127.0.0.1", null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const path = try std.fmt.allocPrint(allocator, "{s}/destination", .{tmp_abs});
+    defer allocator.free(path);
+    try std.Io.Dir.createDirAbsolute(compat.io(), path, .default_dir);
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}.{d}.tmp", .{ path, std.c.getpid() });
+    defer allocator.free(temp_path);
+
+    var failed = false;
+    persist(allocator, path, &store) catch {
+        failed = true;
+    };
+    try std.testing.expect(failed);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(compat.io(), temp_path, .{}));
+}
+
+test "loaded session credentials are wiped, not merely freed" {
+    // Regression for the finding that `@memset` + ordinary free only covered
+    // the serialized JSON blob: the duplicated token/identity copies handed to
+    // callers were released with their plaintext intact.
+    var detector = secrets.CredentialWipeDetector.init(std.testing.allocator);
+    const allocator = detector.allocator();
+
+    const entries = try allocator.alloc(StoredSession, 1);
+    const token = try allocator.dupe(u8, "a" ** session.TOKEN_HEX_LEN);
+    const identity = try allocator.dupe(u8, "alice");
+    detector.watch(token);
+    detector.watch(identity);
+    entries[0] = .{
+        .token = token,
+        .identity = identity,
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+        .device_id = try allocator.dupe(u8, ""),
+        .created_ns = 0,
+        .last_active_ns = 0,
+        .revoked = false,
+    };
+
+    freeLoaded(allocator, entries);
+    try std.testing.expect(detector.allWatchedWiped());
 }

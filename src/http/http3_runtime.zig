@@ -3003,7 +3003,12 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
     return assembler.finish();
 }
 
-fn formatAddressHostAlloc(allocator: std.mem.Allocator, address: quic.udp.Address) ![]u8 {
+/// Render a transport peer as the `client_ip` string upper layers consume.
+///
+/// IPv6 peers are emitted unbracketed and fully expanded, so any consumer that
+/// compares this against operator-configured identities must treat it as an
+/// address, not as an `authority` that can be split on its last colon.
+pub fn formatAddressHostAlloc(allocator: std.mem.Allocator, address: quic.udp.Address) ![]u8 {
     return switch (address.family) {
         .ip4 => std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{
             address.bytes[0], address.bytes[1], address.bytes[2], address.bytes[3],

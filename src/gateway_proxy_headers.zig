@@ -196,14 +196,48 @@ pub fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, cl
 
 /// Strip the port suffix from an authority string.
 /// Handles bare hostnames, `host:port`, and IPv6 bracket notation `[::1]:port`.
+///
+/// A bare (unbracketed) IPv6 literal has no unambiguous `:port` suffix — RFC
+/// 3986 §3.2.2 requires brackets whenever a port follows an IPv6 host — so the
+/// final group of such a value is address data, not a port. Truncating it would
+/// make `2001:db8::1` and `2001:db8::2` normalize to the same string, which is
+/// a trust-comparison bypass rather than a formatting nit.
 pub fn stripPort(authority: []const u8) []const u8 {
     if (authority.len == 0) return authority;
     if (authority[0] == '[') {
         const close_idx = std.mem.findScalar(u8, authority, ']') orelse return authority;
         return authority[0 .. close_idx + 1];
     }
+    if (std.mem.count(u8, authority, ":") > 1) return authority;
     const colon_idx = std.mem.findScalarLast(u8, authority, ':') orelse return authority;
     return authority[0..colon_idx];
+}
+
+/// Remove surrounding IPv6 brackets, if present, leaving the address text.
+fn unbracketHost(host: []const u8) []const u8 {
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') return host[1 .. host.len - 1];
+    return host;
+}
+
+/// Compare two authority hosts for a trust decision.
+///
+/// IP literals are compared by their parsed binary address, so every legal
+/// spelling of one address matches (`2001:db8::1`, `2001:db8:0:0:0:0:0:1`,
+/// `[2001:db8::1]`) while two different addresses can never collide through
+/// textual normalization. Hostnames fall back to a case-insensitive compare.
+/// An IP literal and a hostname are never considered equal.
+fn trustHostsEqual(a: []const u8, b: []const u8) bool {
+    const host_a = unbracketHost(stripPort(a));
+    const host_b = unbracketHost(stripPort(b));
+    if (host_a.len == 0 or host_b.len == 0) return false;
+
+    const ip_a = http.access_control.parseIp(host_a);
+    const ip_b = http.access_control.parseIp(host_b);
+    if (ip_a != null or ip_b != null) {
+        if (ip_a == null or ip_b == null) return false;
+        return ip_a.?.eql(ip_b.?);
+    }
+    return std.ascii.eqlIgnoreCase(host_a, host_b);
 }
 
 /// Returns true when the connecting upstream host is in the trusted set, or
@@ -216,13 +250,9 @@ pub fn stripPort(authority: []const u8) []const u8 {
 pub fn isTrustedUpstream(cfg: *const edge_config.EdgeConfig, upstream_host: []const u8) bool {
     if (!cfg.trust_require_upstream_identity and cfg.trusted_upstream_identities.len == 0) return true;
     if (upstream_host.len == 0) return false;
-    const host = stripPort(upstream_host);
 
     for (cfg.trusted_upstream_identities) |trusted| {
-        const trusted_host = stripPort(trusted);
-        if (std.ascii.eqlIgnoreCase(trusted, upstream_host) or std.ascii.eqlIgnoreCase(trusted_host, host)) {
-            return true;
-        }
+        if (trustHostsEqual(trusted, upstream_host)) return true;
     }
     return false;
 }
@@ -786,6 +816,108 @@ test "stripPort handles bare hostname" {
     try std.testing.expectEqualStrings("example.com", stripPort("example.com:443"));
     try std.testing.expectEqualStrings("127.0.0.1", stripPort("127.0.0.1:8080"));
     try std.testing.expectEqualStrings("", stripPort(""));
+}
+
+test "stripPort never truncates a bare IPv6 literal" {
+    // Unbracketed IPv6 has no port to strip: the final hextet is address data.
+    // H3 supplies peers in exactly this expanded, unbracketed form.
+    try std.testing.expectEqualStrings("2001:db8:0:0:0:0:0:1", stripPort("2001:db8:0:0:0:0:0:1"));
+    try std.testing.expectEqualStrings("2001:db8::1", stripPort("2001:db8::1"));
+    try std.testing.expectEqualStrings("::1", stripPort("::1"));
+}
+
+test "trusted-peer matching is exact for every authority spelling" {
+    var identities = [_][]const u8{"2001:db8:0:0:0:0:0:1"};
+    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .trust_require_upstream_identity = true,
+        .trusted_upstream_identities = identities[0..],
+    });
+
+    // The original bypass: two IPv6 addresses differing only in the final
+    // hextet both normalized to "2001:db8:0:0:0:0:0" and compared equal.
+    try std.testing.expect(!isTrustedUpstream(&cfg, "2001:db8:0:0:0:0:0:2"));
+    try std.testing.expect(!isTrustedUpstream(&cfg, "2001:db8::2"));
+    // Exact match still trusts, in any legal spelling of the same address.
+    try std.testing.expect(isTrustedUpstream(&cfg, "2001:db8:0:0:0:0:0:1"));
+    try std.testing.expect(isTrustedUpstream(&cfg, "2001:db8::1"));
+    try std.testing.expect(isTrustedUpstream(&cfg, "[2001:db8::1]"));
+    try std.testing.expect(isTrustedUpstream(&cfg, "[2001:db8::1]:8443"));
+    // A prefix of the trusted address is not the trusted address.
+    try std.testing.expect(!isTrustedUpstream(&cfg, "2001:db8:0:0:0:0:0"));
+
+    // Compressed spelling in the *config* matches an expanded H3 peer.
+    var compressed = [_][]const u8{"2001:db8::1"};
+    const cfg_compressed = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .trust_require_upstream_identity = true,
+        .trusted_upstream_identities = compressed[0..],
+    });
+    try std.testing.expect(isTrustedUpstream(&cfg_compressed, "2001:db8:0:0:0:0:0:1"));
+    try std.testing.expect(!isTrustedUpstream(&cfg_compressed, "2001:db8:0:0:0:0:0:2"));
+
+    // IPv4 and hostname:port forms keep working, and an IP literal never
+    // equals a hostname.
+    var mixed = [_][]const u8{ "192.0.2.10", "lb.internal:8443" };
+    const cfg_mixed = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .trust_require_upstream_identity = true,
+        .trusted_upstream_identities = mixed[0..],
+    });
+    try std.testing.expect(isTrustedUpstream(&cfg_mixed, "192.0.2.10"));
+    try std.testing.expect(isTrustedUpstream(&cfg_mixed, "192.0.2.10:443"));
+    try std.testing.expect(!isTrustedUpstream(&cfg_mixed, "192.0.2.11"));
+    try std.testing.expect(isTrustedUpstream(&cfg_mixed, "lb.internal"));
+    try std.testing.expect(isTrustedUpstream(&cfg_mixed, "LB.Internal:9000"));
+    try std.testing.expect(!isTrustedUpstream(&cfg_mixed, "lb.internal.evil.test"));
+}
+
+test "H3 transport peers feed the trust check without an IPv6 bypass" {
+    // Drive the concrete producer: whatever H3 formats for `client_ip` is what
+    // the trust boundary must compare, so the two stay honest together.
+    const allocator = std.testing.allocator;
+    var trusted_bytes: [16]u8 = [_]u8{0} ** 16;
+    trusted_bytes[0] = 0x20;
+    trusted_bytes[1] = 0x01;
+    trusted_bytes[2] = 0x0d;
+    trusted_bytes[3] = 0xb8;
+    trusted_bytes[15] = 0x01;
+    var attacker_bytes = trusted_bytes;
+    attacker_bytes[15] = 0x02;
+
+    const trusted_peer = try http.http3_runtime.formatAddressHostAlloc(
+        allocator,
+        .{ .family = .ip6, .bytes = trusted_bytes, .port = 44300 },
+    );
+    defer allocator.free(trusted_peer);
+    const attacker_peer = try http.http3_runtime.formatAddressHostAlloc(
+        allocator,
+        .{ .family = .ip6, .bytes = attacker_bytes, .port = 44301 },
+    );
+    defer allocator.free(attacker_peer);
+
+    // Confirms the producer really emits the unbracketed form this finding is
+    // about, so the test cannot silently stop covering it.
+    try std.testing.expectEqualStrings("2001:db8:0:0:0:0:0:1", trusted_peer);
+    try std.testing.expect(std.mem.count(u8, attacker_peer, ":") > 1);
+    try std.testing.expect(attacker_peer[0] != '[');
+
+    var identities = [_][]const u8{trusted_peer};
+    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .trust_require_upstream_identity = true,
+        .trusted_upstream_identities = identities[0..],
+    });
+    try std.testing.expect(isTrustedUpstream(&cfg, trusted_peer));
+    try std.testing.expect(!isTrustedUpstream(&cfg, attacker_peer));
+}
+
+test "geo trust source rejects a near-miss IPv6 peer" {
+    var blocked = [_][]const u8{"RU"};
+    var identities = [_][]const u8{"2001:db8::1"};
+    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .geo_blocked_countries = blocked[0..],
+        .trust_require_upstream_identity = true,
+        .trusted_upstream_identities = identities[0..],
+    });
+    try std.testing.expect(isTrustedGeoSource(&cfg, "2001:db8:0:0:0:0:0:1"));
+    try std.testing.expect(!isTrustedGeoSource(&cfg, "2001:db8:0:0:0:0:0:2"));
 }
 
 test "stripPort handles IPv6 addresses" {

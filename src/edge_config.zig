@@ -359,6 +359,14 @@ pub const EdgeConfig = struct {
     /// IP access control rules (empty = disabled).
     /// Format: "allow 10.0.0.0/8, deny 0.0.0.0/0"
     access_control_rules: []const u8,
+    /// Parsed form of `access_control_rules`, borrowed from the configuration
+    /// version that owns this `EdgeConfig` (see `ManagedConfigVersion`).
+    ///
+    /// Carried on the config — not on `GatewayState` — so a request enforces the
+    /// ACL belonging to the exact configuration generation it leased, and so the
+    /// rules cannot be freed while that lease is alive. Never owned or freed
+    /// here; `deinit` deliberately ignores it.
+    parsed_access_control: ?*const http.access_control.AccessControl = null,
     /// Request validation limits.
     request_limits: http.request_limits.RequestLimits,
     /// Basic auth credential hashes (SHA-256 of "user:password", empty = disabled).
@@ -3175,7 +3183,7 @@ pub fn validate(cfg: *const EdgeConfig) !void {
     try validateUpstreamBaseUrlList(cfg.upstream_base_urls, "upstream_base_urls");
     try validateUpstreamBaseUrlList(cfg.upstream_backup_base_urls, "upstream_backup_base_urls");
     try validateOptionalAbsoluteUrl(cfg.grpc_upstream, "grpc_upstream");
-    for (cfg.mirror_rules) |rule| try validateOptionalAbsoluteUrl(rule.target_url, "mirror_rule.target_url");
+    for (cfg.mirror_rules) |rule| try validateMirrorTargetUrl(rule.target_url);
     for (cfg.location_blocks) |block| {
         switch (block.action) {
             .proxy_pass => |target| if (isAbsoluteHttpUrl(target) or isUnixEndpoint(target)) try validateOptionalUpstreamBaseUrl(target, "location.proxy_pass"),
@@ -3486,6 +3494,36 @@ fn validateOptionalAbsoluteUrl(raw: []const u8, label: []const u8) !void {
         }
         return err;
     };
+}
+
+/// A mirror target must name a transport explicitly.
+///
+/// Mirror rules replay the original request body, so an unsupported or missing
+/// scheme has to prevent startup/reload rather than be silently treated as
+/// cleartext HTTP at request time. Only `http://` and `https://` are supported.
+fn validateMirrorTargetUrl(raw: []const u8) !void {
+    validateMirrorTargetUrlChecked(raw) catch |err| {
+        std.log.err(
+            "config validation failed: mirror_rule.target_url must be an absolute http:// or https:// URL: {s}",
+            .{raw},
+        );
+        return err;
+    };
+}
+
+fn validateMirrorTargetUrlChecked(raw: []const u8) !void {
+    if (raw.len == 0) return error.InvalidConfigUrl;
+    if (!isAbsoluteHttpUrl(raw)) return error.InvalidConfigUrl;
+    const uri = std.Uri.parse(raw) catch return error.InvalidConfigUrl;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
+        return error.InvalidConfigUrl;
+    }
+    const host = uri.host orelse return error.InvalidConfigUrl;
+    const host_bytes = switch (host) {
+        .raw => |value| value,
+        .percent_encoded => |value| value,
+    };
+    if (host_bytes.len == 0) return error.InvalidConfigUrl;
 }
 
 fn validateOptionalUpstreamBaseUrl(raw: []const u8, label: []const u8) !void {
@@ -4501,6 +4539,23 @@ test "validate mTLS consistency requires CA path when verify is enabled" {
 test "validate rejects malformed access control policy" {
     try validateAccessControlConfig("allow 10.0.0.0/8, deny 0.0.0.0/0");
     try std.testing.expectError(error.InvalidConfigValue, validateAccessControlConfig("allow 10.0.0.0/8, permit all"));
+}
+
+test "mirror targets accept only explicit http and https schemes" {
+    try validateMirrorTargetUrlChecked("http://127.0.0.1:9000/mirror");
+    try validateMirrorTargetUrlChecked("https://mirror.example/ingest");
+
+    // Unsupported schemes must fail closed instead of being treated as
+    // cleartext HTTP on port 80 while carrying the original request body.
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("ftp://mirror.example/path"));
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("file:///etc/passwd"));
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("gopher://mirror.example"));
+    // Schemeless and empty targets.
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("mirror.example/path"));
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("//mirror.example/path"));
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked(""));
+    // A scheme with no host cannot be connected to.
+    try std.testing.expectError(error.InvalidConfigUrl, validateMirrorTargetUrlChecked("http://"));
 }
 
 test "geo blocking requires an explicit trusted country-header source" {

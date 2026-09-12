@@ -5,6 +5,7 @@
 /// log warnings and continue.
 const std = @import("std");
 const compat = @import("zig_compat");
+const secrets = @import("crypto").secrets;
 
 const owner_only_permissions: std.Io.File.Permissions = .fromMode(0o600);
 
@@ -49,11 +50,11 @@ pub fn persist(
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{d}.tmp", .{ path, std.c.getpid() });
     defer allocator.free(tmp_path);
 
+    // The serialized envelope contains bearer-like approval tokens. Use the
+    // project's canonical wipe (non-elidable, correct free semantics) rather
+    // than `@memset` + ordinary free, which #750 documents as insufficient.
     const json_bytes = try compat.stringifyAlloc(allocator, StoreEnvelope{ .version = 1, .entries = entries }, .{});
-    defer {
-        @memset(json_bytes, 0);
-        allocator.free(json_bytes);
-    }
+    defer secrets.secureZeroAndFree(allocator, json_bytes);
 
     std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
     errdefer std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
@@ -88,12 +89,12 @@ pub fn load(
         defer f.close(compat.io());
         var file_buf: [8192]u8 = undefined;
         var reader = f.reader(compat.io(), &file_buf);
-        break :blk try reader.interface.readAlloc(allocator, 64 * 1024 * 1024);
+        // `readAlloc` requires EXACTLY the requested length and fails with
+        // `EndOfStream` on anything shorter, which made every restore attempt
+        // fail. `allocRemaining` reads to EOF under the same size ceiling.
+        break :blk try reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
     };
-    defer {
-        @memset(data, 0);
-        allocator.free(data);
-    }
+    defer secrets.secureZeroAndFree(allocator, data);
 
     const parsed = try std.json.parseFromSlice(
         StoreEnvelope,
@@ -101,7 +102,13 @@ pub fn load(
         data,
         .{ .ignore_unknown_fields = true },
     );
-    defer parsed.deinit();
+    defer {
+        // The parser's arena may hold its own copies of the token strings. We
+        // own that memory until `deinit()`, so wipe the credential fields
+        // before releasing it; otherwise the only wiped copy would be `data`.
+        for (parsed.value.entries) |e| secrets.secureZero(@constCast(e.token));
+        parsed.deinit();
+    }
 
     var out = try allocator.alloc(StoredApproval, parsed.value.entries.len);
     var i: usize = 0;
@@ -136,13 +143,19 @@ pub fn freeLoaded(allocator: std.mem.Allocator, entries: []StoredApproval) void 
 }
 
 fn freeEntry(allocator: std.mem.Allocator, e: StoredApproval) void {
-    allocator.free(e.token);
+    // Explicit disposition per field rather than a blanket free: `token` is
+    // presented as a bearer credential, so its heap copy is wiped. `identity`
+    // and `decided_by` name a principal and are wiped as well, since they are
+    // the inputs an attacker would need to replay an approval. The remaining
+    // fields (method/path/command_id/status) are routing and state metadata
+    // that carry no secret, so an ordinary free is correct for them.
+    secrets.secureZeroAndFree(allocator, @constCast(e.token));
+    secrets.secureZeroAndFree(allocator, @constCast(e.identity));
+    secrets.secureZeroAndFree(allocator, @constCast(e.decided_by));
     allocator.free(e.method);
     allocator.free(e.path);
-    allocator.free(e.identity);
     allocator.free(e.command_id);
     allocator.free(e.status);
-    allocator.free(e.decided_by);
 }
 
 // ---------------------------------------------------------------------------
@@ -215,4 +228,76 @@ test "approval persistence removes credential temp file when rename fails" {
     };
     try std.testing.expect(failed);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(compat.io(), temp_path, .{}));
+}
+
+test "loaded approval credentials are wiped, not merely freed" {
+    // Companion to the session-store regression: approval tokens are
+    // bearer-like, so the duplicated heap copies must be wiped on release.
+    var detector = secrets.CredentialWipeDetector.init(std.testing.allocator);
+    const allocator = detector.allocator();
+
+    const entries = try allocator.alloc(StoredApproval, 1);
+    const token = try allocator.dupe(u8, "approval-token-9f3c");
+    const identity = try allocator.dupe(u8, "alice");
+    detector.watch(token);
+    detector.watch(identity);
+    entries[0] = .{
+        .token = token,
+        .method = try allocator.dupe(u8, "POST"),
+        .path = try allocator.dupe(u8, "/deploy"),
+        .identity = identity,
+        .command_id = try allocator.dupe(u8, "cmd-1"),
+        .status = try allocator.dupe(u8, "pending"),
+        .created_ms = 0,
+        .expires_ms = 0,
+        .decided_ms = 0,
+        .decided_by = try allocator.dupe(u8, ""),
+        .escalation_fired = false,
+    };
+
+    freeLoaded(allocator, entries);
+    try std.testing.expect(detector.allWatchedWiped());
+}
+
+test "approval store round trips through persist and load" {
+    // Regression: `load()` used `readAlloc`, which demands exactly the byte
+    // limit it is given, so every restore of a normally sized store failed with
+    // `EndOfStream` and persisted approvals were silently dropped on restart.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const path = try std.fmt.allocPrint(allocator, "{s}/approvals.json", .{tmp_abs});
+    defer allocator.free(path);
+
+    const entries = [_]StoredApproval{.{
+        .token = "apr-1",
+        .method = "POST",
+        .path = "/deploy",
+        .identity = "alice",
+        .command_id = "cmd-1",
+        .status = "pending",
+        .created_ms = 10,
+        .expires_ms = 20,
+        .decided_ms = 0,
+        .decided_by = "",
+        .escalation_fired = false,
+    }};
+    try persist(allocator, path, entries[0..]);
+
+    const loaded = try load(allocator, path);
+    defer freeLoaded(allocator, loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings("apr-1", loaded[0].token);
+    try std.testing.expectEqualStrings("/deploy", loaded[0].path);
+    try std.testing.expectEqualStrings("pending", loaded[0].status);
+    try std.testing.expectEqual(@as(i64, 20), loaded[0].expires_ms);
+
+    // A missing store is an empty store, not an error.
+    const missing_path = try std.fmt.allocPrint(allocator, "{s}/absent.json", .{tmp_abs});
+    defer allocator.free(missing_path);
+    const empty = try load(allocator, missing_path);
+    defer freeLoaded(allocator, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }

@@ -236,7 +236,111 @@ fn overlaps(storage: []const u8, value: []const u8) bool {
     return value_start < storage_end and storage_start < value_end;
 }
 
+/// Test allocator wrapper that observes the contents of specific buffers at the
+/// moment they are released, so "this credential is zeroized before release"
+/// can be asserted as behavior instead of reviewed by eye.
+///
+/// Why contents-are-zero rather than plaintext-sniffing: `Allocator.free`
+/// scribbles `undefined` (0xaa) over the buffer before the allocator ever sees
+/// it whenever runtime safety is on, so an ordinary free never exposes readable
+/// plaintext *in a safe build* and a plaintext search would pass either way.
+/// `secureZeroAndFree` bypasses that scribble (it calls `rawFree` directly), so
+/// a watched buffer arrives all-zero exactly when the canonical wipe was used:
+/// an ordinary free shows 0xaa, and an unsafe build with no wipe shows the
+/// secret. Both regressions fail this check.
+pub const CredentialWipeDetector = struct {
+    pub const max_watched = 8;
+
+    backing: std.mem.Allocator,
+    watched: [max_watched]?Watch = @splat(null),
+    count: usize = 0,
+
+    const Watch = struct {
+        ptr: [*]const u8,
+        len: usize,
+        released: bool = false,
+        zeroed_on_release: bool = false,
+    };
+
+    pub fn init(backing: std.mem.Allocator) CredentialWipeDetector {
+        return .{ .backing = backing };
+    }
+
+    pub fn allocator(self: *CredentialWipeDetector) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    /// Track `buffer` and require it to be wiped by the time it is released.
+    pub fn watch(self: *CredentialWipeDetector, buffer: []const u8) void {
+        if (self.count >= max_watched) @panic("CredentialWipeDetector: too many watched buffers");
+        self.watched[self.count] = .{ .ptr = buffer.ptr, .len = buffer.len };
+        self.count += 1;
+    }
+
+    /// True when every watched buffer was released AND was fully zeroed at that
+    /// point. A buffer that is never released fails too: a leaked credential is
+    /// not a wiped credential.
+    pub fn allWatchedWiped(self: *const CredentialWipeDetector) bool {
+        for (self.watched[0..self.count]) |maybe| {
+            const entry = maybe orelse return false;
+            if (!entry.released or !entry.zeroed_on_release) return false;
+        }
+        return true;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CredentialWipeDetector = @ptrCast(@alignCast(ctx));
+        return self.backing.vtable.alloc(self.backing.ptr, len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CredentialWipeDetector = @ptrCast(@alignCast(ctx));
+        return self.backing.vtable.resize(self.backing.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CredentialWipeDetector = @ptrCast(@alignCast(ctx));
+        return self.backing.vtable.remap(self.backing.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CredentialWipeDetector = @ptrCast(@alignCast(ctx));
+        for (self.watched[0..self.count]) |*maybe| {
+            const entry = &(maybe.* orelse continue);
+            if (entry.ptr != memory.ptr or entry.len != memory.len) continue;
+            entry.released = true;
+            entry.zeroed_on_release = std.mem.allEqual(u8, memory, 0);
+        }
+        self.backing.vtable.free(self.backing.ptr, memory, alignment, ret_addr);
+    }
+};
+
 const testing = std.testing;
+
+test "CredentialWipeDetector distinguishes a wiped release from an ordinary free" {
+    var detector = CredentialWipeDetector.init(testing.allocator);
+    const allocator = detector.allocator();
+
+    const wiped = try allocator.dupe(u8, "s3cret-token");
+    detector.watch(wiped);
+    secureZeroAndFree(allocator, wiped);
+    try testing.expect(detector.allWatchedWiped());
+
+    var ordinary_detector = CredentialWipeDetector.init(testing.allocator);
+    const ordinary_allocator = ordinary_detector.allocator();
+    const plain = try ordinary_allocator.dupe(u8, "s3cret-token");
+    ordinary_detector.watch(plain);
+    ordinary_allocator.free(plain);
+    try testing.expect(!ordinary_detector.allWatchedWiped());
+}
 
 test "fixed secret copies, borrows, compares, and zeroizes" {
     const Secret32 = FixedSecret(32);

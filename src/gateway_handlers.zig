@@ -514,6 +514,8 @@ fn initHandlerTestState(state: *GatewayState, allocator: std.mem.Allocator, add_
 
 fn minimalAuthConfig(blocks: []http.location_router.LocationBlock, token_hashes: [][]const u8) edge_config.EdgeConfig {
     var cfg: edge_config.EdgeConfig = undefined;
+    cfg.access_control_rules = "";
+    cfg.parsed_access_control = null;
     cfg.basic_auth_hashes = &.{};
     cfg.auth_token_hashes = token_hashes;
     cfg.jwt_secret = "";
@@ -575,7 +577,6 @@ fn initHttp3ProxyTestState(state: *GatewayState, allocator: std.mem.Allocator, a
     initHandlerTestState(state, allocator, add_headers);
     state.rate_limiter_mutex = .{};
     state.rate_limiter = null;
-    state.access_control = null;
     state.circuit_mutex = .{};
     state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{});
     state.upstream_mutex = .{};
@@ -676,6 +677,20 @@ test "writeReturnResponsePlan reports 405 metrics ownership to caller" {
     try std.testing.expectEqual(@as(u64, 1), state.metrics.err_invalid_request);
 }
 
+/// The result of routing a request.
+///
+/// `status` alone cannot tell a caller whether authorization succeeded: a fully
+/// authorized route may legitimately return 401/403 from its own handler or
+/// upstream. `mirror_allowed` therefore carries the authorization decision
+/// explicitly, so side effects that must not observe a denied request body
+/// (mirroring) key off the decision rather than guessing from a number.
+pub const RouteOutcome = struct {
+    status: u16,
+    /// False when Tardigrade itself denied the request before handing it to a
+    /// route action — currently location `auth required` rejections.
+    mirror_allowed: bool = true,
+};
+
 pub fn routeRequest(
     conn: anytype,
     allocator: std.mem.Allocator,
@@ -687,28 +702,31 @@ pub fn routeRequest(
     keep_alive: *bool,
     client_ip: []const u8,
     streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
-) !u16 {
+) !RouteOutcome {
     const writer = conn.writer();
     if (try handleTranscriptRoute(allocator, writer, state, request, correlation_id, keep_alive.*)) |status| {
         state.metricsRecord(status);
-        return status;
+        return .{ .status = status };
     }
 
     switch (resolveRoute(allocator, cfg, request)) {
         .reload_status => {
             const status = try handleReloadStatusRoute(allocator, writer, state, correlation_id, keep_alive.*);
             state.metricsRecord(status);
-            return status;
+            return .{ .status = status };
         },
         .metrics => {
             const status = try handleMetricsRoute(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*);
             state.metricsRecord(status);
-            return status;
+            return .{ .status = status };
         },
         .unmatched => {},
         .location => |matched| {
             if (try enforceLocationAuth(allocator, writer, cfg, state, ctx, request, matched, correlation_id, keep_alive.*, client_ip)) |status| {
-                return status;
+                // Tardigrade denied this request itself. The body must not
+                // reach a mirror target, so say so explicitly instead of
+                // leaving the caller to infer it from `status`.
+                return .{ .status = status, .mirror_allowed = false };
             }
             if (try executeLocationAction(
                 conn,
@@ -723,19 +741,19 @@ pub fn routeRequest(
                 client_ip,
                 streaming_request_body,
             )) |status| {
-                return status;
+                return .{ .status = status };
             }
         },
     }
 
     if (serveTryFilesFallback(allocator, conn, cfg, request, correlation_id, keep_alive.*, state, ctx)) |status| {
         state.metricsRecord(status);
-        return status;
+        return .{ .status = status };
     } else |_| {}
 
     try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive.*, state);
     state.metricsRecord(404);
-    return 404;
+    return .{ .status = 404 };
 }
 
 fn enforceLocationAuth(
@@ -1223,7 +1241,9 @@ pub fn runMiddlewarePipeline(
         }
     }
 
-    if (state.access_control) |*acl| {
+    // Paired with the leased configuration generation, not a global: see
+    // `ManagedConfigVersion.access_control`.
+    if (cfg.parsed_access_control) |acl| {
         if (acl.check(client_ip) == .denied) {
             try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, keep_alive, state);
             logAccessForRequest(state, ctx, request, 403);
@@ -1674,7 +1694,14 @@ fn executeMirrorRequest(
     content_type: ?[]const u8,
 ) !void {
     const uri = try std.Uri.parse(target_url);
+    // Mirror requests copy the original request body, so an unsupported scheme
+    // must fail closed rather than fall through to the cleartext-HTTP default.
+    // `edge_config.validateMirrorTargetUrl` rejects these at startup/reload;
+    // this is the defense-in-depth layer for any future path that reaches here
+    // without that gate.
     const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+    if (!is_http and !is_https) return error.UnsupportedMirrorScheme;
     const host = if (uri.host) |value| gp.uriComponentBytes(value) else return error.UpstreamProtocolError;
     const port: u16 = uri.port orelse (if (is_https) 443 else 80);
     const tls_options: ?http.upstream_tls.UpstreamTlsOptions = if (is_https) .{
@@ -3822,12 +3849,16 @@ test "H3 ACL uses the transport peer address instead of spoofable X-Real-IP" {
     var state: GatewayState = undefined;
     initHttp3ProxyTestState(&state, allocator, &.{});
     defer deinitHttp3ProxyTestState(&state);
-    state.access_control = try http.access_control.AccessControl.fromConfig(
+    // The ACL is owned by the configuration generation, so the test attaches
+    // it the same way production does.
+    var acl = try http.access_control.AccessControl.fromConfig(
         allocator,
         "deny 127.0.0.1/32, allow 0.0.0.0/0",
         .allow,
     );
-    defer if (state.access_control) |*acl| acl.deinit();
+    defer acl.deinit();
+    cfg.access_control_rules = "deny 127.0.0.1/32, allow 0.0.0.0/0";
+    cfg.parsed_access_control = &acl;
     var dispatch_ctx = Http3DispatchContext{
         .config_store = &config_store,
         .cfg = &cfg,
@@ -4482,7 +4513,7 @@ pub fn handleHttp3Request(
             return;
         }
     }
-    if (ctx.state.access_control) |*acl| {
+    if (effective_cfg.parsed_access_control) |acl| {
         if (acl.check(request_ctx.client_ip) == .denied) {
             try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, "forbidden", "Access denied", correlation_id);
             return;

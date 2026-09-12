@@ -1,5 +1,6 @@
 const compat = @import("zig_compat");
 const std = @import("std");
+const secrets = @import("crypto").secrets;
 const http = @import("http.zig");
 const tls_core = @import("tls_core");
 const edge_config = @import("edge_config.zig");
@@ -393,6 +394,11 @@ fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeSta
 /// - `command_mutex` → `command_lifecycle`.
 /// - `approval_mutex` → `approvals` (and the per-identity pending count derived
 ///   from it).
+/// - `approval_persist_mutex` → serializes approval snapshot+write pairs to the
+///   `approval_store_path` file. Acquired BEFORE `approval_mutex` and held
+///   across the snapshot and the write, so the durable file cannot be
+///   overwritten by an older snapshot. Never take `approval_mutex` first and
+///   then this one.
 /// - `runtime_mutex` → `mux_resume_state`, and the reload-time rebinding of the
 ///   hot config-derived fields (`add_headers`, `http3_alt_svc`, `hsts_value`,
 ///   `security_headers`, the `max_*` limits, `compression_config`, log level).
@@ -422,7 +428,7 @@ fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeSta
 ///   the duped IP values in `fd_to_ip`; the nested allocations owned by
 ///   `command_lifecycle`, `approvals`, and `mux_resume_state` entries; and the
 ///   self-managed sub-stores (`rate_limiter`, `idempotency_store`,
-///   `proxy_cache_store`, `session_store`, `access_control`, `acme_challenge_store`,
+///   `proxy_cache_store`, `session_store`, `acme_challenge_store`,
 ///   `event_hub`, `request_buffer_pool`, `relay_buffer_pool`, `upstream_client`,
 ///   `dns_discovery`), each of which owns and frees its own internal state.
 ///
@@ -476,6 +482,7 @@ pub const GatewayState = struct {
     transcript_mutex: compat.Mutex = .{}, // transcript file appends
     command_mutex: compat.Mutex = .{}, // command_lifecycle
     approval_mutex: compat.Mutex = .{}, // approvals + pending-per-identity count
+    approval_persist_mutex: compat.Mutex = .{}, // serializes approval snapshot+write ordering
     circuit_mutex: compat.Mutex = .{}, // [HOT] circuit_breaker
     metrics_mutex: compat.Mutex = .{}, // [HOT] metrics — priority candidate for atomic counters
     upstream_mutex: compat.Mutex = .{}, // [HOT] upstream_health/active_requests + LB selection state
@@ -495,7 +502,7 @@ pub const GatewayState = struct {
     http3_runtime: ?*http.http3_runtime.Runtime, // owned pointer; main-event-loop-only
     session_store: ?http.session.SessionStore, // owned [session_mutex]
     session_store_path: []const u8, // borrowed from startup cfg; restart-only (warns on change at reload)
-    access_control: ?http.access_control.AccessControl, // owned; main-loop-only
+
     logger: http.logger.Logger, // owned; min_level updated on reload [runtime_mutex]
     metrics: http.metrics.Metrics, // shared counters [metrics_mutex]
     compression_config: http.compression.CompressionConfig, // cfg snapshot; updated on reload [runtime_mutex]
@@ -581,7 +588,6 @@ pub const GatewayState = struct {
         if (self.idempotency_store) |*is| is.deinit();
         if (self.proxy_cache_store) |*pc| pc.deinit();
         if (self.session_store) |*ss| ss.deinit();
-        if (self.access_control) |*acl| acl.deinit();
         self.upstream_client.deinit();
         if (self.acme_challenge_store) |*store| store.deinit();
         self.event_hub.deinit();
@@ -1350,14 +1356,17 @@ pub const GatewayState = struct {
         var out = try allocator.alloc(http.approval_store.StoredApproval, self.approvals.count());
         var i: usize = 0;
         errdefer {
+            // Match `approval_store.freeEntry`'s disposition even on this
+            // allocation-failure path: the partially built snapshot already
+            // holds real approval tokens.
             for (out[0..i]) |e| {
-                allocator.free(e.token);
+                secrets.secureZeroAndFree(allocator, @constCast(e.token));
+                secrets.secureZeroAndFree(allocator, @constCast(e.identity));
+                secrets.secureZeroAndFree(allocator, @constCast(e.decided_by));
                 allocator.free(e.method);
                 allocator.free(e.path);
-                allocator.free(e.identity);
                 allocator.free(e.command_id);
                 allocator.free(e.status);
-                allocator.free(e.decided_by);
             }
             allocator.free(out);
         }
@@ -1383,8 +1392,26 @@ pub const GatewayState = struct {
     }
 
     /// Persist all approvals to disk (no-op when store path is unconfigured).
+    /// Write the approval store to disk.
+    ///
+    /// Two orderings matter here, and a unique temp filename gives neither:
+    ///
+    ///  1. Only one persist may be in flight at a time. Concurrent writers
+    ///     otherwise race on the same temp path, where one can unlink the
+    ///     other's still-open file and fail its rename.
+    ///  2. The durable file must end up holding the NEWEST state. Snapshotting
+    ///     before serializing writes lets a delayed older snapshot land after a
+    ///     newer one and resurrect stale approvals.
+    ///
+    /// `approval_persist_mutex` is therefore acquired FIRST and held across both
+    /// the snapshot and the write, so a caller that waits for it snapshots the
+    /// state as of when it won the lock rather than when it was called.
     pub fn persistApprovals(self: *GatewayState) void {
         if (self.approval_store_path.len == 0) return;
+
+        self.approval_persist_mutex.lock();
+        defer self.approval_persist_mutex.unlock();
+
         const snapshot = blk: {
             self.approval_mutex.lock();
             defer self.approval_mutex.unlock();
@@ -3063,12 +3090,33 @@ pub const ManagedConfigVersion = struct {
     owned_cfg: ?*edge_config.EdgeConfig,
     ref_count: usize,
     generation: u64,
+    /// Parsed IP access-control policy for THIS configuration generation.
+    ///
+    /// The ACL lives here, not on `GatewayState`, because authorization state
+    /// must share the lifetime and generation of the configuration a request is
+    /// leasing. A single global ACL has two defects that a mutex cannot fix:
+    /// reload frees the rule slice while a worker may be inside `check()`, and a
+    /// request holding an older config lease can observe a newer (or absent)
+    /// ACL and skip a denial its own configuration still requires. Owned by the
+    /// version and destroyed only when the last lease releases it.
+    access_control: ?http.access_control.AccessControl = null,
+
+    /// The ACL to enforce for a request holding this version, if any.
+    pub fn accessControl(self: *ManagedConfigVersion) ?*http.access_control.AccessControl {
+        if (self.access_control) |*acl| return acl;
+        return null;
+    }
 };
 
 pub const ConfigLease = struct {
     store: *ReloadableConfigStore,
     version: *ManagedConfigVersion,
     cfg: *const edge_config.EdgeConfig,
+
+    /// ACL paired with this lease's configuration generation.
+    pub fn accessControl(self: ConfigLease) ?*http.access_control.AccessControl {
+        return self.version.accessControl();
+    }
 
     pub fn retain(self: *ConfigLease) ConfigLease {
         return self.store.retain(self.version);
@@ -3128,6 +3176,34 @@ pub const ReloadableConfigStore = struct {
         };
     }
 
+    /// Attach the startup generation's parsed ACL. Called once, before any
+    /// worker is accepting, so it needs no synchronization.
+    ///
+    /// `cfg_ptr` must be the same configuration this store was initialized with;
+    /// publishing the borrowed pointer is what lets request paths reach the ACL
+    /// paired with their lease.
+    pub fn setInitialAccessControl(
+        self: *ReloadableConfigStore,
+        cfg_ptr: *edge_config.EdgeConfig,
+        acl: ?http.access_control.AccessControl,
+    ) void {
+        std.debug.assert(self.current.cfg == cfg_ptr);
+        self.current.access_control = acl;
+        cfg_ptr.parsed_access_control = self.current.accessControl();
+    }
+
+    /// Attach a reload generation's parsed ACL to a prepared-but-not-installed
+    /// version. The version owns the ACL from here on, so it stays alive for
+    /// every request that later leases this generation and is freed only when
+    /// the last of those leases is released.
+    pub fn setPreparedAccessControl(
+        version: *ManagedConfigVersion,
+        acl: ?http.access_control.AccessControl,
+    ) void {
+        version.access_control = acl;
+        if (version.owned_cfg) |owned| owned.parsed_access_control = version.accessControl();
+    }
+
     pub fn prepareOwned(self: *ReloadableConfigStore, cfg_ptr: *edge_config.EdgeConfig) !*ManagedConfigVersion {
         const version = try createOwnedVersion(self.allocator, cfg_ptr);
         self.mutex.lock();
@@ -3180,6 +3256,9 @@ pub const ReloadableConfigStore = struct {
     }
 
     pub fn destroyVersion(self: *ReloadableConfigStore, version: *ManagedConfigVersion) void {
+        // Safe precisely because this runs only at ref_count == 0: no request
+        // can still be inside `check()` on these rules.
+        if (version.access_control) |*acl| acl.deinit();
         if (version.owned_cfg) |owned_cfg| {
             owned_cfg.deinit(self.allocator);
             self.allocator.destroy(owned_cfg);
@@ -4048,4 +4127,242 @@ test "served Prometheus metrics reflect updated proxy buffer limit snapshot" {
 
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 393216\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"downstream_to_upstream\",scope=\"global\",limit=\"hard\"} 4194304\n") != null);
+}
+
+fn initApprovalTestState(gs: *GatewayState, allocator: std.mem.Allocator, store_path: []const u8) void {
+    gs.allocator = allocator;
+    gs.approval_mutex = .{};
+    gs.approval_persist_mutex = .{};
+    gs.approvals = std.StringHashMap(ApprovalEntry).init(allocator);
+    gs.approval_store_path = store_path;
+    gs.approval_escalation_webhook = "";
+    gs.approval_ttl_ms = 300_000;
+    gs.approval_max_pending_per_identity = 0;
+    gs.logger = http.logger.Logger.init(.err, "test");
+}
+
+/// Insert a pending approval WITHOUT triggering persistence.
+///
+/// `approvalCreate` persists as part of its contract, which would re-enter
+/// `approval_persist_mutex`; these tests drive persistence explicitly.
+fn insertApprovalForTest(gs: *GatewayState, token: []const u8, path: []const u8, identity: []const u8) !void {
+    gs.approval_mutex.lock();
+    defer gs.approval_mutex.unlock();
+    const now = compat.milliTimestamp();
+    try gs.approvals.put(try gs.allocator.dupe(u8, token), .{
+        .method = try gs.allocator.dupe(u8, "POST"),
+        .path = try gs.allocator.dupe(u8, path),
+        .identity = try gs.allocator.dupe(u8, identity),
+        .command_id = try gs.allocator.dupe(u8, ""),
+        .status = .pending,
+        .created_ms = now,
+        .expires_ms = now + 300_000,
+        .decided_ms = 0,
+        .decided_by = try gs.allocator.dupe(u8, ""),
+    });
+}
+
+fn deinitApprovalTestState(gs: *GatewayState) void {
+    var it = gs.approvals.iterator();
+    while (it.next()) |kv| {
+        gs.allocator.free(kv.key_ptr.*);
+        var entry = kv.value_ptr.*;
+        entry.deinit(gs.allocator);
+    }
+    gs.approvals.deinit();
+}
+
+test "approval persistence snapshots after winning the persist lock, not before" {
+    // Regression for the stale-snapshot ordering bug: a unique temp filename
+    // serializes nothing. A persist that was called early but ran late used to
+    // write the state it observed at call time, overwriting newer approvals.
+    //
+    // The race is made deterministic by holding the persistence lock while a
+    // second mutation lands: the blocked writer must publish the state as of
+    // when it acquires the lock, so the newer approval has to be in the file.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const path = try std.fmt.allocPrint(allocator, "{s}/approvals.json", .{tmp_abs});
+    defer allocator.free(path);
+
+    var gs: GatewayState = undefined;
+    initApprovalTestState(&gs, allocator, path);
+    defer deinitApprovalTestState(&gs);
+
+    try insertApprovalForTest(&gs, "apr-first", "/first", "alice");
+
+    // Block persistence, then start a writer that must wait for the lock.
+    gs.approval_persist_mutex.lock();
+    const Runner = struct {
+        fn run(state: *GatewayState) void {
+            state.persistApprovals();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&gs});
+
+    // While that writer is queued, a newer approval is accepted. A snapshot
+    // taken at call time would not contain it.
+    try insertApprovalForTest(&gs, "apr-second", "/second", "bob");
+
+    gs.approval_persist_mutex.unlock();
+    thread.join();
+
+    const loaded = try http.approval_store.load(allocator, path);
+    defer http.approval_store.freeLoaded(allocator, loaded);
+
+    var saw_first = false;
+    var saw_second = false;
+    for (loaded) |entry| {
+        if (std.mem.eql(u8, entry.path, "/first")) saw_first = true;
+        if (std.mem.eql(u8, entry.path, "/second")) saw_second = true;
+    }
+    try std.testing.expect(saw_first);
+    // The durable file holds the newest complete state, not a stale snapshot.
+    try std.testing.expect(saw_second);
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+}
+
+test "concurrent approval persists do not lose the final state" {
+    // Companion to the ordering test: many interleaved persists must leave a
+    // complete, parseable file rather than one writer's temp file unlinked by
+    // another's, or a torn/partial store.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const path = try std.fmt.allocPrint(allocator, "{s}/approvals.json", .{tmp_abs});
+    defer allocator.free(path);
+
+    var gs: GatewayState = undefined;
+    initApprovalTestState(&gs, allocator, path);
+    defer deinitApprovalTestState(&gs);
+
+    const Worker = struct {
+        fn run(state: *GatewayState, prefix: []const u8, label: []const u8) void {
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                var token_buf: [32]u8 = undefined;
+                const token = std.fmt.bufPrint(&token_buf, "{s}-{d}", .{ prefix, i }) catch return;
+                insertApprovalForTest(state, token, label, "alice") catch return;
+                // Every mutation persists, exactly as the request paths do, so
+                // the writers genuinely contend on the same store file.
+                state.persistApprovals();
+            }
+        }
+    };
+    const a = try std.Thread.spawn(.{}, Worker.run, .{ &gs, "apr-a", "/a" });
+    const b = try std.Thread.spawn(.{}, Worker.run, .{ &gs, "apr-b", "/b" });
+    a.join();
+    b.join();
+
+    // A final persist publishes the terminal state; it must match memory
+    // exactly, proving no earlier writer clobbered it with a stale snapshot.
+    gs.persistApprovals();
+    const loaded = try http.approval_store.load(allocator, path);
+    defer http.approval_store.freeLoaded(allocator, loaded);
+    try std.testing.expectEqual(@as(usize, 16), loaded.len);
+}
+
+test "an in-flight config lease keeps enforcing its own ACL across a reload" {
+    // Regression for the ACL hot-reload finding. Two defects are covered:
+    //
+    //  1. Use-after-free: reload used to `deinit()` the live ACL while a worker
+    //     could be inside `check()` on its rule slice.
+    //  2. Mixed generations: a request holding an older config lease could
+    //     observe the NEWER (or absent) ACL and skip a denial that its own
+    //     leased configuration still required.
+    //
+    // A mutex alone fixes only the first. Pairing ACL lifetime with the config
+    // generation fixes both, which is what this asserts.
+    const allocator = std.testing.allocator;
+
+    var old_cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    old_cfg.access_control_rules = "deny 203.0.113.0/24, allow 0.0.0.0/0";
+
+    var store = try ReloadableConfigStore.initBorrowed(allocator, &old_cfg);
+    defer store.deinit();
+    store.setInitialAccessControl(&old_cfg, try http.access_control.AccessControl.fromConfig(
+        allocator,
+        old_cfg.access_control_rules,
+        .allow,
+    ));
+
+    // A request begins under the old generation and holds its lease.
+    var in_flight = store.acquire();
+    try std.testing.expect(in_flight.cfg.parsed_access_control != null);
+    try std.testing.expectEqual(
+        http.access_control.AccessResult.denied,
+        in_flight.cfg.parsed_access_control.?.check("203.0.113.7"),
+    );
+
+    // Meanwhile a reload installs a generation with NO access control at all.
+    const new_cfg = try allocator.create(edge_config.EdgeConfig);
+    new_cfg.* = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    new_cfg.access_control_rules = "";
+    const prepared = try store.prepareOwned(new_cfg);
+    ReloadableConfigStore.setPreparedAccessControl(prepared, null);
+    store.installPrepared(prepared);
+
+    // The in-flight request still enforces the ACL it leased. Previously this
+    // request would have seen `state.access_control == null` and allowed the
+    // very address its own configuration denies.
+    try std.testing.expect(in_flight.cfg.parsed_access_control != null);
+    try std.testing.expectEqual(
+        http.access_control.AccessResult.denied,
+        in_flight.cfg.parsed_access_control.?.check("203.0.113.7"),
+    );
+
+    // A request that starts after the reload sees the new policy.
+    var fresh = store.acquire();
+    try std.testing.expect(fresh.cfg.parsed_access_control == null);
+    fresh.release();
+
+    // Releasing the last old lease is what retires the old generation and frees
+    // its ACL — never while a request could still be inside `check()`.
+    in_flight.release();
+}
+
+test "a reloaded ACL is published atomically with its own generation" {
+    // The inverse direction: a reload that ADDS an ACL must not leave a window
+    // where the new configuration is live but its ACL is not, and old leases
+    // must not start enforcing rules their generation never had.
+    const allocator = std.testing.allocator;
+
+    var old_cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    old_cfg.access_control_rules = "";
+    var store = try ReloadableConfigStore.initBorrowed(allocator, &old_cfg);
+    defer store.deinit();
+    store.setInitialAccessControl(&old_cfg, null);
+
+    var permissive_lease = store.acquire();
+    try std.testing.expect(permissive_lease.cfg.parsed_access_control == null);
+
+    const new_cfg = try allocator.create(edge_config.EdgeConfig);
+    new_cfg.* = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    // The version owns this config, so `destroyVersion` frees its fields: the
+    // rules must be a real allocation, not a literal.
+    new_cfg.access_control_rules = try allocator.dupe(u8, "deny 198.51.100.0/24, allow 0.0.0.0/0");
+    const prepared = try store.prepareOwned(new_cfg);
+    ReloadableConfigStore.setPreparedAccessControl(prepared, try http.access_control.AccessControl.fromConfig(
+        allocator,
+        new_cfg.access_control_rules,
+        .allow,
+    ));
+    store.installPrepared(prepared);
+
+    // New generation: ACL is already attached the moment it becomes current.
+    var strict_lease = store.acquire();
+    try std.testing.expectEqual(
+        http.access_control.AccessResult.denied,
+        strict_lease.cfg.parsed_access_control.?.check("198.51.100.5"),
+    );
+    // Old generation: unchanged, still permissive.
+    try std.testing.expect(permissive_lease.cfg.parsed_access_control == null);
+
+    strict_lease.release();
+    permissive_lease.release();
 }

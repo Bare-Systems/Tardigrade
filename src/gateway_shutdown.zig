@@ -360,6 +360,11 @@ pub fn hotReloadConfig(
     }
 
     applyReloadedRuntimeConfig(cfg_ptr, state, &prepared_security);
+    // Transfer ACL ownership to the generation it belongs to BEFORE publishing
+    // that generation, so no lease can ever observe the new config without its
+    // matching ACL.
+    gs.ReloadableConfigStore.setPreparedAccessControl(prepared_version, prepared_security.access_control);
+    prepared_security.access_control = null;
     worker_ctx.config_store.installPrepared(prepared_version);
     http3_dispatch_ctx.cfg = cfg_ptr;
     http.access_log.deinit();
@@ -712,12 +717,14 @@ fn applyReloadedRuntimeConfig(
     state.proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds;
     state.proxy_cache_mutex.unlock();
 
-    // Access control and HSTS are prepared before any reload mutation. Swap
-    // them only on the successful commit path, preserving the old policy if
-    // parsing or allocation failed.
-    if (state.access_control) |*acl| acl.deinit();
-    state.access_control = prepared_security.access_control;
-    prepared_security.access_control = null;
+    // HSTS is prepared before any reload mutation and swapped only on the
+    // successful commit path, preserving the old value if parsing or allocation
+    // failed.
+    //
+    // The ACL is deliberately NOT swapped here. It is owned by the new
+    // configuration version and handed over in `installReloadedAccessControl`,
+    // so in-flight requests keep enforcing the ACL of the generation they
+    // leased until that lease is released.
 
     state.runtime_mutex.lock();
     state.add_headers = cfg.add_headers;
@@ -839,7 +846,6 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
     state.proxy_cache_path = "";
     state.proxy_cache_ttl_seconds = 0;
     state.runtime_mutex = .{};
-    state.access_control = null;
     // `metricsToPrometheus` (called below) locks this via `muxMetricsSnapshot`
     // — left uninitialized, `.lock()` on garbage memory hangs indefinitely
     // rather than failing loudly. This test was previously never compiled or
@@ -884,10 +890,15 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
     var prepared_security = try PreparedReloadSecurity.init(allocator, &cfg);
     defer prepared_security.deinit(allocator);
     applyReloadedRuntimeConfig(&cfg, &state, &prepared_security);
-    defer if (state.access_control) |*acl| acl.deinit();
     defer if (state.hsts_value.len > 0) allocator.free(state.hsts_value);
 
-    try std.testing.expectEqual(http.access_control.AccessResult.denied, state.access_control.?.check("203.0.113.4"));
+    // The ACL now belongs to the configuration version rather than to
+    // `GatewayState`; `applyReloadedRuntimeConfig` leaves `prepared_security`
+    // holding it until the new generation is installed.
+    try std.testing.expectEqual(
+        http.access_control.AccessResult.denied,
+        prepared_security.access_control.?.check("203.0.113.4"),
+    );
 
     const prom = try state.metricsToPrometheus(allocator);
     defer allocator.free(prom);

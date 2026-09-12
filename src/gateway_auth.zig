@@ -1,5 +1,7 @@
+const builtin = @import("builtin");
 const compat = @import("zig_compat");
 const std = @import("std");
+const secrets = @import("crypto").secrets;
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const gs = @import("gateway_state.zig");
@@ -7,6 +9,9 @@ const GatewayState = gs.GatewayState;
 const ApprovalDecision = gs.ApprovalDecision;
 
 const JSON_CONTENT_TYPE = "application/json";
+
+/// Device registry entries are HMAC shared secrets, so the file is owner-only.
+const owner_only_permissions: std.Io.File.Permissions = .fromMode(0o600);
 
 pub const AuthResult = struct {
     ok: bool,
@@ -278,9 +283,19 @@ const ApprovalResponsePayload = struct {
     }
 };
 
+/// A device registration. `hmac_key` is a SHARED SECRET, not public material:
+/// device request authentication is HMAC-SHA256 over the request, so whoever
+/// holds this value can sign as the device. The legacy `public_key` JSON field
+/// name is accepted for compatibility but is a misnomer.
 const DeviceRegistration = struct {
     device_id: []const u8,
-    public_key: []const u8,
+    hmac_key: []const u8,
+
+    fn deinit(self: *DeviceRegistration, allocator: std.mem.Allocator) void {
+        allocator.free(self.device_id);
+        secrets.secureZeroAndFree(allocator, @constCast(self.hmac_key));
+        self.* = undefined;
+    }
 };
 
 pub fn parseApprovalRequestBody(allocator: std.mem.Allocator, body: []const u8) !ApprovalRequestBody {
@@ -338,32 +353,60 @@ fn parseDeviceRegistration(allocator: std.mem.Allocator, body: []const u8) !Devi
     if (root != .object) return error.InvalidDeviceRegistration;
     const obj = root.object;
     const did_val = obj.get("device_id") orelse return error.InvalidDeviceRegistration;
-    const pk_val = obj.get("public_key") orelse return error.InvalidDeviceRegistration;
-    if (did_val != .string or pk_val != .string) return error.InvalidDeviceRegistration;
+    // `hmac_key` is the accurate name; `public_key` is accepted because it is
+    // the field this payload shipped with before the protocol moved to HMAC.
+    const key_val = obj.get("hmac_key") orelse obj.get("public_key") orelse return error.InvalidDeviceRegistration;
+    if (did_val != .string or key_val != .string) return error.InvalidDeviceRegistration;
     const device_id = std.mem.trim(u8, did_val.string, " \t\r\n");
-    const public_key = std.mem.trim(u8, pk_val.string, " \t\r\n");
-    if (device_id.len == 0 or public_key.len == 0) return error.InvalidDeviceRegistration;
+    const hmac_key = std.mem.trim(u8, key_val.string, " \t\r\n");
+    if (device_id.len == 0 or hmac_key.len == 0) return error.InvalidDeviceRegistration;
     return .{
         .device_id = try allocator.dupe(u8, device_id),
-        .public_key = try allocator.dupe(u8, public_key),
+        .hmac_key = try allocator.dupe(u8, hmac_key),
     };
 }
 
-fn registerDeviceIdentity(path: []const u8, device_id: []const u8, public_key: []const u8) !void {
-    const path_z = try std.heap.page_allocator.dupeZ(u8, path);
-    defer std.heap.page_allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, std.c.O.WRONLY | std.c.O.CREAT | std.c.O.APPEND, 0o644);
-    if (fd < 0) return error.FileOpenFailed;
-    defer _ = std.c.close(fd);
-    const line = try std.fmt.allocPrint(std.heap.page_allocator, "{s}|{s}\n", .{ device_id, public_key });
-    defer std.heap.page_allocator.free(line);
-    const stream = compat.netStreamFromFd(fd);
-    try stream.writeAll(line);
+/// Append a device's HMAC key to the registry.
+///
+/// The registry holds shared secrets for every registered device, so it is
+/// created owner-only (0600) in the `open` syscall itself — a later `chmod`
+/// would leave a window where another local user could read it. An existing
+/// registry that is group/world accessible is refused rather than appended to,
+/// because writing a new secret into a readable file is the same exposure.
+fn registerDeviceIdentity(path: []const u8, device_id: []const u8, hmac_key: []const u8) !void {
+    var file = try compat.cwd().createFile(path, .{
+        .read = true,
+        .truncate = false,
+        .permissions = owner_only_permissions,
+    });
+    defer file.close();
+    try requireOwnerOnlyRegistry(file);
+    _ = std.c.lseek(file.file.handle, 0, std.c.SEEK.END);
+
+    const line = try std.fmt.allocPrint(std.heap.page_allocator, "{s}|{s}\n", .{ device_id, hmac_key });
+    defer secrets.secureZeroAndFree(std.heap.page_allocator, line);
+    try file.writeAll(line);
 }
 
+/// Reject a device registry that any account other than the owner can read or
+/// write. Returns `error.InsecureDeviceRegistryPermissions` so the caller fails
+/// closed instead of appending a secret to a readable file.
+fn requireOwnerOnlyRegistry(file: compat.FileCompat) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(file.file.handle, &st) != 0) return error.FileOpenFailed;
+    if (st.mode & 0o077 != 0) return error.InsecureDeviceRegistryPermissions;
+}
+
+/// Look up one device's HMAC key.
+///
+/// The registry file holds every device's shared secret, so the raw buffer is
+/// wiped before release rather than left in freed heap memory. The returned key
+/// is secret material too: callers must release it with
+/// `secrets.secureZeroAndFree`.
 fn loadRegisteredDeviceKey(allocator: std.mem.Allocator, registry_path: []const u8, device_id: []const u8) ?[]const u8 {
     const raw = compat.cwd().readFileAlloc(allocator, registry_path, 2 * 1024 * 1024) catch return null;
-    defer allocator.free(raw);
+    defer secrets.secureZeroAndFree(allocator, raw);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r\n");
@@ -394,9 +437,11 @@ fn validateDeviceRequest(
 
     const allocator = std.heap.page_allocator;
     const key = loadRegisteredDeviceKey(allocator, cfg.device_registry_path, device_id) orelse return false;
-    defer allocator.free(key);
+    defer secrets.secureZeroAndFree(allocator, @constCast(key));
     const signing_input = std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n{s}", .{ method, path, ts_str, body }) catch return false;
-    defer allocator.free(signing_input);
+    // The signing input embeds the request body, which can carry credentials of
+    // its own, so it is wiped alongside the key.
+    defer secrets.secureZeroAndFree(allocator, signing_input);
     return verifyDeviceRequestSignature(key, signing_input, provided_sig);
 }
 
@@ -745,4 +790,78 @@ test "parseApprovalRequestBody parses command scoped request" {
     try std.testing.expectEqualStrings("/api/tasks", req.path);
     try std.testing.expect(req.command_id != null);
     try std.testing.expectEqualStrings("cmd-123", req.command_id.?);
+}
+
+test "device registry is created owner-only and refuses insecure permissions" {
+    // The registry holds HMAC shared secrets for every device, so Tardigrade
+    // must not create it 0644 (the pre-HMAC default) and must not append a new
+    // secret to a registry other local accounts can read.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+
+    const path = try std.fmt.allocPrint(allocator, "{s}/devices.registry", .{tmp_abs});
+    defer allocator.free(path);
+    try registerDeviceIdentity(path, "device-1", "s3cret-hmac-key");
+
+    {
+        const created = try std.Io.Dir.openFileAbsolute(compat.io(), path, .{});
+        defer created.close(compat.io());
+        const stat = try created.stat(compat.io());
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    }
+
+    // A registry loosened out-of-band must fail closed rather than gain
+    // another device secret.
+    {
+        var loosened = try compat.cwd().openFile(path, .{ .mode = .read_write });
+        defer loosened.close();
+        try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(loosened.file.handle, 0o644));
+    }
+    try std.testing.expectError(
+        error.InsecureDeviceRegistryPermissions,
+        registerDeviceIdentity(path, "device-2", "another-secret"),
+    );
+}
+
+test "device HMAC key material is wiped after verification" {
+    // Regression: the registry read buffer holds every device's secret and the
+    // returned key is secret material; both were previously freed unwiped.
+    var detector = secrets.CredentialWipeDetector.init(std.testing.allocator);
+    const allocator = detector.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const path = try std.fmt.allocPrint(allocator, "{s}/devices.registry", .{tmp_abs});
+    defer allocator.free(path);
+    try registerDeviceIdentity(path, "device-1", "s3cret-hmac-key");
+
+    const key = loadRegisteredDeviceKey(allocator, path, "device-1").?;
+    try std.testing.expectEqualStrings("s3cret-hmac-key", key);
+    detector.watch(key);
+    secrets.secureZeroAndFree(allocator, @constCast(key));
+    try std.testing.expect(detector.allWatchedWiped());
+
+    // An unknown device yields no key at all.
+    try std.testing.expect(loadRegisteredDeviceKey(allocator, path, "device-absent") == null);
+}
+
+test "device registration accepts the hmac_key name and the legacy spelling" {
+    const allocator = std.testing.allocator;
+    var current = try parseDeviceRegistration(allocator, "{\"device_id\":\"d1\",\"hmac_key\":\"k1\"}");
+    defer current.deinit(allocator);
+    try std.testing.expectEqualStrings("k1", current.hmac_key);
+
+    var legacy = try parseDeviceRegistration(allocator, "{\"device_id\":\"d1\",\"public_key\":\"k2\"}");
+    defer legacy.deinit(allocator);
+    try std.testing.expectEqualStrings("k2", legacy.hmac_key);
+
+    try std.testing.expectError(
+        error.InvalidDeviceRegistration,
+        parseDeviceRegistration(allocator, "{\"device_id\":\"d1\"}"),
+    );
 }

@@ -47,7 +47,10 @@ const MuxResumeState = gs.MuxResumeState;
 const ActiveDrivePollRemoveFn = *const fn (*anyopaque, std.posix.fd_t) anyerror!void;
 const ActiveDrivePollSubmitFn = *const fn (*anyopaque, std.posix.fd_t) anyerror!void;
 
-pub fn run(cfg: *const edge_config.EdgeConfig) !void {
+/// Takes a mutable config because the startup generation publishes its parsed
+/// ACL back onto it (`EdgeConfig.parsed_access_control`), which is what pairs
+/// authorization state with the configuration generation a request leases.
+pub fn run(cfg: *edge_config.EdgeConfig) !void {
     const state_allocator = runtime_allocator.runtimeAllocator();
 
     const initial_hsts = try gp.computeHstsValue(state_allocator, cfg);
@@ -87,10 +90,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         else
             null,
         .session_store_path = cfg.session_store_path,
-        .access_control = if (cfg.access_control_rules.len > 0)
-            try http.access_control.AccessControl.fromConfig(state_allocator, cfg.access_control_rules, .allow)
-        else
-            null,
+        // Ownership lives on the configuration version (see
+        // `ManagedConfigVersion.access_control`), not here: an ACL must not
+        // outlive or under-live the configuration generation a request leased.
+        .access_control = null,
         .logger = http.logger.Logger.init(cfg.log_level, "gateway"),
         .metrics = http.metrics.Metrics.init(),
         .compression_config = .{
@@ -311,6 +314,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var timer = http.event_loop.TimerManager.init(250);
     var config_store = try ReloadableConfigStore.initBorrowed(state_allocator, cfg);
     defer config_store.deinit();
+    config_store.setInitialAccessControl(cfg, if (cfg.access_control_rules.len > 0)
+        try http.access_control.AccessControl.fromConfig(state_allocator, cfg.access_control_rules, .allow)
+    else
+        null);
     var http3_runtime: ?http.http3_runtime.Runtime = null;
     var native_credentials: ?http.native_tls_connection.NativeCredentialStore = null;
     // #488: one process-scoped native resumption runtime, shared by every
@@ -598,7 +605,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (state.session_store != null) {
         state.logger.info(null, "Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });
     }
-    if (state.access_control != null) {
+    if (cfg.access_control_rules.len > 0) {
         state.logger.info(null, "IP access control enabled", .{});
     }
     if (cfg.basic_auth_hashes.len > 0) {
@@ -3678,11 +3685,12 @@ fn h2EvaluateRequestPolicy(
         }
     }
 
-    if (cfg.access_control_rules.len > 0) {
-        if (state.access_control) |*acl| {
-            if (acl.check(client_ip) == .denied) {
-                return .{ .status_code = 403, .code = "forbidden", .message = "Access denied" };
-            }
+    // Enforce the ACL belonging to THIS request's configuration generation.
+    // Reading a global ACL here could both race a reload freeing the rules and
+    // let an older lease skip a denial its own config still requires.
+    if (cfg.parsed_access_control) |acl| {
+        if (acl.check(client_ip) == .denied) {
+            return .{ .status_code = 403, .code = "forbidden", .message = "Access denied" };
         }
     }
 
@@ -4210,7 +4218,7 @@ const H1ProductionPostPreflightHooks = struct {
         keep_alive: *bool,
         client_ip: []const u8,
         streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
-    ) !u16 {
+    ) !ghandlers.RouteOutcome {
         _ = self;
         return try ghandlers.routeRequest(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body);
     }
@@ -4278,12 +4286,16 @@ fn executeH1PostPreflightOrchestration(
         return .logged_terminal;
     }
 
-    const route_status = try hooks.route(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body);
-    // Mirror only after the primary route's own authorization has accepted
-    // the request. Running this before location auth or policy evaluation
-    // leaks denied request bodies to the mirror target.
-    try hooks.mirror(allocator, cfg, request, correlation_id, client_ip);
-    return .{ .route_status = route_status };
+    const outcome = try hooks.route(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body);
+    // Mirror only when routing reports that authorization actually accepted the
+    // request. Ordering after `route()` is not enough on its own: location
+    // `auth required` rejections are returned as an ordinary route status, so
+    // the decision has to be carried explicitly or a denied body still leaks to
+    // the mirror target.
+    if (outcome.mirror_allowed) {
+        try hooks.mirror(allocator, cfg, request, correlation_id, client_ip);
+    }
+    return .{ .route_status = outcome.status };
 }
 
 fn mayNeedStreamingRequestBodyPreRead(cfg: *const edge_config.EdgeConfig) bool {
@@ -4948,7 +4960,7 @@ const H1CountingPostPreflightHooks = struct {
         keep_alive: *bool,
         client_ip: []const u8,
         streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
-    ) !u16 {
+    ) !ghandlers.RouteOutcome {
         _ = conn;
         _ = allocator;
         _ = cfg;
@@ -4961,7 +4973,7 @@ const H1CountingPostPreflightHooks = struct {
         _ = streaming_request_body;
         self.effects.upstream_calls += 1;
         self.effects.handler_calls += 1;
-        return @intFromEnum(http.Status.ok);
+        return .{ .status = @intFromEnum(http.Status.ok) };
     }
 };
 
@@ -6274,6 +6286,10 @@ const H2DispatchTestConn = struct {
         pub fn writeAll(self: Writer, bytes: []const u8) !void {
             try self.conn.out.writer.writeAll(bytes);
         }
+
+        pub fn print(self: Writer, comptime fmt: []const u8, args: anytype) !void {
+            try self.conn.out.writer.print(fmt, args);
+        }
     };
 
     fn init(allocator: std.mem.Allocator) H2DispatchTestConn {
@@ -6287,7 +6303,7 @@ const H2DispatchTestConn = struct {
         self.out.deinit();
     }
 
-    fn writer(self: *H2DispatchTestConn) Writer {
+    pub fn writer(self: *H2DispatchTestConn) Writer {
         return .{ .conn = self };
     }
 
@@ -6904,4 +6920,217 @@ test {
     _ = @import("gateway_handlers.zig");
     _ = @import("gateway_shutdown.zig");
     _ = @import("process_early_data_integration_tests.zig");
+}
+
+/// Hooks that run the REAL router while counting mirror deliveries.
+///
+/// The location-auth mirror leak lives in the seam between `routeRequest`'s
+/// authorization decision and the orchestration's mirror call, so a probe that
+/// stubs out routing cannot observe it.
+const H1RealRouteMirrorProbeHooks = struct {
+    effects: *H1PreflightSideEffectProbe,
+
+    fn rejectEarly(
+        self: H1RealRouteMirrorProbeHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !u16 {
+        _ = .{ self, allocator, writer, state, ctx, request, correlation_id, keep_alive };
+        return @intFromEnum(http.Status.too_early);
+    }
+
+    fn mirror(
+        self: H1RealRouteMirrorProbeHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        client_ip: []const u8,
+    ) !void {
+        _ = .{ allocator, cfg, request, correlation_id, client_ip };
+        self.effects.mirror_calls += 1;
+    }
+
+    fn auth(
+        self: H1RealRouteMirrorProbeHooks,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        headers: *const http.Headers,
+    ) !void {
+        self.effects.auth_calls += 1;
+        try ghandlers.primeRequestAuthContext(allocator, cfg, state, ctx, headers);
+    }
+
+    fn middleware(
+        self: H1RealRouteMirrorProbeHooks,
+        allocator: std.mem.Allocator,
+        writer: anytype,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *const http.Request,
+        correlation_id: []const u8,
+        keep_alive: bool,
+    ) !bool {
+        _ = .{ self, allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive };
+        return false;
+    }
+
+    fn route(
+        self: H1RealRouteMirrorProbeHooks,
+        conn: anytype,
+        allocator: std.mem.Allocator,
+        cfg: *const edge_config.EdgeConfig,
+        state: *GatewayState,
+        ctx: *http.request_context.RequestContext,
+        request: *http.Request,
+        correlation_id: []const u8,
+        keep_alive: *bool,
+        client_ip: []const u8,
+        streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
+    ) !ghandlers.RouteOutcome {
+        self.effects.handler_calls += 1;
+        return try ghandlers.routeRequest(conn, allocator, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, streaming_request_body);
+    }
+};
+
+test "H1 location auth denial never mirrors the denied request body" {
+    // Regression: moving `mirror()` after `route()` did not fix the leak,
+    // because `routeRequest()` returns a location-auth 401/403 as an ordinary
+    // route status. A POST to an `auth required` location with no credentials
+    // must reach no mirror target at all.
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/private",
+            .priority = 0,
+            .action = .{ .return_response = .{ .status = 200, .body = "secret" } },
+            .auth = .required,
+        },
+    };
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{
+        .{ .method = "POST", .pattern = "^/private$", .target_url = "http://127.0.0.1:9002/mirror" },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+
+    var request = try http.Request.parseHead(
+        allocator,
+        "POST /private HTTP/1.1\r\nHost: example.test\r\nContent-Length: 11\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    defer request.request.deinit();
+    // `Request.deinit` owns the body, so it must be a real allocation.
+    request.request.body = try allocator.dupe(u8, "sensitive-payload");
+
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.session_mutex = .{};
+    state.session_store = null;
+    state.logger = http.logger.Logger.init(.err, "test");
+    state.security_headers = .{};
+    state.add_headers = &.{};
+    state.http3_alt_svc = null;
+    var ctx = http.request_context.RequestContext.init(allocator, "req-mirror", "127.0.0.1");
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-mirror", 0);
+    var keep_alive = false;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try executeH1PostPreflightOrchestration(
+        &conn,
+        allocator,
+        &conn.out.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-mirror",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1RealRouteMirrorProbeHooks{ .effects = &effects },
+    );
+
+    // Denied locally...
+    try std.testing.expectEqual(@as(u16, 401), outcome.route_status);
+    // ...and the body never left the process.
+    try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
+    try std.testing.expect(std.mem.find(u8, conn.out.written(), "sensitive-payload") == null);
+}
+
+test "H1 authorized route still mirrors" {
+    // Positive control for the regression above: the fix must not disable
+    // mirroring for requests that were actually allowed.
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/open",
+            .priority = 0,
+            .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+        },
+    };
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{
+        .{ .method = "GET", .pattern = "^/open$", .target_url = "http://127.0.0.1:9002/mirror" },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+
+    var request = try http.Request.parseHead(
+        allocator,
+        "GET /open HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    defer request.request.deinit();
+
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.session_mutex = .{};
+    state.session_store = null;
+    state.logger = http.logger.Logger.init(.err, "test");
+    state.security_headers = .{};
+    state.add_headers = &.{};
+    state.http3_alt_svc = null;
+    var ctx = http.request_context.RequestContext.init(allocator, "req-open", "127.0.0.1");
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-open", 0);
+    var keep_alive = false;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try executeH1PostPreflightOrchestration(
+        &conn,
+        allocator,
+        &conn.out.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-open",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1RealRouteMirrorProbeHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, 200), outcome.route_status);
+    try std.testing.expectEqual(@as(usize, 1), effects.mirror_calls);
 }

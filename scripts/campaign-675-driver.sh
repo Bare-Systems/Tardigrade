@@ -5,8 +5,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-EPOCH_SHA=1c7b51b7ce4732fb0c8329e0fc0205f4d96dcd8a
-E=artifacts/hardening/fuzz/campaign-675-1c7b51b7
+EPOCH_SHA=92dc8a4a4a3a72c580631ebfcd681b3fa2d37b61
+E=artifacts/hardening/fuzz/campaign-675-92dc8a4a
 PVE=root@192.168.86.50
 IMAGE=/var/lib/vz/template/cache/debian-13-genericcloud-amd64-fuzz.qcow2
 IMAGE_SHA=85a969b7e99d7c817414136033df18c58d5c45ac8d27bb36e8ccb67173d2d4e3

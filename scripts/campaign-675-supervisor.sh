@@ -10,7 +10,7 @@
 #                                    passed rows and re-attaches to a launched one).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
-LOG=artifacts/hardening/fuzz/campaign-675-1c7b51b7/driver.log
+LOG=artifacts/hardening/fuzz/campaign-675-92dc8a4a/driver.log
 say() { printf '%s SUPERVISOR %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$LOG"; }
 say "started"
 while true; do

@@ -3,7 +3,7 @@
 # supervisor; deliberately does NOT restart one that stopped on a finding.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
-E=artifacts/hardening/fuzz/campaign-675-1c7b51b7
+E=artifacts/hardening/fuzz/campaign-675-92dc8a4a
 LOG="$E/driver.log"
 STATUS="$E/STATUS.txt"
 now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
@@ -31,11 +31,14 @@ grep -qE "triage required" <<<"$(tail -3 "$LOG" 2>/dev/null)" && halted=yes
 # never fire. Use the timestamp of the last real driver event instead.
 last_drv=$(grep -E "PASS|STOP:|FATAL|START|COMPLETE|INCOMPLETE" "$LOG" 2>/dev/null | tail -1 | awk '{print $1}')
 if [[ -n "$last_drv" ]]; then
-  last_s=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_drv" +%s 2>/dev/null || echo 0)
+  last_s=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$last_drv" +%s 2>/dev/null || echo 0)
 else
   last_s=0
 fi
 if [[ "$last_s" -gt 0 ]]; then age_h=$(( ( $(date +%s) - last_s ) / 3600 )); else age_h=0; fi
+# A negative age means the timestamp parse went wrong; treat as unknown (0)
+# rather than reporting nonsense that would also defeat the staleness check.
+[[ "$age_h" -lt 0 ]] && age_h=0
 
 {
   echo "checked_utc=$(now)"

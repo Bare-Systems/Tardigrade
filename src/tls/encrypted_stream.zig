@@ -5617,6 +5617,14 @@ fn expectStreamStateCleared(subject: *PureZigRecordStream) !void {
 /// per call). Coverage instrumentation on every scalar comparison makes those
 /// test-only scans dominate sustained fuzzing even though their internal loop
 /// carries no useful input-dependent coverage signal.
+fn allEqualScalarUninstrumented(comptime T: type, slice: []const T, scalar: T) bool {
+    @disableInstrumentation();
+    for (slice) |v| {
+        if (v != scalar) return false;
+    }
+    return true;
+}
+
 fn allEqualUninstrumented(comptime T: type, slice: []const T, scalar: T) bool {
     @disableInstrumentation();
     // Explicitly vectorized rather than `std.mem.allEqual`.
@@ -5624,32 +5632,73 @@ fn allEqualUninstrumented(comptime T: type, slice: []const T, scalar: T) bool {
     // `@disableInstrumentation` removes this function's coverage callbacks, but
     // it does NOT restore vectorized memory comparison: Zig deliberately
     // disables that lowering in fuzzing mode, so `std.mem.allEqual` stays a
-    // scalar byte loop. `expectStreamStateCleared` scans ~215 KB of backing
-    // storage per call and the target runs all four cleanup scenario families
-    // per input, so that scalar loop did roughly 0.9M byte comparisons per
-    // execution and accounted for ~89% of sampled CPU.
+    // scalar byte loop. `expectStreamStateCleared` scans ~215 KB per call and
+    // the cleanup target runs all four scenario families per input, so that
+    // loop did ~0.9M comparisons per execution and ~89% of sampled CPU. The
+    // target never once completed a 10M budget in any #675 epoch.
     //
-    // The cost was not theoretical: `fuzz: TLS record: encrypted stream cleanup
-    // preserves root errors across alerts and epoch transitions` never once
-    // completed a 10M budget in any #675 campaign epoch -- its only recorded
-    // outcome was watchdog timeout (exit 124), including a ~22 h run against a
-    // sibling target that finishes the same budget in 64 minutes.
+    // Compared through a BYTE VIEW, never `@Vector(N, bool)`: a vector of bool
+    // is bit-packed while `[N]bool` is one byte per element, so coercing the
+    // array to a bool vector misreads the data. That is not theoretical -- an
+    // earlier version of this function did exactly that, passed on aarch64,
+    // and failed three tests on x86_64 because the largest buffer scanned here
+    // (`inbound_plaintext_provenance`, 32 KiB) is `bool`.
     //
-    // The oracle's strength is unchanged: it still proves every byte of the
-    // full capacity is cleared, not merely the region that happened to be
-    // written.
+    // `@sizeOf(bool) == 1`, so the byte view is exact for the canonical 0/1
+    // representations these buffers hold, and the cleared state being asserted
+    // is all-zero bytes under either reading. Element types wider than a byte
+    // fall back to the scalar loop, where a single-byte comparand would be
+    // meaningless.
+    const want: u8 = switch (@typeInfo(T)) {
+        .bool => @intFromBool(scalar),
+        .int => |info| if (info.bits == 8) @bitCast(scalar) else return allEqualScalarUninstrumented(T, slice, scalar),
+        else => return allEqualScalarUninstrumented(T, slice, scalar),
+    };
+    const bytes = std.mem.sliceAsBytes(slice);
     const lanes = 32;
-    const V = @Vector(lanes, T);
-    const splat: V = @splat(scalar);
+    const V = @Vector(lanes, u8);
+    const splat: V = @splat(want);
     var i: usize = 0;
-    while (i + lanes <= slice.len) : (i += lanes) {
-        const chunk: V = slice[i..][0..lanes].*;
+    while (i + lanes <= bytes.len) : (i += lanes) {
+        const chunk: V = bytes[i..][0..lanes].*;
         if (@reduce(.Or, chunk != splat)) return false;
     }
-    while (i < slice.len) : (i += 1) {
-        if (slice[i] != scalar) return false;
+    while (i < bytes.len) : (i += 1) {
+        if (bytes[i] != want) return false;
     }
     return true;
+}
+
+test "allEqualUninstrumented matches a scalar reference for u8 and bool" {
+    // Direct coverage of the helper itself. The bool instantiation is the one
+    // that broke on x86_64 while passing on aarch64, and nothing exercised it
+    // in isolation -- it was only reachable through a fuzz oracle, so the
+    // breakage only surfaced on a Linux campaign guest.
+    var u8_buf: [201]u8 = undefined;
+    var bool_buf: [201]bool = undefined;
+    // Sizes deliberately straddle the 32-lane boundary so both the vector body
+    // and the scalar tail are exercised, and a dirty element is placed in each.
+    for ([_]usize{ 0, 1, 31, 32, 33, 100, 191, 192, 200 }) |dirty| {
+        @memset(&u8_buf, 0);
+        @memset(&bool_buf, false);
+        try testing.expect(allEqualUninstrumented(u8, &u8_buf, 0));
+        try testing.expect(allEqualUninstrumented(bool, &bool_buf, false));
+        u8_buf[dirty] = 0xff;
+        bool_buf[dirty] = true;
+        try testing.expect(!allEqualUninstrumented(u8, &u8_buf, 0));
+        try testing.expect(!allEqualUninstrumented(bool, &bool_buf, false));
+        // And agree with the scalar reference on every length prefix.
+        for ([_]usize{ 0, 1, 32, 64, 201 }) |len| {
+            try testing.expectEqual(
+                allEqualScalarUninstrumented(u8, u8_buf[0..len], 0),
+                allEqualUninstrumented(u8, u8_buf[0..len], 0),
+            );
+            try testing.expectEqual(
+                allEqualScalarUninstrumented(bool, bool_buf[0..len], false),
+                allEqualUninstrumented(bool, bool_buf[0..len], false),
+            );
+        }
+    }
 }
 
 /// The extra state `fail()` and `deinit()` clear on top of

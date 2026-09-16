@@ -5619,7 +5619,37 @@ fn expectStreamStateCleared(subject: *PureZigRecordStream) !void {
 /// carries no useful input-dependent coverage signal.
 fn allEqualUninstrumented(comptime T: type, slice: []const T, scalar: T) bool {
     @disableInstrumentation();
-    return std.mem.allEqual(T, slice, scalar);
+    // Explicitly vectorized rather than `std.mem.allEqual`.
+    //
+    // `@disableInstrumentation` removes this function's coverage callbacks, but
+    // it does NOT restore vectorized memory comparison: Zig deliberately
+    // disables that lowering in fuzzing mode, so `std.mem.allEqual` stays a
+    // scalar byte loop. `expectStreamStateCleared` scans ~215 KB of backing
+    // storage per call and the target runs all four cleanup scenario families
+    // per input, so that scalar loop did roughly 0.9M byte comparisons per
+    // execution and accounted for ~89% of sampled CPU.
+    //
+    // The cost was not theoretical: `fuzz: TLS record: encrypted stream cleanup
+    // preserves root errors across alerts and epoch transitions` never once
+    // completed a 10M budget in any #675 campaign epoch -- its only recorded
+    // outcome was watchdog timeout (exit 124), including a ~22 h run against a
+    // sibling target that finishes the same budget in 64 minutes.
+    //
+    // The oracle's strength is unchanged: it still proves every byte of the
+    // full capacity is cleared, not merely the region that happened to be
+    // written.
+    const lanes = 32;
+    const V = @Vector(lanes, T);
+    const splat: V = @splat(scalar);
+    var i: usize = 0;
+    while (i + lanes <= slice.len) : (i += lanes) {
+        const chunk: V = slice[i..][0..lanes].*;
+        if (@reduce(.Or, chunk != splat)) return false;
+    }
+    while (i < slice.len) : (i += 1) {
+        if (slice[i] != scalar) return false;
+    }
+    return true;
 }
 
 /// The extra state `fail()` and `deinit()` clear on top of

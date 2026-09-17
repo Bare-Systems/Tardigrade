@@ -11,6 +11,8 @@ if [[ "$#" -gt 1 ]]; then
 fi
 # shellcheck source=scripts/campaign-675-state.sh
 source scripts/campaign-675-state.sh
+# shellcheck source=scripts/campaign-675-row-state.sh
+source scripts/campaign-675-row-state.sh
 campaign_675_load_state "${1:-}" || {
   printf 'campaign-675-driver: no valid immutable campaign state\n' >&2
   exit 1
@@ -42,45 +44,6 @@ watchdog_for() {
 
 say() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$LOG"; }
 
-# Targets per family, for validating that a Tier-1 family row ran ALL of them.
-family_target_count() {
-  case "$1" in
-    crypto) echo 6 ;; pki) echo 7 ;; quic) echo 20 ;;
-    tls-protocol) echo 5 ;; tls-record) echo 6 ;; tls-resumption) echo 11 ;;
-    *) echo 0 ;;
-  esac
-}
-
-# A row counts as passed only when ALL of the following hold.
-#
-# The previous version grepped the manifest with `grep -l '"status":"pass"'`,
-# which matches the FILE if ANY record is a pass. A Tier-1 family row emits one
-# record per target (t1-01 emitted 5), and the wrapper runs a family's targets
-# sequentially and stops at the first non-pass -- so a row whose 4th target
-# genuinely FAILED would have shown three passes, matched the grep, been marked
-# PASS, and let the campaign march straight past a finding. That defeats
-# stop-on-finding, which is the guarantee the whole campaign rests on.
-#
-# Authority is now the wrapper's own exit code (`--collect` exits with the
-# remote campaign's status), corroborated by the manifest, plus a completeness
-# check so a family row that died partway with no failure record cannot pass
-# on the strength of the targets it did finish.
-row_passed() {
-  local rid="$1" tier="${2:-}" family="${3:-}" rc pass_n bad_n want
-  rc="$(cat "$E/$rid/collect.rc" 2>/dev/null || echo missing)"
-  [[ "$rc" == "0" ]] || return 1
-  find "$E/$rid" -name manifest.jsonl -print -quit 2>/dev/null | grep -q . || return 1
-  bad_n=$(find "$E/$rid" -name manifest.jsonl -exec grep -ho '"status":"[a-z_]*"' {} + 2>/dev/null | grep -cv '"status":"pass"')
-  [[ "$bad_n" -eq 0 ]] || return 1
-  pass_n=$(find "$E/$rid" -name manifest.jsonl -exec grep -ho '"status":"pass"' {} + 2>/dev/null | wc -l | tr -d ' ')
-  [[ "$pass_n" -ge 1 ]] || return 1
-  if [[ "$tier" == "1" ]]; then
-    want=$(family_target_count "$family")
-    [[ "$want" -eq 0 || "$pass_n" -eq "$want" ]] || return 1
-  fi
-  return 0
-}
-
 wait_for_row() {                      # $1 = row dir
   local stage; stage="$(grep -E '^REMOTE_STAGE=' "$1/async.env" 2>/dev/null | cut -d= -f2- | tr -d "'")"
   [[ -n "$stage" ]] || { say "ERROR no REMOTE_STAGE in $1/async.env"; return 1; }
@@ -93,10 +56,15 @@ say "queue loaded: $(( ${#QUEUE[@]} - 1 )) rows"
 for line in "${QUEUE[@]}"; do
   IFS=$'\t' read -r rid tier family target budget <<<"$line"
   [[ "$rid" == "row_id" || -z "$rid" ]] && continue
-  if row_passed "$rid" "$tier" "$family"; then say "SKIP $rid (already passed)"; continue; fi
+  if campaign_675_row_passed "$E" "$rid" "$tier" "$family"; then say "SKIP $rid (already passed)"; continue; fi
 
-  # A row already launched (async.env present) just needs waiting on.
-  if [[ -f "$E/$rid/async.env" ]]; then
+  collected=no
+  if campaign_675_row_collected "$E/$rid" || campaign_675_recover_collected_row "$E/$rid"; then
+    # Do not reattach to a remote stage that successful collection has already
+    # removed. This also repairs rows from the old caller-side-marker window.
+    say "RECOVER $rid (verified local collection)"
+    collected=yes
+  elif [[ -f "$E/$rid/async.env" ]]; then
     say "RESUME $rid (already launched) - waiting"
   else
     [[ -z "$budget" ]] && { say "FATAL malformed queue row: $rid (budget empty)"; exit 1; }
@@ -115,24 +83,25 @@ for line in "${QUEUE[@]}"; do
     fi
   fi
 
-  wait_for_row "$E/$rid" || { say "FATAL cannot wait on $rid - stopping"; exit 1; }
-  # Collect with retries. A transient SSH/network blip must NOT be mistaken for
-  # a failed row: without this, one dropped packet during --collect halts the
-  # whole campaign for however long nobody is watching.
-  for attempt in 1 2 3 4 5; do
-    say "COLLECT $rid (attempt $attempt)"
-    scripts/run-proxmox-fuzz-campaign.sh --collect --out-dir "$E/$rid" >>"$LOG" 2>&1
-    echo "$?" > "$E/$rid/collect.rc"
-    if row_passed "$rid" "$tier" "$family"; then break; fi
-    # Distinguish "row genuinely did not pass" from "collection did not happen".
-    if find "$E/$rid" -name manifest.jsonl -print -quit 2>/dev/null | grep -q .; then
-      say "collected, row did not pass - not retrying"; break
-    fi
-    say "collection produced no manifest; retrying in 120s"
-    sleep 120
-  done
+  if [[ "$collected" == no ]]; then
+    wait_for_row "$E/$rid" || { say "FATAL cannot wait on $rid - stopping"; exit 1; }
+    # Collect with retries. A transient SSH/network blip must NOT be mistaken for
+    # a failed row: without this, one dropped packet during --collect halts the
+    # whole campaign for however long nobody is watching.
+    for attempt in 1 2 3 4 5; do
+      say "COLLECT $rid (attempt $attempt)"
+      scripts/run-proxmox-fuzz-campaign.sh --collect --out-dir "$E/$rid" >>"$LOG" 2>&1
+      if campaign_675_row_collected "$E/$rid"; then break; fi
+      # Distinguish "row genuinely did not pass" from "collection did not happen".
+      if find "$E/$rid" -name manifest.jsonl -print -quit 2>/dev/null | grep -q .; then
+        say "collected evidence lacks a durable result - not retrying"; break
+      fi
+      say "collection produced no manifest; retrying in 120s"
+      sleep 120
+    done
+  fi
   runs="$(find "$E/$rid" -name stderr.log -exec grep -ho 'Runs: [0-9]* -> [0-9]*' {} \; 2>/dev/null | tail -1)"
-  if row_passed "$rid" "$tier" "$family"; then
+  if campaign_675_row_passed "$E" "$rid" "$tier" "$family"; then
     say "PASS $rid  ${runs:-<no Runs line>}"
   else
     st="$(find "$E/$rid" -name manifest.jsonl -exec grep -ho '"status":"[a-z_]*"' {} \; 2>/dev/null | tail -1)"
@@ -149,7 +118,7 @@ passed=0; total=0
 for line in "${QUEUE[@]}"; do
   IFS=$'\t' read -r rid tier family _ _ <<<"$line"
   [[ "$rid" == "row_id" || -z "$rid" ]] && continue
-  total=$((total+1)); row_passed "$rid" "$tier" "$family" && passed=$((passed+1))
+  total=$((total+1)); campaign_675_row_passed "$E" "$rid" "$tier" "$family" && passed=$((passed+1))
 done
 if [[ "$passed" -eq "$total" ]]; then
   say "=== ALL ROWS COMPLETE ($passed/$total) ==="

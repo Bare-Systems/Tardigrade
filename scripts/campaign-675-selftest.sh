@@ -5,7 +5,16 @@ cd "$(dirname "$0")/.." || exit 1
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 E="$TMP/epoch"; mkdir -p "$E"
 # shellcheck source=/dev/null
-eval "$(sed -n '/^family_target_count()/,/^}/p;/^row_passed()/,/^}/p;/^watchdog_for()/,/^}/p' scripts/campaign-675-driver.sh)"
+source scripts/campaign-675-row-state.sh
+watchdog_for() {
+  case "$1" in
+    *G) echo 250000 ;;
+    100M) echo 198000 ;;
+    50M) echo 108000 ;;
+    10M) echo 21600 ;;
+    *) echo 108000 ;;
+  esac
+}
 
 fails=0
 check() { # name expected_rc actual_rc
@@ -13,38 +22,51 @@ check() { # name expected_rc actual_rc
 }
 mkrow() { # rid rc records...
   local rid="$1" rc="$2"; shift 2
-  mkdir -p "$E/$rid"; echo "$rc" > "$E/$rid/collect.rc"; : > "$E/$rid/manifest.jsonl"
+  mkdir -p "$E/$rid"; echo "$rc" > "$E/$rid/collect.rc"; printf 'remote_exit_code=%s\n' "$rc" > "$E/$rid/guest-state.env"; : > "$E/$rid/manifest.jsonl"
   for st in "$@"; do printf '{"status":"%s"}\n' "$st" >> "$E/$rid/manifest.jsonl"; done
 }
 
 # THE REGRESSION: family row, 3 targets passed then one failed.
 mkrow mixed 1 pass pass pass fail
-row_passed mixed 1 tls-record; check "family row with a later FAIL is not a pass" 1 $?
+campaign_675_row_passed "$E" mixed 1 tls-record; check "driver and watchdog reject a family row with a later FAIL" 1 $?
 
 # Complete tier-1 family row (tls-record has 6 targets).
 mkrow full 0 pass pass pass pass pass pass
-row_passed full 1 tls-record; check "complete family row passes" 0 $?
+campaign_675_row_passed "$E" full 1 tls-record; check "complete family row passes" 0 $?
 
 # Truncated family row: all passes, but fewer than the family's targets, and no
 # failure record -- the case a status-only check cannot see.
 mkrow short 0 pass pass pass
-row_passed short 1 tls-record; check "truncated family row is not a pass" 1 $?
+campaign_675_row_passed "$E" short 1 tls-record; check "driver and watchdog reject a truncated family row" 1 $?
 
 # Tier-2 single-target rows.
-mkrow t2ok 0 pass;  row_passed t2ok 2 quic; check "tier-2 single pass" 0 $?
-mkrow t2bad 1 fail; row_passed t2bad 2 quic; check "tier-2 fail" 1 $?
+mkrow t2ok 0 pass;  campaign_675_row_passed "$E" t2ok 2 quic; check "tier-2 single pass" 0 $?
+mkrow t2bad 1 fail; campaign_675_row_passed "$E" t2bad 2 quic; check "tier-2 fail" 1 $?
 
 # Non-zero collect exit overrides an all-pass manifest.
 mkrow rcbad 1 pass pass pass pass pass pass
-row_passed rcbad 1 tls-record; check "nonzero collect rc overrides manifest" 1 $?
+campaign_675_row_passed "$E" rcbad 1 tls-record; check "nonzero collect rc overrides manifest" 1 $?
 
 # Missing collect.rc (pre-fix row) must not count.
 mkdir -p "$E/norc"; printf '{"status":"pass"}\n' > "$E/norc/manifest.jsonl"
-row_passed norc 2 quic; check "missing collect.rc is not a pass" 1 $?
+campaign_675_row_passed "$E" norc 2 quic; check "missing collect.rc is not a pass" 1 $?
 
 # No manifest at all.
 mkrow nomani 0; rm -f "$E/nomani/manifest.jsonl"
-row_passed nomani 2 quic; check "no manifest is not a pass" 1 $?
+campaign_675_row_passed "$E" nomani 2 quic; check "no manifest is not a pass" 1 $?
+
+# Crash window regression: a prior collector has copied and verified both
+# archives, then vanished after remote-stage cleanup but before its old caller
+# wrote collect.rc. Recovery is entirely local and never reattaches to PVE.
+mkdir -p "$E/crash-window/archive"
+printf 'payload\n' > "$E/crash-window/archive/evidence"
+printf 'remote_exit_code=0\n' > "$E/crash-window/guest-state.env"
+printf 'REMOTE_STAGE=/tmp/tardigrade-proxmox-fuzz-deleted\n' > "$E/crash-window/async.env"
+printf '{"status":"pass"}\n' > "$E/crash-window/manifest.jsonl"
+tar -C "$E/crash-window/archive" -czf "$E/crash-window/guest-fuzz-artifacts.tgz" evidence
+tar -C "$E/crash-window/archive" -czf "$E/crash-window/proxmox-metadata.tgz" evidence
+campaign_675_recover_collected_row "$E/crash-window"; check "crash-window local evidence is recovered without REMOTE_STAGE" 0 $?
+campaign_675_row_passed "$E" crash-window 2 quic; check "recovered crash-window row is classified locally" 0 $?
 
 # Watchdog bounds must exceed the slowest measured legitimate run per budget.
 w10=$(watchdog_for 10M); w50=$(watchdog_for 50M); w100=$(watchdog_for 100M)
@@ -71,7 +93,7 @@ MOCK_TAG="v9.9.9"
 MOCK_SHA="1111111111111111111111111111111111111111"
 MOCK_MAIN="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 GIT_CALLS=()
-# shellcheck disable=SC2329 # invoked indirectly by campaign_675_reseat_main
+# shellcheck disable=SC2317,SC2329 # test double is invoked indirectly by campaign_675_reseat_main
 git() {
   GIT_CALLS+=("$*")
   local ref="${!#}"

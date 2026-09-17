@@ -1094,8 +1094,16 @@ pub fn Conn(comptime Transport: type) type {
             return id;
         }
 
-        fn responseAllowsContent(status: u16, request_is_head: bool) bool {
+        fn responseMayCarryNonEmptyContent(status: u16, request_is_head: bool) bool {
             return !request_is_head and status != 204 and status != 205 and status != 304;
+        }
+
+        fn responseSkipsContentLengthCheck(status: u16, request_is_head: bool) bool {
+            // HEAD and 304 may carry representation metadata rather than a
+            // message body. 204's Content-Length is rejected by header
+            // validation. A 205 has no non-empty content, but RFC 9110 still
+            // defines it as having content, so an advertised length must be 0.
+            return request_is_head or status == 204 or status == 304;
         }
 
         fn responseEndsAtHeaders(status: u16) bool {
@@ -1169,7 +1177,7 @@ pub fn Conn(comptime Transport: type) type {
                         if (status == null) return self.fail(.frame_unexpected);
                         if (phase == .trailers) return self.fail(.frame_unexpected);
                         if (responseEndsAtHeaders(status.?)) return self.fail(.message_error);
-                        if (!responseAllowsContent(status.?, response.request_is_head) and raw.payload.len > 0) return self.fail(.message_error);
+                        if (!responseMayCarryNonEmptyContent(status.?, response.request_is_head) and raw.payload.len > 0) return self.fail(.message_error);
                         if (body_len == 0) {
                             body_start = offset + (raw.len - raw.payload.len);
                         }
@@ -1185,12 +1193,21 @@ pub fn Conn(comptime Transport: type) type {
                         body_len += raw.payload.len;
                         phase = .body;
                     },
+                    .cancel_push, .settings, .goaway, .max_push_id,
                     .priority_update_request, .priority_update_push => {
                         var event_scratch = EventDecodeScratch{};
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = eventFrameFromRaw(raw, &event_scratch) } });
                         return self.fail(.frame_unexpected);
                     },
-                    else => {
+                    .push_promise => {
+                        var event_scratch = EventDecodeScratch{};
+                        self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = eventFrameFromRaw(raw, &event_scratch) } });
+                        // This client never advertises MAX_PUSH_ID, so every
+                        // server push promise exceeds the permitted push-ID
+                        // space (RFC 9114 section 7.2.3).
+                        return self.fail(.id_error);
+                    },
+                    .unknown => {
                         var event_scratch = EventDecodeScratch{};
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = eventFrameFromRaw(raw, &event_scratch) } });
                     },
@@ -1199,7 +1216,7 @@ pub fn Conn(comptime Transport: type) type {
             }
             const final_status = status orelse return self.fail(.message_error);
             if (declared_content_length) |declared| {
-                if (responseAllowsContent(final_status, response.request_is_head) and declared != body_len) {
+                if (!responseSkipsContentLengthCheck(final_status, response.request_is_head) and declared != body_len) {
                     return self.fail(.message_error);
                 }
             }
@@ -2315,6 +2332,90 @@ test "H3 conn: client rejects a response body longer than content-length" {
 
     try testing.expectError(error.ProtocolError, client.pollResponse(id));
     try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
+}
+
+test "H3 conn: client enforces Content-Length on 205 responses" {
+    const allocator = testing.allocator;
+    const H3 = Conn(MockTransport);
+    inline for ([_]struct { content_length: []const u8, expect_error: bool }{
+        .{ .content_length = "0", .expect_error = false },
+        .{ .content_length = "10", .expect_error = true },
+    }) |case| {
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+
+        var client = H3.init(allocator, .client);
+        defer client.deinit();
+        const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/reset-content" });
+        var wire: [128]u8 = undefined;
+        const headers = try session.ResponseEncoder.encodeHeaders(205, &.{.{ .name = "content-length", .value = case.content_length }}, &wire);
+        _ = try server_transport.writeStream(id, headers, true);
+        try client.pump(&client_transport);
+
+        if (case.expect_error) {
+            try testing.expectError(error.ProtocolError, client.pollResponse(id));
+            try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
+        } else {
+            const response = (try client.pollResponse(id)).?;
+            try testing.expectEqual(@as(u16, 205), response.status);
+            try testing.expectEqual(@as(usize, 0), response.body.len);
+        }
+    }
+}
+
+test "H3 conn: client rejects known control frames on a response stream" {
+    const allocator = testing.allocator;
+    const H3 = Conn(MockTransport);
+    inline for ([_]frame.FrameType{ .settings, .goaway, .max_push_id }) |illegal| {
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+
+        var client = H3.init(allocator, .client);
+        defer client.deinit();
+        const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/illegal-frame" });
+        var wire: [128]u8 = undefined;
+        var len: usize = 0;
+        len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+        len += (try frame.encodeKnownFrame(illegal, &.{}, wire[len..])).len;
+        _ = try server_transport.writeStream(id, wire[0..len], true);
+        try client.pump(&client_transport);
+
+        try testing.expectError(error.ProtocolError, client.pollResponse(id));
+        try testing.expectEqual(ErrorCode.frame_unexpected, client.close_code.?);
+    }
+}
+
+test "H3 conn: client rejects PUSH_PROMISE while push is disabled" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/push-promise" });
+    var wire: [128]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+    len += (try frame.encodeKnownFrame(.push_promise, &.{}, wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.id_error, client.close_code.?);
 }
 
 test "H3 conn: client permits representation content-length on HEAD and 304 responses" {

@@ -280,6 +280,12 @@ if [[ "$MODE" == "collect" ]]; then
   fi
 
   if [[ "$local_collection_ok" == true && "$preservation_verified" == true ]]; then
+    # The driver must never be the first process to record collection
+    # success: this result is durable before removing REMOTE_STAGE, so a host
+    # crash cannot leave a resumable async row pointing at deleted evidence.
+    collect_result_tmp="$LOCAL_OUT_DIR/.collect.rc.$$"
+    printf '%s\n' "$remote_status" > "$collect_result_tmp"
+    mv -f "$collect_result_tmp" "$LOCAL_OUT_DIR/collect.rc"
     # REMOTE_STAGE (source.tgz, orchestrate logs, and the collected
     # artifacts.tgz — potentially hundreds of MB, since it includes the
     # whole guest .zig-cache) is redundant once evidence is verified

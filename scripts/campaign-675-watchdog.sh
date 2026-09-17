@@ -9,6 +9,8 @@ if [[ "$#" -gt 1 ]]; then
 fi
 # shellcheck source=scripts/campaign-675-state.sh
 source scripts/campaign-675-state.sh
+# shellcheck source=scripts/campaign-675-row-state.sh
+source scripts/campaign-675-row-state.sh
 campaign_675_load_state "${1:-}" || {
   printf 'campaign-675-watchdog: no valid immutable campaign state\n' >&2
   exit 1
@@ -24,9 +26,9 @@ now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 # overstated progress -- it reported 10/62 when 6 rows had passed. Row ids come
 # from rows.tsv so sibling dirs (preflight/, findings/, runs/) are never counted.
 passed=0
-while IFS=$'\t' read -r rid _rest; do
+while IFS=$'\t' read -r rid tier family _rest; do
   [[ "$rid" == "row_id" || -z "$rid" ]] && continue
-  if find "$E/$rid" -name manifest.jsonl -exec grep -l '"status":"pass"' {} \; 2>/dev/null | grep -q .; then
+  if campaign_675_row_passed "$E" "$rid" "$tier" "$family"; then
     passed=$((passed+1))
   fi
 done < "$E/rows.tsv"

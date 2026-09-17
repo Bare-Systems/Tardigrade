@@ -58,3 +58,23 @@ campaign_675_row_passed() {
     [[ "$want" -eq 0 || "$pass_n" -eq "$want" ]] || return 1
   fi
 }
+
+# Durable campaign disposition. A collected non-pass remains a hard stop until
+# human triage records the issue, fix, and verification in this row directory.
+campaign_675_row_disposition() {
+  local evidence_root="$1" rid="$2" tier="$3" family="$4" row_dir
+  row_dir="$evidence_root/$rid"
+  if campaign_675_row_passed "$evidence_root" "$rid" "$tier" "$family"; then
+    printf 'pass\n'; return
+  fi
+  if campaign_675_row_collected "$row_dir"; then
+    if find "$row_dir" -name manifest.jsonl -exec grep -qE '"status":"(fail|possible_hang)"' {} + 2>/dev/null; then
+      if [[ "$(awk -F= '$1 == "DISPOSITION" { print $2 }' "$row_dir/disposition.env" 2>/dev/null)" == dispositioned_finding ]] &&
+        grep -qE '^ISSUE=.+|^FIX_COMMIT=.+|^VERIFICATION=.+' "$row_dir/disposition.env" 2>/dev/null; then
+        printf 'dispositioned_finding\n'; return
+      fi
+      printf 'pending_finding\n'; return
+    fi
+  fi
+  printf 'interrupted\n'
+}

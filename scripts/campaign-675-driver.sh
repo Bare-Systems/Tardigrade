@@ -56,7 +56,13 @@ say "queue loaded: $(( ${#QUEUE[@]} - 1 )) rows"
 for line in "${QUEUE[@]}"; do
   IFS=$'\t' read -r rid tier family target budget <<<"$line"
   [[ "$rid" == "row_id" || -z "$rid" ]] && continue
-  if campaign_675_row_passed "$E" "$rid" "$tier" "$family"; then say "SKIP $rid (already passed)"; continue; fi
+  disposition="$(campaign_675_row_disposition "$E" "$rid" "$tier" "$family")"
+  if [[ "$disposition" == pass ]]; then say "SKIP $rid (already passed)"; continue; fi
+  if [[ "$disposition" == dispositioned_finding ]]; then say "ACCOUNTED FINDING $rid"; continue; fi
+  if [[ "$disposition" == pending_finding ]]; then
+    say "STOP: $rid is a pending finding. Triage and write disposition.env before continuing."
+    exit 2
+  fi
 
   collected=no
   if campaign_675_row_collected "$E/$rid" || campaign_675_recover_collected_row "$E/$rid"; then
@@ -114,14 +120,17 @@ done
 # version logged "ALL ROWS COMPLETE" after one row because ssh inside the
 # while-read loop consumed the rest of rows.tsv from stdin -- a false
 # success, which is worse than a crash.
-passed=0; total=0
+passed=0; findings=0; total=0; accounted=0
 for line in "${QUEUE[@]}"; do
   IFS=$'\t' read -r rid tier family _ _ <<<"$line"
   [[ "$rid" == "row_id" || -z "$rid" ]] && continue
-  total=$((total+1)); campaign_675_row_passed "$E" "$rid" "$tier" "$family" && passed=$((passed+1))
+  total=$((total+1))
+  disposition="$(campaign_675_row_disposition "$E" "$rid" "$tier" "$family")"
+  [[ "$disposition" == pass ]] && { passed=$((passed+1)); accounted=$((accounted+1)); }
+  [[ "$disposition" == dispositioned_finding ]] && { findings=$((findings+1)); accounted=$((accounted+1)); }
 done
-if [[ "$passed" -eq "$total" ]]; then
-  say "=== ALL ROWS COMPLETE ($passed/$total) ==="
+if [[ "$accounted" -eq "$total" ]]; then
+  say "=== ALL ROWS ACCOUNTED ($passed pass, $findings dispositioned findings; $total total) ==="
 else
-  say "=== DRIVER EXITED WITH $passed/$total ROWS PASSED - INCOMPLETE ==="; exit 3
+  say "=== DRIVER EXITED WITH $accounted/$total ROWS ACCOUNTED - INCOMPLETE ==="; exit 3
 fi

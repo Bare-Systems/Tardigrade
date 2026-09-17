@@ -118,7 +118,7 @@ All notable user-facing changes to Tardigrade are documented here.
   changes require restart.
 
 - **Fuzz verification is faster and keeps leak detection enabled (#757, #758,
-  #775)** — the TLS encrypted-stream cleanup oracle now compares storage in
+  #774, #775)** — the TLS encrypted-stream cleanup oracle now compares storage in
   vector-sized byte chunks while retaining full-capacity clearing checks, and
   the HTTP/3 command-sequence target uses a target-local debug allocator that
   preserves leak checking without the otherwise unbounded diagnostic stack

@@ -68,6 +68,11 @@ tar -C "$E/crash-window/archive" -czf "$E/crash-window/proxmox-metadata.tgz" evi
 campaign_675_recover_collected_row "$E/crash-window"; check "crash-window local evidence is recovered without REMOTE_STAGE" 0 $?
 campaign_675_row_passed "$E" crash-window 2 quic; check "recovered crash-window row is classified locally" 0 $?
 
+mkrow finding 2 fail
+[[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == pending_finding ]]; check "untriaged finding halts the campaign" 0 $?
+printf 'DISPOSITION=dispositioned_finding\nISSUE=#675\nFIX_COMMIT=deadbeef\nVERIFICATION=zig-build-test\n' > "$E/finding/disposition.env"
+[[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == dispositioned_finding ]]; check "triaged finding is durably accounted" 0 $?
+
 # Watchdog bounds must exceed the slowest measured legitimate run per budget.
 w10=$(watchdog_for 10M); w50=$(watchdog_for 50M); w100=$(watchdog_for 100M)
 if [[ "$w10" -gt 13320 && "$w10" -lt 86400 ]]; then printf '  ok   10M watchdog %ss brackets the 3.7h legit max\n' "$w10"; else printf '  FAIL 10M watchdog %s\n' "$w10"; fails=$((fails+1)); fi
@@ -83,10 +88,10 @@ echo
 source scripts/campaign-675-reseat.sh
 RELEASE_TMP="$TMP/release"
 mkdir -p "$RELEASE_TMP"
-printf 'row_id\ttier\tfamily\ttarget\tbudget\nsmoke\t2\tquic\tfuzz: packet parser preserves bounded slice and progress invariants\t50M\n' > "$RELEASE_TMP/rows.tsv"
+RELEASE_PLAN=$'row_id\ttier\tfamily\ttarget\tbudget\nrelease-smoke\t2\tquic\tfuzz: packet parser preserves bounded slice and progress invariants\t50M\n'
+printf 'row_id\ttier\tfamily\ttarget\tbudget\ncontroller-only\t2\tquic\tfuzz: different controller target\t1K\n' > "$RELEASE_TMP/rows.tsv"
 export CAMPAIGN_675_EVIDENCE_ROOT="$RELEASE_TMP/evidence"
 export CAMPAIGN_675_ACTIVE_STATE="$RELEASE_TMP/evidence/campaign-675-active.env"
-export CAMPAIGN_675_ROW_PLAN="$RELEASE_TMP/rows.tsv"
 export CAMPAIGN_675_GIT_REMOTE="test-origin"
 export CAMPAIGN_675_NO_START=true
 MOCK_TAG="v9.9.9"
@@ -110,6 +115,10 @@ git() {
       fi
       return 1
       ;;
+    show)
+      [[ "$ref" == "$MOCK_SHA:scripts/campaign-675-rows.tsv" ]] || return 1
+      printf '%s' "$RELEASE_PLAN"
+      ;;
     *) return 1 ;;
   esac
 }
@@ -125,14 +134,16 @@ STATE="$CAMPAIGN_675_EVIDENCE_ROOT/campaign-675-$MOCK_TAG/campaign.env"
 ACTIVE="$CAMPAIGN_675_ACTIVE_STATE"
 if [[ "$(grep '^RELEASE_TAG=' "$STATE")" == "RELEASE_TAG=$MOCK_TAG" ]]; then check "campaign state records the requested release" 0 0; else check "campaign state records the requested release" 0 1; fi
 if [[ "$(grep '^SOURCE_SHA=' "$STATE")" == "SOURCE_SHA=$MOCK_SHA" ]]; then check "campaign state records the resolved tag commit" 0 0; else check "campaign state records the resolved tag commit" 0 1; fi
-if [[ -f "$CAMPAIGN_675_EVIDENCE_ROOT/campaign-675-$MOCK_TAG/rows.tsv" ]]; then check "campaign directory receives a fresh row plan" 0 0; else check "campaign directory receives a fresh row plan" 0 1; fi
+if [[ "$(cat "$CAMPAIGN_675_EVIDENCE_ROOT/campaign-675-$MOCK_TAG/rows.tsv")" == "${RELEASE_PLAN%$'\n'}" ]]; then check "campaign directory receives the selected release row plan" 0 0; else check "campaign directory receives the selected release row plan" 0 1; fi
 if [[ "$(grep '^CAMPAIGN_STATE=' "$ACTIVE")" == "CAMPAIGN_STATE=$STATE" ]]; then check "active state points to the release baseline" 0 0; else check "active state points to the release baseline" 0 1; fi
 
 first_state="$(cksum "$STATE")"
 MOCK_MAIN="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+printf 'row_id\ttier\tfamily\ttarget\tbudget\ncontroller-mutated\t2\tquic\tfuzz: another target\t1K\n' > "$RELEASE_TMP/rows.tsv"
 campaign_675_reseat_main "$MOCK_TAG" >/dev/null 2>&1
 check "repeating a release invocation is idempotent" 0 $?
 if [[ "$(cksum "$STATE")" == "$first_state" ]]; then check "main movement cannot change the tag baseline" 0 0; else check "main movement cannot change the tag baseline" 0 1; fi
+if [[ "$(cat "$CAMPAIGN_675_EVIDENCE_ROOT/campaign-675-$MOCK_TAG/rows.tsv")" == "${RELEASE_PLAN%$'\n'}" ]]; then check "controller row-plan mutation cannot change the tag baseline" 0 0; else check "controller row-plan mutation cannot change the tag baseline" 0 1; fi
 printf '%s\n' "${GIT_CALLS[@]}" | grep -q 'origin/main'
 check "release resolution never consults origin/main" 1 $?
 

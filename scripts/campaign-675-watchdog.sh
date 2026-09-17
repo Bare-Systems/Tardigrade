@@ -25,12 +25,12 @@ now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 # record per target in the family (t1-01 alone emitted 5), so counting records
 # overstated progress -- it reported 10/62 when 6 rows had passed. Row ids come
 # from rows.tsv so sibling dirs (preflight/, findings/, runs/) are never counted.
-passed=0
+passed=0; findings=0; accounted=0
 while IFS=$'\t' read -r rid tier family _rest; do
   [[ "$rid" == "row_id" || -z "$rid" ]] && continue
-  if campaign_675_row_passed "$E" "$rid" "$tier" "$family"; then
-    passed=$((passed+1))
-  fi
+  disposition="$(campaign_675_row_disposition "$E" "$rid" "$tier" "$family")"
+  [[ "$disposition" == pass ]] && { passed=$((passed+1)); accounted=$((accounted+1)); }
+  [[ "$disposition" == dispositioned_finding ]] && { findings=$((findings+1)); accounted=$((accounted+1)); }
 done < "$E/rows.tsv"
 total=$(( $(wc -l < "$E/rows.tsv" 2>/dev/null || echo 1) - 1 ))
 alive=no; pgrep -f "campaign-675-supervisor.sh $CAMPAIGN_STATE" >/dev/null && alive=yes
@@ -56,6 +56,8 @@ if [[ "$last_s" -gt 0 ]]; then age_h=$(( ( $(date +%s) - last_s ) / 3600 )); els
 {
   echo "checked_utc=$(now)"
   echo "rows_passed=$passed/$total"
+  echo "rows_dispositioned_findings=$findings"
+  echo "rows_accounted=$accounted/$total"
   echo "supervisor_alive=$alive"
   echo "halted_on_finding=$halted"
   echo "hours_since_last_driver_event=$age_h"
@@ -74,12 +76,12 @@ esac
 action="none"
 if [[ "$halted" == yes ]]; then
   action="HALTED ON FINDING - human triage required, not restarting"
-elif [[ "$alive" == no && "$passed" -lt "$total" ]]; then
+elif [[ "$alive" == no && "$accounted" -lt "$total" ]]; then
   nohup caffeinate -i -s scripts/campaign-675-supervisor.sh "$CAMPAIGN_STATE" >/dev/null 2>&1 &
   action="supervisor was dead; restarted"
 elif [[ "$alive" == yes && "$age_h" -ge "$stale_h" ]]; then
   action="WARNING stale: no driver progress for ${age_h}h (row budget ${cur_budget:-?} bound ${stale_h}h)"
 fi
 echo "action=$action" >> "$STATUS"
-printf '%s WATCHDOG passed=%s/%s alive=%s halted=%s age=%sh action=%s\n' \
-  "$(now)" "$passed" "$total" "$alive" "$halted" "$age_h" "$action" >> "$LOG"
+printf '%s WATCHDOG passed=%s findings=%s accounted=%s/%s alive=%s halted=%s age=%sh action=%s\n' \
+  "$(now)" "$passed" "$findings" "$accounted" "$total" "$alive" "$halted" "$age_h" "$action" >> "$LOG"

@@ -154,6 +154,7 @@ pub const ErrorCode = enum(u64) {
     id_error = 0x0108,
     settings_error = 0x0109,
     missing_settings = 0x010a,
+    request_incomplete = 0x010d,
     message_error = 0x010e,
     qpack_decompression_failed = 0x0200,
     qpack_encoder_stream_error = 0x0201,
@@ -269,6 +270,7 @@ pub fn Conn(comptime Transport: type) type {
         responses: std.AutoHashMap(u64, *ClientResponse),
         peer_goaway_id: ?u64 = null,
         local_goaway_id: ?u64 = null,
+        peer_max_push_id: ?u64 = null,
         /// Bidirectional streams the peer opened that we haven't classified.
         metrics: Metrics = .{},
         events: EventSink = .{},
@@ -448,6 +450,21 @@ pub fn Conn(comptime Transport: type) type {
                 error.InvalidUnidirectionalStreamType,
                 error.DuplicateControlStream,
                 => self.fail(.stream_creation_error),
+            };
+        }
+
+        fn failRequestSessionError(self: *Self, err: session.SessionError) H3Error {
+            return switch (err) {
+                error.IncompleteRequest => self.fail(.request_incomplete),
+                error.BufferTooShort,
+                error.FrameLengthOverflow,
+                error.FrameTooLarge,
+                => self.fail(.frame_error),
+                error.QpackDecodeFailed => self.fail(.qpack_decompression_failed),
+                error.UnexpectedFrame,
+                error.InvalidRequestFrame,
+                => self.fail(.frame_unexpected),
+                else => self.fail(.message_error),
             };
         }
 
@@ -819,6 +836,8 @@ pub fn Conn(comptime Transport: type) type {
                 self.events.emit(.{ .frame_parsed = .{ .stream_id = control, .frame = eventFrameFromRaw(raw, &event_scratch) } });
             }
             switch (raw.typ) {
+                .max_push_id => try self.applyMaxPushId(raw),
+                .cancel_push => try self.applyCancelPush(raw),
                 .priority_update_request, .priority_update_push => {
                     if (!self.peer_control_view.saw_settings) return self.fail(.missing_settings);
                     try self.applyPriorityUpdate(transport, raw);
@@ -832,6 +851,27 @@ pub fn Conn(comptime Transport: type) type {
             if (!had_settings and self.peer_control_view.saw_settings) {
                 self.events.emit(.{ .parameters_set = .{ .initiator = .remote, .settings = self.peer_control_view.settings } });
             }
+        }
+
+        fn applyMaxPushId(self: *Self, raw: frame.RawFrame) H3Error!void {
+            if (!self.peer_control_view.saw_settings) return self.fail(.missing_settings);
+            const decoded = varint.decode(raw.payload) catch return self.fail(.frame_error);
+            if (decoded.len != raw.payload.len) return self.fail(.frame_error);
+            if (self.role == .client) return self.fail(.frame_unexpected);
+            if (self.peer_max_push_id) |previous| {
+                if (decoded.value < previous) return self.fail(.id_error);
+            }
+            self.peer_max_push_id = decoded.value;
+        }
+
+        fn applyCancelPush(self: *Self, raw: frame.RawFrame) H3Error!void {
+            if (!self.peer_control_view.saw_settings) return self.fail(.missing_settings);
+            const decoded = varint.decode(raw.payload) catch return self.fail(.frame_error);
+            if (decoded.len != raw.payload.len) return self.fail(.frame_error);
+            // This implementation creates no push streams. A syntactically
+            // valid cancellation therefore names no known push and is an ID
+            // error rather than silently accepted control traffic.
+            return self.fail(.id_error);
         }
 
         fn applyGoaway(self: *Self, raw: frame.RawFrame) H3Error!void {
@@ -952,15 +992,12 @@ pub fn Conn(comptime Transport: type) type {
                             return self.fail(.excessive_load);
                         }
                         self.buffered_request_bytes += retained_after;
-                        _ = ingest_result catch |err| {
-                            if (err == error.UnexpectedFrame) return self.fail(.frame_unexpected);
-                            return self.fail(.message_error);
-                        };
+                        _ = ingest_result catch |err| return self.failRequestSessionError(err);
                         self.recordPriorityHeaderMetrics(request);
                         self.applyPendingPriorityUpdate(id, request);
                     }
                     if (result.fin) {
-                        request.stream.validateComplete() catch return self.fail(.message_error);
+                        request.stream.validateComplete() catch |err| return self.failRequestSessionError(err);
                         request.finished = true;
                         break;
                     }
@@ -1201,12 +1238,14 @@ pub fn Conn(comptime Transport: type) type {
                     .push_promise => {
                         var event_scratch = EventDecodeScratch{};
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = eventFrameFromRaw(raw, &event_scratch) } });
+                        _ = varint.decode(raw.payload) catch return self.fail(.frame_error);
                         // This client never advertises MAX_PUSH_ID, so every
-                        // server push promise exceeds the permitted push-ID
-                        // space (RFC 9114 section 7.2.3).
+                        // valid PUSH_PROMISE exceeds the permitted push-ID
+                        // space (RFC 9114 section 7.2.5).
                         return self.fail(.id_error);
                     },
                     .unknown => {
+                        if (frame.isForbiddenHttp2FrameType(raw.type_value)) return self.fail(.frame_unexpected);
                         var event_scratch = EventDecodeScratch{};
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = eventFrameFromRaw(raw, &event_scratch) } });
                     },

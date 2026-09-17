@@ -22,19 +22,24 @@ campaign_675_load_state() {
     state_file="$(campaign_675_state_value "$active_state" CAMPAIGN_STATE)" || return 1
   fi
 
-  local release_tag source_sha campaign_dir
+  local release_tag source_sha campaign_dir row_plan_sha
   release_tag="$(campaign_675_state_value "$state_file" RELEASE_TAG)" || return 1
   source_sha="$(campaign_675_state_value "$state_file" SOURCE_SHA)" || return 1
   campaign_dir="$(campaign_675_state_value "$state_file" CAMPAIGN_DIR)" || return 1
+  row_plan_sha="$(campaign_675_state_value "$state_file" ROW_PLAN_SHA256)" || return 1
 
   [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z]+)*$ ]] || return 1
   [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$row_plan_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
   [[ "$campaign_dir" == "$evidence_root/campaign-675-$release_tag" ]] || return 1
   [[ "$state_file" == "$campaign_dir/campaign.env" ]] || return 1
+  [[ -f "$campaign_dir/rows.tsv" ]] || return 1
+  [[ "$(shasum -a 256 "$campaign_dir/rows.tsv" | awk '{print $1}')" == "$row_plan_sha" ]] || return 1
 
   RELEASE_TAG="$release_tag"
   SOURCE_SHA="$source_sha"
   CAMPAIGN_DIR="$campaign_dir"
   CAMPAIGN_STATE="$state_file"
-  export RELEASE_TAG SOURCE_SHA CAMPAIGN_DIR CAMPAIGN_STATE
+  ROW_PLAN_SHA256="$row_plan_sha"
+  export RELEASE_TAG SOURCE_SHA CAMPAIGN_DIR CAMPAIGN_STATE ROW_PLAN_SHA256
 }

@@ -45,6 +45,16 @@ pub const RawFrame = struct {
     len: usize,
 };
 
+/// HTTP/2 frame codes with no HTTP/3 equivalent are explicitly forbidden by
+/// RFC 9114 section 7.2.8. They are not extensions and must never share the
+/// generic unknown-frame ignore path.
+pub fn isForbiddenHttp2FrameType(type_value: u64) bool {
+    return switch (type_value) {
+        0x02, 0x06, 0x08, 0x09 => true, // PRIORITY, PING, WINDOW_UPDATE, CONTINUATION
+        else => false,
+    };
+}
+
 pub const DecodeError = error{
     BufferTooShort,
     FrameLengthOverflow,
@@ -362,6 +372,7 @@ pub const ControlStream = struct {
         switch (raw.typ) {
             .settings => return error.DuplicateSettings,
             .data, .headers, .push_promise => return error.InvalidControlFrame,
+            .unknown => if (isForbiddenHttp2FrameType(raw.type_value)) return error.InvalidControlFrame,
             else => {},
         }
     }

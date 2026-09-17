@@ -14,14 +14,17 @@ state_value() {
   printf '%s\n' "${lines[0]#*=}"
 }
 
+plan_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+
 write_campaign_state() {
-  local state_file="$1" release_tag="$2" source_sha="$3" campaign_dir="$4"
+  local state_file="$1" release_tag="$2" source_sha="$3" campaign_dir="$4" plan_sha="$5"
   local temp
   temp="$(mktemp "$campaign_dir/.campaign.env.XXXXXX")" || return 1
   {
     printf 'RELEASE_TAG=%s\n' "$release_tag"
     printf 'SOURCE_SHA=%s\n' "$source_sha"
     printf 'CAMPAIGN_DIR=%s\n' "$campaign_dir"
+    printf 'ROW_PLAN_SHA256=%s\n' "$plan_sha"
   } > "$temp" || { rm -f "$temp"; return 1; }
   mv -f "$temp" "$state_file"
 }
@@ -48,12 +51,11 @@ campaign_675_reseat_main() {
   fi
 
   local evidence_root="${CAMPAIGN_675_EVIDENCE_ROOT:-artifacts/hardening/fuzz}"
-  local row_plan="${CAMPAIGN_675_ROW_PLAN:-scripts/campaign-675-rows.tsv}"
   local git_remote="${CAMPAIGN_675_GIT_REMOTE:-origin}"
   local campaign_dir="$evidence_root/campaign-675-$release_tag"
   local campaign_state="$campaign_dir/campaign.env"
   local active_state="${CAMPAIGN_675_ACTIVE_STATE:-$evidence_root/campaign-675-active.env}"
-  local source_sha old_active old_release old_sha old_dir
+  local source_sha old_active old_release old_sha old_dir old_plan_sha plan_sha row_plan_tmp
 
   git fetch "$git_remote" --tags --quiet || { say "FATAL unable to fetch tags from $git_remote"; return 1; }
   git rev-parse --verify --quiet "refs/tags/$release_tag" >/dev/null || {
@@ -77,6 +79,7 @@ campaign_675_reseat_main() {
     old_release="$(state_value "$campaign_state" RELEASE_TAG)" || old_release=""
     old_sha="$(state_value "$campaign_state" SOURCE_SHA)" || old_sha=""
     old_dir="$(state_value "$campaign_state" CAMPAIGN_DIR)" || old_dir=""
+    old_plan_sha="$(state_value "$campaign_state" ROW_PLAN_SHA256)" || old_plan_sha=""
     if [[ "$old_release" != "$release_tag" || "$old_sha" != "$source_sha" || "$old_dir" != "$campaign_dir" ]]; then
       say "FATAL campaign identity mismatch in $campaign_dir (recorded $old_release ${old_sha:-<missing>})"
       return 1
@@ -85,12 +88,23 @@ campaign_675_reseat_main() {
       say "FATAL existing campaign baseline lacks rows.tsv: $campaign_dir"
       return 1
     }
+    plan_sha="$(plan_sha256 "$campaign_dir/rows.tsv")" || return 1
+    [[ "$old_plan_sha" == "$plan_sha" ]] || {
+      say "FATAL frozen row-plan hash mismatch in $campaign_dir"
+      return 1
+    }
     say "release baseline already established: $release_tag @ $source_sha"
   else
-    [[ -f "$row_plan" ]] || { say "FATAL row-plan template missing: $row_plan"; return 1; }
     mkdir -p "$campaign_dir" || return 1
-    cp "$row_plan" "$campaign_dir/rows.tsv" || return 1
-    write_campaign_state "$campaign_state" "$release_tag" "$source_sha" "$campaign_dir" || {
+    row_plan_tmp="$campaign_dir/.rows.tsv.$$"
+    git show "$source_sha:scripts/campaign-675-rows.tsv" > "$row_plan_tmp" || {
+      rm -f "$row_plan_tmp"
+      say "FATAL selected release lacks scripts/campaign-675-rows.tsv"
+      return 1
+    }
+    mv -f "$row_plan_tmp" "$campaign_dir/rows.tsv" || return 1
+    plan_sha="$(plan_sha256 "$campaign_dir/rows.tsv")" || return 1
+    write_campaign_state "$campaign_state" "$release_tag" "$source_sha" "$campaign_dir" "$plan_sha" || {
       say "FATAL unable to write campaign state"
       return 1
     }

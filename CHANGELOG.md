@@ -12,7 +12,9 @@ All notable user-facing changes to Tardigrade are documented here.
   preservable fuzzer state. The control plane handles detached long-running
   rows, SSH keepalives, remote-stage cleanup, and evidence-integrity failures
   explicitly so a clean run, a finding, and an interrupted row remain
-  distinguishable.
+  distinguishable. The sustained #675 validation flow now pins each campaign
+  to an explicitly requested published release tag and its resolved commit,
+  rather than following a moving development branch.
 
 ### Changed
 

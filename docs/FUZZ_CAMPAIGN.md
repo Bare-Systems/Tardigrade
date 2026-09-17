@@ -44,6 +44,24 @@ Tier defaults come from #675:
 - Tier 3: finding-driven saturation, 100M+ mutations after fixes or where
   evidence justifies it.
 
+## #675 Published-release baseline
+
+The sustained #675 validation campaign runs against one immutable published
+release, not against a moving development branch. Establish it explicitly:
+
+```bash
+scripts/campaign-675-reseat.sh v0.7.0
+```
+
+The command fetches and resolves the requested tag to a commit, then writes
+`artifacts/hardening/fuzz/campaign-675-v0.7.0/campaign.env` with the release
+tag, full source SHA, and campaign directory. The driver, supervisor, and
+watchdog load that state; they do not rewrite committed scripts or follow
+`origin/main`. Re-running with the same release verifies the stored identity;
+a mismatched existing campaign directory fails rather than being repointed.
+Historical campaign evidence remains separate and never counts as validation
+evidence for a different release.
+
 The runner invokes only the existing build steps:
 
 ```text

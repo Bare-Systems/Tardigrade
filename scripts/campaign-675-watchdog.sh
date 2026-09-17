@@ -25,20 +25,19 @@ now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 # record per target in the family (t1-01 alone emitted 5), so counting records
 # overstated progress -- it reported 10/62 when 6 rows had passed. Row ids come
 # from rows.tsv so sibling dirs (preflight/, findings/, runs/) are never counted.
-passed=0; findings=0; accounted=0
+passed=0; findings=0; accounted=0; pending_findings=0
 while IFS=$'\t' read -r rid tier family _rest; do
   [[ "$rid" == "row_id" || -z "$rid" ]] && continue
   disposition="$(campaign_675_row_disposition "$E" "$rid" "$tier" "$family")"
   [[ "$disposition" == pass ]] && { passed=$((passed+1)); accounted=$((accounted+1)); }
   [[ "$disposition" == dispositioned_finding ]] && { findings=$((findings+1)); accounted=$((accounted+1)); }
+  [[ "$disposition" == pending_finding ]] && pending_findings=$((pending_findings+1))
 done < "$E/rows.tsv"
 total=$(( $(wc -l < "$E/rows.tsv" 2>/dev/null || echo 1) - 1 ))
 alive=no; pgrep -f "campaign-675-supervisor.sh $CAMPAIGN_STATE" >/dev/null && alive=yes
 last_evt=$(grep -E "PASS|STOP:|FATAL|START|COMPLETE|INCOMPLETE" "$LOG" 2>/dev/null | tail -1)
-# A finding (STOP) is terminal until a human triages it.
-halted=no
-grep -q "STOP:" <<<"$last_evt" && halted=yes
-grep -qE "triage required" <<<"$(tail -3 "$LOG" 2>/dev/null)" && halted=yes
+# A finding is terminal only while its current durable disposition is pending.
+halted=no; [[ "$pending_findings" -gt 0 ]] && halted=yes
 # Staleness must measure DRIVER progress, not file mtime: this watchdog appends
 # to the same log every 2h, so mtime always looked fresh and the check could
 # never fire. Use the timestamp of the last real driver event instead.

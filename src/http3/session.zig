@@ -541,6 +541,7 @@ test "response headers reject malformed status and field semantics" {
 
     var wire: [64]u8 = undefined;
     try testing.expectError(error.InvalidStatus, ResponseEncoder.encodeHeaders(600, &.{}, &wire));
+    try testing.expectError(error.InvalidStatus, ResponseEncoder.encodeHeaders(101, &.{}, &wire));
 }
 
 test "request stream maps HEADERS and DATA onto stream_transport Exchange" {
@@ -811,6 +812,22 @@ test "request stream accepts one trailer section and rejects later framing" {
     try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = trailer, .len = trailer.len + 2 }, &scratch);
     try testing.expectError(error.UnexpectedFrame, req.ingestFrame(.{ .typ = .data, .type_value = 0, .payload = "again", .len = 7 }, &scratch));
     try testing.expectError(error.UnexpectedFrame, req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = trailer, .len = trailer.len + 2 }, &scratch));
+}
+
+test "request stream accepts trailers without a body" {
+    var req = RequestStream.init(testing.allocator, 0);
+    defer req.deinit();
+    var initial_buf: [256]u8 = undefined;
+    const initial = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },            .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" }, .{ .name = ":path", .value = "/" },
+    }, &initial_buf);
+    var trailer_buf: [128]u8 = undefined;
+    const trailer = try qpack.encode(&.{.{ .name = "x-checksum", .value = "ok" }}, &trailer_buf);
+    var scratch: [256]u8 = undefined;
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = initial, .len = initial.len + 2 }, &scratch);
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = trailer, .len = trailer.len + 2 }, &scratch);
+    try req.validateComplete();
 }
 
 test "request stream rejects pseudo headers in trailers" {

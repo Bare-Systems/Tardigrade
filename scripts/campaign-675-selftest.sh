@@ -72,6 +72,8 @@ mkrow finding 2 fail
 [[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == pending_finding ]]; check "untriaged finding halts the campaign" 0 $?
 printf 'DISPOSITION=dispositioned_finding\nISSUE=#675\nFIX_COMMIT=deadbeef\nVERIFICATION=zig-build-test\n' > "$E/finding/disposition.env"
 [[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == dispositioned_finding ]]; check "triaged finding is durably accounted" 0 $?
+printf 'DISPOSITION=dispositioned_finding\nISSUE=#675\n' > "$E/finding/disposition.env"
+[[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == pending_finding ]]; check "disposition requires fix and verification" 0 $?
 
 # Watchdog bounds must exceed the slowest measured legitimate run per budget.
 w10=$(watchdog_for 10M); w50=$(watchdog_for 50M); w100=$(watchdog_for 100M)

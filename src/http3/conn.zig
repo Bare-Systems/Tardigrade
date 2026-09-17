@@ -1193,8 +1193,7 @@ pub fn Conn(comptime Transport: type) type {
                         body_len += raw.payload.len;
                         phase = .body;
                     },
-                    .cancel_push, .settings, .goaway, .max_push_id,
-                    .priority_update_request, .priority_update_push => {
+                    .cancel_push, .settings, .goaway, .max_push_id, .priority_update_request, .priority_update_push => {
                         var event_scratch = EventDecodeScratch{};
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = eventFrameFromRaw(raw, &event_scratch) } });
                         return self.fail(.frame_unexpected);

@@ -4,6 +4,22 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 E="$TMP/epoch"; mkdir -p "$E"
+SHA="1111111111111111111111111111111111111111"
+printf 'RELEASE_TAG=v9.9.9\nSOURCE_SHA=%s\n' "$SHA" > "$E/campaign.env"
+cat > "$E/rows.tsv" <<'EOF'
+row_id	tier	family	target	budget
+full	1	tls-record	-	10M
+mixed	1	tls-record	-	10M
+short	1	tls-record	-	10M
+rcbad	1	tls-record	-	10M
+t2ok	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
+t2wrong	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
+t2bad	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
+finding	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
+crash-window	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
+t2-tls-21	2	tls-record	fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption	10M
+t2-tls-22	2	tls-record	fuzz: TLS record: encrypted stream cleanup preserves root errors across alerts and epoch transitions	10M
+EOF
 # shellcheck source=/dev/null
 source scripts/campaign-675-row-state.sh
 watchdog_for() {
@@ -20,31 +36,53 @@ fails=0
 check() { # name expected_rc actual_rc
   if [[ "$2" == "$3" ]]; then printf '  ok   %s\n' "$1"; else printf '  FAIL %s (want rc=%s got rc=%s)\n' "$1" "$2" "$3"; fails=$((fails+1)); fi
 }
-mkrow() { # rid rc records...
+mkrow() { # rid rc records... (status records use the row's canonical identity)
   local rid="$1" rc="$2"; shift 2
   mkdir -p "$E/$rid"; echo "$rc" > "$E/$rid/collect.rc"; printf 'remote_exit_code=%s\n' "$rc" > "$E/$rid/guest-state.env"; : > "$E/$rid/manifest.jsonl"
-  for st in "$@"; do printf '{"status":"%s"}\n' "$st" >> "$E/$rid/manifest.jsonl"; done
+  local family target budget step
+  family="$(awk -F '\t' -v r="$rid" '$1 == r { print $3; exit }' "$E/rows.tsv")"
+  target="$(awk -F '\t' -v r="$rid" '$1 == r { print $4; exit }' "$E/rows.tsv")"
+  budget="$(awk -F '\t' -v r="$rid" '$1 == r { print $5; exit }' "$E/rows.tsv")"
+  case "$family" in quic) step=test-quic ;; tls-record) step=test-tls-record-fuzz ;; esac
+  for st in "$@"; do printf '{"source_commit_sha":"%s","build_step":"%s","filter":"%s","budget_mutations":%s,"status":"%s"}\n' "$SHA" "$step" "$target" "${budget/M/000000}" "$st" >> "$E/$rid/manifest.jsonl"; done
 }
 
 # THE REGRESSION: family row, 3 targets passed then one failed.
-mkrow mixed 1 pass pass pass fail
+mkrow mixed 1 pass fail
 campaign_675_row_passed "$E" mixed 1 tls-record; check "driver and watchdog reject a family row with a later FAIL" 1 $?
 
-# Complete tier-1 family row (tls-record has 6 targets).
-mkrow full 0 pass pass pass pass pass pass
+# Complete tier-1 family row (the frozen plan supplies the expected targets).
+mkrow full 0
+while IFS=$'\t' read -r _ tier family target budget; do
+  [[ "$tier" == 2 && "$family" == tls-record ]] || continue
+  printf '{"source_commit_sha":"%s","build_step":"test-tls-record-fuzz","filter":"%s","budget_mutations":10000000,"status":"pass"}\n' "$SHA" "$target" >> "$E/full/manifest.jsonl"
+done < "$E/rows.tsv"
 campaign_675_row_passed "$E" full 1 tls-record; check "complete family row passes" 0 $?
+printf '{"source_commit_sha":"%s","build_step":"test-tls-record-fuzz","filter":"fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption","budget_mutations":10000000,"status":"interrupted"}\n' "$SHA" >> "$E/full/manifest.jsonl"
+campaign_675_row_passed "$E" full 1 tls-record; check "old interrupted evidence does not poison a canonical pass" 0 $?
 
 # Truncated family row: all passes, but fewer than the family's targets, and no
 # failure record -- the case a status-only check cannot see.
-mkrow short 0 pass pass pass
+mkrow short 0 pass
 campaign_675_row_passed "$E" short 1 tls-record; check "driver and watchdog reject a truncated family row" 1 $?
 
 # Tier-2 single-target rows.
 mkrow t2ok 0 pass;  campaign_675_row_passed "$E" t2ok 2 quic; check "tier-2 single pass" 0 $?
+printf '{"source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"interrupted"}\n' "$SHA" >> "$E/t2ok/manifest.jsonl"
+campaign_675_row_passed "$E" t2ok 2 quic; check "retry evidence remains append-only without blocking completion" 0 $?
+mkrow t2wrong 0 pass
+sed -i.bak "s/\"source_commit_sha\":\"$SHA\"/\"source_commit_sha\":\"2222222222222222222222222222222222222222\"/" "$E/t2wrong/manifest.jsonl"; rm -f "$E/t2wrong/manifest.jsonl.bak"
+campaign_675_row_passed "$E" t2wrong 2 quic; check "wrong release SHA cannot satisfy a row" 1 $?
+printf '{"source_commit_sha":"%s","build_step":"wrong-step","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/identity.jsonl"
+campaign_675_manifest_has_pass "$E/identity.jsonl" "$SHA" test-quic 'fuzz: packet parser preserves bounded slice and progress invariants' 50000000; check "wrong build step cannot satisfy a row" 1 $?
+printf '{"source_commit_sha":"%s","build_step":"test-quic","filter":"wrong filter","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/identity.jsonl"
+campaign_675_manifest_has_pass "$E/identity.jsonl" "$SHA" test-quic 'fuzz: packet parser preserves bounded slice and progress invariants' 50000000; check "wrong target filter cannot satisfy a row" 1 $?
+printf '{"source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":49999999,"status":"pass"}\n' "$SHA" > "$E/identity.jsonl"
+campaign_675_manifest_has_pass "$E/identity.jsonl" "$SHA" test-quic 'fuzz: packet parser preserves bounded slice and progress invariants' 50000000; check "undersized budget cannot satisfy a row" 1 $?
 mkrow t2bad 1 fail; campaign_675_row_passed "$E" t2bad 2 quic; check "tier-2 fail" 1 $?
 
 # Non-zero collect exit overrides an all-pass manifest.
-mkrow rcbad 1 pass pass pass pass pass pass
+mkrow rcbad 1 pass
 campaign_675_row_passed "$E" rcbad 1 tls-record; check "nonzero collect rc overrides manifest" 1 $?
 
 # Missing collect.rc (pre-fix row) must not count.
@@ -60,20 +98,24 @@ campaign_675_row_passed "$E" nomani 2 quic; check "no manifest is not a pass" 1 
 # wrote collect.rc. Recovery is entirely local and never reattaches to PVE.
 mkdir -p "$E/crash-window/archive"
 printf 'payload\n' > "$E/crash-window/archive/evidence"
+printf '{"source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/crash-window/archive/manifest.jsonl"
 printf 'remote_exit_code=0\n' > "$E/crash-window/guest-state.env"
 printf 'REMOTE_STAGE=/tmp/tardigrade-proxmox-fuzz-deleted\n' > "$E/crash-window/async.env"
-printf '{"status":"pass"}\n' > "$E/crash-window/manifest.jsonl"
-tar -C "$E/crash-window/archive" -czf "$E/crash-window/guest-fuzz-artifacts.tgz" evidence
+cp "$E/crash-window/archive/manifest.jsonl" "$E/crash-window/manifest.jsonl"
+tar -C "$E/crash-window/archive" -czf "$E/crash-window/guest-fuzz-artifacts.tgz" evidence manifest.jsonl
 tar -C "$E/crash-window/archive" -czf "$E/crash-window/proxmox-metadata.tgz" evidence
 campaign_675_recover_collected_row "$E/crash-window"; check "crash-window local evidence is recovered without REMOTE_STAGE" 0 $?
+if [[ -f "$E/crash-window/evidence" ]]; then check "recovery restores a partially extracted evidence tree" 0 0; else check "recovery restores a partially extracted evidence tree" 0 1; fi
 campaign_675_row_passed "$E" crash-window 2 quic; check "recovered crash-window row is classified locally" 0 $?
 
 mkrow finding 2 fail
-[[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == pending_finding ]]; check "untriaged finding halts the campaign" 0 $?
+if [[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == pending_finding ]]; then check "untriaged finding halts the campaign" 0 0; else check "untriaged finding halts the campaign" 0 1; fi
+printf 'DISPOSITION=dispositioned_finding\nISSUE=#776\nFIX_COMMIT=deadbeef\nVERIFICATION=zig-build-test\n' > "$E/finding/disposition.env"
+if [[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == dispositioned_finding ]]; then check "triaged finding is durably accounted" 0 0; else check "triaged finding is durably accounted" 0 1; fi
 printf 'DISPOSITION=dispositioned_finding\nISSUE=#675\nFIX_COMMIT=deadbeef\nVERIFICATION=zig-build-test\n' > "$E/finding/disposition.env"
-[[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == dispositioned_finding ]]; check "triaged finding is durably accounted" 0 $?
-printf 'DISPOSITION=dispositioned_finding\nISSUE=#675\n' > "$E/finding/disposition.env"
-[[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == pending_finding ]]; check "disposition requires fix and verification" 0 $?
+if [[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == pending_finding ]]; then check "epic issue cannot disposition a focused finding" 0 0; else check "epic issue cannot disposition a focused finding" 0 1; fi
+printf 'DISPOSITION=dispositioned_finding\nISSUE=#776\n' > "$E/finding/disposition.env"
+if [[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == pending_finding ]]; then check "disposition requires fix and verification" 0 0; else check "disposition requires fix and verification" 0 1; fi
 
 # Watchdog bounds must exceed the slowest measured legitimate run per budget.
 w10=$(watchdog_for 10M); w50=$(watchdog_for 50M); w100=$(watchdog_for 100M)

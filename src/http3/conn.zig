@@ -2431,6 +2431,51 @@ test "H3 conn: client rejects known control frames on a response stream" {
     }
 }
 
+test "H3 conn: client rejects HTTP2-only response frames but ignores extensions" {
+    inline for ([_]u64{ 0x02, 0x06, 0x08, 0x09 }) |typ| {
+        const allocator = testing.allocator;
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+        const H3 = Conn(MockTransport);
+        var client = H3.init(allocator, .client);
+        defer client.deinit();
+        const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/reserved-response" });
+        var wire: [128]u8 = undefined;
+        var len: usize = 0;
+        len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+        len += (try frame.encodeFrame(typ, "", wire[len..])).len;
+        _ = try server_transport.writeStream(id, wire[0..len], true);
+        try client.pump(&client_transport);
+        try testing.expectError(error.ProtocolError, client.pollResponse(id));
+        try testing.expectEqual(ErrorCode.frame_unexpected, client.close_code.?);
+    }
+    inline for ([_]u64{ 0x21, 0x40 }) |typ| {
+        const allocator = testing.allocator;
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+        const H3 = Conn(MockTransport);
+        var client = H3.init(allocator, .client);
+        defer client.deinit();
+        const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/extension-response" });
+        var wire: [128]u8 = undefined;
+        var len: usize = 0;
+        len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+        len += (try frame.encodeFrame(typ, "", wire[len..])).len;
+        _ = try server_transport.writeStream(id, wire[0..len], true);
+        try client.pump(&client_transport);
+        const response = (try client.pollResponse(id)).?;
+        try testing.expectEqual(@as(u16, 200), response.status);
+    }
+}
+
 test "H3 conn: client rejects PUSH_PROMISE while push is disabled" {
     const allocator = testing.allocator;
     var client_transport = MockTransport.init(allocator, true);
@@ -2454,6 +2499,88 @@ test "H3 conn: client rejects PUSH_PROMISE while push is disabled" {
 
     try testing.expectError(error.ProtocolError, client.pollResponse(id));
     try testing.expectEqual(ErrorCode.id_error, client.close_code.?);
+}
+
+test "H3 conn: truncated PUSH_PROMISE is a frame error before disabled-push policy" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/truncated-push" });
+    var wire: [128]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+    len += (try frame.encodeKnownFrame(.push_promise, &.{}, wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.frame_error, client.close_code.?);
+}
+
+test "H3 conn: control MAX_PUSH_ID and CANCEL_PUSH validate payload role and monotonicity" {
+    const Case = struct { typ: frame.FrameType, payload: []const u8, role: Role, want: ErrorCode };
+    const cases = [_]Case{
+        .{ .typ = .max_push_id, .payload = &.{}, .role = .server, .want = .frame_error },
+        .{ .typ = .max_push_id, .payload = &.{ 0, 0 }, .role = .server, .want = .frame_error },
+        .{ .typ = .cancel_push, .payload = &.{}, .role = .server, .want = .frame_error },
+        .{ .typ = .cancel_push, .payload = &.{0}, .role = .server, .want = .id_error },
+        .{ .typ = .max_push_id, .payload = &.{0}, .role = .client, .want = .frame_unexpected },
+    };
+    inline for (cases) |case| {
+        const allocator = testing.allocator;
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+        const H3 = Conn(MockTransport);
+        var receiver = H3.init(allocator, case.role);
+        defer receiver.deinit();
+        var sender = H3.init(allocator, if (case.role == .client) .server else .client);
+        defer sender.deinit();
+        try receiver.start(if (case.role == .client) &client_transport else &server_transport);
+        try sender.start(if (case.role == .client) &server_transport else &client_transport);
+        try receiver.pump(if (case.role == .client) &client_transport else &server_transport);
+        var wire: [16]u8 = undefined;
+        const encoded = try frame.encodeKnownFrame(case.typ, case.payload, &wire);
+        _ = try (if (case.role == .client) server_transport.writeStream(sender.control_out.?, encoded, false) else client_transport.writeStream(sender.control_out.?, encoded, false));
+        try testing.expectError(error.ProtocolError, receiver.pump(if (case.role == .client) &client_transport else &server_transport));
+        try testing.expectEqual(case.want, receiver.close_code.?);
+    }
+
+    // A server accepts a client-issued limit once, but it must never move
+    // backwards on a later MAX_PUSH_ID.
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    try server.start(&server_transport);
+    try client.start(&client_transport);
+    try server.pump(&server_transport);
+    var wire: [16]u8 = undefined;
+    const high = try frame.encodeKnownFrame(.max_push_id, &.{1}, &wire);
+    _ = try client_transport.writeStream(client.control_out.?, high, false);
+    try server.pump(&server_transport);
+    const low = try frame.encodeKnownFrame(.max_push_id, &.{0}, &wire);
+    _ = try client_transport.writeStream(client.control_out.?, low, false);
+    try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+    try testing.expectEqual(ErrorCode.id_error, server.close_code.?);
 }
 
 test "H3 conn: client permits representation content-length on HEAD and 304 responses" {
@@ -2738,6 +2865,27 @@ test "H3 conn: unknown request frame is observed as unknown" {
     try server.pump(&server_transport);
     try testing.expect(server_events.sawUnknownFrame(0x21));
     try testing.expect(!server_events.sawFrame(.parsed, .data));
+}
+
+test "H3 conn: server rejects HTTP2-only request frames" {
+    inline for ([_]u64{ 0x02, 0x06, 0x08, 0x09 }) |typ| {
+        const allocator = testing.allocator;
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+        const H3 = Conn(MockTransport);
+        var server = H3.init(allocator, .server);
+        defer server.deinit();
+        const id = try client_transport.openStream(.bidi);
+        var wire: [16]u8 = undefined;
+        const reserved = try frame.encodeFrame(typ, "", &wire);
+        _ = try client_transport.writeStream(id, reserved, false);
+        try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+        try testing.expectEqual(ErrorCode.frame_unexpected, server.close_code.?);
+    }
 }
 
 test "H3 conn: malformed known frames are not observed as unknown" {

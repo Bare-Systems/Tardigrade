@@ -469,6 +469,22 @@ test "control stream requires SETTINGS first and rejects illegal control frames"
     try testing.expectError(error.InvalidControlFrame, control.ingestFrame(try decodeFrame(data)));
 }
 
+test "control stream rejects HTTP2-only frames but ignores grease extensions" {
+    var payload: [128]u8 = undefined;
+    inline for ([_]u64{ 0x02, 0x06, 0x08, 0x09 }) |typ| {
+        var control = ControlStream{ .saw_type = true, .saw_settings = true };
+        defer control.deinit(testing.allocator);
+        const encoded = try encodeFrame(typ, "", &payload);
+        try testing.expectError(error.InvalidControlFrame, control.ingestFrame(try decodeFrame(encoded)));
+    }
+    inline for ([_]u64{ 0x21, 0x40 }) |typ| {
+        var control = ControlStream{ .saw_type = true, .saw_settings = true };
+        defer control.deinit(testing.allocator);
+        const encoded = try encodeFrame(typ, "", &payload);
+        try control.ingestFrame(try decodeFrame(encoded));
+    }
+}
+
 test "control stream rejects missing duplicate and malformed SETTINGS" {
     var buf: [128]u8 = undefined;
     var pos: usize = 0;

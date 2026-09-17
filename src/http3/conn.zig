@@ -1098,6 +1098,13 @@ pub fn Conn(comptime Transport: type) type {
             return !request_is_head and status != 204 and status != 205 and status != 304;
         }
 
+        fn responseEndsAtHeaders(status: u16) bool {
+            // RFC 9110 sections 15.3.5 and 15.4.5: 204 and 304 are complete
+            // at the end of their header section. Content-Length metadata on
+            // 304 remains legal, but neither DATA nor trailers may follow.
+            return status == 204 or status == 304;
+        }
+
         /// Decode the response once the peer has finished the stream.
         /// Returns null while the response is still in flight. The returned
         /// slices borrow the connection's accumulation buffer and stay valid
@@ -1145,6 +1152,7 @@ pub fn Conn(comptime Transport: type) type {
                                 }
                             },
                             .final_headers, .body => {
+                                if (responseEndsAtHeaders(status.?)) return self.fail(.message_error);
                                 const trailer_count = qpack.decode(raw.payload, &trailer_fields, trailer_scratch[0..]) catch {
                                     self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .malformed = .{ .frame_type = raw.typ, .frame_type_value = raw.type_value, .raw_length = raw.len } } } });
                                     return self.fail(.qpack_decompression_failed);
@@ -1160,6 +1168,7 @@ pub fn Conn(comptime Transport: type) type {
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .data = .{ .raw_length = raw.len } } } });
                         if (status == null) return self.fail(.frame_unexpected);
                         if (phase == .trailers) return self.fail(.frame_unexpected);
+                        if (responseEndsAtHeaders(status.?)) return self.fail(.message_error);
                         if (!responseAllowsContent(status.?, response.request_is_head) and raw.payload.len > 0) return self.fail(.message_error);
                         if (body_len == 0) {
                             body_start = offset + (raw.len - raw.payload.len);
@@ -2308,7 +2317,7 @@ test "H3 conn: client rejects a response body longer than content-length" {
     try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
 }
 
-test "H3 conn: client permits content-length on a no-content response" {
+test "H3 conn: client permits representation content-length on HEAD and 304 responses" {
     const allocator = testing.allocator;
     var client_transport = MockTransport.init(allocator, true);
     defer client_transport.deinit();
@@ -2321,16 +2330,85 @@ test "H3 conn: client permits content-length on a no-content response" {
     var client = H3.init(allocator, .client);
     defer client.deinit();
 
-    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/no-content" });
+    const head_id = try client.sendRequest(&client_transport, .{
+        .method = "HEAD",
+        .authority = "tardigrade.test",
+        .path = "/head-content-length",
+    });
     var wire: [128]u8 = undefined;
-    const headers = try session.ResponseEncoder.encodeHeaders(204, &.{.{ .name = "content-length", .value = "10" }}, &wire);
-    _ = try server_transport.writeStream(id, headers, true);
+    const head_headers = try session.ResponseEncoder.encodeHeaders(200, &.{.{ .name = "content-length", .value = "10" }}, &wire);
+    _ = try server_transport.writeStream(head_id, head_headers, true);
     try client.pump(&client_transport);
 
-    const response = (try client.pollResponse(id)).?;
-    try testing.expectEqual(@as(u16, 204), response.status);
-    try testing.expectEqual(@as(usize, 0), response.body.len);
+    const head_response = (try client.pollResponse(head_id)).?;
+    try testing.expectEqual(@as(u16, 200), head_response.status);
+    try testing.expectEqual(@as(usize, 0), head_response.body.len);
+
+    const not_modified_id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/not-modified" });
+    const not_modified_headers = try session.ResponseEncoder.encodeHeaders(304, &.{.{ .name = "content-length", .value = "10" }}, &wire);
+    _ = try server_transport.writeStream(not_modified_id, not_modified_headers, true);
+    try client.pump(&client_transport);
+
+    const not_modified_response = (try client.pollResponse(not_modified_id)).?;
+    try testing.expectEqual(@as(u16, 304), not_modified_response.status);
+    try testing.expectEqual(@as(usize, 0), not_modified_response.body.len);
     try testing.expectEqual(@as(?ErrorCode, null), client.close_code);
+}
+
+test "H3 conn: client rejects trailers after terminal response headers" {
+    const allocator = testing.allocator;
+    const H3 = Conn(MockTransport);
+    inline for ([_]u16{ 204, 304 }) |status| {
+        {
+            var client_transport = MockTransport.init(allocator, true);
+            defer client_transport.deinit();
+            var server_transport = MockTransport.init(allocator, false);
+            defer server_transport.deinit();
+            client_transport.peer = &server_transport;
+            server_transport.peer = &client_transport;
+
+            var client = H3.init(allocator, .client);
+            defer client.deinit();
+
+            const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/terminal-trailer" });
+            var wire: [256]u8 = undefined;
+            var len: usize = 0;
+            len += (try session.ResponseEncoder.encodeHeaders(status, &.{}, wire[len..])).len;
+            var trailer_block_buf: [128]u8 = undefined;
+            const trailer_block = try qpack.encode(&.{.{ .name = "x-checksum", .value = "ok" }}, &trailer_block_buf);
+            len += (try frame.encodeKnownFrame(.headers, trailer_block, wire[len..])).len;
+            _ = try server_transport.writeStream(id, wire[0..len], true);
+            try client.pump(&client_transport);
+
+            try testing.expectError(error.ProtocolError, client.pollResponse(id));
+            try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
+        }
+    }
+}
+
+test "H3 conn: client rejects empty DATA after terminal response headers" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/terminal-empty-data" });
+    var wire: [128]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(204, &.{}, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeData("", wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
 }
 
 test "H3 conn: event sink observes settings stream frames and priority updates" {

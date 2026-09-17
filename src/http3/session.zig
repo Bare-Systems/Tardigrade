@@ -422,10 +422,14 @@ pub fn validateResponseHeaders(fields: []const qpack.HeaderField) SessionError!R
             content_length = std.fmt.parseInt(usize, field.value, 10) catch return error.InvalidContentLength;
         }
     }
-    return .{
-        .status = status orelse return error.MissingRequiredPseudoHeader,
-        .content_length = content_length,
-    };
+    const final_status = status orelse return error.MissingRequiredPseudoHeader;
+    // RFC 9110 section 8.6 forbids Content-Length on informational and 204
+    // responses. HEAD and 304 are deliberately not included: there it can
+    // describe the selected representation even though no content follows.
+    if (content_length != null and (final_status < 200 or final_status == 204)) {
+        return error.InvalidContentLength;
+    }
+    return .{ .status = final_status, .content_length = content_length };
 }
 
 /// Validate a response trailer field section. Trailers must not contain
@@ -497,6 +501,14 @@ test "response headers reject malformed status and field semantics" {
     try testing.expectError(error.InvalidHeader, validateResponseHeaders(&.{
         .{ .name = ":status", .value = "200" },
         .{ .name = "te", .value = "trailers" },
+    }));
+    try testing.expectError(error.InvalidContentLength, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "103" },
+        .{ .name = "content-length", .value = "3" },
+    }));
+    try testing.expectError(error.InvalidContentLength, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "204" },
+        .{ .name = "content-length", .value = "3" },
     }));
     try testing.expectError(error.InvalidPseudoHeader, validateResponseTrailers(&.{
         .{ .name = ":status", .value = "200" },

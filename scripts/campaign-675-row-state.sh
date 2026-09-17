@@ -45,10 +45,36 @@ campaign_675_manifest_is_collected() {
   local row_dir="$1" manifest="$2" dir
   dir="$(dirname "$manifest")"
   while [[ "$dir" == "$row_dir" || "$dir" == "$row_dir"/* ]]; do
-    [[ "$(cat "$dir/collect.rc" 2>/dev/null || true)" == 0 ]] && return 0
-    [[ "$dir" == "$row_dir" ]] && break
+    if [[ -f "$dir/guest-state.env" ]]; then
+      [[ -f "$dir/collect.rc" && "$(cat "$dir/collect.rc" 2>/dev/null || true)" == 0 ]] && return 0
+      return 1
+    fi
+    [[ "$dir" == "$row_dir" ]] && return 1
     dir="$(dirname "$dir")"
   done
+  return 1
+}
+
+campaign_675_manifest_attempt_is_collected() {
+  local row_dir="$1" manifest="$2" dir
+  dir="$(dirname "$manifest")"
+  while [[ "$dir" == "$row_dir" || "$dir" == "$row_dir"/* ]]; do
+    if [[ -f "$dir/guest-state.env" ]]; then
+      [[ -f "$dir/collect.rc" ]] && return 0
+      return 1
+    fi
+    [[ "$dir" == "$row_dir" ]] && return 1
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+campaign_675_row_has_durable_finding() {
+  local row_dir="$1" manifest
+  while IFS= read -r -d '' manifest; do
+    campaign_675_manifest_attempt_is_collected "$row_dir" "$manifest" || continue
+    grep -qE '"status":"(fail|possible_hang)"' "$manifest" && return 0
+  done < <(find "$row_dir" -name manifest.jsonl -print0)
   return 1
 }
 
@@ -61,7 +87,7 @@ campaign_675_row_collected() {
   while IFS= read -r collect_file; do
     attempt_dir="$(dirname "$collect_file")"
     [[ -f "$attempt_dir/guest-state.env" ]] || continue
-    find "$attempt_dir" -name manifest.jsonl -print -quit 2>/dev/null | grep -q . && return 0
+    find "$attempt_dir" -path "$attempt_dir/attempts" -prune -o -name manifest.jsonl -print -quit 2>/dev/null | grep -q . && return 0
   done < <(find "$row_dir" -name collect.rc -type f -print 2>/dev/null)
   return 1
 }
@@ -98,8 +124,12 @@ campaign_675_recover_collected_row() {
   if find "$row_dir" -name manifest.jsonl -exec grep -q '"preservation_status":"failed"' {} + 2>/dev/null; then
     return 1
   fi
-  if [[ "$status" != 0 ]] && ! find "$row_dir" -name manifest.jsonl -exec grep -qE '"status":"(fail|possible_hang)".*"preservation_status":"ok"' {} + 2>/dev/null; then
-    return 1
+  if [[ "$status" != 0 ]]; then
+    if find "$row_dir" -name manifest.jsonl -exec grep -qE '"status":"(fail|possible_hang)"' {} + 2>/dev/null; then
+      find "$row_dir" -name manifest.jsonl -exec grep -qE '"status":"(fail|possible_hang)".*"preservation_status":"ok"' {} + 2>/dev/null || return 1
+    elif ! find "$row_dir" -name manifest.jsonl -exec grep -q '"status":"interrupted"' {} + 2>/dev/null; then
+      return 1
+    fi
   fi
   campaign_675_write_collect_result "$row_dir" "$status"
 }
@@ -107,27 +137,30 @@ campaign_675_recover_collected_row() {
 # A row passes only when collection was durable and every target frozen in its
 # row plan has an existential matching PASS for this release identity.
 campaign_675_row_passed() {
-  local evidence_root="$1" rid="$2" tier="${3:-}" family="${4:-}" source_sha release_tag step budget target expected=() manifests=() matched
+  local evidence_root="$1" rid="$2" tier="${3:-}" family="${4:-}" source_sha release_tag budget record frozen_family frozen_step frozen_target expected=() manifests=() matched
   campaign_675_row_collected "$evidence_root/$rid" || return 1
   source_sha="$(awk -F= '$1 == "SOURCE_SHA" { if (++n == 1) print $2 }' "$evidence_root/campaign.env")"
   release_tag="$(awk -F= '$1 == "RELEASE_TAG" { if (++n == 1) print $2 }' "$evidence_root/campaign.env")"
   [[ "$source_sha" =~ ^[0-9a-f]{40}$ && "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || return 1
-  step="$(campaign_675_family_step "$family")" || return 1
   budget="$(awk -F '\t' -v r="$rid" '$1 == r { if (++n == 1) print $5 }' "$evidence_root/rows.tsv")"
   [[ -n "$budget" ]] || return 1
   budget="$(campaign_675_budget_mutations "$budget")" || return 1
   if [[ "$tier" == "1" ]]; then
-    mapfile -t expected < <(awk -F '\t' -v f="$family" '$1 == f { print $3 }' "$evidence_root/targets.tsv" | sort -u)
+    mapfile -t expected < <(awk -F '\t' -v f="$family" '$1 == f { print $1 "\t" $2 "\t" $3 }' "$evidence_root/targets.tsv" | sort -u)
   else
-    mapfile -t expected < <(awk -F '\t' -v r="$rid" '$1 == r && $4 != "-" { print $4 }' "$evidence_root/rows.tsv")
+    target="$(awk -F '\t' -v r="$rid" '$1 == r && $4 != "-" { print $4 }' "$evidence_root/rows.tsv")"
+    [[ -n "$target" ]] || return 1
+    mapfile -t expected < <(awk -F '\t' -v f="$family" -v t="$target" '$1 == f && $3 == t { print $1 "\t" $2 "\t" $3 }' "$evidence_root/targets.tsv" | sort -u)
   fi
   [[ "${#expected[@]}" -gt 0 ]] || return 1
   mapfile -d '' -t manifests < <(find "$evidence_root/$rid" -name manifest.jsonl -print0)
-  for target in "${expected[@]}"; do
+  for record in "${expected[@]}"; do
+    IFS=$'\t' read -r frozen_family frozen_step frozen_target <<< "$record"
+    [[ "$frozen_family" == "$family" && -n "$frozen_step" && -n "$frozen_target" ]] || return 1
     matched=false
     for manifest in "${manifests[@]}"; do
       if campaign_675_manifest_is_collected "$evidence_root/$rid" "$manifest" &&
-        campaign_675_manifest_has_pass "$manifest" "$release_tag" "$source_sha" "$step" "$target" "$budget"; then matched=true; break; fi
+        campaign_675_manifest_has_pass "$manifest" "$release_tag" "$source_sha" "$frozen_step" "$frozen_target" "$budget"; then matched=true; break; fi
     done
     [[ "$matched" == true ]] || return 1
   done
@@ -138,11 +171,7 @@ campaign_675_row_passed() {
 campaign_675_row_disposition() {
   local evidence_root="$1" rid="$2" tier="$3" family="$4" row_dir issue
   row_dir="$evidence_root/$rid"
-  if campaign_675_row_passed "$evidence_root" "$rid" "$tier" "$family"; then
-    printf 'pass\n'; return
-  fi
-  if campaign_675_row_collected "$row_dir"; then
-    if find "$row_dir" -name manifest.jsonl -exec grep -qE '"status":"(fail|possible_hang)"' {} + 2>/dev/null; then
+  if campaign_675_row_has_durable_finding "$row_dir"; then
       if [[ "$(awk -F= '$1 == "DISPOSITION" { print $2 }' "$row_dir/disposition.env" 2>/dev/null)" == dispositioned_finding ]] &&
         [[ "$(grep -cE '^ISSUE=.+' "$row_dir/disposition.env" 2>/dev/null)" == 1 ]] &&
         [[ "$(grep -cE '^FIX_COMMIT=.+' "$row_dir/disposition.env" 2>/dev/null)" == 1 ]] &&
@@ -152,7 +181,9 @@ campaign_675_row_disposition() {
         printf 'dispositioned_finding\n'; return
       fi
       printf 'pending_finding\n'; return
-    fi
+  fi
+  if campaign_675_row_passed "$evidence_root" "$rid" "$tier" "$family"; then
+    printf 'pass\n'; return
   fi
   printf 'interrupted\n'
 }

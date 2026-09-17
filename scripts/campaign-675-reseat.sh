@@ -16,32 +16,19 @@ state_value() {
 
 plan_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 
-target_family() {
-  local path="$1" target="$2"
-  case "$target" in
-    'fuzz: TLS protocol:'*) echo tls-protocol ;;
-    'fuzz: TLS record:'*) echo tls-record ;;
-    'fuzz: TLS resumption:'*) echo tls-resumption ;;
-    'fuzz: PKI:'*) echo pki ;;
-    *) case "$path" in tests/crypto_provider_fuzz.zig) echo crypto ;; src/quic/*|src/http3/*) echo quic ;; *) return 1 ;; esac ;;
-  esac
-}
-target_step() { case "$1" in tls-protocol) echo test-tls-protocol-fuzz ;; tls-record) echo test-tls-record-fuzz ;; tls-resumption) echo test-tls-resumption-fuzz ;; pki) echo test-pki-fuzz ;; crypto) echo test-crypto-provider-fuzz ;; quic) echo test-quic ;; esac; }
-
 freeze_target_registry() { # $1 source SHA, $2 output file
-  local source_sha="$1" output="$2" record path _line rest target family
-  : > "$output" || return 1
-  while IFS= read -r record; do
-    record="${record#*:}" # drop git's <revision>: prefix
-    IFS=: read -r path _line rest <<< "$record"
-    target="$(printf '%s\n' "$rest" | sed -n 's/.*test "\(fuzz: [^"]*\)".*/\1/p')"
-    [[ -n "$target" ]] || continue
-    family="$(target_family "$path" "$target" 2>/dev/null || true)"
-    [[ -n "$family" ]] || continue
-    printf '%s\t%s\t%s\n' "$family" "$(target_step "$family")" "$target" >> "$output"
-  done < <(git grep -n 'test "fuzz:' "$source_sha" -- src tests)
-  sort -u -o "$output" "$output"
-  [[ -s "$output" ]]
+  local source_sha="$1" output="$2" source_dir
+  source_dir="$(mktemp -d)" || return 1
+  # The target lister itself is part of the release contract: it carries that
+  # release's family-to-build-step mapping, so never recreate it from the
+  # moving controller checkout.
+  if ! git archive --format=tar "$source_sha" | tar -x -C "$source_dir" ||
+    ! (cd "$source_dir" && scripts/run-fuzz-campaign.sh --list) | awk -F '\t' 'NF >= 3 { print $1 "\t" $2 "\t" $3 }' | sort -u > "$output" ||
+    [[ ! -s "$output" ]]; then
+    rm -rf "$source_dir"
+    return 1
+  fi
+  rm -rf "$source_dir"
 }
 
 write_campaign_state() {

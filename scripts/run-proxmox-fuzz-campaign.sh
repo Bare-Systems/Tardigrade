@@ -263,6 +263,7 @@ if [[ "$MODE" == "collect" ]]; then
 
   local_collection_ok=false
   preservation_verified=false
+  retryable_interruption=false
   if [[ "${guest_allocated:-false}" == true && "${guest_reachable:-false}" == true ]]; then
     if rsync_from_pve "$REMOTE_STAGE/artifacts.tgz" "$artifact_tgz" &&
       scp_from_pve "$REMOTE_STAGE/proxmox-metadata.tgz" "$metadata_tgz" &&
@@ -272,13 +273,18 @@ if [[ "$MODE" == "collect" ]]; then
       local_collection_ok=true
       if collected_findings_are_complete "$remote_status"; then
         preservation_verified=true
+        if [[ "$remote_status" -ne 0 ]] &&
+          ! find "$LOCAL_OUT_DIR" -type f -name manifest.jsonl -exec grep -qE '"status":"(fail|possible_hang)"' {} + &&
+          find "$LOCAL_OUT_DIR" -type f -name manifest.jsonl -exec grep -q '"status":"interrupted"' {} +; then
+          retryable_interruption=true
+        fi
       fi
     fi
   fi
 
   destroy_guest=false
   if [[ "${guest_allocated:-false}" == true && "$local_collection_ok" == true && "$preservation_verified" == true && "$KEEP_GUEST" != true ]]; then
-    if [[ "$remote_status" -eq 0 || "$KEEP_ON_FAILURE" != true ]]; then
+    if [[ "$remote_status" -eq 0 || "$retryable_interruption" == true || "$KEEP_ON_FAILURE" != true ]]; then
       destroy_guest=true
     fi
   fi

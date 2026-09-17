@@ -14,6 +14,7 @@ short	1	tls-record	-	10M
 rcbad	1	tls-record	-	10M
 t2ok	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
 t2wrong	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
+t2isolation	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
 t2bad	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
 finding	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
 crash-window	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
@@ -64,6 +65,9 @@ while IFS=$'\t' read -r family _ target; do
   printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-tls-record-fuzz","filter":"%s","budget_mutations":10000000,"status":"pass"}\n' "$SHA" "$target" >> "$E/full/manifest.jsonl"
 done < "$E/targets.tsv"
 campaign_675_row_passed "$E" full 1 tls-record; check "complete family row passes" 0 $?
+# shellcheck disable=SC2329 # completion intentionally must not call this moving mapping
+campaign_675_family_step() { echo moving-controller-step; }
+campaign_675_row_passed "$E" full 1 tls-record; check "frozen registry step survives a controller mapping change" 0 $?
 printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-tls-record-fuzz","filter":"fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption","budget_mutations":10000000,"status":"interrupted"}\n' "$SHA" >> "$E/full/manifest.jsonl"
 campaign_675_row_passed "$E" full 1 tls-record; check "old interrupted evidence does not poison a canonical pass" 0 $?
 
@@ -81,6 +85,16 @@ printf '0\n' > "$E/t2ok/attempts/retry/collect.rc"
 printf 'remote_exit_code=0\n' > "$E/t2ok/attempts/retry/guest-state.env"
 printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/t2ok/attempts/retry/manifest.jsonl"
 campaign_675_row_passed "$E" t2ok 2 quic; check "interrupted attempt then fresh matching pass completes the row" 0 $?
+
+# A marker on an older attempt must never certify a child manifest that has
+# been extracted but not durably collected.
+mkrow t2isolation 130 interrupted
+mkdir -p "$E/t2isolation/attempts/uncollected"
+printf 'remote_exit_code=1\n' > "$E/t2isolation/attempts/uncollected/guest-state.env"
+printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"fail","preservation_status":"ok"}\n' "$SHA" > "$E/t2isolation/attempts/uncollected/manifest.jsonl"
+if [[ "$(campaign_675_row_disposition "$E" t2isolation 2 quic)" == interrupted ]]; then check "uncollected child finding is not durable" 0 0; else check "uncollected child finding is not durable" 0 1; fi
+printf '0\n' > "$E/t2isolation/attempts/uncollected/collect.rc"
+if [[ "$(campaign_675_row_disposition "$E" t2isolation 2 quic)" == pending_finding ]]; then check "durably collected child finding requires triage" 0 0; else check "durably collected child finding requires triage" 0 1; fi
 mkrow t2wrong 0 pass
 sed -i.bak "s/\"source_commit_sha\":\"$SHA\"/\"source_commit_sha\":\"2222222222222222222222222222222222222222\"/" "$E/t2wrong/manifest.jsonl"; rm -f "$E/t2wrong/manifest.jsonl.bak"
 campaign_675_row_passed "$E" t2wrong 2 quic; check "wrong release SHA cannot satisfy a row" 1 $?
@@ -123,6 +137,11 @@ campaign_675_row_passed "$E" crash-window 2 quic; check "recovered crash-window 
 
 mkrow finding 2 fail
 if [[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == pending_finding ]]; then check "untriaged finding halts the campaign" 0 0; else check "untriaged finding halts the campaign" 0 1; fi
+mkdir -p "$E/finding/attempts/later-pass"
+printf '0\n' > "$E/finding/attempts/later-pass/collect.rc"
+printf 'remote_exit_code=0\n' > "$E/finding/attempts/later-pass/guest-state.env"
+printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/finding/attempts/later-pass/manifest.jsonl"
+if [[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == pending_finding ]]; then check "later pass cannot erase a durable finding" 0 0; else check "later pass cannot erase a durable finding" 0 1; fi
 printf 'DISPOSITION=dispositioned_finding\nISSUE=#776\nFIX_COMMIT=deadbeef\nVERIFICATION=zig-build-test\n' > "$E/finding/disposition.env"
 if [[ "$(campaign_675_row_disposition "$E" finding 2 quic)" == dispositioned_finding ]]; then check "triaged finding is durably accounted" 0 0; else check "triaged finding is durably accounted" 0 1; fi
 printf 'DISPOSITION=dispositioned_finding\nISSUE=#675\nFIX_COMMIT=deadbeef\nVERIFICATION=zig-build-test\n' > "$E/finding/disposition.env"
@@ -145,6 +164,12 @@ echo
 source scripts/campaign-675-reseat.sh
 RELEASE_TMP="$TMP/release"
 mkdir -p "$RELEASE_TMP"
+mkdir -p "$RELEASE_TMP/source/scripts"
+cat > "$RELEASE_TMP/source/scripts/run-fuzz-campaign.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'quic\ttest-release-quic\tfuzz: packet parser preserves bounded slice and progress invariants\tsrc/quic/packet.zig:1\n'
+EOF
+chmod +x "$RELEASE_TMP/source/scripts/run-fuzz-campaign.sh"
 RELEASE_PLAN=$'row_id\ttier\tfamily\ttarget\tbudget\nrelease-smoke\t2\tquic\tfuzz: packet parser preserves bounded slice and progress invariants\t50M\n'
 RELEASE_TARGETS=$'1111111111111111111111111111111111111111:src/quic/packet.zig:1:test "fuzz: packet parser preserves bounded slice and progress invariants" {\n'
 printf 'row_id\ttier\tfamily\ttarget\tbudget\ncontroller-only\t2\tquic\tfuzz: different controller target\t1K\n' > "$RELEASE_TMP/rows.tsv"
@@ -176,6 +201,9 @@ git() {
     show)
       [[ "$ref" == "$MOCK_SHA:scripts/campaign-675-rows.tsv" ]] || return 1
       printf '%s' "$RELEASE_PLAN"
+      ;;
+    archive)
+      tar -C "$RELEASE_TMP/source" -cf - .
       ;;
     grep)
       printf '%s' "$RELEASE_TARGETS"

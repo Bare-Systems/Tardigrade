@@ -118,13 +118,13 @@ for line in "${QUEUE[@]}"; do
       say "COLLECT $rid (attempt $attempt)"
       scripts/run-proxmox-fuzz-campaign.sh --collect --out-dir "$row_dir" >>"$LOG" 2>&1
       if campaign_675_row_collected "$row_dir"; then break; fi
-      # Distinguish "row genuinely did not pass" from "collection did not happen".
-      if find "$row_dir" -name manifest.jsonl -print -quit 2>/dev/null | grep -q .; then
-        say "collected evidence lacks a durable result - not retrying"; break
-      fi
-      say "collection produced no manifest; retrying in 120s"
+      say "collection is not durable; retrying this exact attempt in 120s"
       sleep 120
     done
+  fi
+  if ! campaign_675_row_collected "$row_dir"; then
+    say "collection not durable for $rid; preserving current-attempt for resume"
+    exit 1
   fi
   [[ -f "$current_attempt" && "$(cat "$current_attempt")" == "$row_dir" ]] && rm -f "$current_attempt"
   runs="$(find "$E/$rid" -name stderr.log -exec grep -ho 'Runs: [0-9]* -> [0-9]*' {} \; 2>/dev/null | tail -1)"

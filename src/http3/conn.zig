@@ -2805,8 +2805,27 @@ test "fuzz: H3 connection state command sequences preserve critical stream and r
 fn fuzzH3ConnStateCommands(_: void, smith: *testing.Smith) !void {
     var input: [192]u8 = undefined;
     const len = smith.slice(&input);
-    try runH3ConnStateCommands(input[0..len], .server);
-    try runH3ConnStateCommands(input[0..len], .client);
+    // Leak-checked allocator WITHOUT stack-trace capture.
+    //
+    // `std.testing.allocator` records a 10-frame stack trace on every alloc and
+    // free, walking DWARF unwind tables each time. Profiling this target showed
+    // that unwinding consumed ~90% of the fuzz thread; the H3 code under test
+    // got the remaining ~10%, which is why a 50M row took ~23h. Leak detection
+    // is what #675 needs from the allocator and is kept: every allocation made
+    // for this input must be freed, checked explicitly below. Stack traces only
+    // aid diagnosis, and a leaking input replays deterministically under
+    // `std.testing.allocator` for that.
+    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    const allocator = gpa.allocator();
+    runH3ConnStateCommands(allocator, input[0..len], .server) catch |err| {
+        gpa.deinitWithoutLeakChecks();
+        return err;
+    };
+    runH3ConnStateCommands(allocator, input[0..len], .client) catch |err| {
+        gpa.deinitWithoutLeakChecks();
+        return err;
+    };
+    if (gpa.deinit() == .leak) return error.TestUnexpectedResult;
 }
 
 /// Op 21's bookkeeping: reset the tracked peer request stream and forget its
@@ -2904,8 +2923,7 @@ fn expectPendingUniMatchesModel(conn: anytype, model: *const ModelPendingUni) !v
     for (model.ids[0..model.len]) |id| try testing.expect(conn.pending_uni.contains(id));
 }
 
-fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
-    const allocator = testing.allocator;
+fn runH3ConnStateCommands(allocator: std.mem.Allocator, input: []const u8, role: Role) !void {
     var peer_transport = MockTransport.init(allocator, role == .server);
     defer peer_transport.deinit();
     var local_transport = MockTransport.init(allocator, role == .client);
@@ -3767,8 +3785,8 @@ test "H3 conn-state fuzz model accepts a ceiling-tripping op sequence" {
     // and every assertion inside it execute. A false positive in that branch
     // fails here, deterministically, in milliseconds.
     const input = [_]u8{3} ** 16;
-    try runH3ConnStateCommands(&input, .server);
-    try runH3ConnStateCommands(&input, .client);
+    try runH3ConnStateCommands(testing.allocator, &input, .server);
+    try runH3ConnStateCommands(testing.allocator, &input, .client);
 }
 
 test "H3 conn-state ceiling oracle rejects SUT-only occupancy" {
@@ -3787,8 +3805,8 @@ test "H3 conn-state ceiling oracle rejects SUT-only occupancy" {
 
 test "H3 conn-state model tracks finished and reset-before-accept uni streams" {
     const input = [_]u8{ 25, 26 } ** 8;
-    try runH3ConnStateCommands(&input, .server);
-    try runH3ConnStateCommands(&input, .client);
+    try runH3ConnStateCommands(testing.allocator, &input, .server);
+    try runH3ConnStateCommands(testing.allocator, &input, .client);
 }
 
 test "H3 conn: pending uni streams past max_pending_uni close with excessive load" {

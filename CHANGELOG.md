@@ -131,6 +131,19 @@ All notable user-facing changes to Tardigrade are documented here.
   first acceptance, and caps retained peer unidirectional-stream state with
   `H3_EXCESSIVE_LOAD`.
 
+- **QUIC stream reassembly resists fragmented-input CPU and final-size attacks
+  (#741, #749)** — per-stream out-of-order receive state now caps disjoint
+  segments at 256, preventing a peer from growing the repeated-scan
+  reassembly path into an O(n²) CPU denial of service. A STREAM FIN that
+  undercuts already buffered out-of-order bytes is also rejected rather than
+  resurrecting an invalid smaller final size.
+
+- **TLS queue discard is now amortized O(1) without retaining stale plaintext
+  copies (#741)** — `ByteQueue` and `PlaintextProvenanceQueue` advance a lazy
+  read prefix instead of shifting every remaining byte on each discard.
+  Subsequent compaction securely wipes the obsolete plaintext duplicate before
+  reusing its backing storage.
+
 - **HTTP/3/QPACK protocol validation now handles fragmented and malformed peer
   input without ambiguous state (#775)** — QPACK dynamic references fail when
   capacity is zero; fragmented unidirectional stream-type prefixes retain

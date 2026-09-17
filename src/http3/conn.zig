@@ -358,6 +358,7 @@ pub fn Conn(comptime Transport: type) type {
         const ClientResponse = struct {
             buffer: std.ArrayList(u8) = .empty,
             fin: bool = false,
+            request_is_head: bool = false,
             fields: [64]qpack.HeaderField = undefined,
             scratch: [4096]u8 = undefined,
         };
@@ -1085,12 +1086,16 @@ pub fn Conn(comptime Transport: type) type {
             }
 
             const response = self.allocator.create(ClientResponse) catch return error.OutOfMemory;
-            response.* = .{};
+            response.* = .{ .request_is_head = std.mem.eql(u8, request.method, "HEAD") };
             self.responses.put(id, response) catch {
                 self.allocator.destroy(response);
                 return error.OutOfMemory;
             };
             return id;
+        }
+
+        fn responseAllowsContent(status: u16, request_is_head: bool) bool {
+            return !request_is_head and status != 204 and status != 205 and status != 304;
         }
 
         /// Decode the response once the peer has finished the stream.
@@ -1106,32 +1111,56 @@ pub fn Conn(comptime Transport: type) type {
             var field_count: usize = 0;
             var body_start: usize = 0;
             var body_len: usize = 0;
+            var declared_content_length: ?usize = null;
+            const ResponsePhase = enum { interim, final_headers, body, trailers };
+            var phase: ResponsePhase = .interim;
+            // Trailers are deliberately decoded into independent storage:
+            // `response.fields` and `response.scratch` back the final header
+            // fields returned to the caller.
+            var trailer_fields: [64]qpack.HeaderField = undefined;
+            var trailer_scratch: [4096]u8 = undefined;
             while (offset < response.buffer.items.len) {
                 const raw = frame.decodeFrameWithLimit(response.buffer.items[offset..], max_response_len) catch return self.fail(.frame_error);
                 switch (raw.typ) {
                     .headers => {
-                        var scratch: []u8 = &response.scratch;
-                        field_count = qpack.decode(raw.payload, &response.fields, scratch[0..]) catch {
-                            self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .malformed = .{ .frame_type = raw.typ, .frame_type_value = raw.type_value, .raw_length = raw.len } } } });
-                            return self.fail(.qpack_decompression_failed);
-                        };
-                        self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .headers = .{ .fields = response.fields[0..field_count], .raw_length = raw.len } } } });
-                        if (status != null) return self.fail(.message_error);
-                        const decoded_status = session.validateResponseHeaders(response.fields[0..field_count]) catch return self.fail(.message_error);
-                        // RFC 9114 section 4.1 permits zero or more
-                        // informational responses before the final response.
-                        // 101 is specific to HTTP/1.1 Upgrade and is not valid
-                        // in HTTP/3 (RFC 9114 section 4.5).
-                        if (decoded_status == 101) return self.fail(.message_error);
-                        if (decoded_status < 200) {
-                            field_count = 0;
-                        } else {
-                            status = decoded_status;
+                        switch (phase) {
+                            .interim => {
+                                field_count = qpack.decode(raw.payload, &response.fields, response.scratch[0..]) catch {
+                                    self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .malformed = .{ .frame_type = raw.typ, .frame_type_value = raw.type_value, .raw_length = raw.len } } } });
+                                    return self.fail(.qpack_decompression_failed);
+                                };
+                                self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .headers = .{ .fields = response.fields[0..field_count], .raw_length = raw.len } } } });
+                                const validated = session.validateResponseHeaders(response.fields[0..field_count]) catch return self.fail(.message_error);
+                                // RFC 9114 section 4.1 permits zero or more
+                                // informational responses before the final response.
+                                // 101 is specific to HTTP/1.1 Upgrade and is not valid
+                                // in HTTP/3 (RFC 9114 section 4.5).
+                                if (validated.status == 101) return self.fail(.message_error);
+                                if (validated.status < 200) {
+                                    field_count = 0;
+                                } else {
+                                    status = validated.status;
+                                    declared_content_length = validated.content_length;
+                                    phase = .final_headers;
+                                }
+                            },
+                            .final_headers, .body => {
+                                const trailer_count = qpack.decode(raw.payload, &trailer_fields, trailer_scratch[0..]) catch {
+                                    self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .malformed = .{ .frame_type = raw.typ, .frame_type_value = raw.type_value, .raw_length = raw.len } } } });
+                                    return self.fail(.qpack_decompression_failed);
+                                };
+                                self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .headers = .{ .fields = trailer_fields[0..trailer_count], .raw_length = raw.len } } } });
+                                session.validateResponseTrailers(trailer_fields[0..trailer_count]) catch return self.fail(.message_error);
+                                phase = .trailers;
+                            },
+                            .trailers => return self.fail(.frame_unexpected),
                         }
                     },
                     .data => {
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .data = .{ .raw_length = raw.len } } } });
                         if (status == null) return self.fail(.frame_unexpected);
+                        if (phase == .trailers) return self.fail(.frame_unexpected);
+                        if (!responseAllowsContent(status.?, response.request_is_head) and raw.payload.len > 0) return self.fail(.message_error);
                         if (body_len == 0) {
                             body_start = offset + (raw.len - raw.payload.len);
                         }
@@ -1145,6 +1174,7 @@ pub fn Conn(comptime Transport: type) type {
                             );
                         }
                         body_len += raw.payload.len;
+                        phase = .body;
                     },
                     .priority_update_request, .priority_update_push => {
                         var event_scratch = EventDecodeScratch{};
@@ -1159,6 +1189,11 @@ pub fn Conn(comptime Transport: type) type {
                 offset += raw.len;
             }
             const final_status = status orelse return self.fail(.message_error);
+            if (declared_content_length) |declared| {
+                if (responseAllowsContent(final_status, response.request_is_head) and declared != body_len) {
+                    return self.fail(.message_error);
+                }
+            }
             self.metrics.responses_decoded += 1;
             return .{
                 .status = final_status,
@@ -2128,6 +2163,173 @@ test "H3 conn: client accepts informational responses before the final response"
     const response = (try client.pollResponse(id)).?;
     try testing.expectEqual(@as(u16, 200), response.status);
     try testing.expectEqualStrings("content-type", response.headers[0].name);
+    try testing.expectEqual(@as(?ErrorCode, null), client.close_code);
+}
+
+test "H3 conn: client accepts trailers after an informational and final response" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/trailers" });
+    var wire: [1024]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(103, &.{
+        .{ .name = "link", .value = "</style.css>; rel=preload" },
+    }, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{
+        .{ .name = "content-type", .value = "text/plain" },
+    }, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeData("body", wire[len..])).len;
+    var trailer_block_buf: [128]u8 = undefined;
+    const trailer_block = try qpack.encode(&.{.{ .name = "x-checksum", .value = "ok" }}, &trailer_block_buf);
+    len += (try frame.encodeKnownFrame(.headers, trailer_block, wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    const response = (try client.pollResponse(id)).?;
+    try testing.expectEqual(@as(u16, 200), response.status);
+    try testing.expectEqualStrings("content-type", response.headers[0].name);
+    try testing.expectEqualStrings("body", response.body);
+    try testing.expectEqual(@as(?ErrorCode, null), client.close_code);
+}
+
+test "H3 conn: client rejects a second response trailer section" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/second-trailer" });
+    var wire: [512]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+    var trailer_block_buf: [128]u8 = undefined;
+    const trailer_block = try qpack.encode(&.{.{ .name = "x-checksum", .value = "ok" }}, &trailer_block_buf);
+    len += (try frame.encodeKnownFrame(.headers, trailer_block, wire[len..])).len;
+    len += (try frame.encodeKnownFrame(.headers, trailer_block, wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.frame_unexpected, client.close_code.?);
+}
+
+test "H3 conn: client rejects DATA after response trailers" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/data-after-trailer" });
+    var wire: [512]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+    var trailer_block_buf: [128]u8 = undefined;
+    const trailer_block = try qpack.encode(&.{.{ .name = "x-checksum", .value = "ok" }}, &trailer_block_buf);
+    len += (try frame.encodeKnownFrame(.headers, trailer_block, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeData("body", wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.frame_unexpected, client.close_code.?);
+}
+
+test "H3 conn: client enforces response content-length after the final body" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/short-content-length" });
+    var wire: [256]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{.{ .name = "content-length", .value = "4" }}, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeData("cat", wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
+}
+
+test "H3 conn: client rejects a response body longer than content-length" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/long-content-length" });
+    var wire: [256]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{.{ .name = "content-length", .value = "2" }}, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeData("cat", wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
+}
+
+test "H3 conn: client permits content-length on a no-content response" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/no-content" });
+    var wire: [128]u8 = undefined;
+    const headers = try session.ResponseEncoder.encodeHeaders(204, &.{.{ .name = "content-length", .value = "10" }}, &wire);
+    _ = try server_transport.writeStream(id, headers, true);
+    try client.pump(&client_transport);
+
+    const response = (try client.pollResponse(id)).?;
+    try testing.expectEqual(@as(u16, 204), response.status);
+    try testing.expectEqual(@as(usize, 0), response.body.len);
     try testing.expectEqual(@as(?ErrorCode, null), client.close_code);
 }
 

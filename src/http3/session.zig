@@ -387,13 +387,18 @@ pub const ResponseEncoder = struct {
     }
 };
 
+pub const ResponseHeaderValidation = struct {
+    status: u16,
+    content_length: ?usize,
+};
+
 /// Validate the initial field section of a response before the client makes
 /// it visible to the application. HTTP/3 response pseudo-fields contain
 /// exactly one `:status`, followed by lowercase regular fields.
-pub fn validateResponseHeaders(fields: []const qpack.HeaderField) SessionError!u16 {
+pub fn validateResponseHeaders(fields: []const qpack.HeaderField) SessionError!ResponseHeaderValidation {
     var status: ?u16 = null;
     var regular_seen = false;
-    var content_length_seen = false;
+    var content_length: ?usize = null;
     for (fields) |field| {
         if (field.name.len > 0 and field.name[0] == ':') {
             if (regular_seen) return error.PseudoHeaderAfterRegularHeader;
@@ -408,14 +413,32 @@ pub fn validateResponseHeaders(fields: []const qpack.HeaderField) SessionError!u
 
         regular_seen = true;
         if (!validH3HeaderName(field.name) or !validH3HeaderValue(field.value)) return error.InvalidHeader;
-        if (h3ConnectionSpecificHeader(field.name, field.value)) return error.InvalidHeader;
+        // RFC 9114 section 4.2 permits `te: trailers` only in requests.
+        // Responses reject every TE field alongside the other connection-
+        // specific HTTP/1 fields.
+        if (std.mem.eql(u8, field.name, "te") or h3ConnectionSpecificHeader(field.name, field.value)) return error.InvalidHeader;
         if (std.mem.eql(u8, field.name, "content-length")) {
-            if (content_length_seen) return error.InvalidContentLength;
-            _ = std.fmt.parseInt(usize, field.value, 10) catch return error.InvalidContentLength;
-            content_length_seen = true;
+            if (content_length != null) return error.InvalidContentLength;
+            content_length = std.fmt.parseInt(usize, field.value, 10) catch return error.InvalidContentLength;
         }
     }
-    return status orelse error.MissingRequiredPseudoHeader;
+    return .{
+        .status = status orelse return error.MissingRequiredPseudoHeader,
+        .content_length = content_length,
+    };
+}
+
+/// Validate a response trailer field section. Trailers must not contain
+/// pseudo-fields or connection-specific framing fields, and they cannot alter
+/// the message's already-established content length.
+pub fn validateResponseTrailers(fields: []const qpack.HeaderField) SessionError!void {
+    for (fields) |field| {
+        if (field.name.len > 0 and field.name[0] == ':') return error.InvalidPseudoHeader;
+        if (!validH3HeaderName(field.name) or !validH3HeaderValue(field.value)) return error.InvalidHeader;
+        if (std.mem.eql(u8, field.name, "content-length") or
+            std.mem.eql(u8, field.name, "te") or
+            h3ConnectionSpecificHeader(field.name, field.value)) return error.InvalidHeader;
+    }
 }
 
 fn formatStatus(status: u16, buf: *[3]u8) SessionError![]const u8 {
@@ -453,10 +476,13 @@ const ParsedFrameRecorder = struct {
 };
 
 test "response headers reject malformed status and field semantics" {
-    try testing.expectEqual(@as(u16, 200), try validateResponseHeaders(&.{
+    const valid = try validateResponseHeaders(&.{
         .{ .name = ":status", .value = "200" },
         .{ .name = "content-type", .value = "text/plain" },
-    }));
+        .{ .name = "content-length", .value = "3" },
+    });
+    try testing.expectEqual(@as(u16, 200), valid.status);
+    try testing.expectEqual(@as(?usize, 3), valid.content_length);
     try testing.expectError(error.InvalidStatus, validateResponseHeaders(&.{
         .{ .name = ":status", .value = "600" },
     }));
@@ -467,6 +493,13 @@ test "response headers reject malformed status and field semantics" {
     try testing.expectError(error.InvalidHeader, validateResponseHeaders(&.{
         .{ .name = ":status", .value = "200" },
         .{ .name = "Connection", .value = "close" },
+    }));
+    try testing.expectError(error.InvalidHeader, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "te", .value = "trailers" },
+    }));
+    try testing.expectError(error.InvalidPseudoHeader, validateResponseTrailers(&.{
+        .{ .name = ":status", .value = "200" },
     }));
 
     var wire: [64]u8 = undefined;

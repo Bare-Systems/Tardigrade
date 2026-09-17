@@ -2448,7 +2448,7 @@ test "H3 conn: client rejects PUSH_PROMISE while push is disabled" {
     var wire: [128]u8 = undefined;
     var len: usize = 0;
     len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
-    len += (try frame.encodeKnownFrame(.push_promise, &.{}, wire[len..])).len;
+    len += (try frame.encodeKnownFrame(.push_promise, &.{0}, wire[len..])).len;
     _ = try server_transport.writeStream(id, wire[0..len], true);
     try client.pump(&client_transport);
 
@@ -3357,7 +3357,7 @@ test "H3 conn: FIN without request headers fails before application polling" {
     const request_id = try client_transport.openStream(.bidi);
     _ = try client_transport.writeStream(request_id, "", true);
     try testing.expectError(error.ProtocolError, server.pump(&server_transport));
-    try testing.expectEqual(ErrorCode.message_error, server.close_code.?);
+    try testing.expectEqual(ErrorCode.request_incomplete, server.close_code.?);
 }
 
 test "H3 conn: request stream reset cleanup handles default concurrency" {
@@ -3806,7 +3806,7 @@ fn runH3ConnStateCommandsWithAllocator(input: []const u8, role: Role, allocator:
             },
             15 => blk: {
                 if (role == .server) {
-                    if (peer_request == null) expected_close = .message_error;
+                    if (peer_request == null) expected_close = .request_incomplete;
                     const id = peer_request orelse try peer_transport.openStream(.bidi);
                     peer_request = id;
                     const s = try local_transport.stream(id);

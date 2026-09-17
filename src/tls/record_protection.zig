@@ -826,10 +826,10 @@ fn expectFailedOpen(
 
     if (zeroes_attempted_span) {
         const ciphertext_len = record.payload.len - read.keys.profile.aead.tagLength();
-        try std.testing.expect(allEqualUninstrumented(u8, out[0..ciphertext_len], 0));
-        try std.testing.expect(allEqualUninstrumented(u8, out[ciphertext_len..], fuzz_protection_sentinel));
+        try std.testing.expect(allEqualBytesUninstrumented(out[0..ciphertext_len], 0));
+        try std.testing.expect(allEqualBytesUninstrumented(out[ciphertext_len..], fuzz_protection_sentinel));
     } else {
-        try std.testing.expect(allEqualUninstrumented(u8, out, fuzz_protection_sentinel));
+        try std.testing.expect(allEqualBytesUninstrumented(out, fuzz_protection_sentinel));
     }
 }
 
@@ -838,10 +838,10 @@ fn expectFailedOpen(
 /// `@disableInstrumentation` removes coverage callbacks, but Zig deliberately
 /// keeps `std.mem.allEqual` scalar in fuzz builds. Use an explicit vector loop
 /// so these scans do not dominate sustained fuzzing.
-fn allEqualUninstrumented(comptime T: type, slice: []const T, scalar: T) bool {
+fn allEqualBytesUninstrumented(slice: []const u8, scalar: u8) bool {
     @disableInstrumentation();
     const lanes = 32;
-    const V = @Vector(lanes, T);
+    const V = @Vector(lanes, u8);
     const splat: V = @splat(scalar);
     var i: usize = 0;
     while (i + lanes <= slice.len) : (i += lanes) {
@@ -857,14 +857,14 @@ fn allEqualUninstrumented(comptime T: type, slice: []const T, scalar: T) bool {
 test "record protection bulk equality oracle checks vector body and scalar tail" {
     const sentinel = fuzz_protection_sentinel;
     var bytes: [35]u8 = @splat(sentinel);
-    try std.testing.expect(allEqualUninstrumented(u8, &bytes, sentinel));
+    try std.testing.expect(allEqualBytesUninstrumented(&bytes, sentinel));
 
     bytes[0] ^= 1;
-    try std.testing.expect(!allEqualUninstrumented(u8, &bytes, sentinel));
+    try std.testing.expect(!allEqualBytesUninstrumented(&bytes, sentinel));
     bytes[0] = sentinel;
 
     bytes[bytes.len - 1] ^= 1;
-    try std.testing.expect(!allEqualUninstrumented(u8, &bytes, sentinel));
+    try std.testing.expect(!allEqualBytesUninstrumented(&bytes, sentinel));
 }
 
 test "fuzz: TLS record: protection tamper and sequence boundaries preserve authentication state" {
@@ -1014,14 +1014,14 @@ fn fuzzProtectionInput(_: void, smith: *std.testing.Smith) !void {
             // A rejected seal is transactional: no sequence advance and not
             // one byte written to the caller's buffer.
             try std.testing.expectEqual(initial_sequence, write.sequence);
-            try std.testing.expect(allEqualUninstrumented(u8, out, fuzz_protection_sentinel));
+            try std.testing.expect(allEqualBytesUninstrumented(out, fuzz_protection_sentinel));
         },
         .ok => |ok| {
             const record = try write.seal(content_type, content_buf[0..content_len], padding_len, out);
             try std.testing.expectEqual(ok.record_len, record.len);
             try std.testing.expect(withinRange(out, record));
             // Bytes past the sealed record must still be untouched.
-            try std.testing.expect(allEqualUninstrumented(u8, out[record.len..], fuzz_protection_sentinel));
+            try std.testing.expect(allEqualBytesUninstrumented(out[record.len..], fuzz_protection_sentinel));
 
             // The header the AEAD authenticated as associated data must be
             // exactly the serialized record header, re-derived here rather

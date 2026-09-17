@@ -234,7 +234,11 @@ pub const RequestStream = struct {
         try self.headers.append(self.allocator, .{ .name = owned_name, .value = owned_value });
     }
 
-    pub fn finish(self: *RequestStream) SessionError!stream_transport.Exchange {
+    /// Validate all properties that only become final once the request stream
+    /// reaches FIN. This does not consume or finalize the exchange, so the H3
+    /// connection can reject a malformed completed request immediately while
+    /// leaving `finish` to transfer the borrowed request to the application.
+    pub fn validateComplete(self: *const RequestStream) SessionError!void {
         if (self.pending.items.len != 0 or !self.saw_headers) return error.MissingRequiredPseudoHeader;
         const method = self.method orelse return error.MissingRequiredPseudoHeader;
         const scheme = self.scheme orelse return error.MissingRequiredPseudoHeader;
@@ -253,6 +257,14 @@ pub const RequestStream = struct {
                 if (declared != self.body.items.len) return error.InvalidContentLength;
             }
         }
+    }
+
+    pub fn finish(self: *RequestStream) SessionError!stream_transport.Exchange {
+        try self.validateComplete();
+        const method = self.method.?;
+        const scheme = self.scheme.?;
+        const authority = self.authority.?;
+        const path = self.path.?;
         self.finished = true;
         return .{
             .request = .{
@@ -267,7 +279,7 @@ pub const RequestStream = struct {
     }
 };
 
-fn validH3HeaderName(name: []const u8) bool {
+pub fn validH3HeaderName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |c| {
         // HTTP/3 field names are lowercase. This tchar subset also rejects
@@ -278,7 +290,7 @@ fn validH3HeaderName(name: []const u8) bool {
     return true;
 }
 
-fn validH3HeaderValue(value: []const u8) bool {
+pub fn validH3HeaderValue(value: []const u8) bool {
     for (value) |c| {
         if ((c < 0x20 and c != '\t') or c == 0x7f) return false;
     }
@@ -324,7 +336,7 @@ fn validH3Authority(authority: []const u8) bool {
     return true;
 }
 
-fn h3ConnectionSpecificHeader(name: []const u8, value: []const u8) bool {
+pub fn h3ConnectionSpecificHeader(name: []const u8, value: []const u8) bool {
     if (std.mem.eql(u8, name, "connection") or
         std.mem.eql(u8, name, "proxy-connection") or
         std.mem.eql(u8, name, "keep-alive") or
@@ -375,8 +387,39 @@ pub const ResponseEncoder = struct {
     }
 };
 
+/// Validate the initial field section of a response before the client makes
+/// it visible to the application. HTTP/3 response pseudo-fields contain
+/// exactly one `:status`, followed by lowercase regular fields.
+pub fn validateResponseHeaders(fields: []const qpack.HeaderField) SessionError!u16 {
+    var status: ?u16 = null;
+    var regular_seen = false;
+    var content_length_seen = false;
+    for (fields) |field| {
+        if (field.name.len > 0 and field.name[0] == ':') {
+            if (regular_seen) return error.PseudoHeaderAfterRegularHeader;
+            if (!std.mem.eql(u8, field.name, ":status")) return error.InvalidPseudoHeader;
+            if (status != null) return error.DuplicatePseudoHeader;
+            if (field.value.len != 3) return error.InvalidStatus;
+            const parsed = std.fmt.parseInt(u16, field.value, 10) catch return error.InvalidStatus;
+            if (parsed < 100 or parsed > 599) return error.InvalidStatus;
+            status = parsed;
+            continue;
+        }
+
+        regular_seen = true;
+        if (!validH3HeaderName(field.name) or !validH3HeaderValue(field.value)) return error.InvalidHeader;
+        if (h3ConnectionSpecificHeader(field.name, field.value)) return error.InvalidHeader;
+        if (std.mem.eql(u8, field.name, "content-length")) {
+            if (content_length_seen) return error.InvalidContentLength;
+            _ = std.fmt.parseInt(usize, field.value, 10) catch return error.InvalidContentLength;
+            content_length_seen = true;
+        }
+    }
+    return status orelse error.MissingRequiredPseudoHeader;
+}
+
 fn formatStatus(status: u16, buf: *[3]u8) SessionError![]const u8 {
-    if (status < 100 or status > 999) return error.InvalidStatus;
+    if (status < 100 or status > 599) return error.InvalidStatus;
     _ = std.fmt.bufPrint(buf, "{d}", .{status}) catch return error.InvalidStatus;
     return buf[0..3];
 }
@@ -408,6 +451,27 @@ const ParsedFrameRecorder = struct {
         self.frames.append(testing.allocator, raw) catch unreachable;
     }
 };
+
+test "response headers reject malformed status and field semantics" {
+    try testing.expectEqual(@as(u16, 200), try validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/plain" },
+    }));
+    try testing.expectError(error.InvalidStatus, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "600" },
+    }));
+    try testing.expectError(error.InvalidPseudoHeader, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = ":method", .value = "GET" },
+    }));
+    try testing.expectError(error.InvalidHeader, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "Connection", .value = "close" },
+    }));
+
+    var wire: [64]u8 = undefined;
+    try testing.expectError(error.InvalidStatus, ResponseEncoder.encodeHeaders(600, &.{}, &wire));
+}
 
 test "request stream maps HEADERS and DATA onto stream_transport Exchange" {
     const allocator = testing.allocator;

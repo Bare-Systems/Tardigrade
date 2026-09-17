@@ -35,6 +35,13 @@ external peers out of these loops; ngtcp2/nghttp3, quiche, and aioquic remain un
 
 ## Fuzz-process memory: a large macOS-only footprint
 
+> **Current H3 conn-state target:** FINDING F19 replaced its direct use of
+> `std.testing.allocator` with a target-local `DebugAllocator` that keeps
+> safety and per-input leak checks enabled but disables allocation stack-trace
+> capture. The measurements below document the pre-F19 behavior and explain
+> historical campaign outcomes; they no longer describe the target's current
+> macOS RSS or throughput.
+
 **The command-sequence targets' large memory footprint is specific to macOS.**
 On a Linux guest the same target is tiny. Measured, rather than assumed, after
 an earlier revision of this section wrongly generalised the macOS number:
@@ -147,15 +154,28 @@ additional to #675's deterministic pre-campaign gate, which is about the source
 tree.
 
 **Do not substitute a non-instrumented allocator in the real campaign** to make
-a row fit. The leak detection is the point; see below.
+a row fit. The target-local allocator remains instrumented and checks every
+input for leaks; only diagnostic stack capture is disabled during fuzzing.
 
-The footprint is **stable, not monotonic** — the ramp to ~1.9 GB is a cold-corpus
-warm-up transient, after which RSS oscillates in a band (90-480 MB observed) with
-no upward trend in its floor. There is no leak here to fix, and the leak
-detection that costs this memory is deliberately kept: #675 counts "allocator
-growth attributable to bounded command-sequence targets" as a real finding
-class, so substituting a non-instrumented allocator to save memory would blind
-the campaign to exactly the defects it is looking for.
+The historical footprint was **stable, not monotonic** — the ramp to ~1.9 GB
+was a cold-corpus warm-up transient, after which RSS oscillated in a band
+(90-480 MB observed) with no upward trend in its floor. The cost was the ten
+stack frames captured on every allocation by `std.testing.allocator`, not leak
+detection itself. F19 separates those concerns: `DebugAllocator` safety and
+`deinit()` leak checks remain enabled per fuzz input, while stack capture is
+zero. A deliberately leaked byte still terminated the target as a leak.
+
+Measured on the same macOS host and H3 target after F19:
+
+| budget | fuzz process time | fuzz process max RSS | effective rate |
+| --- | ---: | ---: | ---: |
+| 10K (pre-F19 control) | 19 s | 935 MB | ~580 exec/s |
+| 10K | 0.755 s | 3 MB | ~13,600 exec/s |
+| 100K | 5 s | 3 MB | ~20,200 exec/s |
+| 1M | ~60 s | 3 MB | ~16,700 exec/s |
+
+The compile processes still peak in the hundreds of MB; the 3 MB figure is
+the run artifact reported by the Zig build summary, not the compiler.
 
 Use `-Doptimize=ReleaseFast` for coverage-guided runs with Zig 0.16.0; the
 ordinary deterministic smoke tests continue to run in the default Debug mode.

@@ -918,6 +918,11 @@ pub const DecoderStream = struct {
             self.stream_cancellations = std.math.add(u64, self.stream_cancellations, 1) catch return error.IntegerOverflow;
         } else {
             const inc = decodeInteger(bytes[pos..], 6) catch |err| return if (err == error.TruncatedBlock) null else err;
+            // RFC 9204 section 4.4.3 forbids an Insert Count Increment of
+            // zero. Reject it in the shared instruction parser so callers do
+            // not need to infer whether a syntactically complete instruction
+            // made progress.
+            if (inc.value == 0) return error.MalformedInstruction;
             pos += inc.len;
             self.known_received_count = std.math.add(u64, self.known_received_count, inc.value) catch return error.IntegerOverflow;
         }
@@ -1506,6 +1511,13 @@ test "decoder stream rejects insert count overflow" {
     const encoded = try DecoderStream.encode(.{ .insert_count_increment = 1 }, &buf);
     var stream = DecoderStream{ .known_received_count = std.math.maxInt(u64) };
     try testing.expectError(error.IntegerOverflow, stream.apply(encoded));
+}
+
+test "decoder stream rejects a zero insert count increment" {
+    var buf: [16]u8 = undefined;
+    const encoded = try DecoderStream.encode(.{ .insert_count_increment = 0 }, &buf);
+    var stream = DecoderStream{};
+    try testing.expectError(error.MalformedInstruction, stream.apply(encoded));
 }
 
 test "decoder stream reader handles split varints" {

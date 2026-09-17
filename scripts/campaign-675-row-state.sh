@@ -24,9 +24,10 @@ campaign_675_budget_mutations() {
 # manifests are evidence, so a single matching PASS satisfies one frozen
 # target even if earlier attempts for that target were interrupted or failed.
 campaign_675_manifest_has_pass() {
-  local manifest="$1" sha="$2" step="$3" filter="$4" min_budget="$5"
+  local manifest="$1" release="$2" sha="$3" step="$4" filter="$5" min_budget="$6"
   [[ -f "$manifest" ]] || return 1
-  awk -v sha="$sha" -v step="$step" -v filter="$filter" -v min_budget="$min_budget" '
+  awk -v release="$release" -v sha="$sha" -v step="$step" -v filter="$filter" -v min_budget="$min_budget" '
+    $0 ~ "\"release_tag\":\"" release "\"" &&
     $0 ~ "\"source_commit_sha\":\"" sha "\"" &&
     $0 ~ "\"build_step\":\"" step "\"" &&
     $0 ~ "\"filter\":\"" filter "\"" &&
@@ -40,13 +41,29 @@ campaign_675_manifest_has_pass() {
   ' "$manifest"
 }
 
+campaign_675_manifest_is_collected() {
+  local row_dir="$1" manifest="$2" dir
+  dir="$(dirname "$manifest")"
+  while [[ "$dir" == "$row_dir" || "$dir" == "$row_dir"/* ]]; do
+    [[ "$(cat "$dir/collect.rc" 2>/dev/null || true)" == 0 ]] && return 0
+    [[ "$dir" == "$row_dir" ]] && break
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
 # A row is collected only after the collector has verified local artifacts and
 # atomically recorded the remote campaign exit code.  The guest state and
 # manifest make a stale or hand-written sidecar insufficient on its own.
 campaign_675_row_collected() {
   local row_dir="$1"
-  [[ -f "$row_dir/collect.rc" && -f "$row_dir/guest-state.env" ]] || return 1
-  find "$row_dir" -name manifest.jsonl -print -quit 2>/dev/null | grep -q .
+  local collect_file attempt_dir
+  while IFS= read -r collect_file; do
+    attempt_dir="$(dirname "$collect_file")"
+    [[ -f "$attempt_dir/guest-state.env" ]] || continue
+    find "$attempt_dir" -name manifest.jsonl -print -quit 2>/dev/null | grep -q . && return 0
+  done < <(find "$row_dir" -name collect.rc -type f -print 2>/dev/null)
+  return 1
 }
 
 campaign_675_write_collect_result() {
@@ -90,10 +107,8 @@ campaign_675_recover_collected_row() {
 # A row passes only when collection was durable and every target frozen in its
 # row plan has an existential matching PASS for this release identity.
 campaign_675_row_passed() {
-  local evidence_root="$1" rid="$2" tier="${3:-}" family="${4:-}" rc source_sha release_tag step budget target expected=() manifests=() matched
+  local evidence_root="$1" rid="$2" tier="${3:-}" family="${4:-}" source_sha release_tag step budget target expected=() manifests=() matched
   campaign_675_row_collected "$evidence_root/$rid" || return 1
-  rc="$(cat "$evidence_root/$rid/collect.rc" 2>/dev/null || echo missing)"
-  [[ "$rc" == "0" ]] || return 1
   source_sha="$(awk -F= '$1 == "SOURCE_SHA" { if (++n == 1) print $2 }' "$evidence_root/campaign.env")"
   release_tag="$(awk -F= '$1 == "RELEASE_TAG" { if (++n == 1) print $2 }' "$evidence_root/campaign.env")"
   [[ "$source_sha" =~ ^[0-9a-f]{40}$ && "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || return 1
@@ -102,7 +117,7 @@ campaign_675_row_passed() {
   [[ -n "$budget" ]] || return 1
   budget="$(campaign_675_budget_mutations "$budget")" || return 1
   if [[ "$tier" == "1" ]]; then
-    mapfile -t expected < <(awk -F '\t' -v f="$family" '$2 == "2" && $3 == f && $4 != "-" { print $4 }' "$evidence_root/rows.tsv" | sort -u)
+    mapfile -t expected < <(awk -F '\t' -v f="$family" '$1 == f { print $3 }' "$evidence_root/targets.tsv" | sort -u)
   else
     mapfile -t expected < <(awk -F '\t' -v r="$rid" '$1 == r && $4 != "-" { print $4 }' "$evidence_root/rows.tsv")
   fi
@@ -111,7 +126,8 @@ campaign_675_row_passed() {
   for target in "${expected[@]}"; do
     matched=false
     for manifest in "${manifests[@]}"; do
-      if campaign_675_manifest_has_pass "$manifest" "$source_sha" "$step" "$target" "$budget"; then matched=true; break; fi
+      if campaign_675_manifest_is_collected "$evidence_root/$rid" "$manifest" &&
+        campaign_675_manifest_has_pass "$manifest" "$release_tag" "$source_sha" "$step" "$target" "$budget"; then matched=true; break; fi
     done
     [[ "$matched" == true ]] || return 1
   done

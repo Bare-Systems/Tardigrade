@@ -64,13 +64,32 @@ for line in "${QUEUE[@]}"; do
     exit 2
   fi
 
+  row_root="$E/$rid"
+  row_dir="$row_root"
+  current_attempt="$row_root/current-attempt"
   collected=no
-  if campaign_675_row_collected "$E/$rid" || campaign_675_recover_collected_row "$E/$rid"; then
+  if [[ -f "$current_attempt" ]]; then
+    candidate="$(cat "$current_attempt")"
+    if [[ -f "$candidate/async.env" ]] && ! campaign_675_row_collected "$candidate"; then
+      row_dir="$candidate"
+      say "RESUME $rid (attempt $(basename "$row_dir") already launched) - waiting"
+    else
+      rm -f "$current_attempt"
+    fi
+  fi
+  if [[ "$row_dir" == "$row_root" ]] && (campaign_675_row_collected "$row_root" || campaign_675_recover_collected_row "$row_root"); then
     # Do not reattach to a remote stage that successful collection has already
     # removed. This also repairs rows from the old caller-side-marker window.
-    say "RECOVER $rid (verified local collection)"
-    collected=yes
-  elif [[ -f "$E/$rid/async.env" ]]; then
+    if [[ "$disposition" == interrupted ]]; then
+      row_dir="$row_root/attempts/$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
+      mkdir -p "$row_dir" || exit 1
+      printf '%s\n' "$row_dir" > "$current_attempt"
+      say "RETRY $rid (preserved interrupted evidence; new attempt $(basename "$row_dir"))"
+    else
+      say "RECOVER $rid (verified local collection)"
+      collected=yes
+    fi
+  elif [[ -f "$row_dir/async.env" ]]; then
     say "RESUME $rid (already launched) - waiting"
   else
     [[ -z "$budget" ]] && { say "FATAL malformed queue row: $rid (budget empty)"; exit 1; }
@@ -78,8 +97,9 @@ for line in "${QUEUE[@]}"; do
     args=(--start --target "$PVE" --bind "" --vm-image "$IMAGE"
           --vm-image-sha256 "$IMAGE_SHA" --zig-sha256 "$ZIG_SHA"
           --memory 6144 --vcpus 3 --tardigrade-ref "$SOURCE_SHA"
+          --release-tag "$RELEASE_TAG"
           --tier "$tier" --family "$family" --budget "$budget"
-          --watchdog "$(watchdog_for "$budget")" --out-dir "$E/$rid")
+          --watchdog "$(watchdog_for "$budget")" --out-dir "$row_dir")
     # rows.tsv uses "-" for a family-wide row: an EMPTY column cannot be used,
     # because TAB is an IFS whitespace char and `read` collapses adjacent tabs,
     # which silently shifted budget into target and broke every tier-1 row.
@@ -90,26 +110,31 @@ for line in "${QUEUE[@]}"; do
   fi
 
   if [[ "$collected" == no ]]; then
-    wait_for_row "$E/$rid" || { say "FATAL cannot wait on $rid - stopping"; exit 1; }
+    wait_for_row "$row_dir" || { say "FATAL cannot wait on $rid - stopping"; exit 1; }
     # Collect with retries. A transient SSH/network blip must NOT be mistaken for
     # a failed row: without this, one dropped packet during --collect halts the
     # whole campaign for however long nobody is watching.
     for attempt in 1 2 3 4 5; do
       say "COLLECT $rid (attempt $attempt)"
-      scripts/run-proxmox-fuzz-campaign.sh --collect --out-dir "$E/$rid" >>"$LOG" 2>&1
-      if campaign_675_row_collected "$E/$rid"; then break; fi
+      scripts/run-proxmox-fuzz-campaign.sh --collect --out-dir "$row_dir" >>"$LOG" 2>&1
+      if campaign_675_row_collected "$row_dir"; then break; fi
       # Distinguish "row genuinely did not pass" from "collection did not happen".
-      if find "$E/$rid" -name manifest.jsonl -print -quit 2>/dev/null | grep -q .; then
+      if find "$row_dir" -name manifest.jsonl -print -quit 2>/dev/null | grep -q .; then
         say "collected evidence lacks a durable result - not retrying"; break
       fi
       say "collection produced no manifest; retrying in 120s"
       sleep 120
     done
   fi
+  [[ -f "$current_attempt" && "$(cat "$current_attempt")" == "$row_dir" ]] && rm -f "$current_attempt"
   runs="$(find "$E/$rid" -name stderr.log -exec grep -ho 'Runs: [0-9]* -> [0-9]*' {} \; 2>/dev/null | tail -1)"
   if campaign_675_row_passed "$E" "$rid" "$tier" "$family"; then
     say "PASS $rid  ${runs:-<no Runs line>}"
   else
+    if [[ "$(campaign_675_row_disposition "$E" "$rid" "$tier" "$family")" == interrupted ]]; then
+      say "RETRY $rid after preserved interruption"
+      exec "$0" "$CAMPAIGN_STATE"
+    fi
     st="$(find "$E/$rid" -name manifest.jsonl -exec grep -ho '"status":"[a-z_]*"' {} \; 2>/dev/null | tail -1)"
     say "STOP: $rid did not pass (${st:-unknown}) ${runs:-}. Per #675 stop-on-finding, launching nothing further."
     say "Evidence left intact under $E/$rid. Triage required."

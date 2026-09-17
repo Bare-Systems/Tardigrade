@@ -20,6 +20,12 @@ crash-window	2	quic	fuzz: packet parser preserves bounded slice and progress inv
 t2-tls-21	2	tls-record	fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption	10M
 t2-tls-22	2	tls-record	fuzz: TLS record: encrypted stream cleanup preserves root errors across alerts and epoch transitions	10M
 EOF
+cat > "$E/targets.tsv" <<'EOF'
+quic	test-quic	fuzz: packet parser preserves bounded slice and progress invariants
+tls-record	test-tls-record-fuzz	fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption
+tls-record	test-tls-record-fuzz	fuzz: TLS record: encrypted stream cleanup preserves root errors across alerts and epoch transitions
+tls-record	test-tls-record-fuzz	fuzz: TLS record: Tier-1-only frozen target
+EOF
 # shellcheck source=/dev/null
 source scripts/campaign-675-row-state.sh
 watchdog_for() {
@@ -44,21 +50,21 @@ mkrow() { # rid rc records... (status records use the row's canonical identity)
   target="$(awk -F '\t' -v r="$rid" '$1 == r { print $4; exit }' "$E/rows.tsv")"
   budget="$(awk -F '\t' -v r="$rid" '$1 == r { print $5; exit }' "$E/rows.tsv")"
   case "$family" in quic) step=test-quic ;; tls-record) step=test-tls-record-fuzz ;; esac
-  for st in "$@"; do printf '{"source_commit_sha":"%s","build_step":"%s","filter":"%s","budget_mutations":%s,"status":"%s"}\n' "$SHA" "$step" "$target" "${budget/M/000000}" "$st" >> "$E/$rid/manifest.jsonl"; done
+  for st in "$@"; do printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"%s","filter":"%s","budget_mutations":%s,"status":"%s"}\n' "$SHA" "$step" "$target" "${budget/M/000000}" "$st" >> "$E/$rid/manifest.jsonl"; done
 }
 
 # THE REGRESSION: family row, 3 targets passed then one failed.
 mkrow mixed 1 pass fail
 campaign_675_row_passed "$E" mixed 1 tls-record; check "driver and watchdog reject a family row with a later FAIL" 1 $?
 
-# Complete tier-1 family row (the frozen plan supplies the expected targets).
+# Complete tier-1 family row (the frozen registry, not Tier 2, supplies targets).
 mkrow full 0
-while IFS=$'\t' read -r _ tier family target budget; do
-  [[ "$tier" == 2 && "$family" == tls-record ]] || continue
-  printf '{"source_commit_sha":"%s","build_step":"test-tls-record-fuzz","filter":"%s","budget_mutations":10000000,"status":"pass"}\n' "$SHA" "$target" >> "$E/full/manifest.jsonl"
-done < "$E/rows.tsv"
+while IFS=$'\t' read -r family _ target; do
+  [[ "$family" == tls-record ]] || continue
+  printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-tls-record-fuzz","filter":"%s","budget_mutations":10000000,"status":"pass"}\n' "$SHA" "$target" >> "$E/full/manifest.jsonl"
+done < "$E/targets.tsv"
 campaign_675_row_passed "$E" full 1 tls-record; check "complete family row passes" 0 $?
-printf '{"source_commit_sha":"%s","build_step":"test-tls-record-fuzz","filter":"fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption","budget_mutations":10000000,"status":"interrupted"}\n' "$SHA" >> "$E/full/manifest.jsonl"
+printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-tls-record-fuzz","filter":"fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption","budget_mutations":10000000,"status":"interrupted"}\n' "$SHA" >> "$E/full/manifest.jsonl"
 campaign_675_row_passed "$E" full 1 tls-record; check "old interrupted evidence does not poison a canonical pass" 0 $?
 
 # Truncated family row: all passes, but fewer than the family's targets, and no
@@ -66,19 +72,26 @@ campaign_675_row_passed "$E" full 1 tls-record; check "old interrupted evidence 
 mkrow short 0 pass
 campaign_675_row_passed "$E" short 1 tls-record; check "driver and watchdog reject a truncated family row" 1 $?
 
-# Tier-2 single-target rows.
-mkrow t2ok 0 pass;  campaign_675_row_passed "$E" t2ok 2 quic; check "tier-2 single pass" 0 $?
-printf '{"source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"interrupted"}\n' "$SHA" >> "$E/t2ok/manifest.jsonl"
-campaign_675_row_passed "$E" t2ok 2 quic; check "retry evidence remains append-only without blocking completion" 0 $?
+# Tier-2 retry: preserve an interrupted attempt at the row root, then retain a
+# new attempt beneath attempts/; only the latter matching PASS completes it.
+mkrow t2ok 130 interrupted
+if [[ "$(campaign_675_row_disposition "$E" t2ok 2 quic)" == interrupted ]]; then check "interrupted evidence is retryable, not a finding" 0 0; else check "interrupted evidence is retryable, not a finding" 0 1; fi
+mkdir -p "$E/t2ok/attempts/retry"
+printf '0\n' > "$E/t2ok/attempts/retry/collect.rc"
+printf 'remote_exit_code=0\n' > "$E/t2ok/attempts/retry/guest-state.env"
+printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/t2ok/attempts/retry/manifest.jsonl"
+campaign_675_row_passed "$E" t2ok 2 quic; check "interrupted attempt then fresh matching pass completes the row" 0 $?
 mkrow t2wrong 0 pass
 sed -i.bak "s/\"source_commit_sha\":\"$SHA\"/\"source_commit_sha\":\"2222222222222222222222222222222222222222\"/" "$E/t2wrong/manifest.jsonl"; rm -f "$E/t2wrong/manifest.jsonl.bak"
 campaign_675_row_passed "$E" t2wrong 2 quic; check "wrong release SHA cannot satisfy a row" 1 $?
-printf '{"source_commit_sha":"%s","build_step":"wrong-step","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/identity.jsonl"
-campaign_675_manifest_has_pass "$E/identity.jsonl" "$SHA" test-quic 'fuzz: packet parser preserves bounded slice and progress invariants' 50000000; check "wrong build step cannot satisfy a row" 1 $?
-printf '{"source_commit_sha":"%s","build_step":"test-quic","filter":"wrong filter","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/identity.jsonl"
-campaign_675_manifest_has_pass "$E/identity.jsonl" "$SHA" test-quic 'fuzz: packet parser preserves bounded slice and progress invariants' 50000000; check "wrong target filter cannot satisfy a row" 1 $?
-printf '{"source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":49999999,"status":"pass"}\n' "$SHA" > "$E/identity.jsonl"
-campaign_675_manifest_has_pass "$E/identity.jsonl" "$SHA" test-quic 'fuzz: packet parser preserves bounded slice and progress invariants' 50000000; check "undersized budget cannot satisfy a row" 1 $?
+printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"wrong-step","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/identity.jsonl"
+campaign_675_manifest_has_pass "$E/identity.jsonl" v9.9.9 "$SHA" test-quic 'fuzz: packet parser preserves bounded slice and progress invariants' 50000000; check "wrong build step cannot satisfy a row" 1 $?
+printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-quic","filter":"wrong filter","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/identity.jsonl"
+campaign_675_manifest_has_pass "$E/identity.jsonl" v9.9.9 "$SHA" test-quic 'fuzz: packet parser preserves bounded slice and progress invariants' 50000000; check "wrong target filter cannot satisfy a row" 1 $?
+printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":49999999,"status":"pass"}\n' "$SHA" > "$E/identity.jsonl"
+campaign_675_manifest_has_pass "$E/identity.jsonl" v9.9.9 "$SHA" test-quic 'fuzz: packet parser preserves bounded slice and progress invariants' 50000000; check "undersized budget cannot satisfy a row" 1 $?
+printf '{"release_tag":"v9.9.8","source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/identity.jsonl"
+campaign_675_manifest_has_pass "$E/identity.jsonl" v9.9.9 "$SHA" test-quic 'fuzz: packet parser preserves bounded slice and progress invariants' 50000000; check "wrong release tag cannot satisfy a row" 1 $?
 mkrow t2bad 1 fail; campaign_675_row_passed "$E" t2bad 2 quic; check "tier-2 fail" 1 $?
 
 # Non-zero collect exit overrides an all-pass manifest.
@@ -98,7 +111,7 @@ campaign_675_row_passed "$E" nomani 2 quic; check "no manifest is not a pass" 1 
 # wrote collect.rc. Recovery is entirely local and never reattaches to PVE.
 mkdir -p "$E/crash-window/archive"
 printf 'payload\n' > "$E/crash-window/archive/evidence"
-printf '{"source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/crash-window/archive/manifest.jsonl"
+printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"pass"}\n' "$SHA" > "$E/crash-window/archive/manifest.jsonl"
 printf 'remote_exit_code=0\n' > "$E/crash-window/guest-state.env"
 printf 'REMOTE_STAGE=/tmp/tardigrade-proxmox-fuzz-deleted\n' > "$E/crash-window/async.env"
 cp "$E/crash-window/archive/manifest.jsonl" "$E/crash-window/manifest.jsonl"
@@ -133,6 +146,7 @@ source scripts/campaign-675-reseat.sh
 RELEASE_TMP="$TMP/release"
 mkdir -p "$RELEASE_TMP"
 RELEASE_PLAN=$'row_id\ttier\tfamily\ttarget\tbudget\nrelease-smoke\t2\tquic\tfuzz: packet parser preserves bounded slice and progress invariants\t50M\n'
+RELEASE_TARGETS=$'1111111111111111111111111111111111111111:src/quic/packet.zig:1:test "fuzz: packet parser preserves bounded slice and progress invariants" {\n'
 printf 'row_id\ttier\tfamily\ttarget\tbudget\ncontroller-only\t2\tquic\tfuzz: different controller target\t1K\n' > "$RELEASE_TMP/rows.tsv"
 export CAMPAIGN_675_EVIDENCE_ROOT="$RELEASE_TMP/evidence"
 export CAMPAIGN_675_ACTIVE_STATE="$RELEASE_TMP/evidence/campaign-675-active.env"
@@ -163,6 +177,9 @@ git() {
       [[ "$ref" == "$MOCK_SHA:scripts/campaign-675-rows.tsv" ]] || return 1
       printf '%s' "$RELEASE_PLAN"
       ;;
+    grep)
+      printf '%s' "$RELEASE_TARGETS"
+      ;;
     *) return 1 ;;
   esac
 }
@@ -179,6 +196,7 @@ ACTIVE="$CAMPAIGN_675_ACTIVE_STATE"
 if [[ "$(grep '^RELEASE_TAG=' "$STATE")" == "RELEASE_TAG=$MOCK_TAG" ]]; then check "campaign state records the requested release" 0 0; else check "campaign state records the requested release" 0 1; fi
 if [[ "$(grep '^SOURCE_SHA=' "$STATE")" == "SOURCE_SHA=$MOCK_SHA" ]]; then check "campaign state records the resolved tag commit" 0 0; else check "campaign state records the resolved tag commit" 0 1; fi
 if [[ "$(cat "$CAMPAIGN_675_EVIDENCE_ROOT/campaign-675-$MOCK_TAG/rows.tsv")" == "${RELEASE_PLAN%$'\n'}" ]]; then check "campaign directory receives the selected release row plan" 0 0; else check "campaign directory receives the selected release row plan" 0 1; fi
+if [[ -s "$CAMPAIGN_675_EVIDENCE_ROOT/campaign-675-$MOCK_TAG/targets.tsv" ]]; then check "campaign directory receives the selected release target registry" 0 0; else check "campaign directory receives the selected release target registry" 0 1; fi
 if [[ "$(grep '^CAMPAIGN_STATE=' "$ACTIVE")" == "CAMPAIGN_STATE=$STATE" ]]; then check "active state points to the release baseline" 0 0; else check "active state points to the release baseline" 0 1; fi
 
 first_state="$(cksum "$STATE")"

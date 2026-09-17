@@ -3406,20 +3406,27 @@ test "H3 conn-state model fragments a multi-byte uni stream type" {
 fn fuzzH3ConnStateCommands(_: void, smith: *testing.Smith) !void {
     var input: [192]u8 = undefined;
     const len = smith.slice(&input);
-    // `std.testing.allocator` captures ten stack frames for every allocation,
-    // even in ReleaseFast fuzz builds. That dominates this allocation-heavy
-    // state model on macOS. Keep allocator safety and per-input leak checking,
-    // but omit stack capture: the minimized fuzz input is the actionable leak
-    // witness, and deterministic replay still uses `testing.allocator` below.
-    var fuzz_allocator: std.heap.DebugAllocator(.{
-        .stack_trace_frames = 0,
-        .safety = true,
-        .thread_safe = false,
-    }) = .init;
-    defer testing.expectEqual(std.heap.Check.ok, fuzz_allocator.deinit()) catch @panic("fuzz allocator leak");
-    const allocator = fuzz_allocator.allocator();
-    try runH3ConnStateCommandsWithAllocator(input[0..len], .server, allocator);
-    try runH3ConnStateCommandsWithAllocator(input[0..len], .client, allocator);
+    // Leak-checked allocator WITHOUT stack-trace capture.
+    //
+    // `std.testing.allocator` records a 10-frame stack trace on every alloc and
+    // free, walking DWARF unwind tables each time. Profiling this target showed
+    // that unwinding consumed ~90% of the fuzz thread; the H3 code under test
+    // got the remaining ~10%, which is why a 50M row took ~23h. Leak detection
+    // is what #675 needs from the allocator and is kept: every allocation made
+    // for this input must be freed, checked explicitly below. Stack traces only
+    // aid diagnosis, and a leaking input replays deterministically under
+    // `std.testing.allocator` for that.
+    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    const allocator = gpa.allocator();
+    runH3ConnStateCommandsWithAllocator(input[0..len], .server, allocator) catch |err| {
+        gpa.deinitWithoutLeakChecks();
+        return err;
+    };
+    runH3ConnStateCommandsWithAllocator(input[0..len], .client, allocator) catch |err| {
+        gpa.deinitWithoutLeakChecks();
+        return err;
+    };
+    if (gpa.deinit() == .leak) return error.TestUnexpectedResult;
 }
 
 /// Op 21's bookkeeping: reset the tracked peer request stream and forget its

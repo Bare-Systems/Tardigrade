@@ -159,7 +159,7 @@ echo
 
 # Driver integration: the row starts with no evidence, then the collector
 # returns a durable finding. The driver must consult disposition after
-# collection and stop before starting the next queued row.
+# collection, record the finding, and continue to the next queued row.
 DRIVER_ROOT="$TMP/driver"
 DRIVER_E="$DRIVER_ROOT/campaign-675-v9.9.9"
 mkdir -p "$DRIVER_E" "$TMP/driver-bin"
@@ -191,8 +191,12 @@ exit 0
 EOF
 chmod +x "$TMP/driver-runner.sh" "$TMP/driver-bin/ssh"
 if CAMPAIGN_TEST_SHA="$SHA" CAMPAIGN_675_EVIDENCE_ROOT="$DRIVER_ROOT" CAMPAIGN_675_RUNNER="$TMP/driver-runner.sh" PATH="$TMP/driver-bin:$PATH" scripts/campaign-675-driver.sh "$DRIVER_E/campaign.env" >/dev/null 2>&1; then driver_rc=0; else driver_rc=$?; fi
-check "driver stops after a newly durable finding" 2 "$driver_rc"
-if grep -q 'START second' "$DRIVER_E/driver.log"; then check "driver never launches a later row after collection finding" 0 1; else check "driver never launches a later row after collection finding" 0 0; fi
+check "driver exhausts the queue past durable findings" 4 "$driver_rc"
+if grep -q 'START second' "$DRIVER_E/driver.log"; then check "driver launches the next row after a finding" 0 0; else check "driver launches the next row after a finding" 0 1; fi
+check "driver records each finding in findings.tsv" 2 "$(awk 'NR > 1' "$DRIVER_E/findings.tsv" 2>/dev/null | wc -l | tr -d ' ')"
+if CAMPAIGN_TEST_SHA="$SHA" CAMPAIGN_675_EVIDENCE_ROOT="$DRIVER_ROOT" CAMPAIGN_675_RUNNER="$TMP/driver-runner.sh" PATH="$TMP/driver-bin:$PATH" scripts/campaign-675-driver.sh "$DRIVER_E/campaign.env" >/dev/null 2>&1; then driver_rc=0; else driver_rc=$?; fi
+check "driver rerun over pending findings exits exhausted" 4 "$driver_rc"
+check "driver rerun does not duplicate findings" 2 "$(awk 'NR > 1' "$DRIVER_E/findings.tsv" 2>/dev/null | wc -l | tr -d ' ')"
 
 # Release-baseline tests use a shell-local Git double. They prove the reseat
 

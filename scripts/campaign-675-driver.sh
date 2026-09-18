@@ -24,6 +24,7 @@ IMAGE=/var/lib/vz/template/cache/debian-13-genericcloud-amd64-fuzz.qcow2
 IMAGE_SHA=85a969b7e99d7c817414136033df18c58d5c45ac8d27bb36e8ccb67173d2d4e3
 ZIG_SHA=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
 LOG="$E/driver.log"
+RUNNER="${CAMPAIGN_675_RUNNER:-scripts/run-proxmox-fuzz-campaign.sh}"
 
 # Budget-aware watchdog. A blanket 250000s (69.4h) let a genuinely hung target
 # grind for 23h+ without tripping anything -- the tls-record cleanup oracle,
@@ -104,7 +105,7 @@ for line in "${QUEUE[@]}"; do
     # because TAB is an IFS whitespace char and `read` collapses adjacent tabs,
     # which silently shifted budget into target and broke every tier-1 row.
     [[ "$target" != "-" && -n "$target" ]] && args+=(--campaign-target "$target")
-    if ! scripts/run-proxmox-fuzz-campaign.sh "${args[@]}" >>"$LOG" 2>&1; then
+    if ! "$RUNNER" "${args[@]}" >>"$LOG" 2>&1; then
       say "FATAL launch failed for $rid - stopping"; exit 1
     fi
   fi
@@ -116,7 +117,7 @@ for line in "${QUEUE[@]}"; do
     # whole campaign for however long nobody is watching.
     for attempt in 1 2 3 4 5; do
       say "COLLECT $rid (attempt $attempt)"
-      scripts/run-proxmox-fuzz-campaign.sh --collect --out-dir "$row_dir" >>"$LOG" 2>&1
+      "$RUNNER" --collect --out-dir "$row_dir" >>"$LOG" 2>&1
       if campaign_675_row_collected "$row_dir"; then break; fi
       say "collection is not durable; retrying this exact attempt in 120s"
       sleep 120
@@ -128,18 +129,29 @@ for line in "${QUEUE[@]}"; do
   fi
   [[ -f "$current_attempt" && "$(cat "$current_attempt")" == "$row_dir" ]] && rm -f "$current_attempt"
   runs="$(find "$E/$rid" -name stderr.log -exec grep -ho 'Runs: [0-9]* -> [0-9]*' {} \; 2>/dev/null | tail -1)"
-  if campaign_675_row_passed "$E" "$rid" "$tier" "$family"; then
-    say "PASS $rid  ${runs:-<no Runs line>}"
-  else
-    if [[ "$(campaign_675_row_disposition "$E" "$rid" "$tier" "$family")" == interrupted ]]; then
+  post="$(campaign_675_row_disposition "$E" "$rid" "$tier" "$family")"
+  case "$post" in
+    pass)
+      say "PASS $rid  ${runs:-<no Runs line>}"
+      ;;
+    dispositioned_finding)
+      say "ACCOUNTED FINDING $rid"
+      ;;
+    interrupted)
       say "RETRY $rid after preserved interruption"
       exec "$0" "$CAMPAIGN_STATE"
-    fi
-    st="$(find "$E/$rid" -name manifest.jsonl -exec grep -ho '"status":"[a-z_]*"' {} \; 2>/dev/null | tail -1)"
-    say "STOP: $rid did not pass (${st:-unknown}) ${runs:-}. Per #675 stop-on-finding, launching nothing further."
-    say "Evidence left intact under $E/$rid. Triage required."
-    exit 2
-  fi
+      ;;
+    pending_finding)
+      st="$(find "$E/$rid" -name manifest.jsonl -exec grep -ho '"status":"[a-z_]*"' {} \; 2>/dev/null | tail -1)"
+      say "STOP: $rid produced a durable finding (${st:-unknown}) ${runs:-}. Triage required."
+      say "Evidence left intact under $E/$rid."
+      exit 2
+      ;;
+    *)
+      say "FATAL unknown row disposition '$post' for $rid"
+      exit 1
+      ;;
+  esac
 done
 # Only claim completion if every queued row actually passed. The previous
 # version logged "ALL ROWS COMPLETE" after one row because ssh inside the

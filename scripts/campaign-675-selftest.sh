@@ -65,7 +65,7 @@ while IFS=$'\t' read -r family _ target; do
   printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-tls-record-fuzz","filter":"%s","budget_mutations":10000000,"status":"pass"}\n' "$SHA" "$target" >> "$E/full/manifest.jsonl"
 done < "$E/targets.tsv"
 campaign_675_row_passed "$E" full 1 tls-record; check "complete family row passes" 0 $?
-# shellcheck disable=SC2329 # completion intentionally must not call this moving mapping
+# shellcheck disable=SC2317,SC2329 # intentionally unused override: completion must not call moving mapping
 campaign_675_family_step() { echo moving-controller-step; }
 campaign_675_row_passed "$E" full 1 tls-record; check "frozen registry step survives a controller mapping change" 0 $?
 printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-tls-record-fuzz","filter":"fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption","budget_mutations":10000000,"status":"interrupted"}\n' "$SHA" >> "$E/full/manifest.jsonl"
@@ -156,6 +156,45 @@ if [[ "$w50" -gt 84240 ]]; then printf '  ok   50M watchdog %ss exceeds the 23.4
 if [[ "$w100" -gt "$w50" ]]; then printf '  ok   100M watchdog %ss exceeds 50M\n' "$w100"; else printf '  FAIL 100M watchdog %s\n' "$w100"; fails=$((fails+1)); fi
 
 echo
+
+# Driver integration: the row starts with no evidence, then the collector
+# returns a durable finding. The driver must consult disposition after
+# collection and stop before starting the next queued row.
+DRIVER_ROOT="$TMP/driver"
+DRIVER_E="$DRIVER_ROOT/campaign-675-v9.9.9"
+mkdir -p "$DRIVER_E" "$TMP/driver-bin"
+DRIVER_ROWS=$'row_id\ttier\tfamily\ttarget\tbudget\nfirst\t2\tquic\tfuzz: packet parser preserves bounded slice and progress invariants\t50M\nsecond\t2\tquic\tfuzz: packet parser preserves bounded slice and progress invariants\t50M\n'
+printf '%s' "$DRIVER_ROWS" > "$DRIVER_E/rows.tsv"
+printf 'quic\ttest-quic\tfuzz: packet parser preserves bounded slice and progress invariants\n' > "$DRIVER_E/targets.tsv"
+printf 'RELEASE_TAG=v9.9.9\nSOURCE_SHA=%s\nCAMPAIGN_DIR=%s\nROW_PLAN_SHA256=%s\nTARGET_REGISTRY_SHA256=%s\n' \
+  "$SHA" "$DRIVER_E" "$(shasum -a 256 "$DRIVER_E/rows.tsv" | awk '{print $1}')" "$(shasum -a 256 "$DRIVER_E/targets.tsv" | awk '{print $1}')" > "$DRIVER_E/campaign.env"
+cat > "$TMP/driver-runner.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+out=""
+mode=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in --start|--collect) mode="$1"; shift ;; --out-dir) out="$2"; shift 2 ;; *) shift ;; esac
+done
+mkdir -p "$out"
+if [[ "$mode" == --start ]]; then
+  printf 'REMOTE_STAGE=/tmp/tardigrade-proxmox-fuzz-driver-test\n' > "$out/async.env"
+else
+  printf 'remote_exit_code=1\n' > "$out/guest-state.env"
+  printf '0\n' > "$out/collect.rc"
+  printf '{"release_tag":"v9.9.9","source_commit_sha":"%s","build_step":"test-quic","filter":"fuzz: packet parser preserves bounded slice and progress invariants","budget_mutations":50000000,"status":"fail","preservation_status":"ok"}\n' "$CAMPAIGN_TEST_SHA" > "$out/manifest.jsonl"
+fi
+EOF
+cat > "$TMP/driver-bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$TMP/driver-runner.sh" "$TMP/driver-bin/ssh"
+if CAMPAIGN_TEST_SHA="$SHA" CAMPAIGN_675_EVIDENCE_ROOT="$DRIVER_ROOT" CAMPAIGN_675_RUNNER="$TMP/driver-runner.sh" PATH="$TMP/driver-bin:$PATH" scripts/campaign-675-driver.sh "$DRIVER_E/campaign.env" >/dev/null 2>&1; then driver_rc=0; else driver_rc=$?; fi
+check "driver stops after a newly durable finding" 2 "$driver_rc"
+if grep -q 'START second' "$DRIVER_E/driver.log"; then check "driver never launches a later row after collection finding" 0 1; else check "driver never launches a later row after collection finding" 0 0; fi
+
+# Release-baseline tests use a shell-local Git double. They prove the reseat
 
 # Release-baseline tests use a shell-local Git double. They prove the reseat
 # flow only consults the requested immutable tag; no network, Proxmox host, or

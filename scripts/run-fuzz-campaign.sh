@@ -15,6 +15,7 @@ target=""
 budget=""
 output=""
 source_sha=""
+release_tag=""
 resume=false
 list=false
 noncanonical_smoke=false
@@ -41,6 +42,7 @@ Target selection:
 
 Evidence and safety:
   --source-sha SHA       Refuse canonical runs unless HEAD matches SHA.
+  --release-tag TAG      Immutable release identity for canonical evidence.
   --resume              Skip a row only when manifest proves same SHA, step,
                          filter, same-or-greater budget, and status pass.
   --noncanonical-smoke  Allow dirty worktrees and mark evidence non-canonical.
@@ -181,9 +183,10 @@ target_selects_current_fuzz() {
 }
 
 resume_has_pass() {
-  local manifest="$1" sha="$2" step="$3" filter="$4" min_budget="$5"
+  local manifest="$1" release="$2" sha="$3" step="$4" filter="$5" min_budget="$6"
   [[ -f "$manifest" ]] || return 1
-  awk -v sha="$sha" -v step="$step" -v filter="$filter" -v min_budget="$min_budget" '
+  awk -v release="$release" -v sha="$sha" -v step="$step" -v filter="$filter" -v min_budget="$min_budget" '
+    $0 ~ "\"release_tag\":\"" release "\"" &&
     $0 ~ "\"source_commit_sha\":\"" sha "\"" &&
     $0 ~ "\"build_step\":\"" step "\"" &&
     $0 ~ "\"filter\":\"" filter "\"" &&
@@ -268,6 +271,8 @@ ensure_campaign_metadata() {
   if [[ -f "$output/campaign.json" ]]; then
     grep -F "\"source_commit_sha\":\"$head_sha\"" "$output/campaign.json" >/dev/null ||
       die "output directory belongs to a different source SHA"
+    grep -F "\"release_tag\":\"$release_tag\"" "$output/campaign.json" >/dev/null ||
+      die "output directory belongs to a different release tag"
     grep -F "\"canonical\":$canonical_json" "$output/campaign.json" >/dev/null ||
       die "output directory belongs to a different canonical/smoke mode"
     grep -F "\"expected_zig_version\":\"$EXPECTED_ZIG_VERSION\"" "$output/campaign.json" >/dev/null ||
@@ -275,7 +280,7 @@ ensure_campaign_metadata() {
   else
     metadata_tmp="$(mktemp "${output}/campaign.json.tmp.XXXXXX")"
     cat >"$metadata_tmp" <<EOF
-{"campaign_id":"$(json_escape "$campaign_id")","source_commit_sha":"$head_sha","canonical":$canonical_json,"expected_zig_version":"$(json_escape "$EXPECTED_ZIG_VERSION")","created_utc":"$created_utc"}
+{"campaign_id":"$(json_escape "$campaign_id")","release_tag":"$(json_escape "$release_tag")","source_commit_sha":"$head_sha","canonical":$canonical_json,"expected_zig_version":"$(json_escape "$EXPECTED_ZIG_VERSION")","created_utc":"$created_utc"}
 EOF
     mv "$metadata_tmp" "$output/campaign.json"
   fi
@@ -319,6 +324,7 @@ while [[ $# -gt 0 ]]; do
     --budget) budget="$2"; shift 2 ;;
     --output) output="$2"; shift 2 ;;
     --source-sha) source_sha="$2"; shift 2 ;;
+    --release-tag) release_tag="$2"; shift 2 ;;
     --watchdog) watchdog_seconds="$2"; shift 2 ;;
     --resume) resume=true; shift ;;
     --list) list=true; shift ;;
@@ -337,6 +343,7 @@ fi
 [[ -n "$tier" ]] || tier=2
 case "$tier" in 1|2|3) ;; *) die "--tier must be 1, 2, or 3" ;; esac
 [[ -n "$family" ]] || die "--family is required"
+[[ -z "$release_tag" || "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z]+)*$ ]] || die "--release-tag must be a semantic version"
 step="$(family_step "$family")"
 [[ -n "$output" ]] || die "--output is required"
 
@@ -499,8 +506,8 @@ write_finding() {
 append_manifest_line() {
   local fdir="$1" fsha="$2" preservation_status="$3" finding_path_json="null"
   if [[ -n "$fdir" ]]; then finding_path_json="\"$(json_escape "$fdir")\""; fi
-  printf '{"campaign_id":"%s","started_utc":"%s","ended_utc":"%s","source_commit_sha":"%s","zig_version":"%s","os_arch":"%s/%s","cpu":"%s","family":"%s","build_step":"%s","filter":"%s","budget":"%s","budget_mutations":%s,"optimize":"ReleaseFast","elapsed_seconds":%s,"executions_per_second":%s,"status":"%s","exit_code":%s,"finding_path":%s,"finding_sha256":%s,"preservation_status":"%s","stdout_path":"%s","stderr_path":"%s"}\n' \
-    "$(json_escape "$campaign_id")" "$started_utc" "$ended_utc" "$head_sha" "$(json_escape "$(zig version)")" "$(json_escape "$(uname -s)")" "$(json_escape "$(uname -m)")" \
+  printf '{"campaign_id":"%s","release_tag":"%s","started_utc":"%s","ended_utc":"%s","source_commit_sha":"%s","zig_version":"%s","os_arch":"%s/%s","cpu":"%s","family":"%s","build_step":"%s","filter":"%s","budget":"%s","budget_mutations":%s,"optimize":"ReleaseFast","elapsed_seconds":%s,"executions_per_second":%s,"status":"%s","exit_code":%s,"finding_path":%s,"finding_sha256":%s,"preservation_status":"%s","stdout_path":"%s","stderr_path":"%s"}\n' \
+    "$(json_escape "$campaign_id")" "$(json_escape "$release_tag")" "$started_utc" "$ended_utc" "$head_sha" "$(json_escape "$(zig version)")" "$(json_escape "$(uname -s)")" "$(json_escape "$(uname -m)")" \
     "$(json_escape "$(cpu_identity)")" \
     "$(json_escape "$family")" "$(json_escape "$step")" "$(json_escape "$filter")" "$(json_escape "$budget")" "$budget_mutations" "$elapsed" "$execs_per_sec" "$status" "$exit_code" \
     "$finding_path_json" "$fsha" "$preservation_status" "$(json_escape "$stdout_log")" "$(json_escape "$stderr_log")" >>"$manifest"
@@ -539,7 +546,7 @@ run_one_attempt() {
   local run_key
   run_key="${family}__$(slugify "$target")__${budget}"
 
-  if $resume && resume_has_pass "$manifest" "$head_sha" "$step" "$filter" "$budget_mutations"; then
+  if $resume && resume_has_pass "$manifest" "$release_tag" "$head_sha" "$step" "$filter" "$budget_mutations"; then
     say "==> resume: existing same-SHA pass satisfies $family $filter >= $budget"
     return 0
   fi
@@ -749,7 +756,7 @@ EOF2
       say "==> $status: finding $i/$crash_snapshot_count (${snap_test_name:-unknown test}) preservation=$finding_preservation_status under $this_finding_dir"
       i=$((i + 1))
     done
-  elif [[ "$status" != "pass" ]]; then
+  elif [[ "$status" == "fail" || "$status" == "possible_hang" ]]; then
     finding_sha=""
     local finding_preservation_status="ok"
     if ! write_finding "$finding_dir" "$fuzz_crash_input" "" finding_sha; then

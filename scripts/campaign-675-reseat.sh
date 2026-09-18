@@ -1,56 +1,162 @@
 #!/usr/bin/env bash
-# Re-seat the #675 campaign onto whatever `main` currently is.
-#
-# Restarting is routine: fuzzing exists to find bugs, fixes land, the SHA moves.
-# This makes that a one-command operation instead of a manual teardown dance.
-# Idempotent - a no-op when main has not moved (unless --force).
+# Establish the immutable published-release baseline for the #675 campaign.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
-FORCE=false; [[ "${1:-}" == "--force" ]] && FORCE=true
-PVE=root@192.168.86.50
-PLIST="$HOME/Library/LaunchAgents/com.jaruso.tardigrade.campaign675.watchdog.plist"
-say() { printf '%s reseat: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
-git fetch origin --quiet || { say "FATAL git fetch failed"; exit 1; }
-NEW=$(git rev-parse origin/main); SHORT=${NEW:0:8}
-CUR=$(grep -m1 '^EPOCH_SHA=' scripts/campaign-675-driver.sh | cut -d= -f2)
-if [[ "$NEW" == "$CUR" && "$FORCE" != true ]]; then say "main unchanged ($SHORT); nothing to do"; exit 0; fi
-say "re-seating: ${CUR:0:8} -> $SHORT"
+say() { printf '%s campaign-675: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+usage() { printf 'usage: scripts/campaign-675-reseat.sh <release-version>\n' >&2; }
 
-say "stopping driver/supervisor"
-pkill -f campaign-675-supervisor.sh 2>/dev/null; pkill -f campaign-675-driver.sh 2>/dev/null; sleep 3
+state_value() {
+  local state_file="$1" key="$2"
+  local -a lines=()
+  mapfile -t lines < <(grep -E "^${key}=" "$state_file" 2>/dev/null || true)
+  [[ "${#lines[@]}" -eq 1 ]] || return 1
+  printf '%s\n' "${lines[0]#*=}"
+}
 
-# Tear down any fuzz guest. --skiplock is required: a running guest refuses a
-# plain stop, and a running guest refuses destroy.
-for id in $(ssh -n -o ConnectTimeout=20 "$PVE" 'qm list | awk "/tardigrade-fuzz/{print \$1}"' 2>/dev/null); do
-  say "destroying guest $id"
-  ssh -n -o ConnectTimeout=20 "$PVE" "pkill -f orchestrate.sh; qm stop $id --skiplock 1 >/dev/null 2>&1; sleep 10; qm destroy $id --purge" >/dev/null 2>&1
-done
+plan_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 
-say "checking out main @ $SHORT"
-if ! git checkout main --quiet; then say "FATAL checkout failed"; exit 1; fi
-if ! git reset --hard "$NEW" --quiet; then say "FATAL reset failed"; exit 1; fi
+freeze_target_registry() { # $1 source SHA, $2 output file
+  local source_sha="$1" output="$2" source_dir
+  source_dir="$(mktemp -d)" || return 1
+  # The target lister itself is part of the release contract: it carries that
+  # release's family-to-build-step mapping, so never recreate it from the
+  # moving controller checkout.
+  if ! git archive --format=tar "$source_sha" | tar -x -C "$source_dir" ||
+    ! (cd "$source_dir" && scripts/run-fuzz-campaign.sh --list) | awk -F '\t' 'NF >= 3 { print $1 "\t" $2 "\t" $3 }' | sort -u > "$output" ||
+    [[ ! -s "$output" ]]; then
+    rm -rf "$source_dir"
+    return 1
+  fi
+  rm -rf "$source_dir"
+}
 
-E="artifacts/hardening/fuzz/campaign-675-$SHORT"
-mkdir -p "$E"
-# Carry the row plan forward; regenerate only if it is missing.
-PREV=""
-for d in artifacts/hardening/fuzz/campaign-675-*/; do
-  [[ -d "$d" && "$d" != *"$SHORT"* && -f "$d/rows.tsv" ]] || continue
-  [[ -z "$PREV" || "$d" -nt "$PREV" ]] && PREV="$d"
-done
-[[ -f "$E/rows.tsv" ]] || cp "$PREV/rows.tsv" "$E/rows.tsv" 2>/dev/null
-[[ -f "$E/rows.tsv" ]] || { say "FATAL no rows.tsv to carry forward"; exit 1; }
-say "queue: $(( $(wc -l < "$E/rows.tsv") - 1 )) rows"
+write_campaign_state() {
+  local state_file="$1" release_tag="$2" source_sha="$3" campaign_dir="$4" plan_sha="$5" target_sha="$6"
+  local temp
+  temp="$(mktemp "$campaign_dir/.campaign.env.XXXXXX")" || return 1
+  {
+    printf 'RELEASE_TAG=%s\n' "$release_tag"
+    printf 'SOURCE_SHA=%s\n' "$source_sha"
+    printf 'CAMPAIGN_DIR=%s\n' "$campaign_dir"
+    printf 'ROW_PLAN_SHA256=%s\n' "$plan_sha"
+    printf 'TARGET_REGISTRY_SHA256=%s\n' "$target_sha"
+  } > "$temp" || { rm -f "$temp"; return 1; }
+  mv -f "$temp" "$state_file"
+}
 
-for f in scripts/campaign-675-driver.sh scripts/campaign-675-supervisor.sh scripts/campaign-675-watchdog.sh; do
-  sed -i '' "s|campaign-675-[0-9a-f]\{8\}|campaign-675-$SHORT|g; s|EPOCH_SHA=[0-9a-f]*|EPOCH_SHA=$NEW|g" "$f"
-done
-sed -i '' "s|campaign-675-[0-9a-f]\{8\}|campaign-675-$SHORT|g" "$PLIST" 2>/dev/null
-launchctl unload "$PLIST" 2>/dev/null; launchctl load "$PLIST" 2>/dev/null
-say "watchdog repointed"
+write_active_state() {
+  local active_state="$1" campaign_state="$2"
+  local temp
+  temp="$(mktemp "${active_state}.XXXXXX")" || return 1
+  printf 'CAMPAIGN_STATE=%s\n' "$campaign_state" > "$temp" || { rm -f "$temp"; return 1; }
+  mv -f "$temp" "$active_state"
+}
 
-nohup caffeinate -i -s scripts/campaign-675-supervisor.sh >/dev/null 2>&1 &
-sleep 5
-say "campaign restarted on $SHORT (supervisor pid $!)"
-say "log: $E/driver.log"
+campaign_675_reseat_main() {
+  if [[ "$#" -ne 1 ]]; then
+    usage
+    return 64
+  fi
+
+  local release_tag="$1"
+  if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z]+)*$ ]]; then
+    say "FATAL invalid release version '$release_tag'"
+    usage
+    return 64
+  fi
+
+  local evidence_root="${CAMPAIGN_675_EVIDENCE_ROOT:-artifacts/hardening/fuzz}"
+  local git_remote="${CAMPAIGN_675_GIT_REMOTE:-origin}"
+  local campaign_dir="$evidence_root/campaign-675-$release_tag"
+  local campaign_state="$campaign_dir/campaign.env"
+  local active_state="${CAMPAIGN_675_ACTIVE_STATE:-$evidence_root/campaign-675-active.env}"
+  local source_sha old_active old_release old_sha old_dir old_plan_sha old_target_sha plan_sha target_sha row_plan_tmp targets_tmp
+
+  git fetch "$git_remote" --tags --quiet || { say "FATAL unable to fetch tags from $git_remote"; return 1; }
+  git rev-parse --verify --quiet "refs/tags/$release_tag" >/dev/null || {
+    say "FATAL release tag '$release_tag' does not exist"
+    return 1
+  }
+  source_sha="$(git rev-parse --verify "$release_tag^{commit}" 2>/dev/null)" || {
+    say "FATAL release tag '$release_tag' does not resolve to a commit"
+    return 1
+  }
+  [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || {
+    say "FATAL release tag '$release_tag' resolved to an invalid commit"
+    return 1
+  }
+
+  if [[ -e "$campaign_dir" ]]; then
+    [[ -f "$campaign_state" ]] || {
+      say "FATAL existing campaign directory lacks immutable campaign.env: $campaign_dir"
+      return 1
+    }
+    old_release="$(state_value "$campaign_state" RELEASE_TAG)" || old_release=""
+    old_sha="$(state_value "$campaign_state" SOURCE_SHA)" || old_sha=""
+    old_dir="$(state_value "$campaign_state" CAMPAIGN_DIR)" || old_dir=""
+    old_plan_sha="$(state_value "$campaign_state" ROW_PLAN_SHA256)" || old_plan_sha=""
+    old_target_sha="$(state_value "$campaign_state" TARGET_REGISTRY_SHA256)" || old_target_sha=""
+    if [[ "$old_release" != "$release_tag" || "$old_sha" != "$source_sha" || "$old_dir" != "$campaign_dir" ]]; then
+      say "FATAL campaign identity mismatch in $campaign_dir (recorded $old_release ${old_sha:-<missing>})"
+      return 1
+    fi
+    [[ -f "$campaign_dir/rows.tsv" ]] || {
+      say "FATAL existing campaign baseline lacks rows.tsv: $campaign_dir"
+      return 1
+    }
+    plan_sha="$(plan_sha256 "$campaign_dir/rows.tsv")" || return 1
+    [[ "$old_plan_sha" == "$plan_sha" ]] || {
+      say "FATAL frozen row-plan hash mismatch in $campaign_dir"
+      return 1
+    }
+    [[ -f "$campaign_dir/targets.tsv" ]] || { say "FATAL existing campaign baseline lacks targets.tsv: $campaign_dir"; return 1; }
+    target_sha="$(plan_sha256 "$campaign_dir/targets.tsv")" || return 1
+    [[ "$old_target_sha" == "$target_sha" ]] || { say "FATAL frozen target-registry hash mismatch in $campaign_dir"; return 1; }
+    say "release baseline already established: $release_tag @ $source_sha"
+  else
+    mkdir -p "$campaign_dir" || return 1
+    row_plan_tmp="$campaign_dir/.rows.tsv.$$"
+    git show "$source_sha:scripts/campaign-675-rows.tsv" > "$row_plan_tmp" || {
+      rm -f "$row_plan_tmp"
+      say "FATAL selected release lacks scripts/campaign-675-rows.tsv"
+      return 1
+    }
+    mv -f "$row_plan_tmp" "$campaign_dir/rows.tsv" || return 1
+    targets_tmp="$campaign_dir/.targets.tsv.$$"
+    freeze_target_registry "$source_sha" "$targets_tmp" || { rm -f "$targets_tmp"; say "FATAL unable to derive selected release target registry"; return 1; }
+    mv -f "$targets_tmp" "$campaign_dir/targets.tsv" || return 1
+    plan_sha="$(plan_sha256 "$campaign_dir/rows.tsv")" || return 1
+    target_sha="$(plan_sha256 "$campaign_dir/targets.tsv")" || return 1
+    write_campaign_state "$campaign_state" "$release_tag" "$source_sha" "$campaign_dir" "$plan_sha" "$target_sha" || {
+      say "FATAL unable to write campaign state"
+      return 1
+    }
+    say "release baseline established: $release_tag @ $source_sha"
+  fi
+
+  if [[ -f "$active_state" ]]; then
+    old_active="$(state_value "$active_state" CAMPAIGN_STATE)" || old_active=""
+    if [[ -n "$old_active" && "$old_active" != "$campaign_state" ]] && pgrep -f 'campaign-675-supervisor.sh' >/dev/null 2>&1; then
+      say "FATAL another #675 supervisor is active; refusing to repoint its release baseline"
+      return 1
+    fi
+  fi
+  write_active_state "$active_state" "$campaign_state" || { say "FATAL unable to write active campaign state"; return 1; }
+
+  if [[ "${CAMPAIGN_675_NO_START:-false}" == true ]]; then
+    say "baseline ready without supervisor start: $campaign_state"
+    return 0
+  fi
+  if pgrep -f "campaign-675-supervisor.sh $campaign_state" >/dev/null 2>&1; then
+    say "supervisor already running for $release_tag"
+    return 0
+  fi
+  nohup caffeinate -i -s scripts/campaign-675-supervisor.sh "$campaign_state" >/dev/null 2>&1 &
+  say "campaign started for $release_tag @ $source_sha (supervisor pid $!)"
+  say "evidence: $campaign_dir"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  campaign_675_reseat_main "$@"
+fi

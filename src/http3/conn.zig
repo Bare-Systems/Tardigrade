@@ -154,7 +154,11 @@ pub const ErrorCode = enum(u64) {
     id_error = 0x0108,
     settings_error = 0x0109,
     missing_settings = 0x010a,
+    request_incomplete = 0x010d,
     message_error = 0x010e,
+    qpack_decompression_failed = 0x0200,
+    qpack_encoder_stream_error = 0x0201,
+    qpack_decoder_stream_error = 0x0202,
 
     pub fn wire(self: ErrorCode) u64 {
         return @intFromEnum(self);
@@ -234,6 +238,8 @@ pub fn Conn(comptime Transport: type) type {
         peer_control: ?u64 = null,
         peer_qpack_encoder: ?u64 = null,
         peer_qpack_decoder: ?u64 = null,
+        peer_qpack_decoder_state: qpack.DecoderStream = .{},
+        peer_qpack_decoder_reader: qpack.DecoderStreamReader = .{},
         peer_control_view: frame.ControlStream = .{},
         local_settings: frame.Settings = .{},
         /// Peer uni streams whose type varint has not fully arrived yet, and
@@ -264,6 +270,7 @@ pub fn Conn(comptime Transport: type) type {
         responses: std.AutoHashMap(u64, *ClientResponse),
         peer_goaway_id: ?u64 = null,
         local_goaway_id: ?u64 = null,
+        peer_max_push_id: ?u64 = null,
         /// Bidirectional streams the peer opened that we haven't classified.
         metrics: Metrics = .{},
         events: EventSink = .{},
@@ -309,6 +316,11 @@ pub fn Conn(comptime Transport: type) type {
         const PendingUni = struct {
             classified: bool = false,
             typ: frame.StreamType = .unknown,
+            // QUIC varints are at most eight bytes. Retain a fragmented
+            // stream type until it can be classified; transport reads consume
+            // bytes, so reparsing each delivery independently loses prefixes.
+            type_prefix: [8]u8 = undefined,
+            type_prefix_len: usize = 0,
         };
 
         const ServerRequest = struct {
@@ -348,6 +360,7 @@ pub fn Conn(comptime Transport: type) type {
         const ClientResponse = struct {
             buffer: std.ArrayList(u8) = .empty,
             fin: bool = false,
+            request_is_head: bool = false,
             fields: [64]qpack.HeaderField = undefined,
             scratch: [4096]u8 = undefined,
         };
@@ -374,6 +387,7 @@ pub fn Conn(comptime Transport: type) type {
 
         pub fn deinit(self: *Self) void {
             self.peer_control_view.deinit(self.allocator);
+            self.peer_qpack_decoder_reader.deinit(self.allocator);
             self.pending_uni.deinit();
             var request_it = self.requests.valueIterator();
             while (request_it.next()) |request| {
@@ -436,6 +450,21 @@ pub fn Conn(comptime Transport: type) type {
                 error.InvalidUnidirectionalStreamType,
                 error.DuplicateControlStream,
                 => self.fail(.stream_creation_error),
+            };
+        }
+
+        fn failRequestSessionError(self: *Self, err: session.SessionError) H3Error {
+            return switch (err) {
+                error.IncompleteRequest => self.fail(.request_incomplete),
+                error.BufferTooShort,
+                error.FrameLengthOverflow,
+                error.FrameTooLarge,
+                => self.fail(.frame_error),
+                error.QpackDecodeFailed => self.fail(.qpack_decompression_failed),
+                error.UnexpectedFrame,
+                error.InvalidRequestFrame,
+                => self.fail(.frame_unexpected),
+                else => self.fail(.message_error),
             };
         }
 
@@ -647,13 +676,33 @@ pub fn Conn(comptime Transport: type) type {
                     if (result.len == 0 and !result.fin) break;
                     var bytes: []const u8 = buf[0..result.len];
                     if (!state.classified and bytes.len > 0) {
-                        const decoded = frame.decodeStreamType(bytes) catch break;
+                        if (state.type_prefix_len == 0) {
+                            state.type_prefix[0] = bytes[0];
+                            state.type_prefix_len = 1;
+                            bytes = bytes[1..];
+                        }
+                        const type_len = varint.decodedLen(state.type_prefix[0]);
+                        const take = @min(type_len - state.type_prefix_len, bytes.len);
+                        @memcpy(
+                            state.type_prefix[state.type_prefix_len..][0..take],
+                            bytes[0..take],
+                        );
+                        state.type_prefix_len += take;
+                        bytes = bytes[take..];
+                        if (state.type_prefix_len < type_len) {
+                            // RFC 9114 section 6.2 requires tolerating a uni
+                            // stream closed before its header is complete.
+                            if (result.fin) {
+                                finished_uni.append(self.allocator, id) catch return error.OutOfMemory;
+                                break;
+                            }
+                            continue;
+                        }
+
+                        const decoded = frame.decodeStreamType(state.type_prefix[0..type_len]) catch unreachable;
                         state.classified = true;
                         state.typ = decoded.typ;
                         self.events.emit(.{ .stream_type_set = .{ .stream_id = id, .stream_type = eventStreamTypeFromWire(decoded.typ) } });
-                        // The control-stream view consumes its own stream-type
-                        // varint; strip it only for the other types.
-                        if (decoded.typ != .control) bytes = bytes[decoded.len..];
                         // Only one peer control stream and one of each QPACK
                         // stream is allowed; a duplicate is a connection error
                         // of type H3_STREAM_CREATION_ERROR (RFC 9114 §6.2.1,
@@ -682,6 +731,12 @@ pub fn Conn(comptime Transport: type) type {
                             },
                             .unknown => self.metrics.unknown_uni_streams += 1,
                         }
+                        // The control parser owns a separate view and consumes
+                        // its stream type too. Feed the retained prefix once;
+                        // the normal block below receives only post-type bytes.
+                        if (decoded.typ == .control) {
+                            _ = try self.ingestControlBytes(transport, state.type_prefix[0..type_len]);
+                        }
                     }
                     if (bytes.len > 0 and state.typ == .control) {
                         const had_settings = self.peer_control_view.saw_settings;
@@ -700,9 +755,37 @@ pub fn Conn(comptime Transport: type) type {
                             try self.publishEarlyTicketSnapshot(transport);
                         }
                     }
-                    // QPACK encoder/decoder instructions: with a zero-capacity
-                    // dynamic table the peer sends none that affect state;
-                    // unknown streams are drained and dropped.
+                    // We advertise the default maximum dynamic-table capacity
+                    // of zero. RFC 9204 SS3.2.3 therefore forbids the peer from
+                    // sending *any* encoder instruction, including a redundant
+                    // Set Dynamic Table Capacity 0. Ignoring those bytes would
+                    // silently accept a compression-state violation.
+                    if (bytes.len > 0 and state.typ == .qpack_encoder) {
+                        return self.fail(.qpack_encoder_stream_error);
+                    }
+                    if (bytes.len > 0 and state.typ == .qpack_decoder) {
+                        const before_acks = self.peer_qpack_decoder_state.section_acks;
+                        _ = self.peer_qpack_decoder_reader.ingest(
+                            self.allocator,
+                            &self.peer_qpack_decoder_state,
+                            bytes,
+                        ) catch |err| return if (err == error.OutOfMemory)
+                            error.OutOfMemory
+                        else
+                            self.fail(.qpack_decoder_stream_error);
+
+                        // With no dynamic inserts or references sent by this
+                        // endpoint, every Section Acknowledgment and Insert
+                        // Count Increment is impossible. Stream Cancellation
+                        // remains permitted at capacity zero (RFC 9204
+                        // section 2.2.2.2), so parsed cancellations are kept.
+                        if (self.peer_qpack_decoder_state.section_acks != before_acks or
+                            self.peer_qpack_decoder_state.known_received_count != 0)
+                        {
+                            return self.fail(.qpack_decoder_stream_error);
+                        }
+                    }
+                    // Unknown streams are drained and dropped.
                     if (result.fin) {
                         // Closing the control or either QPACK stream is a
                         // connection error of type H3_CLOSED_CRITICAL_STREAM
@@ -753,6 +836,8 @@ pub fn Conn(comptime Transport: type) type {
                 self.events.emit(.{ .frame_parsed = .{ .stream_id = control, .frame = eventFrameFromRaw(raw, &event_scratch) } });
             }
             switch (raw.typ) {
+                .max_push_id => try self.applyMaxPushId(raw),
+                .cancel_push => try self.applyCancelPush(raw),
                 .priority_update_request, .priority_update_push => {
                     if (!self.peer_control_view.saw_settings) return self.fail(.missing_settings);
                     try self.applyPriorityUpdate(transport, raw);
@@ -766,6 +851,27 @@ pub fn Conn(comptime Transport: type) type {
             if (!had_settings and self.peer_control_view.saw_settings) {
                 self.events.emit(.{ .parameters_set = .{ .initiator = .remote, .settings = self.peer_control_view.settings } });
             }
+        }
+
+        fn applyMaxPushId(self: *Self, raw: frame.RawFrame) H3Error!void {
+            if (!self.peer_control_view.saw_settings) return self.fail(.missing_settings);
+            const decoded = varint.decode(raw.payload) catch return self.fail(.frame_error);
+            if (decoded.len != raw.payload.len) return self.fail(.frame_error);
+            if (self.role == .client) return self.fail(.frame_unexpected);
+            if (self.peer_max_push_id) |previous| {
+                if (decoded.value < previous) return self.fail(.id_error);
+            }
+            self.peer_max_push_id = decoded.value;
+        }
+
+        fn applyCancelPush(self: *Self, raw: frame.RawFrame) H3Error!void {
+            if (!self.peer_control_view.saw_settings) return self.fail(.missing_settings);
+            const decoded = varint.decode(raw.payload) catch return self.fail(.frame_error);
+            if (decoded.len != raw.payload.len) return self.fail(.frame_error);
+            // This implementation creates no push streams. A syntactically
+            // valid cancellation therefore names no known push and is an ID
+            // error rather than silently accepted control traffic.
+            return self.fail(.id_error);
         }
 
         fn applyGoaway(self: *Self, raw: frame.RawFrame) H3Error!void {
@@ -886,14 +992,12 @@ pub fn Conn(comptime Transport: type) type {
                             return self.fail(.excessive_load);
                         }
                         self.buffered_request_bytes += retained_after;
-                        _ = ingest_result catch |err| {
-                            if (err == error.UnexpectedFrame) return self.fail(.frame_unexpected);
-                            return self.fail(.message_error);
-                        };
+                        _ = ingest_result catch |err| return self.failRequestSessionError(err);
                         self.recordPriorityHeaderMetrics(request);
                         self.applyPendingPriorityUpdate(id, request);
                     }
                     if (result.fin) {
+                        request.stream.validateComplete() catch |err| return self.failRequestSessionError(err);
                         request.finished = true;
                         break;
                     }
@@ -1019,12 +1123,31 @@ pub fn Conn(comptime Transport: type) type {
             }
 
             const response = self.allocator.create(ClientResponse) catch return error.OutOfMemory;
-            response.* = .{};
+            response.* = .{ .request_is_head = std.mem.eql(u8, request.method, "HEAD") };
             self.responses.put(id, response) catch {
                 self.allocator.destroy(response);
                 return error.OutOfMemory;
             };
             return id;
+        }
+
+        fn responseMayCarryNonEmptyContent(status: u16, request_is_head: bool) bool {
+            return !request_is_head and status != 204 and status != 205 and status != 304;
+        }
+
+        fn responseSkipsContentLengthCheck(status: u16, request_is_head: bool) bool {
+            // HEAD and 304 may carry representation metadata rather than a
+            // message body. 204's Content-Length is rejected by header
+            // validation. A 205 has no non-empty content, but RFC 9110 still
+            // defines it as having content, so an advertised length must be 0.
+            return request_is_head or status == 204 or status == 304;
+        }
+
+        fn responseEndsAtHeaders(status: u16) bool {
+            // RFC 9110 sections 15.3.5 and 15.4.5: 204 and 304 are complete
+            // at the end of their header section. Content-Length metadata on
+            // 304 remains legal, but neither DATA nor trailers may follow.
+            return status == 204 or status == 304;
         }
 
         /// Decode the response once the peer has finished the stream.
@@ -1040,24 +1163,58 @@ pub fn Conn(comptime Transport: type) type {
             var field_count: usize = 0;
             var body_start: usize = 0;
             var body_len: usize = 0;
+            var declared_content_length: ?usize = null;
+            const ResponsePhase = enum { interim, final_headers, body, trailers };
+            var phase: ResponsePhase = .interim;
+            // Trailers are deliberately decoded into independent storage:
+            // `response.fields` and `response.scratch` back the final header
+            // fields returned to the caller.
+            var trailer_fields: [64]qpack.HeaderField = undefined;
+            var trailer_scratch: [4096]u8 = undefined;
             while (offset < response.buffer.items.len) {
-                const raw = frame.decodeFrameWithLimit(response.buffer.items[offset..], max_response_len) catch return error.ProtocolError;
+                const raw = frame.decodeFrameWithLimit(response.buffer.items[offset..], max_response_len) catch return self.fail(.frame_error);
                 switch (raw.typ) {
                     .headers => {
-                        var scratch: []u8 = &response.scratch;
-                        field_count = qpack.decode(raw.payload, &response.fields, scratch[0..]) catch {
-                            self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .malformed = .{ .frame_type = raw.typ, .frame_type_value = raw.type_value, .raw_length = raw.len } } } });
-                            return error.ProtocolError;
-                        };
-                        self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .headers = .{ .fields = response.fields[0..field_count], .raw_length = raw.len } } } });
-                        if (status != null) return error.ProtocolError;
-                        if (field_count == 0) return error.ProtocolError;
-                        if (!std.mem.eql(u8, response.fields[0].name, ":status")) return error.ProtocolError;
-                        status = std.fmt.parseInt(u16, response.fields[0].value, 10) catch return error.ProtocolError;
+                        switch (phase) {
+                            .interim => {
+                                field_count = qpack.decode(raw.payload, &response.fields, response.scratch[0..]) catch {
+                                    self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .malformed = .{ .frame_type = raw.typ, .frame_type_value = raw.type_value, .raw_length = raw.len } } } });
+                                    return self.fail(.qpack_decompression_failed);
+                                };
+                                self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .headers = .{ .fields = response.fields[0..field_count], .raw_length = raw.len } } } });
+                                const validated = session.validateResponseHeaders(response.fields[0..field_count]) catch return self.fail(.message_error);
+                                // RFC 9114 section 4.1 permits zero or more
+                                // informational responses before the final response.
+                                // 101 is specific to HTTP/1.1 Upgrade and is not valid
+                                // in HTTP/3 (RFC 9114 section 4.5).
+                                if (validated.status == 101) return self.fail(.message_error);
+                                if (validated.status < 200) {
+                                    field_count = 0;
+                                } else {
+                                    status = validated.status;
+                                    declared_content_length = validated.content_length;
+                                    phase = .final_headers;
+                                }
+                            },
+                            .final_headers, .body => {
+                                if (responseEndsAtHeaders(status.?)) return self.fail(.message_error);
+                                const trailer_count = qpack.decode(raw.payload, &trailer_fields, trailer_scratch[0..]) catch {
+                                    self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .malformed = .{ .frame_type = raw.typ, .frame_type_value = raw.type_value, .raw_length = raw.len } } } });
+                                    return self.fail(.qpack_decompression_failed);
+                                };
+                                self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .headers = .{ .fields = trailer_fields[0..trailer_count], .raw_length = raw.len } } } });
+                                session.validateResponseTrailers(trailer_fields[0..trailer_count]) catch return self.fail(.message_error);
+                                phase = .trailers;
+                            },
+                            .trailers => return self.fail(.frame_unexpected),
+                        }
                     },
                     .data => {
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .data = .{ .raw_length = raw.len } } } });
-                        if (status == null) return error.ProtocolError;
+                        if (status == null) return self.fail(.frame_unexpected);
+                        if (phase == .trailers) return self.fail(.frame_unexpected);
+                        if (responseEndsAtHeaders(status.?)) return self.fail(.message_error);
+                        if (!responseMayCarryNonEmptyContent(status.?, response.request_is_head) and raw.payload.len > 0) return self.fail(.message_error);
                         if (body_len == 0) {
                             body_start = offset + (raw.len - raw.payload.len);
                         }
@@ -1071,20 +1228,36 @@ pub fn Conn(comptime Transport: type) type {
                             );
                         }
                         body_len += raw.payload.len;
+                        phase = .body;
                     },
-                    .priority_update_request, .priority_update_push => {
+                    .cancel_push, .settings, .goaway, .max_push_id, .priority_update_request, .priority_update_push => {
                         var event_scratch = EventDecodeScratch{};
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = eventFrameFromRaw(raw, &event_scratch) } });
                         return self.fail(.frame_unexpected);
                     },
-                    else => {
+                    .push_promise => {
+                        var event_scratch = EventDecodeScratch{};
+                        self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = eventFrameFromRaw(raw, &event_scratch) } });
+                        _ = varint.decode(raw.payload) catch return self.fail(.frame_error);
+                        // This client never advertises MAX_PUSH_ID, so every
+                        // valid PUSH_PROMISE exceeds the permitted push-ID
+                        // space (RFC 9114 section 7.2.5).
+                        return self.fail(.id_error);
+                    },
+                    .unknown => {
+                        if (frame.isForbiddenHttp2FrameType(raw.type_value)) return self.fail(.frame_unexpected);
                         var event_scratch = EventDecodeScratch{};
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = eventFrameFromRaw(raw, &event_scratch) } });
                     },
                 }
                 offset += raw.len;
             }
-            const final_status = status orelse return error.ProtocolError;
+            const final_status = status orelse return self.fail(.message_error);
+            if (declared_content_length) |declared| {
+                if (!responseSkipsContentLengthCheck(final_status, response.request_is_head) and declared != body_len) {
+                    return self.fail(.message_error);
+                }
+            }
             self.metrics.responses_decoded += 1;
             return .{
                 .status = final_status,
@@ -1913,6 +2086,7 @@ test "H3 conn: client observes response HEADERS before QPACK failure" {
     try client.pump(&client_transport);
 
     try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.qpack_decompression_failed, client.close_code.?);
     try testing.expect(client_events.sawMalformedFrame(.headers));
 }
 
@@ -1943,6 +2117,7 @@ test "H3 conn: client observes duplicate response HEADERS before rejection" {
     try client.pump(&client_transport);
 
     try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
     try testing.expect(client_events.sawFrame(.parsed, .headers));
 }
 
@@ -1969,7 +2144,537 @@ test "H3 conn: client observes response DATA before missing-headers rejection" {
     try client.pump(&client_transport);
 
     try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.frame_unexpected, client.close_code.?);
     try testing.expect(client_events.sawFrame(.parsed, .data));
+}
+
+test "H3 conn: client maps a truncated response frame to H3_FRAME_ERROR" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/truncated-frame" });
+    _ = try server_transport.writeStream(id, "\x00", true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.frame_error, client.close_code.?);
+}
+
+test "H3 conn: client rejects request pseudo-headers in a response" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/bad-response-pseudo" });
+    var qpack_buf: [128]u8 = undefined;
+    const block = try qpack.encode(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = ":method", .value = "GET" },
+    }, &qpack_buf);
+    var wire: [160]u8 = undefined;
+    const headers = try frame.encodeKnownFrame(.headers, block, &wire);
+    _ = try server_transport.writeStream(id, headers, true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
+}
+
+test "H3 conn: client accepts informational responses before the final response" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/early-hints" });
+    var wire: [512]u8 = undefined;
+    var len: usize = 0;
+    const informational = try session.ResponseEncoder.encodeHeaders(103, &.{
+        .{ .name = "link", .value = "</style.css>; rel=preload" },
+    }, wire[len..]);
+    len += informational.len;
+    const final = try session.ResponseEncoder.encodeHeaders(200, &.{
+        .{ .name = "content-type", .value = "text/plain" },
+    }, wire[len..]);
+    len += final.len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    const response = (try client.pollResponse(id)).?;
+    try testing.expectEqual(@as(u16, 200), response.status);
+    try testing.expectEqualStrings("content-type", response.headers[0].name);
+    try testing.expectEqual(@as(?ErrorCode, null), client.close_code);
+}
+
+test "H3 conn: client accepts trailers after an informational and final response" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/trailers" });
+    var wire: [1024]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(103, &.{
+        .{ .name = "link", .value = "</style.css>; rel=preload" },
+    }, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{
+        .{ .name = "content-type", .value = "text/plain" },
+    }, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeData("body", wire[len..])).len;
+    var trailer_block_buf: [128]u8 = undefined;
+    const trailer_block = try qpack.encode(&.{.{ .name = "x-checksum", .value = "ok" }}, &trailer_block_buf);
+    len += (try frame.encodeKnownFrame(.headers, trailer_block, wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    const response = (try client.pollResponse(id)).?;
+    try testing.expectEqual(@as(u16, 200), response.status);
+    try testing.expectEqualStrings("content-type", response.headers[0].name);
+    try testing.expectEqualStrings("body", response.body);
+    try testing.expectEqual(@as(?ErrorCode, null), client.close_code);
+}
+
+test "H3 conn: client rejects a second response trailer section" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/second-trailer" });
+    var wire: [512]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+    var trailer_block_buf: [128]u8 = undefined;
+    const trailer_block = try qpack.encode(&.{.{ .name = "x-checksum", .value = "ok" }}, &trailer_block_buf);
+    len += (try frame.encodeKnownFrame(.headers, trailer_block, wire[len..])).len;
+    len += (try frame.encodeKnownFrame(.headers, trailer_block, wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.frame_unexpected, client.close_code.?);
+}
+
+test "H3 conn: client rejects DATA after response trailers" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/data-after-trailer" });
+    var wire: [512]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+    var trailer_block_buf: [128]u8 = undefined;
+    const trailer_block = try qpack.encode(&.{.{ .name = "x-checksum", .value = "ok" }}, &trailer_block_buf);
+    len += (try frame.encodeKnownFrame(.headers, trailer_block, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeData("body", wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.frame_unexpected, client.close_code.?);
+}
+
+test "H3 conn: client enforces response content-length after the final body" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/short-content-length" });
+    var wire: [256]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{.{ .name = "content-length", .value = "4" }}, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeData("cat", wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
+}
+
+test "H3 conn: client rejects a response body longer than content-length" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/long-content-length" });
+    var wire: [256]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{.{ .name = "content-length", .value = "2" }}, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeData("cat", wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
+}
+
+test "H3 conn: client enforces Content-Length on 205 responses" {
+    const allocator = testing.allocator;
+    const H3 = Conn(MockTransport);
+    inline for ([_]struct { content_length: []const u8, expect_error: bool }{
+        .{ .content_length = "0", .expect_error = false },
+        .{ .content_length = "10", .expect_error = true },
+    }) |case| {
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+
+        var client = H3.init(allocator, .client);
+        defer client.deinit();
+        const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/reset-content" });
+        var wire: [128]u8 = undefined;
+        const headers = try session.ResponseEncoder.encodeHeaders(205, &.{.{ .name = "content-length", .value = case.content_length }}, &wire);
+        _ = try server_transport.writeStream(id, headers, true);
+        try client.pump(&client_transport);
+
+        if (case.expect_error) {
+            try testing.expectError(error.ProtocolError, client.pollResponse(id));
+            try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
+        } else {
+            const response = (try client.pollResponse(id)).?;
+            try testing.expectEqual(@as(u16, 205), response.status);
+            try testing.expectEqual(@as(usize, 0), response.body.len);
+        }
+    }
+}
+
+test "H3 conn: client rejects known control frames on a response stream" {
+    const allocator = testing.allocator;
+    const H3 = Conn(MockTransport);
+    inline for ([_]frame.FrameType{ .settings, .goaway, .max_push_id }) |illegal| {
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+
+        var client = H3.init(allocator, .client);
+        defer client.deinit();
+        const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/illegal-frame" });
+        var wire: [128]u8 = undefined;
+        var len: usize = 0;
+        len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+        len += (try frame.encodeKnownFrame(illegal, &.{}, wire[len..])).len;
+        _ = try server_transport.writeStream(id, wire[0..len], true);
+        try client.pump(&client_transport);
+
+        try testing.expectError(error.ProtocolError, client.pollResponse(id));
+        try testing.expectEqual(ErrorCode.frame_unexpected, client.close_code.?);
+    }
+}
+
+test "H3 conn: client rejects HTTP2-only response frames but ignores extensions" {
+    inline for ([_]u64{ 0x02, 0x06, 0x08, 0x09 }) |typ| {
+        const allocator = testing.allocator;
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+        const H3 = Conn(MockTransport);
+        var client = H3.init(allocator, .client);
+        defer client.deinit();
+        const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/reserved-response" });
+        var wire: [128]u8 = undefined;
+        var len: usize = 0;
+        len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+        len += (try frame.encodeFrame(typ, "", wire[len..])).len;
+        _ = try server_transport.writeStream(id, wire[0..len], true);
+        try client.pump(&client_transport);
+        try testing.expectError(error.ProtocolError, client.pollResponse(id));
+        try testing.expectEqual(ErrorCode.frame_unexpected, client.close_code.?);
+    }
+    inline for ([_]u64{ 0x21, 0x40 }) |typ| {
+        const allocator = testing.allocator;
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+        const H3 = Conn(MockTransport);
+        var client = H3.init(allocator, .client);
+        defer client.deinit();
+        const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/extension-response" });
+        var wire: [128]u8 = undefined;
+        var len: usize = 0;
+        len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+        len += (try frame.encodeFrame(typ, "", wire[len..])).len;
+        _ = try server_transport.writeStream(id, wire[0..len], true);
+        try client.pump(&client_transport);
+        const response = (try client.pollResponse(id)).?;
+        try testing.expectEqual(@as(u16, 200), response.status);
+    }
+}
+
+test "H3 conn: client rejects PUSH_PROMISE while push is disabled" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/push-promise" });
+    var wire: [128]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+    len += (try frame.encodeKnownFrame(.push_promise, &.{0}, wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.id_error, client.close_code.?);
+}
+
+test "H3 conn: truncated PUSH_PROMISE is a frame error before disabled-push policy" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/truncated-push" });
+    var wire: [128]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..])).len;
+    len += (try frame.encodeKnownFrame(.push_promise, &.{}, wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.frame_error, client.close_code.?);
+}
+
+test "H3 conn: control MAX_PUSH_ID and CANCEL_PUSH validate payload role and monotonicity" {
+    const Case = struct { typ: frame.FrameType, payload: []const u8, role: Role, want: ErrorCode };
+    const cases = [_]Case{
+        .{ .typ = .max_push_id, .payload = &.{}, .role = .server, .want = .frame_error },
+        .{ .typ = .max_push_id, .payload = &.{ 0, 0 }, .role = .server, .want = .frame_error },
+        .{ .typ = .cancel_push, .payload = &.{}, .role = .server, .want = .frame_error },
+        .{ .typ = .cancel_push, .payload = &.{0}, .role = .server, .want = .id_error },
+        .{ .typ = .max_push_id, .payload = &.{0}, .role = .client, .want = .frame_unexpected },
+    };
+    inline for (cases) |case| {
+        const allocator = testing.allocator;
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+        const H3 = Conn(MockTransport);
+        var receiver = H3.init(allocator, case.role);
+        defer receiver.deinit();
+        var sender = H3.init(allocator, if (case.role == .client) .server else .client);
+        defer sender.deinit();
+        try receiver.start(if (case.role == .client) &client_transport else &server_transport);
+        try sender.start(if (case.role == .client) &server_transport else &client_transport);
+        try receiver.pump(if (case.role == .client) &client_transport else &server_transport);
+        var wire: [16]u8 = undefined;
+        const encoded = try frame.encodeKnownFrame(case.typ, case.payload, &wire);
+        _ = try (if (case.role == .client) server_transport.writeStream(sender.control_out.?, encoded, false) else client_transport.writeStream(sender.control_out.?, encoded, false));
+        try testing.expectError(error.ProtocolError, receiver.pump(if (case.role == .client) &client_transport else &server_transport));
+        try testing.expectEqual(case.want, receiver.close_code.?);
+    }
+
+    // A server accepts a client-issued limit once, but it must never move
+    // backwards on a later MAX_PUSH_ID.
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    try server.start(&server_transport);
+    try client.start(&client_transport);
+    try server.pump(&server_transport);
+    var wire: [16]u8 = undefined;
+    const high = try frame.encodeKnownFrame(.max_push_id, &.{1}, &wire);
+    _ = try client_transport.writeStream(client.control_out.?, high, false);
+    try server.pump(&server_transport);
+    const low = try frame.encodeKnownFrame(.max_push_id, &.{0}, &wire);
+    _ = try client_transport.writeStream(client.control_out.?, low, false);
+    try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+    try testing.expectEqual(ErrorCode.id_error, server.close_code.?);
+}
+
+test "H3 conn: client permits representation content-length on HEAD and 304 responses" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const head_id = try client.sendRequest(&client_transport, .{
+        .method = "HEAD",
+        .authority = "tardigrade.test",
+        .path = "/head-content-length",
+    });
+    var wire: [128]u8 = undefined;
+    const head_headers = try session.ResponseEncoder.encodeHeaders(200, &.{.{ .name = "content-length", .value = "10" }}, &wire);
+    _ = try server_transport.writeStream(head_id, head_headers, true);
+    try client.pump(&client_transport);
+
+    const head_response = (try client.pollResponse(head_id)).?;
+    try testing.expectEqual(@as(u16, 200), head_response.status);
+    try testing.expectEqual(@as(usize, 0), head_response.body.len);
+
+    const not_modified_id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/not-modified" });
+    const not_modified_headers = try session.ResponseEncoder.encodeHeaders(304, &.{.{ .name = "content-length", .value = "10" }}, &wire);
+    _ = try server_transport.writeStream(not_modified_id, not_modified_headers, true);
+    try client.pump(&client_transport);
+
+    const not_modified_response = (try client.pollResponse(not_modified_id)).?;
+    try testing.expectEqual(@as(u16, 304), not_modified_response.status);
+    try testing.expectEqual(@as(usize, 0), not_modified_response.body.len);
+    try testing.expectEqual(@as(?ErrorCode, null), client.close_code);
+}
+
+test "H3 conn: client rejects trailers after terminal response headers" {
+    const allocator = testing.allocator;
+    const H3 = Conn(MockTransport);
+    inline for ([_]u16{ 204, 304 }) |status| {
+        {
+            var client_transport = MockTransport.init(allocator, true);
+            defer client_transport.deinit();
+            var server_transport = MockTransport.init(allocator, false);
+            defer server_transport.deinit();
+            client_transport.peer = &server_transport;
+            server_transport.peer = &client_transport;
+
+            var client = H3.init(allocator, .client);
+            defer client.deinit();
+
+            const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/terminal-trailer" });
+            var wire: [256]u8 = undefined;
+            var len: usize = 0;
+            len += (try session.ResponseEncoder.encodeHeaders(status, &.{}, wire[len..])).len;
+            var trailer_block_buf: [128]u8 = undefined;
+            const trailer_block = try qpack.encode(&.{.{ .name = "x-checksum", .value = "ok" }}, &trailer_block_buf);
+            len += (try frame.encodeKnownFrame(.headers, trailer_block, wire[len..])).len;
+            _ = try server_transport.writeStream(id, wire[0..len], true);
+            try client.pump(&client_transport);
+
+            try testing.expectError(error.ProtocolError, client.pollResponse(id));
+            try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
+        }
+    }
+}
+
+test "H3 conn: client rejects empty DATA after terminal response headers" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/terminal-empty-data" });
+    var wire: [128]u8 = undefined;
+    var len: usize = 0;
+    len += (try session.ResponseEncoder.encodeHeaders(204, &.{}, wire[len..])).len;
+    len += (try session.ResponseEncoder.encodeData("", wire[len..])).len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expectEqual(ErrorCode.message_error, client.close_code.?);
 }
 
 test "H3 conn: event sink observes settings stream frames and priority updates" {
@@ -2160,6 +2865,27 @@ test "H3 conn: unknown request frame is observed as unknown" {
     try server.pump(&server_transport);
     try testing.expect(server_events.sawUnknownFrame(0x21));
     try testing.expect(!server_events.sawFrame(.parsed, .data));
+}
+
+test "H3 conn: server rejects HTTP2-only request frames" {
+    inline for ([_]u64{ 0x02, 0x06, 0x08, 0x09 }) |typ| {
+        const allocator = testing.allocator;
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+        const H3 = Conn(MockTransport);
+        var server = H3.init(allocator, .server);
+        defer server.deinit();
+        const id = try client_transport.openStream(.bidi);
+        var wire: [16]u8 = undefined;
+        const reserved = try frame.encodeFrame(typ, "", &wire);
+        _ = try client_transport.writeStream(id, reserved, false);
+        try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+        try testing.expectEqual(ErrorCode.frame_unexpected, server.close_code.?);
+    }
 }
 
 test "H3 conn: malformed known frames are not observed as unknown" {
@@ -2763,6 +3489,25 @@ test "H3 conn: request stream reset releases request state" {
     try testing.expectEqual(@as(u32, 0), server.requests.count());
 }
 
+test "H3 conn: FIN without request headers fails before application polling" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    const request_id = try client_transport.openStream(.bidi);
+    _ = try client_transport.writeStream(request_id, "", true);
+    try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+    try testing.expectEqual(ErrorCode.request_incomplete, server.close_code.?);
+}
+
 test "H3 conn: request stream reset cleanup handles default concurrency" {
     const allocator = testing.allocator;
     var client_transport = MockTransport.init(allocator, true);
@@ -2802,6 +3547,48 @@ test "fuzz: H3 connection state command sequences preserve critical stream and r
     } });
 }
 
+test "H3 conn-state model classifies SETTINGS repeated across pump boundaries" {
+    try runH3ConnStateCommands("\x00\x00\x00\x00", .server);
+    try runH3ConnStateCommands("\x00\x00\x00\x00", .client);
+}
+
+test "H3 conn-state model classifies a headerless request FIN" {
+    try runH3ConnStateCommands("\x0f", .server);
+    try runH3ConnStateCommands("\x0f", .client);
+}
+
+test "H3 conn-state model classifies repeated request HEADERS across pumps" {
+    try runH3ConnStateCommands("\x0b\x00\x0b", .server);
+    try runH3ConnStateCommands("\x0c\x00\x0c", .server);
+}
+
+test "H3 conn-state model rejects encoder instructions at zero QPACK capacity" {
+    try runH3ConnStateCommands("\x1b", .server);
+    try runH3ConnStateCommands("\x1b", .client);
+}
+
+test "H3 conn-state model rejects impossible decoder instructions" {
+    try runH3ConnStateCommands("\x1c", .server);
+    try runH3ConnStateCommands("\x1c", .client);
+}
+
+test "H3 conn-state model permits decoder stream cancellation at zero QPACK capacity" {
+    try runH3ConnStateCommands("\x1d", .server);
+    try runH3ConnStateCommands("\x1d", .client);
+}
+
+test "H3 conn-state model does not repeat stream types when closing QPACK streams" {
+    try runH3ConnStateCommands("\x01\x00\x08", .server);
+    try runH3ConnStateCommands("\x01\x00\x08", .client);
+    try runH3ConnStateCommands("\x1d\x00\x13", .server);
+    try runH3ConnStateCommands("\x1d\x00\x13", .client);
+}
+
+test "H3 conn-state model fragments a multi-byte uni stream type" {
+    try runH3ConnStateCommands("\x1e", .server);
+    try runH3ConnStateCommands("\x1e", .client);
+}
+
 fn fuzzH3ConnStateCommands(_: void, smith: *testing.Smith) !void {
     var input: [192]u8 = undefined;
     const len = smith.slice(&input);
@@ -2817,11 +3604,11 @@ fn fuzzH3ConnStateCommands(_: void, smith: *testing.Smith) !void {
     // `std.testing.allocator` for that.
     var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     const allocator = gpa.allocator();
-    runH3ConnStateCommands(allocator, input[0..len], .server) catch |err| {
+    runH3ConnStateCommandsWithAllocator(input[0..len], .server, allocator) catch |err| {
         gpa.deinitWithoutLeakChecks();
         return err;
     };
-    runH3ConnStateCommands(allocator, input[0..len], .client) catch |err| {
+    runH3ConnStateCommandsWithAllocator(input[0..len], .client, allocator) catch |err| {
         gpa.deinitWithoutLeakChecks();
         return err;
     };
@@ -2923,7 +3710,11 @@ fn expectPendingUniMatchesModel(conn: anytype, model: *const ModelPendingUni) !v
     for (model.ids[0..model.len]) |id| try testing.expect(conn.pending_uni.contains(id));
 }
 
-fn runH3ConnStateCommands(allocator: std.mem.Allocator, input: []const u8, role: Role) !void {
+fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
+    return runH3ConnStateCommandsWithAllocator(input, role, testing.allocator);
+}
+
+fn runH3ConnStateCommandsWithAllocator(input: []const u8, role: Role, allocator: std.mem.Allocator) !void {
     var peer_transport = MockTransport.init(allocator, role == .server);
     defer peer_transport.deinit();
     var local_transport = MockTransport.init(allocator, role == .client);
@@ -2970,8 +3761,14 @@ fn runH3ConnStateCommands(allocator: std.mem.Allocator, input: []const u8, role:
         var model_uni_retired_after_accept: ?u64 = null;
         var expected_close: ?ErrorCode = null;
 
-        const result = switch (op % 27) {
+        const result = switch (op % 31) {
             0 => blk: {
+                // Reusing the tracked control stream sends a second SETTINGS
+                // frame in a later pump. This is distinct from op 6's two
+                // coalesced SETTINGS frames: the incremental control parser
+                // has already committed the first frame and must still report
+                // the exact H3_FRAME_UNEXPECTED connection error.
+                if (before_settings) expected_close = .frame_unexpected;
                 // A refusal here is the transport correctly withholding stream
                 // credit, which a real peer would also hit; skip the op rather
                 // than reporting the refusal as a finding (#753).
@@ -3120,6 +3917,7 @@ fn runH3ConnStateCommands(allocator: std.mem.Allocator, input: []const u8, role:
             },
             11 => blk: {
                 if (role == .server) {
+                    if (peer_request != null) expected_close = .message_error;
                     const id = peer_request orelse try peer_transport.openStream(.bidi);
                     peer_request = id;
                     _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
@@ -3128,6 +3926,7 @@ fn runH3ConnStateCommands(allocator: std.mem.Allocator, input: []const u8, role:
             },
             12 => blk: {
                 if (role == .server) {
+                    if (peer_request != null) expected_close = .message_error;
                     const id = peer_request orelse try peer_transport.openStream(.bidi);
                     peer_request = id;
                     _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
@@ -3155,6 +3954,7 @@ fn runH3ConnStateCommands(allocator: std.mem.Allocator, input: []const u8, role:
             },
             15 => blk: {
                 if (role == .server) {
+                    if (peer_request == null) expected_close = .request_incomplete;
                     const id = peer_request orelse try peer_transport.openStream(.bidi);
                     peer_request = id;
                     const s = try local_transport.stream(id);
@@ -3289,7 +4089,7 @@ fn runH3ConnStateCommands(allocator: std.mem.Allocator, input: []const u8, role:
                 model_uni_retired_after_accept = id;
                 break :blk conn.pump(&local_transport);
             },
-            else => blk: {
+            26 => blk: {
                 // Reset-before-accept streams never become pending H3 state and
                 // therefore are not candidates for the ceiling calculation.
                 if (peer_transport.uniCreditInUse() + reserved_uni_credit >= peer_transport.max_uni_streams)
@@ -3303,6 +4103,50 @@ fn runH3ConnStateCommands(allocator: std.mem.Allocator, input: []const u8, role:
                 _ = try peer_transport.writeStream(id, bytes[0..typ_len], false);
                 try local_transport.resetStreamForTest(id);
                 model_uni_ignored_before_accept = id;
+                break :blk conn.pump(&local_transport);
+            },
+            27 => blk: {
+                // Any encoder instruction is forbidden because this endpoint
+                // advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY=0. A redundant
+                // Set Dynamic Table Capacity 0 is the smallest such input.
+                if (!try writePeerUni(&peer_transport, .qpack_encoder, &.{0x20}, false, &peer_qpack_encoder))
+                    break :blk conn.pump(&local_transport);
+                expected_close = .qpack_encoder_stream_error;
+                break :blk conn.pump(&local_transport);
+            },
+            28 => blk: {
+                // We never send dynamic inserts, so even the smallest Insert
+                // Count Increment is invalid. Zero is independently forbidden
+                // by RFC 9204 section 4.4.3.
+                if (!try writePeerUni(&peer_transport, .qpack_decoder, &.{0x00}, false, &peer_qpack_decoder))
+                    break :blk conn.pump(&local_transport);
+                expected_close = .qpack_decoder_stream_error;
+                break :blk conn.pump(&local_transport);
+            },
+            29 => blk: {
+                // A capacity-zero decoder may still report that it abandoned
+                // a stream. Keep this legal instruction in the op set so the
+                // protocol-error oracle cannot regress into blanket rejection.
+                if (!try writePeerUni(&peer_transport, .qpack_decoder, &.{0x40}, false, &peer_qpack_decoder))
+                    break :blk conn.pump(&local_transport);
+                break :blk conn.pump(&local_transport);
+            },
+            else => blk: {
+                // Deliver a legal two-byte unknown stream type across pumps.
+                // The product must retain the consumed first byte, classify
+                // the completed varint, drain it, and retire it on FIN.
+                if (peer_transport.uniCreditInUse() + reserved_uni_credit >= peer_transport.max_uni_streams)
+                    break :blk conn.pump(&local_transport);
+                const id = peer_transport.openStream(.uni) catch |err| switch (err) {
+                    error.StreamLimitReached => break :blk conn.pump(&local_transport),
+                    else => return err,
+                };
+                var encoded: [8]u8 = undefined;
+                const encoded_len = try varint.encode(64, &encoded);
+                _ = try peer_transport.writeStream(id, encoded[0..1], false);
+                conn.pump(&local_transport) catch |err| break :blk err;
+                _ = try peer_transport.writeStream(id, encoded[1..encoded_len], true);
+                model_uni_retired_after_accept = id;
                 break :blk conn.pump(&local_transport);
             },
         };
@@ -3397,6 +4241,7 @@ fn modelExpectsPendingUniCeiling(before_count: usize, opened_this_op: usize, cei
 /// caller can skip the op instead of surfacing the transport's correct
 /// refusal as a fuzz finding (#753).
 fn writePeerUni(peer_transport: *MockTransport, typ: frame.StreamType, payload_after_type: []const u8, fin: bool, slot: *?u64) !bool {
+    const opening = slot.* == null;
     const id = slot.* orelse peer_transport.openStream(.uni) catch |err| switch (err) {
         error.StreamLimitReached => return false,
         else => return err,
@@ -3405,7 +4250,10 @@ fn writePeerUni(peer_transport: *MockTransport, typ: frame.StreamType, payload_a
     var prefix: [8]u8 = undefined;
     const stream_type = try frame.encodeStreamType(typ, &prefix);
     if (payload_after_type.len == 0 and typ != .control) {
-        _ = try peer_transport.writeStream(id, stream_type, fin);
+        // The type occurs exactly once at the start of a unidirectional
+        // stream. Reusing a tracked critical stream to send FIN must not turn
+        // its type byte into a QPACK instruction (FINDING F15).
+        _ = try peer_transport.writeStream(id, if (opening) stream_type else "", fin);
         return true;
     }
     if (peer_transport.peer) |target| {
@@ -3450,16 +4298,19 @@ fn dataFrameBytes() [5]u8 {
     return .{ 0x00, 0x03, 'b', 'o', 'd' };
 }
 
-fn requestHeadersBytes() [9]u8 {
-    return .{ 0x01, 0x07, 0x00, 0x00, 0xd1, 0xd7, 0x50, 0x00, 0xc1 };
+fn requestHeadersBytes() [10]u8 {
+    // HEADERS carrying GET, https, authority "x", and path "/". Keep this
+    // fixture semantically complete: several state-model operations add FIN
+    // and therefore exercise completion validation, not just frame parsing.
+    return .{ 0x01, 0x08, 0x00, 0x00, 0xd1, 0xd7, 0x50, 0x01, 'x', 0xc1 };
 }
 
-fn duplicateRequestHeadersBytes() [18]u8 {
+fn duplicateRequestHeadersBytes() [20]u8 {
     const h = requestHeadersBytes();
     return h ++ h;
 }
 
-fn requestWithTrailersThenDataBytes() [23]u8 {
+fn requestWithTrailersThenDataBytes() [25]u8 {
     const h = requestHeadersBytes();
     const d = dataFrameBytes();
     return h ++ h ++ d;
@@ -3645,6 +4496,46 @@ test "H3 conn: uni stream reset before first acceptance is never tracked" {
     try testing.expectEqual(@as(u64, 0), server.metrics.unknown_uni_streams);
 }
 
+test "H3 conn: fragmented unknown uni stream type is retained and retired" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    const id = try client_transport.openStream(.uni);
+    var encoded: [8]u8 = undefined;
+    const len = try varint.encode(64, &encoded);
+    try testing.expectEqual(@as(usize, 2), len);
+
+    _ = try client_transport.writeStream(id, encoded[0..1], false);
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(u32, 1), server.pending_uni.count());
+    const pending = server.pending_uni.get(id).?;
+    try testing.expect(!pending.classified);
+    try testing.expectEqual(@as(usize, 1), pending.type_prefix_len);
+
+    _ = try client_transport.writeStream(id, encoded[1..len], true);
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(?ErrorCode, null), server.close_code);
+    try testing.expectEqual(@as(u32, 0), server.pending_uni.count());
+    try testing.expectEqual(@as(u64, 1), server.metrics.unknown_uni_streams);
+
+    // Closing before the stream-type varint is complete is expressly legal.
+    const truncated = try client_transport.openStream(.uni);
+    _ = try client_transport.writeStream(truncated, "\x80", true);
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(?ErrorCode, null), server.close_code);
+    try testing.expectEqual(@as(u32, 0), server.pending_uni.count());
+    try testing.expectEqual(@as(u64, 1), server.metrics.unknown_uni_streams);
+}
+
 test "H3 conn: a reset does not launder an illegal peer stream into a silent skip" {
     // A reset must not turn a protocol violation into a silent skip. A server
     // that opens a bidirectional stream has violated RFC 9114 §6.1 whether or
@@ -3785,8 +4676,8 @@ test "H3 conn-state fuzz model accepts a ceiling-tripping op sequence" {
     // and every assertion inside it execute. A false positive in that branch
     // fails here, deterministically, in milliseconds.
     const input = [_]u8{3} ** 16;
-    try runH3ConnStateCommands(testing.allocator, &input, .server);
-    try runH3ConnStateCommands(testing.allocator, &input, .client);
+    try runH3ConnStateCommands(&input, .server);
+    try runH3ConnStateCommands(&input, .client);
 }
 
 test "H3 conn-state ceiling oracle rejects SUT-only occupancy" {
@@ -3805,8 +4696,8 @@ test "H3 conn-state ceiling oracle rejects SUT-only occupancy" {
 
 test "H3 conn-state model tracks finished and reset-before-accept uni streams" {
     const input = [_]u8{ 25, 26 } ** 8;
-    try runH3ConnStateCommands(testing.allocator, &input, .server);
-    try runH3ConnStateCommands(testing.allocator, &input, .client);
+    try runH3ConnStateCommands(&input, .server);
+    try runH3ConnStateCommands(&input, .client);
 }
 
 test "H3 conn: pending uni streams past max_pending_uni close with excessive load" {

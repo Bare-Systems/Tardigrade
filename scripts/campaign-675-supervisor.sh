@@ -10,11 +10,22 @@
 #                                    passed rows and re-attaches to a launched one).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
-LOG=artifacts/hardening/fuzz/campaign-675-92dc8a4a/driver.log
+if [[ "$#" -gt 1 ]]; then
+  printf 'usage: scripts/campaign-675-supervisor.sh [campaign-state]\n' >&2
+  exit 64
+fi
+# shellcheck source=scripts/campaign-675-state.sh
+source scripts/campaign-675-state.sh
+campaign_675_load_state "${1:-}" || {
+  printf 'campaign-675-supervisor: no valid immutable campaign state\n' >&2
+  exit 1
+}
+
+LOG="$CAMPAIGN_DIR/driver.log"
 say() { printf '%s SUPERVISOR %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$LOG"; }
-say "started"
+say "started for release $RELEASE_TAG @ $SOURCE_SHA"
 while true; do
-  scripts/campaign-675-driver.sh
+  scripts/campaign-675-driver.sh "$CAMPAIGN_STATE"
   rc=$?
   case "$rc" in
     0) say "driver reported all rows complete; supervisor exiting"; exit 0 ;;

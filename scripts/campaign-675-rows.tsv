@@ -1,0 +1,63 @@
+row_id	tier	family	target	budget
+t2-q11	2	quic	fuzz: H3 connection state command sequences preserve critical stream and request invariants	50M
+t2-chg01	2	quic	fuzz: stream manager command sequences preserve flow-control invariants	50M
+t2-chg02	2	quic	fuzz: stream send queue ack loss close command sequences preserve retransmission invariants	50M
+t2-chg03	2	quic	fuzz: QPACK stateful dynamic table and instruction streams preserve invariants	50M
+t2-chg04	2	quic	fuzz: CRYPTO reassembly command sequences preserve bounded invariants	50M
+t1-01	1	tls-protocol	-	10M
+t1-02	1	tls-record	-	10M
+t1-03	1	tls-resumption	-	10M
+t1-04	1	pki	-	10M
+t1-05	1	crypto	-	10M
+t1-06	1	quic	-	10M
+t2-quic01	2	quic	fuzz: QPACK static decoder never panics on arbitrary field sections	50M
+t2-quic02	2	quic	fuzz: QPACK static-table selections round-trip through encoder	50M
+t2-quic03	2	quic	fuzz: Retry token issue validate and mutation boundary is deterministic	50M
+t2-quic04	2	quic	fuzz: SETTINGS decoder never panics on arbitrary payloads	50M
+t2-quic05	2	quic	fuzz: canonical frame encoders round-trip supported families	50M
+t2-quic06	2	quic	fuzz: control stream ingestion never panics or leaks	50M
+t2-quic07	2	quic	fuzz: frame decoder never panics on arbitrary bytes	50M
+t2-quic08	2	quic	fuzz: frame decoder preserves bounded consumption and slice invariants	50M
+t2-quic09	2	quic	fuzz: packet number truncation reconstructs recent sends	50M
+t2-quic10	2	quic	fuzz: packet parser preserves bounded slice and progress invariants	50M
+t2-quic11	2	quic	fuzz: packet writers round-trip public parser fields	50M
+t2-quic12	2	quic	fuzz: transport parameter decoder preserves bounded structural contract	50M
+t2-quic13	2	quic	fuzz: transport parameters canonical encode and binding round-trip	50M
+t2-quic14	2	quic	fuzz: varint decode and minimal re-encode never panic	50M
+t2-quic15	2	quic	fuzz: varint encode round-trips arbitrary in-range values	50M
+t2-tls-16	2	tls-protocol	fuzz: TLS protocol: ClientHello parse and policy negotiation stays within configured registry	50M
+t2-tls-17	2	tls-protocol	fuzz: TLS protocol: HRR decode and ClientHello2 validation reject malformed ordering deterministically	50M
+t2-tls-18	2	tls-protocol	fuzz: TLS protocol: handshake core and driver reject malformed ordering with sticky terminal errors	50M
+t2-tls-19	2	tls-protocol	fuzz: TLS protocol: handshake framing extensions and reassembly preserve bounded cursor invariants	50M
+t2-tls-20	2	tls-protocol	fuzz: TLS protocol: transcript update select and HRR rebind sequences are bounded and deterministic	50M
+t2-tls-21	2	tls-record	fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption	50M
+t2-tls-22	2	tls-record	fuzz: TLS record: encrypted stream cleanup preserves root errors across alerts and epoch transitions	50M
+t2-tls-23	2	tls-record	fuzz: TLS record: encrypted stream scripted carrier progression preserves bytes and terminal state	50M
+t2-tls-24	2	tls-record	fuzz: TLS record: epoch operation sequences preserve one-way key lifecycle	50M
+t2-tls-25	2	tls-record	fuzz: TLS record: inner plaintext framing, padding, and bounds remain transactional	50M
+t2-tls-26	2	tls-record	fuzz: TLS record: protection tamper and sequence boundaries preserve authentication state	50M
+t2-tls-27	2	tls-resumption	fuzz: TLS resumption: NewSessionTicket wire decode and owned-state construction never panic or corrupt output	50M
+t2-tls-28	2	tls-resumption	fuzz: TLS resumption: PSK binder derivation/verification and ticket-age arithmetic are deterministic and bounded	50M
+t2-tls-29	2	tls-resumption	fuzz: TLS resumption: PSK wire codec — modes, OfferedPsks parse, and writeOffer round trip never panic or escape bounds	50M
+t2-tls-30	2	tls-resumption	fuzz: TLS resumption: Protector.resolve authenticates, rejects, and never leaks plaintext under key-state and envelope mutation	50M
+t2-tls-31	2	tls-resumption	fuzz: TLS resumption: client session cache operation sequence preserves transactional state, ownership, eviction, and lease semantics	50M
+t2-tls-32	2	tls-resumption	fuzz: TLS resumption: parseEnvelope is allocation-free, deterministic, and returns an ordered non-overlapping view	50M
+t2-tls-33	2	tls-resumption	fuzz: TLS resumption: parseEnvelope single-field mutation and Limits boundaries never panic	50M
+t2-tls-34	2	tls-resumption	fuzz: TLS resumption: session codec generated client/server records round-trip and reject cross-kind decode	50M
+t2-tls-35	2	tls-resumption	fuzz: TLS resumption: session codec raw decode never panics and owns its decoded state	50M
+t2-tls-36	2	tls-resumption	fuzz: TLS resumption: stateful server cache operation sequence preserves transactional indexes, ownership, handle, and lease semantics	50M
+t2-tls-37	2	tls-resumption	fuzz: TLS resumption: ticket keyring install/validate/acquire/retain/release/seal sequence preserves generation, ledger, nonce, and reference invariants	50M
+t2-pki38	2	pki	fuzz: PKI: DER decoding keeps every view inside the input and the cursor inside its region	50M
+t2-pki39	2	pki	fuzz: PKI: DER length, depth, object-size, and element-count bounds hold at every boundary	50M
+t2-pki40	2	pki	fuzz: PKI: DER parser never panics or leaks on arbitrary input	50M
+t2-pki41	2	pki	fuzz: PKI: PEM chain loading is bounded and its owned chain outlives a mutated, freed input	50M
+t2-pki42	2	pki	fuzz: PKI: X.509 semantic model borrows only from its input and honors its count bounds	50M
+t2-pki43	2	pki	fuzz: PKI: path building terminates inside its budgets and is deterministic on adversarial graphs	50M
+t2-pki44	2	pki	fuzz: PKI: path validation is deterministic, bounded, and sanitized on adversarial chains	50M
+t2-cryp45	2	crypto	fuzz: AEAD open never leaves unauthenticated plaintext on arbitrary key/nonce/tag/ciphertext/AD	50M
+t2-cryp46	2	crypto	fuzz: BoundedSecret replace/eql/deinit preserve invariants under arbitrary capacity and allocator-failure injection	50M
+t2-cryp47	2	crypto	fuzz: FixedSecret replace/eql/deinit preserve invariants under arbitrary overlapping and non-overlapping input	50M
+t2-cryp48	2	crypto	fuzz: deriveSharedSecret never panics on arbitrary scalar and peer-public bytes	50M
+t2-cryp49	2	crypto	fuzz: generateKeyShare never panics on arbitrary output-buffer lengths	50M
+t2-cryp50	2	crypto	fuzz: verify never panics on arbitrary public key, message, and signature bytes	50M
+t3-q11	3	quic	fuzz: H3 connection state command sequences preserve critical stream and request invariants	100M

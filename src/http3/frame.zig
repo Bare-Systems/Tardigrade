@@ -45,6 +45,16 @@ pub const RawFrame = struct {
     len: usize,
 };
 
+/// HTTP/2 frame codes with no HTTP/3 equivalent are explicitly forbidden by
+/// RFC 9114 section 7.2.8. They are not extensions and must never share the
+/// generic unknown-frame ignore path.
+pub fn isForbiddenHttp2FrameType(type_value: u64) bool {
+    return switch (type_value) {
+        0x02, 0x06, 0x08, 0x09 => true, // PRIORITY, PING, WINDOW_UPDATE, CONTINUATION
+        else => false,
+    };
+}
+
 pub const DecodeError = error{
     BufferTooShort,
     FrameLengthOverflow,
@@ -362,6 +372,7 @@ pub const ControlStream = struct {
         switch (raw.typ) {
             .settings => return error.DuplicateSettings,
             .data, .headers, .push_promise => return error.InvalidControlFrame,
+            .unknown => if (isForbiddenHttp2FrameType(raw.type_value)) return error.InvalidControlFrame,
             else => {},
         }
     }
@@ -456,6 +467,22 @@ test "control stream requires SETTINGS first and rejects illegal control frames"
 
     const data = try encodeKnownFrame(.data, "", &payload);
     try testing.expectError(error.InvalidControlFrame, control.ingestFrame(try decodeFrame(data)));
+}
+
+test "control stream rejects HTTP2-only frames but ignores grease extensions" {
+    var payload: [128]u8 = undefined;
+    inline for ([_]u64{ 0x02, 0x06, 0x08, 0x09 }) |typ| {
+        var control = ControlStream{ .saw_type = true, .saw_settings = true };
+        defer control.deinit(testing.allocator);
+        const encoded = try encodeFrame(typ, "", &payload);
+        try testing.expectError(error.InvalidControlFrame, control.ingestFrame(try decodeFrame(encoded)));
+    }
+    inline for ([_]u64{ 0x21, 0x40 }) |typ| {
+        var control = ControlStream{ .saw_type = true, .saw_settings = true };
+        defer control.deinit(testing.allocator);
+        const encoded = try encodeFrame(typ, "", &payload);
+        try control.ingestFrame(try decodeFrame(encoded));
+    }
 }
 
 test "control stream rejects missing duplicate and malformed SETTINGS" {

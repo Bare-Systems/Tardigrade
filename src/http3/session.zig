@@ -25,6 +25,7 @@ pub const SessionError = error{
     InvalidRequestFrame,
     DuplicateHeaders,
     HeadersAfterDataUnsupported,
+    IncompleteRequest,
     MissingRequiredPseudoHeader,
     DuplicatePseudoHeader,
     PseudoHeaderAfterRegularHeader,
@@ -67,6 +68,7 @@ pub const RequestStream = struct {
     priority_duplicate_parameter: bool = false,
     saw_headers: bool = false,
     saw_data: bool = false,
+    saw_trailers: bool = false,
     finished: bool = false,
     max_body_len: usize = default_max_body_len,
 
@@ -139,13 +141,16 @@ pub const RequestStream = struct {
 
     pub fn ingestFrame(self: *RequestStream, raw: frame.RawFrame, qpack_scratch: []u8) SessionError!void {
         switch (raw.typ) {
-            .headers => {
-                if (self.saw_data) return error.HeadersAfterDataUnsupported;
-                if (self.saw_headers) return error.DuplicateHeaders;
+            .headers => if (!self.saw_headers) {
                 try self.ingestHeaders(raw.payload, qpack_scratch);
+            } else {
+                if (self.saw_trailers) return error.UnexpectedFrame;
+                try ingestRequestTrailers(raw.payload, qpack_scratch);
+                self.saw_trailers = true;
             },
             .data => {
                 if (!self.saw_headers) return error.InvalidRequestFrame;
+                if (self.saw_trailers) return error.UnexpectedFrame;
                 self.saw_data = true;
                 if (raw.payload.len > self.max_body_len -| self.body.items.len) return error.BodyTooLarge;
                 try self.body.appendSlice(self.allocator, raw.payload);
@@ -153,7 +158,7 @@ pub const RequestStream = struct {
             .goaway => return error.InvalidRequestFrame,
             .priority_update_request, .priority_update_push => return error.UnexpectedFrame,
             .settings, .cancel_push, .push_promise, .max_push_id => return error.InvalidRequestFrame,
-            .unknown => {},
+            .unknown => if (frame.isForbiddenHttp2FrameType(raw.type_value)) return error.UnexpectedFrame,
         }
     }
 
@@ -234,8 +239,13 @@ pub const RequestStream = struct {
         try self.headers.append(self.allocator, .{ .name = owned_name, .value = owned_value });
     }
 
-    pub fn finish(self: *RequestStream) SessionError!stream_transport.Exchange {
-        if (self.pending.items.len != 0 or !self.saw_headers) return error.MissingRequiredPseudoHeader;
+    /// Validate all properties that only become final once the request stream
+    /// reaches FIN. This does not consume or finalize the exchange, so the H3
+    /// connection can reject a malformed completed request immediately while
+    /// leaving `finish` to transfer the borrowed request to the application.
+    pub fn validateComplete(self: *const RequestStream) SessionError!void {
+        if (self.pending.items.len != 0) return error.BufferTooShort;
+        if (!self.saw_headers) return error.IncompleteRequest;
         const method = self.method orelse return error.MissingRequiredPseudoHeader;
         const scheme = self.scheme orelse return error.MissingRequiredPseudoHeader;
         const authority = self.authority orelse return error.MissingRequiredPseudoHeader;
@@ -253,6 +263,14 @@ pub const RequestStream = struct {
                 if (declared != self.body.items.len) return error.InvalidContentLength;
             }
         }
+    }
+
+    pub fn finish(self: *RequestStream) SessionError!stream_transport.Exchange {
+        try self.validateComplete();
+        const method = self.method.?;
+        const scheme = self.scheme.?;
+        const authority = self.authority.?;
+        const path = self.path.?;
         self.finished = true;
         return .{
             .request = .{
@@ -267,7 +285,7 @@ pub const RequestStream = struct {
     }
 };
 
-fn validH3HeaderName(name: []const u8) bool {
+pub fn validH3HeaderName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |c| {
         // HTTP/3 field names are lowercase. This tchar subset also rejects
@@ -278,7 +296,7 @@ fn validH3HeaderName(name: []const u8) bool {
     return true;
 }
 
-fn validH3HeaderValue(value: []const u8) bool {
+pub fn validH3HeaderValue(value: []const u8) bool {
     for (value) |c| {
         if ((c < 0x20 and c != '\t') or c == 0x7f) return false;
     }
@@ -324,7 +342,7 @@ fn validH3Authority(authority: []const u8) bool {
     return true;
 }
 
-fn h3ConnectionSpecificHeader(name: []const u8, value: []const u8) bool {
+pub fn h3ConnectionSpecificHeader(name: []const u8, value: []const u8) bool {
     if (std.mem.eql(u8, name, "connection") or
         std.mem.eql(u8, name, "proxy-connection") or
         std.mem.eql(u8, name, "keep-alive") or
@@ -375,8 +393,85 @@ pub const ResponseEncoder = struct {
     }
 };
 
+pub const ResponseHeaderValidation = struct {
+    status: u16,
+    content_length: ?usize,
+};
+
+/// Validate the initial field section of a response before the client makes
+/// it visible to the application. HTTP/3 response pseudo-fields contain
+/// exactly one `:status`, followed by lowercase regular fields.
+pub fn validateResponseHeaders(fields: []const qpack.HeaderField) SessionError!ResponseHeaderValidation {
+    var status: ?u16 = null;
+    var regular_seen = false;
+    var content_length: ?usize = null;
+    for (fields) |field| {
+        if (field.name.len > 0 and field.name[0] == ':') {
+            if (regular_seen) return error.PseudoHeaderAfterRegularHeader;
+            if (!std.mem.eql(u8, field.name, ":status")) return error.InvalidPseudoHeader;
+            if (status != null) return error.DuplicatePseudoHeader;
+            if (field.value.len != 3) return error.InvalidStatus;
+            const parsed = std.fmt.parseInt(u16, field.value, 10) catch return error.InvalidStatus;
+            if (parsed < 100 or parsed > 599 or parsed == 101) return error.InvalidStatus;
+            status = parsed;
+            continue;
+        }
+
+        regular_seen = true;
+        if (!validH3HeaderName(field.name) or !validH3HeaderValue(field.value)) return error.InvalidHeader;
+        // RFC 9114 section 4.2 permits `te: trailers` only in requests.
+        // Responses reject every TE field alongside the other connection-
+        // specific HTTP/1 fields.
+        if (std.mem.eql(u8, field.name, "te") or h3ConnectionSpecificHeader(field.name, field.value)) return error.InvalidHeader;
+        if (std.mem.eql(u8, field.name, "content-length")) {
+            if (content_length != null) return error.InvalidContentLength;
+            content_length = std.fmt.parseInt(usize, field.value, 10) catch return error.InvalidContentLength;
+        }
+    }
+    const final_status = status orelse return error.MissingRequiredPseudoHeader;
+    // RFC 9110 section 8.6 forbids Content-Length on informational and 204
+    // responses. HEAD and 304 are deliberately not included: there it can
+    // describe the selected representation even though no content follows.
+    if (content_length != null and (final_status < 200 or final_status == 204)) {
+        return error.InvalidContentLength;
+    }
+    return .{ .status = final_status, .content_length = content_length };
+}
+
+/// Validate a response trailer field section. Trailers must not contain
+/// pseudo-fields or connection-specific framing fields, and they cannot alter
+/// the message's already-established content length.
+pub fn validateResponseTrailers(fields: []const qpack.HeaderField) SessionError!void {
+    for (fields) |field| {
+        if (field.name.len > 0 and field.name[0] == ':') return error.InvalidPseudoHeader;
+        if (!validH3HeaderName(field.name) or !validH3HeaderValue(field.value)) return error.InvalidHeader;
+        if (std.mem.eql(u8, field.name, "content-length") or
+            std.mem.eql(u8, field.name, "te") or
+            h3ConnectionSpecificHeader(field.name, field.value)) return error.InvalidHeader;
+    }
+}
+
+/// Request trailers are validated but deliberately not surfaced through the
+/// current `stream_transport.Exchange` shape. They cannot alter pseudo-header
+/// or message-framing state.
+pub fn validateRequestTrailers(fields: []const qpack.HeaderField) SessionError!void {
+    for (fields) |field| {
+        if (field.name.len > 0 and field.name[0] == ':') return error.InvalidPseudoHeader;
+        if (!validH3HeaderName(field.name) or !validH3HeaderValue(field.value)) return error.InvalidHeader;
+        if (std.mem.eql(u8, field.name, "content-length") or
+            std.mem.eql(u8, field.name, "te") or
+            h3ConnectionSpecificHeader(field.name, field.value)) return error.InvalidHeader;
+    }
+}
+
+fn ingestRequestTrailers(payload: []const u8, qpack_scratch: []u8) SessionError!void {
+    var fields: [128]qpack.HeaderField = undefined;
+    const count = qpack.decode(payload, &fields, qpack_scratch) catch return error.QpackDecodeFailed;
+    return validateRequestTrailers(fields[0..count]);
+}
+
 fn formatStatus(status: u16, buf: *[3]u8) SessionError![]const u8 {
-    if (status < 100 or status > 999) return error.InvalidStatus;
+    if (status < 100 or status > 599 or status == 101) return error.InvalidStatus;
     _ = std.fmt.bufPrint(buf, "{d}", .{status}) catch return error.InvalidStatus;
     return buf[0..3];
 }
@@ -408,6 +503,46 @@ const ParsedFrameRecorder = struct {
         self.frames.append(testing.allocator, raw) catch unreachable;
     }
 };
+
+test "response headers reject malformed status and field semantics" {
+    const valid = try validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "content-length", .value = "3" },
+    });
+    try testing.expectEqual(@as(u16, 200), valid.status);
+    try testing.expectEqual(@as(?usize, 3), valid.content_length);
+    try testing.expectError(error.InvalidStatus, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "600" },
+    }));
+    try testing.expectError(error.InvalidPseudoHeader, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = ":method", .value = "GET" },
+    }));
+    try testing.expectError(error.InvalidHeader, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "Connection", .value = "close" },
+    }));
+    try testing.expectError(error.InvalidHeader, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "te", .value = "trailers" },
+    }));
+    try testing.expectError(error.InvalidContentLength, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "103" },
+        .{ .name = "content-length", .value = "3" },
+    }));
+    try testing.expectError(error.InvalidContentLength, validateResponseHeaders(&.{
+        .{ .name = ":status", .value = "204" },
+        .{ .name = "content-length", .value = "3" },
+    }));
+    try testing.expectError(error.InvalidPseudoHeader, validateResponseTrailers(&.{
+        .{ .name = ":status", .value = "200" },
+    }));
+
+    var wire: [64]u8 = undefined;
+    try testing.expectError(error.InvalidStatus, ResponseEncoder.encodeHeaders(600, &.{}, &wire));
+    try testing.expectError(error.InvalidStatus, ResponseEncoder.encodeHeaders(101, &.{}, &wire));
+}
 
 test "request stream maps HEADERS and DATA onto stream_transport Exchange" {
     const allocator = testing.allocator;
@@ -657,7 +792,7 @@ test "request stream frame observer reports DATA before semantic rejection" {
     try testing.expectEqual(data.len, recorder.frames.items[0].len);
 }
 
-test "request stream rejects DATA before HEADERS and trailers for the MVP" {
+test "request stream accepts one trailer section and rejects later framing" {
     var req = RequestStream.init(testing.allocator, 0);
     defer req.deinit();
     var scratch: [128]u8 = undefined;
@@ -672,33 +807,51 @@ test "request stream rejects DATA before HEADERS and trailers for the MVP" {
     }, &qpack_buf);
     try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch);
     try req.ingestFrame(.{ .typ = .data, .type_value = 0, .payload = "body", .len = 6 }, &scratch);
-    try testing.expectError(error.HeadersAfterDataUnsupported, req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch));
+    var trailer_buf: [128]u8 = undefined;
+    const trailer = try qpack.encode(&.{.{ .name = "x-checksum", .value = "ok" }}, &trailer_buf);
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = trailer, .len = trailer.len + 2 }, &scratch);
+    try testing.expectError(error.UnexpectedFrame, req.ingestFrame(.{ .typ = .data, .type_value = 0, .payload = "again", .len = 7 }, &scratch));
+    try testing.expectError(error.UnexpectedFrame, req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = trailer, .len = trailer.len + 2 }, &scratch));
 }
 
-test "request stream rejects duplicate initial HEADERS before DATA" {
+test "request stream accepts trailers without a body" {
+    var req = RequestStream.init(testing.allocator, 0);
+    defer req.deinit();
+    var initial_buf: [256]u8 = undefined;
+    const initial = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },            .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" }, .{ .name = ":path", .value = "/" },
+    }, &initial_buf);
+    var trailer_buf: [128]u8 = undefined;
+    const trailer = try qpack.encode(&.{.{ .name = "x-checksum", .value = "ok" }}, &trailer_buf);
+    var scratch: [256]u8 = undefined;
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = initial, .len = initial.len + 2 }, &scratch);
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = trailer, .len = trailer.len + 2 }, &scratch);
+    try req.validateComplete();
+}
+
+test "request stream rejects pseudo headers in trailers" {
     var req = RequestStream.init(testing.allocator, 0);
     defer req.deinit();
 
     var qpack_buf: [256]u8 = undefined;
-    var regular_buf: [128]u8 = undefined;
     const block = try qpack.encode(&.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "example.com" },
         .{ .name = ":path", .value = "/" },
     }, &qpack_buf);
-    const regular = try qpack.encode(&.{.{ .name = "accept", .value = "*/*" }}, &regular_buf);
     var scratch: [256]u8 = undefined;
 
     try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch);
-    try testing.expectError(error.DuplicateHeaders, req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = regular, .len = regular.len + 2 }, &scratch));
+    try testing.expectError(error.InvalidPseudoHeader, req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch));
 }
 
 test "request stream finish fails without complete initial HEADERS" {
     var req = RequestStream.init(testing.allocator, 0);
     defer req.deinit();
 
-    try testing.expectError(error.MissingRequiredPseudoHeader, req.finish());
+    try testing.expectError(error.IncompleteRequest, req.finish());
 }
 
 test "request stream validates pseudo headers" {

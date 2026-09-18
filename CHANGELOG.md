@@ -2,12 +2,24 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
-## [Unreleased]
+## [0.7.0] - 2026-09-17
+
+### Added
+
+- **Fuzz-campaign orchestration and evidence capture are now available
+  (#740, #741, #755)** — reproducible local and Proxmox campaign runners now
+  record manifests, watchdog outcomes, exact crash inputs, provenance, and
+  preservable fuzzer state. The control plane handles detached long-running
+  rows, SSH keepalives, remote-stage cleanup, and evidence-integrity failures
+  explicitly so a clean run, a finding, and an interrupted row remain
+  distinguishable. The sustained #675 validation flow now pins each campaign
+  to an explicitly requested published release tag and its resolved commit,
+  rather than following a moving development branch.
 
 ### Changed
 
 - **Release security hardening closes cross-protocol ambiguity, memory, and
-  origin-crash paths** — HTTP/1 now rejects duplicate/malformed Host fields
+  origin-crash paths (#756)** — HTTP/1 now rejects duplicate/malformed Host fields
   and absolute-form/Host authority disagreement. HTTP/2 validates the complete
   pseudo-header envelope and values before its HTTP/1 adapter, strips padding,
   ignores extension frames safely, validates SETTINGS, bounds HPACK state, and
@@ -78,7 +90,7 @@ All notable user-facing changes to Tardigrade are documented here.
   inherit a normal origin's verification bypass or SNI override.
 
 - **Secret zeroization is now materially faster on x86_64, and the
-  guarantee is now Tardigrade-owned (#675)** — `crypto.secrets.secureZero`
+  guarantee is now Tardigrade-owned (#741)** — `crypto.secrets.secureZero`
   no longer wraps `std.crypto.secureZero`, which is `@memset` over a
   volatile slice. LLVM drops the `volatile` there and lowers it to an
   ordinary `memset` libcall; on x86_64-linux that binds to
@@ -94,7 +106,7 @@ All notable user-facing changes to Tardigrade are documented here.
   `encrypted_stream.ByteQueue`'s plaintext cleanup, which previously used
   a plain `@memset`.
 
-- **HTTP/2 and HTTP/3/QUIC are promoted to stable (#389)** — the support
+- **HTTP/2 and HTTP/3/QUIC are promoted to stable (#738)** — the support
   matrix and public/operator docs now describe the stable native downstream
   protocol contract for HTTP/1.1, HTTP/2, and HTTP/3/QUIC. The promotion is
   tied to the retained H2 baseline, #593/#699 real-H3 baseline, the v0.6.5
@@ -104,6 +116,56 @@ All notable user-facing changes to Tardigrade are documented here.
   H2 is TLS/ALPN-only downstream, H3 requires UDP reachability and
   Tardigrade-owned Alt-Svc advertisement, and H3 listener-owned transport
   changes require restart.
+
+- **Fuzz verification is faster and keeps leak detection enabled (#757, #758,
+  #774, #775)** — the TLS encrypted-stream cleanup oracle now compares storage in
+  vector-sized byte chunks while retaining full-capacity clearing checks, and
+  the HTTP/3 command-sequence target uses a target-local debug allocator that
+  preserves leak checking without the otherwise unbounded diagnostic stack
+  metadata cost during sustained fuzzing.
+
+### Fixed
+
+- **TLS and HTTP/3 error-state handling is stricter and remains bounded under
+  hostile transitions (#741, #755)** — TLS 1.3 HelloRetryRequest key-share
+  violations now return `illegal_parameter`; HTTP/3 stops accepting new state
+  after close, rejects bytes after a request FIN, skips streams reset before
+  first acceptance, and caps retained peer unidirectional-stream state with
+  `H3_EXCESSIVE_LOAD`.
+
+- **QUIC stream reassembly resists fragmented-input CPU and final-size attacks
+  (#741, #749)** — per-stream out-of-order receive state now caps disjoint
+  segments at 256, preventing a peer from growing the repeated-scan
+  reassembly path into an O(n²) CPU denial of service. A STREAM FIN that
+  undercuts already buffered out-of-order bytes is also rejected rather than
+  resurrecting an invalid smaller final size.
+
+- **TLS queue discard is now amortized O(1) without retaining stale plaintext
+  copies (#741)** — `ByteQueue` and `PlaintextProvenanceQueue` advance a lazy
+  read prefix instead of shifting every remaining byte on each discard.
+  Subsequent compaction securely wipes the obsolete plaintext duplicate before
+  reusing its backing storage.
+
+- **HTTP/3/QPACK protocol validation now handles fragmented and malformed peer
+  input without ambiguous state (#775)** — QPACK dynamic references fail when
+  capacity is zero; fragmented unidirectional stream-type prefixes retain
+  parser state; peer request streams require a header section; invalid
+  response pseudo-headers and status values fail closed; informational
+  responses do not complete a request; and transport/application close codes
+  remain distinguishable.
+
+### Testing
+
+- **Campaign models and their independent oracles were hardened (#741, #755,
+  #757, #758)** — TLS resumption and transcript models now match their actual
+  contracts, bounded HTTP/3 stream-pressure paths have deterministic
+  regressions, fuzz findings are detected even when the Zig runner exits zero,
+  and the encrypted-stream cleanup oracle compares `bool` storage through an
+  exact byte view on every supported architecture.
+
+### Build
+
+- **GitHub CodeQL SARIF upload action was updated (#703).**
 
 ## [0.6.5] - 2026-08-31
 

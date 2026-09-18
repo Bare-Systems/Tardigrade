@@ -42,6 +42,7 @@ CAMPAIGN_FAMILY="${CAMPAIGN_FAMILY:-quic}"
 CAMPAIGN_TARGET="${CAMPAIGN_TARGET:-}"
 CAMPAIGN_BUDGET="${CAMPAIGN_BUDGET:-1K}"
 CAMPAIGN_WATCHDOG="${CAMPAIGN_WATCHDOG:-}"
+CAMPAIGN_RELEASE_TAG="${CAMPAIGN_RELEASE_TAG:-}"
 CAMPAIGN_NONCANONICAL=false
 COLLECT_GUEST_CACHE=false
 CAMPAIGN_SKIP_PREFLIGHT=false
@@ -90,6 +91,7 @@ Campaign (only meaningful with --start):
   --budget N|K|M|G
   --watchdog SECONDS        Bound one fuzz process; expiry records possible_hang
                             instead of running unbounded
+  --release-tag TAG         Immutable release identity included in evidence
   --noncanonical-smoke      Pass through to local runner
   --skip-preflight          Pass through only with --noncanonical-smoke
 
@@ -139,6 +141,7 @@ while [[ $# -gt 0 ]]; do
     --campaign-target) CAMPAIGN_TARGET="$2"; shift 2 ;;
     --budget) CAMPAIGN_BUDGET="$2"; shift 2 ;;
     --watchdog) CAMPAIGN_WATCHDOG="$2"; shift 2 ;;
+    --release-tag) CAMPAIGN_RELEASE_TAG="$2"; shift 2 ;;
     --collect-guest-cache) COLLECT_GUEST_CACHE=true; shift ;;
     --noncanonical-smoke) CAMPAIGN_NONCANONICAL=true; shift ;;
     --skip-preflight) CAMPAIGN_SKIP_PREFLIGHT=true; shift ;;
@@ -199,9 +202,19 @@ collected_findings_are_complete() {
       preserved_failure_recorded=true
     fi
   done < <(find "$LOCAL_OUT_DIR" -type f -name manifest.jsonl -print0)
-  if [[ "$campaign_status" -ne 0 && "$preserved_failure_recorded" != true ]]; then
-    say "error: failed campaign has no manifest record proving its finding evidence was preserved" >&2
-    return 1
+  if [[ "$campaign_status" -ne 0 ]]; then
+    if find "$LOCAL_OUT_DIR" -type f -name manifest.jsonl -exec grep -qE '"status":"(fail|possible_hang)"' {} +; then
+      [[ "$preserved_failure_recorded" == true ]] || {
+        say "error: failed campaign has no manifest record proving its finding evidence was preserved" >&2
+        return 1
+      }
+    # An interrupted run is retryable infrastructure/control-flow evidence,
+    # not a product finding. Its logs and manifest are retained but it has no
+    # crash state whose preservation gates durable collection.
+    elif ! find "$LOCAL_OUT_DIR" -type f -name manifest.jsonl -exec grep -q '"status":"interrupted"' {} +; then
+      say "error: nonzero campaign result is neither a preserved finding nor an interrupted attempt" >&2
+      return 1
+    fi
   fi
   return 0
 }
@@ -250,6 +263,7 @@ if [[ "$MODE" == "collect" ]]; then
 
   local_collection_ok=false
   preservation_verified=false
+  retryable_interruption=false
   if [[ "${guest_allocated:-false}" == true && "${guest_reachable:-false}" == true ]]; then
     if rsync_from_pve "$REMOTE_STAGE/artifacts.tgz" "$artifact_tgz" &&
       scp_from_pve "$REMOTE_STAGE/proxmox-metadata.tgz" "$metadata_tgz" &&
@@ -259,13 +273,18 @@ if [[ "$MODE" == "collect" ]]; then
       local_collection_ok=true
       if collected_findings_are_complete "$remote_status"; then
         preservation_verified=true
+        if [[ "$remote_status" -ne 0 ]] &&
+          ! find "$LOCAL_OUT_DIR" -type f -name manifest.jsonl -exec grep -qE '"status":"(fail|possible_hang)"' {} + &&
+          find "$LOCAL_OUT_DIR" -type f -name manifest.jsonl -exec grep -q '"status":"interrupted"' {} +; then
+          retryable_interruption=true
+        fi
       fi
     fi
   fi
 
   destroy_guest=false
   if [[ "${guest_allocated:-false}" == true && "$local_collection_ok" == true && "$preservation_verified" == true && "$KEEP_GUEST" != true ]]; then
-    if [[ "$remote_status" -eq 0 || "$KEEP_ON_FAILURE" != true ]]; then
+    if [[ "$remote_status" -eq 0 || "$retryable_interruption" == true || "$KEEP_ON_FAILURE" != true ]]; then
       destroy_guest=true
     fi
   fi
@@ -280,6 +299,12 @@ if [[ "$MODE" == "collect" ]]; then
   fi
 
   if [[ "$local_collection_ok" == true && "$preservation_verified" == true ]]; then
+    # The driver must never be the first process to record collection
+    # success: this result is durable before removing REMOTE_STAGE, so a host
+    # crash cannot leave a resumable async row pointing at deleted evidence.
+    collect_result_tmp="$LOCAL_OUT_DIR/.collect.rc.$$"
+    printf '%s\n' "$remote_status" > "$collect_result_tmp"
+    mv -f "$collect_result_tmp" "$LOCAL_OUT_DIR/collect.rc"
     # REMOTE_STAGE (source.tgz, orchestrate logs, and the collected
     # artifacts.tgz — potentially hundreds of MB, since it includes the
     # whole guest .zig-cache) is redundant once evidence is verified
@@ -342,6 +367,7 @@ write_param CAMPAIGN_FAMILY "$CAMPAIGN_FAMILY"
 write_param CAMPAIGN_TARGET "$CAMPAIGN_TARGET"
 write_param CAMPAIGN_BUDGET "$CAMPAIGN_BUDGET"
 write_param CAMPAIGN_WATCHDOG "$CAMPAIGN_WATCHDOG"
+write_param CAMPAIGN_RELEASE_TAG "$CAMPAIGN_RELEASE_TAG"
 write_param CAMPAIGN_NONCANONICAL "$CAMPAIGN_NONCANONICAL"
 write_param CAMPAIGN_SKIP_PREFLIGHT "$CAMPAIGN_SKIP_PREFLIGHT"
 write_param COLLECT_GUEST_CACHE "$COLLECT_GUEST_CACHE"
@@ -577,6 +603,7 @@ test \"\$(zig version)\" = \"$ZIG_VERSION\"
 
 guest_output="/work/Tardigrade/artifacts/hardening/fuzz/proxmox-${guest_id}-${CAMPAIGN_TIER}-${CAMPAIGN_FAMILY}"
 runner_cmd=(scripts/run-fuzz-campaign.sh --tier "$CAMPAIGN_TIER" --family "$CAMPAIGN_FAMILY" --budget "$CAMPAIGN_BUDGET" --output "$guest_output" --source-sha "$TARDIGRADE_SHA")
+if [[ -n "$CAMPAIGN_RELEASE_TAG" ]]; then runner_cmd+=(--release-tag "$CAMPAIGN_RELEASE_TAG"); fi
 if [[ -n "$CAMPAIGN_TARGET" ]]; then runner_cmd+=(--target "$CAMPAIGN_TARGET"); fi
 if [[ -n "$CAMPAIGN_WATCHDOG" ]]; then runner_cmd+=(--watchdog "$CAMPAIGN_WATCHDOG"); fi
 if [[ "$CAMPAIGN_NONCANONICAL" == true ]]; then runner_cmd+=(--noncanonical-smoke); fi

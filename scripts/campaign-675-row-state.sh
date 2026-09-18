@@ -74,7 +74,7 @@ campaign_675_row_has_durable_finding() {
   while IFS= read -r -d '' manifest; do
     campaign_675_manifest_attempt_is_collected "$row_dir" "$manifest" || continue
     grep -qE '"status":"(fail|possible_hang)"' "$manifest" && return 0
-  done < <(find "$row_dir" -name manifest.jsonl -print0)
+  done < <(find "$row_dir" -name manifest.jsonl -print0 2>/dev/null)
   return 1
 }
 

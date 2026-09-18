@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Every-2h health check for the #675 campaign. Self-heals an unexpectedly dead
-# supervisor; deliberately does NOT restart one that stopped on a finding.
+# supervisor while rows remain; findings are recorded, never a reason to stop.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 if [[ "$#" -gt 1 ]]; then
@@ -35,13 +35,23 @@ while IFS=$'\t' read -r rid tier family _rest; do
 done < "$E/rows.tsv"
 total=$(( $(wc -l < "$E/rows.tsv" 2>/dev/null || echo 1) - 1 ))
 alive=no; pgrep -f "campaign-675-supervisor.sh $CAMPAIGN_STATE" >/dev/null && alive=yes
-last_evt=$(grep -E "PASS|STOP:|FATAL|START|COMPLETE|INCOMPLETE" "$LOG" 2>/dev/null | tail -1)
-# A finding is terminal only while its current durable disposition is pending.
-halted=no; [[ "$pending_findings" -gt 0 ]] && halted=yes
+last_evt=$(grep -E "PASS|FINDING|FATAL|START|COMPLETE|INCOMPLETE|EXHAUSTED" "$LOG" 2>/dev/null | tail -1)
+# Findings never halt the queue: rows that are neither accounted nor pending
+# are the only work left for the driver.
+unfinished=$((total - accounted - pending_findings))
+# findings.tsv is written by the driver; findings-issues.tsv by the scheduled
+# campaign check once it has filed (or linked) a GitHub issue for a finding.
+findings_logged=0; findings_unfiled=0
+if [[ -f "$E/findings.tsv" ]]; then
+  findings_logged=$(awk 'NR > 1' "$E/findings.tsv" | wc -l | tr -d ' ')
+  findings_unfiled=$(awk -F '\t' 'FNR == NR { if (FNR > 1) filed[$1] = 1; next } FNR > 1 && !($8 in filed)' \
+    "$E/findings-issues.tsv" "$E/findings.tsv" 2>/dev/null | wc -l | tr -d ' ')
+  [[ -f "$E/findings-issues.tsv" ]] || findings_unfiled="$findings_logged"
+fi
 # Staleness must measure DRIVER progress, not file mtime: this watchdog appends
 # to the same log every 2h, so mtime always looked fresh and the check could
 # never fire. Use the timestamp of the last real driver event instead.
-last_drv=$(grep -E "PASS|STOP:|FATAL|START|COMPLETE|INCOMPLETE" "$LOG" 2>/dev/null | tail -1 | awk '{print $1}')
+last_drv=$(grep -E "PASS|FINDING|FATAL|START|COMPLETE|INCOMPLETE|EXHAUSTED" "$LOG" 2>/dev/null | tail -1 | awk '{print $1}')
 if [[ -n "$last_drv" ]]; then
   last_s=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$last_drv" +%s 2>/dev/null || echo 0)
 else
@@ -58,7 +68,10 @@ if [[ "$last_s" -gt 0 ]]; then age_h=$(( ( $(date +%s) - last_s ) / 3600 )); els
   echo "rows_dispositioned_findings=$findings"
   echo "rows_accounted=$accounted/$total"
   echo "supervisor_alive=$alive"
-  echo "halted_on_finding=$halted"
+  echo "rows_pending_findings=$pending_findings"
+  echo "rows_unfinished=$unfinished"
+  echo "findings_logged=$findings_logged"
+  echo "findings_without_issue=$findings_unfiled"
   echo "hours_since_last_driver_event=$age_h"
   echo "last_event=$last_evt"
 } > "$STATUS"
@@ -73,14 +86,14 @@ case "$cur_budget" in
   10M) stale_h=6 ;; 50M) stale_h=30 ;; 100M) stale_h=55 ;; *G) stale_h=70 ;; *) stale_h=30 ;;
 esac
 action="none"
-if [[ "$halted" == yes ]]; then
-  action="HALTED ON FINDING - human triage required, not restarting"
-elif [[ "$alive" == no && "$accounted" -lt "$total" ]]; then
+if [[ "$alive" == no && "$unfinished" -eq 0 ]]; then
+  action="queue exhausted ($pending_findings pending findings); nothing to restart"
+elif [[ "$alive" == no ]]; then
   nohup caffeinate -i -s scripts/campaign-675-supervisor.sh "$CAMPAIGN_STATE" >/dev/null 2>&1 &
   action="supervisor was dead; restarted"
 elif [[ "$alive" == yes && "$age_h" -ge "$stale_h" ]]; then
   action="WARNING stale: no driver progress for ${age_h}h (row budget ${cur_budget:-?} bound ${stale_h}h)"
 fi
 echo "action=$action" >> "$STATUS"
-printf '%s WATCHDOG passed=%s findings=%s accounted=%s/%s alive=%s halted=%s age=%sh action=%s\n' \
-  "$(now)" "$passed" "$findings" "$accounted" "$total" "$alive" "$halted" "$age_h" "$action" >> "$LOG"
+printf '%s WATCHDOG passed=%s findings=%s accounted=%s/%s pending=%s unfiled=%s alive=%s age=%sh action=%s\n' \
+  "$(now)" "$passed" "$findings" "$accounted" "$total" "$pending_findings" "$findings_unfiled" "$alive" "$age_h" "$action" >> "$LOG"

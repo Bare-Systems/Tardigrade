@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Autonomous serial driver for the #675 campaign. Detached; survives the
-# controlling session exiting. Runs ONE row at a time per #675, stops dead on
-# the first non-pass per the stop-on-finding rule, and never destroys evidence.
+# controlling session exiting. Runs ONE row at a time per #675, records every
+# non-pass in findings.tsv and keeps going, and never destroys evidence (a
+# failed guest is destroyed only after its evidence is verified locally).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
@@ -45,6 +46,32 @@ watchdog_for() {
 
 say() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$LOG"; }
 
+# Findings do NOT stop the campaign. Each durable finding is appended once to
+# findings.tsv (keyed by its local finding directory) and the driver moves on
+# to the next row. The scheduled campaign check turns un-filed findings into
+# GitHub issues (findings-issues.tsv); a row stays pending_finding until its
+# disposition.env records the issue, fix, and verification.
+FINDINGS="$E/findings.tsv"
+record_findings() {                   # $1 row id, $2 tier, $3 family, $4 target
+  local rid="$1" tier="$2" family="$3" target="$4" prov dir rel sha status recorded=0
+  [[ -f "$FINDINGS" ]] || printf 'recorded_utc\trow_id\ttier\tfamily\ttarget\tstatus\tcrash_input_sha256\tfinding_dir\n' > "$FINDINGS"
+  while IFS= read -r prov; do
+    dir="$(dirname "$prov")"; rel="${dir#"$E"/}"
+    awk -F '\t' -v d="$rel" 'NR > 1 && $8 == d { found = 1 } END { exit(found ? 0 : 1) }' "$FINDINGS" && continue
+    sha="$(awk -F= '$1 == "crash_input_sha256" { print $2; exit }' "$prov")"
+    status="$(awk -F= '$1 == "status" { print $2; exit }' "$prov")"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$rid" "$tier" "$family" \
+      "${target:--}" "${status:-fail}" "${sha:--}" "$rel" >> "$FINDINGS"
+    recorded=$((recorded+1))
+  done < <(find "$E/$rid" -path '*/findings/*' -name provenance.txt -type f 2>/dev/null | sort)
+  # A finding without a preserved provenance file must still be visible.
+  if [[ "$recorded" -eq 0 ]] && ! awk -F '\t' -v r="$rid" 'NR > 1 && $2 == r { found = 1 } END { exit(found ? 0 : 1) }' "$FINDINGS"; then
+    status="$(find "$E/$rid" -name manifest.jsonl -exec grep -hoE '"status":"(fail|possible_hang)"' {} \; 2>/dev/null | tail -1 | cut -d'"' -f4)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$rid" "$tier" "$family" \
+      "${target:--}" "${status:-fail}" "$rid" >> "$FINDINGS"
+  fi
+}
+
 wait_for_row() {                      # $1 = row dir
   local stage; stage="$(grep -E '^REMOTE_STAGE=' "$1/async.env" 2>/dev/null | cut -d= -f2- | tr -d "'")"
   [[ -n "$stage" ]] || { say "ERROR no REMOTE_STAGE in $1/async.env"; return 1; }
@@ -61,8 +88,9 @@ for line in "${QUEUE[@]}"; do
   if [[ "$disposition" == pass ]]; then say "SKIP $rid (already passed)"; continue; fi
   if [[ "$disposition" == dispositioned_finding ]]; then say "ACCOUNTED FINDING $rid"; continue; fi
   if [[ "$disposition" == pending_finding ]]; then
-    say "STOP: $rid is a pending finding. Triage and write disposition.env before continuing."
-    exit 2
+    record_findings "$rid" "$tier" "$family" "$target"
+    say "SKIP $rid (pending finding recorded in findings.tsv; awaiting disposition)"
+    continue
   fi
 
   row_root="$E/$rid"
@@ -100,7 +128,8 @@ for line in "${QUEUE[@]}"; do
           --memory 6144 --vcpus 3 --tardigrade-ref "$SOURCE_SHA"
           --release-tag "$RELEASE_TAG"
           --tier "$tier" --family "$family" --budget "$budget"
-          --watchdog "$(watchdog_for "$budget")" --out-dir "$row_dir")
+          --watchdog "$(watchdog_for "$budget")" --out-dir "$row_dir"
+          --destroy-on-failure)
     # rows.tsv uses "-" for a family-wide row: an EMPTY column cannot be used,
     # because TAB is an IFS whitespace char and `read` collapses adjacent tabs,
     # which silently shifted budget into target and broke every tier-1 row.
@@ -143,9 +172,9 @@ for line in "${QUEUE[@]}"; do
       ;;
     pending_finding)
       st="$(find "$E/$rid" -name manifest.jsonl -exec grep -ho '"status":"[a-z_]*"' {} \; 2>/dev/null | tail -1)"
-      say "STOP: $rid produced a durable finding (${st:-unknown}) ${runs:-}. Triage required."
+      record_findings "$rid" "$tier" "$family" "$target"
+      say "FINDING $rid produced a durable finding (${st:-unknown}) ${runs:-}; recorded in findings.tsv, continuing."
       say "Evidence left intact under $E/$rid."
-      exit 2
       ;;
     *)
       say "FATAL unknown row disposition '$post' for $rid"
@@ -157,7 +186,7 @@ done
 # version logged "ALL ROWS COMPLETE" after one row because ssh inside the
 # while-read loop consumed the rest of rows.tsv from stdin -- a false
 # success, which is worse than a crash.
-passed=0; findings=0; total=0; accounted=0
+passed=0; findings=0; total=0; accounted=0; pending=0
 for line in "${QUEUE[@]}"; do
   IFS=$'\t' read -r rid tier family _ _ <<<"$line"
   [[ "$rid" == "row_id" || -z "$rid" ]] && continue
@@ -165,9 +194,15 @@ for line in "${QUEUE[@]}"; do
   disposition="$(campaign_675_row_disposition "$E" "$rid" "$tier" "$family")"
   [[ "$disposition" == pass ]] && { passed=$((passed+1)); accounted=$((accounted+1)); }
   [[ "$disposition" == dispositioned_finding ]] && { findings=$((findings+1)); accounted=$((accounted+1)); }
+  [[ "$disposition" == pending_finding ]] && pending=$((pending+1))
 done
 if [[ "$accounted" -eq "$total" ]]; then
   say "=== ALL ROWS ACCOUNTED ($passed pass, $findings dispositioned findings; $total total) ==="
+elif [[ $((accounted + pending)) -eq "$total" ]]; then
+  # Every row has run; the rest need fixes, not reruns. Exit 4 so the
+  # supervisor stops instead of spinning over an exhausted queue.
+  say "=== QUEUE EXHAUSTED: $accounted/$total accounted, $pending pending findings awaiting disposition (see findings.tsv) ==="
+  exit 4
 else
   say "=== DRIVER EXITED WITH $accounted/$total ROWS ACCOUNTED - INCOMPLETE ==="; exit 3
 fi

@@ -2,6 +2,15 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- **Requests on a stale pooled upstream connection are retried on a fresh one
+  for every method (#787)** — when a reused keep-alive connection fails while
+  the request is being written, the upstream never saw it, so buffered proxying
+  now retries once on a fresh connection instead of returning 502 for POST/PATCH.
+
 ## [0.7.0] - 2026-09-17
 
 ### Added

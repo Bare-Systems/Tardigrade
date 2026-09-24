@@ -521,7 +521,7 @@ pub fn executeBoundedBufferedUnixSocketHttpRequest(
             return resp;
         } else |err| {
             p.release(key, conn, false, http.event_loop.monotonicMs());
-            if (reused and err == error.UpstreamConnectionClosed and attempt == 0 and isHttpMethodIdempotent(method)) {
+            if (shouldRetryStalePooledBufferedExchange(reused, attempt, err, method)) {
                 p.recordStaleRetry(key);
                 continue; // request never delivered — retry once on a fresh conn
             }
@@ -529,6 +529,17 @@ pub fn executeBoundedBufferedUnixSocketHttpRequest(
         }
     }
     unreachable;
+}
+
+/// Whether a buffered exchange that failed on attempt 0 should be retried once
+/// on a fresh connection. A write failure on a reused pooled connection means
+/// the origin closed it while idle and never saw the request, so every method
+/// is safe (issue #787). A zero-byte response read is ambiguous about delivery,
+/// so it stays limited to idempotent methods.
+fn shouldRetryStalePooledBufferedExchange(reused: bool, attempt: usize, err: anyerror, method: []const u8) bool {
+    if (!reused or attempt != 0) return false;
+    if (err == error.UpstreamRequestWriteFailed) return true;
+    return err == error.UpstreamConnectionClosed and isHttpMethodIdempotent(method);
 }
 
 /// Execute a bounded buffered HTTP/1 request over a TCP socket, with optional
@@ -690,7 +701,7 @@ pub fn executeBoundedBufferedTcpHttpRequest(
             return resp;
         } else |err| {
             p.release(key, conn, false, http.event_loop.monotonicMs()); // active--, close (deinits TLS)
-            if (reused and err == error.UpstreamConnectionClosed and attempt == 0 and isHttpMethodIdempotent(method)) {
+            if (shouldRetryStalePooledBufferedExchange(reused, attempt, err, method)) {
                 p.recordStaleRetry(key);
                 continue; // retry once on a fresh connection
             }
@@ -1586,7 +1597,15 @@ fn exchangeBoundedBufferedHttpRequest(
         try req_writer.writeAll(body);
     }
 
-    try transport.writeAll(req_aw.written());
+    // A failed write means the request never (fully) reached the origin, so a
+    // caller holding a reused pooled connection may retry any method on a fresh
+    // one. Timeouts and OOM keep their own meaning.
+    transport.writeAll(req_aw.written()) catch |err| {
+        // Transports expose different error sets, so match by name.
+        const name = @errorName(err);
+        if (std.mem.eql(u8, name, "Timeout") or std.mem.eql(u8, name, "OutOfMemory")) return err;
+        return error.UpstreamRequestWriteFailed;
+    };
 
     // Bound the wait for the response with poll() rather than SO_RCVTIMEO:
     // SO_RCVTIMEO is reliably honored on AF_UNIX sockets but is silently ignored
@@ -7205,4 +7224,17 @@ test "a failed relay allocation hands the http2 connection back" {
     try std.testing.expectEqual(@as(usize, 0), failed_ctx.counters.reserved);
     try std.testing.expectEqual(@as(usize, 0), ok_ctx.counters.reserved);
     try std.testing.expectEqual(@as(usize, 0), ok_ctx.counters.retained);
+}
+
+test "shouldRetryStalePooledBufferedExchange retries write failures for any method" {
+    try std.testing.expect(shouldRetryStalePooledBufferedExchange(true, 0, error.UpstreamRequestWriteFailed, "POST"));
+    try std.testing.expect(shouldRetryStalePooledBufferedExchange(true, 0, error.UpstreamRequestWriteFailed, "GET"));
+    try std.testing.expect(!shouldRetryStalePooledBufferedExchange(false, 0, error.UpstreamRequestWriteFailed, "POST"));
+    try std.testing.expect(!shouldRetryStalePooledBufferedExchange(true, 1, error.UpstreamRequestWriteFailed, "POST"));
+}
+
+test "shouldRetryStalePooledBufferedExchange keeps zero-byte reads idempotent-only" {
+    try std.testing.expect(shouldRetryStalePooledBufferedExchange(true, 0, error.UpstreamConnectionClosed, "GET"));
+    try std.testing.expect(!shouldRetryStalePooledBufferedExchange(true, 0, error.UpstreamConnectionClosed, "POST"));
+    try std.testing.expect(!shouldRetryStalePooledBufferedExchange(true, 0, error.Timeout, "GET"));
 }

@@ -2,6 +2,21 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [0.7.3] - 2026-09-25
+
+### Security
+
+- **The client IP can no longer be spoofed through `X-Forwarded-For` behind a
+  trusted proxy (#791)** — Tardigrade used the *leftmost* `X-Forwarded-For`
+  entry, which the client controls because CDNs and proxies append the real
+  address rather than replace it. Any client could therefore rotate its
+  per-IP rate-limit bucket and forge the `client_ip` in access logs, even
+  with `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` configured. The chain is now
+  walked from the right, skipping only trusted proxy hops. New
+  `TARDIGRADE_REAL_IP_HEADER` (for example `CF-Connecting-IP`) takes
+  precedence when set, and `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` now
+  accepts CIDR blocks.
+
 ## [0.7.2] - 2026-09-24
 
 ### Fixed

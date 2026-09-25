@@ -3,6 +3,7 @@ const compat = @import("zig_compat");
 const Allocator = std.mem.Allocator;
 const Request = @import("request.zig").Request;
 const RequestLifecycle = @import("request_lifecycle.zig").RequestLifecycle;
+const access_control = @import("access_control.zig");
 
 pub const EarlyDataContext = struct {
     transport_early: bool = false,
@@ -205,44 +206,91 @@ pub const RequestContext = struct {
     }
 };
 
+/// `extractClientIp` trusted-proxy set for callers with no trusted hops:
+/// every `X-Forwarded-For` entry is treated as untrusted, so the rightmost
+/// one (the address the connecting peer itself observed) is the client.
+pub const no_trusted_proxies = struct {
+    pub fn isTrustedProxy(_: @This(), _: []const u8) bool {
+        return false;
+    }
+}{};
+
 /// Extract the client IP from request headers or connection info.
-/// Checks X-Forwarded-For and X-Real-IP before falling back to
-/// the provided default (connection remote address).
 ///
-/// `trusted_forwarding_source` gates whether those client-supplied headers
-/// are honored at all. This value is resolved by the caller (edge_gateway.zig)
-/// against `trusted_upstream_identities` / `trust_require_upstream_identity`
-/// -- the SAME trust boundary `docs/PROXY_SECURITY.md` §7 documents for the
-/// outbound `X-Forwarded-For` Tardigrade sends to its own upstream. Before
-/// #673, this function ignored that boundary entirely: it honored
-/// `X-Forwarded-For`/`X-Real-IP` from *any* client unconditionally, which
-/// let an untrusted client freely rewrite the `client_ip` used to key rate
-/// limiting (`ip:{client_ip}` buckets) and the `client_ip` recorded in
-/// access logs -- a trivial rate-limit bypass and log-forgery vector, live
-/// even when an operator had correctly locked down `trusted_upstream_identities`
-/// per the Safe Deployment Checklist, because this call site never consulted
-/// it. When `trusted_forwarding_source` is false, `default` (the real
-/// connection IP) is always returned, exactly as if no forwarding headers
-/// were present.
-pub fn extractClientIp(request: *const Request, trusted_forwarding_source: bool, default: []const u8) []const u8 {
+/// `trusted_forwarding_source` gates whether client-supplied forwarding
+/// headers are honored at all. This value is resolved by the caller
+/// (edge_gateway.zig) against `trusted_upstream_identities` /
+/// `trust_require_upstream_identity` -- the SAME trust boundary
+/// `docs/PROXY_SECURITY.md` §7 documents for the outbound `X-Forwarded-For`
+/// Tardigrade sends to its own upstream (#673). When it is false, `default`
+/// (the real connection IP) is always returned, exactly as if no forwarding
+/// headers were present.
+///
+/// For a trusted peer, the client is resolved in this order:
+/// 1. `real_ip_header` (e.g. `CF-Connecting-IP`), when configured and it
+///    holds a valid IP. A CDN overwrites this header, so the client cannot
+///    choose its value.
+/// 2. `X-Forwarded-For`, walked from the RIGHT (nginx `real_ip_recursive
+///    on`): each entry was appended by the hop to its right, so entries are
+///    skipped only while they are themselves trusted proxies
+///    (`trusted_proxies.isTrustedProxy(ip)`); the first untrusted address is
+///    the client. The LEFTMOST entry is whatever the client sent -- CDNs and
+///    proxies append to it rather than replace it -- so before #791 taking
+///    it let any client behind a trusted CDN pick its own `client_ip`,
+///    bypassing per-IP rate limiting and forging access-log addresses. The
+///    walk stops at the first entry that is not a valid IP.
+/// 3. `X-Real-IP`, when it holds a valid IP.
+/// 4. `default`.
+pub fn extractClientIp(
+    request: *const Request,
+    trusted_forwarding_source: bool,
+    real_ip_header: []const u8,
+    trusted_proxies: anytype,
+    default: []const u8,
+) []const u8 {
     if (!trusted_forwarding_source) return default;
 
-    // Prefer X-Forwarded-For first IP
-    if (request.headers.get("x-forwarded-for")) |xff| {
-        if (std.mem.findScalar(u8, xff, ',')) |comma| {
-            const first = std.mem.trim(u8, xff[0..comma], " \t");
-            if (first.len > 0) return first;
-        } else {
-            const trimmed = std.mem.trim(u8, xff, " \t");
-            if (trimmed.len > 0) return trimmed;
+    if (real_ip_header.len > 0) {
+        if (request.headers.get(real_ip_header)) |value| {
+            const trimmed = std.mem.trim(u8, value, " \t");
+            if (access_control.parseIp(trimmed) != null) return trimmed;
         }
     }
-    // Then X-Real-IP
+
+    if (request.headers.contains("x-forwarded-for")) {
+        return rightmostUntrustedForwardedFor(request, trusted_proxies) orelse default;
+    }
+
     if (request.headers.get("x-real-ip")) |xri| {
         const trimmed = std.mem.trim(u8, xri, " \t");
-        if (trimmed.len > 0) return trimmed;
+        if (access_control.parseIp(trimmed) != null) return trimmed;
     }
     return default;
+}
+
+/// Walk every `X-Forwarded-For` entry right to left -- across repeated
+/// header lines, which RFC 9110 §5.3 defines as one comma-joined list --
+/// returning the first address that is not a trusted proxy. If every valid
+/// entry is trusted, the leftmost valid one is returned; null when the
+/// rightmost entry is not a valid IP.
+fn rightmostUntrustedForwardedFor(request: *const Request, trusted_proxies: anytype) ?[]const u8 {
+    var candidate: ?[]const u8 = null;
+    const all = request.headers.iterator();
+    var line_idx = all.len;
+    while (line_idx > 0) {
+        line_idx -= 1;
+        const header = all[line_idx];
+        if (!std.ascii.eqlIgnoreCase(header.name, "x-forwarded-for")) continue;
+        var it = std.mem.splitBackwardsScalar(u8, header.value, ',');
+        while (it.next()) |raw_entry| {
+            const entry = std.mem.trim(u8, raw_entry, " \t");
+            if (entry.len == 0) continue;
+            if (access_control.parseIp(entry) == null) return candidate;
+            candidate = entry;
+            if (!trusted_proxies.isTrustedProxy(entry)) return candidate;
+        }
+    }
+    return candidate;
 }
 
 // Tests
@@ -333,17 +381,115 @@ test "EarlyDataContext handshake barrier defaults complete and can be driven" {
     try std.testing.expectEqual(@as(usize, 1), test_barrier.waits);
 }
 
-test "extractClientIp prefers X-Forwarded-For" {
-    const allocator = std.testing.allocator;
+/// Test trusted-proxy set: 10.0.0.0/8 stands in for a CDN/sidecar tier.
+const TestTrustedProxies = struct {
+    pub fn isTrustedProxy(_: TestTrustedProxies, ip: []const u8) bool {
+        const block = access_control.parseCidr("10.0.0.0/8").?;
+        const parsed = access_control.parseIp(ip) orelse return false;
+        return block.contains(parsed);
+    }
+};
 
-    // Build request with X-Forwarded-For header
-    const raw = "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 1.2.3.4, 5.6.7.8\r\n\r\n";
-    const result = try Request.parse(allocator, raw, 1024 * 1024);
+fn expectClientIp(raw: []const u8, trusted: bool, real_ip_header: []const u8, trusted_proxies: anytype, default: []const u8, expected: []const u8) !void {
+    const result = try Request.parse(std.testing.allocator, raw, 1024 * 1024);
     var req = result.request;
     defer req.deinit();
+    try std.testing.expectEqualStrings(expected, extractClientIp(&req, trusted, real_ip_header, trusted_proxies, default));
+}
 
-    const ip = extractClientIp(&req, true, "fallback");
-    try std.testing.expectEqualStrings("1.2.3.4", ip);
+test "extractClientIp takes the rightmost X-Forwarded-For entry, not the client-chosen leftmost (#791)" {
+    // A client behind a CDN sends `X-Forwarded-For: 203.0.113.7`; the CDN
+    // appends the real address. Taking the first entry let every request
+    // pick its own rate-limit bucket and access-log address.
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.7, 198.51.100.20\r\n\r\n",
+        true,
+        "",
+        no_trusted_proxies,
+        "127.0.0.1",
+        "198.51.100.20",
+    );
+}
+
+test "extractClientIp skips trusted proxy hops right to left (#791)" {
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.7, 198.51.100.20, 10.0.0.5, 10.0.0.6\r\n\r\n",
+        true,
+        "",
+        TestTrustedProxies{},
+        "127.0.0.1",
+        "198.51.100.20",
+    );
+    // Every hop trusted: the leftmost is the best remaining answer.
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 10.0.0.1, 10.0.0.2\r\n\r\n",
+        true,
+        "",
+        TestTrustedProxies{},
+        "127.0.0.1",
+        "10.0.0.1",
+    );
+}
+
+test "extractClientIp walks repeated X-Forwarded-For lines as one list (#791)" {
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.7\r\nX-Forwarded-For: 198.51.100.20, 10.0.0.5\r\n\r\n",
+        true,
+        "",
+        TestTrustedProxies{},
+        "127.0.0.1",
+        "198.51.100.20",
+    );
+}
+
+test "extractClientIp stops the walk at an invalid X-Forwarded-For entry (#791)" {
+    // The walk never crosses garbage to reach a client-chosen address.
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.7, unknown, 10.0.0.5\r\n\r\n",
+        true,
+        "",
+        TestTrustedProxies{},
+        "127.0.0.1",
+        "10.0.0.5",
+    );
+    // An invalid rightmost entry falls back to the connection address.
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.7, not-an-ip\r\n\r\n",
+        true,
+        "",
+        no_trusted_proxies,
+        "127.0.0.1",
+        "127.0.0.1",
+    );
+}
+
+test "extractClientIp prefers the configured real-IP header (#791)" {
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nCF-Connecting-IP: 198.51.100.20\r\nX-Forwarded-For: 203.0.113.7, 198.51.100.21\r\n\r\n",
+        true,
+        "CF-Connecting-IP",
+        no_trusted_proxies,
+        "127.0.0.1",
+        "198.51.100.20",
+    );
+    // An invalid or missing real-IP header falls through to X-Forwarded-For.
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nCF-Connecting-IP: bogus\r\nX-Forwarded-For: 203.0.113.7, 198.51.100.21\r\n\r\n",
+        true,
+        "CF-Connecting-IP",
+        no_trusted_proxies,
+        "127.0.0.1",
+        "198.51.100.21",
+    );
+    // The real-IP header is honored only from a trusted forwarding source.
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nCF-Connecting-IP: 198.51.100.20\r\n\r\n",
+        false,
+        "CF-Connecting-IP",
+        no_trusted_proxies,
+        "127.0.0.1",
+        "127.0.0.1",
+    );
 }
 
 test "extractClientIp falls back to X-Real-IP" {
@@ -354,7 +500,7 @@ test "extractClientIp falls back to X-Real-IP" {
     var req = result.request;
     defer req.deinit();
 
-    const ip = extractClientIp(&req, true, "fallback");
+    const ip = extractClientIp(&req, true, "", no_trusted_proxies, "fallback");
     try std.testing.expectEqualStrings("9.8.7.6", ip);
 }
 
@@ -366,7 +512,7 @@ test "extractClientIp uses default when no proxy headers" {
     var req = result.request;
     defer req.deinit();
 
-    const ip = extractClientIp(&req, true, "192.168.1.1");
+    const ip = extractClientIp(&req, true, "", no_trusted_proxies, "192.168.1.1");
     try std.testing.expectEqualStrings("192.168.1.1", ip);
 }
 
@@ -383,6 +529,6 @@ test "extractClientIp ignores X-Forwarded-For/X-Real-IP from an untrusted forwar
     var req = result.request;
     defer req.deinit();
 
-    const ip = extractClientIp(&req, false, "127.0.0.1");
+    const ip = extractClientIp(&req, false, "", no_trusted_proxies, "127.0.0.1");
     try std.testing.expectEqualStrings("127.0.0.1", ip);
 }

@@ -15744,6 +15744,70 @@ test "rate limiting uses asserted identity for shared nat clients" {
     try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
 }
 
+test "per-IP rate limit keys on the rightmost X-Forwarded-For entry, not the client-chosen leftmost (#791)" {
+    // Behind a CDN, the client controls the leftmost X-Forwarded-For entry
+    // and the CDN appends the real address. Rotating the leftmost entry must
+    // not buy a fresh rate-limit bucket.
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "xff-rate-ok" },
+        .{ .body = "xff-rate-ok" },
+        .{ .body = "xff-rate-ok" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /xff-rate {{
+        \\    proxy_pass http://{s}:{d}/xff-rate;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .rate_limit_rps = "0.001",
+        .rate_limit_burst = "1",
+    });
+    defer tardigrade.stop();
+
+    var first = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/xff-rate",
+        .body = null,
+        .headers = &.{.{ .name = "X-Forwarded-For", .value = "203.0.113.1, 198.51.100.20" }},
+    });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+
+    // Same real client, spoofed leftmost entry: same bucket.
+    var spoofed = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/xff-rate",
+        .body = null,
+        .headers = &.{.{ .name = "X-Forwarded-For", .value = "203.0.113.2, 198.51.100.20" }},
+    });
+    defer spoofed.deinit();
+    try std.testing.expectEqual(@as(u16, 429), spoofed.status_code);
+
+    // A different real client still gets its own bucket.
+    var other = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/xff-rate",
+        .body = null,
+        .headers = &.{.{ .name = "X-Forwarded-For", .value = "203.0.113.1, 198.51.100.21" }},
+    });
+    defer other.deinit();
+    try std.testing.expectEqual(@as(u16, 200), other.status_code);
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+}
+
 test "proxy requests preserve safe request ids and structured access logs include upstream metadata" {
     const allocator = std.testing.allocator;
 

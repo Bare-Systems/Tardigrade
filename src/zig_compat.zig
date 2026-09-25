@@ -277,15 +277,59 @@ pub fn netStreamFromFd(fd: std.posix.fd_t) NetStream {
     };
 }
 
+/// Maximum number of addresses kept from one host-name lookup.
+pub const max_resolved_addresses = 16;
+
+/// Resolve `host` (an IP literal or a DNS host name) to the addresses a TCP
+/// connect should try, in resolver order (#786). Zig 0.16's
+/// `IpAddress.resolve` only parses literals and fails host names with
+/// `error.ParseFailed`, so names fall back to `HostName.lookup`, which honors
+/// /etc/hosts and /etc/resolv.conf (Docker/Kubernetes service DNS).
+pub fn resolveHostAddresses(host: []const u8, port: u16, out: *[max_resolved_addresses]std.Io.net.IpAddress) ![]std.Io.net.IpAddress {
+    if (std.Io.net.IpAddress.resolve(io(), host, port)) |address| {
+        out[0] = address;
+        return out[0..1];
+    } else |_| {}
+
+    const host_name = std.Io.net.HostName.init(host) catch return error.UnknownHostName;
+    // Capacity >= 16 guarantees lookup never blocks on a full queue.
+    var lookup_buffer: [max_resolved_addresses + 1]std.Io.net.HostName.LookupResult = undefined;
+    var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+    try host_name.lookup(io(), &queue, .{ .port = port });
+
+    var count: usize = 0;
+    while (queue.getOneUncancelable(io())) |result| switch (result) {
+        .address => |address| {
+            if (count < out.len) {
+                out[count] = address;
+                count += 1;
+            }
+        },
+        .canonical_name => {},
+    } else |err| switch (err) {
+        error.Closed => {},
+    }
+    if (count == 0) return error.UnknownHostName;
+    return out[0..count];
+}
+
 /// Connect a TCP socket to host:port, returning a NetStream.
 pub fn tcpConnectToHost(allocator: std.mem.Allocator, host: []const u8, port: u16) !NetStream {
     _ = allocator;
-    const address = try std.Io.net.IpAddress.resolve(io(), host, port);
-    const stream = try address.connect(io(), .{ .mode = .stream });
-    return .{
-        .inner = stream,
-        .handle = stream.socket.handle,
-    };
+    var addresses: [max_resolved_addresses]std.Io.net.IpAddress = undefined;
+    const resolved = try resolveHostAddresses(host, port, &addresses);
+    var last_err: anyerror = error.ConnectionFailed;
+    for (resolved) |address| {
+        const stream = address.connect(io(), .{ .mode = .stream }) catch |err| {
+            last_err = err;
+            continue;
+        };
+        return .{
+            .inner = stream,
+            .handle = stream.socket.handle,
+        };
+    }
+    return last_err;
 }
 
 /// Connect to a Unix domain socket path, returning a NetStream.
@@ -328,7 +372,18 @@ pub fn connectBlockingTcp(host: []const u8, port: u16) !std.posix.fd_t {
 /// the proxy maps to 504 `upstream_timeout`. `0` preserves the old blocking
 /// behavior. Caller closes the fd.
 pub fn connectBoundedTcp(host: []const u8, port: u16, connect_timeout_ms: u32) !std.posix.fd_t {
-    const resolved = try std.Io.net.IpAddress.resolve(io(), host, port);
+    var addresses: [max_resolved_addresses]std.Io.net.IpAddress = undefined;
+    const resolved = try resolveHostAddresses(host, port, &addresses);
+    // Try each resolved address in order; report the last failure so a
+    // timeout on the final candidate still maps to 504 upstream_timeout.
+    var last_err: anyerror = error.ConnectionFailed;
+    for (resolved) |address| {
+        if (connectAddressBounded(address, connect_timeout_ms)) |sock| return sock else |err| last_err = err;
+    }
+    return last_err;
+}
+
+fn connectAddressBounded(resolved: std.Io.net.IpAddress, connect_timeout_ms: u32) !std.posix.fd_t {
     switch (resolved) {
         .ip4 => |ip4| {
             // Set every field by name (including the address family, which
@@ -575,7 +630,9 @@ pub fn parseIpAddress(host: []const u8, port: u16) !SockAddr {
 }
 
 pub fn resolveIpAddress(host: []const u8, port: u16) !SockAddr {
-    return ipAddressToSockAddr(try std.Io.net.IpAddress.resolve(io(), host, port));
+    var addresses: [max_resolved_addresses]std.Io.net.IpAddress = undefined;
+    const resolved = try resolveHostAddresses(host, port, &addresses);
+    return ipAddressToSockAddr(resolved[0]);
 }
 
 pub fn unixTimestamp() i64 {
@@ -868,6 +925,52 @@ test "connectBoundedTcp connects, restores blocking mode, and round-trips" {
     var buf: [8]u8 = undefined;
     try std.testing.expect(std.c.read(conn, &buf, buf.len) == 4);
     try std.testing.expectEqualStrings("ping", buf[0..4]);
+}
+
+test "connectBoundedTcp resolves a host-name upstream (#786)" {
+    // Regression: Zig 0.16's IpAddress.resolve rejects host names with
+    // error.ParseFailed, which turned every `proxy_pass http://<name>:<port>`
+    // into a 502. "localhost" comes from /etc/hosts and may list ::1 before
+    // 127.0.0.1, so this also covers falling through to a later address.
+    const listen_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    try std.testing.expect(listen_fd >= 0);
+    defer _ = std.c.close(listen_fd);
+    const sin: std.c.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 0),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    try std.testing.expect(std.c.bind(listen_fd, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) == 0);
+    try std.testing.expect(std.c.listen(listen_fd, 8) == 0);
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try std.testing.expect(std.c.getsockname(listen_fd, @ptrCast(&bound), &bound_len) == 0);
+    const port = std.mem.bigToNative(u16, bound.port);
+
+    const fd = try connectBoundedTcp("localhost", port, 2_000);
+    defer _ = std.c.close(fd);
+    const conn = std.c.accept(listen_fd, null, null);
+    try std.testing.expect(conn >= 0);
+    defer _ = std.c.close(conn);
+    const msg = "ping";
+    try std.testing.expect(std.c.write(fd, msg.ptr, msg.len) == 4);
+    var buf: [8]u8 = undefined;
+    try std.testing.expect(std.c.read(conn, &buf, buf.len) == 4);
+    try std.testing.expectEqualStrings("ping", buf[0..4]);
+}
+
+test "resolveHostAddresses keeps literals and rejects invalid names" {
+    var addresses: [max_resolved_addresses]std.Io.net.IpAddress = undefined;
+    const literal = try resolveHostAddresses("127.0.0.1", 8080, &addresses);
+    try std.testing.expectEqual(@as(usize, 1), literal.len);
+    try std.testing.expectEqual(@as(u16, 8080), literal[0].getPort());
+
+    const named = try resolveHostAddresses("localhost", 8080, &addresses);
+    try std.testing.expect(named.len >= 1);
+    for (named) |address| try std.testing.expectEqual(@as(u16, 8080), address.getPort());
+
+    try std.testing.expectError(error.UnknownHostName, resolveHostAddresses("bad..name", 8080, &addresses));
 }
 
 test "connectBoundedTcp bounds a connect that would otherwise hang" {

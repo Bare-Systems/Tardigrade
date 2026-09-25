@@ -2,6 +2,18 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [0.7.3] - 2026-09-25
+
+### Fixed
+
+- **`proxy_pass` with a URI no longer appends a trailing slash when the request
+  path equals the location prefix (#796)** — with `location /mcp {
+  proxy_pass http://ekho-mcp:8000/mcp; }`, `POST /mcp` was forwarded as
+  `/mcp/`, so frameworks such as Starlette/FastMCP answered with a 307 that
+  leaked the internal upstream URL. An empty suffix now leaves the proxy_pass
+  URI unchanged (`/mcp` → `/mcp`, `/mcp/` → `/mcp/`), including for an exact
+  location that shares its path with a prefix location.
+
 ## [0.7.2] - 2026-09-24
 
 ### Fixed

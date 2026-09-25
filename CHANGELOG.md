@@ -2,6 +2,18 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [0.7.2] - 2026-09-24
+
+### Fixed
+
+- **Hostname upstreams are resolved again (#786)** — since 0.5.0, a
+  `proxy_pass http://<name>:<port>` upstream failed every request with 502
+  (`error.ParseFailed`) because upstream hosts were only accepted as IP
+  literals. Host names are now resolved through /etc/hosts and the system DNS
+  configuration (Docker Compose and Kubernetes service names), and each
+  resolved address is tried in turn. The same fix applies to FastCGI, SCGI,
+  uWSGI, memcached, mail, and approval-webhook upstreams addressed by name.
+
 ## [0.7.1] - 2026-09-24
 
 ### Fixed

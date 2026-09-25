@@ -5527,6 +5527,41 @@ test "connectBlockingTcp + exchange round-trips a real TCP origin" {
     try std.testing.expectEqualStrings("text/plain", resp.headerValue("content-type").?);
 }
 
+test "buffered proxy exchange reaches a host-name upstream (#786)" {
+    // Regression: `proxy_pass http://<name>:<port>` failed with
+    // error.ParseFailed because upstream hosts were only parsed as IP
+    // literals. "localhost" must resolve and reach the 127.0.0.1 listener.
+    const allocator = std.testing.allocator;
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    const responder = try std.Thread.spawn(.{}, rawHttpResponder, .{listener.fd});
+    defer responder.join();
+
+    const uri = try std.Uri.parse("http://localhost/");
+    var resp = try executeBoundedBufferedTcpHttpRequest(
+        allocator,
+        "localhost",
+        listener.port,
+        null,
+        uri,
+        "GET",
+        &.{},
+        "",
+        null,
+        1 << 20,
+        2_000,
+        2_000,
+        null,
+        null,
+        false,
+    );
+    defer resp.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqualStrings("hello", resp.body);
+}
+
 /// Raw blocking keep-alive responder: accepts one connection and serves `n`
 /// framed responses on it (Content-Length, no `Connection: close`), so a
 /// pooled client can reuse the connection across requests.

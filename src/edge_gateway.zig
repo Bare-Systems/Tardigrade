@@ -4633,6 +4633,10 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     if (!trusted_forwarding_source) {
         request.headers.remove("x-forwarded-for");
         request.headers.remove("x-real-ip");
+        // The configured real-IP header (e.g. CF-Connecting-IP) is just as
+        // authoritative to an origin that reads it, so an untrusted peer's
+        // copy must not be proxied through either (#791).
+        if (cfg.real_ip_header.len > 0) request.headers.remove(cfg.real_ip_header);
     }
     // A trusted peer's X-Forwarded-For is walked right to left, skipping
     // only explicitly trusted hops (#791): the leftmost entry is whatever

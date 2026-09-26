@@ -356,10 +356,14 @@ For a trusted peer, Tardigrade resolves the client IP (nginx `real_ip_header`
 2. `X-Forwarded-For`, walked from the **right**. Proxies append to this
    header rather than replace it, so the leftmost entry is whatever the client
    sent. Entries matching `trusted_upstream_identities` are skipped; the first
-   untrusted address is the client. The walk stops at an entry that is not a
-   valid IP.
-3. `X-Real-IP`, when it holds a valid IP.
+   untrusted address is the client. The walk stops at an empty or invalid
+   member, since nothing left of it is attested by a trusted hop.
+3. `X-Real-IP`, when it holds a valid IP (also when `X-Forwarded-For` yields
+   no usable address).
 4. The connection address.
+
+From an untrusted peer, the configured real-IP header is stripped along with
+`X-Forwarded-For` and `X-Real-IP`, so a forged copy never reaches the origin.
 
 Before #791 the **leftmost** `X-Forwarded-For` entry was used, so a client
 behind a correctly trusted CDN could still pick its own `client_ip`.

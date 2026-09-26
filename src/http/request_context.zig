@@ -238,8 +238,9 @@ pub const no_trusted_proxies = struct {
 ///    proxies append to it rather than replace it -- so before #791 taking
 ///    it let any client behind a trusted CDN pick its own `client_ip`,
 ///    bypassing per-IP rate limiting and forging access-log addresses. The
-///    walk stops at the first entry that is not a valid IP.
-/// 3. `X-Real-IP`, when it holds a valid IP.
+///    walk stops at the first entry that is empty or not a valid IP.
+/// 3. `X-Real-IP`, when it holds a valid IP (also when `X-Forwarded-For`
+///    yields no usable address).
 /// 4. `default`.
 pub fn extractClientIp(
     request: *const Request,
@@ -258,7 +259,7 @@ pub fn extractClientIp(
     }
 
     if (request.headers.contains("x-forwarded-for")) {
-        return rightmostUntrustedForwardedFor(request, trusted_proxies) orelse default;
+        if (rightmostUntrustedForwardedFor(request, trusted_proxies)) |ip| return ip;
     }
 
     if (request.headers.get("x-real-ip")) |xri| {
@@ -270,9 +271,10 @@ pub fn extractClientIp(
 
 /// Walk every `X-Forwarded-For` entry right to left -- across repeated
 /// header lines, which RFC 9110 §5.3 defines as one comma-joined list --
-/// returning the first address that is not a trusted proxy. If every valid
-/// entry is trusted, the leftmost valid one is returned; null when the
-/// rightmost entry is not a valid IP.
+/// returning the first address that is not a trusted proxy. An empty or
+/// unparseable member ends the walk: nothing left of it is attested by a
+/// trusted hop. If every entry reached is trusted, the leftmost of them is
+/// returned; null when the rightmost member is already unusable.
 fn rightmostUntrustedForwardedFor(request: *const Request, trusted_proxies: anytype) ?[]const u8 {
     var candidate: ?[]const u8 = null;
     const all = request.headers.iterator();
@@ -284,7 +286,6 @@ fn rightmostUntrustedForwardedFor(request: *const Request, trusted_proxies: anyt
         var it = std.mem.splitBackwardsScalar(u8, header.value, ',');
         while (it.next()) |raw_entry| {
             const entry = std.mem.trim(u8, raw_entry, " \t");
-            if (entry.len == 0) continue;
             if (access_control.parseIp(entry) == null) return candidate;
             candidate = entry;
             if (!trusted_proxies.isTrustedProxy(entry)) return candidate;
@@ -455,6 +456,57 @@ test "extractClientIp stops the walk at an invalid X-Forwarded-For entry (#791)"
     // An invalid rightmost entry falls back to the connection address.
     try expectClientIp(
         "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.7, not-an-ip\r\n\r\n",
+        true,
+        "",
+        no_trusted_proxies,
+        "127.0.0.1",
+        "127.0.0.1",
+    );
+}
+
+test "extractClientIp does not cross an empty X-Forwarded-For member (#791)" {
+    // `203.0.113.7, , 10.0.0.5`: the empty member is not attested by the
+    // trusted hop, so the walk must stop at 10.0.0.5 rather than skip it.
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.7, , 10.0.0.5\r\n\r\n",
+        true,
+        "",
+        TestTrustedProxies{},
+        "127.0.0.1",
+        "10.0.0.5",
+    );
+    // Same boundary across repeated header lines: an empty trailing member
+    // on the first line stops the walk before its client-chosen address.
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.7,\r\nX-Forwarded-For: 10.0.0.5\r\n\r\n",
+        true,
+        "",
+        TestTrustedProxies{},
+        "127.0.0.1",
+        "10.0.0.5",
+    );
+}
+
+test "extractClientIp falls through unusable X-Forwarded-For to X-Real-IP (#791)" {
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: not-an-ip\r\nX-Real-IP: 198.51.100.20\r\n\r\n",
+        true,
+        "",
+        no_trusted_proxies,
+        "127.0.0.1",
+        "198.51.100.20",
+    );
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: \r\nX-Real-IP: 198.51.100.20\r\n\r\n",
+        true,
+        "",
+        no_trusted_proxies,
+        "127.0.0.1",
+        "198.51.100.20",
+    );
+    // Neither usable: the connection address.
+    try expectClientIp(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: not-an-ip\r\nX-Real-IP: also-not\r\n\r\n",
         true,
         "",
         no_trusted_proxies,

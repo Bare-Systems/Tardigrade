@@ -9,6 +9,7 @@ const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const gp = @import("gateway_proxy.zig");
+const gpt = @import("gateway_proxy_target.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const gcp = @import("gateway_control_plane_proxy.zig");
 const gs = @import("gateway_state.zig");
@@ -297,6 +298,13 @@ pub fn proxySuffixPathForLocation(
     matched: http.location_router.MatchResult,
     blocks: []const edge_config.EdgeConfig.LocationBlock,
 ) ?[]const u8 {
+    // An exact location whose proxy_pass carries a URI forwards it unchanged,
+    // like nginx; mount-stripping is only for exact blocks on a bare origin (#798).
+    const exact_with_uri = matched.block.match_type == .exact and switch (matched.block.action) {
+        .proxy_pass => |target| gpt.targetHasPath(std.mem.trim(u8, target, " \t\r\n")),
+        else => false,
+    };
+    if (exact_with_uri) return null;
     if (mountStripPrefixForLocation(request_path, matched, blocks)) |strip_prefix| {
         if (std.mem.startsWith(u8, request_path, strip_prefix)) {
             // An empty suffix leaves the proxy_pass URI unchanged (#796).
@@ -2649,6 +2657,26 @@ test "proxySuffixPathForLocation uses mount prefix for split upstream exact rout
     const matched = http.location_router.matchLocation(std.testing.allocator, "/ursa/health", &blocks).?;
     const suffix = proxySuffixPathForLocation("/ursa/health", matched, &blocks).?;
     try std.testing.expectEqualStrings("health", suffix);
+}
+
+test "proxySuffixPathForLocation forwards exact location proxy_pass URI unchanged (#798)" {
+    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/mcp/health",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://up/mcp/health" },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/mcp",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://up/mcp" },
+        },
+    };
+
+    const matched = http.location_router.matchLocation(std.testing.allocator, "/mcp/health", &blocks).?;
+    try std.testing.expect(proxySuffixPathForLocation("/mcp/health", matched, &blocks) == null);
 }
 
 test "proxySuffixPathForLocation keeps mount prefix for split upstream longer prefix route" {

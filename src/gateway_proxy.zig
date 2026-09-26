@@ -552,6 +552,19 @@ fn classifyStalePooledBufferedFailure(reused: bool, attempt: usize, err: anyerro
     return null;
 }
 
+/// Decide whether a connection-level failure of a pooled HTTP/2 stream on
+/// attempt 0 is retried once (#785). GOAWAY, RST_STREAM, and connection close
+/// do not prove the origin never processed the stream, so only idempotent
+/// methods with a replayable body are retried; a non-idempotent request is
+/// refused. There is no zero-byte proof on this path. Null means the failure
+/// is not a replay candidate at all (other errors, second attempts, streamed
+/// uploads) and is not counted.
+fn classifyH2PooledFailure(attempt: usize, body_replayable: bool, err: anyerror, method: []const u8) ?http.upstream_pool.StaleFailureOutcome {
+    if (attempt != 0 or !body_replayable) return null;
+    if (err != error.Http2GoAway and err != error.Http2ConnectionClosed and err != error.Http2StreamReset) return null;
+    return if (isHttpMethodIdempotent(method)) .retried_idempotent else .refused_ambiguous;
+}
+
 /// Execute a bounded buffered HTTP/1 request over a TCP socket, with optional
 /// TLS. This is the manual-transport replacement for the `std.http.Client`
 /// data-plane and control-plane proxy paths: unlike `std.http.Client` it
@@ -878,13 +891,9 @@ fn executeBufferedViaH2Pool(
                     // requests do not pick it, drop our ref, and retry once.
                     h2_pool.evict(key, conn);
                     h2_pool.release(conn);
-                    // These errors do not prove the origin never processed
-                    // the stream, so only idempotent methods are replayed
-                    // (#785).
-                    if (attempt == 0 and isHttpMethodIdempotent(method) and
-                        (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset))
-                    {
-                        continue;
+                    if (classifyH2PooledFailure(attempt, true, err, method)) |outcome| {
+                        if (h1_pool) |p| p.recordStaleFailure(key, outcome);
+                        if (outcome != .refused_ambiguous) continue;
                     }
                     return err;
                 };
@@ -1258,12 +1267,9 @@ fn streamViaH2Pool(
                     // once on connection-level failures.
                     h2_pool.evict(key, conn);
                     h2_pool.release(conn);
-                    // Not proof the origin never processed the stream:
-                    // idempotent methods only (#785).
-                    if (streaming_body == null and attempt == 0 and isHttpMethodIdempotent(method) and
-                        (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset))
-                    {
-                        continue;
+                    if (classifyH2PooledFailure(attempt, streaming_body == null, err, method)) |outcome| {
+                        if (h1_pool) |p| p.recordStaleFailure(key, outcome);
+                        if (outcome != .refused_ambiguous) continue;
                     }
                     return err;
                 };
@@ -1324,12 +1330,9 @@ fn streamViaH2Pool(
                     // client, so this becomes a clean 503 and never counts
                     // against the origin. Retrying would hit the same wall.
                     if (err == error.BufferLimitExceeded) return error.ProxyBufferCapacityUnavailable;
-                    // Not proof the origin never processed the stream:
-                    // idempotent methods only (#785).
-                    if (streaming_body == null and attempt == 0 and isHttpMethodIdempotent(method) and
-                        (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset))
-                    {
-                        continue;
+                    if (classifyH2PooledFailure(attempt, streaming_body == null, err, method)) |outcome| {
+                        if (h1_pool) |p| p.recordStaleFailure(key, outcome);
+                        if (outcome != .refused_ambiguous) continue;
                     }
                     return err;
                 };
@@ -7559,4 +7562,187 @@ test "stale pooled conn: request delivered then EOF before status replays GET on
     const agg = pool.aggregateStats();
     try std.testing.expectEqual(@as(u64, 1), agg.stale_retries_idempotent_total);
     try std.testing.expectEqual(@as(u64, 1), agg.stale_retries_total);
+}
+
+test "classifyH2PooledFailure keeps pooled HTTP/2 replays idempotent-only (#785)" {
+    const Outcome = http.upstream_pool.StaleFailureOutcome;
+    try std.testing.expectEqual(@as(?Outcome, .refused_ambiguous), classifyH2PooledFailure(0, true, error.Http2GoAway, "POST"));
+    try std.testing.expectEqual(@as(?Outcome, .refused_ambiguous), classifyH2PooledFailure(0, true, error.Http2StreamReset, "PATCH"));
+    try std.testing.expectEqual(@as(?Outcome, .refused_ambiguous), classifyH2PooledFailure(0, true, error.Http2ConnectionClosed, "POST"));
+    try std.testing.expectEqual(@as(?Outcome, .retried_idempotent), classifyH2PooledFailure(0, true, error.Http2ConnectionClosed, "GET"));
+    try std.testing.expectEqual(@as(?Outcome, .retried_idempotent), classifyH2PooledFailure(0, true, error.Http2GoAway, "PUT"));
+    // Budget, non-replayable bodies, and unrelated errors are not candidates.
+    try std.testing.expectEqual(@as(?Outcome, null), classifyH2PooledFailure(1, true, error.Http2ConnectionClosed, "GET"));
+    try std.testing.expectEqual(@as(?Outcome, null), classifyH2PooledFailure(0, false, error.Http2ConnectionClosed, "GET"));
+    try std.testing.expectEqual(@as(?Outcome, null), classifyH2PooledFailure(0, true, error.Timeout, "GET"));
+}
+
+/// h2c origin for the #785 H2 regressions. Each accepted connection reads one
+/// complete request stream and counts it as a side effect. The first
+/// connection then closes without responding, so the request may have been
+/// processed but the client sees a connection-level failure. Later connections
+/// answer 200 "ok". Serves exactly `max_conns` connections.
+const H2ProcessThenDieOrigin = struct {
+    listen_fd: std.posix.fd_t,
+    max_conns: usize,
+    side_effects: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+};
+
+fn h2ProcessThenDieServe(origin: *H2ProcessThenDieOrigin) void {
+    var index: usize = 0;
+    while (index < origin.max_conns) : (index += 1) {
+        const conn = std.c.accept(origin.listen_fd, null, null);
+        if (conn < 0) return;
+        defer _ = std.c.close(conn);
+
+        var preface: [24]u8 = undefined;
+        if (!readExactlyFromFd(conn, &preface)) return;
+        const settings = [_]u8{ 0, 0, 0, 0x04, 0, 0, 0, 0, 0 };
+        _ = std.c.write(conn, &settings, settings.len);
+
+        // Drain frames until a request stream ends (END_STREAM on HEADERS or
+        // DATA), remembering its id.
+        var stream_id: u32 = 0;
+        while (true) {
+            var hdr: [9]u8 = undefined;
+            if (!readExactlyFromFd(conn, &hdr)) return;
+            const payload_len = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | @as(usize, hdr[2]);
+            const typ = hdr[3];
+            const flags = hdr[4];
+            const sid = std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff;
+            var scratch: [4096]u8 = undefined;
+            var remaining = payload_len;
+            while (remaining > 0) {
+                const take = @min(remaining, scratch.len);
+                if (!readExactlyFromFd(conn, scratch[0..take])) return;
+                remaining -= take;
+            }
+            if (typ == 0x01) stream_id = sid;
+            if ((typ == 0x00 or typ == 0x01) and (flags & 0x01) != 0 and sid != 0) break;
+        }
+        _ = origin.side_effects.fetchAdd(1, .monotonic);
+        if (index == 0) continue; // processed, then the connection dies
+
+        // HEADERS (END_HEADERS, `:status: 200` = static index 8), then DATA "ok"
+        // with END_STREAM.
+        var head_frame = [_]u8{ 0, 0, 1, 0x01, 0x04, 0, 0, 0, 0, 0x88 };
+        std.mem.writeInt(u32, head_frame[5..9], stream_id, .big);
+        _ = std.c.write(conn, &head_frame, head_frame.len);
+        var body_frame = [_]u8{ 0, 0, 2, 0x00, 0x01, 0, 0, 0, 0, 'o', 'k' };
+        std.mem.writeInt(u32, body_frame[5..9], stream_id, .big);
+        _ = std.c.write(conn, &body_frame, body_frame.len);
+
+        var drain: [256]u8 = undefined;
+        while (std.c.read(conn, &drain, drain.len) > 0) {}
+    }
+}
+
+const H2EntryPoint = enum { buffered, streaming };
+
+/// Result of one pooled-h2 request against `H2ProcessThenDieOrigin`.
+const H2ReplayRun = struct {
+    status: ?u16,
+    err: ?anyerror,
+    side_effects: usize,
+    extra_connection_attempted: bool,
+    stats: http.upstream_pool.HostStats,
+};
+
+fn runH2ReplayScenario(entry: H2EntryPoint, method: []const u8, body: []const u8, expected_conns: usize) !H2ReplayRun {
+    const allocator = std.testing.allocator;
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+    var origin = H2ProcessThenDieOrigin{ .listen_fd = listener.fd, .max_conns = expected_conns };
+    const origin_thread = try std.Thread.spawn(.{}, h2ProcessThenDieServe, .{&origin});
+
+    var h1_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    defer h1_pool.deinit();
+    var h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/orders", .{listener.port}));
+
+    var status: ?u16 = null;
+    var err: ?anyerror = null;
+    switch (entry) {
+        .buffered => {
+            if (executeBufferedViaH2Pool(allocator, &h2_pool, "127.0.0.1", listener.port, null, uri, method, &.{}, body, null, 1 << 20, 2_000, 2_000, &h1_pool)) |resp_val| {
+                var resp = resp_val;
+                status = resp.status_code;
+                resp.deinit(allocator);
+            } else |e| err = e;
+        },
+        .streaming => {
+            const relay_bytes: usize = 16 * 1024;
+            var global = proxy_buffer_account.Aggregate.init(.global, 4 * relay_bytes);
+            var counters = UploadBufferObserver{};
+            var source = FakeUploadSource{ .data = "" };
+            var captured = std.array_list.Managed(u8).init(allocator);
+            defer captured.deinit();
+            var security = http.security_headers.SecurityHeaders{};
+            var downstream_committed = false;
+            if (streamViaH2Pool(allocator, &h2_pool, &h1_pool, "127.0.0.1", listener.port, null, uri, method, &.{}, body, null, relay_bytes, &source, CaptureWriter{ .list = &captured }, &security, null, null, "h2-785-test", true, 2_000, 2_000, null, uploadTestLimits(1024 * 1024), counters.observer(), &global, &downstream_committed)) |result| {
+                status = result.status_code;
+            } else |e| err = e;
+        },
+    }
+
+    // Nothing beyond the expected connections may have been attempted.
+    const extra = try pollFdReadable(listener.fd, 100);
+    h2_pool.deinit(); // closes pooled conns so the origin's drain loop ends
+    origin_thread.join();
+
+    const snaps = try h1_pool.snapshotHosts(allocator);
+    defer http.upstream_pool.freeHostSnapshots(allocator, snaps);
+    var key_buf: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "h2c:127.0.0.1:{d}", .{listener.port});
+    var stats: http.upstream_pool.HostStats = .{};
+    for (snaps) |snap| {
+        if (std.mem.eql(u8, snap.host, key)) stats = snap.stats;
+    }
+    return .{
+        .status = status,
+        .err = err,
+        .side_effects = origin.side_effects.load(.monotonic),
+        .extra_connection_attempted = extra,
+        .stats = stats,
+    };
+}
+
+fn expectH2PostNotReplayed(entry: H2EntryPoint) !void {
+    const run = try runH2ReplayScenario(entry, "POST", "{\"op\":\"create\"}", 1);
+    try std.testing.expect(run.err != null);
+    try std.testing.expectEqual(@as(?u16, null), run.status);
+    try std.testing.expectEqual(@as(usize, 1), run.side_effects);
+    try std.testing.expect(!run.extra_connection_attempted);
+    try std.testing.expectEqual(@as(u64, 1), run.stats.stale_replay_refused_total);
+    try std.testing.expectEqual(@as(u64, 0), run.stats.stale_retries_total);
+}
+
+fn expectH2GetReplayedOnce(entry: H2EntryPoint) !void {
+    const run = try runH2ReplayScenario(entry, "GET", "", 2);
+    try std.testing.expectEqual(@as(?anyerror, null), run.err);
+    try std.testing.expectEqual(@as(?u16, 200), run.status);
+    // The origin counted both streams: a replayed POST would show up here.
+    try std.testing.expectEqual(@as(usize, 2), run.side_effects);
+    try std.testing.expect(!run.extra_connection_attempted);
+    try std.testing.expectEqual(@as(u64, 1), run.stats.stale_retries_idempotent_total);
+    try std.testing.expectEqual(@as(u64, 1), run.stats.stale_retries_total);
+    try std.testing.expectEqual(@as(u64, 0), run.stats.stale_replay_refused_total);
+}
+
+test "pooled h2 buffered: POST processed before connection loss is not replayed (#785)" {
+    try expectH2PostNotReplayed(.buffered);
+}
+
+test "pooled h2 buffered: GET after connection loss is replayed once (#785)" {
+    try expectH2GetReplayedOnce(.buffered);
+}
+
+test "pooled h2 streaming: POST processed before connection loss is not replayed (#785)" {
+    try expectH2PostNotReplayed(.streaming);
+}
+
+test "pooled h2 streaming: GET after connection loss is replayed once (#785)" {
+    try expectH2GetReplayedOnce(.streaming);
 }

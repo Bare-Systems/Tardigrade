@@ -509,7 +509,12 @@ that **zero bytes** of it were sent.
 - Each outcome is counted per origin with no request data:
   `tardigrade_upstream_pool_stale_retries_zero_byte_total`,
   `tardigrade_upstream_pool_stale_retries_idempotent_total`, and
-  `tardigrade_upstream_pool_stale_replay_refused_total`.
+  `tardigrade_upstream_pool_stale_replay_refused_total`. HTTP/1.1 outcomes use
+  the `http:`/`https:`/`unix:` pool key as the `upstream` label. Pooled HTTP/2
+  outcomes use the h2 pool key (`h2:host:port` or `h2c:host:port`), so the two
+  protocols stay distinguishable. HTTP/2 never produces a zero-byte retry,
+  because it has no zero-byte proof. A streamed upload that fails is not a
+  replay candidate and is not counted.
 
 Idle eviction runs in the existing maintenance tick (alongside the parked
 downstream-keepalive reaper): connections past `idle_timeout_ms` or

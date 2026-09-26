@@ -21,7 +21,8 @@ All notable user-facing changes to Tardigrade are documented here.
   any byte is written, so the idle-gap 502s behind #787 stay fixed. New
   per-origin counters: `tardigrade_upstream_pool_stale_retries_zero_byte_total`,
   `..._stale_retries_idempotent_total`, and
-  `..._stale_replay_refused_total`. See
+  `..._stale_replay_refused_total`. HTTP/2 outcomes appear under the
+  `h2:`/`h2c:` upstream label. See
   [UPSTREAM_POOLING.md](docs/UPSTREAM_POOLING.md#stale-connection-replay-policy-785).
 
 ## [0.7.3] - 2026-09-25

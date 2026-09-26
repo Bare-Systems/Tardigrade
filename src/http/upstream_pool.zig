@@ -74,6 +74,18 @@ pub const PooledConn = struct {
     released_by: u64 = 0,
 };
 
+/// How a failed exchange on a reused pooled connection was handled (#785).
+pub const StaleFailureOutcome = enum {
+    /// Transport-backed proof that zero request bytes were sent: retried on a
+    /// fresh connection regardless of method.
+    retried_zero_byte,
+    /// Delivery ambiguous, but the method is idempotent: retried.
+    retried_idempotent,
+    /// Delivery ambiguous and the method is not idempotent: not replayed, the
+    /// failure is surfaced to the client.
+    refused_ambiguous,
+};
+
 /// Per-origin counters. `idle`/`active` are gauges; the rest are monotonic.
 /// `reused_local_total` + `reused_cross_worker_total` partition `reused_total`.
 pub const HostStats = struct {
@@ -82,6 +94,9 @@ pub const HostStats = struct {
     reused_local_total: u64 = 0,
     reused_cross_worker_total: u64 = 0,
     stale_retries_total: u64 = 0,
+    stale_retries_zero_byte_total: u64 = 0,
+    stale_retries_idempotent_total: u64 = 0,
+    stale_replay_refused_total: u64 = 0,
     at_capacity_total: u64 = 0,
     checkout_stale_plaintext_unexpected: u64 = 0,
     checkout_stale_tls_application_plaintext: u64 = 0,
@@ -103,6 +118,9 @@ pub const Stats = struct {
     reused_local_total: u64 = 0,
     reused_cross_worker_total: u64 = 0,
     stale_retries_total: u64 = 0,
+    stale_retries_zero_byte_total: u64 = 0,
+    stale_retries_idempotent_total: u64 = 0,
+    stale_replay_refused_total: u64 = 0,
     at_capacity_total: u64 = 0,
     checkout_stale_plaintext_unexpected: u64 = 0,
     checkout_stale_tls_application_plaintext: u64 = 0,
@@ -682,6 +700,26 @@ pub const UpstreamPool = struct {
         entry.stats.stale_retries_total += 1;
     }
 
+    /// Record how a failure on a reused pooled connection was handled (#785).
+    /// Retries also count toward `stale_retries_total`; a refused replay does
+    /// not, since nothing was retried.
+    pub fn recordStaleFailure(self: *UpstreamPool, key: []const u8, outcome: StaleFailureOutcome) void {
+        const lock_wait_ns = self.lock();
+        defer self.unlock(lock_wait_ns);
+        const entry = self.hostEntry(key) orelse return;
+        switch (outcome) {
+            .retried_zero_byte => {
+                entry.stats.stale_retries_total += 1;
+                entry.stats.stale_retries_zero_byte_total += 1;
+            },
+            .retried_idempotent => {
+                entry.stats.stale_retries_total += 1;
+                entry.stats.stale_retries_idempotent_total += 1;
+            },
+            .refused_ambiguous => entry.stats.stale_replay_refused_total += 1,
+        }
+    }
+
     pub fn recordConnectLatency(self: *UpstreamPool, latency_ms: u64) void {
         const lock_wait_ns = self.lock();
         defer self.unlock(lock_wait_ns);
@@ -876,6 +914,9 @@ pub const UpstreamPool = struct {
             agg.reused_local_total += s.reused_local_total;
             agg.reused_cross_worker_total += s.reused_cross_worker_total;
             agg.stale_retries_total += s.stale_retries_total;
+            agg.stale_retries_zero_byte_total += s.stale_retries_zero_byte_total;
+            agg.stale_retries_idempotent_total += s.stale_retries_idempotent_total;
+            agg.stale_replay_refused_total += s.stale_replay_refused_total;
             agg.at_capacity_total += s.at_capacity_total;
             agg.checkout_stale_plaintext_unexpected += s.checkout_stale_plaintext_unexpected;
             agg.checkout_stale_tls_application_plaintext += s.checkout_stale_tls_application_plaintext;

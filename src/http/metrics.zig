@@ -1376,7 +1376,7 @@ pub const Metrics = struct {
             \\# HELP tardigrade_upstream_connections_idle Upstream connections currently held idle in the pool
             \\# TYPE tardigrade_upstream_connections_idle gauge
             \\tardigrade_upstream_connections_idle {d}
-            \\# HELP tardigrade_upstream_stale_retries_total Idempotent retries after a reused upstream connection was found dead
+            \\# HELP tardigrade_upstream_stale_retries_total Fresh-connection retries after a reused upstream connection was found dead
             \\# TYPE tardigrade_upstream_stale_retries_total counter
             \\tardigrade_upstream_stale_retries_total {d}
             \\

@@ -1881,6 +1881,12 @@ pub const GatewayState = struct {
                 \\# TYPE tardigrade_upstream_pool_connections_active gauge
                 \\# HELP tardigrade_upstream_pool_stale_retries_total Stale-connection retries per origin
                 \\# TYPE tardigrade_upstream_pool_stale_retries_total counter
+                \\# HELP tardigrade_upstream_pool_stale_retries_zero_byte_total Fresh-connection retries (any method) after a reused connection failed with proof that zero request bytes were sent
+                \\# TYPE tardigrade_upstream_pool_stale_retries_zero_byte_total counter
+                \\# HELP tardigrade_upstream_pool_stale_retries_idempotent_total Fresh-connection retries of idempotent requests after an ambiguous failure on a reused connection
+                \\# TYPE tardigrade_upstream_pool_stale_retries_idempotent_total counter
+                \\# HELP tardigrade_upstream_pool_stale_replay_refused_total Non-idempotent requests not replayed after an ambiguous failure on a reused connection
+                \\# TYPE tardigrade_upstream_pool_stale_replay_refused_total counter
                 \\# HELP tardigrade_upstream_pool_checkout_stale_plaintext_unexpected_total Plaintext idle checkouts rejected because unexpected bytes or peer state were readable
                 \\# TYPE tardigrade_upstream_pool_checkout_stale_plaintext_unexpected_total counter
                 \\# HELP tardigrade_upstream_pool_checkout_stale_tls_application_plaintext_total TLS idle checkouts rejected because decrypted application data was queued
@@ -1917,6 +1923,9 @@ pub const GatewayState = struct {
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_idle", snap.host, "{d}", .{s.idle});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_active", snap.host, "{d}", .{s.active});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_stale_retries_total", snap.host, "{d}", .{s.stale_retries_total});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_stale_retries_zero_byte_total", snap.host, "{d}", .{s.stale_retries_zero_byte_total});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_stale_retries_idempotent_total", snap.host, "{d}", .{s.stale_retries_idempotent_total});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_stale_replay_refused_total", snap.host, "{d}", .{s.stale_replay_refused_total});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_checkout_stale_plaintext_unexpected_total", snap.host, "{d}", .{s.checkout_stale_plaintext_unexpected});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_checkout_stale_tls_application_plaintext_total", snap.host, "{d}", .{s.checkout_stale_tls_application_plaintext});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_checkout_stale_tls_peer_closed_total", snap.host, "{d}", .{s.checkout_stale_tls_peer_closed});

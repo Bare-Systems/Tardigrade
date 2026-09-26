@@ -2,6 +2,28 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- **Non-idempotent requests are no longer replayed after an ambiguous failure
+  on a pooled upstream connection (#785)** — 0.7.1 retried POST/PATCH on a
+  fresh connection after any write error on a reused keep-alive connection
+  (#787). A write can transmit part of a request before it fails, so the
+  origin could already have acted on it. A non-idempotent request is now
+  replayed at most once, and only when the first `write(2)` on a plain
+  TCP/unix socket fails with zero bytes accepted (Linux only). Partial writes,
+  TLS write errors, and a request written before the origin closed without a
+  status line return 502 for non-idempotent methods, and idempotent methods
+  still retry once. The same rule now covers the streaming proxy path and
+  pooled HTTP/2 upstreams, which also replayed any method before. Idle
+  connections the origin already closed are still retired at checkout before
+  any byte is written, so the idle-gap 502s behind #787 stay fixed. New
+  per-origin counters: `tardigrade_upstream_pool_stale_retries_zero_byte_total`,
+  `..._stale_retries_idempotent_total`, and
+  `..._stale_replay_refused_total`. See
+  [UPSTREAM_POOLING.md](docs/UPSTREAM_POOLING.md#stale-connection-replay-policy-785).
+
 ## [0.7.3] - 2026-09-25
 
 ### Fixed

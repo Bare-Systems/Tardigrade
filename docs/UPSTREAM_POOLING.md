@@ -467,10 +467,49 @@ exchange (keepalive): send the request without Connection: close, read the
 release(key, conn):  if reusable and under max_idle_per_host and not aged →
   return to the idle list (stamp last_used_ms); else close().
 
-stale retry: if a *reused* connection yields zero response bytes (origin closed
-  the idle socket), the request was never delivered → close and retry once on a
-  fresh connection, for any method (idempotent by construction).
+stale retry: a failed exchange on a *reused* connection is closed (never
+  returned to the pool) and retried at most once on a fresh connection, per the
+  replay policy below.
 ```
+
+### Stale-connection replay policy (#785)
+
+The absence of response bytes never proves the origin did not act on a
+request: a write can transmit a prefix and then fail, and an origin can process
+a fully delivered request and close before sending a status line. Tardigrade
+therefore replays a non-idempotent request only with transport-backed proof
+that **zero bytes** of it were sent.
+
+| Failure on a reused HTTP/1.1 connection | GET/HEAD/PUT/DELETE/OPTIONS/TRACE | POST/PATCH/other |
+|---|---|---|
+| Checkout readiness probe sees the idle conn is readable/closed (nothing written yet) | fresh conn, no retry spent | fresh conn, no retry spent |
+| First `write(2)` fails, zero bytes accepted (plain TCP/unix, Linux only) | retry once | retry once |
+| Partial write then error; any TLS write error; any write error on non-Linux | retry once | **no retry**, 502 |
+| Request written, EOF/no status line (`UpstreamConnectionClosed`) | retry once | **no retry**, 502 |
+| Timeout, reset while reading, or any other error | no retry | no retry |
+
+- Most idle-close stale connections are handled by the first row. When an
+  origin (uvicorn, Puma, Go `net/http`) closes an idle keep-alive socket, the
+  FIN makes the pooled fd readable, so checkout retires it before any request
+  byte is written. The remaining window is an origin close that races the
+  checkout, and it follows the other rows.
+- The zero-byte proof is Linux-only. Linux TCP and AF_UNIX stream sends return
+  the partial count when an error follows a partial copy, so a failed first
+  call accepted nothing. BSD-derived kernels (macOS) can report EPIPE and drop
+  that partial count, so there every write failure is treated as ambiguous.
+- TLS never produces a zero-byte proof. The record layer encrypts and flushes
+  internally, so a TLS write failure is always ambiguous. TLS pooled
+  connections rely on the checkout drain probe (peer `close_notify`/EOF)
+  instead.
+- A streamed (non-replayable) upload is never retried. On the streaming path, a
+  retry also requires that no response byte has reached the client yet.
+- The pooled HTTP/2 path (buffered and streaming) replays GOAWAY, stream-reset,
+  and connection-closed failures only for idempotent methods, because those
+  errors do not prove the origin skipped the stream.
+- Each outcome is counted per origin with no request data:
+  `tardigrade_upstream_pool_stale_retries_zero_byte_total`,
+  `tardigrade_upstream_pool_stale_retries_idempotent_total`, and
+  `tardigrade_upstream_pool_stale_replay_refused_total`.
 
 Idle eviction runs in the existing maintenance tick (alongside the parked
 downstream-keepalive reaper): connections past `idle_timeout_ms` or
@@ -504,7 +543,10 @@ Per-upstream labelled (`{upstream="host:port"}`, Phase 1b):
 - `tardigrade_upstream_pool_connections_reused_cross_worker_total` (#147)
 - `tardigrade_upstream_pool_connections_idle` (gauge)
 - `tardigrade_upstream_pool_connections_active` (gauge — connections checked out)
-- `tardigrade_upstream_pool_stale_retries_total`
+- `tardigrade_upstream_pool_stale_retries_total` (all fresh-connection retries after a reused-connection failure)
+- `tardigrade_upstream_pool_stale_retries_zero_byte_total` (#785 — retries of any method with proof that zero request bytes were sent)
+- `tardigrade_upstream_pool_stale_retries_idempotent_total` (#785 — idempotent retries after an ambiguous failure)
+- `tardigrade_upstream_pool_stale_replay_refused_total` (#785 — non-idempotent requests not replayed after an ambiguous failure)
 - `tardigrade_upstream_pool_reuse_ratio` (gauge — `reused / (reused + new)`)
 
 Connect-latency histogram (Phase 1b): `tardigrade_upstream_connect_latency_ms`

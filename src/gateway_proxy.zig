@@ -8,6 +8,7 @@
 
 const compat = @import("zig_compat");
 const std = @import("std");
+const builtin = @import("builtin");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const gs = @import("gateway_state.zig");
@@ -521,9 +522,9 @@ pub fn executeBoundedBufferedUnixSocketHttpRequest(
             return resp;
         } else |err| {
             p.release(key, conn, false, http.event_loop.monotonicMs());
-            if (shouldRetryStalePooledBufferedExchange(reused, attempt, err, method)) {
-                p.recordStaleRetry(key);
-                continue; // request never delivered — retry once on a fresh conn
+            if (classifyStalePooledBufferedFailure(reused, attempt, err, method)) |outcome| {
+                p.recordStaleFailure(key, outcome);
+                if (outcome != .refused_ambiguous) continue; // retry once on a fresh conn
             }
             return err;
         }
@@ -531,15 +532,37 @@ pub fn executeBoundedBufferedUnixSocketHttpRequest(
     unreachable;
 }
 
-/// Whether a buffered exchange that failed on attempt 0 should be retried once
-/// on a fresh connection. A write failure on a reused pooled connection means
-/// the origin closed it while idle and never saw the request, so every method
-/// is safe (issue #787). A zero-byte response read is ambiguous about delivery,
-/// so it stays limited to idempotent methods.
-fn shouldRetryStalePooledBufferedExchange(reused: bool, attempt: usize, err: anyerror, method: []const u8) bool {
-    if (!reused or attempt != 0) return false;
-    if (err == error.UpstreamRequestWriteFailed) return true;
-    return err == error.UpstreamConnectionClosed and isHttpMethodIdempotent(method);
+/// Decide whether a buffered exchange that failed on attempt 0 of a reused
+/// pooled connection is retried once on a fresh connection (#785).
+///
+/// Absence of response bytes never proves the origin did not act: a partial
+/// write can deliver enough of a POST for the origin to process it, and an
+/// origin can process a fully delivered request and close before answering.
+/// So a non-idempotent request is replayed only on
+/// `error.UpstreamRequestNotSent` — the kernel accepted zero bytes of it.
+/// Ambiguous write failures and a closed-before-status response stay limited
+/// to idempotent methods; timeouts and every other error are never retried.
+/// The buffered body is a fully held slice, so a replay is always complete.
+fn classifyStalePooledBufferedFailure(reused: bool, attempt: usize, err: anyerror, method: []const u8) ?http.upstream_pool.StaleFailureOutcome {
+    if (!reused or attempt != 0) return null;
+    if (err == error.UpstreamRequestNotSent) return .retried_zero_byte;
+    if (err == error.UpstreamRequestWriteFailed or err == error.UpstreamConnectionClosed) {
+        return if (isHttpMethodIdempotent(method)) .retried_idempotent else .refused_ambiguous;
+    }
+    return null;
+}
+
+/// Decide whether a connection-level failure of a pooled HTTP/2 stream on
+/// attempt 0 is retried once (#785). GOAWAY, RST_STREAM, and connection close
+/// do not prove the origin never processed the stream, so only idempotent
+/// methods with a replayable body are retried; a non-idempotent request is
+/// refused. There is no zero-byte proof on this path. Null means the failure
+/// is not a replay candidate at all (other errors, second attempts, streamed
+/// uploads) and is not counted.
+fn classifyH2PooledFailure(attempt: usize, body_replayable: bool, err: anyerror, method: []const u8) ?http.upstream_pool.StaleFailureOutcome {
+    if (attempt != 0 or !body_replayable) return null;
+    if (err != error.Http2GoAway and err != error.Http2ConnectionClosed and err != error.Http2StreamReset) return null;
+    return if (isHttpMethodIdempotent(method)) .retried_idempotent else .refused_ambiguous;
 }
 
 /// Execute a bounded buffered HTTP/1 request over a TCP socket, with optional
@@ -635,9 +658,10 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     var key_buf: [268]u8 = undefined;
     const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_tls) "https" else "http", host, port }) catch host;
 
-    // Attempt 0 uses a pooled connection when available; a reused connection the
-    // origin already closed (error.UpstreamConnectionClosed with zero bytes) is
-    // retried once on a fresh connection since the request was never delivered.
+    // Attempt 0 uses a pooled connection when available; checkout already
+    // retires idle connections the origin visibly closed. A reused connection
+    // that still fails is retried once on a fresh connection per
+    // `classifyStalePooledBufferedFailure` (#785).
     // Checkout reserves an active slot before connecting, so the per-origin
     // active cap (#239) cannot be raced past; a failed connect must release the
     // reservation.
@@ -701,9 +725,9 @@ pub fn executeBoundedBufferedTcpHttpRequest(
             return resp;
         } else |err| {
             p.release(key, conn, false, http.event_loop.monotonicMs()); // active--, close (deinits TLS)
-            if (shouldRetryStalePooledBufferedExchange(reused, attempt, err, method)) {
-                p.recordStaleRetry(key);
-                continue; // retry once on a fresh connection
+            if (classifyStalePooledBufferedFailure(reused, attempt, err, method)) |outcome| {
+                p.recordStaleFailure(key, outcome);
+                if (outcome != .refused_ambiguous) continue; // retry once on a fresh connection
             }
             return err;
         }
@@ -867,8 +891,9 @@ fn executeBufferedViaH2Pool(
                     // requests do not pick it, drop our ref, and retry once.
                     h2_pool.evict(key, conn);
                     h2_pool.release(conn);
-                    if (attempt == 0 and (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset)) {
-                        continue;
+                    if (classifyH2PooledFailure(attempt, true, err, method)) |outcome| {
+                        if (h1_pool) |p| p.recordStaleFailure(key, outcome);
+                        if (outcome != .refused_ambiguous) continue;
                     }
                     return err;
                 };
@@ -1242,8 +1267,9 @@ fn streamViaH2Pool(
                     // once on connection-level failures.
                     h2_pool.evict(key, conn);
                     h2_pool.release(conn);
-                    if (streaming_body == null and attempt == 0 and (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset)) {
-                        continue;
+                    if (classifyH2PooledFailure(attempt, streaming_body == null, err, method)) |outcome| {
+                        if (h1_pool) |p| p.recordStaleFailure(key, outcome);
+                        if (outcome != .refused_ambiguous) continue;
                     }
                     return err;
                 };
@@ -1304,8 +1330,9 @@ fn streamViaH2Pool(
                     // client, so this becomes a clean 503 and never counts
                     // against the origin. Retrying would hit the same wall.
                     if (err == error.BufferLimitExceeded) return error.ProxyBufferCapacityUnavailable;
-                    if (streaming_body == null and attempt == 0 and (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset)) {
-                        continue;
+                    if (classifyH2PooledFailure(attempt, streaming_body == null, err, method)) |outcome| {
+                        if (h1_pool) |p| p.recordStaleFailure(key, outcome);
+                        if (outcome != .refused_ambiguous) continue;
                     }
                     return err;
                 };
@@ -1528,6 +1555,53 @@ fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Write a serialized upstream request, classifying a failure by how much of it
+/// the kernel accepted (#785):
+///
+/// - `error.UpstreamRequestNotSent`: transport-backed proof that zero bytes of
+///   this request left Tardigrade — the very first `write(2)` on a plain socket
+///   failed, so nothing was queued into the send buffer. Only this error lets a
+///   caller replay a non-idempotent request. Linux only: its TCP and AF_UNIX
+///   stream sends return the partial count when an error follows a partial
+///   copy, so a failed first call really copied nothing. BSD-derived kernels
+///   (macOS) can drop that partial count and report only EPIPE, so there the
+///   failure stays ambiguous.
+/// - `error.UpstreamRequestWriteFailed`: ambiguous. Some prefix may have been
+///   transmitted, and a prefix can be enough for the origin to act. TLS always
+///   lands here: the record layer encrypts and flushes internally, so there is
+///   no honest zero-byte proof from outside it.
+/// - `error.Timeout` / `error.OutOfMemory` keep their own meaning.
+const send_failure_proves_zero_bytes = builtin.os.tag == .linux;
+
+fn writeUpstreamRequest(transport: anytype, bytes: []const u8) !void {
+    if (@TypeOf(transport) == compat.NetStream and transport.inner == null) {
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            const rc = std.c.write(transport.handle, bytes[sent..].ptr, bytes.len - sent);
+            switch (std.c.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return error.UpstreamRequestWriteFailed;
+                    sent += @intCast(rc);
+                },
+                .INTR => continue,
+                // SO_SNDTIMEO expiry.
+                .AGAIN => return error.Timeout,
+                else => return if (sent == 0 and send_failure_proves_zero_bytes)
+                    error.UpstreamRequestNotSent
+                else
+                    error.UpstreamRequestWriteFailed,
+            }
+        }
+        return;
+    }
+    transport.writeAll(bytes) catch |err| {
+        // Transports expose different error sets, so match by name.
+        const name = @errorName(err);
+        if (std.mem.eql(u8, name, "Timeout") or std.mem.eql(u8, name, "OutOfMemory")) return err;
+        return error.UpstreamRequestWriteFailed;
+    };
+}
+
 fn exchangeBoundedBufferedHttpRequest(
     allocator: std.mem.Allocator,
     transport: anytype,
@@ -1597,15 +1671,7 @@ fn exchangeBoundedBufferedHttpRequest(
         try req_writer.writeAll(body);
     }
 
-    // A failed write means the request never (fully) reached the origin, so a
-    // caller holding a reused pooled connection may retry any method on a fresh
-    // one. Timeouts and OOM keep their own meaning.
-    transport.writeAll(req_aw.written()) catch |err| {
-        // Transports expose different error sets, so match by name.
-        const name = @errorName(err);
-        if (std.mem.eql(u8, name, "Timeout") or std.mem.eql(u8, name, "OutOfMemory")) return err;
-        return error.UpstreamRequestWriteFailed;
-    };
+    try writeUpstreamRequest(transport, req_aw.written());
 
     // Bound the wait for the response with poll() rather than SO_RCVTIMEO:
     // SO_RCVTIMEO is reliably honored on AF_UNIX sockets but is silently ignored
@@ -2740,7 +2806,10 @@ fn sendStreamingProxyRequest(
         try w.print("Content-Length: {d}\r\n", .{buffered_body.len});
     }
     try w.writeAll("\r\n");
-    try transport.writeAll(req_aw.written());
+    // Classify a head-write failure by send progress (#785) so the stale
+    // pooled-connection retry can tell a proven zero-byte failure from an
+    // ambiguous one.
+    try writeUpstreamRequest(transport, req_aw.written());
 
     if (streaming_body) |sb| {
         try relayStreamingUploadToHttp1(
@@ -2753,7 +2822,10 @@ fn sendStreamingProxyRequest(
             proxy_buffer_observer,
         );
     } else if (buffered_body.len > 0) {
-        try transport.writeAll(buffered_body);
+        // The head is already on the wire, so no body-write failure is zero-byte.
+        writeUpstreamRequest(transport, buffered_body) catch |err| {
+            return if (err == error.UpstreamRequestNotSent) error.UpstreamRequestWriteFailed else err;
+        };
     }
 }
 
@@ -3301,11 +3373,13 @@ pub fn executeStreamingHttpProxyRequest(
                 var s = conn.stream;
                 s.close();
             }
-            if (!wrote_downstream and reused and retry_allowed and attempt == 0 and
-                (err == error.UpstreamConnectionClosed or err == error.WriteFailed))
-            {
-                if (active_pool) |p| p.recordStaleRetry(key);
-                continue;
+            // Same replay policy as the buffered path (#785); a streamed
+            // upload is never replayable.
+            if (!wrote_downstream and retry_allowed) {
+                if (classifyStalePooledBufferedFailure(reused, attempt, err, method)) |outcome| {
+                    if (active_pool) |p| p.recordStaleFailure(key, outcome);
+                    if (outcome != .refused_ambiguous) continue;
+                }
             }
             downstream_committed.* = wrote_downstream;
             return err;
@@ -7261,15 +7335,414 @@ test "a failed relay allocation hands the http2 connection back" {
     try std.testing.expectEqual(@as(usize, 0), ok_ctx.counters.retained);
 }
 
-test "shouldRetryStalePooledBufferedExchange retries write failures for any method" {
-    try std.testing.expect(shouldRetryStalePooledBufferedExchange(true, 0, error.UpstreamRequestWriteFailed, "POST"));
-    try std.testing.expect(shouldRetryStalePooledBufferedExchange(true, 0, error.UpstreamRequestWriteFailed, "GET"));
-    try std.testing.expect(!shouldRetryStalePooledBufferedExchange(false, 0, error.UpstreamRequestWriteFailed, "POST"));
-    try std.testing.expect(!shouldRetryStalePooledBufferedExchange(true, 1, error.UpstreamRequestWriteFailed, "POST"));
+test "classifyStalePooledBufferedFailure replays non-idempotent requests only on proven zero-byte sends (#785)" {
+    const Outcome = http.upstream_pool.StaleFailureOutcome;
+    // Proven zero bytes sent: any method, once.
+    try std.testing.expectEqual(@as(?Outcome, .retried_zero_byte), classifyStalePooledBufferedFailure(true, 0, error.UpstreamRequestNotSent, "POST"));
+    try std.testing.expectEqual(@as(?Outcome, .retried_zero_byte), classifyStalePooledBufferedFailure(true, 0, error.UpstreamRequestNotSent, "GET"));
+    // Ambiguous partial write or close before the status line: idempotent only.
+    try std.testing.expectEqual(@as(?Outcome, .refused_ambiguous), classifyStalePooledBufferedFailure(true, 0, error.UpstreamRequestWriteFailed, "POST"));
+    try std.testing.expectEqual(@as(?Outcome, .refused_ambiguous), classifyStalePooledBufferedFailure(true, 0, error.UpstreamRequestWriteFailed, "PATCH"));
+    try std.testing.expectEqual(@as(?Outcome, .retried_idempotent), classifyStalePooledBufferedFailure(true, 0, error.UpstreamRequestWriteFailed, "PUT"));
+    try std.testing.expectEqual(@as(?Outcome, .refused_ambiguous), classifyStalePooledBufferedFailure(true, 0, error.UpstreamConnectionClosed, "POST"));
+    try std.testing.expectEqual(@as(?Outcome, .retried_idempotent), classifyStalePooledBufferedFailure(true, 0, error.UpstreamConnectionClosed, "GET"));
+    try std.testing.expectEqual(@as(?Outcome, .retried_idempotent), classifyStalePooledBufferedFailure(true, 0, error.UpstreamConnectionClosed, "HEAD"));
+    // Fresh connections, second attempts, and timeouts/resets are never retried.
+    try std.testing.expectEqual(@as(?Outcome, null), classifyStalePooledBufferedFailure(false, 0, error.UpstreamRequestNotSent, "POST"));
+    try std.testing.expectEqual(@as(?Outcome, null), classifyStalePooledBufferedFailure(true, 1, error.UpstreamRequestNotSent, "POST"));
+    try std.testing.expectEqual(@as(?Outcome, null), classifyStalePooledBufferedFailure(true, 0, error.Timeout, "GET"));
+    try std.testing.expectEqual(@as(?Outcome, null), classifyStalePooledBufferedFailure(true, 0, error.ConnectionResetByPeer, "GET"));
 }
 
-test "shouldRetryStalePooledBufferedExchange keeps zero-byte reads idempotent-only" {
-    try std.testing.expect(shouldRetryStalePooledBufferedExchange(true, 0, error.UpstreamConnectionClosed, "GET"));
-    try std.testing.expect(!shouldRetryStalePooledBufferedExchange(true, 0, error.UpstreamConnectionClosed, "POST"));
-    try std.testing.expect(!shouldRetryStalePooledBufferedExchange(true, 0, error.Timeout, "GET"));
+test "writeUpstreamRequest never claims a zero-byte send through a non-plain transport (#785)" {
+    // Stand-in for UpstreamTlsConn: the record layer hides send progress, so
+    // every failure must stay ambiguous.
+    const FailingTransport = struct {
+        pub fn writeAll(_: *@This(), _: []const u8) error{TlsWriteFailed}!void {
+            return error.TlsWriteFailed;
+        }
+    };
+    var t: FailingTransport = .{};
+    try std.testing.expectError(error.UpstreamRequestWriteFailed, writeUpstreamRequest(&t, "POST / HTTP/1.1\r\n\r\n"));
+}
+
+/// Origin for the #785 stale-replay regressions: accepts one connection, reads
+/// one request, counts it as a side effect, and answers 200.
+fn countingHttpResponder(listen_fd: std.posix.fd_t, side_effects: *std.atomic.Value(usize)) void {
+    const conn = std.c.accept(listen_fd, null, null);
+    if (conn < 0) return;
+    defer _ = std.c.close(conn);
+    var buf: [4096]u8 = undefined;
+    if (std.c.read(conn, &buf, buf.len) <= 0) return;
+    _ = side_effects.fetchAdd(1, .monotonic);
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+    _ = std.c.write(conn, response.ptr, response.len);
+}
+
+/// Stale-pool peer: reads a full small request (through `marker`), counts it
+/// as a side effect, then closes without sending a status line.
+fn processThenCloseBeforeStatus(peer_fd: std.posix.fd_t, marker: []const u8, side_effects: *std.atomic.Value(usize)) void {
+    var buf: [4096]u8 = undefined;
+    var len: usize = 0;
+    while (std.mem.find(u8, buf[0..len], marker) == null and len < buf.len) {
+        const n = std.c.read(peer_fd, buf[len..].ptr, buf.len - len);
+        if (n <= 0) break;
+        len += @intCast(n);
+    }
+    if (std.mem.find(u8, buf[0..len], marker) != null) _ = side_effects.fetchAdd(1, .monotonic);
+    _ = std.c.close(peer_fd);
+}
+
+/// Stale-pool peer: accepts only a prefix of the request, then closes with the
+/// rest unread, so the client's in-flight write fails after a partial send.
+fn readPrefixThenClose(peer_fd: std.posix.fd_t) void {
+    var buf: [16]u8 = undefined;
+    _ = std.c.read(peer_fd, &buf, buf.len);
+    _ = std.c.close(peer_fd);
+}
+
+/// Park `client_fd` in `pool` as an idle keep-alive connection for the plain
+/// TCP origin `127.0.0.1:port`, so the next request checks it out as reused.
+fn seedPooledConn(pool: *http.upstream_pool.UpstreamPool, key: []const u8, client_fd: std.posix.fd_t) void {
+    const now_ms = http.event_loop.monotonicMs();
+    pool.release(key, .{ .stream = compat.netStreamFromFd(client_fd), .tls = null, .created_ms = now_ms, .last_used_ms = now_ms }, true, now_ms);
+}
+
+fn postThroughPool(allocator: std.mem.Allocator, pool: *http.upstream_pool.UpstreamPool, port: u16, method: []const u8, body: []const u8) !BufferedUpstreamResponse {
+    const uri = try std.Uri.parse("http://127.0.0.1/");
+    return executeBoundedBufferedTcpHttpRequest(allocator, "127.0.0.1", port, null, uri, method, &.{}, body, null, 1 << 20, 2_000, 2_000, pool, null, false);
+}
+
+test "stale pooled conn: zero-byte send failure replays POST once on a fresh conn (#785)" {
+    // Only Linux reports a partial count ahead of a later send error, so only
+    // there is a failed first write proof of zero bytes sent.
+    if (!send_failure_proves_zero_bytes) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+    var origin_effects = std.atomic.Value(usize).init(0);
+    const responder = try std.Thread.spawn(.{}, countingHttpResponder, .{ listener.fd, &origin_effects });
+    defer responder.join();
+
+    var pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    defer pool.deinit();
+    var key_buf: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "http:127.0.0.1:{d}", .{listener.port});
+
+    // The stale peer stopped receiving: checkout's readiness poll sees nothing,
+    // but the first write fails with EPIPE before a byte is queued.
+    const fds = try makeBlockingSocketpair();
+    defer _ = std.c.close(fds[1]);
+    _ = std.c.shutdown(fds[1], std.posix.SHUT.RD);
+    seedPooledConn(&pool, key, fds[0]);
+
+    var resp = try postThroughPool(allocator, &pool, listener.port, "POST", "{\"op\":\"create\"}");
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqual(@as(usize, 1), origin_effects.load(.monotonic));
+
+    const agg = pool.aggregateStats();
+    try std.testing.expectEqual(@as(u64, 1), agg.reused_total);
+    try std.testing.expectEqual(@as(u64, 1), agg.stale_retries_zero_byte_total);
+    try std.testing.expectEqual(@as(u64, 0), agg.stale_replay_refused_total);
+}
+
+test "stale pooled conn: checkout retires a peer-closed conn before any byte is sent (#785)" {
+    const allocator = std.testing.allocator;
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+    var origin_effects = std.atomic.Value(usize).init(0);
+    const responder = try std.Thread.spawn(.{}, countingHttpResponder, .{ listener.fd, &origin_effects });
+    defer responder.join();
+
+    var pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    defer pool.deinit();
+    var key_buf: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "http:127.0.0.1:{d}", .{listener.port});
+
+    // The origin closed the idle keep-alive connection (the Ekho idle-gap case).
+    const fds = try makeBlockingSocketpair();
+    _ = std.c.close(fds[1]);
+    seedPooledConn(&pool, key, fds[0]);
+
+    var resp = try postThroughPool(allocator, &pool, listener.port, "POST", "{\"op\":\"create\"}");
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqual(@as(usize, 1), origin_effects.load(.monotonic));
+
+    const agg = pool.aggregateStats();
+    try std.testing.expectEqual(@as(u64, 0), agg.reused_total);
+    try std.testing.expectEqual(@as(u64, 1), agg.checkout_stale_plaintext_unexpected);
+    try std.testing.expectEqual(@as(u64, 0), agg.stale_retries_zero_byte_total);
+}
+
+test "stale pooled conn: partial write then error never replays POST (#785)" {
+    const allocator = std.testing.allocator;
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    var pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    defer pool.deinit();
+    var key_buf: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "http:127.0.0.1:{d}", .{listener.port});
+
+    // A body far larger than the socket buffer: the peer takes a prefix while
+    // the write is in flight, then closes, so the write fails mid-request.
+    const fds = try makeBlockingSocketpair();
+    seedPooledConn(&pool, key, fds[0]);
+    const peer = try std.Thread.spawn(.{}, readPrefixThenClose, .{fds[1]});
+    defer peer.join();
+
+    const body = try allocator.alloc(u8, 4 << 20);
+    defer allocator.free(body);
+    @memset(body, 'x');
+
+    try std.testing.expectError(error.UpstreamRequestWriteFailed, postThroughPool(allocator, &pool, listener.port, "POST", body));
+    // No replay: nothing ever connected to the fresh origin.
+    try std.testing.expect(!try pollFdReadable(listener.fd, 100));
+
+    const agg = pool.aggregateStats();
+    try std.testing.expectEqual(@as(u64, 1), agg.stale_replay_refused_total);
+    try std.testing.expectEqual(@as(u64, 0), agg.stale_retries_total);
+    try std.testing.expectEqual(@as(u64, 0), agg.idle);
+}
+
+test "stale pooled conn: request delivered then EOF before status never replays POST (#785)" {
+    const allocator = std.testing.allocator;
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    var pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    defer pool.deinit();
+    var key_buf: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "http:127.0.0.1:{d}", .{listener.port});
+
+    var stale_effects = std.atomic.Value(usize).init(0);
+    const fds = try makeBlockingSocketpair();
+    seedPooledConn(&pool, key, fds[0]);
+    const peer = try std.Thread.spawn(.{}, processThenCloseBeforeStatus, .{ fds[1], "create-order", &stale_effects });
+    defer peer.join();
+
+    try std.testing.expectError(error.UpstreamConnectionClosed, postThroughPool(allocator, &pool, listener.port, "POST", "create-order"));
+    try std.testing.expectEqual(@as(usize, 1), stale_effects.load(.monotonic));
+    try std.testing.expect(!try pollFdReadable(listener.fd, 100));
+
+    const agg = pool.aggregateStats();
+    try std.testing.expectEqual(@as(u64, 1), agg.stale_replay_refused_total);
+    try std.testing.expectEqual(@as(u64, 0), agg.stale_retries_total);
+}
+
+test "stale pooled conn: request delivered then EOF before status replays GET once (#785)" {
+    // Same failure as the POST case, but idempotent: one replay is allowed, and
+    // the combined side-effect count proves the counters would catch a
+    // duplicate if a non-idempotent request were ever replayed.
+    const allocator = std.testing.allocator;
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+    var origin_effects = std.atomic.Value(usize).init(0);
+    const responder = try std.Thread.spawn(.{}, countingHttpResponder, .{ listener.fd, &origin_effects });
+    defer responder.join();
+
+    var pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    defer pool.deinit();
+    var key_buf: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "http:127.0.0.1:{d}", .{listener.port});
+
+    var stale_effects = std.atomic.Value(usize).init(0);
+    const fds = try makeBlockingSocketpair();
+    seedPooledConn(&pool, key, fds[0]);
+    const peer = try std.Thread.spawn(.{}, processThenCloseBeforeStatus, .{ fds[1], "\r\n\r\n", &stale_effects });
+    defer peer.join();
+
+    var resp = try postThroughPool(allocator, &pool, listener.port, "GET", "");
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqual(@as(usize, 2), stale_effects.load(.monotonic) + origin_effects.load(.monotonic));
+
+    const agg = pool.aggregateStats();
+    try std.testing.expectEqual(@as(u64, 1), agg.stale_retries_idempotent_total);
+    try std.testing.expectEqual(@as(u64, 1), agg.stale_retries_total);
+}
+
+test "classifyH2PooledFailure keeps pooled HTTP/2 replays idempotent-only (#785)" {
+    const Outcome = http.upstream_pool.StaleFailureOutcome;
+    try std.testing.expectEqual(@as(?Outcome, .refused_ambiguous), classifyH2PooledFailure(0, true, error.Http2GoAway, "POST"));
+    try std.testing.expectEqual(@as(?Outcome, .refused_ambiguous), classifyH2PooledFailure(0, true, error.Http2StreamReset, "PATCH"));
+    try std.testing.expectEqual(@as(?Outcome, .refused_ambiguous), classifyH2PooledFailure(0, true, error.Http2ConnectionClosed, "POST"));
+    try std.testing.expectEqual(@as(?Outcome, .retried_idempotent), classifyH2PooledFailure(0, true, error.Http2ConnectionClosed, "GET"));
+    try std.testing.expectEqual(@as(?Outcome, .retried_idempotent), classifyH2PooledFailure(0, true, error.Http2GoAway, "PUT"));
+    // Budget, non-replayable bodies, and unrelated errors are not candidates.
+    try std.testing.expectEqual(@as(?Outcome, null), classifyH2PooledFailure(1, true, error.Http2ConnectionClosed, "GET"));
+    try std.testing.expectEqual(@as(?Outcome, null), classifyH2PooledFailure(0, false, error.Http2ConnectionClosed, "GET"));
+    try std.testing.expectEqual(@as(?Outcome, null), classifyH2PooledFailure(0, true, error.Timeout, "GET"));
+}
+
+/// h2c origin for the #785 H2 regressions. Each accepted connection reads one
+/// complete request stream and counts it as a side effect. The first
+/// connection then closes without responding, so the request may have been
+/// processed but the client sees a connection-level failure. Later connections
+/// answer 200 "ok". Serves exactly `max_conns` connections.
+const H2ProcessThenDieOrigin = struct {
+    listen_fd: std.posix.fd_t,
+    max_conns: usize,
+    side_effects: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+};
+
+fn h2ProcessThenDieServe(origin: *H2ProcessThenDieOrigin) void {
+    var index: usize = 0;
+    while (index < origin.max_conns) : (index += 1) {
+        const conn = std.c.accept(origin.listen_fd, null, null);
+        if (conn < 0) return;
+        defer _ = std.c.close(conn);
+
+        var preface: [24]u8 = undefined;
+        if (!readExactlyFromFd(conn, &preface)) return;
+        const settings = [_]u8{ 0, 0, 0, 0x04, 0, 0, 0, 0, 0 };
+        _ = std.c.write(conn, &settings, settings.len);
+
+        // Drain frames until a request stream ends (END_STREAM on HEADERS or
+        // DATA), remembering its id.
+        var stream_id: u32 = 0;
+        while (true) {
+            var hdr: [9]u8 = undefined;
+            if (!readExactlyFromFd(conn, &hdr)) return;
+            const payload_len = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | @as(usize, hdr[2]);
+            const typ = hdr[3];
+            const flags = hdr[4];
+            const sid = std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff;
+            var scratch: [4096]u8 = undefined;
+            var remaining = payload_len;
+            while (remaining > 0) {
+                const take = @min(remaining, scratch.len);
+                if (!readExactlyFromFd(conn, scratch[0..take])) return;
+                remaining -= take;
+            }
+            if (typ == 0x01) stream_id = sid;
+            if ((typ == 0x00 or typ == 0x01) and (flags & 0x01) != 0 and sid != 0) break;
+        }
+        _ = origin.side_effects.fetchAdd(1, .monotonic);
+        if (index == 0) continue; // processed, then the connection dies
+
+        // HEADERS (END_HEADERS, `:status: 200` = static index 8), then DATA "ok"
+        // with END_STREAM.
+        var head_frame = [_]u8{ 0, 0, 1, 0x01, 0x04, 0, 0, 0, 0, 0x88 };
+        std.mem.writeInt(u32, head_frame[5..9], stream_id, .big);
+        _ = std.c.write(conn, &head_frame, head_frame.len);
+        var body_frame = [_]u8{ 0, 0, 2, 0x00, 0x01, 0, 0, 0, 0, 'o', 'k' };
+        std.mem.writeInt(u32, body_frame[5..9], stream_id, .big);
+        _ = std.c.write(conn, &body_frame, body_frame.len);
+
+        var drain: [256]u8 = undefined;
+        while (std.c.read(conn, &drain, drain.len) > 0) {}
+    }
+}
+
+const H2EntryPoint = enum { buffered, streaming };
+
+/// Result of one pooled-h2 request against `H2ProcessThenDieOrigin`.
+const H2ReplayRun = struct {
+    status: ?u16,
+    err: ?anyerror,
+    side_effects: usize,
+    extra_connection_attempted: bool,
+    stats: http.upstream_pool.HostStats,
+};
+
+fn runH2ReplayScenario(entry: H2EntryPoint, method: []const u8, body: []const u8, expected_conns: usize) !H2ReplayRun {
+    const allocator = std.testing.allocator;
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+    var origin = H2ProcessThenDieOrigin{ .listen_fd = listener.fd, .max_conns = expected_conns };
+    const origin_thread = try std.Thread.spawn(.{}, h2ProcessThenDieServe, .{&origin});
+
+    var h1_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    defer h1_pool.deinit();
+    var h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/orders", .{listener.port}));
+
+    var status: ?u16 = null;
+    var err: ?anyerror = null;
+    switch (entry) {
+        .buffered => {
+            if (executeBufferedViaH2Pool(allocator, &h2_pool, "127.0.0.1", listener.port, null, uri, method, &.{}, body, null, 1 << 20, 2_000, 2_000, &h1_pool)) |resp_val| {
+                var resp = resp_val;
+                status = resp.status_code;
+                resp.deinit(allocator);
+            } else |e| err = e;
+        },
+        .streaming => {
+            const relay_bytes: usize = 16 * 1024;
+            var global = proxy_buffer_account.Aggregate.init(.global, 4 * relay_bytes);
+            var counters = UploadBufferObserver{};
+            var source = FakeUploadSource{ .data = "" };
+            var captured = std.array_list.Managed(u8).init(allocator);
+            defer captured.deinit();
+            var security = http.security_headers.SecurityHeaders{};
+            var downstream_committed = false;
+            if (streamViaH2Pool(allocator, &h2_pool, &h1_pool, "127.0.0.1", listener.port, null, uri, method, &.{}, body, null, relay_bytes, &source, CaptureWriter{ .list = &captured }, &security, null, null, "h2-785-test", true, 2_000, 2_000, null, uploadTestLimits(1024 * 1024), counters.observer(), &global, &downstream_committed)) |result| {
+                status = result.status_code;
+            } else |e| err = e;
+        },
+    }
+
+    // Nothing beyond the expected connections may have been attempted.
+    const extra = try pollFdReadable(listener.fd, 100);
+    h2_pool.deinit(); // closes pooled conns so the origin's drain loop ends
+    origin_thread.join();
+
+    const snaps = try h1_pool.snapshotHosts(allocator);
+    defer http.upstream_pool.freeHostSnapshots(allocator, snaps);
+    var key_buf: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "h2c:127.0.0.1:{d}", .{listener.port});
+    var stats: http.upstream_pool.HostStats = .{};
+    for (snaps) |snap| {
+        if (std.mem.eql(u8, snap.host, key)) stats = snap.stats;
+    }
+    return .{
+        .status = status,
+        .err = err,
+        .side_effects = origin.side_effects.load(.monotonic),
+        .extra_connection_attempted = extra,
+        .stats = stats,
+    };
+}
+
+fn expectH2PostNotReplayed(entry: H2EntryPoint) !void {
+    const run = try runH2ReplayScenario(entry, "POST", "{\"op\":\"create\"}", 1);
+    try std.testing.expect(run.err != null);
+    try std.testing.expectEqual(@as(?u16, null), run.status);
+    try std.testing.expectEqual(@as(usize, 1), run.side_effects);
+    try std.testing.expect(!run.extra_connection_attempted);
+    try std.testing.expectEqual(@as(u64, 1), run.stats.stale_replay_refused_total);
+    try std.testing.expectEqual(@as(u64, 0), run.stats.stale_retries_total);
+}
+
+fn expectH2GetReplayedOnce(entry: H2EntryPoint) !void {
+    const run = try runH2ReplayScenario(entry, "GET", "", 2);
+    try std.testing.expectEqual(@as(?anyerror, null), run.err);
+    try std.testing.expectEqual(@as(?u16, 200), run.status);
+    // The origin counted both streams: a replayed POST would show up here.
+    try std.testing.expectEqual(@as(usize, 2), run.side_effects);
+    try std.testing.expect(!run.extra_connection_attempted);
+    try std.testing.expectEqual(@as(u64, 1), run.stats.stale_retries_idempotent_total);
+    try std.testing.expectEqual(@as(u64, 1), run.stats.stale_retries_total);
+    try std.testing.expectEqual(@as(u64, 0), run.stats.stale_replay_refused_total);
+}
+
+test "pooled h2 buffered: POST processed before connection loss is not replayed (#785)" {
+    try expectH2PostNotReplayed(.buffered);
+}
+
+test "pooled h2 buffered: GET after connection loss is replayed once (#785)" {
+    try expectH2GetReplayedOnce(.buffered);
+}
+
+test "pooled h2 streaming: POST processed before connection loss is not replayed (#785)" {
+    try expectH2PostNotReplayed(.streaming);
+}
+
+test "pooled h2 streaming: GET after connection loss is replayed once (#785)" {
+    try expectH2GetReplayedOnce(.streaming);
 }

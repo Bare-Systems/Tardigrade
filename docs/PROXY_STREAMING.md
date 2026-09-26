@@ -133,7 +133,9 @@ Streaming trades replayability for bounded memory. The boundaries are:
 - **A streamed upload is not replayable once client bytes are consumed.** The
   stale-pooled-connection retry that the buffered path performs is disabled for
   streamed uploads even before any response byte exists, because the request
-  body has already been forwarded and cannot be re-sent.
+  body has already been forwarded and cannot be re-sent. For replayable bodies
+  the retry follows the zero-byte replay policy in
+  [UPSTREAM_POOLING.md](UPSTREAM_POOLING.md#stale-connection-replay-policy-785).
 - **Body-dependent middleware requires buffering.** Rewrite, return,
   conditional, internal-redirect, mirror, and `auth_request` all need the whole
   body, or need to duplicate it. Routes configured with any of them fall back

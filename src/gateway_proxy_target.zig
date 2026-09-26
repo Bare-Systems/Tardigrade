@@ -126,6 +126,12 @@ pub fn combineProxyTarget(allocator: std.mem.Allocator, target: []const u8, suff
     if (suffix_path == null) return allocator.dupe(u8, target);
 
     const suffix = suffix_path.?;
+    // An empty suffix (request path == location prefix) keeps the proxy_pass
+    // URI as written, like nginx; only a bare origin gains a root "/" (#796).
+    if (suffix.len == 0) {
+        if (targetHasPath(target)) return allocator.dupe(u8, target);
+        return std.fmt.allocPrint(allocator, "{s}/", .{target});
+    }
     const left_trimmed = compat.trimRight(u8, target, "/");
     const right_trimmed = std.mem.trimStart(u8, suffix, "/");
 
@@ -138,6 +144,11 @@ pub fn combineProxyTarget(allocator: std.mem.Allocator, target: []const u8, suff
     }
 
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ left_trimmed, right_trimmed });
+}
+
+fn targetHasPath(target: []const u8) bool {
+    const scheme_end = std.mem.find(u8, target, "://") orelse return target.len > 0;
+    return std.mem.findScalarPos(u8, target, scheme_end + 3, '/') != null;
 }
 
 pub fn parseUpstreamHost(base_url: []const u8) ?[]const u8 {
@@ -168,6 +179,25 @@ test "combineProxyTarget preserves root suffix" {
     const joined = try combineProxyTarget(allocator, "http://127.0.0.1:8080", "/");
     defer allocator.free(joined);
     try std.testing.expectEqualStrings("http://127.0.0.1:8080/", joined);
+}
+
+test "combineProxyTarget keeps proxy_pass URI for empty suffix" {
+    const allocator = std.testing.allocator;
+    const exact = try combineProxyTarget(allocator, "http://ekho-mcp:8000/mcp", "");
+    defer allocator.free(exact);
+    try std.testing.expectEqualStrings("http://ekho-mcp:8000/mcp", exact);
+
+    const slash = try combineProxyTarget(allocator, "http://ekho-mcp:8000/mcp", "/");
+    defer allocator.free(slash);
+    try std.testing.expectEqualStrings("http://ekho-mcp:8000/mcp/", slash);
+
+    const origin = try combineProxyTarget(allocator, "http://127.0.0.1:8080", "");
+    defer allocator.free(origin);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/", origin);
+
+    const relative = try combineProxyTarget(allocator, "/mcp", "");
+    defer allocator.free(relative);
+    try std.testing.expectEqualStrings("/mcp", relative);
 }
 
 test "resolveProxyTarget handles absolute and relative proxy_pass" {

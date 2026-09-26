@@ -299,8 +299,8 @@ pub fn proxySuffixPathForLocation(
 ) ?[]const u8 {
     if (mountStripPrefixForLocation(request_path, matched, blocks)) |strip_prefix| {
         if (std.mem.startsWith(u8, request_path, strip_prefix)) {
-            const suffix = request_path[strip_prefix.len..];
-            return if (suffix.len == 0) "/" else suffix;
+            // An empty suffix leaves the proxy_pass URI unchanged (#796).
+            return request_path[strip_prefix.len..];
         }
     }
     return matchedLocationSuffixPath(request_path, matched);
@@ -314,8 +314,7 @@ fn matchedLocationSuffixPath(
         .exact => null,
         .prefix, .prefix_priority => blk: {
             if (std.mem.startsWith(u8, request_path, matched.block.pattern)) {
-                const suffix = request_path[matched.block.pattern.len..];
-                break :blk if (suffix.len == 0) "/" else suffix;
+                break :blk request_path[matched.block.pattern.len..];
             }
             break :blk request_path;
         },
@@ -2673,7 +2672,7 @@ test "proxySuffixPathForLocation keeps mount prefix for split upstream longer pr
     try std.testing.expectEqualStrings("download/file.bin", suffix);
 }
 
-test "proxySuffixPathForLocation maps split upstream mount root to slash" {
+test "proxySuffixPathForLocation maps split upstream mount root to empty suffix" {
     const blocks = [_]edge_config.EdgeConfig.LocationBlock{
         .{
             .match_type = .prefix,
@@ -2685,7 +2684,44 @@ test "proxySuffixPathForLocation maps split upstream mount root to slash" {
 
     const matched = http.location_router.matchLocation(std.testing.allocator, "/ursa/", &blocks).?;
     const suffix = proxySuffixPathForLocation("/ursa/", matched, &blocks).?;
-    try std.testing.expectEqualStrings("/", suffix);
+    try std.testing.expectEqualStrings("", suffix);
+}
+
+test "proxySuffixPathForLocation yields empty suffix when path equals prefix" {
+    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/mcp",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://ekho-mcp:8000/mcp" },
+        },
+    };
+
+    const matched = http.location_router.matchLocation(std.testing.allocator, "/mcp", &blocks).?;
+    try std.testing.expectEqualStrings("", proxySuffixPathForLocation("/mcp", matched, &blocks).?);
+
+    const matched_slash = http.location_router.matchLocation(std.testing.allocator, "/mcp/", &blocks).?;
+    try std.testing.expectEqualStrings("/", proxySuffixPathForLocation("/mcp/", matched_slash, &blocks).?);
+}
+
+test "proxySuffixPathForLocation yields empty suffix for exact route shadowing same prefix" {
+    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/mcp",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://ekho-mcp:8000/mcp" },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/mcp",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://ekho-mcp:8000/mcp" },
+        },
+    };
+
+    const matched = http.location_router.matchLocation(std.testing.allocator, "/mcp", &blocks).?;
+    try std.testing.expectEqualStrings("", proxySuffixPathForLocation("/mcp", matched, &blocks).?);
 }
 
 test "isHttpMethodIdempotent classifies idempotent methods" {

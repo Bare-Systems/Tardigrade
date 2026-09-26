@@ -4633,8 +4633,21 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     if (!trusted_forwarding_source) {
         request.headers.remove("x-forwarded-for");
         request.headers.remove("x-real-ip");
+        // The configured real-IP header (e.g. CF-Connecting-IP) is just as
+        // authoritative to an origin that reads it, so an untrusted peer's
+        // copy must not be proxied through either (#791).
+        if (cfg.real_ip_header.len > 0) request.headers.remove(cfg.real_ip_header);
     }
-    const client_ip = http.request_context.extractClientIp(&request, trusted_forwarding_source, effective_connection_ip);
+    // A trusted peer's X-Forwarded-For is walked right to left, skipping
+    // only explicitly trusted hops (#791): the leftmost entry is whatever
+    // the client sent, since CDNs append to the chain rather than replace it.
+    const client_ip = http.request_context.extractClientIp(
+        &request,
+        trusted_forwarding_source,
+        cfg.real_ip_header,
+        gph.TrustedProxySet{ .cfg = cfg },
+        effective_connection_ip,
+    );
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
     ctx.early_data.transport_early = request_transport_early;
     ctx.early_data.inbound_marker = request.headers.hasEarlyDataMarker();

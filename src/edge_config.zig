@@ -304,6 +304,9 @@ pub const EdgeConfig = struct {
     trusted_upstream_identities: [][]const u8,
     /// Whether to require signed upstream identity headers on responses.
     trust_require_upstream_identity: bool,
+    /// Single-value header a trusted peer sets to the real client IP (e.g.
+    /// `CF-Connecting-IP`); consulted before `X-Forwarded-For`. Empty = unused.
+    real_ip_header: []const u8 = "",
     upstream_base_url: []const u8,
     upstream_base_urls: [][]const u8,
     upstream_base_url_weights: []u32,
@@ -687,6 +690,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.trust_shared_secret);
         for (self.trusted_upstream_identities) |id| allocator.free(id);
         allocator.free(self.trusted_upstream_identities);
+        if (self.real_ip_header.ptr != "".ptr) allocator.free(self.real_ip_header);
         allocator.free(self.upstream_base_url);
         for (self.upstream_base_urls) |u| allocator.free(u);
         allocator.free(self.upstream_base_urls);
@@ -1004,6 +1008,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const trust_require_upstream_identity_str = envOrDefault(allocator, "TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY", "false") catch unreachable;
     defer allocator.free(trust_require_upstream_identity_str);
     const trust_require_upstream_identity = std.mem.eql(u8, trust_require_upstream_identity_str, "true") or std.mem.eql(u8, trust_require_upstream_identity_str, "1");
+    const real_ip_header = envOrDefault(allocator, "TARDIGRADE_REAL_IP_HEADER", "") catch unreachable;
+    errdefer allocator.free(real_ip_header);
 
     const upstream_base_url = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_BASE_URL", "http://127.0.0.1:8080") catch unreachable;
     errdefer allocator.free(upstream_base_url);
@@ -1685,6 +1691,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .trust_shared_secret = trust_shared_secret,
         .trusted_upstream_identities = trusted_upstream_identities,
         .trust_require_upstream_identity = trust_require_upstream_identity,
+        .real_ip_header = real_ip_header,
         .upstream_base_url = upstream_base_url,
         .upstream_base_urls = upstream_base_urls,
         .upstream_base_url_weights = upstream_base_url_weights,
@@ -3109,6 +3116,10 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: policy configuration contains an invalid entry: {}", .{err});
         return error.InvalidConfigValue;
     };
+    if (cfg.real_ip_header.len > 0 and !http.headers.isValidHeaderName(cfg.real_ip_header)) {
+        std.log.err("config validation failed: TARDIGRADE_REAL_IP_HEADER is not a valid header name", .{});
+        return error.InvalidConfigValue;
+    }
     validateGeoTrustConfig(cfg.geo_blocked_countries.len, cfg.trust_require_upstream_identity, cfg.trusted_upstream_identities.len) catch {
         std.log.err("config validation failed: TARDIGRADE_GEO_BLOCKED_COUNTRIES requires TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true and at least one TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES entry", .{});
         return error.InvalidConfigValue;

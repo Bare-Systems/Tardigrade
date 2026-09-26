@@ -15744,6 +15744,213 @@ test "rate limiting uses asserted identity for shared nat clients" {
     try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
 }
 
+test "per-IP rate limit keys on the rightmost X-Forwarded-For entry, not the client-chosen leftmost (#791)" {
+    // Behind a CDN, the client controls the leftmost X-Forwarded-For entry
+    // and the CDN appends the real address. Rotating the leftmost entry must
+    // not buy a fresh rate-limit bucket.
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "xff-rate-ok" },
+        .{ .body = "xff-rate-ok" },
+        .{ .body = "xff-rate-ok" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /xff-rate {{
+        \\    proxy_pass http://{s}:{d}/xff-rate;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .rate_limit_rps = "0.001",
+        .rate_limit_burst = "1",
+    });
+    defer tardigrade.stop();
+
+    var first = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/xff-rate",
+        .body = null,
+        .headers = &.{.{ .name = "X-Forwarded-For", .value = "203.0.113.1, 198.51.100.20" }},
+    });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+
+    // Same real client, spoofed leftmost entry: same bucket.
+    var spoofed = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/xff-rate",
+        .body = null,
+        .headers = &.{.{ .name = "X-Forwarded-For", .value = "203.0.113.2, 198.51.100.20" }},
+    });
+    defer spoofed.deinit();
+    try std.testing.expectEqual(@as(u16, 429), spoofed.status_code);
+
+    // A different real client still gets its own bucket.
+    var other = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/xff-rate",
+        .body = null,
+        .headers = &.{.{ .name = "X-Forwarded-For", .value = "203.0.113.1, 198.51.100.21" }},
+    });
+    defer other.deinit();
+    try std.testing.expectEqual(@as(u16, 200), other.status_code);
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+}
+
+fn xffRateConfig(allocator: std.mem.Allocator, upstream_port: u16) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /xff-rate {{
+        \\    proxy_pass http://{s}:{d}/xff-rate;
+        \\}}
+    , .{ test_host, upstream_port });
+}
+
+fn sendXffRateRequest(allocator: std.mem.Allocator, port: u16, headers: []const RequestHeader) !HttpResponse {
+    return sendRequest(allocator, port, .{
+        .method = "GET",
+        .path = "/xff-rate",
+        .body = null,
+        .headers = headers,
+    });
+}
+
+test "configured trust boundary skips CIDR-trusted hops when keying the per-IP rate limit (#791)" {
+    // The incident configuration: trust locked down to the proxy tier by
+    // CIDR. The socket peer (127.0.0.1) and the 10.0.0.5 hop are trusted, so
+    // the walk lands on the real client regardless of the spoofed leftmost.
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "xff-rate-ok" },
+        .{ .body = "xff-rate-ok" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try xffRateConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .rate_limit_rps = "0.001",
+        .rate_limit_burst = "1",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES", .value = "127.0.0.0/8,10.0.0.0/8" },
+            .{ .name = "TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var first = try sendXffRateRequest(allocator, tardigrade.port, &.{
+        .{ .name = "X-Forwarded-For", .value = "203.0.113.1, 198.51.100.20, 10.0.0.5" },
+    });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try std.testing.expectEqualStrings("198.51.100.20", upstream.capturedHeader("X-Real-IP").?);
+
+    var spoofed = try sendXffRateRequest(allocator, tardigrade.port, &.{
+        .{ .name = "X-Forwarded-For", .value = "203.0.113.2, 198.51.100.20, 10.0.0.5" },
+    });
+    defer spoofed.deinit();
+    try std.testing.expectEqual(@as(u16, 429), spoofed.status_code);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+}
+
+test "configured real-IP header from a trusted peer wins over contradictory X-Forwarded-For (#791)" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "xff-rate-ok" },
+        .{ .body = "xff-rate-ok" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try xffRateConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .rate_limit_rps = "0.001",
+        .rate_limit_burst = "1",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES", .value = "127.0.0.0/8" },
+            .{ .name = "TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY", .value = "true" },
+            .{ .name = "TARDIGRADE_REAL_IP_HEADER", .value = "CF-Connecting-IP" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var first = try sendXffRateRequest(allocator, tardigrade.port, &.{
+        .{ .name = "CF-Connecting-IP", .value = "198.51.100.30" },
+        .{ .name = "X-Forwarded-For", .value = "198.51.100.40" },
+    });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try std.testing.expectEqualStrings("198.51.100.30", upstream.capturedHeader("X-Real-IP").?);
+
+    // Same real-IP header, different XFF: still the same bucket.
+    var second = try sendXffRateRequest(allocator, tardigrade.port, &.{
+        .{ .name = "CF-Connecting-IP", .value = "198.51.100.30" },
+        .{ .name = "X-Forwarded-For", .value = "198.51.100.41" },
+    });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 429), second.status_code);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+}
+
+test "untrusted peer cannot set the client IP or forward a forged real-IP header to the origin (#791)" {
+    // Only 10.0.0.0/8 is trusted, so the 127.0.0.1 test client is an
+    // untrusted direct client: its CF-Connecting-IP / X-Forwarded-For must
+    // neither change the resolved client IP nor reach the origin.
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "xff-rate-ok" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try xffRateConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES", .value = "10.0.0.0/8" },
+            .{ .name = "TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY", .value = "true" },
+            .{ .name = "TARDIGRADE_REAL_IP_HEADER", .value = "CF-Connecting-IP" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendXffRateRequest(allocator, tardigrade.port, &.{
+        .{ .name = "CF-Connecting-IP", .value = "198.51.100.50" },
+        .{ .name = "X-Forwarded-For", .value = "198.51.100.51" },
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expect(upstream.capturedHeader("CF-Connecting-IP") == null);
+    try std.testing.expectEqualStrings("127.0.0.1", upstream.capturedHeader("X-Real-IP").?);
+    try std.testing.expectEqualStrings("127.0.0.1", upstream.capturedHeader("X-Forwarded-For").?);
+}
+
 test "proxy requests preserve safe request ids and structured access logs include upstream metadata" {
     const allocator = std.testing.allocator;
 

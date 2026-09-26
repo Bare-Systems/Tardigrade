@@ -513,7 +513,10 @@ that **zero bytes** of it were sent.
   the `http:`/`https:`/`unix:` pool key as the `upstream` label. Pooled HTTP/2
   outcomes use the h2 pool key (`h2:host:port` or `h2c:host:port`), so the two
   protocols stay distinguishable. HTTP/2 never produces a zero-byte retry,
-  because it has no zero-byte proof. A streamed upload that fails is not a
+  because it has no zero-byte proof. HTTP/2 counters record a failed
+  first attempt whether or not that connection was actually reused, so the
+  `stale` in the metric names does not by itself prove H2 connection reuse;
+  the retry decision does not depend on it. A streamed upload that fails is not a
   replay candidate and is not counted.
 
 Idle eviction runs in the existing maintenance tick (alongside the parked

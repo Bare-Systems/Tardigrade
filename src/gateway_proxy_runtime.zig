@@ -2732,7 +2732,7 @@ test "proxySuffixPathForLocation yields empty suffix when path equals prefix" {
     try std.testing.expectEqualStrings("/", proxySuffixPathForLocation("/mcp/", matched_slash, &blocks).?);
 }
 
-test "proxySuffixPathForLocation yields empty suffix for exact route shadowing same prefix" {
+test "proxySuffixPathForLocation yields no suffix for exact route shadowing same prefix" {
     const blocks = [_]edge_config.EdgeConfig.LocationBlock{
         .{
             .match_type = .exact,
@@ -2749,7 +2749,7 @@ test "proxySuffixPathForLocation yields empty suffix for exact route shadowing s
     };
 
     const matched = http.location_router.matchLocation(std.testing.allocator, "/mcp", &blocks).?;
-    try std.testing.expectEqualStrings("", proxySuffixPathForLocation("/mcp", matched, &blocks).?);
+    try std.testing.expect(proxySuffixPathForLocation("/mcp", matched, &blocks) == null);
 }
 
 test "isHttpMethodIdempotent classifies idempotent methods" {

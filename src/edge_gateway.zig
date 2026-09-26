@@ -4633,6 +4633,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     if (!trusted_forwarding_source) {
         request.headers.remove("x-forwarded-for");
         request.headers.remove("x-real-ip");
+        // The configured real-IP header is authoritative to origins too; an
+        // untrusted peer must not be able to forward a forged one.
+        if (cfg.real_ip_header.len != 0) request.headers.remove(cfg.real_ip_header);
     }
     const client_ip = http.request_context.extractClientIp(&request, trusted_forwarding_source, effective_connection_ip, .{
         .real_ip_header = cfg.real_ip_header,

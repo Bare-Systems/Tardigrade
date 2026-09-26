@@ -238,12 +238,12 @@ pub const ClientIpPolicy = struct {
 ///
 /// For a trusted source the client is resolved, in order, from:
 ///   1. `policy.real_ip_header`, when configured and holding an IP literal;
-///   2. `X-Forwarded-For`, walked from the RIGHT, skipping entries that are
+///   2. every `X-Forwarded-For` field line, walked from the RIGHT (last line first), skipping entries that are
 ///      trusted proxies -- the first untrusted address is the client. CDNs and
 ///      proxies append the address they saw, so the leftmost entry is whatever
 ///      the client chose to send and must never be believed (#791). If every
 ///      entry is a trusted proxy the leftmost one is used;
-///   3. `X-Real-IP`;
+///   3. `X-Real-IP`, when an IP literal;
 ///   4. `default`.
 pub fn extractClientIp(request: *const Request, trusted_forwarding_source: bool, default: []const u8, policy: ClientIpPolicy) []const u8 {
     if (!trusted_forwarding_source) return default;
@@ -255,23 +255,30 @@ pub fn extractClientIp(request: *const Request, trusted_forwarding_source: bool,
         }
     }
 
-    if (request.headers.get("x-forwarded-for")) |xff| {
-        var remaining = xff;
-        var candidate: ?[]const u8 = null;
+    // Walk every X-Forwarded-For field line, last line first, so a proxy that
+    // appends its own line cannot be shadowed by a client-supplied earlier one.
+    // An invalid/empty element is a trust boundary we must not cross.
+    var candidate: ?[]const u8 = null;
+    const items = request.headers.iterator();
+    var idx = items.len;
+    walk: while (idx > 0) {
+        idx -= 1;
+        if (!std.ascii.eqlIgnoreCase(items[idx].name, "x-forwarded-for")) continue;
+        var remaining = items[idx].value;
         while (true) {
             const comma = std.mem.findScalarLast(u8, remaining, ',');
             const entry = std.mem.trim(u8, if (comma) |c| remaining[c + 1 ..] else remaining, " \t");
-            const ip = access_control.parseIp(entry) orelse break;
+            const ip = access_control.parseIp(entry) orelse break :walk;
             candidate = entry;
             if (!policy.isTrustedProxy(ip)) return entry;
             remaining = if (comma) |c| remaining[0..c] else break;
         }
-        // Every entry was a trusted proxy: the leftmost is the best answer.
-        if (candidate) |c| return c;
     }
+    // Every entry was a trusted proxy: the leftmost is the best answer.
+    if (candidate) |c| return c;
     if (request.headers.get("x-real-ip")) |xri| {
         const trimmed = std.mem.trim(u8, xri, " \t");
-        if (trimmed.len > 0) return trimmed;
+        if (access_control.parseIp(trimmed) != null) return trimmed;
     }
     return default;
 }
@@ -471,4 +478,36 @@ test "extractClientIp ignores a non-IP real-IP header value (#791)" {
     defer req.deinit();
 
     try std.testing.expectEqualStrings("10.0.0.2", extractClientIp(&req, true, "10.0.0.2", .{ .real_ip_header = "CF-Connecting-IP" }));
+}
+
+test "extractClientIp walks separate X-Forwarded-For field lines (#791)" {
+    const allocator = std.testing.allocator;
+    var req = try parseForTest(allocator, "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.7, 198.51.100.99\r\nX-Forwarded-For: 198.51.100.20\r\nX-Forwarded-For: 10.0.0.2\r\n\r\n");
+    defer req.deinit();
+
+    const cidrs = [_][]const u8{"10.0.0.0/8"};
+    const policy = ClientIpPolicy{ .trusted_proxy_cidrs = cidrs[0..] };
+    try std.testing.expectEqualStrings("198.51.100.20", extractClientIp(&req, true, "10.0.0.2", policy));
+}
+
+test "extractClientIp stops at an invalid X-Forwarded-For element (#791)" {
+    const allocator = std.testing.allocator;
+    var req = try parseForTest(allocator, "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.7, garbage, 10.0.0.2\r\n\r\n");
+    defer req.deinit();
+
+    const cidrs = [_][]const u8{"10.0.0.0/8"};
+    // The walk hits `garbage` after skipping the trusted hop and must not
+    // cross it to the spoofable entry beyond; it keeps the last valid hop.
+    try std.testing.expectEqualStrings("10.0.0.2", extractClientIp(&req, true, "192.0.2.1", .{ .trusted_proxy_cidrs = cidrs[0..] }));
+}
+
+test "extractClientIp validates the X-Real-IP fallback (#791)" {
+    const allocator = std.testing.allocator;
+    var bad = try parseForTest(allocator, "GET / HTTP/1.1\r\nHost: localhost\r\nX-Real-IP: bogus, 1.2.3.4\r\n\r\n");
+    defer bad.deinit();
+    try std.testing.expectEqualStrings("192.0.2.1", extractClientIp(&bad, true, "192.0.2.1", .{}));
+
+    var malformed_xff = try parseForTest(allocator, "GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: nope\r\nX-Real-IP: 198.51.100.5\r\n\r\n");
+    defer malformed_xff.deinit();
+    try std.testing.expectEqualStrings("198.51.100.5", extractClientIp(&malformed_xff, true, "192.0.2.1", .{}));
 }

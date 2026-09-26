@@ -4,6 +4,15 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An exact `location` with a full `proxy_pass` URI no longer doubles the path
+  when a shorter prefix location exists (#798)** — with `location =
+  /mcp/health { proxy_pass http://up/mcp/health; }` next to `location /mcp`,
+  `GET /mcp/health` was sent upstream as `/mcp/health/health`. The exact
+  block's URI is now forwarded unchanged; exact blocks targeting a bare origin
+  keep the mount-prefix stripping used by split-upstream routes.
+  
 ### Security
 
 - **The client IP can no longer be spoofed through `X-Forwarded-For` behind a

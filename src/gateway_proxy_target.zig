@@ -146,7 +146,7 @@ pub fn combineProxyTarget(allocator: std.mem.Allocator, target: []const u8, suff
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ left_trimmed, right_trimmed });
 }
 
-fn targetHasPath(target: []const u8) bool {
+pub fn targetHasPath(target: []const u8) bool {
     const scheme_end = std.mem.find(u8, target, "://") orelse return target.len > 0;
     return std.mem.findScalarPos(u8, target, scheme_end + 3, '/') != null;
 }

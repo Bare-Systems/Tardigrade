@@ -517,6 +517,8 @@ fn minimalAuthConfig(blocks: []http.location_router.LocationBlock, token_hashes:
     cfg.access_control_rules = "";
     cfg.parsed_access_control = null;
     cfg.basic_auth_hashes = &.{};
+    cfg.trusted_proxy_cidrs = &.{};
+    cfg.real_ip_header = "";
     cfg.auth_token_hashes = token_hashes;
     cfg.jwt_secret = "";
     cfg.jwt_issuer = "";

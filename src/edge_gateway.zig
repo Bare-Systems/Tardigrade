@@ -4634,7 +4634,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         request.headers.remove("x-forwarded-for");
         request.headers.remove("x-real-ip");
     }
-    const client_ip = http.request_context.extractClientIp(&request, trusted_forwarding_source, effective_connection_ip);
+    const client_ip = http.request_context.extractClientIp(&request, trusted_forwarding_source, effective_connection_ip, .{
+        .real_ip_header = cfg.real_ip_header,
+        .trusted_proxies = cfg.trusted_upstream_identities,
+        .trusted_proxy_cidrs = cfg.trusted_proxy_cidrs,
+    });
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
     ctx.early_data.transport_early = request_transport_early;
     ctx.early_data.inbound_marker = request.headers.hasEarlyDataMarker();

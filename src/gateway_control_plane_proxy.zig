@@ -843,6 +843,7 @@ fn initControlPlaneProxyTestConfig(upstream_base_url: []const u8) edge_config.Ed
     cfg.trust_shared_secret = "";
     cfg.trust_gateway_id = "";
     cfg.trusted_upstream_identities = &.{};
+    cfg.trusted_proxy_cidrs = &.{};
     cfg.max_connection_memory_bytes = 0;
     cfg.upstream_max_fails = 1;
     cfg.upstream_fail_timeout_ms = 60_000;

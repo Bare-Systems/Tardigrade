@@ -350,6 +350,20 @@ gate at all -- any client could rewrite both just by sending
 `X-Forwarded-For`/`X-Real-IP`, live even behind a correctly configured
 `trusted_upstream_identities`, because that code path never consulted it.
 
+#### Client address resolution (#791)
+
+From a trusted peer, the client address is resolved like nginx
+`real_ip_header` / `set_real_ip_from` / `real_ip_recursive`:
+
+1. `TARDIGRADE_REAL_IP_HEADER` (e.g. `CF-Connecting-IP`), when set and holding an IP literal.
+2. `X-Forwarded-For` walked from the **right**, skipping entries that are trusted
+   proxies (`TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` addresses or
+   `TARDIGRADE_TRUSTED_PROXY_CIDRS`); the first untrusted address is the client.
+   The leftmost entry is client-controlled and is never believed on its own.
+3. `X-Real-IP`, then the connection address.
+
+A peer inside `TARDIGRADE_TRUSTED_PROXY_CIDRS` counts as a trusted forwarding source.
+
 Implementation: `isTrustedUpstream()`, `buildForwardedFor()`,
 `appendProxyRequestHeaders()` in `src/gateway_proxy_headers.zig`;
 `extractClientIp()` in `src/http/request_context.zig`; the untrusted-path

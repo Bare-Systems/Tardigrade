@@ -248,8 +248,17 @@ fn trustHostsEqual(a: []const u8, b: []const u8) bool {
 /// `trust_require_upstream_identity` to prevent clients from spoofing
 /// `X-Forwarded-For`.
 pub fn isTrustedUpstream(cfg: *const edge_config.EdgeConfig, upstream_host: []const u8) bool {
-    if (!cfg.trust_require_upstream_identity and cfg.trusted_upstream_identities.len == 0) return true;
+    if (!cfg.trust_require_upstream_identity and cfg.trusted_upstream_identities.len == 0 and cfg.trusted_proxy_cidrs.len == 0) return true;
     if (upstream_host.len == 0) return false;
+
+    if (cfg.trusted_proxy_cidrs.len > 0) {
+        if (http.access_control.parseIp(unbracketHost(stripPort(upstream_host)))) |peer| {
+            for (cfg.trusted_proxy_cidrs) |entry| {
+                const block = http.access_control.parseCidr(std.mem.trim(u8, entry, " \t")) orelse continue;
+                if (block.contains(peer)) return true;
+            }
+        }
+    }
 
     for (cfg.trusted_upstream_identities) |trusted| {
         if (trustHostsEqual(trusted, upstream_host)) return true;
@@ -924,4 +933,12 @@ test "stripPort handles IPv6 addresses" {
     try std.testing.expectEqualStrings("[::1]", stripPort("[::1]"));
     try std.testing.expectEqualStrings("[::1]", stripPort("[::1]:8080"));
     try std.testing.expectEqualStrings("[2001:db8::1]", stripPort("[2001:db8::1]:443"));
+}
+
+test "isTrustedUpstream treats a peer inside trusted_proxy_cidrs as trusted (#791)" {
+    var cidrs = [_][]const u8{"172.18.0.0/16"};
+    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{ .trusted_proxy_cidrs = cidrs[0..] });
+    try std.testing.expect(isTrustedUpstream(&cfg, "172.18.0.1"));
+    try std.testing.expect(!isTrustedUpstream(&cfg, "203.0.113.5"));
+    try std.testing.expect(!isTrustedUpstream(&cfg, "cloudflared"));
 }

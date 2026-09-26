@@ -2,6 +2,22 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- **Client IP is no longer taken from the client-controlled first
+  `X-Forwarded-For` entry (#791)** — per-IP rate limits could be bypassed, and
+  access logs spoofed, by sending a random `X-Forwarded-For` on each request.
+  The client is now the first untrusted address walking `X-Forwarded-For` from
+  the right (nginx `real_ip_recursive` semantics), skipping trusted proxies.
+
+### Added
+
+- `TARDIGRADE_REAL_IP_HEADER` (e.g. `CF-Connecting-IP`) names a header carrying
+  the client address from a trusted CDN, and `TARDIGRADE_TRUSTED_PROXY_CIDRS`
+  lists trusted proxy ranges (e.g. a Docker bridge gateway).
+
 ## [0.7.3] - 2026-09-25
 
 ### Fixed

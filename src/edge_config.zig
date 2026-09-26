@@ -302,6 +302,12 @@ pub const EdgeConfig = struct {
     trust_shared_secret: []const u8,
     /// Trusted upstream identities accepted when signature verification is enabled.
     trusted_upstream_identities: [][]const u8,
+    /// CIDRs of trusted proxies (#791): a connecting peer inside one is a trusted
+    /// forwarding source, and X-Forwarded-For entries inside one are skipped when
+    /// resolving the client address from the right.
+    trusted_proxy_cidrs: [][]const u8,
+    /// Header a trusted CDN/proxy sets to the client address (e.g. CF-Connecting-IP).
+    real_ip_header: []const u8,
     /// Whether to require signed upstream identity headers on responses.
     trust_require_upstream_identity: bool,
     upstream_base_url: []const u8,
@@ -687,6 +693,9 @@ pub const EdgeConfig = struct {
         allocator.free(self.trust_shared_secret);
         for (self.trusted_upstream_identities) |id| allocator.free(id);
         allocator.free(self.trusted_upstream_identities);
+        for (self.trusted_proxy_cidrs) |c| allocator.free(c);
+        allocator.free(self.trusted_proxy_cidrs);
+        allocator.free(self.real_ip_header);
         allocator.free(self.upstream_base_url);
         for (self.upstream_base_urls) |u| allocator.free(u);
         allocator.free(self.upstream_base_urls);
@@ -1001,6 +1010,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         for (trusted_upstream_identities) |id| allocator.free(id);
         allocator.free(trusted_upstream_identities);
     }
+    const trusted_proxy_cidrs_raw = envOrDefault(allocator, "TARDIGRADE_TRUSTED_PROXY_CIDRS", "") catch unreachable;
+    defer allocator.free(trusted_proxy_cidrs_raw);
+    const trusted_proxy_cidrs = try parseCsvValues(allocator, trusted_proxy_cidrs_raw);
+    errdefer {
+        for (trusted_proxy_cidrs) |c| allocator.free(c);
+        allocator.free(trusted_proxy_cidrs);
+    }
+    const real_ip_header = envOrDefault(allocator, "TARDIGRADE_REAL_IP_HEADER", "") catch unreachable;
+    errdefer allocator.free(real_ip_header);
     const trust_require_upstream_identity_str = envOrDefault(allocator, "TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY", "false") catch unreachable;
     defer allocator.free(trust_require_upstream_identity_str);
     const trust_require_upstream_identity = std.mem.eql(u8, trust_require_upstream_identity_str, "true") or std.mem.eql(u8, trust_require_upstream_identity_str, "1");
@@ -1684,6 +1702,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .trust_gateway_id = trust_gateway_id,
         .trust_shared_secret = trust_shared_secret,
         .trusted_upstream_identities = trusted_upstream_identities,
+        .trusted_proxy_cidrs = trusted_proxy_cidrs,
+        .real_ip_header = real_ip_header,
         .trust_require_upstream_identity = trust_require_upstream_identity,
         .upstream_base_url = upstream_base_url,
         .upstream_base_urls = upstream_base_urls,

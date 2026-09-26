@@ -2749,7 +2749,12 @@ test "proxySuffixPathForLocation yields no suffix for exact route shadowing same
     };
 
     const matched = http.location_router.matchLocation(std.testing.allocator, "/mcp", &blocks).?;
-    try std.testing.expect(proxySuffixPathForLocation("/mcp", matched, &blocks) == null);
+    const suffix = proxySuffixPathForLocation("/mcp", matched, &blocks);
+    try std.testing.expect(suffix == null);
+
+    const combined = try gpt.combineProxyTarget(std.testing.allocator, "http://ekho-mcp:8000/mcp", suffix);
+    defer std.testing.allocator.free(combined);
+    try std.testing.expectEqualStrings("http://ekho-mcp:8000/mcp", combined);
 }
 
 test "isHttpMethodIdempotent classifies idempotent methods" {

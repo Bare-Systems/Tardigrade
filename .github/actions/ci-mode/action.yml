@@ -1,0 +1,35 @@
+name: Select CI mode
+description: >-
+  Resolve the smoke/full validation mode (#806) with scripts/ci-mode.sh.
+  Requires a prior full-history checkout (fetch-depth: 0).
+inputs:
+  override:
+    description: auto, smoke or full (workflow_dispatch selection)
+    required: false
+    default: auto
+outputs:
+  mode:
+    description: smoke or full
+    value: ${{ steps.detect.outputs.mode }}
+runs:
+  using: composite
+  steps:
+    - id: detect
+      shell: bash
+      env:
+        OVERRIDE: ${{ inputs.override }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+        case "$EVENT_NAME" in
+          pull_request) base="$PR_BASE"; head="$PR_HEAD" ;;
+          push) base="$PUSH_BEFORE"; head="$SHA" ;;
+          *) base="origin/main"; head="$SHA" ;;
+        esac
+        mode=$(./scripts/ci-mode.sh --base "$base" --head "$head" --override "${OVERRIDE:-auto}")
+        echo "mode=$mode" >>"$GITHUB_OUTPUT"
+        echo "### CI mode: \`$mode\`" >>"$GITHUB_STEP_SUMMARY"

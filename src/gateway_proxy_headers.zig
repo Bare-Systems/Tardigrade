@@ -219,6 +219,21 @@ fn unbracketHost(host: []const u8) []const u8 {
     return host;
 }
 
+/// Match a `trusted_upstream_identities` entry against a peer host.
+///
+/// An entry containing `/` is a CIDR block (e.g. `172.16.0.0/12`, for a
+/// sidecar such as cloudflared on a Docker bridge whose address is not
+/// fixed) and matches any IP literal inside it. Otherwise the entry is
+/// compared with `trustHostsEqual`.
+fn trustEntryMatches(entry: []const u8, host: []const u8) bool {
+    if (std.mem.findScalar(u8, entry, '/') != null) {
+        const block = http.access_control.parseCidr(std.mem.trim(u8, entry, " \t")) orelse return false;
+        const ip = http.access_control.parseIp(unbracketHost(stripPort(host))) orelse return false;
+        return block.contains(ip);
+    }
+    return trustHostsEqual(entry, host);
+}
+
 /// Compare two authority hosts for a trust decision.
 ///
 /// IP literals are compared by their parsed binary address, so every legal
@@ -252,10 +267,27 @@ pub fn isTrustedUpstream(cfg: *const edge_config.EdgeConfig, upstream_host: []co
     if (upstream_host.len == 0) return false;
 
     for (cfg.trusted_upstream_identities) |trusted| {
-        if (trustHostsEqual(trusted, upstream_host)) return true;
+        if (trustEntryMatches(trusted, upstream_host)) return true;
     }
     return false;
 }
+
+/// The trusted-proxy set `http.request_context.extractClientIp` consults
+/// while walking `X-Forwarded-For` right to left: an address is a trusted
+/// hop only when it explicitly matches a `trusted_upstream_identities`
+/// entry. Unlike `isTrustedUpstream`, there is no open-trust default -- with
+/// no identities configured, no hop is skipped and the rightmost entry (the
+/// address the connecting peer observed) is the client.
+pub const TrustedProxySet = struct {
+    cfg: *const edge_config.EdgeConfig,
+
+    pub fn isTrustedProxy(self: TrustedProxySet, ip: []const u8) bool {
+        for (self.cfg.trusted_upstream_identities) |trusted| {
+            if (trustEntryMatches(trusted, ip)) return true;
+        }
+        return false;
+    }
+};
 
 /// Geo policy is meaningful only when the country header arrived from the
 /// explicitly trusted proxy/CDN tier. Direct clients must not be able to pick
@@ -867,6 +899,42 @@ test "trusted-peer matching is exact for every authority spelling" {
     try std.testing.expect(isTrustedUpstream(&cfg_mixed, "lb.internal"));
     try std.testing.expect(isTrustedUpstream(&cfg_mixed, "LB.Internal:9000"));
     try std.testing.expect(!isTrustedUpstream(&cfg_mixed, "lb.internal.evil.test"));
+}
+
+test "isTrustedUpstream accepts CIDR entries (#791)" {
+    // A host-local cloudflared on a Docker bridge has no fixed address, so
+    // operators pin the bridge subnet instead of a single IP.
+    var identities = [_][]const u8{ "172.16.0.0/12", "2001:db8::/32" };
+    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .trust_require_upstream_identity = true,
+        .trusted_upstream_identities = identities[0..],
+    });
+    try std.testing.expect(isTrustedUpstream(&cfg, "172.18.0.1"));
+    try std.testing.expect(isTrustedUpstream(&cfg, "172.31.255.254:5000"));
+    try std.testing.expect(!isTrustedUpstream(&cfg, "172.32.0.1"));
+    try std.testing.expect(!isTrustedUpstream(&cfg, "10.0.0.1"));
+    try std.testing.expect(isTrustedUpstream(&cfg, "2001:db8:0:0:0:0:0:7"));
+    try std.testing.expect(isTrustedUpstream(&cfg, "[2001:db8::7]:443"));
+    try std.testing.expect(!isTrustedUpstream(&cfg, "2001:db9::1"));
+    // A CIDR entry never matches a hostname.
+    try std.testing.expect(!isTrustedUpstream(&cfg, "cloudflared.internal"));
+}
+
+test "TrustedProxySet only trusts explicitly listed hops (#791)" {
+    var identities = [_][]const u8{ "10.0.0.0/8", "192.0.2.10" };
+    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .trusted_upstream_identities = identities[0..],
+    });
+    const set = TrustedProxySet{ .cfg = &cfg };
+    try std.testing.expect(set.isTrustedProxy("10.1.2.3"));
+    try std.testing.expect(set.isTrustedProxy("192.0.2.10"));
+    try std.testing.expect(!set.isTrustedProxy("192.0.2.11"));
+
+    // Open trust (nothing configured) still admits every peer's forwarding
+    // headers, but skips no XFF hop.
+    const open_cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    try std.testing.expect(isTrustedUpstream(&open_cfg, "198.51.100.1"));
+    try std.testing.expect(!(TrustedProxySet{ .cfg = &open_cfg }).isTrustedProxy("198.51.100.1"));
 }
 
 test "H3 transport peers feed the trust check without an IPv6 bypass" {

@@ -342,6 +342,37 @@ behind a load balancer MUST set `trusted_upstream_identities` to the load
 balancer's address(es) and enable `trust_require_upstream_identity: true` to
 prevent clients from spoofing their source IP via `X-Forwarded-For`.
 
+Entries may be exact hosts/addresses or CIDR blocks (`172.16.0.0/12`), which
+suits a sidecar such as cloudflared on a Docker bridge with no fixed address.
+
+### Resolving the client IP
+
+For a trusted peer, Tardigrade resolves the client IP (nginx `real_ip_header`
+/ `set_real_ip_from` / `real_ip_recursive on` semantics):
+
+1. `TARDIGRADE_REAL_IP_HEADER` (for example `CF-Connecting-IP`), when set
+   and the header holds a valid IP. A CDN overwrites this header, so the
+   client cannot choose it.
+2. `X-Forwarded-For`, walked from the **right**. Proxies append to this
+   header rather than replace it, so the leftmost entry is whatever the client
+   sent. Entries matching `trusted_upstream_identities` are skipped; the first
+   untrusted address is the client. The walk stops at an empty or invalid
+   member, since nothing left of it is attested by a trusted hop.
+3. `X-Real-IP`, when it holds a valid IP (also when `X-Forwarded-For` yields
+   no usable address).
+4. The connection address.
+
+From an untrusted peer, the configured real-IP header is stripped along with
+`X-Forwarded-For` and `X-Real-IP`, so a forged copy never reaches the origin.
+
+Before #791 the **leftmost** `X-Forwarded-For` entry was used, so a client
+behind a correctly trusted CDN could still pick its own `client_ip`.
+
+With open trust (nothing configured) every peer's forwarding headers are
+honored and the rightmost entry is used, so a client connecting directly can
+still set its own `client_ip`. Configure `trusted_upstream_identities`
+whenever Tardigrade is reachable other than through the proxy tier.
+
 The same trust decision also governs the `client_ip` Tardigrade uses
 internally: the identity rate limiting keys unauthenticated traffic on
 (`ip:{client_ip}` buckets) and the `client_ip` field written to access logs.
@@ -691,7 +722,8 @@ Implementation: `shouldSkipUpstreamRequestHeader()` in `src/gateway_proxy_header
 1. **Load balancer in front of Tardigrade**: Set `trusted_upstream_identities`
    to the load balancer's IP(s) and enable `trust_require_upstream_identity:
    true`.  Without this, clients can forge `X-Forwarded-For` to spoof their
-   apparent source IP.
+   apparent source IP. Behind a CDN that sends a single-value client header
+   (Cloudflare's `CF-Connecting-IP`), also set `TARDIGRADE_REAL_IP_HEADER`.
 
 2. **TLS termination**: Enable `tls_cert_path` / `tls_key_path` to terminate
    TLS at Tardigrade. Use `hsts_enabled: true` on public HTTPS services.

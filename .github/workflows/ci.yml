@@ -5,7 +5,22 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Validation mode: auto (changelog-driven), smoke, or full"
+        type: choice
+        options:
+          - auto
+          - smoke
+          - full
+        default: auto
 
+# Two validation modes only (#806), chosen by scripts/ci-mode.sh:
+#   smoke  ordinary unreleased work (no numbered changelog release added).
+#   full   a new `## [X.Y.Z]` changelog heading vs the base (release
+#          promotion), or a manual `mode=full` dispatch.
+# `ci-result` is the single stable branch-protection-required check.
 permissions:
   contents: read
 
@@ -14,6 +29,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── Mode selection ────────────────────────────────────────────────────────────
+  mode:
+    name: Select CI mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      os_matrix: ${{ steps.mode.outputs.mode == 'full' && '["ubuntu-latest","ubuntu-24.04-arm","macos-14"]' || '["ubuntu-latest"]' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect mode
+        id: mode
+        uses: ./.github/actions/ci-mode
+        with:
+          override: ${{ inputs.mode || 'auto' }}
+
   # ── Format ────────────────────────────────────────────────────────────────────
   # Fast source formatting check. Required on every PR and push.
   format:
@@ -44,6 +81,9 @@ jobs:
 
       - name: Run actionlint
         uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+
+      - name: Test CI mode detector and required-result gate (#806)
+        run: ./scripts/test-ci-mode.sh
 
       - name: Run shellcheck
         run: find scripts/ packaging/ tests/vectors/pki -name "*.sh" -exec shellcheck {} +
@@ -173,6 +213,8 @@ jobs:
 
   dependency-audit-darwin:
     name: Production binary audit (macOS)
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
     runs-on: macos-14
     timeout-minutes: 25
 
@@ -208,15 +250,13 @@ jobs:
   # Runs unit tests across platforms. Required on every PR and push.
   test:
     name: Test (${{ matrix.os }})
+    needs: mode
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-          - os: ubuntu-24.04-arm
-          - os: macos-14
+        os: ${{ fromJSON(needs.mode.outputs.os_matrix) }}
 
     steps:
       - name: Checkout
@@ -275,6 +315,8 @@ jobs:
   # separate manual run.
   test-appliance:
     name: Test appliance profile (${{ matrix.os }})
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -380,15 +422,13 @@ jobs:
   # present.
   test-general-native-tls:
     name: Test general profile native TLS listener (${{ matrix.os }})
+    needs: mode
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-          - os: ubuntu-24.04-arm
-          - os: macos-14
+        os: ${{ fromJSON(needs.mode.outputs.os_matrix) }}
 
     steps:
       - name: Checkout
@@ -421,6 +461,8 @@ jobs:
   # and Go crypto/x509. External validators remain out of process.
   pki-differential:
     name: PKI differential (core)
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -518,6 +560,8 @@ jobs:
   # (Linux x86_64, Linux ARM64, macOS).
   build:
     name: Build (${{ matrix.os }}, ${{ matrix.optimize }})
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -558,6 +602,8 @@ jobs:
   # disposable container.
   packaging-smoke:
     name: Packaging smoke
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -596,6 +642,8 @@ jobs:
 
   homebrew-formula-smoke:
     name: Homebrew formula smoke (${{ matrix.os }})
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -648,6 +696,8 @@ jobs:
   # obvious regressions without making PRs noisy or flaky.
   perf-smoke:
     name: Perf smoke
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -714,6 +764,8 @@ jobs:
   # noisy shared runner cannot make PR CI flaky (docs/CRYPTO_BENCHMARKS.md).
   crypto-bench:
     name: Crypto benchmark trend
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -824,6 +876,8 @@ jobs:
   # boundary -- scripts/audit-dependencies.sh) and never appear in this file.
   h3-resumption-interop:
     name: H3 resumption/0-RTT interop
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -881,6 +935,8 @@ jobs:
   # implementation's sweep. See docs/TLS_INTEROP_MATRIX.md.
   tls-conformance-matrix:
     name: TLS interop/conformance matrix
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -937,12 +993,13 @@ jobs:
           retention-days: 7
 
   # ── Integration tests ─────────────────────────────────────────────────────────
-  # Runs on push to main only (not PRs). Failures block the workflow.
+  # Default (general) profile live-process suite on Linux, in BOTH modes (#806):
+  # it is the smoke tier's core integration / security-regression gate.
+  # (macOS is deliberately excluded for scheduling-variance reasons.)
   integration-test:
     name: Integration tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout
@@ -967,3 +1024,57 @@ jobs:
 
       - name: Run integration tests
         run: zig build test-integration --summary all
+
+  # ── Required result ───────────────────────────────────────────────────────────
+  # The ONE check to require in branch protection ("CI result"). It passes only
+  # when every job required for the selected mode succeeded; full-only jobs are
+  # expected to be skipped in smoke mode, but must all succeed in full mode.
+  ci-result:
+    name: CI result
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - mode
+      - format
+      - lint
+      - dependency-audit
+      - dependency-audit-darwin
+      - test
+      - test-appliance
+      - test-general-native-tls
+      - pki-differential
+      - examples
+      - build
+      - packaging-smoke
+      - homebrew-formula-smoke
+      - perf-smoke
+      - crypto-bench
+      - security
+      - dependency-review
+      - h3-resumption-interop
+      - tls-conformance-matrix
+      - integration-test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Evaluate required jobs for the selected mode
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          MODE: ${{ needs.mode.outputs.mode }}
+          SMOKE_JOBS: >-
+            mode format lint dependency-audit test test-general-native-tls
+            examples security integration-test
+          # Skipped by design on workflow_dispatch (pull_request-only job).
+          OPTIONAL_JOBS: dependency-review
+          FULL_JOBS: >-
+            dependency-audit-darwin test-appliance pki-differential build
+            packaging-smoke homebrew-formula-smoke perf-smoke crypto-bench
+            h3-resumption-interop tls-conformance-matrix
+        run: |
+          printf '%s' "$NEEDS" >"$RUNNER_TEMP/needs.json"
+          ./scripts/ci-gate.sh "$MODE" "$RUNNER_TEMP/needs.json"

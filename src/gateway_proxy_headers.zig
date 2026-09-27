@@ -155,6 +155,100 @@ pub fn appendProxyRequestHeaders(
     }
 }
 
+// ---------------------------------------------------------------------------
+// proxy_set_header (#809)
+// ---------------------------------------------------------------------------
+
+/// Per-request values for the variables a `proxy_set_header` value may use.
+pub const ProxySetHeaderVars = struct {
+    /// Raw client `Host` (or `:authority`); `$http_host`, and `$host` without
+    /// its port and lowercased.
+    host: ?[]const u8,
+    /// The trusted client IP Tardigrade already resolved (the `X-Real-IP`
+    /// value), never a raw client-supplied `X-Forwarded-For` entry.
+    remote_addr: []const u8,
+    scheme: []const u8,
+    /// The `X-Forwarded-For` value Tardigrade would send (`$remote_addr`
+    /// appended to the inbound chain).
+    proxy_add_x_forwarded_for: []const u8,
+    request_id: []const u8,
+};
+
+/// Apply `proxy_set_header` rules to a fully built upstream header list.
+///
+/// Runs after every client-copied and Tardigrade-generated header is in place,
+/// so a rule overrides both: every instance of the name, in any case, is
+/// removed before the expanded value is appended; a value that expands to the
+/// empty string only removes. Expanded values are allocated from `arena` and
+/// must outlive the upstream request write.
+pub fn applyProxySetHeaders(
+    arena: std.mem.Allocator,
+    extra_headers: *std.array_list.Managed(std.http.Header),
+    rules: []const http.location_router.ProxySetHeader,
+    vars: ProxySetHeaderVars,
+) !void {
+    if (rules.len == 0) return;
+    // Remove first, then add, so two rules never interfere with each other.
+    var i: usize = 0;
+    while (i < extra_headers.items.len) {
+        if (proxySetHeaderRuleFor(rules, extra_headers.items[i].name) != null) {
+            _ = extra_headers.orderedRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+    for (rules) |rule| {
+        const value = try expandProxySetHeaderValue(arena, rule.value, vars);
+        if (value.len == 0) continue;
+        try extra_headers.append(.{ .name = rule.name, .value = value });
+    }
+}
+
+fn proxySetHeaderRuleFor(rules: []const http.location_router.ProxySetHeader, name: []const u8) ?*const http.location_router.ProxySetHeader {
+    for (rules) |*rule| {
+        if (std.ascii.eqlIgnoreCase(rule.name, name)) return rule;
+    }
+    return null;
+}
+
+fn expandProxySetHeaderValue(arena: std.mem.Allocator, template: []const u8, vars: ProxySetHeaderVars) ![]const u8 {
+    if (std.mem.findScalar(u8, template, '$') == null) return template;
+    var out = std.ArrayList(u8).empty;
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] != '$') {
+            try out.append(arena, template[i]);
+            i += 1;
+            continue;
+        }
+        var end = i + 1;
+        while (end < template.len and http.location_router.isProxySetHeaderVariableChar(template[end])) end += 1;
+        const name = template[i + 1 .. end];
+        if (std.mem.eql(u8, name, "host")) {
+            if (vars.host) |raw| {
+                const host = stripPort(std.mem.trim(u8, raw, " \t"));
+                for (host) |c| try out.append(arena, std.ascii.toLower(c));
+            }
+        } else if (std.mem.eql(u8, name, "http_host")) {
+            if (vars.host) |raw| try out.appendSlice(arena, std.mem.trim(u8, raw, " \t"));
+        } else if (std.mem.eql(u8, name, "remote_addr")) {
+            try out.appendSlice(arena, vars.remote_addr);
+        } else if (std.mem.eql(u8, name, "scheme")) {
+            try out.appendSlice(arena, vars.scheme);
+        } else if (std.mem.eql(u8, name, "proxy_add_x_forwarded_for")) {
+            try out.appendSlice(arena, vars.proxy_add_x_forwarded_for);
+        } else if (std.mem.eql(u8, name, "request_id")) {
+            try out.appendSlice(arena, vars.request_id);
+        } else {
+            // Config load rejects unknown variables; keep the text literal
+            // rather than guess if one ever reaches here.
+            try out.appendSlice(arena, template[i..end]);
+        }
+        i = end;
+    }
+    return out.items;
+}
+
 pub fn appendCanonicalEarlyDataHeader(extra_headers: *std.array_list.Managed(std.http.Header), enabled: bool) !void {
     if (!enabled) return;
     try extra_headers.append(.{ .name = http.early_data.HEADER_NAME, .value = http.early_data.HEADER_VALUE });
@@ -992,4 +1086,118 @@ test "stripPort handles IPv6 addresses" {
     try std.testing.expectEqualStrings("[::1]", stripPort("[::1]"));
     try std.testing.expectEqualStrings("[::1]", stripPort("[::1]:8080"));
     try std.testing.expectEqualStrings("[2001:db8::1]", stripPort("[2001:db8::1]:443"));
+}
+
+fn countHeaders(headers: []const std.http.Header, name: []const u8) usize {
+    var n: usize = 0;
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) n += 1;
+    }
+    return n;
+}
+
+fn findHeader(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
+}
+
+const test_set_header_vars = ProxySetHeaderVars{
+    .host = "App.Example.Test:8443",
+    .remote_addr = "198.51.100.7",
+    .scheme = "https",
+    .proxy_add_x_forwarded_for = "203.0.113.9, 198.51.100.7",
+    .request_id = "req-809",
+};
+
+test "proxy_set_header overwrites every client and generated instance of a header (#809)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var headers = std.array_list.Managed(std.http.Header).init(std.testing.allocator);
+    defer headers.deinit();
+    // Client duplicates and case variants, plus the value Tardigrade generated.
+    try headers.append(.{ .name = "x-forwarded-proto", .value = "http" });
+    try headers.append(.{ .name = "Accept", .value = "*/*" });
+    try headers.append(.{ .name = "X-FORWARDED-PROTO", .value = "gopher" });
+    try headers.append(.{ .name = "X-Forwarded-Proto", .value = "http" });
+
+    const rules = [_]http.location_router.ProxySetHeader{
+        .{ .name = "X-Forwarded-Proto", .value = "https" },
+    };
+    try applyProxySetHeaders(arena.allocator(), &headers, &rules, test_set_header_vars);
+
+    try std.testing.expectEqual(@as(usize, 1), countHeaders(headers.items, "x-forwarded-proto"));
+    try std.testing.expectEqualStrings("https", findHeader(headers.items, "x-forwarded-proto").?);
+    try std.testing.expectEqualStrings("*/*", findHeader(headers.items, "accept").?);
+}
+
+test "proxy_set_header empty value removes the header (#809)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var headers = std.array_list.Managed(std.http.Header).init(std.testing.allocator);
+    defer headers.deinit();
+    try headers.append(.{ .name = "X-Forwarded-For", .value = "10.9.9.9" });
+    try headers.append(.{ .name = "x-forwarded-for", .value = "10.8.8.8, 198.51.100.7" });
+
+    const rules = [_]http.location_router.ProxySetHeader{
+        .{ .name = "X-Forwarded-For", .value = "" },
+    };
+    try applyProxySetHeaders(arena.allocator(), &headers, &rules, test_set_header_vars);
+    try std.testing.expectEqual(@as(usize, 0), countHeaders(headers.items, "x-forwarded-for"));
+}
+
+test "proxy_set_header Host replaces the upstream Host override (#809)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var headers = std.array_list.Managed(std.http.Header).init(std.testing.allocator);
+    defer headers.deinit();
+    try headers.append(.{ .name = "Host", .value = "client.example" });
+
+    const rules = [_]http.location_router.ProxySetHeader{
+        .{ .name = "Host", .value = "auth.baresystems.com" },
+    };
+    try applyProxySetHeaders(arena.allocator(), &headers, &rules, test_set_header_vars);
+    try std.testing.expectEqual(@as(usize, 1), countHeaders(headers.items, "host"));
+    try std.testing.expectEqualStrings("auth.baresystems.com", findHeader(headers.items, "host").?);
+}
+
+test "proxy_set_header expands variables from trusted request state (#809)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var headers = std.array_list.Managed(std.http.Header).init(std.testing.allocator);
+    defer headers.deinit();
+    // A spoofed client X-Forwarded-For must not feed $remote_addr.
+    try headers.append(.{ .name = "X-Forwarded-For", .value = "6.6.6.6" });
+
+    const rules = [_]http.location_router.ProxySetHeader{
+        .{ .name = "X-Forwarded-For", .value = "$remote_addr" },
+        .{ .name = "X-Origin", .value = "$scheme://$host" },
+        .{ .name = "X-Raw-Host", .value = "$http_host" },
+        .{ .name = "X-Chain", .value = "$proxy_add_x_forwarded_for" },
+        .{ .name = "X-Req", .value = "id=$request_id;" },
+    };
+    try applyProxySetHeaders(arena.allocator(), &headers, &rules, test_set_header_vars);
+    try std.testing.expectEqualStrings("198.51.100.7", findHeader(headers.items, "x-forwarded-for").?);
+    try std.testing.expectEqual(@as(usize, 1), countHeaders(headers.items, "x-forwarded-for"));
+    try std.testing.expectEqualStrings("https://app.example.test", findHeader(headers.items, "x-origin").?);
+    try std.testing.expectEqualStrings("App.Example.Test:8443", findHeader(headers.items, "x-raw-host").?);
+    try std.testing.expectEqualStrings("203.0.113.9, 198.51.100.7", findHeader(headers.items, "x-chain").?);
+    try std.testing.expectEqualStrings("id=req-809;", findHeader(headers.items, "x-req").?);
+}
+
+test "proxy_set_header variable expanding to empty removes the header (#809)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var headers = std.array_list.Managed(std.http.Header).init(std.testing.allocator);
+    defer headers.deinit();
+    try headers.append(.{ .name = "X-Forwarded-Host", .value = "evil.example" });
+
+    var vars = test_set_header_vars;
+    vars.host = null;
+    const rules = [_]http.location_router.ProxySetHeader{
+        .{ .name = "X-Forwarded-Host", .value = "$host" },
+    };
+    try applyProxySetHeaders(arena.allocator(), &headers, &rules, vars);
+    try std.testing.expectEqual(@as(usize, 0), countHeaders(headers.items, "x-forwarded-host"));
 }

@@ -3682,6 +3682,7 @@ fn executeHttp2ProxyRoute(
         forwarded_proto,
         request.headers.get("host"),
         request.headers.get("host"),
+        matched.block.proxy_set_headers,
         ctx.identity,
         ctx.user_id,
         ctx.device_id,

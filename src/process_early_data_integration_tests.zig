@@ -210,6 +210,7 @@ const LoopbackAttemptExecutor = struct {
             "http",
             self.request.headers.get("host"),
             null,
+            &.{},
             null,
             null,
             null,

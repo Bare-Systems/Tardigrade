@@ -128,6 +128,106 @@ pub const ProxyEarlyDataPolicy = enum {
     }
 };
 
+/// One `proxy_set_header NAME VALUE;` rule (#809). Every client-supplied and
+/// Tardigrade-generated instance of `name` is removed from the upstream
+/// request before `value` (after variable expansion) is added; a value that
+/// expands to the empty string only removes the header.
+pub const ProxySetHeader = struct {
+    name: []const u8,
+    /// Template; may reference the variables in `proxy_set_header_variables`.
+    value: []const u8,
+
+    pub fn deinit(self: *ProxySetHeader, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.value);
+        self.* = undefined;
+    }
+};
+
+/// Variables a `proxy_set_header` value may reference. Expanded per request by
+/// `gateway_proxy_headers.applyProxySetHeaders`.
+pub const proxy_set_header_variables = [_][]const u8{
+    "host",
+    "http_host",
+    "remote_addr",
+    "scheme",
+    "proxy_add_x_forwarded_for",
+    "request_id",
+};
+
+pub const ProxySetHeaderError = error{
+    InvalidProxySetHeaderName,
+    InvalidProxySetHeaderValue,
+    ForbiddenProxySetHeader,
+    UnknownProxySetHeaderVariable,
+};
+
+/// Headers that frame the request or that Tardigrade must own. They are
+/// rejected outright, because letting config set them could desynchronize the
+/// upstream's view of the request body or forge asserted identity.
+fn isForbiddenProxySetHeaderName(name: []const u8) bool {
+    const tardigrade_prefix = "x-tardigrade-";
+    if (name.len >= tardigrade_prefix.len and std.ascii.eqlIgnoreCase(name[0..tardigrade_prefix.len], tardigrade_prefix)) return true;
+    return std.ascii.eqlIgnoreCase(name, "content-length") or
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
+        std.ascii.eqlIgnoreCase(name, "early-data");
+}
+
+/// Hop-by-hop headers keep their existing handling: Tardigrade always strips
+/// the client's copies and manages the upstream connection itself. Clearing
+/// one (`proxy_set_header Connection "";`, common in nginx configs) is accepted
+/// as a no-op so such configs port unchanged; setting one is rejected.
+fn isHopByHopProxySetHeaderName(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "connection") or
+        std.ascii.eqlIgnoreCase(name, "keep-alive") or
+        std.ascii.eqlIgnoreCase(name, "proxy-authenticate") or
+        std.ascii.eqlIgnoreCase(name, "proxy-authorization") or
+        std.ascii.eqlIgnoreCase(name, "proxy-connection") or
+        std.ascii.eqlIgnoreCase(name, "te") or
+        std.ascii.eqlIgnoreCase(name, "trailer") or
+        std.ascii.eqlIgnoreCase(name, "upgrade");
+}
+
+fn isHeaderTokenChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or switch (c) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
+pub fn isProxySetHeaderVariableChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+pub fn isKnownProxySetHeaderVariable(name: []const u8) bool {
+    for (proxy_set_header_variables) |known| {
+        if (std.mem.eql(u8, known, name)) return true;
+    }
+    return false;
+}
+
+/// Validate one rule as `tardi check` and config load see it.
+pub fn validateProxySetHeader(name: []const u8, value: []const u8) ProxySetHeaderError!void {
+    if (name.len == 0) return error.InvalidProxySetHeaderName;
+    for (name) |c| if (!isHeaderTokenChar(c)) return error.InvalidProxySetHeaderName;
+    if (isForbiddenProxySetHeaderName(name)) return error.ForbiddenProxySetHeader;
+    if (isHopByHopProxySetHeaderName(name) and value.len > 0) return error.ForbiddenProxySetHeader;
+
+    // RFC 9110 field-value: no CR, LF, NUL or other controls except HTAB.
+    for (value) |c| {
+        if (c == '\t') continue;
+        if (c < 0x20 or c == 0x7f) return error.InvalidProxySetHeaderValue;
+    }
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        if (value[i] != '$') continue;
+        var end = i + 1;
+        while (end < value.len and isProxySetHeaderVariableChar(value[end])) end += 1;
+        if (!isKnownProxySetHeaderVariable(value[i + 1 .. end])) return error.UnknownProxySetHeaderVariable;
+        i = end - 1;
+    }
+}
+
 pub const LocationBlock = struct {
     match_type: MatchType,
     pattern: []const u8,
@@ -138,12 +238,17 @@ pub const LocationBlock = struct {
     proxy_streaming_policy: ProxyStreamingPolicy = .inherit,
     early_data: EarlyDataPolicy = .off,
     proxy_early_data: ProxyEarlyDataPolicy = .off,
+    /// `proxy_set_header` rules for this location, already resolved against
+    /// the enclosing `server` block's rules (#809).
+    proxy_set_headers: []ProxySetHeader = &.{},
 
     pub fn deinit(self: *LocationBlock, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);
         self.action.deinit(allocator);
         for (self.error_pages) |*rule| rule.deinit(allocator);
         if (self.error_pages.len > 0) allocator.free(self.error_pages);
+        for (self.proxy_set_headers) |*rule| rule.deinit(allocator);
+        if (self.proxy_set_headers.len > 0) allocator.free(self.proxy_set_headers);
         self.* = undefined;
     }
 };
@@ -409,4 +514,33 @@ fn fuzzMatchLocation(_: void, smith: *std.testing.Smith) !void {
         .rangeAtMost(u8, 0x00, 0x1f, 1), // control characters
     });
     _ = matchLocation(std.testing.allocator, buf[0..len], &fuzz_router_blocks);
+}
+
+test "proxy_set_header validation accepts supported names, values and variables (#809)" {
+    try validateProxySetHeader("Host", "auth.baresystems.com");
+    try validateProxySetHeader("X-Forwarded-For", "");
+    try validateProxySetHeader("X-Forwarded-For", "$remote_addr");
+    try validateProxySetHeader("X-Origin", "$scheme://$host:443\tok");
+    try validateProxySetHeader("X-Chain", "$proxy_add_x_forwarded_for");
+    // Clearing a hop-by-hop header ports from nginx as a no-op.
+    try validateProxySetHeader("Connection", "");
+    try validateProxySetHeader("Upgrade", "");
+}
+
+test "proxy_set_header validation rejects framing, CR/LF and unknown variables (#809)" {
+    try std.testing.expectError(error.ForbiddenProxySetHeader, validateProxySetHeader("Content-Length", "0"));
+    try std.testing.expectError(error.ForbiddenProxySetHeader, validateProxySetHeader("transfer-encoding", "chunked"));
+    try std.testing.expectError(error.ForbiddenProxySetHeader, validateProxySetHeader("Content-Length", ""));
+    try std.testing.expectError(error.ForbiddenProxySetHeader, validateProxySetHeader("X-Tardigrade-User-Id", "admin"));
+    try std.testing.expectError(error.ForbiddenProxySetHeader, validateProxySetHeader("Early-Data", "1"));
+    try std.testing.expectError(error.ForbiddenProxySetHeader, validateProxySetHeader("Connection", "keep-alive"));
+    try std.testing.expectError(error.ForbiddenProxySetHeader, validateProxySetHeader("Upgrade", "websocket"));
+    try std.testing.expectError(error.InvalidProxySetHeaderValue, validateProxySetHeader("X-A", "a\r\nX-Injected: 1"));
+    try std.testing.expectError(error.InvalidProxySetHeaderValue, validateProxySetHeader("X-A", "a\nb"));
+    try std.testing.expectError(error.InvalidProxySetHeaderValue, validateProxySetHeader("X-A", "a\x00b"));
+    try std.testing.expectError(error.InvalidProxySetHeaderName, validateProxySetHeader("X A", "b"));
+    try std.testing.expectError(error.InvalidProxySetHeaderName, validateProxySetHeader("X:A", "b"));
+    try std.testing.expectError(error.InvalidProxySetHeaderName, validateProxySetHeader("", "b"));
+    try std.testing.expectError(error.UnknownProxySetHeaderVariable, validateProxySetHeader("X-A", "$hots"));
+    try std.testing.expectError(error.UnknownProxySetHeaderVariable, validateProxySetHeader("X-A", "cost $"));
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("zig_compat");
+const location_router = @import("location_router.zig");
 
 pub const Overrides = struct {
     map: std.StringHashMap([]const u8),
@@ -58,6 +59,20 @@ const BlockContext = union(enum) {
 const server_block_record_sep = "\x1e";
 const server_block_field_sep = "\x1f";
 
+/// One parsed `proxy_set_header NAME VALUE;` (#809), owned by its builder.
+const ProxySetHeaderBuilder = struct {
+    name: []u8,
+    value: []u8,
+};
+
+fn deinitProxySetHeaders(allocator: std.mem.Allocator, list: *std.ArrayList(ProxySetHeaderBuilder)) void {
+    for (list.items) |rule| {
+        allocator.free(rule.name);
+        allocator.free(rule.value);
+    }
+    list.deinit(allocator);
+}
+
 const LocationBlockBuilder = struct {
     const ErrorPageBuilder = struct {
         status_codes_csv: []u8,
@@ -84,6 +99,7 @@ const LocationBlockBuilder = struct {
     early_data: ?[]u8 = null,
     proxy_early_data: ?[]u8 = null,
     error_pages: std.ArrayList(ErrorPageBuilder) = .empty,
+    proxy_set_headers: std.ArrayList(ProxySetHeaderBuilder) = .empty,
 
     fn actionKind(self: *const LocationBlockBuilder) ?[]const u8 {
         if (self.proxy_pass != null) return "proxy_pass";
@@ -119,8 +135,16 @@ const LocationBlockBuilder = struct {
             allocator.free(entry.target);
         }
         self.error_pages.deinit(allocator);
+        deinitProxySetHeaders(allocator, &self.proxy_set_headers);
         self.* = undefined;
     }
+};
+
+const ServerLocationEntry = struct {
+    entry: []u8,
+    /// A `proxy_pass` location with no `proxy_set_header` of its own takes the
+    /// server block's rules; one with any rule replaces them (nginx's rule).
+    inherits_proxy_set_headers: bool,
 };
 
 const ServerBlockBuilder = struct {
@@ -132,7 +156,8 @@ const ServerBlockBuilder = struct {
     upstream_base_url: ?[]u8 = null,
     proxy_pass_chat: ?[]u8 = null,
     proxy_pass_commands_prefix: ?[]u8 = null,
-    location_entries: std.ArrayList([]u8) = .empty,
+    location_entries: std.ArrayList(ServerLocationEntry) = .empty,
+    proxy_set_headers: std.ArrayList(ProxySetHeaderBuilder) = .empty,
 
     fn deinit(self: *ServerBlockBuilder, allocator: std.mem.Allocator) void {
         if (self.server_names) |value| allocator.free(value);
@@ -143,8 +168,9 @@ const ServerBlockBuilder = struct {
         if (self.upstream_base_url) |value| allocator.free(value);
         if (self.proxy_pass_chat) |value| allocator.free(value);
         if (self.proxy_pass_commands_prefix) |value| allocator.free(value);
-        for (self.location_entries.items) |entry| allocator.free(entry);
+        for (self.location_entries.items) |location| allocator.free(location.entry);
         self.location_entries.deinit(allocator);
+        deinitProxySetHeaders(allocator, &self.proxy_set_headers);
         self.* = undefined;
     }
 };
@@ -204,7 +230,10 @@ fn parseFile(
                             .server => |*server_builder| {
                                 const entry = try buildLocationBlockEntry(allocator, &owned_builder);
                                 errdefer allocator.free(entry);
-                                try server_builder.location_entries.append(allocator, entry);
+                                try server_builder.location_entries.append(allocator, .{
+                                    .entry = entry,
+                                    .inherits_proxy_set_headers = owned_builder.proxy_pass != null and owned_builder.proxy_set_headers.items.len == 0,
+                                });
                             },
                             else => try flushLocationBlock(allocator, overrides, &owned_builder),
                         }
@@ -286,6 +315,11 @@ fn parseStatement(
         }
         try vars.put(key, val);
         return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_set_header")) {
+        logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_set_header is only supported inside server and location blocks", .{ file_path, line_no });
+        return error.InvalidConfigSyntax;
     }
 
     const value_raw = std.mem.trim(u8, it.rest(), " \t");
@@ -565,6 +599,10 @@ fn parseServerStatement(
         std.log.err("config syntax error at {s}:{d}: directive '{s}' missing value", .{ file_path, line_no, directive });
         return error.InvalidConfigSyntax;
     }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_set_header")) {
+        try parseProxySetHeader(allocator, file_path, line_no, value_raw, vars, &builder.proxy_set_headers);
+        return;
+    }
     const value_interp = try interpolate(allocator, std.mem.trim(u8, value_raw, " \t\"'"), vars);
     defer allocator.free(value_interp);
 
@@ -683,6 +721,10 @@ fn parseLocationStatement(
     if (value_raw.len == 0) {
         std.log.err("config syntax error at {s}:{d}: directive '{s}' missing value", .{ file_path, line_no, directive });
         return error.InvalidConfigSyntax;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_set_header")) {
+        try parseProxySetHeader(allocator, file_path, line_no, value_raw, vars, &builder.proxy_set_headers);
+        return;
     }
     const trimmed_value = std.mem.trim(u8, value_raw, " \t\"'");
     const value_interp = try interpolate(allocator, trimmed_value, vars);
@@ -938,13 +980,95 @@ fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlock
             entry = with_proxy_early_data;
         }
     }
+    if (builder.proxy_set_headers.items.len > 0) {
+        if (builder.proxy_pass == null) {
+            logConfigSyntaxDiagnostic("config syntax error: location '{s}' uses proxy_set_header without proxy_pass", .{builder.pattern});
+            allocator.free(entry);
+            return error.InvalidConfigSyntax;
+        }
+        const with_set_headers = try appendProxySetHeaderOptions(allocator, entry, builder.proxy_set_headers.items);
+        allocator.free(entry);
+        entry = with_set_headers;
+    }
     return entry;
+}
+
+/// Encode `proxy_set_header` rules as `|set_header:<hex name>:<hex value>`
+/// location-entry options. Hex keeps arbitrary header values (which may carry
+/// the `|`/`;` entry separators) out of the entry grammar.
+fn appendProxySetHeaderOptions(allocator: std.mem.Allocator, entry: []const u8, rules: []const ProxySetHeaderBuilder) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, entry);
+    for (rules) |rule| {
+        try out.appendSlice(allocator, "|set_header:");
+        try appendHexLower(allocator, &out, rule.name);
+        try out.append(allocator, ':');
+        try appendHexLower(allocator, &out, rule.value);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendHexLower(allocator: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8) !void {
+    const digits = "0123456789abcdef";
+    for (bytes) |b| {
+        try out.append(allocator, digits[b >> 4]);
+        try out.append(allocator, digits[b & 0x0f]);
+    }
+}
+
+/// Parse the arguments of `proxy_set_header NAME VALUE;` (#809). The value may
+/// be quoted, and `""` clears the header. `${VAR}` config interpolation runs as
+/// for other directives; `$name` request variables are kept for runtime
+/// expansion and checked against the supported set here, so `tardi check`
+/// reports a typo instead of the proxy forwarding a literal `$hots`.
+fn parseProxySetHeader(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    line_no: usize,
+    args_raw: []const u8,
+    vars: *std.StringHashMap([]const u8),
+    rules: *std.ArrayList(ProxySetHeaderBuilder),
+) !void {
+    const args = std.mem.trim(u8, args_raw, " \t");
+    const name_end = std.mem.findAny(u8, args, " \t") orelse {
+        logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_set_header requires a name and a value (use \"\" to clear a header)", .{ file_path, line_no });
+        return error.InvalidConfigSyntax;
+    };
+    const name = args[0..name_end];
+    var value_raw = std.mem.trim(u8, args[name_end..], " \t");
+    if (value_raw.len >= 2 and (value_raw[0] == '"' or value_raw[0] == '\'') and value_raw[value_raw.len - 1] == value_raw[0]) {
+        value_raw = value_raw[1 .. value_raw.len - 1];
+    }
+    const value = try interpolate(allocator, value_raw, vars);
+    errdefer allocator.free(value);
+
+    location_router.validateProxySetHeader(name, value) catch |err| {
+        switch (err) {
+            error.InvalidProxySetHeaderName => logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_set_header name '{s}' is not a valid header name", .{ file_path, line_no, name }),
+            error.InvalidProxySetHeaderValue => logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_set_header {s} value contains CR, LF or another control character", .{ file_path, line_no, name }),
+            error.ForbiddenProxySetHeader => logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_set_header cannot set {s}; request framing, hop-by-hop and X-Tardigrade-* headers are managed by Tardigrade", .{ file_path, line_no, name }),
+            error.UnknownProxySetHeaderVariable => logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_set_header {s} uses an unsupported variable; supported: $host $http_host $remote_addr $scheme $proxy_add_x_forwarded_for $request_id", .{ file_path, line_no, name }),
+        }
+        return error.InvalidConfigSyntax;
+    };
+    for (rules.items) |existing| {
+        if (std.ascii.eqlIgnoreCase(existing.name, name)) {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: duplicate proxy_set_header {s} in the same block", .{ file_path, line_no, name });
+            return error.InvalidConfigSyntax;
+        }
+    }
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    try rules.append(allocator, .{ .name = owned_name, .value = value });
 }
 
 fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, builder: *LocationBlockBuilder) !void {
     const entry = buildLocationBlockEntry(allocator, builder) catch |err| switch (err) {
         error.InvalidConfigSyntax => {
-            logConfigSyntaxDiagnostic("config syntax error: location '{s}' has no action directive", .{builder.pattern});
+            if (builder.actionKind() == null) {
+                logConfigSyntaxDiagnostic("config syntax error: location '{s}' has no action directive", .{builder.pattern});
+            }
             return err;
         },
         else => return err,
@@ -967,9 +1091,15 @@ fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, build
 fn flushServerBlock(allocator: std.mem.Allocator, overrides: *Overrides, builder: *ServerBlockBuilder) !void {
     var location_blob = std.ArrayList(u8).empty;
     defer location_blob.deinit(allocator);
-    for (builder.location_entries.items, 0..) |entry, idx| {
+    for (builder.location_entries.items, 0..) |location, idx| {
         if (idx != 0) try location_blob.append(allocator, ';');
-        try location_blob.appendSlice(allocator, entry);
+        if (location.inherits_proxy_set_headers and builder.proxy_set_headers.items.len > 0) {
+            const inherited = try appendProxySetHeaderOptions(allocator, location.entry, builder.proxy_set_headers.items);
+            defer allocator.free(inherited);
+            try location_blob.appendSlice(allocator, inherited);
+        } else {
+            try location_blob.appendSlice(allocator, location.entry);
+        }
     }
     const record = try std.fmt.allocPrint(
         allocator,
@@ -1660,4 +1790,124 @@ test "server block supports nested location serialization" {
         server_block_field_sep ++ "" ++
         server_block_field_sep ++ "prefix|/|proxy_pass|http://127.0.0.1:9101";
     try std.testing.expectEqualStrings(expected, overrides.map.get("TARDIGRADE_SERVER_BLOCKS").?);
+}
+
+fn parseProxySetHeaderTestConfig(allocator: std.mem.Allocator, overrides: *Overrides, text: []const u8) !void {
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{ .sub_path = "proxy-set-header.conf", .data = text });
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "proxy-set-header.conf");
+    defer allocator.free(absolute);
+
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+    try parseFile(allocator, absolute, overrides, &vars, &visited);
+}
+
+fn expectProxySetHeaderConfigRejected(text: []const u8) !void {
+    var overrides = Overrides.init(std.testing.allocator);
+    defer overrides.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidConfigSyntax, parseProxySetHeaderTestConfig(std.testing.allocator, &overrides, text));
+}
+
+test "location proxy_set_header serializes hex-encoded rules (#809)" {
+    const allocator = std.testing.allocator;
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    try parseProxySetHeaderTestConfig(allocator, &overrides,
+        \\location /realms/ekho/ {
+        \\    proxy_set_header Host auth.baresystems.com;
+        \\    proxy_pass http://keycloak:8080/realms/ekho/;
+        \\    proxy_set_header X-Forwarded-For "";
+        \\    proxy_set_header X-Origin "$scheme://$host|a;b";
+        \\}
+    );
+    // Host=auth.baresystems.com, X-Forwarded-For="", X-Origin="$scheme://$host|a;b"
+    try std.testing.expectEqualStrings(
+        "prefix|/realms/ekho/|proxy_pass|http://keycloak:8080/realms/ekho/" ++
+            "|set_header:486f7374:617574682e6261726573797374656d732e636f6d" ++
+            "|set_header:582d466f727761726465642d466f72:" ++
+            "|set_header:582d4f726967696e:24736368656d653a2f2f24686f73747c613b62",
+        overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
+    );
+}
+
+test "server proxy_set_header is inherited only by proxy locations without their own rules (#809)" {
+    const allocator = std.testing.allocator;
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    try parseProxySetHeaderTestConfig(allocator, &overrides,
+        \\server {
+        \\    server_name auth.example.test;
+        \\    location /inherit/ {
+        \\        proxy_pass http://127.0.0.1:9101;
+        \\    }
+        \\    location /own/ {
+        \\        proxy_pass http://127.0.0.1:9102;
+        \\        proxy_set_header X-B b;
+        \\    }
+        \\    location /static/ {
+        \\        root /srv;
+        \\    }
+        \\    proxy_set_header X-A a;
+        \\}
+    );
+    const record = overrides.map.get("TARDIGRADE_SERVER_BLOCKS").?;
+    const blob = record[std.mem.findScalarLast(u8, record, server_block_field_sep[0]).? + 1 ..];
+    try std.testing.expectEqualStrings(
+        // X-A=a is declared after the locations but still inherited.
+        "prefix|/inherit/|proxy_pass|http://127.0.0.1:9101|set_header:582d41:61;" ++
+            // A location with its own rule replaces, not merges with, the server rules.
+            "prefix|/own/|proxy_pass|http://127.0.0.1:9102|set_header:582d42:62;" ++
+            "prefix|/static/|static_root|/srv|off|off|index.html|",
+        blob,
+    );
+}
+
+test "proxy_set_header rejects framing headers, CR/LF, unknown variables and misplacement (#809)" {
+    try expectProxySetHeaderConfigRejected(
+        \\location / {
+        \\    proxy_pass http://127.0.0.1:9101;
+        \\    proxy_set_header Content-Length 0;
+        \\}
+    );
+    try expectProxySetHeaderConfigRejected(
+        \\location / {
+        \\    proxy_pass http://127.0.0.1:9101;
+        \\    proxy_set_header Transfer-Encoding chunked;
+        \\}
+    );
+    try expectProxySetHeaderConfigRejected("location / {\n    proxy_pass http://127.0.0.1:9101;\n    proxy_set_header X-A \"a\rX-Injected: 1\";\n}\n");
+    try expectProxySetHeaderConfigRejected(
+        \\location / {
+        \\    proxy_pass http://127.0.0.1:9101;
+        \\    proxy_set_header X-A $hots;
+        \\}
+    );
+    try expectProxySetHeaderConfigRejected(
+        \\location / {
+        \\    proxy_pass http://127.0.0.1:9101;
+        \\    proxy_set_header X-A;
+        \\}
+    );
+    try expectProxySetHeaderConfigRejected(
+        \\location / {
+        \\    proxy_pass http://127.0.0.1:9101;
+        \\    proxy_set_header X-A a;
+        \\    proxy_set_header x-a b;
+        \\}
+    );
+    try expectProxySetHeaderConfigRejected(
+        \\location / {
+        \\    root /srv;
+        \\    proxy_set_header X-A a;
+        \\}
+    );
+    try expectProxySetHeaderConfigRejected("proxy_set_header X-A a;\n");
 }

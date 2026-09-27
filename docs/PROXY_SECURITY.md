@@ -329,6 +329,18 @@ derived from the actual connection:
 | `X-Forwarded-Proto` | `https` or `http` based on TLS state |
 | `X-Forwarded-Host` | The inbound `Host` header value |
 
+Other forwarded-origin headers, such as `X-Forwarded-Port` and `Forwarded`,
+are not stripped by default. Pin or clear them per location with
+`proxy_set_header` (#809), which also overrides the values in the table above:
+
+```nginx
+proxy_set_header X-Forwarded-Proto https;
+proxy_set_header X-Forwarded-Port 443;
+proxy_set_header X-Forwarded-For $remote_addr;
+```
+
+See [CONFIGURATION.md](CONFIGURATION.md#upstream-request-headers-proxy_set_header).
+
 ### Trusted upstream identity
 
 When `trust_require_upstream_identity: true` is set in the config, Tardigrade

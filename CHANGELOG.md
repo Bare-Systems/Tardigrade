@@ -37,6 +37,23 @@ All notable user-facing changes to Tardigrade are documented here.
   `tardigrade_forward_auth_total{protocol,outcome}`. See
   [examples/forward-auth](examples/forward-auth/README.md).
 
+### Security
+
+- **A location `rewrite` can no longer reach a protected resource around its
+  gates.** On HTTP/1.1 a rewritten request was served from the server `root`
+  without matching locations again, so `location = /go { rewrite ^
+  /admin/secret.txt last; }` returned a file under a protected `/admin/`
+  location with no `auth required` or `forward_auth` check. HTTP/1.1 now
+  re-matches the rewritten target, as HTTP/3 already did. On both protocols
+  every location in a rewrite chain enforces its own `auth`, `forward_auth`
+  and path policy against the rewritten target, and `forward_auth` sees the
+  rewritten URI. HTTP/3 keeps auth-asserted request headers across a
+  rewrite instead of reverting to the client's. A rewrite back into the same
+  location is served from the server `root` as before; a chain longer than
+  4 locations fails with 508 instead of falling back to the static root. A
+  `?query` in a location rewrite's replacement now replaces the request query
+  on both protocols (HTTP/3 previously dropped it).
+
 ## [0.8.0] - 2026-09-28
 
 ### Added

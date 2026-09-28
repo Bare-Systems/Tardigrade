@@ -102,6 +102,10 @@ an access decision cacheable.
 
 ## Notes
 
+- A `rewrite` that leads into a protected location is authorized against the
+  rewritten target before anything is served, and asserted headers from an
+  earlier hop stay in place; a rewrite never reaches protected content
+  around `forward_auth`.
 - Only the protected location strips client copies of
   `forward_auth_upstream_headers`. If other, unprotected locations reach the
   same upstream, make sure it does not trust those headers from them.

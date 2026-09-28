@@ -13794,6 +13794,57 @@ test "forward_auth verifies the client's bearer token and asserts a different on
     try std.testing.expect(std.mem.find(u8, upstream.capture.headers_raw, "client-inbound") == null);
 }
 
+test "forward_auth cannot be bypassed by rewriting into a protected location" {
+    const allocator = std.testing.allocator;
+
+    var auth = try UpstreamServer.start(allocator, &.{.{ .status_code = 403, .body = "denied" }});
+    defer auth.stop();
+    try auth.run();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).makePath("admin");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "admin/secret.txt", .data = "top-secret-file" });
+    const site_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(site_root);
+
+    // The protected file is also reachable from the server-level root, so a
+    // rewrite that skipped the /admin/ location's gate would serve it.
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\root {s};
+        \\
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /go {{
+        \\    rewrite ^ /admin/secret.txt last;
+        \\}}
+        \\
+        \\location /admin/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    root {s};
+        \\}}
+    , .{ site_root, test_host, auth.port(), site_root });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+    try auth.resetCapture();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/go", .body = null, .headers = &.{} });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 403), response.status_code);
+    try std.testing.expect(std.mem.find(u8, response.body, "top-secret-file") == null);
+    try std.testing.expectEqual(@as(u32, 1), auth.requestCount());
+    try std.testing.expectEqualStrings("/admin/secret.txt", auth.capturedHeader("X-Forwarded-Uri").?);
+}
+
 test "forward_auth fails closed when the auth service is unreachable or slow" {
     const allocator = std.testing.allocator;
 

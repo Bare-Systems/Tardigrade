@@ -192,7 +192,7 @@ return, rewrite, or static.
 | `autoindex` | bool | `off` | `on`, `off`, `true`, `false`. | `autoindex off;` |
 | `try_files` | string/list | `""` | Location-level candidate list. | `try_files $uri /index.html;` |
 | `return` | status/body | n/a | Status u16 and optional response body. | `return 200 ok;` |
-| `rewrite` | pattern/replacement/flag | n/a | Default flag is `last`; accepted flags are `last`, `break`, `redirect`, `permanent`. | `rewrite ^/old/(.*)$ /new/$1 last;` |
+| `rewrite` | pattern/replacement/flag | n/a | Default flag is `last`; accepted flags are `last`, `break`, `redirect`, `permanent`. The rewritten target is matched against the locations again (HTTP/1.1 and HTTP/3), and that location's `auth`, `forward_auth` and path policy are enforced before it runs. A rewrite back into the same location is served from the server `root`. A `?query` in the replacement replaces the request's query. More than 4 locations in one rewrite chain fails with 508. | `rewrite ^/old/(.*)$ /new/$1 last;` |
 | `error_page` | statuses/target | `[]` | Status codes followed by path or HTTP(S) URL target. | `error_page 502 503 /50x.html;` |
 | `auth` | enum | `off` | `off`, `required`. | `auth required;` |
 | `proxy_streaming` / `proxy_streaming_mode` | enum | `inherit` | `inherit`, `off`/`buffered`, `response`/`responses`, `full`/`request_response`/`request-response`. | `proxy_streaming response;` |

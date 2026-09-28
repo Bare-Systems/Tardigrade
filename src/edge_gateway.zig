@@ -7691,6 +7691,80 @@ test "H1 forward_auth grant survives a rewrite into the static fallback" {
     try std.testing.expectEqual(@as(usize, 0), http.security_headers.requestScopedHeaders().len);
 }
 
+test "H1 rewrite into a protected location is authorized, never served from the static root" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).makePath("admin");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "admin/secret.txt", .data = "top-secret" });
+    const doc_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(doc_root);
+
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{ .match_type = .exact, .pattern = "/go", .priority = 0, .action = .{ .rewrite = .{ .replacement = "/admin/secret.txt?dl=1", .flag = .last } } },
+        .{
+            .match_type = .prefix,
+            .pattern = "/admin/",
+            .priority = 1,
+            .action = .{ .static_root = .{ .root = doc_root, .alias = false, .autoindex = false, .index = "", .try_files = "" } },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+        },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.doc_root = doc_root;
+    cfg.try_files = "";
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /go HTTP/1.1\r\nHost: example.test\r\n\r\n", &conn, &effects, &state);
+
+    try std.testing.expectEqual(@as(u16, 403), outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, conn.out.written(), "top-secret") == null);
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+    try std.testing.expect(auth_server.requestContains(0, "X-Forwarded-Uri: /admin/secret.txt?dl=1"));
+}
+
+test "H1 path policy and the rewrite budget apply to rewritten targets" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{ .match_type = .exact, .pattern = "/public", .priority = 0, .action = .{ .rewrite = .{ .replacement = "/admin/panel", .flag = .last } } },
+        .{ .match_type = .prefix, .pattern = "/admin/", .priority = 1, .action = .{ .return_response = .{ .status = 200, .body = "admin-panel" } } },
+        .{ .match_type = .exact, .pattern = "/a", .priority = 2, .action = .{ .rewrite = .{ .replacement = "/b", .flag = .last } } },
+        .{ .match_type = .exact, .pattern = "/b", .priority = 3, .action = .{ .rewrite = .{ .replacement = "/c", .flag = .last } } },
+        .{ .match_type = .exact, .pattern = "/c", .priority = 4, .action = .{ .rewrite = .{ .replacement = "/d", .flag = .last } } },
+        .{ .match_type = .exact, .pattern = "/d", .priority = 5, .action = .{ .rewrite = .{ .replacement = "/e", .flag = .last } } },
+        .{ .match_type = .exact, .pattern = "/e", .priority = 6, .action = .{ .return_response = .{ .status = 200, .body = "too-deep" } } },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.policy_rules_raw = "GET|^/admin/|admin|false||";
+
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var policy_conn = H2DispatchTestConn.init(allocator);
+    defer policy_conn.deinit();
+    const policy_outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /public HTTP/1.1\r\nHost: example.test\r\n\r\n", &policy_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 403), policy_outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, policy_conn.out.written(), "admin-panel") == null);
+
+    var loop_conn = H2DispatchTestConn.init(allocator);
+    defer loop_conn.deinit();
+    const loop_outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /a HTTP/1.1\r\nHost: example.test\r\n\r\n", &loop_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 508), loop_outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, loop_conn.out.written(), "too-deep") == null);
+}
+
 test "H1 forward_auth HEAD denial sends the challenge head without a body" {
     const allocator = std.testing.allocator;
     var auth_server = try gfa.TestAuthServer.start(allocator, &.{

@@ -105,6 +105,49 @@ pub const Decision = struct {
     }
 };
 
+/// Most location hops one request may take through rewrites before routing
+/// fails closed with 508. Shared by the H1 and H3 route loops.
+pub const MAX_ROUTE_HOPS: usize = 4;
+
+/// Allow decisions granted while routing one request across rewrite hops.
+/// `client_headers` is the concatenation of every grant's client headers, in
+/// grant order, and borrows from the decisions it holds. Any denial on any hop
+/// must `clear()` it so no grant decorates a refusal.
+pub const Grants = struct {
+    decisions: [MAX_ROUTE_HOPS]Decision = undefined,
+    len: usize = 0,
+    client_headers: std.ArrayList(Header) = .empty,
+
+    pub fn add(self: *Grants, allocator: std.mem.Allocator, decision: Decision) !void {
+        var owned = decision;
+        if (self.len == self.decisions.len) {
+            owned.deinit();
+            return;
+        }
+        errdefer owned.deinit();
+        try self.client_headers.appendSlice(allocator, owned.client_headers);
+        self.decisions[self.len] = owned;
+        self.len += 1;
+    }
+
+    pub fn clear(self: *Grants) void {
+        self.client_headers.clearRetainingCapacity();
+        for (self.decisions[0..self.len]) |*decision| decision.deinit();
+        self.len = 0;
+    }
+
+    pub fn deinit(self: *Grants, allocator: std.mem.Allocator) void {
+        self.clear();
+        self.client_headers.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Add every granted client header to a response.
+    pub fn apply(self: *const Grants, response: *http.Response) !void {
+        for (self.client_headers.items) |header| try response.headers.append(header.name, header.value);
+    }
+};
+
 /// Ask the auth service about `input`. Never returns a transport error:
 /// every failure becomes a fail-closed `Decision`. Only allocation failure
 /// propagates.

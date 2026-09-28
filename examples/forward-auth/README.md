@@ -33,21 +33,27 @@ kill %1; curl -i http://localhost:8080/admin/                          # → 503
 
 1. Rate limiting, access control and `auth required` run first.
 2. Tardigrade sends a bounded HTTP/1.1 subrequest to the `forward_auth` URL:
-   `GET` with no body by default (`POST` with the body only when
-   `forward_auth_body` allows it).
+   a bodyless `GET` by default, or a `POST` carrying the body (possibly empty)
+   whenever `forward_auth_body` is set.
 3. **2xx** allows the request. Headers listed in
    `forward_auth_upstream_headers` are copied onto the upstream request after
-   every client-supplied copy of those names is removed.
+   every client-supplied copy of those names is removed. Headers listed in
+   `forward_auth_client_headers` (for example a refreshed `Set-Cookie`) are
+   added to the response the client receives, whether it is proxied,
+   streamed, static or local.
 4. **3xx / 4xx** denies it. The auth service's status, body, `Content-Type`,
    `Location` (3xx), `WWW-Authenticate` (401) and any
-   `forward_auth_client_headers` are returned to the client with
-   `Cache-Control: no-store`.
+   `forward_auth_client_headers` are returned to the client.
 5. **Anything else** — connect failure, timeout, 1xx/5xx, malformed or
    oversized (>64 KiB) response — fails closed with
    `forward_auth_failure_status` (default 503) and a JSON error
    (`auth_unavailable` or `auth_timeout`).
 
+Every denial and failure carries `Cache-Control: no-store`. A `HEAD` request
+gets the same status and headers, including `Content-Length`, without a body.
 Denied requests never reach the upstream, a mirror target, or a retry.
+Auth-response headers the auth service nominates as hop-by-hop through
+`Connection` are never copied, even when allowlisted.
 
 ## What the auth service receives
 
@@ -65,7 +71,10 @@ proxied request. Tardigrade then sets:
 | `X-Request-ID`, `X-Correlation-ID` | Tardigrade request ID. |
 | `traceparent` (+ `tracestate`) | Child span of a valid inbound trace, or a new trace. |
 
-Client-supplied copies of these headers are never passed through.
+Client headers in the `X-Forwarded-*` and `X-Original-*` namespaces (for
+example `X-Forwarded-User` or `X-Original-URL`), `Forwarded`, and the
+location's `forward_auth_upstream_headers` names are never passed through, so
+a client cannot hand the auth service a forged proxy assertion.
 
 ## Key directives
 
@@ -73,8 +82,8 @@ Client-supplied copies of these headers are never passed through.
 |-----------|---------|---------|
 | `forward_auth <url>;` | — | Absolute `http://` or `https://` auth endpoint. HTTPS always verifies the certificate against the URL host. |
 | `forward_auth_upstream_headers <name>...;` | none | Auth-response headers copied to the upstream on success. |
-| `forward_auth_client_headers <name>...;` | none | Extra auth-response headers relayed to the client on denial. |
-| `forward_auth_body <bytes>\|off;` | `off` | Forward request bodies up to this size; larger bodies get 413. |
+| `forward_auth_client_headers <name>...;` | none | Auth-response headers added to the client response, on allow and on denial. |
+| `forward_auth_body <bytes>\|off;` | `off` | Send the request as a `POST` with bodies up to this size; larger bodies get 413. |
 | `forward_auth_timeout_ms <ms>;` | upstream timeouts, else 5000 | Connect and response deadline for the subrequest. |
 | `forward_auth_failure_status <status>;` | `503` | One of 401, 403, 500, 502, 503, 504. |
 
@@ -87,7 +96,12 @@ context, or `X-Tardigrade-*`; those are owned by Tardigrade.
 - Only the protected location strips client copies of
   `forward_auth_upstream_headers`. If other, unprotected locations reach the
   same upstream, make sure it does not trust those headers from them.
-- Protected locations reject 0-RTT early data (425), because the auth
-  subrequest is itself a side effect.
+- Protected locations reject replay-exposed 0-RTT early data with 425 on
+  HTTP/1.1, HTTP/2 and HTTP/3, because the auth subrequest is itself a side
+  effect. On HTTP/2 this holds even after the handshake completes.
+- Server-sent events proxied with `proxy_streaming response` are gated like
+  any other response, and allowed streams carry `forward_auth_client_headers`
+  on their streamed head. Tardigrade does not relay WebSocket upgrades, so
+  there is no WebSocket path to protect.
 - Outcomes are exported as
   `tardigrade_forward_auth_total{protocol,outcome}` on the metrics endpoint.

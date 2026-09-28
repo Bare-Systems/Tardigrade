@@ -553,6 +553,9 @@ pub fn writeSecurityHeadersFiltered(
         try writer.print("Cross-Origin-Opener-Policy: {s}\r\n", .{sec.cross_origin_opener_policy});
     if (sec.cross_origin_resource_policy.len > 0 and !has(upstream_headers, "Cross-Origin-Resource-Policy"))
         try writer.print("Cross-Origin-Resource-Policy: {s}\r\n", .{sec.cross_origin_resource_policy});
+    for (http.security_headers.requestScopedHeaders()) |scoped| {
+        try writer.print("{s}: {s}\r\n", .{ scoped.name, scoped.value });
+    }
 }
 
 pub fn writeChunk(writer: anytype, bytes: []const u8) !void {

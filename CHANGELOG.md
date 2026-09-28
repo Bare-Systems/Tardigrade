@@ -12,17 +12,24 @@ All notable user-facing changes to Tardigrade are documented here.
   `forward_auth` fill. Tardigrade sends a bounded HTTP/1.1 subrequest carrying
   the client's end-to-end headers plus `X-Forwarded-Method/-Uri/-Host/-Proto/-For`,
   `X-Original-Method/-URI`, the request ID and a W3C `traceparent`. A 2xx
-  allows the request; a 3xx/4xx is relayed to the client with its body,
-  `Location`, `WWW-Authenticate` and any `forward_auth_client_headers`.
+  allows the request, and `forward_auth_client_headers` (for example a
+  refreshed `Set-Cookie`) are added to the response the client receives. A
+  3xx/4xx is relayed to the client with its body, `Location`,
+  `WWW-Authenticate` and the same allowlisted headers; every denial is
+  `Cache-Control: no-store`, and `HEAD` gets the head without a body.
   Timeouts, connect failures, 1xx/5xx and malformed responses fail closed with
   `forward_auth_failure_status` (default 503). `forward_auth_upstream_headers`
   copies auth-response headers (for example `X-Auth-Request-User`) to the
   upstream after removing any client-supplied copy, and cannot name
-  Tardigrade-owned forwarding, identity or trace headers. Request bodies are
-  not sent unless `forward_auth_body` sets a limit. Auth runs after rate
+  Tardigrade-owned forwarding, identity or trace headers. Auth-response
+  fields nominated by `Connection` are never copied, and client
+  `X-Forwarded-*`/`X-Original-*` headers never reach the auth service.
+  Request bodies are not sent unless `forward_auth_body` sets a limit. Auth runs after rate
   limiting and `auth required`, before mirrors, retries and the location
   action, on HTTP/1.1, HTTP/2 and HTTP/3; protected locations reject
-  replay-exposed 0-RTT. New counter:
+  replay-exposed 0-RTT, including HTTP/2 streams deferred until the handshake
+  completes. HTTP/2 now also serves `root`/`alias` locations, which previously
+  returned 404. New counter:
   `tardigrade_forward_auth_total{protocol,outcome}`. See
   [examples/forward-auth](examples/forward-auth/README.md).
 

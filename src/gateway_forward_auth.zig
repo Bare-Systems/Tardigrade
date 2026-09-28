@@ -6,6 +6,8 @@
 //! - 2xx allows the request. Headers named by `forward_auth_upstream_headers`
 //!   are copied from the auth response onto the upstream request; client
 //!   copies of those names are always removed first so they cannot be forged.
+//!   Headers named by `forward_auth_client_headers` (for example a refreshed
+//!   `Set-Cookie`) are added to the final response the client receives.
 //! - 3xx and 4xx deny it. The auth service's status, body, `Content-Type`,
 //!   `Location` (3xx), `WWW-Authenticate` (401) and any
 //!   `forward_auth_client_headers` are relayed to the client.
@@ -49,10 +51,7 @@ pub const Input = struct {
     body: ?[]const u8,
 };
 
-pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
-};
+pub const Header = http.security_headers.ScopedHeader;
 
 pub const Decision = struct {
     arena: std.heap.ArenaAllocator,
@@ -61,7 +60,8 @@ pub const Decision = struct {
     status: u16 = 200,
     /// Allowed: header values to place on the upstream request.
     upstream_headers: []const Header = &.{},
-    /// Denied: headers to relay to the client.
+    /// Headers to relay to the client: on denial, with the auth response;
+    /// on allow, added to whatever response the location action produces.
     client_headers: []const Header = &.{},
     /// Denied: the auth service's body. Failures leave it empty and callers
     /// render a JSON API error from `errorCode()`/`errorMessage()`.
@@ -137,8 +137,14 @@ pub fn authorize(
     const host = ga.unbracketUriHost(decoded_host);
     const port = uri.port orelse if (is_https) @as(u16, 443) else @as(u16, 80);
 
+    // With `forward_auth_body` configured the subrequest is always a POST,
+    // even for an empty body, so the auth service sees one route per policy.
+    const forwards_body = fa.max_body_bytes > 0;
     var headers = std.array_list.Managed(std.http.Header).init(arena);
-    try appendAuthRequestHeaders(&headers, input, send_body.len > 0);
+    try appendAuthRequestHeaders(&headers, input, forwards_body, fa.upstream_headers);
+    // The bounded transport only declares a length for a non-empty body; an
+    // empty POST must still be explicitly framed (RFC 9110 §8.6).
+    if (forwards_body and send_body.len == 0) try headers.append(.{ .name = "Content-Length", .value = "0" });
 
     const timeout_ms = effectiveTimeoutMs(cfg, fa);
     var response = gp.executeBoundedBufferedTcpHttpRequest(
@@ -147,7 +153,7 @@ pub fn authorize(
         port,
         if (is_https) ga.authSubrequestTlsOptions(cfg) else null,
         uri,
-        if (send_body.len > 0) "POST" else "GET",
+        if (forwards_body) "POST" else "GET",
         headers.items,
         send_body,
         null,
@@ -169,6 +175,7 @@ pub fn authorize(
     if (status >= 200 and status < 300) {
         decision.outcome = .allowed;
         decision.upstream_headers = try collectHeaders(arena, &response, fa.upstream_headers, &.{});
+        decision.client_headers = try collectHeaders(arena, &response, fa.client_headers, &.{});
         return decision;
     }
     if (status >= 300 and status < 500) {
@@ -230,10 +237,17 @@ fn classifyTransportError(err: anyerror) Outcome {
 /// `Authorization`, `Cookie` and `Accept` reach it), and Tardigrade then
 /// asserts the original request's metadata in both the Traefik/Caddy
 /// (`X-Forwarded-*`) and NGINX (`X-Original-*`) conventions.
+///
+/// Every client header in the `x-forwarded-*` and `x-original-*` namespaces is
+/// dropped, not just the names Tardigrade sets: auth services commonly trust
+/// proxy-style assertions such as `X-Forwarded-User` or `X-Original-URL`. The
+/// location's `identity_names` (its `forward_auth_upstream_headers`) are
+/// dropped too, since they name exactly what the auth service asserts.
 fn appendAuthRequestHeaders(
     headers: *std.array_list.Managed(std.http.Header),
     input: Input,
     has_body: bool,
+    identity_names: []const []const u8,
 ) !void {
     const arena = headers.allocator;
     const request_headers = input.headers.iterator();
@@ -242,6 +256,7 @@ fn appendAuthRequestHeaders(
         if (gph.shouldSkipUpstreamRequestHeader(header.name, null)) continue;
         if (gph.anyConnectionHeaderReferencesHeader(request_headers, header.name)) continue;
         if (isAssertedAuthRequestHeader(header.name)) continue;
+        if (nameListed(header.name, identity_names)) continue;
         if (!has_body and isBodyHeader(header.name)) continue;
         try headers.append(.{ .name = header.name, .value = header.value });
     }
@@ -278,10 +293,9 @@ fn appendAuthRequestHeaders(
 }
 
 fn isAssertedAuthRequestHeader(name: []const u8) bool {
-    const asserted = [_][]const u8{
-        "forwarded",      "x-forwarded-method", "x-forwarded-uri", "x-original-method",
-        "x-original-uri", "traceparent",        "tracestate",      "expect",
-    };
+    if (std.ascii.startsWithIgnoreCase(name, "x-forwarded-") or
+        std.ascii.startsWithIgnoreCase(name, "x-original-")) return true;
+    const asserted = [_][]const u8{ "forwarded", "x-real-ip", "traceparent", "tracestate", "expect" };
     for (asserted) |candidate| {
         if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
     }
@@ -294,7 +308,9 @@ fn isBodyHeader(name: []const u8) bool {
 }
 
 /// Copy every occurrence of each allowlisted header from the auth response.
-/// Values that are not valid field values are dropped rather than relayed.
+/// Hop-by-hop fields, including any the auth response nominates through
+/// `Connection`, are never copied, and invalid values are dropped. The
+/// bounded transport already filters both; this keeps the guarantee local.
 fn collectHeaders(
     arena: std.mem.Allocator,
     response: *const gp.BufferedUpstreamResponse,
@@ -304,6 +320,8 @@ fn collectHeaders(
     var out = std.ArrayList(Header).empty;
     for (response.headers) |header| {
         if (!nameListed(header.name, configured) and !nameListed(header.name, implicit)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(header.name, null)) continue;
+        if (gph.anyConnectionHeaderReferencesHeader(response.headers, header.name)) continue;
         if (!http.headers.isValidHeaderValue(header.value)) continue;
         try out.append(arena, .{
             .name = try arena.dupe(u8, header.name),
@@ -329,20 +347,29 @@ pub fn applyUpstreamHeaders(headers: *http.Headers, fa: *const ForwardAuth, deci
     for (decision.upstream_headers) |header| try headers.append(header.name, header.value);
 }
 
-/// Render a deny or failure decision into an `http.Response`. Security and
-/// correlation headers are left to the caller, which owns those policies.
+/// Render a deny or failure decision into an `http.Response`. The body is
+/// always set so `Content-Length` describes the GET-equivalent representation;
+/// callers answering HEAD write the head only. Security and correlation
+/// headers are left to the caller, which owns those policies.
 pub fn shapeResponse(allocator: std.mem.Allocator, response: *http.Response, decision: *const Decision, correlation_id: []const u8) !void {
     _ = response.setStatus(@enumFromInt(decision.status));
     if (decision.relaysAuthResponse()) {
         if (decision.body.len > 0) _ = response.setBodyOwned(try allocator.dupe(u8, decision.body));
         if (decision.content_type) |content_type| _ = response.setContentType(content_type);
-        for (decision.client_headers) |header| try response.headers.append(header.name, header.value);
-        // Auth decisions are per-request; never let a shared cache replay one.
-        _ = response.setHeaderIfAbsent("Cache-Control", "no-store");
+        try appendClientHeaders(response, decision);
     } else {
         const payload = try gp.buildApiErrorJson(allocator, decision.errorCode(), decision.errorMessage(), correlation_id);
         _ = response.setBodyOwned(payload).setContentType("application/json");
     }
+    // Auth decisions are per-request, and a generated failure may carry a
+    // 401/403 status; never let a shared cache replay either.
+    _ = response.setHeaderIfAbsent("Cache-Control", "no-store");
+}
+
+/// Add the decision's client headers to a response, keeping every value so
+/// repeated fields such as `Set-Cookie` survive.
+pub fn appendClientHeaders(response: *http.Response, decision: *const Decision) !void {
+    for (decision.client_headers) |header| try response.headers.append(header.name, header.value);
 }
 
 // ---------------------------------------------------------------------------
@@ -587,10 +614,82 @@ test "authorize treats 5xx, malformed and slow auth responses as fail-closed fai
     try std.testing.expectEqual(@as(u16, 504), slow.status);
 }
 
+test "authorize keeps allowlisted client headers on 2xx, including repeated Set-Cookie" {
+    const allocator = std.testing.allocator;
+    var server = try TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nX-Auth-User: alice\r\nSet-Cookie: refreshed=1\r\nSet-Cookie: csrf=2\r\nX-Internal: secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer server.stop();
+    try server.run();
+    var url_buf: [64]u8 = undefined;
+    const fa = ForwardAuth{ .url = server.url(&url_buf, "/verify"), .upstream_headers = &.{"X-Auth-User"}, .client_headers = &.{"Set-Cookie"} };
+    var headers = http.Headers.init(allocator);
+    defer headers.deinit();
+    var cfg = testConfig();
+
+    var decision = try authorize(allocator, &cfg, &fa, testInput(&headers, null));
+    defer decision.deinit();
+
+    try std.testing.expect(decision.allowed());
+    try std.testing.expectEqual(@as(usize, 1), decision.upstream_headers.len);
+    try std.testing.expectEqual(@as(usize, 2), decision.client_headers.len);
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    try appendClientHeaders(&response, &decision);
+    try std.testing.expectEqual(@as(usize, 2), response.headers.countByName("set-cookie"));
+    try std.testing.expect(response.headers.get("x-internal") == null);
+}
+
+test "authorize never copies auth-response fields nominated by Connection" {
+    const allocator = std.testing.allocator;
+    var server = try TestAuthServer.start(allocator, &.{
+        // Duplicate Connection fields, mixed case: each nomination counts.
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nconnection: x-AUTH-user\r\nCONNECTION: Set-Cookie, close\r\nX-Auth-User: alice\r\nX-Auth-Email: a@example.test\r\nSet-Cookie: s=1\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 302 Found\r\nConnection: close, x-login-hint\r\nLocation: https://sso.example.test/\r\nX-Login-Hint: nominated\r\nContent-Length: 0\r\n\r\n",
+    });
+    defer server.stop();
+    try server.run();
+    var url_buf: [64]u8 = undefined;
+    const fa = ForwardAuth{
+        .url = server.url(&url_buf, "/verify"),
+        .upstream_headers = &.{ "X-Auth-User", "X-Auth-Email" },
+        .client_headers = &.{ "Set-Cookie", "X-Login-Hint" },
+    };
+    var headers = http.Headers.init(allocator);
+    defer headers.deinit();
+    var cfg = testConfig();
+
+    var allowed = try authorize(allocator, &cfg, &fa, testInput(&headers, null));
+    defer allowed.deinit();
+    try std.testing.expect(allowed.allowed());
+    try std.testing.expectEqual(@as(usize, 1), allowed.upstream_headers.len);
+    try std.testing.expect(std.ascii.eqlIgnoreCase("x-auth-email", allowed.upstream_headers[0].name));
+    try std.testing.expectEqual(@as(usize, 0), allowed.client_headers.len);
+
+    var denied = try authorize(allocator, &cfg, &fa, testInput(&headers, null));
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 302), denied.status);
+    try std.testing.expectEqual(@as(usize, 1), denied.client_headers.len);
+    try std.testing.expect(std.ascii.eqlIgnoreCase("location", denied.client_headers[0].name));
+}
+
+test "generated forward_auth failures are never cacheable" {
+    const allocator = std.testing.allocator;
+    inline for (.{ Outcome.timeout, Outcome.unavailable, Outcome.body_too_large }) |outcome| {
+        var decision = Decision{ .arena = std.heap.ArenaAllocator.init(allocator), .outcome = outcome, .status = 403 };
+        defer decision.deinit();
+        var response = http.Response.init(allocator);
+        defer response.deinit();
+        try shapeResponse(allocator, &response, &decision, "req-fail");
+        try std.testing.expectEqualStrings("no-store", response.headers.get("cache-control").?);
+        try std.testing.expectEqualStrings("application/json", response.headers.get("content-type").?);
+    }
+}
+
 test "authorize sends the body only when forward_auth_body allows it" {
     const allocator = std.testing.allocator;
     const ok = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
-    var server = try TestAuthServer.start(allocator, &.{ ok, ok });
+    var server = try TestAuthServer.start(allocator, &.{ ok, ok, ok });
     defer server.stop();
     try server.run();
     var url_buf: [64]u8 = undefined;
@@ -613,6 +712,14 @@ test "authorize sends the body only when forward_auth_body allows it" {
     try std.testing.expect(second.allowed());
     try std.testing.expect(server.requestContains(1, "POST /verify"));
     try std.testing.expect(server.requestContains(1, "{\"secret\":1}"));
+
+    // Body forwarding picks the method from policy: an empty original body is
+    // still a POST, explicitly framed as zero-length.
+    var third = try authorize(allocator, &cfg, &with_body, testInput(&headers, ""));
+    defer third.deinit();
+    try std.testing.expect(third.allowed());
+    try std.testing.expect(server.requestContains(2, "POST /verify"));
+    try std.testing.expect(server.requestContains(2, "content-length: 0"));
 }
 
 test "classifyTransportError separates timeouts from unreachable services" {
@@ -634,6 +741,11 @@ test "auth request forwards client credentials and asserts original request meta
     try request_headers.append("X-Original-URI", "/forged");
     try request_headers.append("Content-Type", "application/json");
     try request_headers.append("X-Tardigrade-User-ID", "forged");
+    try request_headers.append("X-Forwarded-User", "forged-admin");
+    try request_headers.append("X-Forwarded-Client-Cert", "forged-cert");
+    try request_headers.append("x-ORIGINAL-url", "/forged");
+    try request_headers.append("Forwarded", "for=6.6.6.6;by=forged");
+    try request_headers.append("X-Auth-Request-User", "forged-identity");
     try request_headers.append("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01");
 
     var headers = std.array_list.Managed(std.http.Header).init(arena_state.allocator());
@@ -646,7 +758,7 @@ test "auth request forwards client credentials and asserts original request meta
         .correlation_id = "req-1",
         .headers = &request_headers,
         .body = null,
-    }, false);
+    }, false, &.{"X-Auth-Request-User"});
 
     const Lookup = struct {
         fn count(items: []const std.http.Header, name: []const u8) usize {
@@ -674,6 +786,12 @@ test "auth request forwards client credentials and asserts original request meta
     try std.testing.expectEqual(@as(usize, 1), Lookup.count(headers.items, "X-Original-URI"));
     try std.testing.expectEqual(@as(usize, 0), Lookup.count(headers.items, "content-type"));
     try std.testing.expectEqual(@as(usize, 0), Lookup.count(headers.items, "x-tardigrade-user-id"));
+    try std.testing.expectEqual(@as(usize, 0), Lookup.count(headers.items, "x-forwarded-user"));
+    try std.testing.expectEqual(@as(usize, 0), Lookup.count(headers.items, "x-forwarded-client-cert"));
+    try std.testing.expectEqual(@as(usize, 0), Lookup.count(headers.items, "x-original-url"));
+    try std.testing.expectEqual(@as(usize, 0), Lookup.count(headers.items, "forwarded"));
+    try std.testing.expectEqual(@as(usize, 0), Lookup.count(headers.items, "x-auth-request-user"));
+    for (headers.items) |h| try std.testing.expect(std.mem.find(u8, h.value, "forged") == null);
     const traceparent = Lookup.value(headers.items, "traceparent").?;
     try std.testing.expect(std.mem.startsWith(u8, traceparent, "00-0af7651916cd43dd8448eb211c80319c-"));
     try std.testing.expect(!std.mem.endsWith(u8, traceparent, "-b7ad6b7169203331-01"));

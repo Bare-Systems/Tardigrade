@@ -3985,6 +3985,93 @@ test "h3interop.quic.resume" {
     try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_quic_zero_rtt_packet_total", &.{"outcome=\"accepted\""}) orelse 0);
 }
 
+test "h3interop.forward_auth.deny_then_allow" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const client_path = try requireNgtcp2Client(allocator);
+    defer allocator.free(client_path);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+
+    var auth = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 403, .body = "h3-denied", .connection_header = "close" },
+        .{ .status_code = 200, .body = "", .connection_header = "close", .headers = &.{.{ .name = "X-Auth-Request-User", .value = "h3-alice" }} },
+    });
+    defer auth.stop();
+    try auth.run();
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "h3-forward-auth-ok", .connection_header = "close" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h3-admin {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_upstream_headers X-Auth-Request-User;
+        \\    proxy_pass http://{s}:{d}/h3-admin;
+        \\}}
+    , .{ test_host, auth.port(), test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+        },
+    });
+    defer tardigrade.stop();
+
+    const sess_path = try ngtcp2SessionPath(allocator, quic_port, "forward-auth");
+    defer allocator.free(sess_path);
+    defer compat.cwd().deleteFile(sess_path) catch {};
+    const tp_path = try ngtcp2TpPath(allocator, quic_port, "forward-auth");
+    defer allocator.free(tp_path);
+    defer compat.cwd().deleteFile(tp_path) catch {};
+
+    var denied = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/h3-admin",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+        .disable_early_data = true,
+    });
+    defer denied.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(denied.outcome));
+    try assertContains(denied.stderr, "[:status: 403]");
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    var allowed = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/h3-admin",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+        .disable_early_data = true,
+    });
+    defer allowed.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(allowed.outcome));
+    try assertContains(allowed.stderr, "[:status: 200]");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+    try std.testing.expectEqualStrings("h3-alice", upstream.capturedHeader("X-Auth-Request-User").?);
+    try std.testing.expectEqual(@as(u32, 2), auth.requestCount());
+}
+
 test "h3interop.quic.early.accepted" {
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -5131,13 +5218,25 @@ test "interop.h2.forward_auth_denial_and_allow" {
 
     var auth = try UpstreamServer.start(allocator, &.{
         .{ .status_code = 403, .body = "h2-denied", .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }} },
-        .{ .status_code = 200, .body = "", .headers = &.{.{ .name = "X-Auth-Request-User", .value = "h2-alice" }} },
+        .{ .status_code = 200, .body = "", .headers = &.{
+            .{ .name = "X-Auth-Request-User", .value = "h2-alice" },
+            .{ .name = "Set-Cookie", .value = "h2-refreshed=1" },
+        } },
+        // Protected static location: deny, then allow.
+        .{ .status_code = 401, .body = "h2-static-denied" },
+        .{ .status_code = 200, .body = "" },
     });
     defer auth.stop();
     try auth.run();
     var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "h2-forward-auth-ok" }});
     defer upstream.stop();
     try upstream.run();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "report.txt", .data = "h2-static-report" });
+    const static_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(static_root);
 
     const config_text = try std.fmt.allocPrint(allocator,
         \\location = /healthz {{
@@ -5147,9 +5246,15 @@ test "interop.h2.forward_auth_denial_and_allow" {
         \\location = /h2-admin {{
         \\    forward_auth http://{s}:{d}/verify;
         \\    forward_auth_upstream_headers X-Auth-Request-User;
+        \\    forward_auth_client_headers Set-Cookie;
         \\    proxy_pass http://{s}:{d}/h2-admin;
         \\}}
-    , .{ test_host, auth.port(), test_host, upstream.port() });
+        \\
+        \\location /h2-reports/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    alias {s}/;
+        \\}}
+    , .{ test_host, auth.port(), test_host, upstream.port(), test_host, auth.port(), static_root });
     defer allocator.free(config_text);
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
@@ -5183,6 +5288,21 @@ test "interop.h2.forward_auth_denial_and_allow" {
     try assertContains(allowed_body, "h2-forward-auth-ok");
     try waitForUpstreamCount(&upstream, 1, 2_000);
     try std.testing.expectEqualStrings("h2-alice", upstream.capturedHeader("X-Auth-Request-User").?);
+
+    const static_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-reports/report.txt" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const static_denied = try pureZigH2GetBody(allocator, tardigrade.port, static_headers[0..]);
+    defer allocator.free(static_denied);
+    try assertContains(static_denied, "h2-static-denied");
+    try std.testing.expect(std.mem.find(u8, static_denied, "h2-static-report") == null);
+    const static_allowed = try pureZigH2GetBody(allocator, tardigrade.port, static_headers[0..]);
+    defer allocator.free(static_allowed);
+    try assertContains(static_allowed, "h2-static-report");
+    try std.testing.expectEqual(@as(u32, 4), auth.requestCount());
 }
 
 test "interop.h2.proxy_malformed_authority_rejected_before_upstream" {
@@ -13450,9 +13570,14 @@ test "forward_auth protects proxied and static locations over h1" {
     const allocator = std.testing.allocator;
 
     var auth = try UpstreamServer.start(allocator, &.{
-        // 1: allowed, asserting the user for the upstream.
+        // 1: allowed, asserting the user for the upstream and refreshing the
+        // client's session cookie. X-Auth-Request-Email is allowlisted but
+        // nominated hop-by-hop, so it must not be copied.
         .{ .status_code = 200, .body = "", .headers = &.{
             .{ .name = "X-Auth-Request-User", .value = "alice" },
+            .{ .name = "X-Auth-Request-Email", .value = "nominated@example.test" },
+            .{ .name = "Connection", .value = "x-AUTH-request-email" },
+            .{ .name = "Set-Cookie", .value = "refreshed=1; HttpOnly" },
             .{ .name = "X-Internal-Debug", .value = "must-not-leak" },
         } },
         // 2: redirect to the login page.
@@ -13469,6 +13594,10 @@ test "forward_auth protects proxied and static locations over h1" {
         .{ .status_code = 204, .body = "" },
         // 5: large upload allowed; the body must not have been forwarded.
         .{ .status_code = 200, .body = "" },
+        // 6: streamed-response location allowed with a cookie refresh.
+        .{ .status_code = 200, .body = "", .headers = &.{.{ .name = "Set-Cookie", .value = "streamed=1" }} },
+        // 7: HEAD challenge.
+        .{ .status_code = 401, .body = "head-challenge-body", .headers = &.{.{ .name = "WWW-Authenticate", .value = "Basic" }} },
     });
     defer auth.stop();
     try auth.run();
@@ -13490,8 +13619,15 @@ test "forward_auth protects proxied and static locations over h1" {
         \\
         \\location /admin/ {{
         \\    forward_auth http://{s}:{d}/verify;
-        \\    forward_auth_upstream_headers X-Auth-Request-User;
+        \\    forward_auth_upstream_headers X-Auth-Request-User X-Auth-Request-Email;
         \\    forward_auth_client_headers Set-Cookie;
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\
+        \\location /stream/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_client_headers Set-Cookie;
+        \\    proxy_streaming response;
         \\    proxy_pass http://{s}:{d};
         \\}}
         \\
@@ -13499,7 +13635,7 @@ test "forward_auth protects proxied and static locations over h1" {
         \\    forward_auth http://{s}:{d}/verify;
         \\    alias {s}/;
         \\}}
-    , .{ test_host, auth.port(), test_host, upstream.port(), test_host, auth.port(), static_root });
+    , .{ test_host, auth.port(), test_host, upstream.port(), test_host, auth.port(), test_host, upstream.port(), test_host, auth.port(), static_root });
     defer allocator.free(config_text);
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
@@ -13519,13 +13655,26 @@ test "forward_auth protects proxied and static locations over h1" {
         .headers = &.{
             .{ .name = "Cookie", .value = "_oauth2_proxy=session" },
             .{ .name = "X-Auth-Request-User", .value = "mallory" },
+            .{ .name = "X-Auth-Request-Email", .value = "mallory@example.test" },
+            // Proxy-style assertions an auth service might trust.
+            .{ .name = "X-Forwarded-User", .value = "forged-admin" },
+            .{ .name = "X-Forwarded-Client-Cert", .value = "forged-cert" },
+            .{ .name = "X-Original-URL", .value = "/forged" },
         },
     });
     defer allowed.deinit();
     try std.testing.expectEqual(@as(u16, 200), allowed.status_code);
     try assertContains(allowed.body, "admin-upstream-ok");
+    try std.testing.expectEqualStrings("refreshed=1; HttpOnly", allowed.header("Set-Cookie").?);
     try std.testing.expectEqualStrings("alice", upstream.capturedHeader("X-Auth-Request-User").?);
+    // Allowlisted but Connection-nominated by the auth service: never copied,
+    // and the client's forged value was stripped regardless.
+    try std.testing.expect(upstream.capturedHeader("X-Auth-Request-Email") == null);
     try std.testing.expect(upstream.capturedHeader("X-Internal-Debug") == null);
+    try std.testing.expect(auth.capturedHeader("X-Forwarded-User") == null);
+    try std.testing.expect(auth.capturedHeader("X-Forwarded-Client-Cert") == null);
+    try std.testing.expect(auth.capturedHeader("X-Original-URL") == null);
+    try std.testing.expect(auth.capturedHeader("X-Auth-Request-User") == null);
     try std.testing.expectEqualStrings("_oauth2_proxy=session", auth.capturedHeader("Cookie").?);
     try std.testing.expectEqualStrings("/admin/users?page=2", auth.capturedHeader("X-Forwarded-Uri").?);
     try std.testing.expectEqualStrings("GET", auth.capturedHeader("X-Forwarded-Method").?);
@@ -13567,13 +13716,28 @@ test "forward_auth protects proxied and static locations over h1" {
     defer allocator.free(auth_body);
     try std.testing.expectEqual(@as(usize, 0), auth_body.len);
     try std.testing.expectEqualStrings("POST", auth.capturedHeader("X-Forwarded-Method").?);
-    try std.testing.expectEqual(@as(u32, 5), auth.requestCount());
+
+    // Streamed upstream response: the auth cookie rides on the streamed head.
+    var streamed = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/stream/feed", .body = null, .headers = &.{} });
+    defer streamed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), streamed.status_code);
+    try assertContains(streamed.body, "admin-upstream-ok");
+    try std.testing.expectEqualStrings("streamed=1", streamed.header("Set-Cookie").?);
+
+    // HEAD denial: GET-equivalent head, no body bytes.
+    var head_denied = try sendRequest(allocator, tardigrade.port, .{ .method = "HEAD", .path = "/admin/", .body = null, .headers = &.{} });
+    defer head_denied.deinit();
+    try std.testing.expectEqual(@as(u16, 401), head_denied.status_code);
+    try std.testing.expectEqualStrings("19", head_denied.header("Content-Length").?);
+    try std.testing.expectEqualStrings("no-store", head_denied.header("Cache-Control").?);
+    try std.testing.expectEqual(@as(usize, 0), head_denied.body.len);
+    try std.testing.expectEqual(@as(u32, 7), auth.requestCount());
 
     var metrics = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
     defer metrics.deinit();
     try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
-    try assertContains(metrics.body, "tardigrade_forward_auth_total{protocol=\"h1\",outcome=\"allowed\"} 3");
-    try assertContains(metrics.body, "tardigrade_forward_auth_total{protocol=\"h1\",outcome=\"denied\"} 2");
+    try assertContains(metrics.body, "tardigrade_forward_auth_total{protocol=\"h1\",outcome=\"allowed\"} 4");
+    try assertContains(metrics.body, "tardigrade_forward_auth_total{protocol=\"h1\",outcome=\"denied\"} 3");
 }
 
 test "forward_auth fails closed when the auth service is unreachable or slow" {
@@ -13619,11 +13783,13 @@ test "forward_auth fails closed when the auth service is unreachable or slow" {
     defer down.deinit();
     try std.testing.expectEqual(@as(u16, 503), down.status_code);
     try assertContains(down.body, "\"code\":\"auth_unavailable\"");
+    try std.testing.expectEqualStrings("no-store", down.header("Cache-Control").?);
 
     var slow = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/slow/x", .body = null, .headers = &.{} });
     defer slow.deinit();
     try std.testing.expectEqual(@as(u16, 504), slow.status_code);
     try assertContains(slow.body, "\"code\":\"auth_timeout\"");
+    try std.testing.expectEqualStrings("no-store", slow.header("Cache-Control").?);
 
     compat.sleepNs(200 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());

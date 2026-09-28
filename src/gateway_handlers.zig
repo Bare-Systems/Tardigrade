@@ -744,9 +744,15 @@ pub fn routeRequest(
                 // leaving the caller to infer it from `status`.
                 return .{ .status = status, .mirror_allowed = false };
             }
-            if (try enforceLocationForwardAuth(allocator, writer, cfg, state, request, matched, correlation_id, keep_alive, client_ip, streaming_request_body != null)) |status| {
+            var forward_auth_allowed: ?gfa.Decision = null;
+            defer if (forward_auth_allowed) |*decision| decision.deinit();
+            if (try enforceLocationForwardAuth(allocator, writer, cfg, state, request, matched, correlation_id, keep_alive, client_ip, streaming_request_body != null, &forward_auth_allowed)) |status| {
                 return .{ .status = status, .mirror_allowed = false };
             }
+            // `forward_auth_client_headers` from an allow decision decorate
+            // whatever response the action writes on this thread.
+            if (forward_auth_allowed) |*decision| http.security_headers.setRequestScopedHeaders(decision.client_headers);
+            defer http.security_headers.clearRequestScopedHeaders();
             if (try executeLocationAction(
                 conn,
                 allocator,
@@ -831,8 +837,10 @@ fn forwardAuthRequestTarget(allocator: std.mem.Allocator, path: []const u8, quer
 }
 
 /// Run the location's `forward_auth` subrequest (#761). Returns null when the
-/// request may proceed (with any auth-provided upstream headers applied), or
-/// the status Tardigrade already wrote for a denial or fail-closed error.
+/// request may proceed: auth-provided upstream headers are applied, and the
+/// allow decision is handed to `allowed_out` (caller-owned) so its client
+/// headers can decorate the final response. Otherwise returns the status
+/// Tardigrade already wrote for a denial or fail-closed error.
 fn enforceLocationForwardAuth(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -844,6 +852,7 @@ fn enforceLocationForwardAuth(
     keep_alive: *bool,
     client_ip: []const u8,
     body_unread: bool,
+    allowed_out: *?gfa.Decision,
 ) !?u16 {
     const fa = if (matched.block.forward_auth) |*fa| fa else return null;
     const target = try forwardAuthRequestTarget(allocator, request.uri.path, request.uri.query);
@@ -858,10 +867,13 @@ fn enforceLocationForwardAuth(
         .headers = &request.headers,
         .body = request.body,
     });
-    defer decision.deinit();
+    var decision_owned = true;
+    defer if (decision_owned) decision.deinit();
     state.metricsRecordForwardAuth(.h1, decision.outcome);
     if (decision.allowed()) {
         try gfa.applyUpstreamHeaders(&request.headers, fa, &decision);
+        allowed_out.* = decision;
+        decision_owned = false;
         return null;
     }
     if (!decision.relaysAuthResponse()) {
@@ -877,7 +889,12 @@ fn enforceLocationForwardAuth(
     _ = response.setConnection(keep_alive.*);
     setRequestIdHeaders(&response, correlation_id);
     applyResponseHeaders(state, &response);
-    try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+    // HEAD gets the GET-equivalent head (Content-Length included), no body.
+    if (request.method == .HEAD) {
+        try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+    } else {
+        try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+    }
     state.metricsRecord(decision.status);
     if (!decision.relaysAuthResponse()) state.metricsRecordErrorCode(decision.errorCode());
     return decision.status;
@@ -3224,8 +3241,10 @@ fn rejectHttp3AuthRequiredLocation(
 
 /// H3 counterpart of `enforceLocationForwardAuth`. Returns true when the
 /// request may proceed; `headers_out` then holds the rewritten request headers
-/// when the location propagates auth-response headers upstream. Returns false
-/// after shaping the denial or fail-closed response.
+/// when the location propagates auth-response headers upstream, and
+/// `allowed_out` the allow decision (caller-owned) whose client headers the
+/// caller adds to the final response. Returns false after shaping the denial
+/// or fail-closed response.
 fn enforceHttp3ForwardAuth(
     allocator: std.mem.Allocator,
     request: *const http.http3_session.StreamRequest,
@@ -3235,6 +3254,7 @@ fn enforceHttp3ForwardAuth(
     location_pattern: []const u8,
     correlation_id: []const u8,
     headers_out: *?http.Headers,
+    allowed_out: *?gfa.Decision,
 ) !bool {
     var decision = try gfa.authorize(allocator, ctx.cfg, fa, .{
         .method = request.method,
@@ -3246,15 +3266,19 @@ fn enforceHttp3ForwardAuth(
         .headers = &request.headers,
         .body = request.body,
     });
-    defer decision.deinit();
+    var decision_owned = true;
+    defer if (decision_owned) decision.deinit();
     ctx.state.metricsRecordForwardAuth(.h3, decision.outcome);
     if (decision.allowed()) {
-        if (fa.upstream_headers.len == 0) return true;
-        var headers = http.Headers.init(allocator);
-        errdefer headers.deinit();
-        for (request.headers.iterator()) |header| try headers.append(header.name, header.value);
-        try gfa.applyUpstreamHeaders(&headers, fa, &decision);
-        headers_out.* = headers;
+        if (fa.upstream_headers.len > 0) {
+            var headers = http.Headers.init(allocator);
+            errdefer headers.deinit();
+            for (request.headers.iterator()) |header| try headers.append(header.name, header.value);
+            try gfa.applyUpstreamHeaders(&headers, fa, &decision);
+            headers_out.* = headers;
+        }
+        allowed_out.* = decision;
+        decision_owned = false;
         return true;
     }
     if (!decision.relaysAuthResponse()) {
@@ -3263,6 +3287,12 @@ fn enforceHttp3ForwardAuth(
     try gfa.shapeResponse(allocator, response, &decision, correlation_id);
     _ = response.setHeader(http.correlation.HEADER_NAME, correlation_id);
     finalizeHttp3Response(response);
+    // H3 has no head-only send: empty the body but keep the GET-equivalent
+    // Content-Length, as the H3 static path does.
+    if (std.mem.eql(u8, request.method, "HEAD")) {
+        const representation_len = if (response.body) |body| body.len else 0;
+        _ = response.setBodyOwned(try allocator.dupe(u8, "")).setContentLength(representation_len);
+    }
     applyResponseHeaders(ctx.state, response);
     ctx.state.metricsRecord(decision.status);
     if (!decision.relaysAuthResponse()) ctx.state.metricsRecordErrorCode(decision.errorCode());
@@ -3343,15 +3373,36 @@ fn routeHttp3Location(
     }
     var forward_auth_headers: ?http.Headers = null;
     defer if (forward_auth_headers) |*headers| headers.deinit();
+    var forward_auth_allowed: ?gfa.Decision = null;
+    defer if (forward_auth_allowed) |*allowed| allowed.deinit();
     if (matched.block.forward_auth) |*fa| {
-        if (!try enforceHttp3ForwardAuth(allocator, request, response, ctx, fa, matched.block.pattern, correlation_id, &forward_auth_headers)) {
+        if (!try enforceHttp3ForwardAuth(allocator, request, response, ctx, fa, matched.block.pattern, correlation_id, &forward_auth_headers, &forward_auth_allowed)) {
             return .handled;
         }
     }
+    const outcome = try executeHttp3LocationAction(allocator, request, response, ctx, matched, request_path, request_query, correlation_id, &early_ctx, forward_early_data, if (forward_auth_headers) |*headers| headers else null);
+    if (forward_auth_allowed) |*allowed| {
+        if (outcome == .handled) try gfa.appendClientHeaders(response, allowed);
+    }
+    return outcome;
+}
+
+fn executeHttp3LocationAction(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+    matched: http.location_router.MatchResult,
+    request_path: []const u8,
+    request_query: ?[]const u8,
+    correlation_id: []const u8,
+    early_ctx: *http.request_context.EarlyDataContext,
+    forward_early_data: bool,
+    forward_auth_headers: ?*const http.Headers,
+) !Http3LocationOutcome {
     switch (matched.block.action) {
         .proxy_pass => |target| {
-            const headers_override: ?*const http.Headers = if (forward_auth_headers) |*headers| headers else null;
-            try handleHttp3LocationProxyPass(allocator, request, response, ctx, matched, request_path, request_query, target, correlation_id, &early_ctx, forward_early_data, headers_override);
+            try handleHttp3LocationProxyPass(allocator, request, response, ctx, matched, request_path, request_query, target, correlation_id, early_ctx, forward_early_data, forward_auth_headers);
             return .handled;
         },
         .return_response => |ret| {
@@ -4329,6 +4380,85 @@ test "H3 forward_auth denial is returned before the upstream is contacted" {
     const prom = try state.metrics.toPrometheus(allocator);
     defer allocator.free(prom);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_forward_auth_total{protocol=\"h3\",outcome=\"denied\"} 1") != null);
+}
+
+fn runH3ForwardAuthRequest(
+    allocator: std.mem.Allocator,
+    blocks: []http.location_router.LocationBlock,
+    method: []const u8,
+    path: []const u8,
+    response: *http.Response,
+) !void {
+    var cfg = minimalHttp3ProxyConfig(blocks);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, method),
+        .path = try allocator.dupe(u8, path),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+    };
+    defer request.deinit();
+    try handleHttp3Request(allocator, &request, response, &dispatch_ctx);
+}
+
+test "H3 forward_auth allow adds the auth Set-Cookie to the action response" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=1\r\nSet-Cookie: csrf=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-ok" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .client_headers = &.{"Set-Cookie"} },
+    }};
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequest(allocator, blocks[0..], "GET", "/admin", &response);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("admin-ok", response.body orelse "");
+    try std.testing.expectEqual(@as(usize, 2), response.headers.countByName("set-cookie"));
+}
+
+test "H3 forward_auth HEAD denial keeps Content-Length and drops the body" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 302 Found\r\nLocation: https://sso.example.test/\r\nContent-Length: 9\r\nConnection: close\r\n\r\nredirect!",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-ok" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequest(allocator, blocks[0..], "HEAD", "/admin", &response);
+
+    try std.testing.expectEqual(@as(u16, 302), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("", response.body orelse "");
+    try std.testing.expectEqualStrings("9", response.headers.get("content-length").?);
+    try std.testing.expectEqualStrings("https://sso.example.test/", response.headers.get("location").?);
+    try std.testing.expectEqualStrings("no-store", response.headers.get("cache-control").?);
 }
 
 test "h3 proxy parked early 425 forwards second 425 without third delivery" {

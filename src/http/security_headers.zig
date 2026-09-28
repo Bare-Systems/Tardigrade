@@ -1,6 +1,32 @@
 const std = @import("std");
 const Response = @import("response.zig").Response;
 
+/// A response header scoped to the request currently being handled on this
+/// thread (#761: `forward_auth_client_headers` on an allowed request).
+pub const ScopedHeader = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// HTTP/1.1 handles one request at a time per worker thread, and every H1
+/// response head passes through `SecurityHeaders.apply` or the raw
+/// security-header writer. Scoping extra headers here lets them reach proxied
+/// (buffered and streamed), static, local and upgrade responses without
+/// threading them through each writer. Callers must pair `set` with `clear`.
+threadlocal var request_scoped_headers: []const ScopedHeader = &.{};
+
+pub fn setRequestScopedHeaders(headers: []const ScopedHeader) void {
+    request_scoped_headers = headers;
+}
+
+pub fn clearRequestScopedHeaders() void {
+    request_scoped_headers = &.{};
+}
+
+pub fn requestScopedHeaders() []const ScopedHeader {
+    return request_scoped_headers;
+}
+
 /// Standard security headers applied to all responses.
 ///
 /// - X-Frame-Options
@@ -51,6 +77,7 @@ pub const SecurityHeaders = struct {
             _ = response.setHeaderIfAbsent("Cross-Origin-Opener-Policy", self.cross_origin_opener_policy);
         if (self.cross_origin_resource_policy.len > 0)
             _ = response.setHeaderIfAbsent("Cross-Origin-Resource-Policy", self.cross_origin_resource_policy);
+        appendRequestScopedHeaders(response);
     }
 
     /// Default secure configuration.
@@ -63,7 +90,34 @@ pub const SecurityHeaders = struct {
     pub const api: SecurityHeaders = .{};
 };
 
+/// Append the request-scoped headers, skipping any exact name/value pair the
+/// response already carries so a response decorated twice stays correct.
+fn appendRequestScopedHeaders(response: *Response) void {
+    outer: for (request_scoped_headers) |scoped| {
+        for (response.headers.iterator()) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing.name, scoped.name) and std.mem.eql(u8, existing.value, scoped.value)) continue :outer;
+        }
+        response.headers.append(scoped.name, scoped.value) catch {};
+    }
+}
+
 // Tests
+
+test "apply adds request-scoped headers once, keeping repeated names" {
+    const allocator = std.testing.allocator;
+    var response = Response.init(allocator);
+    defer response.deinit();
+    const scoped = [_]ScopedHeader{
+        .{ .name = "Set-Cookie", .value = "a=1" },
+        .{ .name = "Set-Cookie", .value = "b=2" },
+    };
+    setRequestScopedHeaders(&scoped);
+    defer clearRequestScopedHeaders();
+    const sec = SecurityHeaders{};
+    sec.apply(&response);
+    sec.apply(&response);
+    try std.testing.expectEqual(@as(usize, 2), response.headers.countByName("set-cookie"));
+}
 
 test "apply sets all default security headers" {
     const allocator = std.testing.allocator;

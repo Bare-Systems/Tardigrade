@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("zig_compat");
 const Allocator = std.mem.Allocator;
 const Request = @import("request.zig").Request;
+const Headers = @import("headers.zig").Headers;
 const RequestLifecycle = @import("request_lifecycle.zig").RequestLifecycle;
 const access_control = @import("access_control.zig");
 
@@ -249,20 +250,32 @@ pub fn extractClientIp(
     trusted_proxies: anytype,
     default: []const u8,
 ) []const u8 {
+    return extractClientIpFromHeaders(&request.headers, trusted_forwarding_source, real_ip_header, trusted_proxies, default);
+}
+
+/// `extractClientIp` over a bare header list, for protocol front ends (HTTP/2,
+/// HTTP/3) whose requests are not an HTTP/1 `Request`.
+pub fn extractClientIpFromHeaders(
+    headers: *const Headers,
+    trusted_forwarding_source: bool,
+    real_ip_header: []const u8,
+    trusted_proxies: anytype,
+    default: []const u8,
+) []const u8 {
     if (!trusted_forwarding_source) return default;
 
     if (real_ip_header.len > 0) {
-        if (request.headers.get(real_ip_header)) |value| {
+        if (headers.get(real_ip_header)) |value| {
             const trimmed = std.mem.trim(u8, value, " \t");
             if (access_control.parseIp(trimmed) != null) return trimmed;
         }
     }
 
-    if (request.headers.contains("x-forwarded-for")) {
-        if (rightmostUntrustedForwardedFor(request, trusted_proxies)) |ip| return ip;
+    if (headers.contains("x-forwarded-for")) {
+        if (rightmostUntrustedForwardedFor(headers, trusted_proxies)) |ip| return ip;
     }
 
-    if (request.headers.get("x-real-ip")) |xri| {
+    if (headers.get("x-real-ip")) |xri| {
         const trimmed = std.mem.trim(u8, xri, " \t");
         if (access_control.parseIp(trimmed) != null) return trimmed;
     }
@@ -275,9 +288,9 @@ pub fn extractClientIp(
 /// unparseable member ends the walk: nothing left of it is attested by a
 /// trusted hop. If every entry reached is trusted, the leftmost of them is
 /// returned; null when the rightmost member is already unusable.
-fn rightmostUntrustedForwardedFor(request: *const Request, trusted_proxies: anytype) ?[]const u8 {
+fn rightmostUntrustedForwardedFor(headers: *const Headers, trusted_proxies: anytype) ?[]const u8 {
     var candidate: ?[]const u8 = null;
-    const all = request.headers.iterator();
+    const all = headers.iterator();
     var line_idx = all.len;
     while (line_idx > 0) {
         line_idx -= 1;

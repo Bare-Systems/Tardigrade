@@ -160,6 +160,7 @@ pub const ProxySetHeaderError = error{
     InvalidProxySetHeaderValue,
     ForbiddenProxySetHeader,
     UnknownProxySetHeaderVariable,
+    EmptyProxySetHeaderHost,
 };
 
 /// Headers that frame the request or that Tardigrade must own. They are
@@ -212,6 +213,10 @@ pub fn validateProxySetHeader(name: []const u8, value: []const u8) ProxySetHeade
     for (name) |c| if (!isHeaderTokenChar(c)) return error.InvalidProxySetHeaderName;
     if (isForbiddenProxySetHeaderName(name)) return error.ForbiddenProxySetHeader;
     if (isHopByHopProxySetHeaderName(name) and value.len > 0) return error.ForbiddenProxySetHeader;
+    // HTTP/1.1 requires Host and HTTP/2 requires :authority, so Host cannot be
+    // cleared: a template that expands empty at runtime falls back to the
+    // proxy_pass authority instead.
+    if (value.len == 0 and std.ascii.eqlIgnoreCase(name, "host")) return error.EmptyProxySetHeaderHost;
 
     // RFC 9110 field-value: no CR, LF, NUL or other controls except HTAB.
     for (value) |c| {
@@ -543,4 +548,7 @@ test "proxy_set_header validation rejects framing, CR/LF and unknown variables (
     try std.testing.expectError(error.InvalidProxySetHeaderName, validateProxySetHeader("", "b"));
     try std.testing.expectError(error.UnknownProxySetHeaderVariable, validateProxySetHeader("X-A", "$hots"));
     try std.testing.expectError(error.UnknownProxySetHeaderVariable, validateProxySetHeader("X-A", "cost $"));
+    try std.testing.expectError(error.EmptyProxySetHeaderHost, validateProxySetHeader("Host", ""));
+    try std.testing.expectError(error.EmptyProxySetHeaderHost, validateProxySetHeader("host", ""));
+    try validateProxySetHeader("Host", "$host");
 }

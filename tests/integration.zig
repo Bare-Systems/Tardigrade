@@ -16201,6 +16201,122 @@ test "interop.h2.proxy_set_header_pins_headers_for_http2_clients (#809)" {
     try expectEkhoPinnedHeaders(&upstream);
 }
 
+fn startH2ClientIpTardigrade(allocator: std.mem.Allocator, config_text: []const u8, tls_paths: anytype, trusted: []const u8) !TardigradeProcess {
+    return TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES", .value = trusted },
+            .{ .name = "TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY", .value = "true" },
+            .{ .name = "TARDIGRADE_REAL_IP_HEADER", .value = "CF-Connecting-IP" },
+        },
+    });
+}
+
+const h2_client_ip_request = [_]hpack.HeaderField{
+    .{ .name = ":method", .value = "GET" },
+    .{ .name = ":path", .value = "/client-ip" },
+    .{ .name = ":scheme", .value = "https" },
+    .{ .name = ":authority", .value = "tardigrade.test" },
+    .{ .name = "cf-connecting-ip", .value = "198.51.100.30" },
+    .{ .name = "x-forwarded-for", .value = "6.6.6.6" },
+};
+
+test "interop.h2.proxy_set_header_remote_addr_uses_trusted_client_ip (#809)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "h2-client-ip" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try proxySetHeaderConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    // The test client (127.0.0.1) is the trusted proxy tier: its
+    // CF-Connecting-IP names the client, and the spoofed XFF is ignored.
+    var tardigrade = try startH2ClientIpTardigrade(allocator, config_text, &tls_paths, "127.0.0.0/8");
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const body = try pureZigH2GetBody(allocator, tardigrade.port, h2_client_ip_request[0..]);
+    defer allocator.free(body);
+    try assertContains(body, "h2-client-ip");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+
+    upstream.mutex.lock();
+    defer upstream.mutex.unlock();
+    const raw = upstream.capture.headers_raw;
+    try std.testing.expectEqualStrings("198.51.100.30", headerValue(raw, "X-Forwarded-For").?);
+    try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(raw, "X-Forwarded-For"));
+    try std.testing.expectEqualStrings("198.51.100.30", headerValue(raw, "X-Real-IP").?);
+}
+
+test "interop.h2.untrusted_peer_cannot_choose_remote_addr (#809)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "h2-untrusted" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try proxySetHeaderConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    // Only 10.0.0.0/8 is trusted, so the 127.0.0.1 client is a direct
+    // client: its CF-Connecting-IP / XFF neither pick $remote_addr nor reach
+    // the origin.
+    var tardigrade = try startH2ClientIpTardigrade(allocator, config_text, &tls_paths, "10.0.0.0/8");
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const body = try pureZigH2GetBody(allocator, tardigrade.port, h2_client_ip_request[0..]);
+    defer allocator.free(body);
+    try assertContains(body, "h2-untrusted");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+
+    upstream.mutex.lock();
+    defer upstream.mutex.unlock();
+    const raw = upstream.capture.headers_raw;
+    try std.testing.expectEqualStrings("127.0.0.1", headerValue(raw, "X-Forwarded-For").?);
+    try std.testing.expectEqualStrings("127.0.0.1", headerValue(raw, "X-Real-IP").?);
+    try std.testing.expect(headerValue(raw, "CF-Connecting-IP") == null);
+}
+
+test "tardi check rejects an empty proxy_set_header Host (#809)" {
+    const allocator = std.testing.allocator;
+    const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-proxy-set-header-host-{d}.conf", .{compat.nanoTimestamp()});
+    defer {
+        compat.cwd().deleteFile(config_rel) catch {};
+        allocator.free(config_rel);
+    }
+    try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = "location / {\n    proxy_pass http://127.0.0.1:9;\n    proxy_set_header Host \"\";\n}\n" });
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expect(result.term != .exited or result.term.exited != 0);
+    try assertContains(result.stderr, "proxy_set_header Host cannot be empty");
+}
+
 test "tardi check rejects proxy_set_header framing headers and CR/LF (#809)" {
     const allocator = std.testing.allocator;
 

@@ -1048,6 +1048,7 @@ fn parseProxySetHeader(
             error.InvalidProxySetHeaderName => logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_set_header name '{s}' is not a valid header name", .{ file_path, line_no, name }),
             error.InvalidProxySetHeaderValue => logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_set_header {s} value contains CR, LF or another control character", .{ file_path, line_no, name }),
             error.ForbiddenProxySetHeader => logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_set_header cannot set {s}; request framing, hop-by-hop and X-Tardigrade-* headers are managed by Tardigrade", .{ file_path, line_no, name }),
+            error.EmptyProxySetHeaderHost => logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_set_header Host cannot be empty; Host is required upstream, so omit the rule to send the proxy_pass host", .{ file_path, line_no }),
             error.UnknownProxySetHeaderVariable => logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_set_header {s} uses an unsupported variable; supported: $host $http_host $remote_addr $scheme $proxy_add_x_forwarded_for $request_id", .{ file_path, line_no, name }),
         }
         return error.InvalidConfigSyntax;
@@ -1910,4 +1911,10 @@ test "proxy_set_header rejects framing headers, CR/LF, unknown variables and mis
         \\}
     );
     try expectProxySetHeaderConfigRejected("proxy_set_header X-A a;\n");
+    try expectProxySetHeaderConfigRejected(
+        \\location / {
+        \\    proxy_pass http://127.0.0.1:9101;
+        \\    proxy_set_header Host "";
+        \\}
+    );
 }

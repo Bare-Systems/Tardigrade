@@ -366,6 +366,16 @@ pub fn isTrustedUpstream(cfg: *const edge_config.EdgeConfig, upstream_host: []co
     return false;
 }
 
+/// Whether an HTTP/2 or HTTP/3 peer may supply the client IP through
+/// `TARDIGRADE_REAL_IP_HEADER` / `X-Forwarded-For` / `X-Real-IP`: only a peer
+/// matching an explicitly configured `trusted_upstream_identities` entry.
+/// Unlike `isTrustedUpstream` there is no open-trust default, because #756
+/// made those front ends key ACLs and rate limits on the transport peer so a
+/// direct client cannot choose its own address.
+pub fn isExplicitlyTrustedUpstream(cfg: *const edge_config.EdgeConfig, upstream_host: []const u8) bool {
+    return cfg.trusted_upstream_identities.len > 0 and isTrustedUpstream(cfg, upstream_host);
+}
+
 /// The trusted-proxy set `http.request_context.extractClientIp` consults
 /// while walking `X-Forwarded-For` right to left: an address is a trusted
 /// hop only when it explicitly matches a `trusted_upstream_identities`
@@ -382,6 +392,24 @@ pub const TrustedProxySet = struct {
         return false;
     }
 };
+
+/// True for the inbound forwarded-client headers an untrusted peer must not be
+/// able to supply: they would otherwise choose the resolved client IP or reach
+/// an origin that trusts them (#791).
+pub fn isForwardedClientHeader(cfg: *const edge_config.EdgeConfig, name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "x-forwarded-for") or
+        std.ascii.eqlIgnoreCase(name, "x-real-ip") or
+        (cfg.real_ip_header.len > 0 and std.ascii.eqlIgnoreCase(name, cfg.real_ip_header));
+}
+
+/// Drop an untrusted peer's forwarded-client headers before the client IP is
+/// resolved or the request is proxied. Shared by the HTTP/1 and HTTP/2 front
+/// ends so `$remote_addr` and rate limiting agree across protocols (#809).
+pub fn stripUntrustedForwardingHeaders(headers: *http.Headers, cfg: *const edge_config.EdgeConfig) void {
+    headers.remove("x-forwarded-for");
+    headers.remove("x-real-ip");
+    if (cfg.real_ip_header.len > 0) headers.remove(cfg.real_ip_header);
+}
 
 /// Geo policy is meaningful only when the country header arrived from the
 /// explicitly trusted proxy/CDN tier. Direct clients must not be able to pick

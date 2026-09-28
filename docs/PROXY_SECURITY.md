@@ -359,6 +359,12 @@ suits a sidecar such as cloudflared on a Docker bridge with no fixed address.
 
 ### Resolving the client IP
 
+HTTP/2 and HTTP/3 clients follow the same order, but only when the
+connecting peer matches an explicitly configured `trusted_upstream_identities`
+entry. Without one, the transport peer stays the client IP, so a direct
+client cannot choose the address its ACL, rate-limit and `$remote_addr`
+(`proxy_set_header`) decisions use.
+
 For a trusted peer, Tardigrade resolves the client IP (nginx `real_ip_header`
 / `set_real_ip_from` / `real_ip_recursive on` semantics):
 

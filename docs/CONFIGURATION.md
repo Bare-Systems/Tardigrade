@@ -250,17 +250,29 @@ location /realms/ekho/ {
 - **An empty value removes the header** (`proxy_set_header X-Forwarded-For "";`).
   So does a value whose variables all expand to nothing.
 - **`Host`** sets the HTTP/1.1 `Host` line and the HTTP/2 `:authority`. The
-  connection still goes to the `proxy_pass` address.
+  connection still goes to the `proxy_pass` address. `Host` is the one header
+  that cannot be removed, because HTTP/1.1 requires `Host` and HTTP/2 requires
+  `:authority`: `proxy_set_header Host "";` is rejected at config load, and a
+  `Host` value whose variables expand to nothing (for example `$host` on a
+  request without one) falls back to the `proxy_pass` host and port.
 - **Variables:**
 
   | Variable | Value |
   | --- | --- |
   | `$host` | Client `Host` (or `:authority`), port removed, lowercased; empty if absent. |
   | `$http_host` | Client `Host` exactly as sent. |
-  | `$remote_addr` | The trusted client IP Tardigrade resolved (the `X-Real-IP` value), after `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` / `TARDIGRADE_REAL_IP_HEADER` are applied. Never a raw client `X-Forwarded-For` entry. |
+  | `$remote_addr` | The client IP Tardigrade resolved (the `X-Real-IP` value), after `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` / `TARDIGRADE_REAL_IP_HEADER` are applied. Never a raw client `X-Forwarded-For` entry. See the note below for HTTP/2 and HTTP/3 clients. |
   | `$scheme` | `https` when Tardigrade terminates TLS, else `http`. |
   | `$proxy_add_x_forwarded_for` | The `X-Forwarded-For` value Tardigrade would send: `$remote_addr` appended to the inbound chain. |
   | `$request_id` | The request's correlation ID. |
+
+  For HTTP/2 and HTTP/3 clients, the client IP is read from
+  `TARDIGRADE_REAL_IP_HEADER` / `X-Forwarded-For` / `X-Real-IP` only when the
+  connecting peer matches an explicitly configured
+  `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` entry. Otherwise it is the
+  transport peer, so a direct client cannot choose its own address. HTTP/1.1
+  also trusts every peer when no identities are configured (the open-trust
+  default described in [PROXY_SECURITY.md](PROXY_SECURITY.md#trusted-upstream-identity)).
 
   `${NAME}` is still config-load interpolation (from `set` or the environment),
   as for every other directive. An unknown `$name` fails config load.
@@ -271,7 +283,7 @@ location /realms/ekho/ {
   `location` block.
 - **Rejected at config load (`tardi check`):** header names that are not
   valid tokens; values containing CR, LF, NUL or other control characters; the
-  same name twice in one block; `Content-Length` and `Transfer-Encoding`
+  same name twice in one block; an empty `Host`; `Content-Length` and `Transfer-Encoding`
   (request framing); `Early-Data`; `X-Tardigrade-*` (asserted identity); and
   any non-empty value for a hop-by-hop header (`Connection`, `Keep-Alive`,
   `Proxy-Authenticate`, `Proxy-Authorization`, `Proxy-Connection`, `TE`,
@@ -282,16 +294,20 @@ location /realms/ekho/ {
 ### Upstream response header size
 
 HTTP/1.1 upstream response heads (status line plus headers) of at least
-32 KiB relay without tuning, so a large `Location` plus several session
+32 KiB relay without tuning (verified end to end for HTTP/1.1 clients), so a large `Location` plus several session
 `Set-Cookie` headers from an identity provider passes through. There is no
 equivalent of nginx's `proxy_buffer_size` to raise.
 
 - Buffered proxying (the default): the head counts toward
   `TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES` and has no separate limit.
 - Streaming proxying (`TARDIGRADE_PROXY_STREAMING_MODE`): a head larger than
-  `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE` spills into a side buffer that is
-  charged to the stream's proxy-buffer reservation. Heads over 64 KiB fail
-  with 502.
+  `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE` spills into a fixed 64 KiB side buffer.
+  That buffer is charged in full to the stream's proxy-buffer limits
+  (`TARDIGRADE_PROXY_BUFFER_*`) before it is allocated, and released once the
+  head is parsed. Heads over 64 KiB fail with 502; a spill the proxy-buffer
+  limits cannot admit fails with 503.
+
+Large response heads from HTTP/2 upstreams have not been verified end to end.
 
 ## Top-Level Routing Directives
 

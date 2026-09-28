@@ -769,11 +769,7 @@ fn executeBufferedH2OrH1Fresh(
         else if (connect_timeout_ms > 0) connect_timeout_ms else 30_000;
 
         var authority_buf: [300]u8 = undefined;
-        // A Host override (`proxy_set_header Host`, #809) becomes `:authority`.
-        const authority = headerValue(extra_headers, "host") orelse if (port == 443)
-            host
-        else
-            std.fmt.bufPrint(&authority_buf, "{s}:{d}", .{ host, port }) catch host;
+        const authority = upstreamH2Authority(extra_headers, host, port, 443, &authority_buf);
 
         var path_buf: std.Io.Writer.Allocating = .init(allocator);
         defer path_buf.deinit();
@@ -865,11 +861,7 @@ fn executeBufferedViaH2Pool(
                 if (h1_pool) |p| p.recordProtocol(true);
 
                 var authority_buf: [300]u8 = undefined;
-                // A Host override (`proxy_set_header Host`, #809) becomes `:authority`.
-                const authority = headerValue(extra_headers, "host") orelse if (port == default_port)
-                    host
-                else
-                    std.fmt.bufPrint(&authority_buf, "{s}:{d}", .{ host, port }) catch host;
+                const authority = upstreamH2Authority(extra_headers, host, port, default_port, &authority_buf);
 
                 var path_buf: std.Io.Writer.Allocating = .init(allocator);
                 defer path_buf.deinit();
@@ -1207,11 +1199,7 @@ fn streamViaH2Pool(
                 // allocates nothing at all.
 
                 var authority_buf: [300]u8 = undefined;
-                // A Host override (`proxy_set_header Host`, #809) becomes `:authority`.
-                const authority = headerValue(extra_headers, "host") orelse if (port == default_port)
-                    host
-                else
-                    std.fmt.bufPrint(&authority_buf, "{s}:{d}", .{ host, port }) catch host;
+                const authority = upstreamH2Authority(extra_headers, host, port, default_port, &authority_buf);
 
                 // The connection is acquired, so every failure from here on has
                 // to hand its reference back before returning.
@@ -1551,6 +1539,31 @@ fn h2ResponseToBuffered(allocator: std.mem.Allocator, h2resp: *http.upstream_h2.
 /// `read([]u8) !usize` (satisfied by both `compat.NetStream` and
 /// `*UpstreamTlsConn`). `fd` is the underlying socket used for per-phase
 /// timeout control. The caller owns connecting and closing the transport.
+/// The `:authority` for an HTTP/2 upstream request: a `Host` entry in the
+/// outgoing headers (`proxy_set_header Host`, #809) wins; otherwise the
+/// proxy_pass host, with its port when not the scheme default. A Host rule
+/// whose value expanded empty removed the entry, so it falls back here too --
+/// `:authority` cannot be omitted, just as HTTP/1.1 `Host` cannot.
+fn upstreamH2Authority(
+    extra_headers: []const std.http.Header,
+    host: []const u8,
+    port: u16,
+    default_port: u16,
+    buf: []u8,
+) []const u8 {
+    if (headerValue(extra_headers, "host")) |override| return override;
+    if (port == default_port) return host;
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ host, port }) catch host;
+}
+
+test "upstreamH2Authority prefers a Host override and falls back to the proxy_pass authority (#809)" {
+    var buf: [300]u8 = undefined;
+    const override = [_]std.http.Header{.{ .name = "Host", .value = "auth.example" }};
+    try std.testing.expectEqualStrings("auth.example", upstreamH2Authority(&override, "keycloak", 8080, 80, &buf));
+    try std.testing.expectEqualStrings("keycloak:8080", upstreamH2Authority(&.{}, "keycloak", 8080, 80, &buf));
+    try std.testing.expectEqualStrings("keycloak", upstreamH2Authority(&.{}, "keycloak", 443, 443, &buf));
+}
+
 fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
     for (headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
@@ -2312,7 +2325,7 @@ test "readUpstreamHead rejects a status line whose embedded bare LF swallows a h
 
     try testing.expectError(
         error.UpstreamProtocolError,
-        readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", null),
+        readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", test_head_spill),
     );
 }
 
@@ -2532,6 +2545,16 @@ fn cancelStopped(tok: ?*const CancellationToken) bool {
     return false;
 }
 
+fn allocateHeadSpillSlab(spill: HeadSpill) ![]u8 {
+    if (spill.reservation) |reservation| {
+        reservation.reserve(max_streaming_upstream_head_bytes) catch return error.ProxyBufferCapacityUnavailable;
+    }
+    return spill.allocator.alloc(u8, max_streaming_upstream_head_bytes) catch |err| {
+        if (spill.reservation) |reservation| reservation.release(max_streaming_upstream_head_bytes);
+        return err;
+    };
+}
+
 const ParsedUpstreamHead = struct {
     status_code: u16,
     reason: []const u8, // arena-owned
@@ -2548,12 +2571,26 @@ const ParsedUpstreamHead = struct {
 /// buffered path.
 pub const max_streaming_upstream_head_bytes: usize = 64 * 1024;
 
+const test_head_spill = HeadSpill{ .allocator = std.testing.allocator, .reservation = null };
+
+/// Where `readUpstreamHead` puts a head that outgrows the relay window (#809).
+const HeadSpill = struct {
+    /// Allocates the side slab; it is freed before `readUpstreamHead` returns,
+    /// so it must be reclaimable (not an arena).
+    allocator: std.mem.Allocator,
+    /// Charged for the whole slab before it is allocated and released when it
+    /// is freed (#140). Null only in parser tests.
+    reservation: ?*ProxyBufferReservation,
+};
+
 /// Read and parse the upstream response head from `rb` (poll-bounded), leaving
 /// any already-read body bytes in `rb`. reason/headers are allocated in `arena`.
 ///
-/// A head that outgrows `rb`'s window is spilled into `arena`, up to
-/// `max_streaming_upstream_head_bytes`; the spilled bytes are charged to
-/// `head_reservation` when one is given (#140).
+/// A head that outgrows `rb`'s window is spilled into one side slab of exactly
+/// `max_streaming_upstream_head_bytes`, reserved in full before it is
+/// allocated. The slab is freed and its reservation released once the head has
+/// been parsed into `arena`, so each head owns its own spill and a discarded
+/// 1xx head leaves no charge behind for the next one.
 fn readUpstreamHead(
     arena: std.mem.Allocator,
     rb: *StreamReadBuf,
@@ -2561,35 +2598,42 @@ fn readUpstreamHead(
     fd: std.posix.fd_t,
     deadline_ms: u32,
     method: []const u8,
-    head_reservation: ?*ProxyBufferReservation,
+    spill: HeadSpill,
 ) !ParsedUpstreamHead {
-    var spilled = std.ArrayList(u8).empty;
+    var slab: ?[]u8 = null;
+    defer if (slab) |buf| {
+        spill.allocator.free(buf);
+        if (spill.reservation) |reservation| reservation.release(buf.len);
+    };
+    var spilled_len: usize = 0;
     while (std.mem.find(u8, rb.available(), "\r\n\r\n") == null) {
         const avail = rb.available();
-        if (spilled.items.len + avail.len > max_streaming_upstream_head_bytes) return error.StreamTooLong;
+        if (spilled_len + avail.len > max_streaming_upstream_head_bytes) return error.StreamTooLong;
         if (avail.len == rb.buf.len) {
             // Window full without a delimiter: move all but the last three
             // bytes aside, so a "\r\n\r\n" straddling the boundary is still
             // found in `rb`.
             const spill_len = avail.len -| 3;
             if (spill_len == 0) return error.StreamTooLong;
-            if (head_reservation) |reservation| {
-                reservation.reserve(spill_len) catch return error.ProxyBufferCapacityUnavailable;
-            }
-            try spilled.appendSlice(arena, avail[0..spill_len]);
+            const buf = slab orelse try allocateHeadSpillSlab(spill);
+            slab = buf;
+            @memcpy(buf[spilled_len..][0..spill_len], avail[0..spill_len]);
+            spilled_len += spill_len;
             rb.consume(spill_len);
         }
         if (!try rb.fill(transport, fd, deadline_ms)) {
-            return if (rb.available().len == 0 and spilled.items.len == 0) error.UpstreamConnectionClosed else error.UpstreamProtocolError;
+            return if (rb.available().len == 0 and spilled_len == 0) error.UpstreamConnectionClosed else error.UpstreamProtocolError;
         }
     }
     const win = rb.available();
     const head_end = std.mem.find(u8, win, "\r\n\r\n").?;
-    if (spilled.items.len + head_end > max_streaming_upstream_head_bytes) return error.StreamTooLong;
-    const header_block = if (spilled.items.len == 0) win[0..head_end] else blk: {
-        try spilled.appendSlice(arena, win[0..head_end]);
-        break :blk spilled.items;
-    };
+    if (spilled_len + head_end > max_streaming_upstream_head_bytes) return error.StreamTooLong;
+    const header_block = if (slab) |buf| blk: {
+        // The slab was sized and reserved for the whole bound up front, so
+        // the head's tail lands in already-charged memory.
+        @memcpy(buf[spilled_len..][0..head_end], win[0..head_end]);
+        break :blk buf[0 .. spilled_len + head_end];
+    } else win[0..head_end];
 
     // Uses the SAME strict status-line parser `detectResponseFraming`
     // uses (#673 review): a prior version had this function find the
@@ -3095,7 +3139,7 @@ fn streamProxyOverTransport(
     // `cancel_token`; or (3) run for an unbounded number of iterations at
     // all, since `read_deadline_ms` bounds a single read, not the cumulative
     // time/iterations spent here.
-    var head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method, &response_reservation);
+    var head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method, .{ .allocator = allocator, .reservation = &response_reservation });
     var interim_responses: usize = 0;
     while (head.status_code >= 100 and head.status_code < 200) {
         if (cancelStopped(cancel_token)) return error.RequestCancelled;
@@ -3105,7 +3149,7 @@ fn streamProxyOverTransport(
         // the next one; the eventual non-1xx head's allocations are the only
         // ones left standing when this loop exits.
         _ = arena.reset(.free_all);
-        head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method, &response_reservation);
+        head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method, .{ .allocator = allocator, .reservation = &response_reservation });
     }
     const ttfb_ms = http.event_loop.monotonicMs() - ttfb_start_ms;
 
@@ -3743,6 +3787,10 @@ test "exchangeBoundedBufferedHttpRequest parses a buffered response from a peer"
 /// Run one buffered exchange against a socketpair peer and return the request
 /// bytes the client serialized (caller owns the returned slice).
 fn captureBufferedRequestBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    return captureBufferedRequestBytesWithHeaders(allocator, url, &.{});
+}
+
+fn captureBufferedRequestBytesWithHeaders(allocator: std.mem.Allocator, url: []const u8, extra_headers: []const std.http.Header) ![]u8 {
     const fds = try makeBlockingSocketpair();
     const client_fd = fds[0];
     const peer_fd = fds[1];
@@ -3760,7 +3808,7 @@ fn captureBufferedRequestBytes(allocator: std.mem.Allocator, url: []const u8) ![
         client_fd,
         uri,
         "GET",
-        &.{},
+        extra_headers,
         "",
         null,
         1 << 20,
@@ -3775,6 +3823,30 @@ fn captureBufferedRequestBytes(allocator: std.mem.Allocator, url: []const u8) ![
     const n = std.c.read(peer_fd, &req_buf, req_buf.len);
     try std.testing.expect(n > 0);
     return allocator.dupe(u8, req_buf[0..@intCast(n)]);
+}
+
+test "proxy_set_header Host that expands empty falls back to the proxy_pass Host (#809)" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
+    defer headers.deinit();
+    // The HTTP/2 front end's upstream Host override, then a `$host` rule for a
+    // request without a Host value.
+    try headers.append(.{ .name = "Host", .value = "client.example" });
+    const rules = [_]http.location_router.ProxySetHeader{.{ .name = "Host", .value = "$host" }};
+    try gph.applyProxySetHeaders(arena.allocator(), &headers, &rules, .{
+        .host = null,
+        .remote_addr = "198.51.100.7",
+        .scheme = "http",
+        .proxy_add_x_forwarded_for = "198.51.100.7",
+        .request_id = "req",
+    });
+
+    const req = try captureBufferedRequestBytesWithHeaders(allocator, "http://127.0.0.1:8123/", headers.items);
+    defer allocator.free(req);
+    try std.testing.expect(std.mem.indexOf(u8, req, "Host: 127.0.0.1:8123\r\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, req, "Host: "));
 }
 
 test "buffered request Host header includes a non-default upstream port" {
@@ -4163,7 +4235,7 @@ test "readUpstreamHead rejects an upstream status code outside 100..599 (#673 re
 
         try std.testing.expectError(
             error.UpstreamProtocolError,
-            readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", null),
+            readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", test_head_spill),
         );
     }
 }
@@ -4205,7 +4277,7 @@ fn runStreamingRelay(
     defer arena.deinit();
     const transport = compat.netStreamFromFd(client_fd);
 
-    const head = try readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, method, null);
+    const head = try readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, method, test_head_spill);
 
     var captured = std.array_list.Managed(u8).init(allocator);
     defer captured.deinit();
@@ -4323,7 +4395,7 @@ test "readUpstreamHead rejects control characters embedded in a header value (#6
 
     try std.testing.expectError(
         error.UpstreamProtocolError,
-        readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", null),
+        readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", test_head_spill),
     );
 }
 
@@ -4350,7 +4422,7 @@ test "readUpstreamHead spills a head larger than the relay window and keeps the 
     defer arena.deinit();
     const transport = compat.netStreamFromFd(client_fd);
 
-    const head = try readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", null);
+    const head = try readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", test_head_spill);
     try std.testing.expectEqual(@as(u16, 302), head.status_code);
     var cookies: usize = 0;
     for (head.headers) |header| {
@@ -4399,8 +4471,151 @@ test "readUpstreamHead rejects a head over the streaming head bound (#809)" {
 
     try std.testing.expectError(
         error.StreamTooLong,
-        readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", null),
+        readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", test_head_spill),
     );
+}
+
+/// Build `count` responses: `interim` large 103 heads, then a large 200.
+fn buildLargeHeadSequence(allocator: std.mem.Allocator, interim: usize, cookie_bytes: usize) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i <= interim) : (i += 1) {
+        try out.appendSlice(allocator, if (i < interim) "HTTP/1.1 103 Early Hints\r\n" else "HTTP/1.1 200 OK\r\n");
+        for (0..4) |_| {
+            try out.appendSlice(allocator, "Set-Cookie: K=");
+            try out.appendNTimes(allocator, 'c', cookie_bytes);
+            try out.appendSlice(allocator, "\r\n");
+        }
+        if (i == interim) try out.appendSlice(allocator, "Content-Length: 2\r\n");
+        try out.appendSlice(allocator, "\r\n");
+    }
+    try out.appendSlice(allocator, "ok");
+    return out.toOwnedSlice(allocator);
+}
+
+/// A socketpair whose buffers hold `bytes` in full, so a test can write a
+/// whole multi-head upstream response up front without a writer thread (a
+/// thread blocked on a full AF_UNIX socket is not reliably woken when the
+/// reader gives up early).
+fn socketpairPreloaded(bytes: []const u8) ![2]std.posix.fd_t {
+    const fds = try makeBlockingSocketpair();
+    errdefer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+    const size: c_int = @intCast(bytes.len + 64 * 1024);
+    _ = std.c.setsockopt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&size), @sizeOf(c_int));
+    _ = std.c.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&size), @sizeOf(c_int));
+    const written = std.c.write(fds[1], bytes.ptr, bytes.len);
+    if (written != @as(isize, @intCast(bytes.len))) return error.SocketPairFailed;
+    return fds;
+}
+
+const HeadSpillBudgetTest = struct {
+    relay: [16 * 1024]u8 = undefined,
+    counters: UploadBufferObserver = .{},
+    reservation: ProxyBufferReservation = undefined,
+
+    fn init(self: *HeadSpillBudgetTest, hard_limit: usize) !void {
+        const limits = proxy_buffer_account.Limits{
+            .per_stream_low_watermark = 1024,
+            .per_stream_high_watermark = 2048,
+            .per_stream_hard_limit = hard_limit,
+            .per_origin_hard_limit = 0,
+            .global_hard_limit = 0,
+        };
+        self.reservation = ProxyBufferReservation.init(.upstream_to_downstream, limits, self.counters.observer(), .{});
+        // The relay window is charged up front, as in streamProxyOverTransport.
+        try self.reservation.reserve(self.relay.len);
+    }
+};
+
+test "streaming head spill is charged in full before allocation and released after parsing (#809)" {
+    const allocator = std.testing.allocator;
+    // One ~40 KiB head: well past the 16 KiB relay window, under the bound.
+    const response = try buildLargeHeadSequence(allocator, 0, 10 * 1024);
+    defer allocator.free(response);
+
+    // Exactly room for the relay window plus the whole spill slab.
+    {
+        const fds = try socketpairPreloaded(response);
+        defer _ = std.c.close(fds[0]);
+        defer _ = std.c.close(fds[1]);
+
+        var budget = HeadSpillBudgetTest{};
+        try budget.init(16 * 1024 + max_streaming_upstream_head_bytes);
+        defer budget.reservation.releaseAll();
+        var rb = StreamReadBuf{ .buf = &budget.relay };
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const head = try readUpstreamHead(arena.allocator(), &rb, compat.netStreamFromFd(fds[0]), fds[0], 1_000, "GET", .{
+            .allocator = allocator,
+            .reservation = &budget.reservation,
+        });
+        try std.testing.expectEqual(@as(u16, 200), head.status_code);
+        // The slab peaked at its full size and is released with the parse.
+        try std.testing.expectEqual(16 * 1024 + max_streaming_upstream_head_bytes, budget.counters.peak_reserved);
+        try std.testing.expectEqual(@as(usize, 16 * 1024), budget.reservation.account.snapshot().current);
+    }
+
+    // One byte short of the slab: refused before anything is allocated.
+    {
+        const fds = try socketpairPreloaded(response);
+        defer _ = std.c.close(fds[0]);
+        defer _ = std.c.close(fds[1]);
+
+        var budget = HeadSpillBudgetTest{};
+        try budget.init(16 * 1024 + max_streaming_upstream_head_bytes - 1);
+        defer budget.reservation.releaseAll();
+        var rb = StreamReadBuf{ .buf = &budget.relay };
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        try std.testing.expectError(error.ProxyBufferCapacityUnavailable, readUpstreamHead(
+            arena.allocator(),
+            &rb,
+            compat.netStreamFromFd(fds[0]),
+            fds[0],
+            1_000,
+            "GET",
+            .{ .allocator = allocator, .reservation = &budget.reservation },
+        ));
+        try std.testing.expectEqual(@as(usize, 16 * 1024), budget.reservation.account.snapshot().current);
+    }
+}
+
+test "discarded large 103 heads release their spill before the final head (#809)" {
+    const allocator = std.testing.allocator;
+    // Three ~40 KiB Early Hints heads, then a ~40 KiB 200. Under a budget that
+    // holds only one spill at a time, charges must not accumulate across heads.
+    const response = try buildLargeHeadSequence(allocator, 3, 10 * 1024);
+    defer allocator.free(response);
+    const fds = try socketpairPreloaded(response);
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    var budget = HeadSpillBudgetTest{};
+    try budget.init(16 * 1024 + max_streaming_upstream_head_bytes);
+    defer budget.reservation.releaseAll();
+    var rb = StreamReadBuf{ .buf = &budget.relay };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const transport = compat.netStreamFromFd(fds[0]);
+    const spill = HeadSpill{ .allocator = allocator, .reservation = &budget.reservation };
+
+    // The same loop streamProxyOverTransport runs.
+    var head = try readUpstreamHead(arena.allocator(), &rb, transport, fds[0], 1_000, "GET", spill);
+    var interim: usize = 0;
+    while (head.status_code >= 100 and head.status_code < 200) {
+        interim += 1;
+        _ = arena.reset(.free_all);
+        head = try readUpstreamHead(arena.allocator(), &rb, transport, fds[0], 1_000, "GET", spill);
+    }
+    try std.testing.expectEqual(@as(usize, 3), interim);
+    try std.testing.expectEqual(@as(u16, 200), head.status_code);
+    try std.testing.expectEqual(@as(usize, 16 * 1024), budget.reservation.account.snapshot().current);
 }
 
 test "readUpstreamHead rejects a 101 Switching Protocols upstream response (#673 review)" {
@@ -4425,7 +4640,7 @@ test "readUpstreamHead rejects a 101 Switching Protocols upstream response (#673
 
     try std.testing.expectError(
         error.UpstreamProtocolError,
-        readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", null),
+        readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, "GET", test_head_spill),
     );
 }
 

@@ -3607,6 +3607,21 @@ fn executeHttp2ProxyRoute(
     var effective_cfg_storage = cfg.*;
     const route_cfg = http2RouteConfig(cfg, request, &effective_cfg_storage) orelse return null;
 
+    // Behind an explicitly trusted proxy tier, resolve the client IP as the
+    // HTTP/1 front end does (#791), so rate limiting, ACLs, `X-Real-IP` and
+    // `proxy_set_header ... $remote_addr` (#809) see the real client rather
+    // than the connecting proxy. Without configured trust the transport peer
+    // stays authoritative (#756). Untrusted peers' forwarding metadata is
+    // stripped by the same rule as HTTP/1.
+    if (!gph.isTrustedUpstream(route_cfg, connection_ip)) gph.stripUntrustedForwardingHeaders(&request.headers, route_cfg);
+    const client_ip = http.request_context.extractClientIp(
+        request,
+        gph.isExplicitlyTrustedUpstream(route_cfg, connection_ip),
+        route_cfg.real_ip_header,
+        gph.TrustedProxySet{ .cfg = route_cfg },
+        connection_ip,
+    );
+
     // Primed early (like H1's `primeRequestAuthContext` pre-middleware hook)
     // so a valid bearer/session identity informs both rate limiting below
     // and the proxied request's trust boundary, rather than H2 requests
@@ -3615,7 +3630,7 @@ fn executeHttp2ProxyRoute(
     // every request), this connection's `allocator` is long-lived across
     // every stream it serves, so the identity strings must be freed
     // explicitly rather than left for a bulk arena reset.
-    var ctx = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
+    var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
     ctx.lifecycle = lifecycle;
     defer {
         if (ctx.identity) |v| allocator.free(v);
@@ -3625,7 +3640,7 @@ fn executeHttp2ProxyRoute(
     }
     try ghandlers.primeRequestAuthContext(allocator, route_cfg, state, &ctx, &request.headers);
 
-    if (h2EvaluateRequestPolicy(route_cfg, state, request, connection_ip, ctx.identity)) |rejection| {
+    if (h2EvaluateRequestPolicy(route_cfg, state, request, connection_ip, client_ip, ctx.identity)) |rejection| {
         return .{ .local_rejection = rejection };
     }
 
@@ -3678,10 +3693,11 @@ fn executeHttp2ProxyRoute(
         &request.headers,
         request.body orelse "",
         correlation_id,
-        connection_ip,
+        client_ip,
         forwarded_proto,
         request.headers.get("host"),
         request.headers.get("host"),
+        matched.block.proxy_set_headers,
         ctx.identity,
         ctx.user_id,
         ctx.device_id,
@@ -3701,7 +3717,7 @@ fn executeHttp2ProxyRoute(
         request.uri.path,
         correlation_id,
         null,
-        connection_ip,
+        client_ip,
         upstream_url.value,
         request.body orelse "",
         proxy_response.statusCode(),
@@ -3719,11 +3735,14 @@ fn h2EvaluateRequestPolicy(
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
     request: *const http.Request,
+    /// The connecting peer; decides whether geo headers are trusted.
+    peer_ip: []const u8,
+    /// The resolved client IP; keys ACLs and rate limits, as on HTTP/1.
     client_ip: []const u8,
     identity: ?[]const u8,
 ) ?Http2LocalRejection {
     if (cfg.geo_blocked_countries.len > 0) {
-        if (!gph.isTrustedGeoSource(cfg, client_ip)) {
+        if (!gph.isTrustedGeoSource(cfg, peer_ip)) {
             return .{ .status_code = 403, .code = "forbidden", .message = "Geo identity source is not trusted" };
         }
         const country = request.headers.get(cfg.geo_country_header);
@@ -4631,12 +4650,10 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // connection IP", which this call site previously never enforced.
     const trusted_forwarding_source = gph.isTrustedUpstream(cfg, connection_ip);
     if (!trusted_forwarding_source) {
-        request.headers.remove("x-forwarded-for");
-        request.headers.remove("x-real-ip");
         // The configured real-IP header (e.g. CF-Connecting-IP) is just as
         // authoritative to an origin that reads it, so an untrusted peer's
         // copy must not be proxied through either (#791).
-        if (cfg.real_ip_header.len > 0) request.headers.remove(cfg.real_ip_header);
+        gph.stripUntrustedForwardingHeaders(&request.headers, cfg);
     }
     // A trusted peer's X-Forwarded-For is walked right to left, skipping
     // only explicitly trusted hops (#791): the leftmost entry is whatever

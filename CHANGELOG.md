@@ -2,6 +2,53 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [0.8.0] - 2026-09-28
+
+### Added
+
+- **`proxy_set_header` sets, overwrites or clears upstream request headers
+  (#809)** — nginx-compatible, in `location` and `server` blocks, so a header
+  pin such as Keycloak's `X-Forwarded-Proto https` no longer needs a separate
+  proxy in front of the origin. Every copy of the header is replaced, whether
+  the client sent it (duplicates and any case) or Tardigrade generated it
+  (`X-Forwarded-*`, `X-Real-IP`, ...); `""` removes it. `Host` also sets the
+  HTTP/2 `:authority`, and cannot be cleared: `proxy_set_header Host "";` is
+  rejected, and a `Host` value that expands empty falls back to the
+  `proxy_pass` host. Values can use `$host`, `$http_host`, `$remote_addr` (the
+  resolved client IP), `$scheme`, `$proxy_add_x_forwarded_for` and
+  `$request_id`. A location with its own rules replaces the server block's
+  list. `tardi check` rejects invalid names, CR/LF and control characters,
+  unknown variables, duplicate names, `Content-Length`, `Transfer-Encoding`,
+  `Early-Data`, `X-Tardigrade-*`, and non-empty hop-by-hop headers. Applies to
+  HTTP/1.1, HTTP/2 and HTTP/3 clients on the buffered and streaming proxy
+  paths. See
+  [CONFIGURATION.md](docs/CONFIGURATION.md#upstream-request-headers-proxy_set_header).
+
+### Fixed
+
+- **The streaming proxy no longer returns 502 for large upstream response
+  heads (#809)** — with `TARDIGRADE_PROXY_STREAMING_MODE` enabled, a response
+  head larger than `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE` (16 KiB by default),
+  such as a long `Location` plus several `Set-Cookie` headers from an identity
+  provider, failed with `StreamTooLong`. Heads up to 64 KiB now relay; the
+  overflow goes into a fixed side buffer charged in full to the proxy-buffer
+  limits before allocation and released once the head is parsed. A spill those
+  limits cannot admit fails with 503; heads over 64 KiB still fail with 502.
+
+### Security
+
+- **HTTP/2 and HTTP/3 clients resolve the client IP behind a trusted proxy
+  tier (#809)** — both front ends keyed ACLs, rate limits, `X-Real-IP` and
+  `X-Forwarded-For` on the connecting peer, so behind a CDN or tunnel every
+  request appeared to come from the proxy. When the peer matches an explicitly
+  configured `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` entry, the client IP is
+  now resolved as on HTTP/1 (`TARDIGRADE_REAL_IP_HEADER`, then
+  `X-Forwarded-For` walked from the right, then `X-Real-IP`). Without
+  configured trust the transport peer stays authoritative, so a direct client
+  still cannot choose its own address (#756). An untrusted peer's
+  `X-Forwarded-For`, `X-Real-IP` and real-IP header are no longer forwarded to
+  the origin.
+
 ## [0.7.4] - 2026-09-25
 
 ### Fixed

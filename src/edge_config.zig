@@ -2661,6 +2661,11 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         var proxy_streaming_policy: http.location_router.ProxyStreamingPolicy = .inherit;
         var early_data: http.location_router.EarlyDataPolicy = .off;
         var proxy_early_data: http.location_router.ProxyEarlyDataPolicy = .off;
+        var set_headers = std.ArrayList(http.location_router.ProxySetHeader).empty;
+        errdefer {
+            for (set_headers.items) |*rule| rule.deinit(allocator);
+            set_headers.deinit(allocator);
+        }
         while (fields.next()) |option_raw| {
             const option = std.mem.trim(u8, option_raw, " \t\r\n");
             if (std.mem.startsWith(u8, option, "auth:")) {
@@ -2671,11 +2676,14 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
                 early_data = http.location_router.EarlyDataPolicy.parse(option["early_data:".len..]) orelse return error.InvalidLocationBlockFormat;
             } else if (std.mem.startsWith(u8, option, "proxy_early_data:")) {
                 proxy_early_data = http.location_router.ProxyEarlyDataPolicy.parse(option["proxy_early_data:".len..]) orelse return error.InvalidLocationBlockFormat;
+            } else if (std.mem.startsWith(u8, option, "set_header:")) {
+                try set_headers.ensureUnusedCapacity(allocator, 1);
+                set_headers.appendAssumeCapacity(try parseProxySetHeaderOption(allocator, option["set_header:".len..], set_headers.items));
             } else {
                 return error.InvalidLocationBlockFormat;
             }
         }
-        if (proxy_early_data == .rfc8470) switch (action) {
+        if (proxy_early_data == .rfc8470 or set_headers.items.len > 0) switch (action) {
             .proxy_pass => {},
             else => return error.InvalidLocationBlockFormat,
         };
@@ -2690,11 +2698,42 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .proxy_streaming_policy = proxy_streaming_policy,
             .early_data = early_data,
             .proxy_early_data = proxy_early_data,
+            .proxy_set_headers = &.{},
         });
         action_owned = false;
+        if (set_headers.items.len > 0) {
+            out.items[out.items.len - 1].proxy_set_headers = try set_headers.toOwnedSlice(allocator);
+        } else {
+            set_headers.deinit(allocator);
+        }
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+/// Decode one `set_header:<hex name>:<hex value>` location option (#809) and
+/// re-validate it, so a hand-written `TARDIGRADE_LOCATION_BLOCKS` value gets the
+/// same checks as the config-file directive.
+fn parseProxySetHeaderOption(
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+    existing: []const http.location_router.ProxySetHeader,
+) !http.location_router.ProxySetHeader {
+    const sep = std.mem.findScalar(u8, encoded, ':') orelse return error.InvalidLocationBlockFormat;
+    const name_hex = encoded[0..sep];
+    const value_hex = encoded[sep + 1 ..];
+    if (name_hex.len % 2 != 0 or value_hex.len % 2 != 0) return error.InvalidLocationBlockFormat;
+    const name = try allocator.alloc(u8, name_hex.len / 2);
+    errdefer allocator.free(name);
+    _ = std.fmt.hexToBytes(name, name_hex) catch return error.InvalidLocationBlockFormat;
+    const value = try allocator.alloc(u8, value_hex.len / 2);
+    errdefer allocator.free(value);
+    _ = std.fmt.hexToBytes(value, value_hex) catch return error.InvalidLocationBlockFormat;
+    http.location_router.validateProxySetHeader(name, value) catch return error.InvalidLocationBlockFormat;
+    for (existing) |rule| {
+        if (std.ascii.eqlIgnoreCase(rule.name, name)) return error.InvalidLocationBlockFormat;
+    }
+    return .{ .name = name, .value = value };
 }
 
 fn applyLocationErrorPages(allocator: std.mem.Allocator, blocks: []EdgeConfig.LocationBlock, raw: []const u8) !void {
@@ -4087,6 +4126,50 @@ test "parse location blocks include route streaming policy option" {
     try std.testing.expectEqual(http.location_router.ProxyStreamingPolicy.off, blocks[0].proxy_streaming_policy);
     try std.testing.expectEqual(http.location_router.ProxyStreamingPolicy.full, blocks[1].proxy_streaming_policy);
     try std.testing.expectEqual(http.location_router.AuthMode.required, blocks[1].auth);
+}
+
+test "parse location blocks decode proxy_set_header options (#809)" {
+    const allocator = std.testing.allocator;
+    // Host=auth.example, X-Forwarded-For="" (removal)
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "prefix|/auth/|proxy_pass|http://127.0.0.1:9002|set_header:486f7374:617574682e6578616d706c65|set_header:582d466f727761726465642d466f72:;prefix|/plain/|proxy_pass|http://127.0.0.1:9003",
+    );
+    defer {
+        for (blocks) |*block| {
+            block.deinit(allocator);
+        }
+        allocator.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqual(@as(usize, 2), blocks[0].proxy_set_headers.len);
+    try std.testing.expectEqualStrings("Host", blocks[0].proxy_set_headers[0].name);
+    try std.testing.expectEqualStrings("auth.example", blocks[0].proxy_set_headers[0].value);
+    try std.testing.expectEqualStrings("X-Forwarded-For", blocks[0].proxy_set_headers[1].name);
+    try std.testing.expectEqualStrings("", blocks[0].proxy_set_headers[1].value);
+    try std.testing.expectEqual(@as(usize, 0), blocks[1].proxy_set_headers.len);
+}
+
+test "parse location blocks reject invalid proxy_set_header options (#809)" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        // Not a proxy_pass location.
+        "prefix|/local/|return|200|ok|set_header:582d41:61",
+        // Odd-length / non-hex encodings.
+        "prefix|/p/|proxy_pass|http://127.0.0.1:9002|set_header:582d4:61",
+        "prefix|/p/|proxy_pass|http://127.0.0.1:9002|set_header:zz:61",
+        "prefix|/p/|proxy_pass|http://127.0.0.1:9002|set_header:582d41",
+        // X-A: "a\r\nX-B: 1" -- CR/LF smuggled through a hand-written env value.
+        "prefix|/p/|proxy_pass|http://127.0.0.1:9002|set_header:582d41:610d0a582d423a2031",
+        // Content-Length is a framing header.
+        "prefix|/p/|proxy_pass|http://127.0.0.1:9002|set_header:436f6e74656e742d4c656e677468:30",
+        // Duplicate name.
+        "prefix|/p/|proxy_pass|http://127.0.0.1:9002|set_header:582d41:61|set_header:782d61:62",
+    };
+    for (cases) |raw| {
+        try std.testing.expectError(error.InvalidLocationBlockFormat, parseLocationBlocks(allocator, raw));
+    }
 }
 
 test "parse location blocks include early data policy options" {

@@ -165,6 +165,7 @@ start from the top-level config and overlay non-empty per-block values. See the
 | `upstream_base_url` | URL | `""` | Per-server default reverse-proxy upstream. | `upstream_base_url http://127.0.0.1:8081;` |
 | `proxy_pass_chat` | URL | `""` | BearClaw/chat route upstream. | `proxy_pass_chat http://127.0.0.1:9001;` |
 | `proxy_pass_commands_prefix` | URL/path | `""` | BearClaw commands prefix upstream. | `proxy_pass_commands_prefix http://127.0.0.1:9002;` |
+| `proxy_set_header` | name value | `[]` | Default upstream request-header rules for this block's `proxy_pass` locations. See [Upstream request headers](#upstream-request-headers-proxy_set_header). | `proxy_set_header X-Forwarded-Proto https;` |
 | nested `location` | block | `[]` | Locations scoped to this server block. The parser requires the block opener on a line ending with `{` and a closing line containing only `}`. | See matcher examples below. |
 
 ## Location Blocks
@@ -197,6 +198,7 @@ return, rewrite, or static.
 | `proxy_streaming` / `proxy_streaming_mode` | enum | `inherit` | `inherit`, `off`/`buffered`, `response`/`responses`, `full`/`request_response`/`request-response`. | `proxy_streaming response;` |
 | `early_data` | enum | `off` | `off`, `replay_safe`/`replay-safe`. | `early_data replay_safe;` |
 | `proxy_early_data` | enum | `off` | `off`, `rfc8470`/`rfc-8470`; valid only with `proxy_pass`. | `proxy_early_data rfc8470;` |
+| `proxy_set_header` | name value | `[]` | Set, overwrite or clear an upstream request header; valid only with `proxy_pass`. Repeatable, one per header name. See [Upstream request headers](#upstream-request-headers-proxy_set_header). | `proxy_set_header Host auth.example.com;` |
 
 Parser-valid matcher examples:
 
@@ -221,6 +223,91 @@ location /api/ {
     proxy_pass http://127.0.0.1:8080;
 }
 ```
+
+## Upstream Request Headers (`proxy_set_header`)
+
+`proxy_set_header NAME VALUE;` rewrites a request header on its way to a
+`proxy_pass` upstream, with nginx syntax so existing configs port directly. It
+applies to HTTP/1.1 and HTTP/2 upstreams, on the buffered and streaming proxy
+paths, for HTTP/1.1, HTTP/2 and HTTP/3 clients.
+
+```nginx
+location /realms/ekho/ {
+    proxy_pass http://keycloak:8080/realms/ekho/;
+    proxy_set_header Host auth.example.com;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Host auth.example.com;
+    proxy_set_header X-Forwarded-Port 443;
+    proxy_set_header X-Forwarded-For "";
+}
+```
+
+- **Overwrite, not append.** Every instance of the header is removed first,
+  whatever its case and however many times the client sent it, and so is the
+  value Tardigrade itself would have added (`X-Forwarded-For`,
+  `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Real-IP`, `X-Request-ID`, ...).
+  Then the configured value is added once.
+- **An empty value removes the header** (`proxy_set_header X-Forwarded-For "";`).
+  So does a value whose variables all expand to nothing.
+- **`Host`** sets the HTTP/1.1 `Host` line and the HTTP/2 `:authority`. The
+  connection still goes to the `proxy_pass` address. `Host` is the one header
+  that cannot be removed, because HTTP/1.1 requires `Host` and HTTP/2 requires
+  `:authority`: `proxy_set_header Host "";` is rejected at config load, and a
+  `Host` value whose variables expand to nothing (for example `$host` on a
+  request without one) falls back to the `proxy_pass` host and port.
+- **Variables:**
+
+  | Variable | Value |
+  | --- | --- |
+  | `$host` | Client `Host` (or `:authority`), port removed, lowercased; empty if absent. |
+  | `$http_host` | Client `Host` exactly as sent. |
+  | `$remote_addr` | The client IP Tardigrade resolved (the `X-Real-IP` value), after `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` / `TARDIGRADE_REAL_IP_HEADER` are applied. Never a raw client `X-Forwarded-For` entry. See the note below for HTTP/2 and HTTP/3 clients. |
+  | `$scheme` | `https` when Tardigrade terminates TLS, else `http`. |
+  | `$proxy_add_x_forwarded_for` | The `X-Forwarded-For` value Tardigrade would send: `$remote_addr` appended to the inbound chain. |
+  | `$request_id` | The request's correlation ID. |
+
+  For HTTP/2 and HTTP/3 clients, the client IP is read from
+  `TARDIGRADE_REAL_IP_HEADER` / `X-Forwarded-For` / `X-Real-IP` only when the
+  connecting peer matches an explicitly configured
+  `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` entry. Otherwise it is the
+  transport peer, so a direct client cannot choose its own address. HTTP/1.1
+  also trusts every peer when no identities are configured (the open-trust
+  default described in [PROXY_SECURITY.md](PROXY_SECURITY.md#trusted-upstream-identity)).
+
+  `${NAME}` is still config-load interpolation (from `set` or the environment),
+  as for every other directive. An unknown `$name` fails config load.
+- **Inheritance:** `proxy_set_header` in a `server {}` block applies to that
+  block's `proxy_pass` locations. A location with *any* `proxy_set_header` of
+  its own uses only its own list and does not merge with the server's (nginx's
+  rule). A top-level `proxy_set_header` is rejected; put it in a `server` or
+  `location` block.
+- **Rejected at config load (`tardi check`):** header names that are not
+  valid tokens; values containing CR, LF, NUL or other control characters; the
+  same name twice in one block; an empty `Host`; `Content-Length` and `Transfer-Encoding`
+  (request framing); `Early-Data`; `X-Tardigrade-*` (asserted identity); and
+  any non-empty value for a hop-by-hop header (`Connection`, `Keep-Alive`,
+  `Proxy-Authenticate`, `Proxy-Authorization`, `Proxy-Connection`, `TE`,
+  `Trailer`, `Upgrade`). Tardigrade always strips hop-by-hop headers itself,
+  so clearing one (`proxy_set_header Connection "";`) is accepted and does
+  nothing.
+
+### Upstream response header size
+
+HTTP/1.1 upstream response heads (status line plus headers) of at least
+32 KiB relay without tuning (verified end to end for HTTP/1.1 clients), so a large `Location` plus several session
+`Set-Cookie` headers from an identity provider passes through. There is no
+equivalent of nginx's `proxy_buffer_size` to raise.
+
+- Buffered proxying (the default): the head counts toward
+  `TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES` and has no separate limit.
+- Streaming proxying (`TARDIGRADE_PROXY_STREAMING_MODE`): a head larger than
+  `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE` spills into a fixed 64 KiB side buffer.
+  That buffer is charged in full to the stream's proxy-buffer limits
+  (`TARDIGRADE_PROXY_BUFFER_*`) before it is allocated, and released once the
+  head is parsed. Heads over 64 KiB fail with 502; a spill the proxy-buffer
+  limits cannot admit fails with 503.
+
+Large response heads from HTTP/2 upstreams have not been verified end to end.
 
 ## Top-Level Routing Directives
 

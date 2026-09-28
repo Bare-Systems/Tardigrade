@@ -329,6 +329,18 @@ derived from the actual connection:
 | `X-Forwarded-Proto` | `https` or `http` based on TLS state |
 | `X-Forwarded-Host` | The inbound `Host` header value |
 
+Other forwarded-origin headers, such as `X-Forwarded-Port` and `Forwarded`,
+are not stripped by default. Pin or clear them per location with
+`proxy_set_header` (#809), which also overrides the values in the table above:
+
+```nginx
+proxy_set_header X-Forwarded-Proto https;
+proxy_set_header X-Forwarded-Port 443;
+proxy_set_header X-Forwarded-For $remote_addr;
+```
+
+See [CONFIGURATION.md](CONFIGURATION.md#upstream-request-headers-proxy_set_header).
+
 ### Trusted upstream identity
 
 When `trust_require_upstream_identity: true` is set in the config, Tardigrade
@@ -346,6 +358,12 @@ Entries may be exact hosts/addresses or CIDR blocks (`172.16.0.0/12`), which
 suits a sidecar such as cloudflared on a Docker bridge with no fixed address.
 
 ### Resolving the client IP
+
+HTTP/2 and HTTP/3 clients follow the same order, but only when the
+connecting peer matches an explicitly configured `trusted_upstream_identities`
+entry. Without one, the transport peer stays the client IP, so a direct
+client cannot choose the address its ACL, rate-limit and `$remote_addr`
+(`proxy_set_header`) decisions use.
 
 For a trusted peer, Tardigrade resolves the client IP (nginx `real_ip_header`
 / `set_real_ip_from` / `real_ip_recursive on` semantics):

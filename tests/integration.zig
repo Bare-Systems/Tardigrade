@@ -582,6 +582,20 @@ const H2cUpstreamServer = struct {
         return allocator.dupe(u8, self.body);
     }
 
+    /// Value of the first `name: value` line in the last request's decoded
+    /// header block (pseudo-headers included), duplicated into `allocator`.
+    fn capturedHeaderValue(self: *H2cUpstreamServer, allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var lines = std.mem.splitScalar(u8, self.headers_raw, '\n');
+        while (lines.next()) |line| {
+            // Pseudo-header names start with ':', so split on the separator.
+            const sep = std.mem.find(u8, line, ": ") orelse continue;
+            if (std.ascii.eqlIgnoreCase(line[0..sep], name)) return try allocator.dupe(u8, line[sep + 2 ..]);
+        }
+        return null;
+    }
+
     /// True when a `name: value` line is present in the last request's decoded
     /// header block. Used to assert both presence and absence.
     fn capturedHasHeader(self: *H2cUpstreamServer, name: []const u8) bool {
@@ -1842,7 +1856,12 @@ fn handleUpstreamConnection(server: *UpstreamServer, conn: compat.NetConnection)
             response_spec.connection_header,
         });
         for (response_spec.headers) |header| {
-            try conn.stream.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
+            // Piecewise: `print` formats into a 4 KiB stack buffer, and #809
+            // relays single header lines larger than that.
+            try conn.stream.writer().writeAll(header.name);
+            try conn.stream.writer().writeAll(": ");
+            try conn.stream.writer().writeAll(header.value);
+            try conn.stream.writer().writeAll("\r\n");
         }
         try conn.stream.writer().writeAll("\r\n");
         if (!response_spec.omit_body) {
@@ -15949,6 +15968,436 @@ test "untrusted peer cannot set the client IP or forward a forged real-IP header
     try std.testing.expect(upstream.capturedHeader("CF-Connecting-IP") == null);
     try std.testing.expectEqualStrings("127.0.0.1", upstream.capturedHeader("X-Real-IP").?);
     try std.testing.expectEqualStrings("127.0.0.1", upstream.capturedHeader("X-Forwarded-For").?);
+}
+
+fn proxySetHeaderConfig(allocator: std.mem.Allocator, upstream_port: u16) ![]u8 {
+    // The Ekho keycloak-proxy pins (#809), plus a trusted-client-IP variable.
+    return std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /realms/ekho/ {{
+        \\    proxy_pass http://{s}:{d}/realms/ekho/;
+        \\    proxy_set_header Host auth.baresystems.com;
+        \\    proxy_set_header X-Forwarded-For "";
+        \\    proxy_set_header X-Forwarded-Host auth.baresystems.com;
+        \\    proxy_set_header X-Forwarded-Port 443;
+        \\    proxy_set_header X-Forwarded-Proto https;
+        \\}}
+        \\
+        \\location = /client-ip {{
+        \\    proxy_pass http://{s}:{d}/client-ip;
+        \\    proxy_set_header X-Forwarded-For $remote_addr;
+        \\    proxy_set_header X-Origin "$scheme://$host";
+        \\}}
+    , .{ test_host, upstream_port, test_host, upstream_port });
+}
+
+fn expectEkhoPinnedHeaders(upstream: *UpstreamServer) !void {
+    upstream.mutex.lock();
+    defer upstream.mutex.unlock();
+    const raw = upstream.capture.headers_raw;
+    try std.testing.expectEqualStrings("auth.baresystems.com", headerValue(raw, "Host").?);
+    try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(raw, "Host"));
+    try std.testing.expectEqualStrings("https", headerValue(raw, "X-Forwarded-Proto").?);
+    try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(raw, "X-Forwarded-Proto"));
+    try std.testing.expectEqualStrings("auth.baresystems.com", headerValue(raw, "X-Forwarded-Host").?);
+    try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(raw, "X-Forwarded-Host"));
+    try std.testing.expectEqualStrings("443", headerValue(raw, "X-Forwarded-Port").?);
+    try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(raw, "X-Forwarded-Port"));
+    try std.testing.expectEqual(@as(usize, 0), countHeaderOccurrences(raw, "X-Forwarded-For"));
+}
+
+const forged_forwarded_headers = [_]RequestHeader{
+    .{ .name = "X-Forwarded-Proto", .value = "http" },
+    .{ .name = "x-forwarded-proto", .value = "gopher" },
+    .{ .name = "X-Forwarded-Host", .value = "evil.example" },
+    .{ .name = "X-FORWARDED-HOST", .value = "evil2.example" },
+    .{ .name = "X-Forwarded-Port", .value = "80" },
+    .{ .name = "x-forwarded-port", .value = "8080" },
+    .{ .name = "X-Forwarded-For", .value = "6.6.6.6" },
+};
+
+test "proxy_set_header pins upstream headers and overrides forged client values (#809)" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "pinned" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try proxySetHeaderConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/realms/ekho/protocol/openid-connect/auth",
+        .body = null,
+        .headers = &forged_forwarded_headers,
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try expectEkhoPinnedHeaders(&upstream);
+}
+
+test "proxy_set_header pins upstream headers on the streaming relay (#809)" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "pinned-streamed" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try proxySetHeaderConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/realms/ekho/account",
+        .body = null,
+        .headers = &forged_forwarded_headers,
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "pinned-streamed");
+    try expectEkhoPinnedHeaders(&upstream);
+}
+
+test "proxy_set_header $remote_addr uses the trusted client IP, not a spoofed X-Forwarded-For (#809)" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "client-ip" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try proxySetHeaderConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES", .value = "127.0.0.0/8" },
+            .{ .name = "TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY", .value = "true" },
+            .{ .name = "TARDIGRADE_REAL_IP_HEADER", .value = "CF-Connecting-IP" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/client-ip",
+        .body = null,
+        .headers = &.{
+            .{ .name = "CF-Connecting-IP", .value = "198.51.100.30" },
+            .{ .name = "X-Forwarded-For", .value = "6.6.6.6" },
+        },
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+
+    upstream.mutex.lock();
+    defer upstream.mutex.unlock();
+    const raw = upstream.capture.headers_raw;
+    try std.testing.expectEqualStrings("198.51.100.30", headerValue(raw, "X-Forwarded-For").?);
+    try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(raw, "X-Forwarded-For"));
+    try std.testing.expectEqualStrings("http://127.0.0.1", headerValue(raw, "X-Origin").?);
+}
+
+test "proxy_set_header Host becomes the h2 upstream :authority (#809)" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try H2cUpstreamServer.start(allocator, "h2c-pinned");
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try proxySetHeaderConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_PROTOCOL", .value = "h2c" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/realms/ekho/account",
+        .body = null,
+        .headers = &forged_forwarded_headers,
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "h2c-pinned");
+
+    const authority = (try upstream.capturedHeaderValue(allocator, ":authority")).?;
+    defer allocator.free(authority);
+    try std.testing.expectEqualStrings("auth.baresystems.com", authority);
+    try std.testing.expect(!upstream.capturedHasHeader("host"));
+    try std.testing.expect(!upstream.capturedHasHeader("x-forwarded-for"));
+    const proto = (try upstream.capturedHeaderValue(allocator, "x-forwarded-proto")).?;
+    defer allocator.free(proto);
+    try std.testing.expectEqualStrings("https", proto);
+}
+
+test "interop.h2.proxy_set_header_pins_headers_for_http2_clients (#809)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "h2-pinned" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try proxySetHeaderConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const request_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/realms/ekho/account" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+        .{ .name = "x-forwarded-proto", .value = "http" },
+        .{ .name = "x-forwarded-host", .value = "evil.example" },
+        .{ .name = "x-forwarded-for", .value = "6.6.6.6" },
+    };
+    const body = try pureZigH2GetBody(allocator, tardigrade.port, request_headers[0..]);
+    defer allocator.free(body);
+    try assertContains(body, "h2-pinned");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+    try expectEkhoPinnedHeaders(&upstream);
+}
+
+fn startH2ClientIpTardigrade(allocator: std.mem.Allocator, config_text: []const u8, tls_paths: anytype, trusted: []const u8) !TardigradeProcess {
+    return TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES", .value = trusted },
+            .{ .name = "TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY", .value = "true" },
+            .{ .name = "TARDIGRADE_REAL_IP_HEADER", .value = "CF-Connecting-IP" },
+        },
+    });
+}
+
+const h2_client_ip_request = [_]hpack.HeaderField{
+    .{ .name = ":method", .value = "GET" },
+    .{ .name = ":path", .value = "/client-ip" },
+    .{ .name = ":scheme", .value = "https" },
+    .{ .name = ":authority", .value = "tardigrade.test" },
+    .{ .name = "cf-connecting-ip", .value = "198.51.100.30" },
+    .{ .name = "x-forwarded-for", .value = "6.6.6.6" },
+};
+
+test "interop.h2.proxy_set_header_remote_addr_uses_trusted_client_ip (#809)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "h2-client-ip" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try proxySetHeaderConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    // The test client (127.0.0.1) is the trusted proxy tier: its
+    // CF-Connecting-IP names the client, and the spoofed XFF is ignored.
+    var tardigrade = try startH2ClientIpTardigrade(allocator, config_text, &tls_paths, "127.0.0.0/8");
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const body = try pureZigH2GetBody(allocator, tardigrade.port, h2_client_ip_request[0..]);
+    defer allocator.free(body);
+    try assertContains(body, "h2-client-ip");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+
+    upstream.mutex.lock();
+    defer upstream.mutex.unlock();
+    const raw = upstream.capture.headers_raw;
+    try std.testing.expectEqualStrings("198.51.100.30", headerValue(raw, "X-Forwarded-For").?);
+    try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(raw, "X-Forwarded-For"));
+    try std.testing.expectEqualStrings("198.51.100.30", headerValue(raw, "X-Real-IP").?);
+}
+
+test "interop.h2.untrusted_peer_cannot_choose_remote_addr (#809)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "h2-untrusted" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try proxySetHeaderConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    // Only 10.0.0.0/8 is trusted, so the 127.0.0.1 client is a direct
+    // client: its CF-Connecting-IP / XFF neither pick $remote_addr nor reach
+    // the origin.
+    var tardigrade = try startH2ClientIpTardigrade(allocator, config_text, &tls_paths, "10.0.0.0/8");
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const body = try pureZigH2GetBody(allocator, tardigrade.port, h2_client_ip_request[0..]);
+    defer allocator.free(body);
+    try assertContains(body, "h2-untrusted");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+
+    upstream.mutex.lock();
+    defer upstream.mutex.unlock();
+    const raw = upstream.capture.headers_raw;
+    try std.testing.expectEqualStrings("127.0.0.1", headerValue(raw, "X-Forwarded-For").?);
+    try std.testing.expectEqualStrings("127.0.0.1", headerValue(raw, "X-Real-IP").?);
+    try std.testing.expect(headerValue(raw, "CF-Connecting-IP") == null);
+}
+
+test "tardi check rejects an empty proxy_set_header Host (#809)" {
+    const allocator = std.testing.allocator;
+    const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-proxy-set-header-host-{d}.conf", .{compat.nanoTimestamp()});
+    defer {
+        compat.cwd().deleteFile(config_rel) catch {};
+        allocator.free(config_rel);
+    }
+    try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = "location / {\n    proxy_pass http://127.0.0.1:9;\n    proxy_set_header Host \"\";\n}\n" });
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expect(result.term != .exited or result.term.exited != 0);
+    try assertContains(result.stderr, "proxy_set_header Host cannot be empty");
+}
+
+test "tardi check rejects proxy_set_header framing headers and CR/LF (#809)" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_][]const u8{
+        "location / {\n    proxy_pass http://127.0.0.1:9;\n    proxy_set_header Content-Length 0;\n}\n",
+        "location / {\n    proxy_pass http://127.0.0.1:9;\n    proxy_set_header Transfer-Encoding chunked;\n}\n",
+        "location / {\n    proxy_pass http://127.0.0.1:9;\n    proxy_set_header X-A \"a\rX-B: 1\";\n}\n",
+        "location / {\n    proxy_pass http://127.0.0.1:9;\n    proxy_set_header X-A $hots;\n}\n",
+    };
+    for (cases) |config_text| {
+        const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-proxy-set-header-check-{d}.conf", .{compat.nanoTimestamp()});
+        defer {
+            compat.cwd().deleteFile(config_rel) catch {};
+            allocator.free(config_rel);
+        }
+        try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = config_text });
+
+        var env_map = try inheritedEnvMap(allocator);
+        defer env_map.deinit();
+        const result = try std.process.run(allocator, compat.io(), .{
+            .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+            .environ_map = &env_map,
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expect(result.term != .exited or result.term.exited != 0);
+        try assertContains(result.stderr, "proxy_set_header");
+    }
+}
+
+test "proxy relays at least 32 KB of upstream response headers (#809)" {
+    const allocator = std.testing.allocator;
+
+    // A large-scope authorization response: long Location plus several
+    // session cookies, well past nginx's default 4-8 KB proxy_buffer_size.
+    const cookie_value = "c" ** 8000;
+    const location_value = "https://auth.baresystems.com/realms/ekho/login-actions/authenticate?scope=" ++ ("openid%20" ** 400);
+    const big_headers = [_]ResponseHeader{
+        .{ .name = "Location", .value = location_value },
+        .{ .name = "Set-Cookie", .value = "KC_A=" ++ cookie_value ++ "; Path=/; Secure; HttpOnly" },
+        .{ .name = "Set-Cookie", .value = "KC_B=" ++ cookie_value ++ "; Path=/; Secure; HttpOnly" },
+        .{ .name = "Set-Cookie", .value = "KC_C=" ++ cookie_value ++ "; Path=/; Secure; HttpOnly" },
+        .{ .name = "Set-Cookie", .value = "KC_D=" ++ cookie_value ++ "; Path=/; Secure; HttpOnly" },
+    };
+    var total: usize = 0;
+    for (big_headers) |h| total += h.name.len + h.value.len + 4;
+    try std.testing.expect(total >= 32 * 1024);
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 302, .headers = &big_headers, .body = "" },
+        .{ .status_code = 302, .headers = &big_headers, .body = "" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try proxySetHeaderConfig(allocator, upstream.port());
+    defer allocator.free(config_text);
+
+    inline for (.{ "off", "response" }) |mode| {
+        var tardigrade = try TardigradeProcess.start(allocator, .{
+            .config_text = config_text,
+            .ready_path = "/healthz",
+            .extra_env = &.{
+                .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = mode },
+            },
+        });
+        defer tardigrade.stop();
+
+        var response = try sendRequest(allocator, tardigrade.port, .{
+            .method = "GET",
+            .path = "/realms/ekho/protocol/openid-connect/auth",
+            .body = null,
+            .headers = &.{},
+        });
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 302), response.status_code);
+        try std.testing.expectEqualStrings(location_value, response.header("Location").?);
+        try std.testing.expectEqual(@as(usize, 4), countHeaderOccurrences(response.raw, "Set-Cookie"));
+    }
 }
 
 test "proxy requests preserve safe request ids and structured access logs include upstream metadata" {

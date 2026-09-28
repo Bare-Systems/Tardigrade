@@ -371,6 +371,16 @@ pub const entries = [_]ConfigEntry{
         .example = "location /idempotent/ {\n    proxy_pass http://up;\n    proxy_early_data rfc8470;\n}",
         .docs = &.{"docs/QUIC_TLS.md"},
     },
+    .{
+        .name = "location.proxy_set_header",
+        .aliases = &.{"proxy_set_header"},
+        .contexts = &[_]Context{ .server, .location },
+        .value_type = "header-name value",
+        .default_value = "none",
+        .description = "Sets, overwrites or clears an upstream request header. Every client-sent and Tardigrade-generated instance of the name (any case) is removed first; an empty value (\"\") only removes it. Variables: $host, $http_host, $remote_addr (trusted client IP), $scheme, $proxy_add_x_forwarded_for, $request_id. A location with any proxy_set_header replaces the server block's list rather than merging. Content-Length, Transfer-Encoding, Early-Data and X-Tardigrade-* are rejected; hop-by-hop headers may only be cleared; Host cannot be cleared (an empty expansion falls back to the proxy_pass host).",
+        .example = "location /realms/ekho/ {\n    proxy_pass http://keycloak:8080/realms/ekho/;\n    proxy_set_header Host auth.example.com;\n    proxy_set_header X-Forwarded-Proto https;\n    proxy_set_header X-Forwarded-For $remote_addr;\n}",
+        .docs = &.{ "docs/CONFIGURATION.md", "docs/PROXY_SECURITY.md" },
+    },
 
     // ---- TLS ---------------------------------------------------------------
     .{

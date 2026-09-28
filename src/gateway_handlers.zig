@@ -516,6 +516,9 @@ fn minimalAuthConfig(blocks: []http.location_router.LocationBlock, token_hashes:
     var cfg: edge_config.EdgeConfig = undefined;
     cfg.access_control_rules = "";
     cfg.parsed_access_control = null;
+    cfg.trust_require_upstream_identity = false;
+    cfg.trusted_upstream_identities = &.{};
+    cfg.real_ip_header = "";
     cfg.basic_auth_hashes = &.{};
     cfg.auth_token_hashes = token_hashes;
     cfg.jwt_secret = "";
@@ -2012,6 +2015,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
     client_ip: []const u8,
     forwarded_proto: []const u8,
     incoming_host: ?[]const u8,
+    proxy_set_headers: []const http.location_router.ProxySetHeader,
     selection_base_url: []const u8,
     absolute_target: bool,
     budget_start_ms: u64,
@@ -2068,6 +2072,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
             self.forwarded_proto,
             self.incoming_host,
             null,
+            self.proxy_set_headers,
             null,
             null,
             null,
@@ -2209,6 +2214,8 @@ const Http3Early425ProxyContinuation = struct {
     client_ip: []u8,
     forwarded_proto: []u8,
     incoming_host: ?[]u8,
+    /// Borrowed from the location block; `config_lease` keeps it alive.
+    proxy_set_headers: []const http.location_router.ProxySetHeader,
     selection_base_url: []const u8,
     absolute_target: bool,
     budget_start_ms: u64,
@@ -2262,6 +2269,7 @@ const Http3Early425ProxyContinuation = struct {
             .client_ip = client_ip,
             .forwarded_proto = forwarded_proto,
             .incoming_host = incoming_host,
+            .proxy_set_headers = executor.proxy_set_headers,
             .selection_base_url = executor.selection_base_url,
             .absolute_target = executor.absolute_target,
             .budget_start_ms = executor.budget_start_ms,
@@ -2327,6 +2335,7 @@ const Http3Early425ProxyContinuation = struct {
             self.forwarded_proto,
             self.incoming_host,
             null,
+            self.proxy_set_headers,
             null,
             null,
             null,
@@ -2465,6 +2474,22 @@ fn handleHttp3LocationProxyPass(
     defer upstream_url.deinit(allocator);
     const absolute_target = gs.isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"));
 
+    // An untrusted QUIC peer's forwarded-client headers must not reach the
+    // origin or extend the forwarded chain (#791); the request is shared, so
+    // proxy a filtered copy rather than editing it.
+    var filtered_headers: ?http.Headers = null;
+    defer if (filtered_headers) |*headers| headers.deinit();
+    if (!gph.isTrustedUpstream(ctx.cfg, request.client_ip orelse "unknown")) {
+        var headers = http.Headers.init(allocator);
+        errdefer headers.deinit();
+        for (request.headers.iterator()) |header| {
+            if (gph.isForwardedClientHeader(ctx.cfg, header.name)) continue;
+            try headers.append(header.name, header.value);
+        }
+        filtered_headers = headers;
+    }
+    const proxy_headers: *const http.Headers = if (filtered_headers) |*headers| headers else &request.headers;
+
     const max_attempts = gproxy_runtime.proxyRetryAttemptLimit(ctx.cfg.upstream_retry_attempts, ctx.cfg.upstream_retry_idempotent_only, request.method);
     var attempt_executor = Http3BufferedProxyAttemptExecutor{
         .allocator = allocator,
@@ -2475,12 +2500,13 @@ fn handleHttp3LocationProxyPass(
         .upstream_url = upstream_url.value,
         .unix_socket_path = resolved.unix_socket_path,
         .method = request.method,
-        .headers = &request.headers,
+        .headers = proxy_headers,
         .body = request.body,
         .correlation_id = correlation_id,
         .client_ip = ctx.client_ip,
         .forwarded_proto = if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
         .incoming_host = request.headers.get(":authority") orelse request.headers.get("host"),
+        .proxy_set_headers = matched.block.proxy_set_headers,
         .selection_base_url = ctx.cfg.upstream_base_url,
         .absolute_target = absolute_target,
         .budget_start_ms = http.event_loop.monotonicMs(),
@@ -3886,6 +3912,63 @@ test "H3 ACL uses the transport peer address instead of spoofable X-Real-IP" {
     try std.testing.expect(std.mem.find(u8, response.body orelse "", "Access denied") != null);
 }
 
+fn runH3ClientIpAclRequest(peer_ip: []const u8, real_ip: []const u8) !u16 {
+    const allocator = std.testing.allocator;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/private",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "allowed" } },
+    }};
+    var trusted = [_][]const u8{"192.0.2.10"};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.trusted_upstream_identities = trusted[0..];
+    cfg.trust_require_upstream_identity = true;
+    cfg.real_ip_header = "CF-Connecting-IP";
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var acl = try http.access_control.AccessControl.fromConfig(
+        allocator,
+        "deny 198.51.100.30/32, allow 0.0.0.0/0",
+        .allow,
+    );
+    defer acl.deinit();
+    cfg.access_control_rules = "deny 198.51.100.30/32, allow 0.0.0.0/0";
+    cfg.parsed_access_control = &acl;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/private"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, peer_ip),
+    };
+    defer request.deinit();
+    try request.headers.append("cf-connecting-ip", real_ip);
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+    return @intFromEnum(response.status);
+}
+
+test "H3 resolves the client IP from an explicitly trusted proxy peer (#809)" {
+    // Behind the configured proxy tier the real-IP header names the client, so
+    // ACLs, rate limits and `$remote_addr` agree with HTTP/1.
+    try std.testing.expectEqual(@as(u16, 403), try runH3ClientIpAclRequest("192.0.2.10", "198.51.100.30"));
+    // A direct (untrusted) peer cannot choose its address with the same header.
+    try std.testing.expectEqual(@as(u16, 200), try runH3ClientIpAclRequest("203.0.113.77", "198.51.100.30"));
+}
+
 test "H3 geo policy rejects a forged country header from an untrusted peer" {
     const allocator = std.testing.allocator;
     var blocks = [_]http.location_router.LocationBlock{.{
@@ -4461,10 +4544,24 @@ pub fn handleHttp3Request(
         return;
     }
 
+    // Behind an explicitly trusted proxy tier, resolve the client IP as the
+    // HTTP/1 front end does (#791), so rate limiting, ACLs, `X-Real-IP` and
+    // `proxy_set_header ... $remote_addr` (#809) see the real client rather
+    // than the connecting proxy. Without configured trust the QUIC peer stays
+    // authoritative, so a direct client cannot pick its address (#756).
+    const peer_ip = request.client_ip orelse "unknown";
+    const client_ip = http.request_context.extractClientIpFromHeaders(
+        &request.headers,
+        gph.isExplicitlyTrustedUpstream(effective_cfg, peer_ip),
+        effective_cfg.real_ip_header,
+        gph.TrustedProxySet{ .cfg = effective_cfg },
+        peer_ip,
+    );
+
     var effective_ctx = ctx.*;
     effective_ctx.cfg = effective_cfg;
     effective_ctx.cfg_lease = &cfg_lease;
-    effective_ctx.client_ip = request.client_ip orelse "unknown";
+    effective_ctx.client_ip = client_ip;
 
     // Preserve the H1 invariant that replay rejection happens before auth,
     // rate-limit, approval, or upstream side effects. The normal H3 router
@@ -4494,7 +4591,7 @@ pub fn handleHttp3Request(
     }
 
     const correlation_id = request.headers.get(http.correlation.REQUEST_HEADER_NAME) orelse request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
-    var request_ctx = http.request_context.RequestContext.init(allocator, correlation_id, request.client_ip orelse "unknown");
+    var request_ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
     defer {
         if (request_ctx.identity) |value| allocator.free(value);
         if (request_ctx.user_id) |value| allocator.free(value);

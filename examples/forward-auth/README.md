@@ -40,7 +40,9 @@ kill %1; curl -i http://localhost:8080/admin/                          # → 503
    every client-supplied copy of those names is removed. Headers listed in
    `forward_auth_client_headers` (for example a refreshed `Set-Cookie`) are
    added to the response the client receives, whether it is proxied,
-   streamed, static or local.
+   streamed, static or local, including after a rewrite or `try_files`
+   fallback. If a rewrite leads to another protected location that denies the
+   request, no earlier grant's headers are sent.
 4. **3xx / 4xx** denies it. The auth service's status, body, `Content-Type`,
    `Location` (3xx), `WWW-Authenticate` (401) and any
    `forward_auth_client_headers` are returned to the client.
@@ -74,7 +76,12 @@ proxied request. Tardigrade then sets:
 Client headers in the `X-Forwarded-*` and `X-Original-*` namespaces (for
 example `X-Forwarded-User` or `X-Original-URL`), `Forwarded`, and the
 location's `forward_auth_upstream_headers` names are never passed through, so
-a client cannot hand the auth service a forged proxy assertion.
+a client cannot hand the auth service a forged proxy assertion. The exception
+is `Authorization` and `Cookie`: they are the client's credentials, so the
+auth service always receives them, even when `forward_auth_upstream_headers`
+names them. In that case only the upstream request gets the auth service's
+value, which enables token exchange (verify the client's bearer token, send
+the origin a different one).
 
 ## Key directives
 
@@ -88,8 +95,10 @@ a client cannot hand the auth service a forged proxy assertion.
 | `forward_auth_failure_status <status>;` | `503` | One of 401, 403, 500, 502, 503, 504. |
 
 Header lists cannot name hop-by-hop headers, `Host`, `Content-*`,
-`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, request/correlation IDs, trace
-context, or `X-Tardigrade-*`; those are owned by Tardigrade.
+`Cache-Control`, `X-Forwarded-*`, `Forwarded`, `X-Real-IP`,
+request/correlation IDs, trace context, or `X-Tardigrade-*`; those are owned
+by Tardigrade. `Cache-Control` is excluded so an auth response can never make
+an access decision cacheable.
 
 ## Notes
 

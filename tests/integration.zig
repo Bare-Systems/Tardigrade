@@ -3998,7 +3998,10 @@ test "h3interop.forward_auth.deny_then_allow" {
 
     var auth = try UpstreamServer.start(allocator, &.{
         .{ .status_code = 403, .body = "h3-denied", .connection_header = "close" },
-        .{ .status_code = 200, .body = "", .connection_header = "close", .headers = &.{.{ .name = "X-Auth-Request-User", .value = "h3-alice" }} },
+        .{ .status_code = 200, .body = "", .connection_header = "close", .headers = &.{
+            .{ .name = "X-Auth-Request-User", .value = "h3-alice" },
+            .{ .name = "Set-Cookie", .value = "h3-refreshed=1" },
+        } },
     });
     defer auth.stop();
     try auth.run();
@@ -4014,6 +4017,7 @@ test "h3interop.forward_auth.deny_then_allow" {
         \\location = /h3-admin {{
         \\    forward_auth http://{s}:{d}/verify;
         \\    forward_auth_upstream_headers X-Auth-Request-User;
+        \\    forward_auth_client_headers Set-Cookie;
         \\    proxy_pass http://{s}:{d}/h3-admin;
         \\}}
     , .{ test_host, auth.port(), test_host, upstream.port() });
@@ -4067,6 +4071,8 @@ test "h3interop.forward_auth.deny_then_allow" {
     defer allowed.deinit(allocator);
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(allowed.outcome));
     try assertContains(allowed.stderr, "[:status: 200]");
+    // The external client logs each received field as `[name: value]`.
+    try assertContains(allowed.stderr, "[set-cookie: h3-refreshed=1]");
     try waitForUpstreamCount(&upstream, 1, 2_000);
     try std.testing.expectEqualStrings("h3-alice", upstream.capturedHeader("X-Auth-Request-User").?);
     try std.testing.expectEqual(@as(u32, 2), auth.requestCount());
@@ -13738,6 +13744,54 @@ test "forward_auth protects proxied and static locations over h1" {
     try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
     try assertContains(metrics.body, "tardigrade_forward_auth_total{protocol=\"h1\",outcome=\"allowed\"} 4");
     try assertContains(metrics.body, "tardigrade_forward_auth_total{protocol=\"h1\",outcome=\"denied\"} 3");
+}
+
+test "forward_auth verifies the client's bearer token and asserts a different one upstream" {
+    const allocator = std.testing.allocator;
+
+    var auth = try UpstreamServer.start(allocator, &.{.{ .status_code = 200, .body = "", .headers = &.{
+        .{ .name = "Authorization", .value = "Bearer service-minted" },
+    } }});
+    defer auth.stop();
+    try auth.run();
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "token-exchange-ok" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /api/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_upstream_headers Authorization;
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, auth.port(), test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/api/items",
+        .body = null,
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer client-inbound" }},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    // The verifier sees the client's credential...
+    try std.testing.expectEqualStrings("Bearer client-inbound", auth.capturedHeader("Authorization").?);
+    // ...and the origin sees only the credential the auth service asserted.
+    try std.testing.expectEqualStrings("Bearer service-minted", upstream.capturedHeader("Authorization").?);
+    try std.testing.expect(std.mem.find(u8, upstream.capture.headers_raw, "client-inbound") == null);
 }
 
 test "forward_auth fails closed when the auth service is unreachable or slow" {

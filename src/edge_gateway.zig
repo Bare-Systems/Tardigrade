@@ -2885,9 +2885,8 @@ fn h2DispatchReadyStreams(
             state.metricsRecordEarlyDataRequest(.h2, .transport);
             ps.early_request_recorded = true;
         }
-        if (ps.transport_early) {
-            state.metricsRecordEarlyDataDecision(.h2, .accepted);
-        }
+        // The accept/reject decision for a transport-early stream is recorded
+        // by `respondHttp2Stream`, once routing has had its say (#761).
 
         try respondHttp2Stream(conn, allocator, state, cfg, sid, ps, next_server_stream_id, streams, pending_responses, conn_send_window, connection_ip);
         ps.dispatch_count += 1;
@@ -3424,7 +3423,12 @@ fn respondHttp2Stream(
     // decorate whatever response the location produces (#761).
     var forward_auth_allowed: ?gfa.Decision = null;
     defer if (forward_auth_allowed) |*allowed| allowed.deinit();
-    if (try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle, &forward_auth_allowed)) |result| {
+    // Exactly one early-data decision per transport-early stream: routing
+    // records `too_early` itself when it refuses one; otherwise it was
+    // accepted.
+    var early_data_refused = false;
+    defer if (ps.transport_early and !early_data_refused) state.metricsRecordEarlyDataDecision(.h2, .accepted);
+    if (try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle, &forward_auth_allowed, &early_data_refused)) |result| {
         switch (result) {
             .response => |proxy_response| {
                 var response = proxy_response;
@@ -3627,6 +3631,7 @@ fn executeHttp2ProxyRoute(
     connection_ip: []const u8,
     lifecycle: *http.request_lifecycle.RequestLifecycle,
     forward_auth_allowed: *?gfa.Decision,
+    early_data_refused: *bool,
 ) !?Http2ProxyRouteResult {
     if (ps.body_limit_exceeded) return .{ .local_rejection = .{
         .status_code = @intFromEnum(http.Status.payload_too_large),
@@ -3703,6 +3708,7 @@ fn executeHttp2ProxyRoute(
         // a side effect, so refuse before it, as H1/H3 do (#761).
         if (ps.transport_early or request.headers.hasEarlyDataMarker()) {
             state.metricsRecordEarlyDataDecision(.h2, .too_early);
+            early_data_refused.* = true;
             return .{ .local_rejection = .{
                 .status_code = @intFromEnum(http.Status.too_early),
                 .code = "too_early",
@@ -6819,6 +6825,11 @@ test "H2 resumed 0-RTT stream to a forward_auth location gets 425 without callin
     try std.testing.expect(std.mem.find(u8, written, "no-store") != null);
     try std.testing.expect(std.mem.find(u8, written, "admin-secret") == null);
     try std.testing.expectEqual(@as(usize, 0), auth_server.requestCount());
+    // One request, one decision: refused, never also counted as accepted.
+    const prom = try h.state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h2\",decision=\"too_early\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h2\",decision=\"accepted\"} 0") != null);
 }
 
 test "H2 forward_auth allow serves a protected static location with the auth Set-Cookie" {
@@ -7637,6 +7648,46 @@ test "H1 forward_auth allow adds allowlisted auth headers to the action response
     try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "set-cookie: refreshed=1") != null);
     try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "set-cookie: csrf=2") != null);
     // The scope ends with the request: nothing leaks onto later responses.
+    try std.testing.expectEqual(@as(usize, 0), http.security_headers.requestScopedHeaders().len);
+}
+
+test "H1 forward_auth grant survives a rewrite into the static fallback" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "landing.txt", .data = "fallback-landing" });
+    const doc_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(doc_root);
+
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/old",
+        .priority = 0,
+        .action = .{ .rewrite = .{ .replacement = "/landing.txt", .flag = .last } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .client_headers = &.{"Set-Cookie"} },
+    }};
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.doc_root = doc_root;
+    cfg.try_files = "";
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /old HTTP/1.1\r\nHost: example.test\r\n\r\n", &conn, &effects, &state);
+
+    try std.testing.expectEqual(@as(u16, 200), outcome.route_status);
+    const written = conn.out.written();
+    try std.testing.expect(std.mem.find(u8, written, "fallback-landing") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "set-cookie: refreshed=1") != null);
     try std.testing.expectEqual(@as(usize, 0), http.security_headers.requestScopedHeaders().len);
 }
 

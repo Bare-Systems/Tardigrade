@@ -167,6 +167,9 @@ pub fn isProtectedForwardAuthHeader(name: []const u8) bool {
         "content-encoding",  "content-type",     "forwarded",  "x-real-ip",
         "x-request-id",      "x-correlation-id", "early-data", "traceparent",
         "tracestate",        "server",           "alt-svc",    "expect",
+        // Denials and failures are always `no-store`; an auth response must
+        // not be able to make an access decision cacheable.
+        "cache-control",
     };
     for (protected_names) |protected| {
         if (std.ascii.eqlIgnoreCase(name, protected)) return true;
@@ -179,6 +182,7 @@ test "isProtectedForwardAuthHeader rejects trust and framing headers" {
     try std.testing.expect(isProtectedForwardAuthHeader("X-Forwarded-For"));
     try std.testing.expect(isProtectedForwardAuthHeader("Content-Length"));
     try std.testing.expect(isProtectedForwardAuthHeader("traceparent"));
+    try std.testing.expect(isProtectedForwardAuthHeader("Cache-Control"));
     try std.testing.expect(!isProtectedForwardAuthHeader("X-Auth-Request-User"));
     try std.testing.expect(!isProtectedForwardAuthHeader("Remote-User"));
     try std.testing.expect(!isProtectedForwardAuthHeader("Set-Cookie"));

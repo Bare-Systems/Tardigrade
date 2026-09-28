@@ -242,7 +242,10 @@ fn classifyTransportError(err: anyerror) Outcome {
 /// dropped, not just the names Tardigrade sets: auth services commonly trust
 /// proxy-style assertions such as `X-Forwarded-User` or `X-Original-URL`. The
 /// location's `identity_names` (its `forward_auth_upstream_headers`) are
-/// dropped too, since they name exactly what the auth service asserts.
+/// dropped too, since they name exactly what the auth service asserts --
+/// except `Authorization` and `Cookie`, which are the client's credentials
+/// the auth service must verify. Those are only replaced on the upstream
+/// request, by `applyUpstreamHeaders`.
 fn appendAuthRequestHeaders(
     headers: *std.array_list.Managed(std.http.Header),
     input: Input,
@@ -256,7 +259,7 @@ fn appendAuthRequestHeaders(
         if (gph.shouldSkipUpstreamRequestHeader(header.name, null)) continue;
         if (gph.anyConnectionHeaderReferencesHeader(request_headers, header.name)) continue;
         if (isAssertedAuthRequestHeader(header.name)) continue;
-        if (nameListed(header.name, identity_names)) continue;
+        if (nameListed(header.name, identity_names) and !isClientCredentialHeader(header.name)) continue;
         if (!has_body and isBodyHeader(header.name)) continue;
         try headers.append(.{ .name = header.name, .value = header.value });
     }
@@ -300,6 +303,10 @@ fn isAssertedAuthRequestHeader(name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
     }
     return false;
+}
+
+fn isClientCredentialHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "authorization") or std.ascii.eqlIgnoreCase(name, "cookie");
 }
 
 fn isBodyHeader(name: []const u8) bool {
@@ -362,8 +369,10 @@ pub fn shapeResponse(allocator: std.mem.Allocator, response: *http.Response, dec
         _ = response.setBodyOwned(payload).setContentType("application/json");
     }
     // Auth decisions are per-request, and a generated failure may carry a
-    // 401/403 status; never let a shared cache replay either.
-    _ = response.setHeaderIfAbsent("Cache-Control", "no-store");
+    // 401/403 status; never let a shared cache replay either. Enforced, not
+    // defaulted: any Cache-Control already on the response is replaced.
+    response.headers.remove("cache-control");
+    try response.headers.append("Cache-Control", "no-store");
 }
 
 /// Add the decision's client headers to a response, keeping every value so
@@ -671,6 +680,46 @@ test "authorize never copies auth-response fields nominated by Connection" {
     try std.testing.expectEqual(@as(u16, 302), denied.status);
     try std.testing.expectEqual(@as(usize, 1), denied.client_headers.len);
     try std.testing.expect(std.ascii.eqlIgnoreCase("location", denied.client_headers[0].name));
+}
+
+test "denials stay no-store even if a Cache-Control reached the client headers" {
+    const allocator = std.testing.allocator;
+    // Config validation rejects Cache-Control in the allowlists; this proves
+    // the response policy holds on its own.
+    var decision = Decision{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .outcome = .denied,
+        .status = 403,
+        .client_headers = &.{.{ .name = "Cache-Control", .value = "public, max-age=3600" }},
+    };
+    defer decision.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setHeader("Cache-Control", "public");
+    try shapeResponse(allocator, &response, &decision, "req-cc");
+    try std.testing.expectEqual(@as(usize, 1), response.headers.countByName("cache-control"));
+    try std.testing.expectEqualStrings("no-store", response.headers.get("cache-control").?);
+}
+
+test "credential headers reach the auth service even when named as upstream identity" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var request_headers = http.Headers.init(allocator);
+    defer request_headers.deinit();
+    try request_headers.append("Authorization", "Bearer inbound-token");
+    try request_headers.append("Cookie", "session=browser");
+    try request_headers.append("X-Auth-User", "forged");
+    var headers = std.array_list.Managed(std.http.Header).init(arena_state.allocator());
+    try appendAuthRequestHeaders(&headers, testInput(&request_headers, null), false, &.{ "Authorization", "Cookie", "X-Auth-User" });
+    var saw_authorization = false;
+    var saw_cookie = false;
+    for (headers.items) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "authorization")) saw_authorization = std.mem.eql(u8, h.value, "Bearer inbound-token");
+        if (std.ascii.eqlIgnoreCase(h.name, "cookie")) saw_cookie = std.mem.eql(u8, h.value, "session=browser");
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(h.name, "x-auth-user"));
+    }
+    try std.testing.expect(saw_authorization and saw_cookie);
 }
 
 test "generated forward_auth failures are never cacheable" {

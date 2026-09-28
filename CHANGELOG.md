@@ -16,14 +16,18 @@ All notable user-facing changes to Tardigrade are documented here.
   refreshed `Set-Cookie`) are added to the response the client receives. A
   3xx/4xx is relayed to the client with its body, `Location`,
   `WWW-Authenticate` and the same allowlisted headers; every denial is
-  `Cache-Control: no-store`, and `HEAD` gets the head without a body.
+  `Cache-Control: no-store` (which the allowlists cannot name), and `HEAD`
+  gets the head without a body.
   Timeouts, connect failures, 1xx/5xx and malformed responses fail closed with
   `forward_auth_failure_status` (default 503). `forward_auth_upstream_headers`
   copies auth-response headers (for example `X-Auth-Request-User`) to the
   upstream after removing any client-supplied copy, and cannot name
   Tardigrade-owned forwarding, identity or trace headers. Auth-response
   fields nominated by `Connection` are never copied, and client
-  `X-Forwarded-*`/`X-Original-*` headers never reach the auth service.
+  `X-Forwarded-*`/`X-Original-*` headers never reach the auth service. The
+  client's `Authorization` and `Cookie` always reach it, even when also named
+  as upstream headers, so a location can verify one token and send the
+  origin another.
   Request bodies are not sent unless `forward_auth_body` sets a limit. Auth runs after rate
   limiting and `auth required`, before mirrors, retries and the location
   action, on HTTP/1.1, HTTP/2 and HTTP/3; protected locations reject

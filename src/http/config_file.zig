@@ -1692,6 +1692,7 @@ test "location block rejects unsafe forward_auth directives" {
         "location /a/ {\n    forward_auth_timeout_ms 100;\n    return 200 ok;\n}\n",
         "location /a/ {\n    forward_auth http://127.0.0.1/v;\n    forward_auth_upstream_headers X-Tardigrade-User-ID;\n    return 200 ok;\n}\n",
         "location /a/ {\n    forward_auth http://127.0.0.1/v;\n    forward_auth_client_headers Content-Length;\n    return 200 ok;\n}\n",
+        "location /a/ {\n    forward_auth http://127.0.0.1/v;\n    forward_auth_client_headers Set-Cookie Cache-Control;\n    return 200 ok;\n}\n",
         "location /a/ {\n    forward_auth 127.0.0.1:4180;\n    return 200 ok;\n}\n",
         "location /a/ {\n    forward_auth http://127.0.0.1/v;\n    forward_auth_failure_status 200;\n    return 200 ok;\n}\n",
     };

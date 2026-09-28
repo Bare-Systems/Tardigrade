@@ -28,6 +28,7 @@ const gprotocol_policy = @import("gateway_protocol_policy.zig");
 const gp = @import("gateway_proxy.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const ga = @import("gateway_auth.zig");
+const gfa = @import("gateway_forward_auth.zig");
 
 // Local runtime shorthands only. Keep this list to state/types used by
 // edge_gateway itself; call subsystem behavior through the owning module alias
@@ -3438,6 +3439,25 @@ fn respondHttp2Stream(
                 }
                 state.metricsRecordErrorCode(rejection.code);
             },
+            .forward_auth_denied => |denied| {
+                var decision = denied;
+                defer decision.deinit();
+                var shaped = http.Response.init(allocator);
+                defer shaped.deinit();
+                try gfa.shapeResponse(allocator, &shaped, &decision, correlation_id);
+                status_code = decision.status;
+                body_alloc = try allocator.dupe(u8, shaped.body orelse "");
+                body = body_alloc.?;
+                for (shaped.headers.iterator()) |header| {
+                    if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+                    const name = try lowercaseName(allocator, &lowered_names, header.name);
+                    const value = try allocator.dupe(u8, header.value);
+                    errdefer allocator.free(value);
+                    try owned_header_values.append(value);
+                    try response_headers.append(.{ .name = name, .value = value });
+                }
+                if (!decision.relaysAuthResponse()) state.metricsRecordErrorCode(decision.errorCode());
+            },
             .return_response => |plan| {
                 switch (plan) {
                     .method_not_allowed => {
@@ -3548,6 +3568,7 @@ fn respondHttp2Stream(
 const Http2ProxyRouteResult = union(enum) {
     response: gp.BufferedUpstreamResponse,
     local_rejection: Http2LocalRejection,
+    forward_auth_denied: gfa.Decision,
     return_response: ghandlers.ReturnResponsePlan,
     static_response: Http2StaticResponse,
 };
@@ -3663,6 +3684,32 @@ fn executeHttp2ProxyRoute(
         .code = "unauthorized",
         .message = "Unauthorized",
     } };
+    if (matched.block.forward_auth) |*fa| {
+        const target = if (request.uri.query) |q|
+            try std.fmt.allocPrint(allocator, "{s}?{s}", .{ request.uri.path, q })
+        else
+            try allocator.dupe(u8, request.uri.path);
+        defer allocator.free(target);
+        var decision = try gfa.authorize(allocator, route_cfg, fa, .{
+            .method = method,
+            .uri = target,
+            .host = ps.authority orelse request.headers.get("host"),
+            .proto = if (edge_config.hasTlsFiles(route_cfg)) "https" else "http",
+            .client_ip = ctx.client_ip,
+            .correlation_id = correlation_id,
+            .headers = &request.headers,
+            .body = request.body,
+        });
+        state.metricsRecordForwardAuth(.h2, decision.outcome);
+        if (!decision.allowed()) {
+            if (!decision.relaysAuthResponse()) {
+                state.logger.warn(correlation_id, "forward_auth {s} ({s}) for {s}: failing closed with {d}", .{ @tagName(decision.outcome), decision.cause, matched.block.pattern, decision.status });
+            }
+            return .{ .forward_auth_denied = decision };
+        }
+        defer decision.deinit();
+        try gfa.applyUpstreamHeaders(&request.headers, fa, &decision);
+    }
     const target = switch (matched.block.action) {
         .proxy_pass => |value| value,
         .return_response => |ret| {
@@ -4154,6 +4201,11 @@ fn streamingUploadEligibilityBeforeBodyRead(
         cfg.mirror_rules.len > 0 or cfg.auth_request_url.len > 0)
     {
         return .{ .fallback = .body_dependent_middleware };
+    }
+    // `forward_auth_body` sends the upload to the auth service before the
+    // upstream sees it, so the body has to be materialized first (#761).
+    if (matched.block.forward_auth) |fa| {
+        if (fa.max_body_bytes > 0) return .{ .fallback = .body_dependent_middleware };
     }
     if (cfg.upstream_retry_attempts > 1) {
         if (!cfg.upstream_retry_idempotent_only) return .{ .fallback = .retries_configured };
@@ -7018,6 +7070,7 @@ test "#368 Slice 2: one process-scoped early-data replay store is shared by nati
 // applianceCredentialConfigChanged/applyReloadedRuntimeConfig coverage) was
 // silently never compiled or run by `zig build test`.
 test {
+    _ = @import("gateway_forward_auth.zig");
     _ = @import("gateway_handlers.zig");
     _ = @import("gateway_shutdown.zig");
     _ = @import("process_early_data_integration_tests.zig");
@@ -7171,6 +7224,143 @@ test "H1 location auth denial never mirrors the denied request body" {
     // ...and the body never left the process.
     try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
     try std.testing.expect(std.mem.find(u8, conn.out.written(), "sensitive-payload") == null);
+}
+
+fn initForwardAuthProbeState(state: *GatewayState) void {
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.session_mutex = .{};
+    state.session_store = null;
+    state.logger = http.logger.Logger.init(.err, "test");
+    state.security_headers = .{};
+    state.add_headers = &.{};
+    state.http3_alt_svc = null;
+}
+
+test "H1 forward_auth denial relays the auth redirect and never mirrors" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 302 Found\r\nLocation: https://sso.example.test/start\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-secret" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{
+        .{ .method = "POST", .pattern = "^/admin$", .target_url = "http://127.0.0.1:9002/mirror" },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+
+    var request = try http.Request.parseHead(
+        allocator,
+        "POST /admin HTTP/1.1\r\nHost: example.test\r\nContent-Length: 17\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    defer request.request.deinit();
+    request.request.body = try allocator.dupe(u8, "sensitive-payload");
+
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    initForwardAuthProbeState(&state);
+    var ctx = http.request_context.RequestContext.init(allocator, "req-fa", "127.0.0.1");
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-fa", 0);
+    var keep_alive = true;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try executeH1PostPreflightOrchestration(
+        &conn,
+        allocator,
+        &conn.out.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-fa",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1RealRouteMirrorProbeHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, 302), outcome.route_status);
+    try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
+    const written = conn.out.written();
+    try std.testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 302"));
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "location: https://sso.example.test/start") != null);
+    try std.testing.expect(std.mem.find(u8, written, "admin-secret") == null);
+    // The auth service saw the request metadata but not the body.
+    try std.testing.expect(auth_server.requestContains(0, "X-Forwarded-Method: POST"));
+    try std.testing.expect(!auth_server.requestContains(0, "sensitive-payload"));
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_forward_auth_total{protocol=\"h1\",outcome=\"denied\"} 1") != null);
+}
+
+test "H1 forward_auth allow runs the action and still mirrors" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-ok" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{
+        .{ .method = "GET", .pattern = "^/admin$", .target_url = "http://127.0.0.1:9002/mirror" },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+
+    var request = try http.Request.parseHead(allocator, "GET /admin HTTP/1.1\r\nHost: example.test\r\n\r\n", MAX_REQUEST_SIZE);
+    defer request.request.deinit();
+
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    initForwardAuthProbeState(&state);
+    var ctx = http.request_context.RequestContext.init(allocator, "req-fa-ok", "127.0.0.1");
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-fa-ok", 0);
+    var keep_alive = true;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try executeH1PostPreflightOrchestration(
+        &conn,
+        allocator,
+        &conn.out.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-fa-ok",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1RealRouteMirrorProbeHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, 200), outcome.route_status);
+    try std.testing.expectEqual(@as(usize, 1), effects.mirror_calls);
+    try std.testing.expect(std.mem.find(u8, conn.out.written(), "admin-ok") != null);
 }
 
 test "H1 authorized route still mirrors" {

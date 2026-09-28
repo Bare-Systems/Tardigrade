@@ -5122,6 +5122,69 @@ test "interop.h2.valid_auth_is_forwarded_and_policy_denial_stays_local" {
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
+test "interop.h2.forward_auth_denial_and_allow" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var auth = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 403, .body = "h2-denied", .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }} },
+        .{ .status_code = 200, .body = "", .headers = &.{.{ .name = "X-Auth-Request-User", .value = "h2-alice" }} },
+    });
+    defer auth.stop();
+    try auth.run();
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "h2-forward-auth-ok" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-admin {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_upstream_headers X-Auth-Request-User;
+        \\    proxy_pass http://{s}:{d}/h2-admin;
+        \\}}
+    , .{ test_host, auth.port(), test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-admin" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+        .{ .name = "x-auth-request-user", .value = "h2-mallory" },
+    };
+    const denied_body = try pureZigH2GetBody(allocator, tardigrade.port, headers[0..]);
+    defer allocator.free(denied_body);
+    try assertContains(denied_body, "h2-denied");
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    const allowed_body = try pureZigH2GetBody(allocator, tardigrade.port, headers[0..]);
+    defer allocator.free(allowed_body);
+    try assertContains(allowed_body, "h2-forward-auth-ok");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+    try std.testing.expectEqualStrings("h2-alice", upstream.capturedHeader("X-Auth-Request-User").?);
+}
+
 test "interop.h2.proxy_malformed_authority_rejected_before_upstream" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -13381,6 +13444,189 @@ test "jwt auth forwards asserted identity headers upstream" {
     try std.testing.expectEqualStrings("bearclaw-web", upstream.capturedHeader("X-Tardigrade-Device-ID").?);
     try std.testing.expectEqualStrings("bearclaw.operator", upstream.capturedHeader("X-Tardigrade-Scopes").?);
     try std.testing.expectEqualStrings("user-42", upstream.capturedHeader("X-Tardigrade-Auth-Identity").?);
+}
+
+test "forward_auth protects proxied and static locations over h1" {
+    const allocator = std.testing.allocator;
+
+    var auth = try UpstreamServer.start(allocator, &.{
+        // 1: allowed, asserting the user for the upstream.
+        .{ .status_code = 200, .body = "", .headers = &.{
+            .{ .name = "X-Auth-Request-User", .value = "alice" },
+            .{ .name = "X-Internal-Debug", .value = "must-not-leak" },
+        } },
+        // 2: redirect to the login page.
+        .{ .status_code = 302, .body = "", .headers = &.{
+            .{ .name = "Location", .value = "https://sso.example.test/login?rd=%2Fadmin%2F" },
+            .{ .name = "Set-Cookie", .value = "csrf=abc; HttpOnly" },
+        } },
+        // 3: challenge.
+        .{ .status_code = 401, .body = "sign in", .headers = &.{
+            .{ .name = "WWW-Authenticate", .value = "Basic realm=\"admin\"" },
+            .{ .name = "Content-Type", .value = "text/plain" },
+        } },
+        // 4: static location allowed.
+        .{ .status_code = 204, .body = "" },
+        // 5: large upload allowed; the body must not have been forwarded.
+        .{ .status_code = 200, .body = "" },
+    });
+    defer auth.stop();
+    try auth.run();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "admin-upstream-ok" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "report.txt", .data = "static-report" });
+    const static_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(static_root);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /admin/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_upstream_headers X-Auth-Request-User;
+        \\    forward_auth_client_headers Set-Cookie;
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\
+        \\location /reports/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    alias {s}/;
+        \\}}
+    , .{ test_host, auth.port(), test_host, upstream.port(), test_host, auth.port(), static_root });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+    try auth.resetCapture();
+
+    // Allowed: the forged client header is replaced by the auth assertion.
+    var allowed = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/admin/users?page=2",
+        .body = null,
+        .headers = &.{
+            .{ .name = "Cookie", .value = "_oauth2_proxy=session" },
+            .{ .name = "X-Auth-Request-User", .value = "mallory" },
+        },
+    });
+    defer allowed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), allowed.status_code);
+    try assertContains(allowed.body, "admin-upstream-ok");
+    try std.testing.expectEqualStrings("alice", upstream.capturedHeader("X-Auth-Request-User").?);
+    try std.testing.expect(upstream.capturedHeader("X-Internal-Debug") == null);
+    try std.testing.expectEqualStrings("_oauth2_proxy=session", auth.capturedHeader("Cookie").?);
+    try std.testing.expectEqualStrings("/admin/users?page=2", auth.capturedHeader("X-Forwarded-Uri").?);
+    try std.testing.expectEqualStrings("GET", auth.capturedHeader("X-Forwarded-Method").?);
+
+    // Redirect denial: relayed with Location and the allowlisted cookie.
+    var redirected = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/admin/", .body = null, .headers = &.{} });
+    defer redirected.deinit();
+    try std.testing.expectEqual(@as(u16, 302), redirected.status_code);
+    try std.testing.expectEqualStrings("https://sso.example.test/login?rd=%2Fadmin%2F", redirected.header("Location").?);
+    try std.testing.expectEqualStrings("csrf=abc; HttpOnly", redirected.header("Set-Cookie").?);
+
+    // Challenge denial: status, body and WWW-Authenticate relayed.
+    var challenged = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/admin/", .body = null, .headers = &.{} });
+    defer challenged.deinit();
+    try std.testing.expectEqual(@as(u16, 401), challenged.status_code);
+    try std.testing.expectEqualStrings("Basic realm=\"admin\"", challenged.header("WWW-Authenticate").?);
+    try assertContains(challenged.body, "sign in");
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    // Static location.
+    var report = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/reports/report.txt", .body = null, .headers = &.{} });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(u16, 200), report.status_code);
+    try assertContains(report.body, "static-report");
+
+    // Large body: the auth service sees a bodyless GET by default.
+    const big_body = try allocator.alloc(u8, 48 * 1024);
+    defer allocator.free(big_body);
+    @memset(big_body, 'x');
+    var upload = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/admin/upload",
+        .body = big_body,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+    });
+    defer upload.deinit();
+    try std.testing.expectEqual(@as(u16, 200), upload.status_code);
+    const auth_body = try auth.capturedBody(allocator);
+    defer allocator.free(auth_body);
+    try std.testing.expectEqual(@as(usize, 0), auth_body.len);
+    try std.testing.expectEqualStrings("POST", auth.capturedHeader("X-Forwarded-Method").?);
+    try std.testing.expectEqual(@as(u32, 5), auth.requestCount());
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
+    try assertContains(metrics.body, "tardigrade_forward_auth_total{protocol=\"h1\",outcome=\"allowed\"} 3");
+    try assertContains(metrics.body, "tardigrade_forward_auth_total{protocol=\"h1\",outcome=\"denied\"} 2");
+}
+
+test "forward_auth fails closed when the auth service is unreachable or slow" {
+    const allocator = std.testing.allocator;
+
+    var slow_auth = try UpstreamServer.start(allocator, &.{.{ .status_code = 200, .body = "", .delay_ms = 1_500 }});
+    defer slow_auth.stop();
+    try slow_auth.run();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "must-not-reach" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const dead_port = try findFreePort();
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /down/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\
+        \\location /slow/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_timeout_ms 200;
+        \\    forward_auth_failure_status 504;
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, dead_port, test_host, upstream.port(), test_host, slow_auth.port(), test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+
+    var down = try sendRequest(allocator, tardigrade.port, .{ .method = "POST", .path = "/down/x", .body = "payload", .headers = &.{} });
+    defer down.deinit();
+    try std.testing.expectEqual(@as(u16, 503), down.status_code);
+    try assertContains(down.body, "\"code\":\"auth_unavailable\"");
+
+    var slow = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/slow/x", .body = null, .headers = &.{} });
+    defer slow.deinit();
+    try std.testing.expectEqual(@as(u16, 504), slow.status_code);
+    try assertContains(slow.body, "\"code\":\"auth_timeout\"");
+
+    compat.sleepNs(200 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
 }
 
 test "jwt auth rejects malformed bearer and invalid signature without proxying" {

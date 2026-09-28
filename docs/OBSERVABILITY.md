@@ -159,6 +159,11 @@ logs are written through `src/http/logger.zig`.
   `tardigrade_http_early_data_upstream_425_total{action}`,
   `tardigrade_http_early_data_retry_total{result}`,
   and `tardigrade_http3_early_data_compat_total{decision}`
+- `forward_auth` subrequest outcomes (#761):
+  `tardigrade_forward_auth_total{protocol,outcome}` with `protocol` in
+  `h1`/`h2`/`h3` and fixed outcomes `allowed`, `denied`, `timeout`,
+  `unavailable`, `invalid_response`, and `body_too_large`. Every fail-closed
+  outcome also logs a `WARN` line naming the outcome, cause and location.
 - native TLS/QUIC 0-RTT anti-replay store outcomes (#368):
   `tardigrade_tls_early_data_replay_total{outcome}` with fixed outcomes
   `accepted`, `duplicate`, `capacity_rejected`, `expired`, `unavailable`, and

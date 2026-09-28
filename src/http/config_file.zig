@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("zig_compat");
 const location_router = @import("location_router.zig");
+const http_headers = @import("headers.zig");
 
 pub const Overrides = struct {
     map: std.StringHashMap([]const u8),
@@ -98,6 +99,12 @@ const LocationBlockBuilder = struct {
     proxy_streaming: ?[]u8 = null,
     early_data: ?[]u8 = null,
     proxy_early_data: ?[]u8 = null,
+    forward_auth: ?[]u8 = null,
+    forward_auth_upstream_headers: ?[]u8 = null,
+    forward_auth_client_headers: ?[]u8 = null,
+    forward_auth_body: ?usize = null,
+    forward_auth_timeout_ms: ?u32 = null,
+    forward_auth_failure_status: ?u16 = null,
     error_pages: std.ArrayList(ErrorPageBuilder) = .empty,
     proxy_set_headers: std.ArrayList(ProxySetHeaderBuilder) = .empty,
 
@@ -130,6 +137,9 @@ const LocationBlockBuilder = struct {
         if (self.proxy_streaming) |value| allocator.free(value);
         if (self.early_data) |value| allocator.free(value);
         if (self.proxy_early_data) |value| allocator.free(value);
+        if (self.forward_auth) |value| allocator.free(value);
+        if (self.forward_auth_upstream_headers) |value| allocator.free(value);
+        if (self.forward_auth_client_headers) |value| allocator.free(value);
         for (self.error_pages.items) |entry| {
             allocator.free(entry.status_codes_csv);
             allocator.free(entry.target);
@@ -833,6 +843,58 @@ fn parseLocationStatement(
         try replaceOptionalOwned(allocator, &builder.rewrite_flag, flag_raw);
         return;
     }
+    if (std.ascii.eqlIgnoreCase(directive, "forward_auth")) {
+        // The URL travels through the `|`/`;`-delimited location encoding, and
+        // must stay a single absolute http(s) URL.
+        if (std.mem.findAny(u8, value_interp, "|; \t") != null or
+            !(std.ascii.startsWithIgnoreCase(value_interp, "http://") or std.ascii.startsWithIgnoreCase(value_interp, "https://")))
+        {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: forward_auth must be a single absolute http:// or https:// URL", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        }
+        try replaceOptionalOwned(allocator, &builder.forward_auth, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "forward_auth_upstream_headers") or
+        std.ascii.eqlIgnoreCase(directive, "forward_auth_client_headers"))
+    {
+        const joined = try joinForwardAuthHeaderNames(allocator, file_path, line_no, directive, value_interp);
+        defer allocator.free(joined);
+        const target = if (std.ascii.eqlIgnoreCase(directive, "forward_auth_upstream_headers"))
+            &builder.forward_auth_upstream_headers
+        else
+            &builder.forward_auth_client_headers;
+        try replaceOptionalOwned(allocator, target, joined);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "forward_auth_body")) {
+        builder.forward_auth_body = if (std.ascii.eqlIgnoreCase(value_interp, "off"))
+            0
+        else
+            std.fmt.parseInt(usize, value_interp, 10) catch {
+                logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: forward_auth_body must be 'off' or a byte count", .{ file_path, line_no });
+                return error.InvalidConfigSyntax;
+            };
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "forward_auth_timeout_ms")) {
+        const timeout_ms = std.fmt.parseInt(u32, value_interp, 10) catch 0;
+        if (timeout_ms == 0) {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: forward_auth_timeout_ms must be a positive number of milliseconds", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        }
+        builder.forward_auth_timeout_ms = timeout_ms;
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "forward_auth_failure_status")) {
+        const status = std.fmt.parseInt(u16, value_interp, 10) catch 0;
+        if (!isForwardAuthFailureStatus(status)) {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: forward_auth_failure_status must be one of 401, 403, 500, 502, 503, 504", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        }
+        builder.forward_auth_failure_status = status;
+        return;
+    }
     if (std.ascii.eqlIgnoreCase(directive, "auth")) {
         if (!std.ascii.eqlIgnoreCase(value_interp, "required") and !std.ascii.eqlIgnoreCase(value_interp, "off")) {
             std.log.err("config syntax error at {s}:{d}: auth must be 'required' or 'off'", .{ file_path, line_no });
@@ -865,6 +927,39 @@ fn parseLocationStatement(
         try replaceOptionalOwned(allocator, &builder.proxy_early_data, value_interp);
         return;
     }
+}
+
+fn isForwardAuthFailureStatus(status: u16) bool {
+    return switch (status) {
+        401, 403, 500, 502, 503, 504 => true,
+        else => false,
+    };
+}
+
+/// Normalize a `forward_auth_*_headers` value (names separated by spaces or
+/// commas) into the comma-joined form the location encoding carries.
+fn joinForwardAuthHeaderNames(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    line_no: usize,
+    directive: []const u8,
+    value: []const u8,
+) ![]u8 {
+    var names = std.ArrayList([]const u8).empty;
+    defer names.deinit(allocator);
+    var toks = std.mem.tokenizeAny(u8, value, " \t,");
+    while (toks.next()) |name| {
+        if (!http_headers.isValidHeaderName(name) or location_router.isProtectedForwardAuthHeader(name)) {
+            logConfigSyntaxDiagnostic(
+                "config syntax error at {s}:{d}: {s} cannot name '{s}' (invalid or Tardigrade-owned header)",
+                .{ file_path, line_no, directive, name },
+            );
+            return error.InvalidConfigSyntax;
+        }
+        try names.append(allocator, name);
+    }
+    if (names.items.len == 0) return error.InvalidConfigSyntax;
+    return std.mem.join(allocator, ",", names.items);
 }
 
 fn isLocationProxyStreamingPolicy(value: []const u8) bool {
@@ -989,6 +1084,24 @@ fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlock
         const with_set_headers = try appendProxySetHeaderOptions(allocator, entry, builder.proxy_set_headers.items);
         allocator.free(entry);
         entry = with_set_headers;
+    }
+    if (builder.forward_auth) |url| {
+        var fa_entry: std.ArrayList(u8) = .empty;
+        defer fa_entry.deinit(allocator);
+        try fa_entry.print(allocator, "{s}|forward_auth:{s}", .{ entry, url });
+        if (builder.forward_auth_upstream_headers) |names| try fa_entry.print(allocator, "|forward_auth_upstream_headers:{s}", .{names});
+        if (builder.forward_auth_client_headers) |names| try fa_entry.print(allocator, "|forward_auth_client_headers:{s}", .{names});
+        if (builder.forward_auth_body) |max_bytes| try fa_entry.print(allocator, "|forward_auth_body:{d}", .{max_bytes});
+        if (builder.forward_auth_timeout_ms) |timeout_ms| try fa_entry.print(allocator, "|forward_auth_timeout_ms:{d}", .{timeout_ms});
+        if (builder.forward_auth_failure_status) |status| try fa_entry.print(allocator, "|forward_auth_failure_status:{d}", .{status});
+        allocator.free(entry);
+        entry = try fa_entry.toOwnedSlice(allocator);
+    } else if (builder.forward_auth_upstream_headers != null or builder.forward_auth_client_headers != null or
+        builder.forward_auth_body != null or builder.forward_auth_timeout_ms != null or builder.forward_auth_failure_status != null)
+    {
+        logConfigSyntaxDiagnostic("config syntax error: location '{s}' sets forward_auth_* options without forward_auth", .{builder.pattern});
+        allocator.free(entry);
+        return error.InvalidConfigSyntax;
     }
     return entry;
 }
@@ -1530,6 +1643,63 @@ test "location block serializes early data policies" {
         "prefix|/submit/|proxy_pass|http://127.0.0.1:9001|early_data:replay_safe|proxy_early_data:rfc8470",
         overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
     );
+}
+
+fn parseLocationConfigForTest(allocator: std.mem.Allocator, data: []const u8, overrides: *Overrides) !void {
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{ .sub_path = "location.conf", .data = data });
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "location.conf");
+    defer allocator.free(absolute);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+    try parseFile(allocator, absolute, overrides, &vars, &visited);
+}
+
+test "location block serializes forward_auth directives" {
+    const allocator = std.testing.allocator;
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    try parseLocationConfigForTest(allocator,
+        \\location /admin/ {
+        \\    forward_auth http://127.0.0.1:4180/oauth2/auth;
+        \\    forward_auth_upstream_headers X-Auth-Request-User X-Auth-Request-Email;
+        \\    forward_auth_client_headers Set-Cookie;
+        \\    forward_auth_body off;
+        \\    forward_auth_timeout_ms 750;
+        \\    forward_auth_failure_status 502;
+        \\    proxy_pass http://127.0.0.1:9000;
+        \\}
+    , &overrides);
+
+    try std.testing.expectEqualStrings(
+        "prefix|/admin/|proxy_pass|http://127.0.0.1:9000|forward_auth:http://127.0.0.1:4180/oauth2/auth" ++
+            "|forward_auth_upstream_headers:X-Auth-Request-User,X-Auth-Request-Email|forward_auth_client_headers:Set-Cookie" ++
+            "|forward_auth_body:0|forward_auth_timeout_ms:750|forward_auth_failure_status:502",
+        overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
+    );
+}
+
+test "location block rejects unsafe forward_auth directives" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "location /a/ {\n    forward_auth_timeout_ms 100;\n    return 200 ok;\n}\n",
+        "location /a/ {\n    forward_auth http://127.0.0.1/v;\n    forward_auth_upstream_headers X-Tardigrade-User-ID;\n    return 200 ok;\n}\n",
+        "location /a/ {\n    forward_auth http://127.0.0.1/v;\n    forward_auth_client_headers Content-Length;\n    return 200 ok;\n}\n",
+        "location /a/ {\n    forward_auth 127.0.0.1:4180;\n    return 200 ok;\n}\n",
+        "location /a/ {\n    forward_auth http://127.0.0.1/v;\n    forward_auth_failure_status 200;\n    return 200 ok;\n}\n",
+    };
+    for (cases) |data| {
+        var overrides = Overrides.init(allocator);
+        defer overrides.deinit(allocator);
+        try std.testing.expectError(error.InvalidConfigSyntax, parseLocationConfigForTest(allocator, data, &overrides));
+    }
 }
 
 test "location block rejects proxy early data on non proxy action" {

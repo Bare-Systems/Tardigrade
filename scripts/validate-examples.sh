@@ -93,6 +93,9 @@ check "production-baseline" \
     "TARDIGRADE_UPSTREAM_BASE_URL=http://127.0.0.1:8080" \
     "TARDIGRADE_HSTS_ENABLED=true"
 
+check "forward-auth" \
+    examples/forward-auth/tardigrade.conf
+
 check "bearclaw" \
     examples/bearclaw/tardigrade.conf \
     "TARDIGRADE_TLS_CERT_PATH=$FIXTURE_CERT" \

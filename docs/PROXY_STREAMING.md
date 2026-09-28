@@ -110,7 +110,7 @@ logged at debug level with the request's correlation ID.
 | `early_data_retry_semantics` | response | The request arrived as replay-exposed TLS early data and needs 425 orchestration, which requires a retryable exchange. |
 | `missing_content_length` | upload | A body-bearing method sent neither `Content-Length` nor `Transfer-Encoding`. |
 | `body_too_large` | upload | The declared `Content-Length` exceeds the request-body maximum. |
-| `body_dependent_middleware` | upload | Rewrite, return, conditional, internal-redirect, mirror, or `auth_request` rules are configured, and they may read or duplicate the body. |
+| `body_dependent_middleware` | upload | Rewrite, return, conditional, internal-redirect, mirror, or `auth_request` rules are configured, or the location sets `forward_auth_body`, and they may read or duplicate the body. |
 | `unsupported_route_type` | upload | The request did not match a route, or matched a route whose action is not a direct `proxy_pass`. |
 
 Upload and response eligibility are evaluated separately, so a single request can
@@ -137,9 +137,11 @@ Streaming trades replayability for bounded memory. The boundaries are:
   the retry follows the zero-byte replay policy in
   [UPSTREAM_POOLING.md](UPSTREAM_POOLING.md#stale-connection-replay-policy-785).
 - **Body-dependent middleware requires buffering.** Rewrite, return,
-  conditional, internal-redirect, mirror, and `auth_request` all need the whole
-  body, or need to duplicate it. Routes configured with any of them fall back
-  with `body_dependent_middleware`. Making them work with streaming needs an
+  conditional, internal-redirect, mirror, `auth_request`, and a
+  `forward_auth_body` limit all need the whole body, or need to duplicate it.
+  Routes configured with any of them fall back with `body_dependent_middleware`.
+  A `forward_auth` location without `forward_auth_body` still streams: the
+  auth subrequest carries no body and completes before the upload is relayed. Making them work with streaming needs an
   explicit tee, not an incidental buffer.
 - **Streaming mode is a route behavior decision, not a guarantee.** Enabling
   `full` asks for streaming where it is supported; it does not promise that

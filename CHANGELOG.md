@@ -2,6 +2,30 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [0.8.1] - 2026-09-28
+
+### Added
+
+- **Per-location external authentication with `forward_auth` (#761)** — a
+  location can now ask an auth service (oauth2-proxy, Authelia, or your own)
+  whether a request may proceed, the role NGINX `auth_request` and Caddy
+  `forward_auth` fill. Tardigrade sends a bounded HTTP/1.1 subrequest carrying
+  the client's end-to-end headers plus `X-Forwarded-Method/-Uri/-Host/-Proto/-For`,
+  `X-Original-Method/-URI`, the request ID and a W3C `traceparent`. A 2xx
+  allows the request; a 3xx/4xx is relayed to the client with its body,
+  `Location`, `WWW-Authenticate` and any `forward_auth_client_headers`.
+  Timeouts, connect failures, 1xx/5xx and malformed responses fail closed with
+  `forward_auth_failure_status` (default 503). `forward_auth_upstream_headers`
+  copies auth-response headers (for example `X-Auth-Request-User`) to the
+  upstream after removing any client-supplied copy, and cannot name
+  Tardigrade-owned forwarding, identity or trace headers. Request bodies are
+  not sent unless `forward_auth_body` sets a limit. Auth runs after rate
+  limiting and `auth required`, before mirrors, retries and the location
+  action, on HTTP/1.1, HTTP/2 and HTTP/3; protected locations reject
+  replay-exposed 0-RTT. New counter:
+  `tardigrade_forward_auth_total{protocol,outcome}`. See
+  [examples/forward-auth](examples/forward-auth/README.md).
+
 ## [0.8.0] - 2026-09-28
 
 ### Added

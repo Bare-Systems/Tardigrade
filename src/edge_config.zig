@@ -2666,9 +2666,41 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             for (set_headers.items) |*rule| rule.deinit(allocator);
             set_headers.deinit(allocator);
         }
+        var forward_auth: ?http.location_router.ForwardAuth = null;
+        errdefer if (forward_auth) |*fa| fa.deinit(allocator);
+        var fa_upstream_headers: ?[]const u8 = null;
+        var fa_client_headers: ?[]const u8 = null;
+        var fa_body: usize = 0;
+        var fa_timeout_ms: u32 = 0;
+        var fa_failure_status: u16 = http.location_router.ForwardAuth.DEFAULT_FAILURE_STATUS;
+        var fa_options_seen = false;
         while (fields.next()) |option_raw| {
             const option = std.mem.trim(u8, option_raw, " \t\r\n");
-            if (std.mem.startsWith(u8, option, "auth:")) {
+            if (std.mem.startsWith(u8, option, "forward_auth:")) {
+                const url = option["forward_auth:".len..];
+                validateForwardAuthUrl(url) catch return error.InvalidLocationBlockFormat;
+                if (forward_auth != null) return error.InvalidLocationBlockFormat;
+                forward_auth = .{ .url = try allocator.dupe(u8, url) };
+            } else if (std.mem.startsWith(u8, option, "forward_auth_upstream_headers:")) {
+                fa_upstream_headers = option["forward_auth_upstream_headers:".len..];
+                fa_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "forward_auth_client_headers:")) {
+                fa_client_headers = option["forward_auth_client_headers:".len..];
+                fa_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "forward_auth_body:")) {
+                fa_body = std.fmt.parseInt(usize, option["forward_auth_body:".len..], 10) catch return error.InvalidLocationBlockFormat;
+                fa_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "forward_auth_timeout_ms:")) {
+                fa_timeout_ms = std.fmt.parseInt(u32, option["forward_auth_timeout_ms:".len..], 10) catch return error.InvalidLocationBlockFormat;
+                fa_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "forward_auth_failure_status:")) {
+                fa_failure_status = std.fmt.parseInt(u16, option["forward_auth_failure_status:".len..], 10) catch return error.InvalidLocationBlockFormat;
+                switch (fa_failure_status) {
+                    401, 403, 500, 502, 503, 504 => {},
+                    else => return error.InvalidLocationBlockFormat,
+                }
+                fa_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "auth:")) {
                 auth = http.location_router.AuthMode.parse(option["auth:".len..]) orelse return error.InvalidLocationBlockFormat;
             } else if (std.mem.startsWith(u8, option, "stream:")) {
                 proxy_streaming_policy = http.location_router.ProxyStreamingPolicy.parse(option["stream:".len..]) orelse return error.InvalidLocationBlockFormat;
@@ -2687,6 +2719,15 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .proxy_pass => {},
             else => return error.InvalidLocationBlockFormat,
         };
+        if (forward_auth) |*fa| {
+            fa.max_body_bytes = fa_body;
+            fa.timeout_ms = fa_timeout_ms;
+            fa.failure_status = fa_failure_status;
+            if (fa_upstream_headers) |raw_names| fa.upstream_headers = try parseForwardAuthHeaderNames(allocator, raw_names);
+            if (fa_client_headers) |raw_names| fa.client_headers = try parseForwardAuthHeaderNames(allocator, raw_names);
+        } else if (fa_options_seen) {
+            return error.InvalidLocationBlockFormat;
+        }
 
         try out.append(allocator, .{
             .match_type = match_type,
@@ -2699,8 +2740,10 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .early_data = early_data,
             .proxy_early_data = proxy_early_data,
             .proxy_set_headers = &.{},
+            .forward_auth = forward_auth,
         });
         action_owned = false;
+        forward_auth = null;
         if (set_headers.items.len > 0) {
             out.items[out.items.len - 1].proxy_set_headers = try set_headers.toOwnedSlice(allocator);
         } else {
@@ -2734,6 +2777,36 @@ fn parseProxySetHeaderOption(
         if (std.ascii.eqlIgnoreCase(rule.name, name)) return error.InvalidLocationBlockFormat;
     }
     return .{ .name = name, .value = value };
+}
+
+/// `forward_auth` shares the reverse proxy's upstream URL rules (absolute
+/// http/https, a host) and adds the auth-subrequest constraints: no userinfo
+/// (it would silently change the auth contract), no fragment, and no bytes
+/// that could split the request line.
+fn validateForwardAuthUrl(raw: []const u8) !void {
+    try validateMirrorTargetUrlChecked(raw);
+    for (raw) |byte| {
+        if (byte <= 0x20 or byte == 0x7f) return error.InvalidConfigUrl;
+    }
+    const uri = std.Uri.parse(raw) catch return error.InvalidConfigUrl;
+    if (uri.user != null or uri.password != null or uri.fragment != null) return error.InvalidConfigUrl;
+}
+
+fn parseForwardAuthHeaderNames(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    var names = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    var it = std.mem.tokenizeAny(u8, raw, ", \t");
+    while (it.next()) |name| {
+        if (!http.headers.isValidHeaderName(name) or http.location_router.isProtectedForwardAuthHeader(name)) {
+            return error.InvalidLocationBlockFormat;
+        }
+        try names.append(allocator, try allocator.dupe(u8, name));
+    }
+    if (names.items.len == 0) return error.InvalidLocationBlockFormat;
+    return names.toOwnedSlice(allocator);
 }
 
 fn applyLocationErrorPages(allocator: std.mem.Allocator, blocks: []EdgeConfig.LocationBlock, raw: []const u8) !void {
@@ -4197,6 +4270,49 @@ test "parse location blocks reject proxy early data on non proxy action" {
         error.InvalidLocationBlockFormat,
         parseLocationBlocks(std.testing.allocator, "prefix|/local/|return|200|ok|proxy_early_data:rfc8470"),
     );
+}
+
+test "parse location blocks read forward_auth options" {
+    const allocator = std.testing.allocator;
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "prefix|/admin/|proxy_pass|http://127.0.0.1:9000|forward_auth:http://127.0.0.1:4180/oauth2/auth?rd=1" ++
+            "|forward_auth_upstream_headers:X-Auth-Request-User,X-Auth-Request-Email" ++
+            "|forward_auth_client_headers:Set-Cookie|forward_auth_body:1024|forward_auth_timeout_ms:750|forward_auth_failure_status:502" ++
+            ";prefix|/open/|return|200|ok",
+    );
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+
+    const fa = blocks[0].forward_auth.?;
+    try std.testing.expectEqualStrings("http://127.0.0.1:4180/oauth2/auth?rd=1", fa.url);
+    try std.testing.expectEqual(@as(usize, 2), fa.upstream_headers.len);
+    try std.testing.expectEqualStrings("X-Auth-Request-Email", fa.upstream_headers[1]);
+    try std.testing.expectEqualStrings("Set-Cookie", fa.client_headers[0]);
+    try std.testing.expectEqual(@as(usize, 1024), fa.max_body_bytes);
+    try std.testing.expectEqual(@as(u32, 750), fa.timeout_ms);
+    try std.testing.expectEqual(@as(u16, 502), fa.failure_status);
+    try std.testing.expect(blocks[1].forward_auth == null);
+}
+
+test "parse location blocks reject unsafe forward_auth configuration" {
+    const cases = [_][]const u8{
+        // Userinfo would silently change the auth contract.
+        "prefix|/a/|return|200|ok|forward_auth:http://user:pw@127.0.0.1:4180/verify",
+        "prefix|/a/|return|200|ok|forward_auth:ftp://127.0.0.1/verify",
+        "prefix|/a/|return|200|ok|forward_auth:/verify",
+        // Options without the endpoint.
+        "prefix|/a/|return|200|ok|forward_auth_body:10",
+        // Auth responses may not assert Tardigrade-owned headers.
+        "prefix|/a/|return|200|ok|forward_auth:http://127.0.0.1/v|forward_auth_upstream_headers:X-Tardigrade-User-ID",
+        "prefix|/a/|return|200|ok|forward_auth:http://127.0.0.1/v|forward_auth_upstream_headers:X-Forwarded-For",
+        "prefix|/a/|return|200|ok|forward_auth:http://127.0.0.1/v|forward_auth_failure_status:200",
+    };
+    for (cases) |raw| {
+        try std.testing.expectError(error.InvalidLocationBlockFormat, parseLocationBlocks(std.testing.allocator, raw));
+    }
 }
 
 test "apply location error pages csv" {

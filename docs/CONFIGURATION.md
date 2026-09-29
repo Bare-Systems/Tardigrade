@@ -389,7 +389,10 @@ the idle timeout should send pings.
 lifetime, and counts as an active connection and an in-flight request.
 `proxy_websocket_max_tunnels` / `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS`
 caps concurrent tunnels per process; the default (`0`) is half the worker
-threads, at least one, so tunnels can never occupy every worker. Deployments
+threads, rounded down, so tunnels can never occupy every worker. With a single
+worker thread that is zero: every upgrade gets 503 and startup logs a warning.
+Run at least two workers, or set an explicit cap to accept that a tunnel can
+block every other request. Deployments
 that expect many long-lived WebSockets should raise
 `TARDIGRADE_WORKER_THREADS` and the cap together.
 
@@ -905,7 +908,7 @@ WebSockets are relayed per location with `proxy_websocket on;` (see
 
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
-| `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS` | u32 | `0` (half the worker threads, at least 1) | Maximum concurrent WebSocket tunnels per process. A handshake over the cap gets 503 before the origin is contacted. Config directive: `proxy_websocket_max_tunnels`. | `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS=256` |
+| `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS` | u32 | `0` (half the worker threads, rounded down; none with one worker) | Maximum concurrent WebSocket tunnels per process. A handshake over the cap gets 503 before the origin is contacted. Config directive: `proxy_websocket_max_tunnels`. | `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS=256` |
 
 Server-sent events need no special setting: proxy them as a streamed response
 (`proxy_streaming response;` on the location, or

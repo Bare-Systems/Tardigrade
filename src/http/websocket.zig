@@ -127,8 +127,14 @@ pub fn classifyClientHandshake(is_get: bool, is_http11: bool, headers: *const He
     }
     var key: ?[]const u8 = null;
     var version: ?[]const u8 = null;
+    var origins: usize = 0;
     for (headers.iterator()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "sec-websocket-key")) {
+        if (std.ascii.eqlIgnoreCase(header.name, "origin")) {
+            // The Origin allowlist and the origin application must judge the
+            // same value; two fields make that ambiguous.
+            origins += 1;
+            if (origins > 1) return .{ .invalid = "Duplicate Origin" };
+        } else if (std.ascii.eqlIgnoreCase(header.name, "sec-websocket-key")) {
             if (key != null) return .{ .invalid = "Duplicate Sec-WebSocket-Key" };
             key = std.mem.trim(u8, header.value, " \t");
         } else if (std.ascii.eqlIgnoreCase(header.name, "sec-websocket-version")) {
@@ -284,6 +290,7 @@ test "classifyClientHandshake rejects malformed and smuggling-shaped handshakes"
         &.{ base[0], base[1], base[2], base[2], base[3] },
         &.{ base[0], base[1], base[2], base[3], .{ "Content-Length", "5" } },
         &.{ base[0], base[1], base[2], base[3], .{ "Transfer-Encoding", "chunked" } },
+        &.{ base[0], base[1], base[2], base[3], .{ "Origin", "https://app.example.test" }, .{ "origin", "https://evil.example.test" } },
     };
     for (cases) |pairs| {
         var headers = try handshakeHeadersForTest(pairs);

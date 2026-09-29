@@ -30,7 +30,9 @@ All notable user-facing changes to Tardigrade are documented here.
   window. `proxy_websocket_origins` adds an `Origin` allowlist against
   cross-site WebSocket hijacking. Each tunnel holds a worker thread, so
   `proxy_websocket_max_tunnels` (`TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS`)
-  caps them per process (default: half the worker threads) and an
+  caps them per process (default: half the worker threads, rounded down, so
+  a single-worker process refuses upgrades instead of letting one tunnel
+  block every other request) and an
   over-capacity handshake gets 503 before the origin is contacted. `wss://`
   works on both hops over the native TLS stack. HTTP/2 and HTTP/3 extended
   CONNECT are not supported and not advertised, so browsers use HTTP/1.1 for
@@ -47,6 +49,13 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Fixed
 
+- **`tardigrade_active_connections` no longer drifts upward under connection
+  churn.** Plaintext and native-TLS connections closed their socket before
+  releasing their connection slot, and slots are keyed by fd number, so a
+  connection accepted in between could reuse the number and have its slot
+  dropped by the late release. Each occurrence leaked one count, which also
+  consumed `TARDIGRADE_MAX_ACTIVE_CONNECTIONS` headroom. Slots are now
+  released before the socket is closed.
 - **Pipelined HTTP/1.1 requests are no longer dropped.** When a client sent
   more than one request in a single write, only the first was answered: the
   bytes read behind it were discarded, and the connection then sat idle

@@ -535,9 +535,9 @@ pub const GatewayState = struct {
     /// Open (or opening) WebSocket tunnels (#812). Lock-free.
     websocket_tunnels: std.atomic.Value(u32) = .init(0),
     /// Tunnel cap used when `proxy_websocket_max_tunnels` is 0: half the
-    /// worker threads, at least one, so tunnels can never hold every worker.
-    /// Set once at startup.
-    websocket_default_max_tunnels: u32 = 1,
+    /// worker threads, rounded down, so tunnels can never hold every worker
+    /// (zero with a single worker). Set once at startup.
+    websocket_default_max_tunnels: u32 = 0,
     active_ws_streams: usize, // runtime accounting [connection_mutex]
     active_sse_streams: usize, // runtime accounting [connection_mutex]
     active_mux_connections: usize, // runtime accounting [connection_mutex]

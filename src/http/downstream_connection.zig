@@ -242,6 +242,15 @@ pub const ManagedConnection = struct {
             return self.owned_ip orelse "unknown";
         }
 
+        /// Run the close hook (connection-slot release) now, while the fd
+        /// number is still owned; `deinit` then skips it.
+        fn releaseBeforeClose(self: *Lifecycle, fd: std.posix.fd_t) void {
+            if (self.close_fn) |close_hook| {
+                if (self.close_ctx) |ctx| close_hook(ctx, fd);
+            }
+            self.close_fn = null;
+        }
+
         fn deinit(self: *Lifecycle, fd: std.posix.fd_t) void {
             if (self.release_session_fn) |release| {
                 if (self.release_session_ctx) |ctx| {
@@ -333,6 +342,9 @@ pub const ManagedConnection = struct {
         self.observeTlsBufferMetrics();
         self.releaseTlsBufferMetrics();
         deinitPhase(&self.phase);
+        // The slot table is keyed by fd: release before the fd is closed and
+        // its number can be reused by a newly accepted connection.
+        self.lifecycle.releaseBeforeClose(fd);
         self.transport.deinit();
         self.lifecycle.deinit(fd);
         self.* = undefined;
@@ -569,6 +581,30 @@ test "plaintext downstream transport exposes read interest" {
     try std.testing.expectEqual(@as(std.posix.fd_t, 90031), transport.rawFd());
     try std.testing.expectEqual(@as(usize, 0), transport.pendingPlaintext());
     try std.testing.expectEqual(event_loop.Interest{ .read = true }, transport.interest());
+}
+
+const SlotReleaseProbe = struct {
+    fd_open_at_release: ?bool = null,
+
+    fn hook(raw: *anyopaque, fd: std.posix.fd_t) void {
+        const self: *SlotReleaseProbe = @ptrCast(@alignCast(raw));
+        self.fd_open_at_release = std.c.fcntl(fd, std.c.F.GETFD, @as(c_int, 0)) != -1;
+    }
+};
+
+test "managed connection releases its slot before closing the fd" {
+    // Connection slots are keyed by fd number. Releasing after close lets a
+    // newly accepted connection reuse the number first, and the late release
+    // then drops that connection's slot, leaking an active-connection count.
+    const fd = std.c.dup(0);
+    try std.testing.expect(fd >= 0);
+    var probe = SlotReleaseProbe{};
+    var managed = ManagedConnection.init(.{ .plaintext = fd }, .{ .http1 = try Http1ConnectionState.init(std.testing.allocator, 64) });
+    managed.lifecycle.close_ctx = &probe;
+    managed.lifecycle.close_fn = SlotReleaseProbe.hook;
+    managed.deinit();
+    try std.testing.expectEqual(@as(?bool, true), probe.fd_open_at_release);
+    try std.testing.expectEqual(@as(c_int, -1), std.c.fcntl(fd, std.c.F.GETFD, @as(c_int, 0)));
 }
 
 test "managed connection captures fd phase and initial interest" {

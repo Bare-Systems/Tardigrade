@@ -537,10 +537,14 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         break :blk @intCast(@max(configured, @as(u32, 1)));
     };
     // Each WebSocket tunnel holds a worker for its lifetime (#812): unless the
-    // operator sets a cap, never let tunnels take more than half of them.
-    state.websocket_default_max_tunnels = @intCast(@max(worker_count / 2, 1));
+    // operator sets a cap, tunnels never take more than half of them, so a
+    // single worker allows none (upgrades get 503) rather than letting one
+    // tunnel starve every other request.
+    state.websocket_default_max_tunnels = @intCast(worker_count / 2);
     if (cfg.proxy_websocket_max_tunnels > 0 and cfg.proxy_websocket_max_tunnels >= worker_count) {
         state.logger.warn(null, "proxy_websocket_max_tunnels={d} can hold every worker thread ({d}); ordinary requests may stall while that many tunnels are open", .{ cfg.proxy_websocket_max_tunnels, worker_count });
+    } else if (cfg.proxy_websocket_max_tunnels == 0 and state.websocket_default_max_tunnels == 0 and configRelaysWebSockets(cfg)) {
+        state.logger.warn(null, "proxy_websocket is configured but there is only {d} worker thread; WebSocket upgrades will be refused with 503. Set TARDIGRADE_WORKER_THREADS to 2 or more, or set proxy_websocket_max_tunnels to accept that a tunnel can block every other request", .{worker_count});
     }
     var worker_ctx = WorkerContext{
         .config_store = &config_store,
@@ -979,6 +983,16 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         state.logger.warn(null, "drain timeout elapsed; force-closed {d} queued connection(s)", .{drain_result.forced_closes});
     }
     state.logger.info(null, "Graceful shutdown complete (forced_closes={d} drain_timed_out={})", .{ drain_result.forced_closes, drain_result.timed_out });
+}
+
+/// True when any location, top-level or in a server block, sets
+/// `proxy_websocket on`.
+fn configRelaysWebSockets(cfg: *const edge_config.EdgeConfig) bool {
+    for (cfg.location_blocks) |block| if (block.websocket != null) return true;
+    for (cfg.server_blocks) |server| {
+        for (server.location_blocks) |block| if (block.websocket != null) return true;
+    }
+    return false;
 }
 
 const Http3AdvertisementPhase = enum {
@@ -1519,9 +1533,13 @@ fn closeNewConnection(
     fd: std.posix.fd_t,
     session: *ConnectionSession,
 ) void {
+    // Release the slot while this connection still owns the fd number. The
+    // slot table is keyed by fd, and once it is closed the acceptor may hand
+    // the same number to a new connection: releasing afterwards would drop
+    // that connection's entry and leak one active-connection count.
+    ctx.state.releaseConnectionSlot(fd);
     _ = std.c.close(fd);
     ctx.session_pool.release(session);
-    ctx.state.releaseConnectionSlot(fd);
 }
 
 /// Park a freshly-idle new connection off the worker pool and arm the event

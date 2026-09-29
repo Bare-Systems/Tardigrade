@@ -23411,6 +23411,15 @@ test "proxy_websocket runs auth, forward_auth and Origin checks before any upstr
     defer cross_site.deinit(allocator);
     try std.testing.expectEqual(@as(u16, 403), cross_site.status);
 
+    // Two Origin fields: the allowlist and the origin could read different
+    // ones, so the handshake is refused outright.
+    var two_origins = try wsHandshake(allocator, tardigrade.port, "/origin-locked/x", &.{
+        .{ .name = "Origin", .value = "https://app.example.test" },
+        .{ .name = "Origin", .value = "https://evil.example.test" },
+    }, "");
+    defer two_origins.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 400), two_origins.status);
+
     // No gate let a denied handshake reach the origin.
     try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
 
@@ -23507,6 +23516,30 @@ test "proxy_websocket closes idle tunnels and caps concurrent tunnels with a cle
     try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"idle\""));
 }
 
+test "proxy_websocket never lets a tunnel take a single worker's only thread (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    // The harness default: one worker thread.
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz" });
+    defer tardigrade.stop();
+    try waitForLogSubstring(allocator, tardigrade.log_path, "WebSocket upgrades will be refused with 503", 2_000);
+
+    var hs = try wsHandshake(allocator, tardigrade.port, "/ws/starve", &.{}, "");
+    defer hs.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 503), hs.status);
+    try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
+
+    // Ordinary requests are still served while that client stays connected.
+    var health = try sendRequestWithTimeout(allocator, tardigrade.port, .{ .method = "GET", .path = "/healthz", .body = null, .headers = &.{} }, 2_000);
+    defer health.deinit();
+    try std.testing.expectEqual(@as(u16, 200), health.status_code);
+}
+
 test "proxy_websocket tunnels drain within the shutdown window and the process exits (#812)" {
     const allocator = std.testing.allocator;
     const origin = try WsOrigin.start(allocator, .echo);
@@ -23550,6 +23583,14 @@ test "proxy_websocket soak: repeated connect/close settles tunnels and connectio
     var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
     defer tardigrade.stop();
 
+    // Metric probes send `Connection: close`, so a probe counts only itself.
+    // Measure that baseline rather than assuming it.
+    const baseline_connections = blk: {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        break :blk prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0;
+    };
+
     const rounds = 120;
     var i: usize = 0;
     while (i < rounds) : (i += 1) {
@@ -23575,12 +23616,12 @@ test "proxy_websocket soak: repeated connect/close settles tunnels and connectio
             closed += wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"" ++ reason ++ "\"");
         }
         const connections = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0;
-        if (active == 0 and closed == rounds and connections <= 1) {
+        if (active == 0 and closed == rounds and connections <= baseline_connections) {
             try std.testing.expectEqual(@as(u64, rounds), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"relayed\""));
             break;
         }
         if (compat.milliTimestamp() > deadline) {
-            std.debug.print("unsettled: active={d} closed={d} connections={d}\n", .{ active, closed, connections });
+            std.debug.print("unsettled: active={d} closed={d} connections={d} baseline={d}\n", .{ active, closed, connections, baseline_connections });
             return error.TunnelsDidNotSettle;
         }
         compat.sleepNs(50 * std.time.ns_per_ms);

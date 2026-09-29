@@ -31,6 +31,16 @@ pub fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void
     http.security_headers.applyProtectedCachePolicy(response, http.security_headers.requestCachePolicy());
 }
 
+/// `applyResponseHeaders` for a gateway-generated security refusal (auth
+/// denial or fail-closed error, 425 Too Early): after configured headers,
+/// force exactly one `Cache-Control: no-store` and strip every CDN/surrogate
+/// cache field, so a global `TARDIGRADE_ADD_HEADERS` can never make a refusal
+/// cacheable (#761).
+pub fn applyRefusalResponseHeaders(state: *GatewayState, response: *http.Response) void {
+    applyResponseHeaders(state, response);
+    http.security_headers.applyProtectedCachePolicy(response, .no_store);
+}
+
 pub fn writeStreamedUpstreamResponse(
     writer: anytype,
     status_code: u16,

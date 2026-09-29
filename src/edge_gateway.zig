@@ -3423,6 +3423,9 @@ fn respondHttp2Stream(
     // decorate whatever response the location produces (#761).
     var forward_auth_allowed: ?gfa.Decision = null;
     defer if (forward_auth_allowed) |*allowed| allowed.deinit();
+    // Set for gateway-generated security refusals (forward_auth denial or
+    // failure, protected 425) that must end up `no-store` (#761).
+    var refusal_no_store = false;
     // Exactly one early-data decision per transport-early stream: routing
     // records `too_early` itself when it refuses one; otherwise it was
     // accepted.
@@ -3445,10 +3448,14 @@ fn respondHttp2Stream(
                 if (rejection.retry_after) |value| {
                     try response_headers.append(.{ .name = "retry-after", .value = value });
                 }
-                if (rejection.no_store) try response_headers.append(.{ .name = "cache-control", .value = "no-store" });
+                if (rejection.no_store) {
+                    try response_headers.append(.{ .name = "cache-control", .value = "no-store" });
+                    refusal_no_store = true;
+                }
                 state.metricsRecordErrorCode(rejection.code);
             },
             .forward_auth_denied => |denied| {
+                refusal_no_store = true;
                 var decision = denied;
                 defer decision.deinit();
                 var shaped = http.Response.init(allocator);
@@ -3541,12 +3548,19 @@ fn respondHttp2Stream(
     for (state.add_headers) |h| {
         try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, h.name), .value = h.value });
     }
-    // Last header operation: a forward_auth-protected response must never be
-    // shared-cacheable, whatever the origin or configured headers say (#761).
-    // Every Cache-Control field is folded; every cache-controlling field,
-    // CDN/surrogate ones included, is replaced by the one protected policy.
-    if (forward_auth_allowed) |*allowed| {
-        const policy: http.security_headers.ProtectedCachePolicy = if (allowed.client_headers.len > 0) .no_store else .private;
+    // Last header operation: a forward_auth-protected response, or a security
+    // refusal, must never be shared-cacheable, whatever the origin or
+    // configured headers say (#761). Every Cache-Control field is folded;
+    // every cache-controlling field, CDN/surrogate ones included, is replaced
+    // by the one protected policy.
+    const final_cache_policy: http.security_headers.ProtectedCachePolicy = if (refusal_no_store)
+        .no_store
+    else if (forward_auth_allowed) |*allowed|
+        (if (allowed.client_headers.len > 0) .no_store else .private)
+    else
+        .none;
+    if (final_cache_policy != .none) {
+        const policy = final_cache_policy;
         var cache_buf: [256]u8 = undefined;
         var fold = http.security_headers.CacheControlFold.init(&cache_buf, policy);
         var idx: usize = 0;
@@ -6853,6 +6867,57 @@ test "H2 resumed 0-RTT stream to a forward_auth location gets 425 without callin
     defer allocator.free(prom);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h2\",decision=\"too_early\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h2\",decision=\"accepted\"} 0") != null);
+}
+
+test "H2 forward_auth refusals stay no-store despite global CDN cache headers" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-secret" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+    const add_headers = [_]edge_config.EdgeConfig.HeaderPair{
+        .{ .name = "CDN-Cache-Control", .value = "public, max-age=3600" },
+        .{ .name = "Surrogate-Control", .value = "max-age=3600" },
+        .{ .name = "Cache-Control", .value = "public" },
+    };
+
+    var h: H2ForwardAuthHarness = undefined;
+    h.init(allocator);
+    defer h.deinit();
+    h.state.add_headers = add_headers[0..];
+    h.conn.handshake_complete = true;
+    // Stream 1: ordinary request, denied by the auth service.
+    try h.addStream(1, "GET", "/admin", false);
+    try h.dispatch(&cfg);
+    const denied = h.conn.out.written();
+    try std.testing.expect(std.mem.find(u8, denied, "401") != null);
+    try std.testing.expect(std.mem.find(u8, denied, "no-store") != null);
+    try std.testing.expect(std.mem.find(u8, denied, "cdn-cache-control") == null);
+    try std.testing.expect(std.mem.find(u8, denied, "surrogate-control") == null);
+    try std.testing.expect(std.mem.find(u8, denied, "public") == null);
+
+    // Stream 3: replay-exposed request to the protected location (425).
+    const denied_len = denied.len;
+    try h.addStream(3, "GET", "/admin", true);
+    try h.dispatch(&cfg);
+    const too_early = h.conn.out.written()[denied_len..];
+    try std.testing.expect(std.mem.find(u8, too_early, "425") != null);
+    try std.testing.expect(std.mem.find(u8, too_early, "no-store") != null);
+    try std.testing.expect(std.mem.find(u8, too_early, "cdn-cache-control") == null);
+    try std.testing.expect(std.mem.find(u8, too_early, "surrogate-control") == null);
+    try std.testing.expect(std.mem.find(u8, too_early, "public") == null);
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
 }
 
 test "H2 forward_auth allow serves a protected static location with the auth Set-Cookie" {

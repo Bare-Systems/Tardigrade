@@ -25,7 +25,11 @@ All notable user-facing changes to Tardigrade are documented here.
   surrogate cache fields (`CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`,
   `Surrogate-Control`, `Edge-Control`, `X-Accel-Expires`) are removed, a
   configured `Cache-Control` in `TARDIGRADE_ADD_HEADERS` cannot override the
-  policy, and a response that cannot carry it is replaced by a 503.
+  policy, and a response that cannot carry it is replaced by a 503. Auth
+  denials, fail-closed errors and protected 425 responses likewise end with
+  exactly one `no-store` and no CDN/surrogate field, even with such headers
+  configured globally. Over HTTP/2, a `rewrite` action in a forward_auth
+  location is not supported yet and answers 404 (#814).
   Every denial is
   `Cache-Control: no-store` (which the allowlists cannot name), and `HEAD`
   gets the head without a body.

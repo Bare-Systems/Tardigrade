@@ -41,6 +41,7 @@ pub const writeRequestIdHeaders = gph.writeRequestIdHeaders;
 pub const setRequestIdHeaders = gph.setRequestIdHeaders;
 // -- gateway_proxy_response.zig (gpres)
 pub const applyResponseHeaders = gpres.applyResponseHeaders;
+pub const applyRefusalResponseHeaders = gpres.applyRefusalResponseHeaders;
 pub const writeStreamedUpstreamResponse = gpres.writeStreamedUpstreamResponse;
 pub const writeStreamedUpstreamResponseHeadFromHeaders = gpres.writeStreamedUpstreamResponseHeadFromHeaders;
 pub const writeBufferedUpstreamResponse = gpres.writeBufferedUpstreamResponse;

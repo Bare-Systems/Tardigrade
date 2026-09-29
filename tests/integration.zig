@@ -14170,6 +14170,58 @@ test "forward_auth responses are never shared-cacheable over h1" {
     try std.testing.expectEqualStrings("no-store", split.header("Cache-Control").?);
 }
 
+test "forward_auth refusals stay no-store despite global CDN cache headers over h1" {
+    const allocator = std.testing.allocator;
+
+    var auth = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 302, .body = "", .headers = &.{
+            .{ .name = "Location", .value = "https://sso.example.test/login" },
+            .{ .name = "Set-Cookie", .value = "csrf=abc" },
+        } },
+        .{ .status_code = 401, .body = "sign in", .headers = &.{.{ .name = "WWW-Authenticate", .value = "Basic" }} },
+        .{ .status_code = 500, .body = "" },
+    });
+    defer auth.stop();
+    try auth.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /admin/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_client_headers Set-Cookie;
+        \\    return 200 admin-secret;
+        \\}}
+    , .{ test_host, auth.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_ADD_HEADERS", .value = "CDN-Cache-Control: public, max-age=3600|Surrogate-Control: max-age=3600|Cache-Control: public" }},
+    });
+    defer tardigrade.stop();
+
+    const expected_status = [_]u16{ 302, 401, 503 };
+    for (expected_status) |status| {
+        var response = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/admin/", .body = null, .headers = &.{} });
+        defer response.deinit();
+        try std.testing.expectEqual(status, response.status_code);
+        try std.testing.expectEqual(@as(usize, 1), countRawHeader(response.headers_raw, "cache-control"));
+        try std.testing.expectEqualStrings("no-store", response.header("Cache-Control").?);
+        try std.testing.expect(response.header("CDN-Cache-Control") == null);
+        try std.testing.expect(response.header("Surrogate-Control") == null);
+        if (status == 302) {
+            try std.testing.expectEqualStrings("https://sso.example.test/login", response.header("Location").?);
+            try std.testing.expectEqualStrings("csrf=abc", response.header("Set-Cookie").?);
+        }
+    }
+}
+
 test "forward_auth fails closed when the auth service is unreachable or slow" {
     const allocator = std.testing.allocator;
 

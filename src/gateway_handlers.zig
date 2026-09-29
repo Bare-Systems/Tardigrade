@@ -29,6 +29,7 @@ const resolveRequestConfig = ga.resolveRequestConfig;
 const isGeoBlocked = ga.isGeoBlocked;
 const executeBoundedControlPlaneJsonProxy = gcp.executeBoundedControlPlaneJsonProxy;
 const applyResponseHeaders = gp.applyResponseHeaders;
+const applyRefusalResponseHeaders = gp.applyRefusalResponseHeaders;
 const appendProxyQueryString = gp.appendProxyQueryString;
 const buildApiErrorJson = gp.buildApiErrorJson;
 const resolveProxyTarget = gp.resolveProxyTarget;
@@ -218,7 +219,7 @@ pub fn writeTooEarlyResponse(
         .setHeader("Cache-Control", "no-store");
     setRequestIdHeaders(&response, correlation_id);
     ctx.response_bytes = payload.len;
-    applyResponseHeaders(state, &response);
+    applyRefusalResponseHeaders(state, &response);
     try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
     state.metricsRecord(@intFromEnum(plan.status));
     state.metricsRecordErrorCode(plan.code);
@@ -1018,7 +1019,7 @@ fn enforceLocationForwardAuth(
     try gfa.shapeResponse(allocator, &response, &decision, correlation_id);
     _ = response.setConnection(keep_alive.*);
     setRequestIdHeaders(&response, correlation_id);
-    applyResponseHeaders(state, &response);
+    applyRefusalResponseHeaders(state, &response);
     // HEAD gets the GET-equivalent head (Content-Length included), no body.
     if (request.method == .HEAD) {
         try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
@@ -3433,7 +3434,7 @@ fn enforceHttp3ForwardAuth(
     if (std.mem.eql(u8, request.method, "HEAD")) {
         _ = response.setBodyOwned(try allocator.dupe(u8, ""));
     }
-    applyResponseHeaders(ctx.state, response);
+    applyRefusalResponseHeaders(ctx.state, response);
     ctx.state.metricsRecord(decision.status);
     if (!decision.relaysAuthResponse()) ctx.state.metricsRecordErrorCode(decision.errorCode());
     return false;
@@ -3554,7 +3555,7 @@ fn routeHttp3Hop(
                 .setHeader("cache-control", "no-store")
                 .setHeader(http.correlation.HEADER_NAME, correlation_id);
             finalizeHttp3Response(response);
-            applyResponseHeaders(ctx.state, response);
+            applyRefusalResponseHeaders(ctx.state, response);
             ctx.state.metricsRecord(425);
             ctx.state.metricsRecordErrorCode("too_early");
             route.grants.clear();
@@ -4584,6 +4585,8 @@ const H3ForwardAuthTestOptions = struct {
     doc_root: []const u8 = "",
     policy_rules_raw: []const u8 = "",
     request_headers: []const http.headers.Header = &.{},
+    add_headers: []const edge_config.EdgeConfig.HeaderPair = &.{},
+    transport_early: bool = false,
 };
 
 fn runH3ForwardAuthRequest(
@@ -4610,7 +4613,7 @@ fn runH3ForwardAuthRequestWith(
     var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
     defer config_store.deinit();
     var state: GatewayState = undefined;
-    initHttp3ProxyTestState(&state, allocator, &.{});
+    initHttp3ProxyTestState(&state, allocator, options.add_headers);
     defer deinitHttp3ProxyTestState(&state);
     var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
     var request = http.http3_session.StreamRequest{
@@ -4621,6 +4624,7 @@ fn runH3ForwardAuthRequestWith(
         .headers = http.Headers.init(allocator),
         .body = try allocator.alloc(u8, 0),
         .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+        .transport_early = options.transport_early,
     };
     defer request.deinit();
     for (options.request_headers) |header| try request.headers.append(header.name, header.value);
@@ -5002,6 +5006,79 @@ test "H3 forward_auth responses are never shared-cacheable" {
     try runH3ForwardAuthRequest(allocator, blocks[0..], "GET", "/reports/report.txt", &static_file);
     try std.testing.expectEqual(@as(u16, 200), @intFromEnum(static_file.status));
     try std.testing.expect(std.mem.startsWith(u8, static_file.headers.get("cache-control").?, "private"));
+}
+
+const test_public_cdn_add_headers = [_]edge_config.EdgeConfig.HeaderPair{
+    .{ .name = "CDN-Cache-Control", .value = "public, max-age=3600" },
+    .{ .name = "Surrogate-Control", .value = "max-age=3600" },
+    .{ .name = "Cache-Control", .value = "public" },
+};
+
+fn expectRefusalCachePolicy(response: *const http.Response) !void {
+    try std.testing.expectEqual(@as(usize, 1), response.headers.countByName("cache-control"));
+    try std.testing.expectEqualStrings("no-store", response.headers.get("cache-control").?);
+    inline for (.{ "cdn-cache-control", "surrogate-control", "cloudflare-cdn-cache-control", "edge-control" }) |name| {
+        try std.testing.expect(response.headers.get(name) == null);
+    }
+}
+
+test "H3 forward_auth refusals stay no-store despite global CDN cache headers" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 302 Found\r\nLocation: https://sso.example.test/\r\nSet-Cookie: csrf=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-ok" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .client_headers = &.{"Set-Cookie"} },
+    }};
+    const options = H3ForwardAuthTestOptions{ .add_headers = test_public_cdn_add_headers[0..] };
+
+    var redirect = http.Response.init(allocator);
+    defer redirect.deinit();
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/admin", &redirect, options);
+    try std.testing.expectEqual(@as(u16, 302), @intFromEnum(redirect.status));
+    try std.testing.expectEqualStrings("csrf=1", redirect.headers.get("set-cookie").?);
+    try expectRefusalCachePolicy(&redirect);
+
+    var failure = http.Response.init(allocator);
+    defer failure.deinit();
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/admin", &failure, options);
+    try std.testing.expectEqual(@as(u16, 503), @intFromEnum(failure.status));
+    try expectRefusalCachePolicy(&failure);
+
+    // Replay-exposed request to the protected location: 425 before any
+    // auth call, with the same cache rule.
+    var too_early = http.Response.init(allocator);
+    defer too_early.deinit();
+    var early_options = options;
+    early_options.transport_early = true;
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/admin", &too_early, early_options);
+    try std.testing.expectEqual(@as(u16, 425), @intFromEnum(too_early.status));
+    try expectRefusalCachePolicy(&too_early);
+    try std.testing.expectEqual(@as(usize, 2), auth_server.requestCount());
+}
+
+test "H1 425 Too Early stays no-store despite global CDN cache headers" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, test_public_cdn_add_headers[0..]);
+    var ctx = http.request_context.RequestContext.init(allocator, "req-early", "127.0.0.1");
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    _ = try writeTooEarlyResponse(allocator, &output.writer, &state, &ctx, "req-early", false);
+    const written = output.written();
+    try std.testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 425"));
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "cache-control: no-store\r\n") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "cache-control: public") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "cdn-cache-control") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "surrogate-control") == null);
 }
 
 test "H3 forward_auth HEAD denial keeps Content-Length and drops the body" {

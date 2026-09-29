@@ -387,7 +387,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_LOCATION,
         .value_type = "url",
         .default_value = "none",
-        .description = "External auth subrequest run before the location action. 2xx allows, 3xx/4xx is relayed to the client, and timeouts, connect failures, 1xx/5xx or malformed responses fail closed with forward_auth_failure_status.",
+        .description = "External auth subrequest run before the location action. 2xx allows; a 4xx, or a 301/302/303/307/308 with a valid Location, is relayed to the client; 304, other 3xx, redirects without a Location, 1xx/5xx, timeouts, connect failures and malformed responses fail closed with forward_auth_failure_status. Allowed and denied responses are never shared-cacheable. On HTTP/2, a rewrite action in a forward_auth location is not supported (the request gets 404).",
         .example = "location /admin/ {\n    forward_auth http://127.0.0.1:4180/oauth2/auth;\n    proxy_pass http://up;\n}",
         .docs = &.{"examples/forward-auth/README.md"},
     },
@@ -407,7 +407,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_LOCATION,
         .value_type = "header names",
         .default_value = "none",
-        .description = "Auth-response headers added to the client response: on allow, to whatever the location returns; on denial, in addition to Location (3xx) and WWW-Authenticate (401). Repeated fields such as Set-Cookie are kept.",
+        .description = "Auth-response headers added to the client response: on allow, to whatever the location returns; on a relayed denial, in addition to Location (for a 301/302/303/307/308 redirect) and WWW-Authenticate (401). Repeated fields such as Set-Cookie are kept.",
         .example = "location /admin/ {\n    forward_auth http://127.0.0.1:4180/verify;\n    forward_auth_client_headers Set-Cookie;\n    proxy_pass http://up;\n}",
         .docs = &.{"examples/forward-auth/README.md"},
     },
@@ -1957,4 +1957,20 @@ test "explaining a secret field never includes a live secret value even if prese
     const written = out.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "do-not-print-this") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "TARDIGRADE_JWT_SECRET") != null);
+}
+
+test "forward_auth reference text matches the relayed-status contract" {
+    // Keep `tardi explain forward_auth` aligned with
+    // gateway_forward_auth.isRelayableDenial: only 4xx and real redirects are
+    // relayed; 304 and other 3xx fail closed.
+    var found = false;
+    for (entries) |field| {
+        if (!std.mem.eql(u8, field.name, "location.forward_auth")) continue;
+        found = true;
+        inline for (.{ "301/302/303/307/308", "Location", "304", "fail closed" }) |needle| {
+            try std.testing.expect(std.mem.find(u8, field.description, needle) != null);
+        }
+        try std.testing.expect(std.mem.find(u8, field.description, "3xx/4xx is relayed") == null);
+    }
+    try std.testing.expect(found);
 }

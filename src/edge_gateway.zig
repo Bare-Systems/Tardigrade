@@ -3523,24 +3523,6 @@ fn respondHttp2Stream(
         for (allowed.client_headers) |header| {
             try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, header.name), .value = header.value });
         }
-        // A forward_auth-protected response must never be shared-cacheable:
-        // replace the origin's policy (#761).
-        const policy: http.security_headers.ProtectedCachePolicy = if (allowed.client_headers.len > 0) .no_store else .private;
-        var origin_cache_control: ?[]const u8 = null;
-        var idx: usize = 0;
-        while (idx < response_headers.items.len) {
-            if (std.ascii.eqlIgnoreCase(response_headers.items[idx].name, "cache-control")) {
-                if (origin_cache_control == null) origin_cache_control = response_headers.items[idx].value;
-                _ = response_headers.orderedRemove(idx);
-                continue;
-            }
-            idx += 1;
-        }
-        var cache_buf: [256]u8 = undefined;
-        const cache_value = try allocator.dupe(u8, http.security_headers.protectedCacheControl(&cache_buf, origin_cache_control, policy));
-        errdefer allocator.free(cache_value);
-        try owned_header_values.append(cache_value);
-        try response_headers.append(.{ .name = "cache-control", .value = cache_value });
     }
 
     const status_str = try std.fmt.allocPrint(allocator, "{d}", .{status_code});
@@ -3558,6 +3540,29 @@ fn respondHttp2Stream(
     try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.HEADER_NAME), .value = correlation_id });
     for (state.add_headers) |h| {
         try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, h.name), .value = h.value });
+    }
+    // Last header operation: a forward_auth-protected response must never be
+    // shared-cacheable, whatever the origin or configured headers say (#761).
+    // Every Cache-Control field is folded; every cache-controlling field,
+    // CDN/surrogate ones included, is replaced by the one protected policy.
+    if (forward_auth_allowed) |*allowed| {
+        const policy: http.security_headers.ProtectedCachePolicy = if (allowed.client_headers.len > 0) .no_store else .private;
+        var cache_buf: [256]u8 = undefined;
+        var fold = http.security_headers.CacheControlFold.init(&cache_buf, policy);
+        var idx: usize = 0;
+        while (idx < response_headers.items.len) {
+            const field = response_headers.items[idx];
+            if (http.security_headers.isProtectedCacheField(field.name)) {
+                if (std.ascii.eqlIgnoreCase(field.name, "cache-control")) fold.add(field.value);
+                _ = response_headers.orderedRemove(idx);
+                continue;
+            }
+            idx += 1;
+        }
+        const cache_value = try allocator.dupe(u8, fold.value());
+        errdefer allocator.free(cache_value);
+        try owned_header_values.append(cache_value);
+        try response_headers.append(.{ .name = "cache-control", .value = cache_value });
     }
 
     const header_block = try http.hpack.encodeLiteralHeaderBlock(allocator, response_headers.items);

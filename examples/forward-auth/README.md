@@ -57,9 +57,16 @@ Every denial and failure carries `Cache-Control: no-store`. Allowed responses
 are never shared-cacheable either, whatever the origin says: a shared cache
 would otherwise answer the next request without asking the auth service.
 When the auth service added headers (such as a refreshed session cookie) the
-response is `Cache-Control: no-store`; otherwise the origin's directives are
-kept but made `private` (`public`, `s-maxage` and `proxy-revalidate` are
-dropped). An origin `no-store` always stays `no-store`. A `HEAD` request
+response is `Cache-Control: no-store`; otherwise every origin `Cache-Control`
+field is folded into one `private` policy (`public`, `s-maxage` and
+`proxy-revalidate` are dropped), and a `no-store` in any field wins. The
+cache-controlling fields that CDNs and reverse proxies honor ahead of
+`Cache-Control` (`CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`,
+`Surrogate-Control`, `Edge-Control`, `X-Accel-Expires`) are removed, and a
+`Cache-Control` from `TARDIGRADE_ADD_HEADERS` cannot override the policy. If
+the policy cannot be attached, the response is replaced by an empty 503
+rather than sent unprotected. Cache rules configured *in* a CDN that ignore
+origin headers remain the operator's responsibility. A `HEAD` request
 gets the same status and headers, including `Content-Length`, without a body.
 Denied requests never reach the upstream, a mirror target, or a retry.
 Auth-response headers the auth service nominates as hop-by-hop through

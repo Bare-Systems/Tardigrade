@@ -4946,8 +4946,9 @@ test "H3 forward_auth responses are never shared-cacheable" {
     });
     defer auth_server.stop();
     try auth_server.run();
-    // The origin marks its body publicly cacheable.
-    const public_origin = "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=600\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    // The origin marks its body publicly cacheable, including through the
+    // CDN/surrogate fields caches in front of Tardigrade honor first.
+    const public_origin = "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=600\r\nCDN-Cache-Control: public, max-age=3600\r\nCloudflare-CDN-Cache-Control: public, max-age=3600\r\nSurrogate-Control: max-age=3600\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
     var origin = try gfa.TestAuthServer.start(allocator, &.{ public_origin, public_origin });
     defer origin.stop();
     try origin.run();
@@ -4991,6 +4992,10 @@ test "H3 forward_auth responses are never shared-cacheable" {
     try runH3ForwardAuthRequest(allocator, blocks[0..], "GET", "/app/page", &no_cookie);
     try std.testing.expectEqual(@as(usize, 1), no_cookie.headers.countByName("cache-control"));
     try std.testing.expectEqualStrings("private, max-age=600", no_cookie.headers.get("cache-control").?);
+    inline for (.{ "cdn-cache-control", "cloudflare-cdn-cache-control", "surrogate-control" }) |name| {
+        try std.testing.expect(no_cookie.headers.get(name) == null);
+        try std.testing.expect(with_cookie.headers.get(name) == null);
+    }
 
     var static_file = http.Response.init(allocator);
     defer static_file.deinit();

@@ -20,7 +20,12 @@ All notable user-facing changes to Tardigrade are documented here.
   are never sent to the auth service. Responses to allowed requests are
   never shared-cacheable, since a CDN would otherwise serve them without the
   auth check: `Cache-Control: no-store` when the auth service added headers
-  such as a session cookie, otherwise the origin's directives made `private`.
+  such as a session cookie, otherwise the origin's directives (all
+  `Cache-Control` fields, `no-store` winning) made `private`. CDN and
+  surrogate cache fields (`CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`,
+  `Surrogate-Control`, `Edge-Control`, `X-Accel-Expires`) are removed, a
+  configured `Cache-Control` in `TARDIGRADE_ADD_HEADERS` cannot override the
+  policy, and a response that cannot carry it is replaced by a 503.
   Every denial is
   `Cache-Control: no-store` (which the allowlists cannot name), and `HEAD`
   gets the head without a body.

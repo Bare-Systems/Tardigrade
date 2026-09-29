@@ -26,6 +26,9 @@ pub fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void
     if (state.http3_alt_svc) |value| {
         _ = response.setHeader("Alt-Svc", value);
     }
+    // Last: configured headers above must not reintroduce a shared-cache
+    // policy on a forward_auth-protected response (#761).
+    http.security_headers.applyProtectedCachePolicy(response, http.security_headers.requestCachePolicy());
 }
 
 pub fn writeStreamedUpstreamResponse(
@@ -560,17 +563,18 @@ pub fn writeSecurityHeadersFiltered(
     }
     // A forward_auth-protected response replaces the origin's cache policy
     // (whose field the caller skipped) with a non-shared one (#761).
+    // A forward_auth-protected response replaces every origin
+    // cache-controlling field (the caller skipped them all, CDN/surrogate
+    // fields included) with one non-shared policy folded from all origin
+    // `Cache-Control` fields (#761).
     const cache_policy = http.security_headers.requestCachePolicy();
     if (cache_policy != .none) {
-        var origin_cache_control: ?[]const u8 = null;
-        for (upstream_headers) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "cache-control")) {
-                origin_cache_control = h.value;
-                break;
-            }
-        }
         var buf: [256]u8 = undefined;
-        try writer.print("Cache-Control: {s}\r\n", .{http.security_headers.protectedCacheControl(&buf, origin_cache_control, cache_policy)});
+        var fold = http.security_headers.CacheControlFold.init(&buf, cache_policy);
+        for (upstream_headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "cache-control")) fold.add(h.value);
+        }
+        try writer.print("Cache-Control: {s}\r\n", .{fold.value()});
     }
 }
 

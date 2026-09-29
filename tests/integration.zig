@@ -5326,7 +5326,11 @@ test "interop.h2.forward_auth_responses_are_not_shared_cacheable" {
     });
     defer auth.stop();
     try auth.run();
-    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "h2-protected", .headers = &.{.{ .name = "Cache-Control", .value = "public, max-age=600" }} }});
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "h2-protected", .headers = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=600" },
+        .{ .name = "CDN-Cache-Control", .value = "public, max-age=3600" },
+        .{ .name = "Surrogate-Control", .value = "max-age=3600" },
+    } }});
     defer upstream.stop();
     try upstream.run();
 
@@ -5363,6 +5367,7 @@ test "interop.h2.forward_auth_responses_are_not_shared_cacheable" {
             .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
             .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
             .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_ADD_HEADERS", .value = "Cache-Control: public, max-age=3600" },
         },
     });
     defer tardigrade.stop();
@@ -5383,6 +5388,8 @@ test "interop.h2.forward_auth_responses_are_not_shared_cacheable" {
         if (std.ascii.eqlIgnoreCase(h.name, "cache-control")) cache_fields += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), cache_fields);
+    try std.testing.expect(proxied.header("cdn-cache-control") == null);
+    try std.testing.expect(proxied.header("surrogate-control") == null);
 
     const static_headers = [_]hpack.HeaderField{
         .{ .name = ":method", .value = "GET" },
@@ -5393,7 +5400,13 @@ test "interop.h2.forward_auth_responses_are_not_shared_cacheable" {
     var static_file = try pureZigH2GetResponse(allocator, tardigrade.port, static_headers[0..]);
     defer static_file.deinit(allocator);
     try std.testing.expectEqual(@as(u16, 200), static_file.status);
-    try std.testing.expect(std.mem.startsWith(u8, static_file.header("cache-control").?, "private"));
+    // The configured public policy is normalized, not appended after it.
+    var static_cache_fields: usize = 0;
+    for (static_file.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "cache-control")) static_cache_fields += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), static_cache_fields);
+    try std.testing.expectEqualStrings("private, max-age=3600", static_file.header("cache-control").?);
 }
 
 test "interop.h2.proxy_malformed_authority_rejected_before_upstream" {
@@ -14045,14 +14058,29 @@ test "forward_auth responses are never shared-cacheable over h1" {
         .{ .status_code = 200, .body = "" }, // buffered, no cookie
         .{ .status_code = 200, .body = "", .headers = refresh }, // streamed, cookie
         .{ .status_code = 200, .body = "" }, // static, no cookie
+        .{ .status_code = 200, .body = "" }, // buffered, split no-store origin
     });
     defer auth.stop();
     try auth.run();
     // The origin marks everything publicly cacheable, unaware the gateway
-    // gates it and may add a session cookie.
-    const public_cache: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=600" }};
+    // gates it and may add a session cookie, including through the
+    // CDN/surrogate fields that caches in front of Tardigrade honor first.
+    const public_cache: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=600" },
+        .{ .name = "CDN-Cache-Control", .value = "public, max-age=3600" },
+        .{ .name = "Cloudflare-CDN-Cache-Control", .value = "public, max-age=3600" },
+        .{ .name = "Surrogate-Control", .value = "max-age=3600" },
+    };
+    // A second origin field carrying no-store must dominate.
+    const split_no_store: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=600" },
+        .{ .name = "Cache-Control", .value = "no-store" },
+    };
     var upstream = try UpstreamServer.start(allocator, &.{
         .{ .body = "protected-body", .headers = public_cache },
+        .{ .body = "protected-body", .headers = public_cache },
+        .{ .body = "protected-body", .headers = public_cache },
+        .{ .body = "protected-body", .headers = split_no_store },
     });
     defer upstream.stop();
     try upstream.run();
@@ -14093,8 +14121,12 @@ test "forward_auth responses are never shared-cacheable over h1" {
         .auth_token_hashes = null,
         .config_text = config_text,
         .ready_path = "/healthz",
+        // A globally configured header must not reintroduce shared caching.
+        .extra_env = &.{.{ .name = "TARDIGRADE_ADD_HEADERS", .value = "Cache-Control: public, max-age=3600" }},
     });
     defer tardigrade.stop();
+
+    const vendor_fields = [_][]const u8{ "CDN-Cache-Control", "Cloudflare-CDN-Cache-Control", "Surrogate-Control" };
 
     // Buffered proxy + auth cookie: no-store, the user's cookie kept.
     var with_cookie = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/app/page", .body = null, .headers = &.{} });
@@ -14103,12 +14135,15 @@ test "forward_auth responses are never shared-cacheable over h1" {
     try std.testing.expectEqual(@as(usize, 1), countRawHeader(with_cookie.headers_raw, "cache-control"));
     try std.testing.expectEqualStrings("no-store", with_cookie.header("Cache-Control").?);
     try std.testing.expectEqualStrings("refreshed=alice", with_cookie.header("Set-Cookie").?);
+    for (vendor_fields) |name| try std.testing.expect(with_cookie.header(name) == null);
 
     // Buffered proxy, no cookie: still never shared-cacheable.
     var no_cookie = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/app/page", .body = null, .headers = &.{} });
     defer no_cookie.deinit();
     try std.testing.expectEqual(@as(usize, 1), countRawHeader(no_cookie.headers_raw, "cache-control"));
     try std.testing.expectEqualStrings("private, max-age=600", no_cookie.header("Cache-Control").?);
+    // No cookie involved, yet a CDN must still not be able to cache it.
+    for (vendor_fields) |name| try std.testing.expect(no_cookie.header(name) == null);
 
     // Streamed (SSE-style) proxy + auth cookie.
     var streamed = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/events/feed", .body = null, .headers = &.{} });
@@ -14117,14 +14152,22 @@ test "forward_auth responses are never shared-cacheable over h1" {
     try std.testing.expectEqual(@as(usize, 1), countRawHeader(streamed.headers_raw, "cache-control"));
     try std.testing.expectEqualStrings("no-store", streamed.header("Cache-Control").?);
     try std.testing.expectEqualStrings("refreshed=alice", streamed.header("Set-Cookie").?);
+    for (vendor_fields) |name| try std.testing.expect(streamed.header(name) == null);
 
     // Protected static file.
     var static_file = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/reports/report.txt", .body = null, .headers = &.{} });
     defer static_file.deinit();
     try std.testing.expectEqual(@as(u16, 200), static_file.status_code);
     try assertContains(static_file.body, "static-report");
+    // The configured `public, max-age=3600` was normalized, not appended.
     try std.testing.expectEqual(@as(usize, 1), countRawHeader(static_file.headers_raw, "cache-control"));
-    try std.testing.expect(std.mem.startsWith(u8, static_file.header("Cache-Control").?, "private"));
+    try std.testing.expectEqualStrings("private, max-age=3600", static_file.header("Cache-Control").?);
+
+    // Split origin fields: a later `no-store` field dominates.
+    var split = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/app/page", .body = null, .headers = &.{} });
+    defer split.deinit();
+    try std.testing.expectEqual(@as(usize, 1), countRawHeader(split.headers_raw, "cache-control"));
+    try std.testing.expectEqualStrings("no-store", split.header("Cache-Control").?);
 }
 
 test "forward_auth fails closed when the auth service is unreachable or slow" {

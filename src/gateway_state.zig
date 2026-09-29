@@ -1571,6 +1571,12 @@ pub const GatewayState = struct {
         self.metrics.recordHttpEarlyDataRequest(protocol, source);
     }
 
+    pub fn metricsRecordForwardAuth(self: *GatewayState, protocol: http.metrics.HttpProtocol, outcome: http.metrics.ForwardAuthOutcome) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordForwardAuth(protocol, outcome);
+    }
+
     pub fn metricsRecordEarlyDataDecision(self: *GatewayState, protocol: http.metrics.HttpProtocol, decision: http.metrics.EarlyDataDecision) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();

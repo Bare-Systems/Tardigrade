@@ -59,6 +59,9 @@ pub const ProxyStreamingFallbackReason = enum {
         return @tagName(self);
     }
 };
+/// #761: per-location `forward_auth` subrequest outcomes. Closed enum; the
+/// Prometheus label is the tag name.
+pub const ForwardAuthOutcome = enum { allowed, denied, timeout, unavailable, invalid_response, body_too_large };
 pub const EarlyDataSource = enum { transport, header, both };
 pub const EarlyDataDecision = enum { accepted, too_early, deferred, forwarded };
 pub const EarlyDataUpstream425Action = enum { forwarded, retried };
@@ -145,6 +148,7 @@ const resumption_mode_count = 3;
 const ticket_result_count = 3;
 const ticket_key_reload_outcome_count = 4;
 const http_protocol_count = 3;
+const forward_auth_outcome_count = std.meta.fields(ForwardAuthOutcome).len;
 const response_write_mode_count = 4;
 const accept_error_reason_count = 2;
 const early_data_source_count = 3;
@@ -308,6 +312,8 @@ pub const Metrics = struct {
     /// closed enum. Never contains paths, key IDs, key bytes, nonces, or
     /// ciphertext.
     tls_ticket_key_reload_total: [ticket_key_reload_outcome_count]u64,
+    /// #761: `forward_auth` subrequest outcomes by downstream protocol.
+    forward_auth_total: [http_protocol_count][forward_auth_outcome_count]u64,
     /// HTTP early-data replay-exposed requests by protocol and source.
     http_early_data_requests_total: [http_protocol_count][early_data_source_count]u64,
     response_write_mode_total: [response_write_mode_count]u64,
@@ -528,6 +534,7 @@ pub const Metrics = struct {
             .tls_ticket_store_total = .{0} ** ticket_result_count,
             .tls_ticket_resolve_total = .{.{0} ** ticket_result_count} ** resumption_mode_count,
             .tls_ticket_key_reload_total = .{0} ** ticket_key_reload_outcome_count,
+            .forward_auth_total = .{.{0} ** forward_auth_outcome_count} ** http_protocol_count,
             .http_early_data_requests_total = .{.{0} ** early_data_source_count} ** http_protocol_count,
             .response_write_mode_total = .{0} ** response_write_mode_count,
             .response_writev_iovecs_total = 0,
@@ -691,6 +698,10 @@ pub const Metrics = struct {
 
     pub fn recordResponseWriteError(self: *Metrics, mode: ResponseWriteMode) void {
         self.response_write_errors_total[responseWriteModeIndex(mode)] += 1;
+    }
+
+    pub fn recordForwardAuth(self: *Metrics, protocol: HttpProtocol, outcome: ForwardAuthOutcome) void {
+        self.forward_auth_total[httpProtocolIndex(protocol)][@intFromEnum(outcome)] += 1;
     }
 
     pub fn recordHttpEarlyDataDecision(self: *Metrics, protocol: HttpProtocol, decision: EarlyDataDecision) void {
@@ -1336,6 +1347,7 @@ pub const Metrics = struct {
         try self.appendResumptionPrometheus(&out);
         try self.appendQuicH3Prometheus(&out);
         try self.appendHttpEarlyDataPrometheus(&out);
+        try self.appendForwardAuthPrometheus(&out);
         try self.appendEarlyDataReplayPrometheus(&out);
 
         try out.print(
@@ -1803,6 +1815,23 @@ pub const Metrics = struct {
                 ticketKeyReloadOutcomeLabel(outcome),
                 self.tls_ticket_key_reload_total[ticketKeyReloadOutcomeIndex(outcome)],
             });
+        }
+    }
+
+    fn appendForwardAuthPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        try out.appendSlice(
+            \\# HELP tardigrade_forward_auth_total forward_auth subrequest outcomes by protocol
+            \\# TYPE tardigrade_forward_auth_total counter
+            \\
+        );
+        inline for (.{ HttpProtocol.h1, HttpProtocol.h2, HttpProtocol.h3 }) |protocol| {
+            inline for (comptime std.enums.values(ForwardAuthOutcome)) |outcome| {
+                try out.print("tardigrade_forward_auth_total{{protocol=\"{s}\",outcome=\"{s}\"}} {d}\n", .{
+                    httpProtocolLabel(protocol),
+                    @tagName(outcome),
+                    self.forward_auth_total[httpProtocolIndex(protocol)][@intFromEnum(outcome)],
+                });
+            }
         }
     }
 

@@ -2,6 +2,92 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [0.8.1] - 2026-09-28
+
+### Added
+
+- **Per-location external authentication with `forward_auth` (#761)** — a
+  location can now ask an auth service (oauth2-proxy, Authelia, or your own)
+  whether a request may proceed, the role NGINX `auth_request` and Caddy
+  `forward_auth` fill. Tardigrade sends a bounded HTTP/1.1 subrequest carrying
+  the client's end-to-end headers plus `X-Forwarded-Method/-Uri/-Host/-Proto/-For`,
+  `X-Original-Method/-URI`, the request ID and a W3C `traceparent`. A 2xx
+  allows the request, and `forward_auth_client_headers` (for example a
+  refreshed `Set-Cookie`) are added to the response the client receives. A
+  4xx, or a redirect with a `Location`, is relayed to the client with its
+  body, `Location`, `WWW-Authenticate` and the same allowlisted headers; a
+  304 or other non-redirect 3xx fails closed, and conditional/range headers
+  are never sent to the auth service. Responses to allowed requests are
+  never shared-cacheable, since a CDN would otherwise serve them without the
+  auth check: `Cache-Control: no-store` when the auth service added headers
+  such as a session cookie, otherwise the origin's directives (all
+  `Cache-Control` fields, `no-store` winning) made `private`. CDN and
+  surrogate cache fields (`CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`,
+  `Surrogate-Control`, `Edge-Control`, `X-Accel-Expires`) are removed, a
+  configured `Cache-Control` in `TARDIGRADE_ADD_HEADERS` cannot override the
+  policy, and a response that cannot carry it is replaced by a 503. Auth
+  denials, fail-closed errors and protected 425 responses likewise end with
+  exactly one `no-store` and no CDN/surrogate field, even with such headers
+  configured globally. Over HTTP/2, a `rewrite` action in a forward_auth
+  location is not supported yet and answers 404 (#814).
+  Every denial is
+  `Cache-Control: no-store` (which the allowlists cannot name), and `HEAD`
+  gets the head without a body.
+  Timeouts, connect failures, 1xx/5xx and malformed responses fail closed with
+  `forward_auth_failure_status` (default 503). `forward_auth_upstream_headers`
+  copies auth-response headers (for example `X-Auth-Request-User`) to the
+  upstream after removing any client-supplied copy, and cannot name
+  Tardigrade-owned forwarding, identity or trace headers. Auth-response
+  fields nominated by `Connection` are never copied, and client
+  `X-Forwarded-*`/`X-Original-*` headers never reach the auth service. The
+  client's `Authorization` and `Cookie` always reach it, even when also named
+  as upstream headers, so a location can verify one token and send the
+  origin another.
+  Request bodies are not sent unless `forward_auth_body` sets a limit. Auth runs after rate
+  limiting and `auth required`, before mirrors, retries and the location
+  action, on HTTP/1.1, HTTP/2 and HTTP/3; protected locations reject
+  replay-exposed 0-RTT, including HTTP/2 streams deferred until the handshake
+  completes. HTTP/2 now also serves `root`/`alias` locations, which previously
+  returned 404. New counter:
+  `tardigrade_forward_auth_total{protocol,outcome}`. See
+  [examples/forward-auth](examples/forward-auth/README.md).
+
+### Fixed
+
+- **A peer that disconnects at the wrong moment can no longer abort the
+  gateway on macOS.** macOS returns `EINVAL` from `setsockopt` on a socket
+  whose peer has already shut down, and Zig's `std.posix.setsockopt` treats
+  `EINVAL` as unreachable, so setting a socket timeout or `TCP_NODELAY` on
+  such a connection crashed the process. A `catch` around the call could not
+  prevent this. It could hit accepted client connections, upstream and
+  Unix-socket origins, FastCGI/SCGI/uWSGI adapters, and pooled connections,
+  and it surfaced as an intermittent macOS CI abort. These calls now go
+  through a setter that reports the failure: a best-effort timeout is skipped
+  and the next read or write sees the closed connection, and a required one
+  fails that connection or upstream request (502) instead of the process.
+  HTTP/3's advisory UDP socket-option probes use the same setter, so a kernel
+  that rejects an option reads as unsupported.
+
+### Security
+
+- **A location `rewrite` can no longer reach a protected resource around its
+  gates.** On HTTP/1.1 a rewritten request was served from the server `root`
+  without matching locations again, so `location = /go { rewrite ^
+  /admin/secret.txt last; }` returned a file under a protected `/admin/`
+  location with no `auth required` or `forward_auth` check. HTTP/1.1 now
+  re-matches the rewritten target, as HTTP/3 already did. On both protocols
+  every location in a rewrite chain enforces its own `auth`, `forward_auth`
+  and path policy against the rewritten target, and `forward_auth` sees the
+  rewritten URI. HTTP/3 keeps auth-asserted request headers across a
+  rewrite instead of reverting to the client's, while every verifier in the
+  chain (including built-in `auth required`) judges the client's original
+  credentials, never a token an earlier hop minted for the origin. A rewrite
+  back into the same location re-runs that location's gates against the
+  rewritten target before the server `root` answers; a chain longer than 4
+  locations fails with 508 instead of falling back to the static root. A
+  `?query` in a location rewrite's replacement now replaces the request query
+  on both protocols (HTTP/3 previously dropped it).
+
 ## [0.8.0] - 2026-09-28
 
 ### Added

@@ -117,6 +117,77 @@ pub const EarlyDataPolicy = enum {
     }
 };
 
+/// Per-location external authorization subrequest (`forward_auth`, #761).
+/// Tardigrade asks `url` whether the request may proceed before the location
+/// action runs; see `gateway_forward_auth.zig` for the request/decision
+/// contract.
+pub const ForwardAuth = struct {
+    pub const DEFAULT_FAILURE_STATUS: u16 = 503;
+
+    /// Absolute http:// or https:// URL of the authorization endpoint.
+    url: []const u8,
+    /// Headers copied from a 2xx auth response onto the upstream request.
+    /// Client-supplied copies of these names are always removed first.
+    upstream_headers: []const []const u8 = &.{},
+    /// Headers copied from a non-2xx auth response onto the client response,
+    /// in addition to `Location` and `WWW-Authenticate`.
+    client_headers: []const []const u8 = &.{},
+    /// Largest request body forwarded to the auth service. Zero (the default)
+    /// never sends the body.
+    max_body_bytes: usize = 0,
+    /// Connect and response timeout for the subrequest. Zero inherits the
+    /// upstream connect/response timeouts.
+    timeout_ms: u32 = 0,
+    /// Status returned to the client when the auth service cannot produce a
+    /// decision (timeout, connect failure, 5xx, malformed response).
+    failure_status: u16 = DEFAULT_FAILURE_STATUS,
+
+    pub fn deinit(self: *ForwardAuth, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+        for (self.upstream_headers) |name| allocator.free(name);
+        if (self.upstream_headers.len > 0) allocator.free(self.upstream_headers);
+        for (self.client_headers) |name| allocator.free(name);
+        if (self.client_headers.len > 0) allocator.free(self.client_headers);
+        self.* = undefined;
+    }
+};
+
+/// Header names `forward_auth_upstream_headers` / `forward_auth_client_headers`
+/// may not name: hop-by-hop and framing headers, and the forwarding, identity,
+/// correlation and trace headers Tardigrade itself asserts. An auth response
+/// must never be able to overwrite one of these.
+pub fn isProtectedForwardAuthHeader(name: []const u8) bool {
+    const protected_prefixes = [_][]const u8{ "x-tardigrade-", "x-forwarded-", "proxy-" };
+    for (protected_prefixes) |prefix| {
+        if (name.len >= prefix.len and std.ascii.eqlIgnoreCase(name[0..prefix.len], prefix)) return true;
+    }
+    const protected_names = [_][]const u8{
+        "connection",        "keep-alive",       "te",         "trailer",
+        "transfer-encoding", "upgrade",          "host",       "content-length",
+        "content-encoding",  "content-type",     "forwarded",  "x-real-ip",
+        "x-request-id",      "x-correlation-id", "early-data", "traceparent",
+        "tracestate",        "server",           "alt-svc",    "expect",
+        // Denials and failures are always `no-store`; an auth response must
+        // not be able to make an access decision cacheable.
+        "cache-control",
+    };
+    for (protected_names) |protected| {
+        if (std.ascii.eqlIgnoreCase(name, protected)) return true;
+    }
+    return false;
+}
+
+test "isProtectedForwardAuthHeader rejects trust and framing headers" {
+    try std.testing.expect(isProtectedForwardAuthHeader("X-Tardigrade-User-ID"));
+    try std.testing.expect(isProtectedForwardAuthHeader("X-Forwarded-For"));
+    try std.testing.expect(isProtectedForwardAuthHeader("Content-Length"));
+    try std.testing.expect(isProtectedForwardAuthHeader("traceparent"));
+    try std.testing.expect(isProtectedForwardAuthHeader("Cache-Control"));
+    try std.testing.expect(!isProtectedForwardAuthHeader("X-Auth-Request-User"));
+    try std.testing.expect(!isProtectedForwardAuthHeader("Remote-User"));
+    try std.testing.expect(!isProtectedForwardAuthHeader("Set-Cookie"));
+}
+
 pub const ProxyEarlyDataPolicy = enum {
     off,
     rfc8470,
@@ -246,10 +317,12 @@ pub const LocationBlock = struct {
     /// `proxy_set_header` rules for this location, already resolved against
     /// the enclosing `server` block's rules (#809).
     proxy_set_headers: []ProxySetHeader = &.{},
+    forward_auth: ?ForwardAuth = null,
 
     pub fn deinit(self: *LocationBlock, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);
         self.action.deinit(allocator);
+        if (self.forward_auth) |*fa| fa.deinit(allocator);
         for (self.error_pages) |*rule| rule.deinit(allocator);
         if (self.error_pages.len > 0) allocator.free(self.error_pages);
         for (self.proxy_set_headers) |*rule| rule.deinit(allocator);

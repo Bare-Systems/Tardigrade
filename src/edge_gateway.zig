@@ -28,6 +28,7 @@ const gprotocol_policy = @import("gateway_protocol_policy.zig");
 const gp = @import("gateway_proxy.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const ga = @import("gateway_auth.zig");
+const gfa = @import("gateway_forward_auth.zig");
 
 // Local runtime shorthands only. Keep this list to state/types used by
 // edge_gateway itself; call subsystem behavior through the owning module alias
@@ -2884,9 +2885,8 @@ fn h2DispatchReadyStreams(
             state.metricsRecordEarlyDataRequest(.h2, .transport);
             ps.early_request_recorded = true;
         }
-        if (ps.transport_early) {
-            state.metricsRecordEarlyDataDecision(.h2, .accepted);
-        }
+        // The accept/reject decision for a transport-early stream is recorded
+        // by `respondHttp2Stream`, once routing has had its say (#761).
 
         try respondHttp2Stream(conn, allocator, state, cfg, sid, ps, next_server_stream_id, streams, pending_responses, conn_send_window, connection_ip);
         ps.dispatch_count += 1;
@@ -3419,7 +3419,19 @@ fn respondHttp2Stream(
         owned_header_values.deinit();
     }
 
-    if (try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle)) |result| {
+    // An allow decision from a `forward_auth` location; its client headers
+    // decorate whatever response the location produces (#761).
+    var forward_auth_allowed: ?gfa.Decision = null;
+    defer if (forward_auth_allowed) |*allowed| allowed.deinit();
+    // Set for gateway-generated security refusals (forward_auth denial or
+    // failure, protected 425) that must end up `no-store` (#761).
+    var refusal_no_store = false;
+    // Exactly one early-data decision per transport-early stream: routing
+    // records `too_early` itself when it refuses one; otherwise it was
+    // accepted.
+    var early_data_refused = false;
+    defer if (ps.transport_early and !early_data_refused) state.metricsRecordEarlyDataDecision(.h2, .accepted);
+    if (try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle, &forward_auth_allowed, &early_data_refused)) |result| {
         switch (result) {
             .response => |proxy_response| {
                 var response = proxy_response;
@@ -3436,7 +3448,31 @@ fn respondHttp2Stream(
                 if (rejection.retry_after) |value| {
                     try response_headers.append(.{ .name = "retry-after", .value = value });
                 }
+                if (rejection.no_store) {
+                    try response_headers.append(.{ .name = "cache-control", .value = "no-store" });
+                    refusal_no_store = true;
+                }
                 state.metricsRecordErrorCode(rejection.code);
+            },
+            .forward_auth_denied => |denied| {
+                refusal_no_store = true;
+                var decision = denied;
+                defer decision.deinit();
+                var shaped = http.Response.init(allocator);
+                defer shaped.deinit();
+                try gfa.shapeResponse(allocator, &shaped, &decision, correlation_id);
+                status_code = decision.status;
+                body_alloc = try allocator.dupe(u8, shaped.body orelse "");
+                body = body_alloc.?;
+                for (shaped.headers.iterator()) |header| {
+                    if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+                    const name = try lowercaseName(allocator, &lowered_names, header.name);
+                    const value = try allocator.dupe(u8, header.value);
+                    errdefer allocator.free(value);
+                    try owned_header_values.append(value);
+                    try response_headers.append(.{ .name = name, .value = value });
+                }
+                if (!decision.relaysAuthResponse()) state.metricsRecordErrorCode(decision.errorCode());
             },
             .return_response => |plan| {
                 switch (plan) {
@@ -3490,6 +3526,12 @@ fn respondHttp2Stream(
         }
     }
 
+    if (forward_auth_allowed) |*allowed| {
+        for (allowed.client_headers) |header| {
+            try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, header.name), .value = header.value });
+        }
+    }
+
     const status_str = try std.fmt.allocPrint(allocator, "{d}", .{status_code});
     defer allocator.free(status_str);
     const len_str = try std.fmt.allocPrint(allocator, "{d}", .{body.len});
@@ -3505,6 +3547,36 @@ fn respondHttp2Stream(
     try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.HEADER_NAME), .value = correlation_id });
     for (state.add_headers) |h| {
         try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, h.name), .value = h.value });
+    }
+    // Last header operation: a forward_auth-protected response, or a security
+    // refusal, must never be shared-cacheable, whatever the origin or
+    // configured headers say (#761). Every Cache-Control field is folded;
+    // every cache-controlling field, CDN/surrogate ones included, is replaced
+    // by the one protected policy.
+    const final_cache_policy: http.security_headers.ProtectedCachePolicy = if (refusal_no_store)
+        .no_store
+    else if (forward_auth_allowed) |*allowed|
+        (if (allowed.client_headers.len > 0) .no_store else .private)
+    else
+        .none;
+    if (final_cache_policy != .none) {
+        const policy = final_cache_policy;
+        var cache_buf: [256]u8 = undefined;
+        var fold = http.security_headers.CacheControlFold.init(&cache_buf, policy);
+        var idx: usize = 0;
+        while (idx < response_headers.items.len) {
+            const field = response_headers.items[idx];
+            if (http.security_headers.isProtectedCacheField(field.name)) {
+                if (std.ascii.eqlIgnoreCase(field.name, "cache-control")) fold.add(field.value);
+                _ = response_headers.orderedRemove(idx);
+                continue;
+            }
+            idx += 1;
+        }
+        const cache_value = try allocator.dupe(u8, fold.value());
+        errdefer allocator.free(cache_value);
+        try owned_header_values.append(cache_value);
+        try response_headers.append(.{ .name = "cache-control", .value = cache_value });
     }
 
     const header_block = try http.hpack.encodeLiteralHeaderBlock(allocator, response_headers.items);
@@ -3548,6 +3620,7 @@ fn respondHttp2Stream(
 const Http2ProxyRouteResult = union(enum) {
     response: gp.BufferedUpstreamResponse,
     local_rejection: Http2LocalRejection,
+    forward_auth_denied: gfa.Decision,
     return_response: ghandlers.ReturnResponsePlan,
     static_response: Http2StaticResponse,
 };
@@ -3557,6 +3630,7 @@ const Http2LocalRejection = struct {
     code: []const u8,
     message: []const u8,
     retry_after: ?[]const u8 = null,
+    no_store: bool = false,
 };
 
 const Http2StaticResponse = struct {
@@ -3593,6 +3667,8 @@ fn executeHttp2ProxyRoute(
     correlation_id: []const u8,
     connection_ip: []const u8,
     lifecycle: *http.request_lifecycle.RequestLifecycle,
+    forward_auth_allowed: *?gfa.Decision,
+    early_data_refused: *bool,
 ) !?Http2ProxyRouteResult {
     if (ps.body_limit_exceeded) return .{ .local_rejection = .{
         .status_code = @intFromEnum(http.Status.payload_too_large),
@@ -3663,11 +3739,57 @@ fn executeHttp2ProxyRoute(
         .code = "unauthorized",
         .message = "Unauthorized",
     } };
+    if (matched.block.forward_auth) |*fa| {
+        // H2 dispatches deferred 0-RTT streams once the handshake completes,
+        // but that does not make them any less replayable. The auth call is
+        // a side effect, so refuse before it, as H1/H3 do (#761).
+        if (ps.transport_early or request.headers.hasEarlyDataMarker()) {
+            state.metricsRecordEarlyDataDecision(.h2, .too_early);
+            early_data_refused.* = true;
+            return .{ .local_rejection = .{
+                .status_code = @intFromEnum(http.Status.too_early),
+                .code = "too_early",
+                .message = "Too Early",
+                .no_store = true,
+            } };
+        }
+        const target = if (request.uri.query) |q|
+            try std.fmt.allocPrint(allocator, "{s}?{s}", .{ request.uri.path, q })
+        else
+            try allocator.dupe(u8, request.uri.path);
+        defer allocator.free(target);
+        var decision = try gfa.authorize(allocator, route_cfg, fa, .{
+            .method = method,
+            .uri = target,
+            .host = ps.authority orelse request.headers.get("host"),
+            .proto = if (edge_config.hasTlsFiles(route_cfg)) "https" else "http",
+            .client_ip = ctx.client_ip,
+            .correlation_id = correlation_id,
+            .headers = &request.headers,
+            .body = request.body,
+        });
+        state.metricsRecordForwardAuth(.h2, decision.outcome);
+        if (!decision.allowed()) {
+            if (!decision.relaysAuthResponse()) {
+                state.logger.warn(correlation_id, "forward_auth {s} ({s}) for {s}: failing closed with {d}", .{ @tagName(decision.outcome), decision.cause, matched.block.pattern, decision.status });
+            }
+            return .{ .forward_auth_denied = decision };
+        }
+        errdefer decision.deinit();
+        try gfa.applyUpstreamHeaders(&request.headers, fa, &decision);
+        forward_auth_allowed.* = decision;
+    }
     const target = switch (matched.block.action) {
         .proxy_pass => |value| value,
         .return_response => |ret| {
             const is_get_or_head = std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD");
             return .{ .return_response = ghandlers.planReturnResponse(is_get_or_head, ret.status, ret.body) };
+        },
+        .static_root => |root_cfg| {
+            if (try buildHttp2LocationStaticResponse(allocator, request, matched, root_cfg)) |static_response| {
+                return .{ .static_response = static_response };
+            }
+            return null;
         },
         else => return null,
     };
@@ -3968,6 +4090,45 @@ fn http2ProxyAttemptTimeoutMs(cfg: *const edge_config.EdgeConfig) u32 {
     return @intCast(@min(@as(u64, cfg.upstream_timeout_ms), cfg.upstream_timeout_budget_ms));
 }
 
+/// Serve a `location { root/alias ...; }` block over native H2 with the same
+/// `static_file.serve` semantics H1/H3 use. Previously H2 answered every
+/// static location with its default 404.
+fn buildHttp2LocationStaticResponse(
+    allocator: std.mem.Allocator,
+    request: *const http.Request,
+    matched: http.location_router.MatchResult,
+    root_cfg: anytype,
+) !?Http2StaticResponse {
+    if (!(request.method == .GET or request.method == .HEAD)) return null;
+    var served = (try http.static_file.serve(allocator, .{
+        .root = root_cfg.root,
+        .request_path = request.uri.path,
+        .matched_pattern = matched.block.pattern,
+        .alias = root_cfg.alias,
+        .index = root_cfg.index,
+        .try_files = root_cfg.try_files,
+        .autoindex = root_cfg.autoindex,
+        .headers = &request.headers,
+        .prefer_file_backed = false,
+    })) orelse return null;
+    defer served.deinit(allocator);
+    return try http2StaticResponseFromServed(allocator, &served);
+}
+
+fn http2StaticResponseFromServed(allocator: std.mem.Allocator, served: anytype) !Http2StaticResponse {
+    var result = Http2StaticResponse{
+        .body = try allocator.dupe(u8, served.body orelse ""),
+        .status_code = @intFromEnum(served.status_code),
+        .content_type = served.content_type,
+        .accept_ranges = served.accept_ranges,
+    };
+    errdefer result.deinit(allocator);
+    result.etag = if (served.etag_value) |v| try allocator.dupe(u8, v) else null;
+    result.last_modified = if (served.last_modified_value) |v| try allocator.dupe(u8, v) else null;
+    result.content_range = if (served.content_range_value) |v| try allocator.dupe(u8, v) else null;
+    return result;
+}
+
 fn buildHttp2StaticResponse(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, request: *const http.Request) !?Http2StaticResponse {
     if (!(request.method == .GET or request.method == .HEAD)) return null;
     if (cfg.doc_root.len == 0) return null;
@@ -3988,18 +4149,7 @@ fn buildHttp2StaticResponse(allocator: std.mem.Allocator, cfg: *const edge_confi
         .prefer_file_backed = false,
     })) orelse return null;
     defer served.deinit(allocator);
-
-    var result = Http2StaticResponse{
-        .body = try allocator.dupe(u8, served.body orelse ""),
-        .status_code = @intFromEnum(served.status_code),
-        .content_type = served.content_type,
-        .accept_ranges = served.accept_ranges,
-    };
-    errdefer result.deinit(allocator);
-    result.etag = if (served.etag_value) |v| try allocator.dupe(u8, v) else null;
-    result.last_modified = if (served.last_modified_value) |v| try allocator.dupe(u8, v) else null;
-    result.content_range = if (served.content_range_value) |v| try allocator.dupe(u8, v) else null;
-    return result;
+    return try http2StaticResponseFromServed(allocator, &served);
 }
 
 test "buildHttp2StaticResponse: buffered static response over 256 KiB is not truncated" {
@@ -4154,6 +4304,11 @@ fn streamingUploadEligibilityBeforeBodyRead(
         cfg.mirror_rules.len > 0 or cfg.auth_request_url.len > 0)
     {
         return .{ .fallback = .body_dependent_middleware };
+    }
+    // `forward_auth_body` sends the upload to the auth service before the
+    // upstream sees it, so the body has to be materialized first (#761).
+    if (matched.block.forward_auth) |fa| {
+        if (fa.max_body_bytes > 0) return .{ .fallback = .body_dependent_middleware };
     }
     if (cfg.upstream_retry_attempts > 1) {
         if (!cfg.upstream_retry_idempotent_only) return .{ .fallback = .retries_configured };
@@ -6603,6 +6758,214 @@ test "H2 early stream defers dispatch until handshake completion then dispatches
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h2\",decision=\"accepted\"} 1") != null);
 }
 
+const H2ForwardAuthHarness = struct {
+    allocator: std.mem.Allocator,
+    state: GatewayState = undefined,
+    pending: std.AutoHashMap(u31, Http2PendingStream),
+    streams: std.AutoHashMap(u31, http.http2_stream.Stream),
+    pending_responses: std.AutoHashMap(u31, PendingHttp2Response),
+    ready: std.array_list.Managed(u31),
+    conn: H2DispatchTestConn,
+    next_server_stream_id: u31 = 2,
+    conn_send_window: i32 = 65_535,
+    buffered_request_bytes: usize = 0,
+
+    fn init(self: *H2ForwardAuthHarness, allocator: std.mem.Allocator) void {
+        self.* = .{
+            .allocator = allocator,
+            .pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator),
+            .streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator),
+            .pending_responses = std.AutoHashMap(u31, PendingHttp2Response).init(allocator),
+            .ready = std.array_list.Managed(u31).init(allocator),
+            .conn = H2DispatchTestConn.init(allocator),
+        };
+        initForwardAuthProbeState(&self.state);
+        self.state.rate_limiter_mutex = .{};
+        self.state.rate_limiter = null;
+    }
+
+    fn deinit(self: *H2ForwardAuthHarness) void {
+        var it = self.pending.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        self.pending.deinit();
+        self.streams.deinit();
+        var resp_it = self.pending_responses.iterator();
+        while (resp_it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        self.pending_responses.deinit();
+        self.ready.deinit();
+        self.conn.deinit();
+    }
+
+    fn addStream(self: *H2ForwardAuthHarness, id: u31, method: []const u8, path: []const u8, transport_early: bool) !void {
+        var ps = Http2PendingStream.init(self.allocator);
+        ps.method = try self.allocator.dupe(u8, method);
+        ps.path = try self.allocator.dupe(u8, path);
+        ps.transport_early = transport_early;
+        try self.pending.put(id, ps);
+        try self.streams.put(id, http.http2_stream.Stream.init(id, 65_535));
+        try self.ready.append(id);
+    }
+
+    fn dispatch(self: *H2ForwardAuthHarness, cfg: *const edge_config.EdgeConfig) !void {
+        try h2DispatchReadyStreams(
+            &self.conn,
+            self.allocator,
+            &self.state,
+            cfg,
+            &self.pending,
+            &self.streams,
+            &self.pending_responses,
+            &self.ready,
+            &self.next_server_stream_id,
+            &self.conn_send_window,
+            &self.buffered_request_bytes,
+            "127.0.0.1",
+        );
+    }
+};
+
+test "H2 resumed 0-RTT stream to a forward_auth location gets 425 without calling auth" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-secret" } },
+        .early_data = .replay_safe,
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+
+    var h: H2ForwardAuthHarness = undefined;
+    h.init(allocator);
+    defer h.deinit();
+    try h.addStream(1, "GET", "/admin", true);
+    h.conn.handshake_complete = false;
+
+    // Deferred while the handshake is incomplete...
+    try h.dispatch(&cfg);
+    try std.testing.expect(h.pending.contains(1));
+    // ...and still refused once it completes: replay provenance persists.
+    h.conn.handshake_complete = true;
+    try h.dispatch(&cfg);
+
+    try std.testing.expect(!h.pending.contains(1));
+    const written = h.conn.out.written();
+    try std.testing.expect(std.mem.find(u8, written, "425") != null);
+    try std.testing.expect(std.mem.find(u8, written, "no-store") != null);
+    try std.testing.expect(std.mem.find(u8, written, "admin-secret") == null);
+    try std.testing.expectEqual(@as(usize, 0), auth_server.requestCount());
+    // One request, one decision: refused, never also counted as accepted.
+    const prom = try h.state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h2\",decision=\"too_early\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h2\",decision=\"accepted\"} 0") != null);
+}
+
+test "H2 forward_auth refusals stay no-store despite global CDN cache headers" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-secret" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+    const add_headers = [_]edge_config.EdgeConfig.HeaderPair{
+        .{ .name = "CDN-Cache-Control", .value = "public, max-age=3600" },
+        .{ .name = "Surrogate-Control", .value = "max-age=3600" },
+        .{ .name = "Cache-Control", .value = "public" },
+    };
+
+    var h: H2ForwardAuthHarness = undefined;
+    h.init(allocator);
+    defer h.deinit();
+    h.state.add_headers = add_headers[0..];
+    h.conn.handshake_complete = true;
+    // Stream 1: ordinary request, denied by the auth service.
+    try h.addStream(1, "GET", "/admin", false);
+    try h.dispatch(&cfg);
+    const denied = h.conn.out.written();
+    try std.testing.expect(std.mem.find(u8, denied, "401") != null);
+    try std.testing.expect(std.mem.find(u8, denied, "no-store") != null);
+    try std.testing.expect(std.mem.find(u8, denied, "cdn-cache-control") == null);
+    try std.testing.expect(std.mem.find(u8, denied, "surrogate-control") == null);
+    try std.testing.expect(std.mem.find(u8, denied, "public") == null);
+
+    // Stream 3: replay-exposed request to the protected location (425).
+    const denied_len = denied.len;
+    try h.addStream(3, "GET", "/admin", true);
+    try h.dispatch(&cfg);
+    const too_early = h.conn.out.written()[denied_len..];
+    try std.testing.expect(std.mem.find(u8, too_early, "425") != null);
+    try std.testing.expect(std.mem.find(u8, too_early, "no-store") != null);
+    try std.testing.expect(std.mem.find(u8, too_early, "cdn-cache-control") == null);
+    try std.testing.expect(std.mem.find(u8, too_early, "surrogate-control") == null);
+    try std.testing.expect(std.mem.find(u8, too_early, "public") == null);
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+}
+
+test "H2 forward_auth allow serves a protected static location with the auth Set-Cookie" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "report.txt", .data = "h2-static-report" });
+    const root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const alias_root = try std.fmt.allocPrint(allocator, "{s}/", .{root});
+    defer allocator.free(alias_root);
+
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/reports/",
+        .priority = 0,
+        .action = .{ .static_root = .{ .root = alias_root, .alias = true, .autoindex = false, .index = "", .try_files = "" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .client_headers = &.{"Set-Cookie"} },
+    }};
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+
+    var h: H2ForwardAuthHarness = undefined;
+    h.init(allocator);
+    defer h.deinit();
+    h.conn.handshake_complete = true;
+    try h.addStream(1, "GET", "/reports/report.txt", false);
+    try h.dispatch(&cfg);
+    const allowed = h.conn.out.written();
+    try std.testing.expect(std.mem.find(u8, allowed, "h2-static-report") != null);
+    try std.testing.expect(std.mem.find(u8, allowed, "refreshed=1") != null);
+
+    const allowed_len = allowed.len;
+    try h.addStream(3, "GET", "/reports/report.txt", false);
+    try h.dispatch(&cfg);
+    const denied = h.conn.out.written()[allowed_len..];
+    try std.testing.expect(std.mem.find(u8, denied, "401") != null);
+    try std.testing.expect(std.mem.find(u8, denied, "h2-static-report") == null);
+    try std.testing.expectEqual(@as(usize, 2), auth_server.requestCount());
+}
+
 test "H2 ordinary stream dispatch remains unchanged" {
     const allocator = std.testing.allocator;
     var state: GatewayState = undefined;
@@ -7018,6 +7381,7 @@ test "#368 Slice 2: one process-scoped early-data replay store is shared by nati
 // applianceCredentialConfigChanged/applyReloadedRuntimeConfig coverage) was
 // silently never compiled or run by `zig build test`.
 test {
+    _ = @import("gateway_forward_auth.zig");
     _ = @import("gateway_handlers.zig");
     _ = @import("gateway_shutdown.zig");
     _ = @import("process_early_data_integration_tests.zig");
@@ -7171,6 +7535,467 @@ test "H1 location auth denial never mirrors the denied request body" {
     // ...and the body never left the process.
     try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
     try std.testing.expect(std.mem.find(u8, conn.out.written(), "sensitive-payload") == null);
+}
+
+fn initForwardAuthProbeState(state: *GatewayState) void {
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.session_mutex = .{};
+    state.session_store = null;
+    state.logger = http.logger.Logger.init(.err, "test");
+    state.security_headers = .{};
+    state.add_headers = &.{};
+    state.http3_alt_svc = null;
+}
+
+test "H1 forward_auth denial relays the auth redirect and never mirrors" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 302 Found\r\nLocation: https://sso.example.test/start\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-secret" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{
+        .{ .method = "POST", .pattern = "^/admin$", .target_url = "http://127.0.0.1:9002/mirror" },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+
+    var request = try http.Request.parseHead(
+        allocator,
+        "POST /admin HTTP/1.1\r\nHost: example.test\r\nContent-Length: 17\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    defer request.request.deinit();
+    request.request.body = try allocator.dupe(u8, "sensitive-payload");
+
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    initForwardAuthProbeState(&state);
+    var ctx = http.request_context.RequestContext.init(allocator, "req-fa", "127.0.0.1");
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-fa", 0);
+    var keep_alive = true;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try executeH1PostPreflightOrchestration(
+        &conn,
+        allocator,
+        &conn.out.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-fa",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1RealRouteMirrorProbeHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, 302), outcome.route_status);
+    try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
+    const written = conn.out.written();
+    try std.testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 302"));
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "location: https://sso.example.test/start") != null);
+    try std.testing.expect(std.mem.find(u8, written, "admin-secret") == null);
+    // The auth service saw the request metadata but not the body.
+    try std.testing.expect(auth_server.requestContains(0, "X-Forwarded-Method: POST"));
+    try std.testing.expect(!auth_server.requestContains(0, "sensitive-payload"));
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_forward_auth_total{protocol=\"h1\",outcome=\"denied\"} 1") != null);
+}
+
+test "H1 forward_auth allow runs the action and still mirrors" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-ok" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var mirrors = [_]edge_config.EdgeConfig.MirrorRule{
+        .{ .method = "GET", .pattern = "^/admin$", .target_url = "http://127.0.0.1:9002/mirror" },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = mirrors[0..];
+
+    var request = try http.Request.parseHead(allocator, "GET /admin HTTP/1.1\r\nHost: example.test\r\n\r\n", MAX_REQUEST_SIZE);
+    defer request.request.deinit();
+
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    initForwardAuthProbeState(&state);
+    var ctx = http.request_context.RequestContext.init(allocator, "req-fa-ok", "127.0.0.1");
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-fa-ok", 0);
+    var keep_alive = true;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try executeH1PostPreflightOrchestration(
+        &conn,
+        allocator,
+        &conn.out.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-fa-ok",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1RealRouteMirrorProbeHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, 200), outcome.route_status);
+    try std.testing.expectEqual(@as(usize, 1), effects.mirror_calls);
+    try std.testing.expect(std.mem.find(u8, conn.out.written(), "admin-ok") != null);
+}
+
+fn runH1ForwardAuthRequest(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    raw_request: []const u8,
+    conn: *H2DispatchTestConn,
+    effects: *H1PreflightSideEffectProbe,
+    state: *GatewayState,
+) !H1PostPreflightOutcome {
+    var request = try http.Request.parseHead(allocator, raw_request, MAX_REQUEST_SIZE);
+    defer request.request.deinit();
+    initForwardAuthProbeState(state);
+    var ctx = http.request_context.RequestContext.init(allocator, "req-fa", "127.0.0.1");
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-fa", 0);
+    var keep_alive = true;
+    return executeH1PostPreflightOrchestration(
+        conn,
+        allocator,
+        &conn.out.writer,
+        cfg,
+        state,
+        &ctx,
+        &request.request,
+        "req-fa",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1RealRouteMirrorProbeHooks{ .effects = effects },
+    );
+}
+
+test "H1 forward_auth allow adds allowlisted auth headers to the action response" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=1\r\nSet-Cookie: csrf=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-ok" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .client_headers = &.{"Set-Cookie"} },
+    }};
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /admin HTTP/1.1\r\nHost: example.test\r\n\r\n", &conn, &effects, &state);
+
+    try std.testing.expectEqual(@as(u16, 200), outcome.route_status);
+    const written = conn.out.written();
+    try std.testing.expect(std.mem.find(u8, written, "admin-ok") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "set-cookie: refreshed=1") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "set-cookie: csrf=2") != null);
+    // The scope ends with the request: nothing leaks onto later responses.
+    try std.testing.expectEqual(@as(usize, 0), http.security_headers.requestScopedHeaders().len);
+}
+
+test "H1 forward_auth grant survives a rewrite into the static fallback" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "landing.txt", .data = "fallback-landing" });
+    const doc_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(doc_root);
+
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/old",
+        .priority = 0,
+        .action = .{ .rewrite = .{ .replacement = "/landing.txt", .flag = .last } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .client_headers = &.{"Set-Cookie"} },
+    }};
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.doc_root = doc_root;
+    cfg.try_files = "";
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /old HTTP/1.1\r\nHost: example.test\r\n\r\n", &conn, &effects, &state);
+
+    try std.testing.expectEqual(@as(u16, 200), outcome.route_status);
+    const written = conn.out.written();
+    try std.testing.expect(std.mem.find(u8, written, "fallback-landing") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "set-cookie: refreshed=1") != null);
+    try std.testing.expectEqual(@as(usize, 0), http.security_headers.requestScopedHeaders().len);
+}
+
+test "H1 rewrite into a protected location is authorized, never served from the static root" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).makePath("admin");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "admin/secret.txt", .data = "top-secret" });
+    const doc_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(doc_root);
+
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{ .match_type = .exact, .pattern = "/go", .priority = 0, .action = .{ .rewrite = .{ .replacement = "/admin/secret.txt?dl=1", .flag = .last } } },
+        .{
+            .match_type = .prefix,
+            .pattern = "/admin/",
+            .priority = 1,
+            .action = .{ .static_root = .{ .root = doc_root, .alias = false, .autoindex = false, .index = "", .try_files = "" } },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+        },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.doc_root = doc_root;
+    cfg.try_files = "";
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /go HTTP/1.1\r\nHost: example.test\r\n\r\n", &conn, &effects, &state);
+
+    try std.testing.expectEqual(@as(u16, 403), outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, conn.out.written(), "top-secret") == null);
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+    try std.testing.expect(auth_server.requestContains(0, "X-Forwarded-Uri: /admin/secret.txt?dl=1"));
+}
+
+test "H1 path policy and the rewrite budget apply to rewritten targets" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{ .match_type = .exact, .pattern = "/public", .priority = 0, .action = .{ .rewrite = .{ .replacement = "/admin/panel", .flag = .last } } },
+        .{ .match_type = .prefix, .pattern = "/admin/", .priority = 1, .action = .{ .return_response = .{ .status = 200, .body = "admin-panel" } } },
+        .{ .match_type = .exact, .pattern = "/a", .priority = 2, .action = .{ .rewrite = .{ .replacement = "/b", .flag = .last } } },
+        .{ .match_type = .exact, .pattern = "/b", .priority = 3, .action = .{ .rewrite = .{ .replacement = "/c", .flag = .last } } },
+        .{ .match_type = .exact, .pattern = "/c", .priority = 4, .action = .{ .rewrite = .{ .replacement = "/d", .flag = .last } } },
+        .{ .match_type = .exact, .pattern = "/d", .priority = 5, .action = .{ .rewrite = .{ .replacement = "/e", .flag = .last } } },
+        .{ .match_type = .exact, .pattern = "/e", .priority = 6, .action = .{ .return_response = .{ .status = 200, .body = "too-deep" } } },
+    };
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.policy_rules_raw = "GET|^/admin/|admin|false||";
+
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var policy_conn = H2DispatchTestConn.init(allocator);
+    defer policy_conn.deinit();
+    const policy_outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /public HTTP/1.1\r\nHost: example.test\r\n\r\n", &policy_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 403), policy_outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, policy_conn.out.written(), "admin-panel") == null);
+
+    var loop_conn = H2DispatchTestConn.init(allocator);
+    defer loop_conn.deinit();
+    const loop_outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /a HTTP/1.1\r\nHost: example.test\r\n\r\n", &loop_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 508), loop_outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, loop_conn.out.written(), "too-deep") == null);
+}
+
+test "H1 self-rewrite re-authorizes the rewritten target before serving it" {
+    const allocator = std.testing.allocator;
+    // Path-sensitive verifier: allows the landing URI, denies the file.
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).makePath("admin");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "admin/private.txt", .data = "private-bytes" });
+    const doc_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(doc_root);
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/admin/",
+        .priority = 0,
+        .action = .{ .rewrite = .{ .replacement = "/admin/private.txt", .flag = .last } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.doc_root = doc_root;
+    cfg.try_files = "";
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /admin/public HTTP/1.1\r\nHost: example.test\r\n\r\n", &conn, &effects, &state);
+
+    try std.testing.expectEqual(@as(u16, 403), outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, conn.out.written(), "private-bytes") == null);
+    try std.testing.expectEqual(@as(usize, 2), auth_server.requestCount());
+    try std.testing.expect(auth_server.requestContains(0, "X-Forwarded-Uri: /admin/public"));
+    try std.testing.expect(auth_server.requestContains(1, "X-Forwarded-Uri: /admin/private.txt"));
+}
+
+test "H1 later verifiers judge the caller's credential, not an earlier hop's minted one" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        // Hop A allows the client and mints a privileged origin token.
+        "HTTP/1.1 200 OK\r\nAuthorization: Bearer service-minted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        // Hop B would deny the client's own token.
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+        // Second request: hop A again, minting the gateway's valid token.
+        "HTTP/1.1 200 OK\r\nAuthorization: Bearer integration-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    const auth_url = auth_server.url(&url_buf, "/verify");
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/public",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/admin", .flag = .last } },
+            .forward_auth = .{ .url = auth_url, .upstream_headers = &.{"Authorization"} },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/admin",
+            .priority = 1,
+            .action = .{ .return_response = .{ .status = 200, .body = "admin-secret" } },
+            .forward_auth = .{ .url = auth_url },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/builtin",
+            .priority = 2,
+            .action = .{ .rewrite = .{ .replacement = "/private", .flag = .last } },
+            .forward_auth = .{ .url = auth_url, .upstream_headers = &.{"Authorization"} },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/private",
+            .priority = 3,
+            .action = .{ .return_response = .{ .status = 200, .body = "private-secret" } },
+            .auth = .required,
+        },
+    };
+    // sha256("integration-token"): the minted token would pass built-in auth.
+    var token_hashes = [_][]const u8{"521bc8ca01307d0189b55a19da738e39c7204f7077e0076e803026e32b2f9383"};
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.auth_token_hashes = token_hashes[0..];
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+
+    var chain_conn = H2DispatchTestConn.init(allocator);
+    defer chain_conn.deinit();
+    const chain = try runH1ForwardAuthRequest(allocator, &cfg, "GET /public HTTP/1.1\r\nHost: example.test\r\nAuthorization: Bearer client-inbound\r\n\r\n", &chain_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 403), chain.route_status);
+    try std.testing.expect(std.mem.find(u8, chain_conn.out.written(), "admin-secret") == null);
+    try std.testing.expect(auth_server.requestContains(1, "Bearer client-inbound"));
+    try std.testing.expect(!auth_server.requestContains(1, "service-minted"));
+
+    var builtin_conn = H2DispatchTestConn.init(allocator);
+    defer builtin_conn.deinit();
+    const builtin_outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /builtin HTTP/1.1\r\nHost: example.test\r\nAuthorization: Bearer client-wrong\r\n\r\n", &builtin_conn, &effects, &state);
+    // An invalid bearer is 403 in built-in auth; the point is it is refused.
+    try std.testing.expectEqual(@as(u16, 403), builtin_outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, builtin_conn.out.written(), "private-secret") == null);
+}
+
+test "H1 forward_auth HEAD denial sends the challenge head without a body" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic\r\nContent-Length: 11\r\nConnection: close\r\n\r\nsign-in-now",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-ok" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try runH1ForwardAuthRequest(allocator, &cfg, "HEAD /admin HTTP/1.1\r\nHost: example.test\r\n\r\n", &conn, &effects, &state);
+
+    try std.testing.expectEqual(@as(u16, 401), outcome.route_status);
+    const written = conn.out.written();
+    try std.testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 401"));
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "content-length: 11\r\n") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "www-authenticate: basic") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
+    try std.testing.expect(std.mem.find(u8, written, "sign-in-now") == null);
 }
 
 test "H1 authorized route still mirrors" {

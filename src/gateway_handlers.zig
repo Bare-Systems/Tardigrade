@@ -7,6 +7,7 @@ const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const ga = @import("gateway_auth.zig");
+const gfa = @import("gateway_forward_auth.zig");
 const gcp = @import("gateway_control_plane_proxy.zig");
 const gp = @import("gateway_proxy.zig");
 const gph = @import("gateway_proxy_headers.zig");
@@ -28,6 +29,7 @@ const resolveRequestConfig = ga.resolveRequestConfig;
 const isGeoBlocked = ga.isGeoBlocked;
 const executeBoundedControlPlaneJsonProxy = gcp.executeBoundedControlPlaneJsonProxy;
 const applyResponseHeaders = gp.applyResponseHeaders;
+const applyRefusalResponseHeaders = gp.applyRefusalResponseHeaders;
 const appendProxyQueryString = gp.appendProxyQueryString;
 const buildApiErrorJson = gp.buildApiErrorJson;
 const resolveProxyTarget = gp.resolveProxyTarget;
@@ -96,6 +98,9 @@ fn locationEarlyDataDecision(
     block: *const http.location_router.LocationBlock,
 ) http.early_data.Decision {
     if (block.auth == .required) return .too_early;
+    // The auth subrequest is itself a side effect a replayed 0-RTT request
+    // must not trigger (#761).
+    if (block.forward_auth != null) return .too_early;
     return switch (block.action) {
         .static_root, .return_response => http.early_data.decide(.{
             .replay_exposed = early_ctx.replayExposed(),
@@ -214,7 +219,7 @@ pub fn writeTooEarlyResponse(
         .setHeader("Cache-Control", "no-store");
     setRequestIdHeaders(&response, correlation_id);
     ctx.response_bytes = payload.len;
-    applyResponseHeaders(state, &response);
+    applyRefusalResponseHeaders(state, &response);
     try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
     state.metricsRecord(@intFromEnum(plan.status));
     state.metricsRecordErrorCode(plan.code);
@@ -283,6 +288,14 @@ test "earlyDataDecisionForRequest gates H1 routes before side effects" {
             .action = .{ .rewrite = .{ .replacement = "/safe", .flag = .last } },
             .early_data = .replay_safe,
         },
+        .{
+            .match_type = .exact,
+            .pattern = "/forward-auth",
+            .priority = 5,
+            .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+            .early_data = .replay_safe,
+            .forward_auth = .{ .url = "http://127.0.0.1:1/verify" },
+        },
     };
     var token_hashes = [_][]const u8{};
     var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
@@ -299,6 +312,7 @@ test "earlyDataDecisionForRequest gates H1 routes before side effects" {
     try std.testing.expectEqual(http.early_data.Decision.forward_rfc8470, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/proxy", false));
     try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/auth", false));
     try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/rewrite", false));
+    try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/forward-auth", false));
     try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, cfg.metrics_path, false));
     try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/transcripts", false));
     try std.testing.expectEqual(http.early_data.Decision.too_early, earlyDataDecisionForRequest(std.testing.allocator, &cfg, early, .GET, "/missing", false));
@@ -573,6 +587,8 @@ fn minimalHttp3ProxyConfig(blocks: []http.location_router.LocationBlock) edge_co
     cfg.tls_cert_path = "";
     cfg.tls_key_path = "";
     cfg.add_headers = &.{};
+    cfg.doc_root = "";
+    cfg.try_files = "";
     return cfg;
 }
 
@@ -712,6 +728,17 @@ pub fn routeRequest(
         return .{ .status = status };
     }
 
+    // `forward_auth` allow decisions live for the rest of routing: a rewrite
+    // hop or the try_files fallback may produce the response the client
+    // receives, and their `forward_auth_client_headers` must decorate it
+    // (#761). The scoped headers are cleared before the grants that own them
+    // are freed.
+    var grants = gfa.Grants{};
+    defer grants.deinit(allocator);
+    var client_view = H1ClientAuthView{};
+    defer client_view.deinit(allocator);
+    defer http.security_headers.clearRequestScope();
+
     switch (resolveRoute(allocator, cfg, request)) {
         .reload_status => {
             const status = try handleReloadStatusRoute(allocator, writer, state, correlation_id, keep_alive.*);
@@ -724,13 +751,73 @@ pub fn routeRequest(
             return .{ .status = status };
         },
         .unmatched => {},
-        .location => |matched| {
-            if (try enforceLocationAuth(allocator, writer, cfg, state, ctx, request, matched, correlation_id, keep_alive.*, client_ip)) |status| {
-                // Tardigrade denied this request itself. The body must not
-                // reach a mirror target, so say so explicitly instead of
-                // leaving the caller to infer it from `status`.
-                return .{ .status = status, .mirror_allowed = false };
+        .location => |first_match| {
+            // A bounded effective-route loop. Every location a request reaches
+            // through `rewrite` gets its own `auth required`, `forward_auth`
+            // and path-policy decision against the rewritten target before
+            // anything is served, so a rewrite can never reach a protected
+            // location, or fall into the static root, around its gates.
+            var matched = first_match;
+            var hops: usize = 1;
+            // Set when a rewrite lands back in the same location: its gates
+            // must be re-run for the rewritten target, but its rewrite action
+            // must not run again.
+            var gate_only = false;
+            while (true) {
+                // Refusals on this hop must not carry an earlier hop's grants.
+                http.security_headers.clearRequestScope();
+                // Built-in auth checks the caller's own credentials, never an
+                // earlier hop's auth-asserted replacement.
+                var verifier_request = request.*;
+                verifier_request.headers = client_view.headers(request).*;
+                if (try enforceLocationAuth(allocator, writer, cfg, state, ctx, &verifier_request, matched, correlation_id, keep_alive.*, client_ip)) |status| {
+                    // Tardigrade denied this request itself. The body must not
+                    // reach a mirror target, so say so explicitly instead of
+                    // leaving the caller to infer it from `status`.
+                    grants.clear();
+                    return .{ .status = status, .mirror_allowed = false };
+                }
+                var allowed: ?gfa.Decision = null;
+                if (try enforceLocationForwardAuth(allocator, writer, cfg, state, request, matched, correlation_id, keep_alive, client_ip, streaming_request_body != null, &client_view, &allowed)) |status| {
+                    grants.clear();
+                    return .{ .status = status, .mirror_allowed = false };
+                }
+                if (allowed) |decision| try grants.add(allocator, decision);
+                if (gate_only) {
+                    return try finishRoute(allocator, conn, cfg, state, ctx, request, correlation_id, keep_alive.*, &grants);
+                }
+
+                const rewrite_rule = switch (matched.block.action) {
+                    .rewrite => |rule| rule,
+                    else => break,
+                };
+                applyLocationRewrite(request, rewrite_rule.replacement);
+                if (ga.evaluatePolicy(state, cfg, request.method.toString(), request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |reason| {
+                    grants.clear();
+                    try sendApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive.*, state);
+                    state.metricsRecord(403);
+                    return .{ .status = 403, .mirror_allowed = false };
+                }
+                const next = http.location_router.matchLocation(allocator, request.uri.path, cfg.location_blocks) orelse {
+                    // No location claims the rewritten target: only the
+                    // unprotected static root can answer it.
+                    return try finishRoute(allocator, conn, cfg, state, ctx, request, correlation_id, keep_alive.*, &grants);
+                };
+                // A rewrite back into the same location is served from the
+                // static root rather than looping, but only after that
+                // location's gates pass again for the rewritten target: an
+                // auth decision about the old path says nothing about the new.
+                if (next.index == matched.index) gate_only = true;
+                if (hops >= gfa.MAX_ROUTE_HOPS) {
+                    grants.clear();
+                    try sendApiError(allocator, writer, .loop_detected, "rewrite_loop", "Rewrite limit exceeded", correlation_id, keep_alive.*, state);
+                    state.metricsRecord(508);
+                    return .{ .status = 508, .mirror_allowed = false };
+                }
+                hops += 1;
+                matched = next;
             }
+            http.security_headers.setRequestScope(grants.client_headers.items, grants.cachePolicy());
             if (try executeLocationAction(
                 conn,
                 allocator,
@@ -749,12 +836,41 @@ pub fn routeRequest(
         },
     }
 
-    if (serveTryFilesFallback(allocator, conn, cfg, request, correlation_id, keep_alive.*, state, ctx)) |status| {
+    return finishRoute(allocator, conn, cfg, state, ctx, request, correlation_id, keep_alive.*, &grants);
+}
+
+/// Point `request` at a location rewrite's replacement. A `?query` in the
+/// replacement replaces the original query; otherwise the original is kept.
+fn applyLocationRewrite(request: *http.Request, replacement: []const u8) void {
+    if (std.mem.findScalar(u8, replacement, '?')) |idx| {
+        request.uri.path = replacement[0..idx];
+        request.uri.query = if (idx + 1 < replacement.len) replacement[idx + 1 ..] else null;
+    } else {
+        request.uri.path = replacement;
+    }
+}
+
+/// The static-root fallback, then 404, for a request whose location gates
+/// (if any) have all passed; `grants` decorate either response.
+fn finishRoute(
+    allocator: std.mem.Allocator,
+    conn: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    grants: *const gfa.Grants,
+) !RouteOutcome {
+    http.security_headers.setRequestScope(grants.client_headers.items, grants.cachePolicy());
+    const writer = conn.writer();
+    if (serveTryFilesFallback(allocator, conn, cfg, request, correlation_id, keep_alive, state, ctx)) |status| {
         state.metricsRecord(status);
         return .{ .status = status };
     } else |_| {}
 
-    try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive.*, state);
+    try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
     state.metricsRecord(404);
     return .{ .status = 404 };
 }
@@ -806,6 +922,113 @@ fn enforceLocationAuth(
     const auth_status_code: u16 = @intFromEnum(auth_status);
     try sendApiError(allocator, writer, auth_status, auth_code, auth_message, correlation_id, keep_alive, state);
     return auth_status_code;
+}
+
+/// What verifiers see of an HTTP/1.1 request across rewrite hops (#761).
+/// `forward_auth` rewrites `request.headers` in place with auth-asserted
+/// values meant for the origin; later verifiers (another `forward_auth`, or
+/// built-in `auth required`) must still judge the caller's own credentials,
+/// never a token an earlier auth service minted. `snapshot` holds the
+/// client's headers from before the first assertion, and `asserted_names`
+/// every name asserted so far, whose client copies are forged.
+const H1ClientAuthView = struct {
+    snapshot: ?http.Headers = null,
+    asserted_names: std.ArrayList([]const u8) = .empty,
+
+    fn headers(self: *const H1ClientAuthView, request: *const http.Request) *const http.Headers {
+        return if (self.snapshot) |*snapshot| snapshot else &request.headers;
+    }
+
+    fn preserve(self: *H1ClientAuthView, allocator: std.mem.Allocator, request: *const http.Request) !void {
+        if (self.snapshot != null) return;
+        var copy = http.Headers.init(allocator);
+        errdefer copy.deinit();
+        for (request.headers.iterator()) |header| try copy.append(header.name, header.value);
+        self.snapshot = copy;
+    }
+
+    fn deinit(self: *H1ClientAuthView, allocator: std.mem.Allocator) void {
+        if (self.snapshot) |*snapshot| snapshot.deinit();
+        self.asserted_names.deinit(allocator);
+    }
+};
+
+/// Protocol-neutral request target (`path[?query]`) for the auth service.
+fn forwardAuthRequestTarget(allocator: std.mem.Allocator, path: []const u8, query: ?[]const u8) ![]u8 {
+    if (query) |q| return std.fmt.allocPrint(allocator, "{s}?{s}", .{ path, q });
+    return allocator.dupe(u8, path);
+}
+
+/// Run the location's `forward_auth` subrequest (#761). Returns null when the
+/// request may proceed: auth-provided upstream headers are applied, and the
+/// allow decision is handed to `allowed_out` (caller-owned) so its client
+/// headers can decorate the final response. Otherwise returns the status
+/// Tardigrade already wrote for a denial or fail-closed error.
+fn enforceLocationForwardAuth(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    request: *http.Request,
+    matched: http.location_router.MatchResult,
+    correlation_id: []const u8,
+    keep_alive: *bool,
+    client_ip: []const u8,
+    body_unread: bool,
+    client_view: *H1ClientAuthView,
+    allowed_out: *?gfa.Decision,
+) !?u16 {
+    const fa = if (matched.block.forward_auth) |*fa| fa else return null;
+    const target = try forwardAuthRequestTarget(allocator, request.uri.path, request.uri.query);
+    defer allocator.free(target);
+    var decision = try gfa.authorize(allocator, cfg, fa, .{
+        .method = request.method.toString(),
+        .uri = target,
+        .host = request.headers.get("host"),
+        .proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http",
+        .client_ip = client_ip,
+        .correlation_id = correlation_id,
+        .headers = client_view.headers(request),
+        .body = request.body,
+        .asserted_names = client_view.asserted_names.items,
+    });
+    var decision_owned = true;
+    defer if (decision_owned) decision.deinit();
+    state.metricsRecordForwardAuth(.h1, decision.outcome);
+    if (decision.allowed()) {
+        if (fa.upstream_headers.len > 0) {
+            // Keep the caller's original headers for any later verifier
+            // before replacing them with this service's assertions.
+            try client_view.preserve(allocator, request);
+            try client_view.asserted_names.appendSlice(allocator, fa.upstream_headers);
+        }
+        try gfa.applyUpstreamHeaders(&request.headers, fa, &decision);
+        allowed_out.* = decision;
+        decision_owned = false;
+        return null;
+    }
+    if (!decision.relaysAuthResponse()) {
+        state.logger.warn(correlation_id, "forward_auth {s} ({s}) for {s}: failing closed with {d}", .{ @tagName(decision.outcome), decision.cause, matched.block.pattern, decision.status });
+    }
+
+    // A streamed upload's body is still on the wire; never reuse the
+    // connection after refusing it.
+    if (body_unread) keep_alive.* = false;
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    try gfa.shapeResponse(allocator, &response, &decision, correlation_id);
+    _ = response.setConnection(keep_alive.*);
+    setRequestIdHeaders(&response, correlation_id);
+    applyRefusalResponseHeaders(state, &response);
+    // HEAD gets the GET-equivalent head (Content-Length included), no body.
+    if (request.method == .HEAD) {
+        try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+    } else {
+        try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+    }
+    state.metricsRecord(decision.status);
+    if (!decision.relaysAuthResponse()) state.metricsRecordErrorCode(decision.errorCode());
+    return decision.status;
 }
 
 test "enforceLocationAuth records invalid session rejection exactly once" {
@@ -1822,6 +2045,9 @@ pub const Http3DispatchContext = struct {
     state: *GatewayState,
     client_ip: []const u8 = "unknown",
     authenticated: bool = false,
+    /// Resolved identity for path-scoped policy re-checks after a rewrite.
+    identity: ?[]const u8 = null,
+    device_id: ?[]const u8 = null,
 };
 
 const Http3LocationOutcome = union(enum) {
@@ -1830,6 +2056,8 @@ const Http3LocationOutcome = union(enum) {
     rewritten: struct {
         path: []const u8,
         query: ?[]const u8,
+        /// Index of the location that rewrote, to detect self-rewrites.
+        from_index: usize,
     },
 };
 
@@ -2467,6 +2695,8 @@ fn handleHttp3LocationProxyPass(
     correlation_id: []const u8,
     early_ctx: *http.request_context.EarlyDataContext,
     forward_early_data: bool,
+    /// Request headers after `forward_auth` rewrote them, when it did.
+    headers_override: ?*const http.Headers,
 ) !void {
     const resolved = try resolveProxyTarget(allocator, ctx.cfg.upstream_base_url, target, proxySuffixPathForLocation(request_path, matched, ctx.cfg.location_blocks));
     defer allocator.free(resolved.url);
@@ -2477,18 +2707,19 @@ fn handleHttp3LocationProxyPass(
     // An untrusted QUIC peer's forwarded-client headers must not reach the
     // origin or extend the forwarded chain (#791); the request is shared, so
     // proxy a filtered copy rather than editing it.
+    const source_headers: *const http.Headers = headers_override orelse &request.headers;
     var filtered_headers: ?http.Headers = null;
     defer if (filtered_headers) |*headers| headers.deinit();
     if (!gph.isTrustedUpstream(ctx.cfg, request.client_ip orelse "unknown")) {
         var headers = http.Headers.init(allocator);
         errdefer headers.deinit();
-        for (request.headers.iterator()) |header| {
+        for (source_headers.iterator()) |header| {
             if (gph.isForwardedClientHeader(ctx.cfg, header.name)) continue;
             try headers.append(header.name, header.value);
         }
         filtered_headers = headers;
     }
-    const proxy_headers: *const http.Headers = if (filtered_headers) |*headers| headers else &request.headers;
+    const proxy_headers: *const http.Headers = if (filtered_headers) |*headers| headers else source_headers;
 
     const max_attempts = gproxy_runtime.proxyRetryAttemptLimit(ctx.cfg.upstream_retry_attempts, ctx.cfg.upstream_retry_idempotent_only, request.method);
     var attempt_executor = Http3BufferedProxyAttemptExecutor{
@@ -3144,6 +3375,114 @@ fn rejectHttp3AuthRequiredLocation(
     ctx.state.metricsRecordErrorCode("unauthorized");
 }
 
+/// H3 counterpart of `enforceLocationForwardAuth`. Returns true when the
+/// request may proceed: auth-asserted upstream headers are applied to the
+/// route's verified header set, and `allowed_out` receives the allow decision
+/// (caller-owned) whose client headers decorate the final response. Returns
+/// false after shaping the denial or fail-closed response.
+fn enforceHttp3ForwardAuth(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+    fa: *const http.location_router.ForwardAuth,
+    location_pattern: []const u8,
+    correlation_id: []const u8,
+    route: *Http3RouteState,
+    allowed_out: *?gfa.Decision,
+) !bool {
+    // Authorize what will actually be served: the effective (possibly
+    // rewritten) target, judged on the caller's own headers -- never on a
+    // credential an earlier hop's auth service minted for the origin.
+    const target = if (route.query) |q|
+        try std.fmt.allocPrint(allocator, "{s}?{s}", .{ route.path, q })
+    else
+        try allocator.dupe(u8, route.path);
+    defer allocator.free(target);
+    var decision = try gfa.authorize(allocator, ctx.cfg, fa, .{
+        .method = request.method,
+        .uri = target,
+        .host = request.authority orelse request.headers.get("host"),
+        .proto = "https",
+        .client_ip = ctx.client_ip,
+        .correlation_id = correlation_id,
+        .headers = &request.headers,
+        .body = request.body,
+        .asserted_names = route.asserted_names.items,
+    });
+    var decision_owned = true;
+    defer if (decision_owned) decision.deinit();
+    ctx.state.metricsRecordForwardAuth(.h3, decision.outcome);
+    if (decision.allowed()) {
+        if (fa.upstream_headers.len > 0) {
+            try gfa.applyUpstreamHeaders(try route.verifiedHeaders(allocator, request), fa, &decision);
+            try route.asserted_names.appendSlice(allocator, fa.upstream_headers);
+        }
+        allowed_out.* = decision;
+        decision_owned = false;
+        return true;
+    }
+    if (!decision.relaysAuthResponse()) {
+        ctx.state.logger.warn(correlation_id, "forward_auth {s} ({s}) for {s}: failing closed with {d}", .{ @tagName(decision.outcome), decision.cause, location_pattern, decision.status });
+    }
+    try gfa.shapeResponse(allocator, response, &decision, correlation_id);
+    _ = response.setHeader(http.correlation.HEADER_NAME, correlation_id);
+    finalizeHttp3Response(response);
+    // H3 has no head-only send: empty the body but keep the GET-equivalent
+    // Content-Length, as the H3 static path does.
+    // `finalizeHttp3Response` already recorded the representation length.
+    if (std.mem.eql(u8, request.method, "HEAD")) {
+        _ = response.setBodyOwned(try allocator.dupe(u8, ""));
+    }
+    applyRefusalResponseHeaders(ctx.state, response);
+    ctx.state.metricsRecord(decision.status);
+    if (!decision.relaysAuthResponse()) ctx.state.metricsRecordErrorCode(decision.errorCode());
+    return false;
+}
+
+/// The effective request as it moves through H3 rewrite hops (#761): the
+/// target the next location serves, the request headers after every
+/// `forward_auth` assertion so far, and the response grants. Authorization,
+/// policy and the final action all read from here, never from the original
+/// request line or its unverified headers.
+const Http3RouteState = struct {
+    path: []const u8,
+    query: ?[]const u8,
+    /// Owned copy of the request headers once a `forward_auth` hop asserts
+    /// upstream headers; null while the client's headers are unmodified.
+    /// Origin-facing only: verifiers always judge `request.headers`.
+    headers: ?http.Headers = null,
+    /// Names earlier hops asserted upstream; client copies are forged.
+    asserted_names: std.ArrayList([]const u8) = .empty,
+    grants: gfa.Grants = .{},
+    /// Set when a rewrite lands back in the same location: re-run its gates
+    /// for the rewritten target, then fall back without re-running its action.
+    gate_only: bool = false,
+
+    fn init(request: *const http.http3_session.StreamRequest) Http3RouteState {
+        const path, const query = splitHttp3PathAndQuery(request.path);
+        return .{ .path = path, .query = query };
+    }
+
+    fn deinit(self: *Http3RouteState, allocator: std.mem.Allocator) void {
+        if (self.headers) |*headers| headers.deinit();
+        self.asserted_names.deinit(allocator);
+        self.grants.deinit(allocator);
+    }
+
+    fn verifiedHeaders(self: *Http3RouteState, allocator: std.mem.Allocator, request: *const http.http3_session.StreamRequest) !*http.Headers {
+        if (self.headers == null) {
+            var headers = http.Headers.init(allocator);
+            errdefer headers.deinit();
+            for (request.headers.iterator()) |header| try headers.append(header.name, header.value);
+            self.headers = headers;
+        }
+        return &self.headers.?;
+    }
+};
+
+/// Route one H3 location with no surrounding rewrite loop, applying any
+/// `forward_auth` grants to the response it produces.
 fn routeHttp3Location(
     allocator: std.mem.Allocator,
     request: *const http.http3_session.StreamRequest,
@@ -3152,6 +3491,25 @@ fn routeHttp3Location(
     request_path: []const u8,
     correlation_id: []const u8,
 ) !Http3LocationOutcome {
+    var route = Http3RouteState.init(request);
+    defer route.deinit(allocator);
+    route.path = request_path;
+    const outcome = try routeHttp3Hop(allocator, request, response, ctx, correlation_id, &route);
+    if (outcome == .handled) try route.grants.apply(response);
+    return outcome;
+}
+
+/// Route one location hop of `route`. Every refusal clears `route.grants`
+/// first so no earlier hop's grant decorates it.
+fn routeHttp3Hop(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+    correlation_id: []const u8,
+    route: *Http3RouteState,
+) !Http3LocationOutcome {
+    const request_path = route.path;
     // Share the h1/h3 route-matching precedence (#201, PR 3). h3 serves only
     // location routes today; the reload-status and metrics endpoints (which the
     // shared resolver ranks ahead of locations) fall through to the caller's 404
@@ -3197,9 +3555,10 @@ fn routeHttp3Location(
                 .setHeader("cache-control", "no-store")
                 .setHeader(http.correlation.HEADER_NAME, correlation_id);
             finalizeHttp3Response(response);
-            applyResponseHeaders(ctx.state, response);
+            applyRefusalResponseHeaders(ctx.state, response);
             ctx.state.metricsRecord(425);
             ctx.state.metricsRecordErrorCode("too_early");
+            route.grants.clear();
             return .handled;
         },
         .ordinary => {},
@@ -3210,15 +3569,39 @@ fn routeHttp3Location(
         .reload_status, .metrics, .unmatched => return .not_handled,
     };
 
-    const split = splitHttp3PathAndQuery(request.path);
-    const request_query = split[1];
     if (matched.block.auth == .required and !ctx.authenticated) {
+        route.grants.clear();
         try rejectHttp3AuthRequiredLocation(allocator, response, ctx, correlation_id);
         return .handled;
     }
+    if (matched.block.forward_auth) |*fa| {
+        var allowed: ?gfa.Decision = null;
+        if (!try enforceHttp3ForwardAuth(allocator, request, response, ctx, fa, matched.block.pattern, correlation_id, route, &allowed)) {
+            route.grants.clear();
+            return .handled;
+        }
+        if (allowed) |grant| try route.grants.add(allocator, grant);
+    }
+    if (route.gate_only) return .not_handled;
+    return executeHttp3LocationAction(allocator, request, response, ctx, matched, request_path, route.query, correlation_id, &early_ctx, forward_early_data, if (route.headers) |*headers| headers else null);
+}
+
+fn executeHttp3LocationAction(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+    matched: http.location_router.MatchResult,
+    request_path: []const u8,
+    request_query: ?[]const u8,
+    correlation_id: []const u8,
+    early_ctx: *http.request_context.EarlyDataContext,
+    forward_early_data: bool,
+    forward_auth_headers: ?*const http.Headers,
+) !Http3LocationOutcome {
     switch (matched.block.action) {
         .proxy_pass => |target| {
-            try handleHttp3LocationProxyPass(allocator, request, response, ctx, matched, request_path, request_query, target, correlation_id, &early_ctx, forward_early_data);
+            try handleHttp3LocationProxyPass(allocator, request, response, ctx, matched, request_path, request_query, target, correlation_id, early_ctx, forward_early_data, forward_auth_headers);
             return .handled;
         },
         .return_response => |ret| {
@@ -3233,7 +3616,7 @@ fn routeHttp3Location(
         },
         .rewrite => |rw| {
             const rewritten_path, const rewritten_query = splitHttp3PathAndQuery(rw.replacement);
-            return .{ .rewritten = .{ .path = rewritten_path, .query = rewritten_query } };
+            return .{ .rewritten = .{ .path = rewritten_path, .query = rewritten_query, .from_index = matched.index } };
         },
         .static_root => |root_cfg| {
             if (try handleHttp3StaticLocation(allocator, request, response, matched, root_cfg, correlation_id, ctx, request_path)) {
@@ -4095,6 +4478,637 @@ test "H3 production dispatch accepts valid bearer auth for required location" {
     try std.testing.expectEqualStrings("authenticated-h3-ok", response.body orelse "");
 }
 
+test "H3 forward_auth allow propagates auth headers upstream and drops client forgeries" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nX-Auth-User: alice\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var origin = try H3ProxyOrigin.start(allocator, &.{200});
+    defer origin.stop();
+    try origin.run();
+
+    var auth_url_buf: [64]u8 = undefined;
+    var target_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "http://127.0.0.1:{d}", .{origin.port()});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+        .forward_auth = .{
+            .url = auth_server.url(&auth_url_buf, "/verify"),
+            .upstream_headers = &.{ "X-Auth-User", "X-Auth-Email" },
+        },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/admin/users"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+    };
+    defer request.deinit();
+    try request.headers.append("X-Auth-User", "forged-admin");
+    try request.headers.append("X-Auth-Email", "forged@example.test");
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+    try std.testing.expect(auth_server.requestContains(0, "X-Forwarded-Uri: /admin/users"));
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expect(origin.requestContains(0, "alice"));
+    try std.testing.expect(!origin.requestContains(0, "forged"));
+}
+
+test "H3 forward_auth denial is returned before the upstream is contacted" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+
+    var auth_url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/admin",
+        .priority = 0,
+        // Nothing listens here: reaching the upstream would surface as a 5xx.
+        .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+        .forward_auth = .{ .url = auth_server.url(&auth_url_buf, "/verify") },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/admin"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("nope", response.body orelse "");
+    try std.testing.expectEqualStrings("text/plain", response.headers.get("content-type").?);
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_forward_auth_total{protocol=\"h3\",outcome=\"denied\"} 1") != null);
+}
+
+const H3ForwardAuthTestOptions = struct {
+    doc_root: []const u8 = "",
+    policy_rules_raw: []const u8 = "",
+    request_headers: []const http.headers.Header = &.{},
+    add_headers: []const edge_config.EdgeConfig.HeaderPair = &.{},
+    transport_early: bool = false,
+};
+
+fn runH3ForwardAuthRequest(
+    allocator: std.mem.Allocator,
+    blocks: []http.location_router.LocationBlock,
+    method: []const u8,
+    path: []const u8,
+    response: *http.Response,
+) !void {
+    return runH3ForwardAuthRequestWith(allocator, blocks, method, path, response, .{});
+}
+
+fn runH3ForwardAuthRequestWith(
+    allocator: std.mem.Allocator,
+    blocks: []http.location_router.LocationBlock,
+    method: []const u8,
+    path: []const u8,
+    response: *http.Response,
+    options: H3ForwardAuthTestOptions,
+) !void {
+    var cfg = minimalHttp3ProxyConfig(blocks);
+    cfg.doc_root = options.doc_root;
+    cfg.policy_rules_raw = options.policy_rules_raw;
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, options.add_headers);
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, method),
+        .path = try allocator.dupe(u8, path),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+        .transport_early = options.transport_early,
+    };
+    defer request.deinit();
+    for (options.request_headers) |header| try request.headers.append(header.name, header.value);
+    try handleHttp3Request(allocator, &request, response, &dispatch_ctx);
+}
+
+test "H3 forward_auth allow adds the auth Set-Cookie to the action response" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=1\r\nSet-Cookie: csrf=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-ok" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .client_headers = &.{"Set-Cookie"} },
+    }};
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequest(allocator, blocks[0..], "GET", "/admin", &response);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("admin-ok", response.body orelse "");
+    try std.testing.expectEqual(@as(usize, 2), response.headers.countByName("set-cookie"));
+}
+
+test "H3 forward_auth grants carry across rewrites and are dropped by a later denial" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        // Request 1: /old allows, rewrites to /new (unprotected).
+        "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        // Request 2: /old allows, rewrites to /guarded, which denies.
+        "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    const auth_url = auth_server.url(&url_buf, "/verify");
+    var first_blocks = [_]http.location_router.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/old",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/new", .flag = .last } },
+            .forward_auth = .{ .url = auth_url, .client_headers = &.{"Set-Cookie"} },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/new",
+            .priority = 1,
+            .action = .{ .return_response = .{ .status = 200, .body = "rewritten-ok" } },
+        },
+    };
+    var allowed = http.Response.init(allocator);
+    defer allowed.deinit();
+    try runH3ForwardAuthRequest(allocator, first_blocks[0..], "GET", "/old", &allowed);
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(allowed.status));
+    try std.testing.expectEqualStrings("rewritten-ok", allowed.body orelse "");
+    try std.testing.expectEqualStrings("refreshed=1", allowed.headers.get("set-cookie").?);
+
+    var second_blocks = [_]http.location_router.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/old",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/guarded", .flag = .last } },
+            .forward_auth = .{ .url = auth_url, .client_headers = &.{"Set-Cookie"} },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/guarded",
+            .priority = 1,
+            .action = .{ .return_response = .{ .status = 200, .body = "guarded-secret" } },
+            .forward_auth = .{ .url = auth_url, .client_headers = &.{"Set-Cookie"} },
+        },
+    };
+    var denied = http.Response.init(allocator);
+    defer denied.deinit();
+    try runH3ForwardAuthRequest(allocator, second_blocks[0..], "GET", "/old", &denied);
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(denied.status));
+    try std.testing.expect(denied.headers.get("set-cookie") == null);
+    try std.testing.expectEqual(@as(usize, 3), auth_server.requestCount());
+}
+
+test "H3 rewrite keeps forward_auth's verified headers for an unprotected destination" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nX-Auth-User: alice\r\nAuthorization: Bearer service-minted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var origin = try H3ProxyOrigin.start(allocator, &.{200});
+    defer origin.stop();
+    try origin.run();
+    var url_buf: [64]u8 = undefined;
+    var target_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "http://127.0.0.1:{d}", .{origin.port()});
+    var blocks = [_]http.location_router.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/old",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/new", .flag = .last } },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .upstream_headers = &.{ "X-Auth-User", "Authorization" } },
+        },
+        .{ .match_type = .exact, .pattern = "/new", .priority = 1, .action = .{ .proxy_pass = target } },
+    };
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/old", &response, .{ .request_headers = &.{
+        .{ .name = "X-Auth-User", .value = "forged-admin" },
+        .{ .name = "Authorization", .value = "Bearer client-inbound" },
+    } });
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    // The verifier saw the client's own credential...
+    try std.testing.expect(auth_server.requestContains(0, "Bearer client-inbound"));
+    // ...and the origin behind the unprotected destination only sees what
+    // the auth service asserted.
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expect(origin.requestContains(0, "alice"));
+    try std.testing.expect(origin.requestContains(0, "Bearer service-minted"));
+    try std.testing.expect(!origin.requestContains(0, "forged-admin"));
+    try std.testing.expect(!origin.requestContains(0, "client-inbound"));
+}
+
+test "H3 forward_auth authorizes the rewritten target, query included" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{
+        .{ .match_type = .exact, .pattern = "/public", .priority = 0, .action = .{ .rewrite = .{ .replacement = "/admin/secret?view=raw", .flag = .last } } },
+        .{
+            .match_type = .prefix,
+            .pattern = "/admin/",
+            .priority = 1,
+            // Reaching this upstream would surface as a 5xx, not a 403.
+            .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+        },
+    };
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/public?orig=1", &response, .{});
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(auth_server.requestContains(0, "X-Forwarded-Uri: /admin/secret?view=raw"));
+    try std.testing.expect(!auth_server.requestContains(0, "/public"));
+}
+
+test "H3 path policy is enforced on the rewritten target" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]http.location_router.LocationBlock{
+        .{ .match_type = .exact, .pattern = "/public", .priority = 0, .action = .{ .rewrite = .{ .replacement = "/admin/panel", .flag = .last } } },
+        .{ .match_type = .prefix, .pattern = "/admin/", .priority = 1, .action = .{ .return_response = .{ .status = 200, .body = "admin-panel" } } },
+    };
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/public", &response, .{ .policy_rules_raw = "GET|^/admin/|admin|false||" });
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.find(u8, response.body orelse "", "admin-panel") == null);
+}
+
+test "H3 rewrite budget exhaustion fails closed instead of serving the static root" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).makePath("admin");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "admin/secret.txt", .data = "top-secret" });
+    const root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{
+        .{ .match_type = .exact, .pattern = "/a", .priority = 0, .action = .{ .rewrite = .{ .replacement = "/b", .flag = .last } } },
+        .{ .match_type = .exact, .pattern = "/b", .priority = 1, .action = .{ .rewrite = .{ .replacement = "/c", .flag = .last } } },
+        .{ .match_type = .exact, .pattern = "/c", .priority = 2, .action = .{ .rewrite = .{ .replacement = "/d", .flag = .last } } },
+        .{ .match_type = .exact, .pattern = "/d", .priority = 3, .action = .{ .rewrite = .{ .replacement = "/admin/secret.txt", .flag = .last } } },
+        .{
+            .match_type = .prefix,
+            .pattern = "/admin/",
+            .priority = 4,
+            .action = .{ .static_root = .{ .root = root, .alias = false, .autoindex = false, .index = "", .try_files = "" } },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+        },
+    };
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/a", &response, .{ .doc_root = root });
+
+    try std.testing.expectEqual(@as(u16, 508), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.find(u8, response.body orelse "", "top-secret") == null);
+}
+
+test "H3 grants never decorate a later auth required denial" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/old",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/private", .flag = .last } },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .client_headers = &.{"Set-Cookie"} },
+        },
+        .{ .match_type = .exact, .pattern = "/private", .priority = 1, .action = .{ .return_response = .{ .status = 200, .body = "private" } }, .auth = .required },
+    };
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequest(allocator, blocks[0..], "GET", "/old", &response);
+
+    try std.testing.expectEqual(@as(u16, 401), @intFromEnum(response.status));
+    try std.testing.expect(response.headers.get("set-cookie") == null);
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+}
+
+test "H3 self-rewrite re-authorizes the rewritten target before the static fallback" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).makePath("admin");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "admin/private.txt", .data = "private-bytes" });
+    const root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/admin/",
+        .priority = 0,
+        .action = .{ .rewrite = .{ .replacement = "/admin/private.txt", .flag = .last } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/admin/landing", &response, .{ .doc_root = root });
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.find(u8, response.body orelse "", "private-bytes") == null);
+    try std.testing.expectEqual(@as(usize, 2), auth_server.requestCount());
+    try std.testing.expect(auth_server.requestContains(1, "X-Forwarded-Uri: /admin/private.txt"));
+}
+
+test "H3 later verifiers judge the caller's credential, not an earlier hop's minted one" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nAuthorization: Bearer service-minted\r\nX-Auth-User: alice\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    const auth_url = auth_server.url(&url_buf, "/verify");
+    var blocks = [_]http.location_router.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/public",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/admin", .flag = .last } },
+            .forward_auth = .{ .url = auth_url, .upstream_headers = &.{ "Authorization", "X-Auth-User" } },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/admin",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+            .forward_auth = .{ .url = auth_url },
+        },
+    };
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/public", &response, .{ .request_headers = &.{
+        .{ .name = "Authorization", .value = "Bearer client-inbound" },
+        .{ .name = "X-Auth-User", .value = "forged-admin" },
+    } });
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(auth_server.requestContains(1, "Bearer client-inbound"));
+    try std.testing.expect(!auth_server.requestContains(1, "service-minted"));
+    // Hop A's asserted names are withheld from hop B too, so the client's
+    // forged copy never reaches it.
+    try std.testing.expect(!auth_server.requestContains(1, "forged-admin"));
+}
+
+test "H3 forward_auth responses are never shared-cacheable" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=alice\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    // The origin marks its body publicly cacheable, including through the
+    // CDN/surrogate fields caches in front of Tardigrade honor first.
+    const public_origin = "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=600\r\nCDN-Cache-Control: public, max-age=3600\r\nCloudflare-CDN-Cache-Control: public, max-age=3600\r\nSurrogate-Control: max-age=3600\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    var origin = try gfa.TestAuthServer.start(allocator, &.{ public_origin, public_origin });
+    defer origin.stop();
+    try origin.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "report.txt", .data = "static-report" });
+    const root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var auth_buf: [64]u8 = undefined;
+    const auth_url = auth_server.url(&auth_buf, "/verify");
+    var origin_buf: [64]u8 = undefined;
+    const origin_url = origin.url(&origin_buf, "");
+    var blocks = [_]http.location_router.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/app/",
+            .priority = 0,
+            .action = .{ .proxy_pass = origin_url },
+            .forward_auth = .{ .url = auth_url, .client_headers = &.{"Set-Cookie"} },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/reports/",
+            .priority = 1,
+            .action = .{ .static_root = .{ .root = root, .alias = true, .autoindex = false, .index = "", .try_files = "" } },
+            .forward_auth = .{ .url = auth_url },
+        },
+    };
+
+    var with_cookie = http.Response.init(allocator);
+    defer with_cookie.deinit();
+    try runH3ForwardAuthRequest(allocator, blocks[0..], "GET", "/app/page", &with_cookie);
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(with_cookie.status));
+    try std.testing.expectEqual(@as(usize, 1), with_cookie.headers.countByName("cache-control"));
+    try std.testing.expectEqualStrings("no-store", with_cookie.headers.get("cache-control").?);
+    try std.testing.expectEqualStrings("refreshed=alice", with_cookie.headers.get("set-cookie").?);
+
+    var no_cookie = http.Response.init(allocator);
+    defer no_cookie.deinit();
+    try runH3ForwardAuthRequest(allocator, blocks[0..], "GET", "/app/page", &no_cookie);
+    try std.testing.expectEqual(@as(usize, 1), no_cookie.headers.countByName("cache-control"));
+    try std.testing.expectEqualStrings("private, max-age=600", no_cookie.headers.get("cache-control").?);
+    inline for (.{ "cdn-cache-control", "cloudflare-cdn-cache-control", "surrogate-control" }) |name| {
+        try std.testing.expect(no_cookie.headers.get(name) == null);
+        try std.testing.expect(with_cookie.headers.get(name) == null);
+    }
+
+    var static_file = http.Response.init(allocator);
+    defer static_file.deinit();
+    try runH3ForwardAuthRequest(allocator, blocks[0..], "GET", "/reports/report.txt", &static_file);
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(static_file.status));
+    try std.testing.expect(std.mem.startsWith(u8, static_file.headers.get("cache-control").?, "private"));
+}
+
+const test_public_cdn_add_headers = [_]edge_config.EdgeConfig.HeaderPair{
+    .{ .name = "CDN-Cache-Control", .value = "public, max-age=3600" },
+    .{ .name = "Surrogate-Control", .value = "max-age=3600" },
+    .{ .name = "Cache-Control", .value = "public" },
+};
+
+fn expectRefusalCachePolicy(response: *const http.Response) !void {
+    try std.testing.expectEqual(@as(usize, 1), response.headers.countByName("cache-control"));
+    try std.testing.expectEqualStrings("no-store", response.headers.get("cache-control").?);
+    inline for (.{ "cdn-cache-control", "surrogate-control", "cloudflare-cdn-cache-control", "edge-control" }) |name| {
+        try std.testing.expect(response.headers.get(name) == null);
+    }
+}
+
+test "H3 forward_auth refusals stay no-store despite global CDN cache headers" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 302 Found\r\nLocation: https://sso.example.test/\r\nSet-Cookie: csrf=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-ok" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .client_headers = &.{"Set-Cookie"} },
+    }};
+    const options = H3ForwardAuthTestOptions{ .add_headers = test_public_cdn_add_headers[0..] };
+
+    var redirect = http.Response.init(allocator);
+    defer redirect.deinit();
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/admin", &redirect, options);
+    try std.testing.expectEqual(@as(u16, 302), @intFromEnum(redirect.status));
+    try std.testing.expectEqualStrings("csrf=1", redirect.headers.get("set-cookie").?);
+    try expectRefusalCachePolicy(&redirect);
+
+    var failure = http.Response.init(allocator);
+    defer failure.deinit();
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/admin", &failure, options);
+    try std.testing.expectEqual(@as(u16, 503), @intFromEnum(failure.status));
+    try expectRefusalCachePolicy(&failure);
+
+    // Replay-exposed request to the protected location: 425 before any
+    // auth call, with the same cache rule.
+    var too_early = http.Response.init(allocator);
+    defer too_early.deinit();
+    var early_options = options;
+    early_options.transport_early = true;
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/admin", &too_early, early_options);
+    try std.testing.expectEqual(@as(u16, 425), @intFromEnum(too_early.status));
+    try expectRefusalCachePolicy(&too_early);
+    try std.testing.expectEqual(@as(usize, 2), auth_server.requestCount());
+}
+
+test "H1 425 Too Early stays no-store despite global CDN cache headers" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, test_public_cdn_add_headers[0..]);
+    var ctx = http.request_context.RequestContext.init(allocator, "req-early", "127.0.0.1");
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    _ = try writeTooEarlyResponse(allocator, &output.writer, &state, &ctx, "req-early", false);
+    const written = output.written();
+    try std.testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 425"));
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "cache-control: no-store\r\n") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "cache-control: public") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "cdn-cache-control") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "surrogate-control") == null);
+}
+
+test "H3 forward_auth HEAD denial keeps Content-Length and drops the body" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 302 Found\r\nLocation: https://sso.example.test/\r\nContent-Length: 9\r\nConnection: close\r\n\r\nredirect!",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "admin-ok" } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequest(allocator, blocks[0..], "HEAD", "/admin", &response);
+
+    try std.testing.expectEqual(@as(u16, 302), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("", response.body orelse "");
+    try std.testing.expectEqualStrings("9", response.headers.get("content-length").?);
+    try std.testing.expectEqual(@as(usize, 1), response.headers.countByName("content-length"));
+    try std.testing.expectEqualStrings("https://sso.example.test/", response.headers.get("location").?);
+    try std.testing.expectEqualStrings("no-store", response.headers.get("cache-control").?);
+}
+
 test "h3 proxy parked early 425 forwards second 425 without third delivery" {
     const allocator = std.testing.allocator;
     var origin = try H3ProxyOrigin.start(allocator, &.{ 425, 425, 200 });
@@ -4473,19 +5487,42 @@ fn handleHttp3Connection(
     ctx: *Http3DispatchContext,
 ) !void {
     const correlation_id = request.headers.get(http.correlation.REQUEST_HEADER_NAME) orelse request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
-    var http3_path, _ = splitHttp3PathAndQuery(request.path);
-    var rewrite_budget: usize = 0;
-    while (rewrite_budget < 4) : (rewrite_budget += 1) {
-        switch (try routeHttp3Location(allocator, request, response, ctx, http3_path, correlation_id)) {
-            .handled => return,
+    // A bounded effective-route loop (#761): each location reached through a
+    // rewrite is gated against the rewritten target, with the verified
+    // headers of earlier hops, before it acts. Grants from every allowing hop
+    // decorate whichever response finally answers the request.
+    var route = Http3RouteState.init(request);
+    defer route.deinit(allocator);
+    var hops: usize = 1;
+    while (true) {
+        switch (try routeHttp3Hop(allocator, request, response, ctx, correlation_id, &route)) {
+            .handled => return route.grants.apply(response),
             .not_handled => break,
-            .rewritten => |rewrite_result| {
-                http3_path = rewrite_result.path;
+            .rewritten => |next| {
+                route.path = next.path;
+                if (next.query) |query| route.query = query;
+                if (ga.evaluatePolicy(ctx.state, ctx.cfg, request.method, route.path, ctx.identity, ctx.device_id, &request.headers)) |reason| {
+                    route.grants.clear();
+                    try rejectHttp3ProxyError(allocator, response, ctx, .forbidden, "forbidden", reason, correlation_id);
+                    return;
+                }
+                const next_match = http.location_router.matchLocation(allocator, route.path, ctx.cfg.location_blocks) orelse break;
+                // A rewrite back into the same location is answered from the
+                // static root rather than looping, but only after its gates
+                // pass again for the rewritten target.
+                if (next_match.index == next.from_index) route.gate_only = true;
+                if (hops >= gfa.MAX_ROUTE_HOPS) {
+                    route.grants.clear();
+                    try rejectHttp3ProxyError(allocator, response, ctx, .loop_detected, "rewrite_loop", "Rewrite limit exceeded", correlation_id);
+                    return;
+                }
+                hops += 1;
             },
         }
     }
 
-    if (try handleHttp3TopLevelStaticFallback(allocator, request, response, ctx, http3_path, correlation_id)) return;
+    const http3_path = route.path;
+    if (try handleHttp3TopLevelStaticFallback(allocator, request, response, ctx, http3_path, correlation_id)) return route.grants.apply(response);
 
     const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
     _ = response
@@ -4495,6 +5532,7 @@ fn handleHttp3Connection(
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
     finalizeHttp3Response(response);
     applyResponseHeaders(ctx.state, response);
+    try route.grants.apply(response);
     ctx.state.metricsRecord(404);
 }
 
@@ -4601,6 +5639,8 @@ pub fn handleHttp3Request(
     try primeRequestAuthContext(allocator, effective_cfg, ctx.state, &request_ctx, &request.headers);
     effective_ctx.client_ip = request_ctx.client_ip;
     effective_ctx.authenticated = request_ctx.authenticated or request_ctx.identity != null;
+    effective_ctx.identity = request_ctx.identity;
+    effective_ctx.device_id = request_ctx.device_id;
 
     if (effective_cfg.geo_blocked_countries.len > 0) {
         if (!gph.isTrustedGeoSource(effective_cfg, request.client_ip orelse "")) {

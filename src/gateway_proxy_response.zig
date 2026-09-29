@@ -26,6 +26,19 @@ pub fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void
     if (state.http3_alt_svc) |value| {
         _ = response.setHeader("Alt-Svc", value);
     }
+    // Last: configured headers above must not reintroduce a shared-cache
+    // policy on a forward_auth-protected response (#761).
+    http.security_headers.applyProtectedCachePolicy(response, http.security_headers.requestCachePolicy());
+}
+
+/// `applyResponseHeaders` for a gateway-generated security refusal (auth
+/// denial or fail-closed error, 425 Too Early): after configured headers,
+/// force exactly one `Cache-Control: no-store` and strip every CDN/surrogate
+/// cache field, so a global `TARDIGRADE_ADD_HEADERS` can never make a refusal
+/// cacheable (#761).
+pub fn applyRefusalResponseHeaders(state: *GatewayState, response: *http.Response) void {
+    applyResponseHeaders(state, response);
+    http.security_headers.applyProtectedCachePolicy(response, .no_store);
 }
 
 pub fn writeStreamedUpstreamResponse(
@@ -242,6 +255,7 @@ fn writeStreamedUpstreamResponseHeadFromHeadersDirect(
     for (upstream_headers) |header| {
         if (gph.shouldSkipUpstreamResponseHeader(header.name, null)) continue;
         if (gph.anyConnectionHeaderReferencesHeader(upstream_headers, header.name)) continue;
+        if (http.security_headers.requestScopeReplacesHeader(header.name)) continue;
         try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     if (sticky_set_cookie) |cookie| {
@@ -452,6 +466,7 @@ pub fn writeBufferedUpstreamResponseHead(
         // populated through a code path that bypasses shouldSkipUpstreamResponseHeader).
         if (gph.shouldSkipUpstreamResponseHeader(header.name, null)) continue;
         if (gph.anyConnectionHeaderReferencesHeader(upstream_response.headers, header.name)) continue;
+        if (http.security_headers.requestScopeReplacesHeader(header.name)) continue;
         try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     if (sticky_set_cookie) |cookie| {
@@ -553,6 +568,24 @@ pub fn writeSecurityHeadersFiltered(
         try writer.print("Cross-Origin-Opener-Policy: {s}\r\n", .{sec.cross_origin_opener_policy});
     if (sec.cross_origin_resource_policy.len > 0 and !has(upstream_headers, "Cross-Origin-Resource-Policy"))
         try writer.print("Cross-Origin-Resource-Policy: {s}\r\n", .{sec.cross_origin_resource_policy});
+    for (http.security_headers.requestScopedHeaders()) |scoped| {
+        try writer.print("{s}: {s}\r\n", .{ scoped.name, scoped.value });
+    }
+    // A forward_auth-protected response replaces the origin's cache policy
+    // (whose field the caller skipped) with a non-shared one (#761).
+    // A forward_auth-protected response replaces every origin
+    // cache-controlling field (the caller skipped them all, CDN/surrogate
+    // fields included) with one non-shared policy folded from all origin
+    // `Cache-Control` fields (#761).
+    const cache_policy = http.security_headers.requestCachePolicy();
+    if (cache_policy != .none) {
+        var buf: [256]u8 = undefined;
+        var fold = http.security_headers.CacheControlFold.init(&buf, cache_policy);
+        for (upstream_headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "cache-control")) fold.add(h.value);
+        }
+        try writer.print("Cache-Control: {s}\r\n", .{fold.value()});
+    }
 }
 
 pub fn writeChunk(writer: anytype, bytes: []const u8) !void {

@@ -9,17 +9,8 @@ const sendApiError = gp.sendApiError;
 const applyResponseHeaders = gp.applyResponseHeaders;
 const max_mail_reply_bytes: usize = 1024 * 1024;
 
-fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) !void {
-    const recv_tv = std.posix.timeval{
-        .sec = @intCast(recv_timeout_ms / 1000),
-        .usec = @intCast((recv_timeout_ms % 1000) * 1000),
-    };
-    const send_tv = std.posix.timeval{
-        .sec = @intCast(send_timeout_ms / 1000),
-        .usec = @intCast((send_timeout_ms % 1000) * 1000),
-    };
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_tv));
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_tv));
+fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) compat.SocketOptionError!void {
+    try compat.setSocketTimeoutsMsChecked(fd, recv_timeout_ms, send_timeout_ms);
 }
 
 fn stripHostPort(raw_host: []const u8) []const u8 {

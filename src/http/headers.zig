@@ -67,6 +67,21 @@ pub const Headers = struct {
         });
     }
 
+    /// `append` without the `MAX_HEADERS` cap, for a response field that must
+    /// be present (the protected cache policy, #761). The cap bounds inbound
+    /// header counts; a response Tardigrade itself decorates may exceed it by
+    /// a mandatory field. Still validated and still fails on allocation.
+    pub fn appendRequired(self: *Headers, name: []const u8, value: []const u8) !void {
+        if (!isValidHeaderName(name)) return error.InvalidHeader;
+        if (!isValidHeaderValue(value)) return error.InvalidHeader;
+        const lower_name = try self.allocator.alloc(u8, name.len);
+        errdefer self.allocator.free(lower_name);
+        for (name, 0..) |c, i| lower_name[i] = std.ascii.toLower(c);
+        const value_copy = try self.allocator.dupe(u8, std.mem.trim(u8, value, " \t"));
+        errdefer self.allocator.free(value_copy);
+        try self.items.append(self.allocator, .{ .name = lower_name, .value = value_copy });
+    }
+
     /// Get the first header value by name (case-insensitive)
     pub fn get(self: *const Headers, name: []const u8) ?[]const u8 {
         // Create lowercase version for comparison

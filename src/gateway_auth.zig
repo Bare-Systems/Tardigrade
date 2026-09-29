@@ -701,7 +701,7 @@ pub fn authorizeViaSubrequest(
     return status >= 200 and status < 300;
 }
 
-fn authSubrequestTlsOptions(cfg: *const edge_config.EdgeConfig) http.upstream_tls.UpstreamTlsOptions {
+pub fn authSubrequestTlsOptions(cfg: *const edge_config.EdgeConfig) http.upstream_tls.UpstreamTlsOptions {
     return .{
         // The authorization service is a separate trust boundary from the
         // normal reverse-proxy origin. An operator may deliberately disable
@@ -718,7 +718,7 @@ fn authSubrequestTlsOptions(cfg: *const edge_config.EdgeConfig) http.upstream_tl
     };
 }
 
-fn authSubrequestUriSafe(uri: std.Uri) bool {
+pub fn authSubrequestUriSafe(uri: std.Uri) bool {
     // Userinfo is not forwarded by the bounded transport, so reject it rather
     // than accidentally changing the authentication contract. Fragments are
     // never part of an HTTP request target and are likewise configuration
@@ -737,7 +737,7 @@ fn authSubrequestUriComponentSafe(component: std.Uri.Component, allow_empty: boo
     return authSubrequestBytesSafe(gp.uriComponentBytes(component), allow_empty);
 }
 
-fn authSubrequestBytesSafe(value: []const u8, allow_empty: bool) bool {
+pub fn authSubrequestBytesSafe(value: []const u8, allow_empty: bool) bool {
     if (value.len == 0) return allow_empty;
     for (value) |byte| {
         // Parsed Uri components are marked percent-encoded even when the
@@ -748,7 +748,7 @@ fn authSubrequestBytesSafe(value: []const u8, allow_empty: bool) bool {
     return true;
 }
 
-fn unbracketUriHost(host: []const u8) []const u8 {
+pub fn unbracketUriHost(host: []const u8) []const u8 {
     if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') return host[1 .. host.len - 1];
     return host;
 }

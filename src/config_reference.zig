@@ -381,6 +381,67 @@ pub const entries = [_]ConfigEntry{
         .example = "location /realms/ekho/ {\n    proxy_pass http://keycloak:8080/realms/ekho/;\n    proxy_set_header Host auth.example.com;\n    proxy_set_header X-Forwarded-Proto https;\n    proxy_set_header X-Forwarded-For $remote_addr;\n}",
         .docs = &.{ "docs/CONFIGURATION.md", "docs/PROXY_SECURITY.md" },
     },
+    .{
+        .name = "location.forward_auth",
+        .aliases = &.{"forward_auth"},
+        .contexts = CTX_LOCATION,
+        .value_type = "url",
+        .default_value = "none",
+        .description = "External auth subrequest run before the location action. 2xx allows; a 4xx, or a 301/302/303/307/308 with a valid Location, is relayed to the client; 304, other 3xx, redirects without a Location, 1xx/5xx, timeouts, connect failures and malformed responses fail closed with forward_auth_failure_status. Allowed and denied responses are never shared-cacheable. On HTTP/2, a rewrite action in a forward_auth location is not supported (the request gets 404).",
+        .example = "location /admin/ {\n    forward_auth http://127.0.0.1:4180/oauth2/auth;\n    proxy_pass http://up;\n}",
+        .docs = &.{"examples/forward-auth/README.md"},
+    },
+    .{
+        .name = "location.forward_auth_upstream_headers",
+        .aliases = &.{"forward_auth_upstream_headers"},
+        .contexts = CTX_LOCATION,
+        .value_type = "header names",
+        .default_value = "none",
+        .description = "Auth-response headers copied onto the upstream request when forward_auth allows it. Client-supplied copies are always removed first. Tardigrade-owned headers cannot be named.",
+        .example = "location /admin/ {\n    forward_auth http://127.0.0.1:4180/verify;\n    forward_auth_upstream_headers X-Auth-Request-User;\n    proxy_pass http://up;\n}",
+        .docs = &.{"examples/forward-auth/README.md"},
+    },
+    .{
+        .name = "location.forward_auth_client_headers",
+        .aliases = &.{"forward_auth_client_headers"},
+        .contexts = CTX_LOCATION,
+        .value_type = "header names",
+        .default_value = "none",
+        .description = "Auth-response headers added to the client response: on allow, to whatever the location returns; on a relayed denial, in addition to Location (for a 301/302/303/307/308 redirect) and WWW-Authenticate (401). Repeated fields such as Set-Cookie are kept.",
+        .example = "location /admin/ {\n    forward_auth http://127.0.0.1:4180/verify;\n    forward_auth_client_headers Set-Cookie;\n    proxy_pass http://up;\n}",
+        .docs = &.{"examples/forward-auth/README.md"},
+    },
+    .{
+        .name = "location.forward_auth_body",
+        .aliases = &.{"forward_auth_body"},
+        .contexts = CTX_LOCATION,
+        .value_type = "bytes",
+        .default_value = "off",
+        .description = "Largest request body forwarded to the forward_auth service. When set, the subrequest is always a POST (an empty body is sent with Content-Length: 0); larger bodies get 413. off sends a bodyless GET; a non-zero limit disables upload streaming for the location.",
+        .example = "location /api/ {\n    forward_auth http://127.0.0.1:4180/verify;\n    forward_auth_body 8192;\n    proxy_pass http://up;\n}",
+        .docs = &.{"examples/forward-auth/README.md"},
+    },
+    .{
+        .name = "location.forward_auth_timeout_ms",
+        .aliases = &.{"forward_auth_timeout_ms"},
+        .contexts = CTX_LOCATION,
+        .value_type = "milliseconds",
+        .default_value = "upstream response timeout, else 5000",
+        .description = "Connect and response deadline for the forward_auth subrequest.",
+        .example = "location /admin/ {\n    forward_auth http://127.0.0.1:4180/verify;\n    forward_auth_timeout_ms 500;\n    proxy_pass http://up;\n}",
+        .docs = &.{"examples/forward-auth/README.md"},
+    },
+    .{
+        .name = "location.forward_auth_failure_status",
+        .aliases = &.{"forward_auth_failure_status"},
+        .contexts = CTX_LOCATION,
+        .value_type = "status",
+        .default_value = "503",
+        .valid_values = &.{ "401", "403", "500", "502", "503", "504" },
+        .description = "Status returned when the forward_auth service cannot produce a decision (timeout, connect failure, 1xx/5xx, malformed response).",
+        .example = "location /admin/ {\n    forward_auth http://127.0.0.1:4180/verify;\n    forward_auth_failure_status 502;\n    proxy_pass http://up;\n}",
+        .docs = &.{"examples/forward-auth/README.md"},
+    },
 
     // ---- TLS ---------------------------------------------------------------
     .{
@@ -1896,4 +1957,20 @@ test "explaining a secret field never includes a live secret value even if prese
     const written = out.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "do-not-print-this") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "TARDIGRADE_JWT_SECRET") != null);
+}
+
+test "forward_auth reference text matches the relayed-status contract" {
+    // Keep `tardi explain forward_auth` aligned with
+    // gateway_forward_auth.isRelayableDenial: only 4xx and real redirects are
+    // relayed; 304 and other 3xx fail closed.
+    var found = false;
+    for (entries) |field| {
+        if (!std.mem.eql(u8, field.name, "location.forward_auth")) continue;
+        found = true;
+        inline for (.{ "301/302/303/307/308", "Location", "304", "fail closed" }) |needle| {
+            try std.testing.expect(std.mem.find(u8, field.description, needle) != null);
+        }
+        try std.testing.expect(std.mem.find(u8, field.description, "3xx/4xx is relayed") == null);
+    }
+    try std.testing.expect(found);
 }

@@ -8,23 +8,89 @@ pub const ScopedHeader = struct {
     value: []const u8,
 };
 
+/// Shared-cache policy for a response to a request that passed
+/// `forward_auth` (#761). A protected response must never be stored by a
+/// shared cache: the next request would be answered without the auth check.
+pub const ProtectedCachePolicy = enum {
+    /// Not a forward_auth-protected response.
+    none,
+    /// Protected: keep the origin's directives but make them `private`,
+    /// dropping `public`, `s-maxage` and `proxy-revalidate`.
+    private,
+    /// Protected and carrying auth-issued headers such as a session cookie:
+    /// `no-store` outright.
+    no_store,
+};
+
 /// HTTP/1.1 handles one request at a time per worker thread, and every H1
 /// response head passes through `SecurityHeaders.apply` or the raw
-/// security-header writer. Scoping extra headers here lets them reach proxied
-/// (buffered and streamed), static, local and upgrade responses without
-/// threading them through each writer. Callers must pair `set` with `clear`.
+/// security-header writer. Scoping extra headers and the cache policy here
+/// lets them reach proxied (buffered and streamed), static, local and upgrade
+/// responses without threading them through each writer. Callers must pair
+/// `set` with `clear`.
 threadlocal var request_scoped_headers: []const ScopedHeader = &.{};
+threadlocal var request_cache_policy: ProtectedCachePolicy = .none;
 
-pub fn setRequestScopedHeaders(headers: []const ScopedHeader) void {
+pub fn setRequestScope(headers: []const ScopedHeader, cache_policy: ProtectedCachePolicy) void {
     request_scoped_headers = headers;
+    request_cache_policy = cache_policy;
 }
 
-pub fn clearRequestScopedHeaders() void {
+pub fn clearRequestScope() void {
     request_scoped_headers = &.{};
+    request_cache_policy = .none;
 }
 
 pub fn requestScopedHeaders() []const ScopedHeader {
     return request_scoped_headers;
+}
+
+pub fn requestCachePolicy() ProtectedCachePolicy {
+    return request_cache_policy;
+}
+
+/// True when a raw writer must not forward the origin's value of `name`
+/// because the request scope replaces it.
+pub fn requestScopeReplacesHeader(name: []const u8) bool {
+    return request_cache_policy != .none and std.ascii.eqlIgnoreCase(name, "cache-control");
+}
+
+/// The `Cache-Control` value for a protected response, derived from the
+/// origin's value (if any). Written into `buf`; falls back to `no-store` if
+/// the rewritten directives would not fit.
+pub fn protectedCacheControl(buf: []u8, origin: ?[]const u8, policy: ProtectedCachePolicy) []const u8 {
+    std.debug.assert(policy != .none);
+    if (policy == .no_store) return "no-store";
+    var out: std.ArrayList(u8) = .initBuffer(buf);
+    out.appendSliceBounded("private") catch return "no-store";
+    var directives = std.mem.splitScalar(u8, origin orelse "", ',');
+    while (directives.next()) |raw| {
+        const directive = std.mem.trim(u8, raw, " \t");
+        if (directive.len == 0) continue;
+        const name_end = std.mem.findScalar(u8, directive, '=') orelse directive.len;
+        const name = std.mem.trim(u8, directive[0..name_end], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "no-store")) return "no-store";
+        // Shared-cache permissions and qualified `private="field"` (which
+        // still lets a shared cache store the rest) are replaced by the
+        // unqualified `private` above.
+        if (std.ascii.eqlIgnoreCase(name, "public") or
+            std.ascii.eqlIgnoreCase(name, "s-maxage") or
+            std.ascii.eqlIgnoreCase(name, "proxy-revalidate") or
+            std.ascii.eqlIgnoreCase(name, "private")) continue;
+        out.appendSliceBounded(", ") catch return "no-store";
+        out.appendSliceBounded(directive) catch return "no-store";
+    }
+    return out.items;
+}
+
+/// Replace every `Cache-Control` on `response` with the protected policy.
+pub fn applyProtectedCachePolicy(response: *Response, policy: ProtectedCachePolicy) void {
+    if (policy == .none) return;
+    // Computed into `buf` (or a literal) before the origin field is freed.
+    var buf: [256]u8 = undefined;
+    const value = protectedCacheControl(&buf, response.headers.get("cache-control"), policy);
+    response.headers.remove("cache-control");
+    response.headers.append("Cache-Control", value) catch {};
 }
 
 /// Standard security headers applied to all responses.
@@ -78,6 +144,7 @@ pub const SecurityHeaders = struct {
         if (self.cross_origin_resource_policy.len > 0)
             _ = response.setHeaderIfAbsent("Cross-Origin-Resource-Policy", self.cross_origin_resource_policy);
         appendRequestScopedHeaders(response);
+        applyProtectedCachePolicy(response, request_cache_policy);
     }
 
     /// Default secure configuration.
@@ -103,6 +170,28 @@ fn appendRequestScopedHeaders(response: *Response) void {
 
 // Tests
 
+test "protectedCacheControl never leaves a protected response shared-cacheable" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("private, max-age=600", protectedCacheControl(&buf, "public, max-age=600, s-maxage=3600", .private));
+    try std.testing.expectEqualStrings("private", protectedCacheControl(&buf, null, .private));
+    try std.testing.expectEqualStrings("private, no-cache", protectedCacheControl(&buf, "private=\"Set-Cookie\", no-cache, proxy-revalidate", .private));
+    try std.testing.expectEqualStrings("no-store", protectedCacheControl(&buf, "public, NO-STORE", .private));
+    try std.testing.expectEqualStrings("no-store", protectedCacheControl(&buf, "public, max-age=600", .no_store));
+}
+
+test "apply rewrites Cache-Control under a protected request scope" {
+    const allocator = std.testing.allocator;
+    var response = Response.init(allocator);
+    defer response.deinit();
+    _ = response.setHeader("Cache-Control", "public, max-age=600");
+    setRequestScope(&.{}, .private);
+    defer clearRequestScope();
+    const sec = SecurityHeaders{};
+    sec.apply(&response);
+    try std.testing.expectEqual(@as(usize, 1), response.headers.countByName("cache-control"));
+    try std.testing.expectEqualStrings("private, max-age=600", response.headers.get("cache-control").?);
+}
+
 test "apply adds request-scoped headers once, keeping repeated names" {
     const allocator = std.testing.allocator;
     var response = Response.init(allocator);
@@ -111,8 +200,8 @@ test "apply adds request-scoped headers once, keeping repeated names" {
         .{ .name = "Set-Cookie", .value = "a=1" },
         .{ .name = "Set-Cookie", .value = "b=2" },
     };
-    setRequestScopedHeaders(&scoped);
-    defer clearRequestScopedHeaders();
+    setRequestScope(&scoped, .none);
+    defer clearRequestScope();
     const sec = SecurityHeaders{};
     sec.apply(&response);
     sec.apply(&response);

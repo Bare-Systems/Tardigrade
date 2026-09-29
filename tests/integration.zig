@@ -4073,6 +4073,8 @@ test "h3interop.forward_auth.deny_then_allow" {
     try assertContains(allowed.stderr, "[:status: 200]");
     // The external client logs each received field as `[name: value]`.
     try assertContains(allowed.stderr, "[set-cookie: h3-refreshed=1]");
+    // A protected response carrying an auth cookie is never cacheable.
+    try assertContains(allowed.stderr, "[cache-control: no-store]");
     try waitForUpstreamCount(&upstream, 1, 2_000);
     try std.testing.expectEqualStrings("h3-alice", upstream.capturedHeader("X-Auth-Request-User").?);
     try std.testing.expectEqual(@as(u32, 2), auth.requestCount());
@@ -5309,6 +5311,89 @@ test "interop.h2.forward_auth_denial_and_allow" {
     defer allocator.free(static_allowed);
     try assertContains(static_allowed, "h2-static-report");
     try std.testing.expectEqual(@as(u32, 4), auth.requestCount());
+}
+
+test "interop.h2.forward_auth_responses_are_not_shared_cacheable" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var auth = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 200, .body = "", .headers = &.{.{ .name = "Set-Cookie", .value = "h2-refreshed=alice" }} },
+        .{ .status_code = 200, .body = "" },
+    });
+    defer auth.stop();
+    try auth.run();
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "h2-protected", .headers = &.{.{ .name = "Cache-Control", .value = "public, max-age=600" }} }});
+    defer upstream.stop();
+    try upstream.run();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "report.txt", .data = "h2-static-report" });
+    const static_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(static_root);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-app {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_client_headers Set-Cookie;
+        \\    proxy_pass http://{s}:{d}/h2-app;
+        \\}}
+        \\
+        \\location /h2-reports/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    alias {s}/;
+        \\}}
+    , .{ test_host, auth.port(), test_host, upstream.port(), test_host, auth.port(), static_root });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const proxy_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-app" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    var proxied = try pureZigH2GetResponse(allocator, tardigrade.port, proxy_headers[0..]);
+    defer proxied.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), proxied.status);
+    try std.testing.expectEqualStrings("no-store", proxied.header("cache-control").?);
+    try std.testing.expectEqualStrings("h2-refreshed=alice", proxied.header("set-cookie").?);
+    var cache_fields: usize = 0;
+    for (proxied.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "cache-control")) cache_fields += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), cache_fields);
+
+    const static_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-reports/report.txt" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    var static_file = try pureZigH2GetResponse(allocator, tardigrade.port, static_headers[0..]);
+    defer static_file.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), static_file.status);
+    try std.testing.expect(std.mem.startsWith(u8, static_file.header("cache-control").?, "private"));
 }
 
 test "interop.h2.proxy_malformed_authority_rejected_before_upstream" {
@@ -13939,6 +14024,107 @@ test "forward_auth fails closed when the auth service answers a conditional requ
     try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
     // Validators are not forwarded to the auth subrequest.
     try std.testing.expect(auth.capturedHeader("If-None-Match") == null);
+}
+
+fn countRawHeader(headers_raw: []const u8, name: []const u8) usize {
+    var count: usize = 0;
+    var lines = std.mem.splitSequence(u8, headers_raw, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) count += 1;
+    }
+    return count;
+}
+
+test "forward_auth responses are never shared-cacheable over h1" {
+    const allocator = std.testing.allocator;
+
+    const refresh: []const ResponseHeader = &.{.{ .name = "Set-Cookie", .value = "refreshed=alice" }};
+    var auth = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 200, .body = "", .headers = refresh }, // buffered, cookie
+        .{ .status_code = 200, .body = "" }, // buffered, no cookie
+        .{ .status_code = 200, .body = "", .headers = refresh }, // streamed, cookie
+        .{ .status_code = 200, .body = "" }, // static, no cookie
+    });
+    defer auth.stop();
+    try auth.run();
+    // The origin marks everything publicly cacheable, unaware the gateway
+    // gates it and may add a session cookie.
+    const public_cache: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=600" }};
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "protected-body", .headers = public_cache },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "report.txt", .data = "static-report" });
+    const static_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(static_root);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /app/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_client_headers Set-Cookie;
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\
+        \\location /events/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_client_headers Set-Cookie;
+        \\    proxy_streaming response;
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\
+        \\location /reports/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    alias {s}/;
+        \\}}
+    , .{ test_host, auth.port(), test_host, upstream.port(), test_host, auth.port(), test_host, upstream.port(), test_host, auth.port(), static_root });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+
+    // Buffered proxy + auth cookie: no-store, the user's cookie kept.
+    var with_cookie = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/app/page", .body = null, .headers = &.{} });
+    defer with_cookie.deinit();
+    try std.testing.expectEqual(@as(u16, 200), with_cookie.status_code);
+    try std.testing.expectEqual(@as(usize, 1), countRawHeader(with_cookie.headers_raw, "cache-control"));
+    try std.testing.expectEqualStrings("no-store", with_cookie.header("Cache-Control").?);
+    try std.testing.expectEqualStrings("refreshed=alice", with_cookie.header("Set-Cookie").?);
+
+    // Buffered proxy, no cookie: still never shared-cacheable.
+    var no_cookie = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/app/page", .body = null, .headers = &.{} });
+    defer no_cookie.deinit();
+    try std.testing.expectEqual(@as(usize, 1), countRawHeader(no_cookie.headers_raw, "cache-control"));
+    try std.testing.expectEqualStrings("private, max-age=600", no_cookie.header("Cache-Control").?);
+
+    // Streamed (SSE-style) proxy + auth cookie.
+    var streamed = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/events/feed", .body = null, .headers = &.{} });
+    defer streamed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), streamed.status_code);
+    try std.testing.expectEqual(@as(usize, 1), countRawHeader(streamed.headers_raw, "cache-control"));
+    try std.testing.expectEqualStrings("no-store", streamed.header("Cache-Control").?);
+    try std.testing.expectEqualStrings("refreshed=alice", streamed.header("Set-Cookie").?);
+
+    // Protected static file.
+    var static_file = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/reports/report.txt", .body = null, .headers = &.{} });
+    defer static_file.deinit();
+    try std.testing.expectEqual(@as(u16, 200), static_file.status_code);
+    try assertContains(static_file.body, "static-report");
+    try std.testing.expectEqual(@as(usize, 1), countRawHeader(static_file.headers_raw, "cache-control"));
+    try std.testing.expect(std.mem.startsWith(u8, static_file.header("Cache-Control").?, "private"));
 }
 
 test "forward_auth fails closed when the auth service is unreachable or slow" {

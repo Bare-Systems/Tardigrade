@@ -736,7 +736,7 @@ pub fn routeRequest(
     defer grants.deinit(allocator);
     var client_view = H1ClientAuthView{};
     defer client_view.deinit(allocator);
-    defer http.security_headers.clearRequestScopedHeaders();
+    defer http.security_headers.clearRequestScope();
 
     switch (resolveRoute(allocator, cfg, request)) {
         .reload_status => {
@@ -764,7 +764,7 @@ pub fn routeRequest(
             var gate_only = false;
             while (true) {
                 // Refusals on this hop must not carry an earlier hop's grants.
-                http.security_headers.clearRequestScopedHeaders();
+                http.security_headers.clearRequestScope();
                 // Built-in auth checks the caller's own credentials, never an
                 // earlier hop's auth-asserted replacement.
                 var verifier_request = request.*;
@@ -816,7 +816,7 @@ pub fn routeRequest(
                 hops += 1;
                 matched = next;
             }
-            http.security_headers.setRequestScopedHeaders(grants.client_headers.items);
+            http.security_headers.setRequestScope(grants.client_headers.items, grants.cachePolicy());
             if (try executeLocationAction(
                 conn,
                 allocator,
@@ -862,7 +862,7 @@ fn finishRoute(
     keep_alive: bool,
     grants: *const gfa.Grants,
 ) !RouteOutcome {
-    http.security_headers.setRequestScopedHeaders(grants.client_headers.items);
+    http.security_headers.setRequestScope(grants.client_headers.items, grants.cachePolicy());
     const writer = conn.writer();
     if (serveTryFilesFallback(allocator, conn, cfg, request, correlation_id, keep_alive, state, ctx)) |status| {
         state.metricsRecord(status);
@@ -4935,6 +4935,68 @@ test "H3 later verifiers judge the caller's credential, not an earlier hop's min
     // Hop A's asserted names are withheld from hop B too, so the client's
     // forged copy never reaches it.
     try std.testing.expect(!auth_server.requestContains(1, "forged-admin"));
+}
+
+test "H3 forward_auth responses are never shared-cacheable" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=alice\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    // The origin marks its body publicly cacheable.
+    const public_origin = "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=600\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    var origin = try gfa.TestAuthServer.start(allocator, &.{ public_origin, public_origin });
+    defer origin.stop();
+    try origin.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "report.txt", .data = "static-report" });
+    const root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var auth_buf: [64]u8 = undefined;
+    const auth_url = auth_server.url(&auth_buf, "/verify");
+    var origin_buf: [64]u8 = undefined;
+    const origin_url = origin.url(&origin_buf, "");
+    var blocks = [_]http.location_router.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/app/",
+            .priority = 0,
+            .action = .{ .proxy_pass = origin_url },
+            .forward_auth = .{ .url = auth_url, .client_headers = &.{"Set-Cookie"} },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/reports/",
+            .priority = 1,
+            .action = .{ .static_root = .{ .root = root, .alias = true, .autoindex = false, .index = "", .try_files = "" } },
+            .forward_auth = .{ .url = auth_url },
+        },
+    };
+
+    var with_cookie = http.Response.init(allocator);
+    defer with_cookie.deinit();
+    try runH3ForwardAuthRequest(allocator, blocks[0..], "GET", "/app/page", &with_cookie);
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(with_cookie.status));
+    try std.testing.expectEqual(@as(usize, 1), with_cookie.headers.countByName("cache-control"));
+    try std.testing.expectEqualStrings("no-store", with_cookie.headers.get("cache-control").?);
+    try std.testing.expectEqualStrings("refreshed=alice", with_cookie.headers.get("set-cookie").?);
+
+    var no_cookie = http.Response.init(allocator);
+    defer no_cookie.deinit();
+    try runH3ForwardAuthRequest(allocator, blocks[0..], "GET", "/app/page", &no_cookie);
+    try std.testing.expectEqual(@as(usize, 1), no_cookie.headers.countByName("cache-control"));
+    try std.testing.expectEqualStrings("private, max-age=600", no_cookie.headers.get("cache-control").?);
+
+    var static_file = http.Response.init(allocator);
+    defer static_file.deinit();
+    try runH3ForwardAuthRequest(allocator, blocks[0..], "GET", "/reports/report.txt", &static_file);
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(static_file.status));
+    try std.testing.expect(std.mem.startsWith(u8, static_file.headers.get("cache-control").?, "private"));
 }
 
 test "H3 forward_auth HEAD denial keeps Content-Length and drops the body" {

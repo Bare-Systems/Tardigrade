@@ -147,9 +147,19 @@ pub const Grants = struct {
         self.* = undefined;
     }
 
-    /// Add every granted client header to a response.
+    /// Shared-cache policy for the response to a request these grants
+    /// allowed: `no-store` when an auth service added headers (typically a
+    /// session cookie), otherwise `private`.
+    pub fn cachePolicy(self: *const Grants) http.security_headers.ProtectedCachePolicy {
+        if (self.len == 0) return .none;
+        return if (self.client_headers.items.len > 0) .no_store else .private;
+    }
+
+    /// Add every granted client header to a response and make it
+    /// non-shared-cacheable.
     pub fn apply(self: *const Grants, response: *http.Response) !void {
         for (self.client_headers.items) |header| try response.headers.append(header.name, header.value);
+        http.security_headers.applyProtectedCachePolicy(response, self.cachePolicy());
     }
 };
 

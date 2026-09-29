@@ -53,7 +53,13 @@ kill %1; curl -i http://localhost:8080/admin/                          # → 503
    `forward_auth_failure_status` (default 503) and a JSON error
    (`auth_unavailable` or `auth_timeout`).
 
-Every denial and failure carries `Cache-Control: no-store`. A `HEAD` request
+Every denial and failure carries `Cache-Control: no-store`. Allowed responses
+are never shared-cacheable either, whatever the origin says: a shared cache
+would otherwise answer the next request without asking the auth service.
+When the auth service added headers (such as a refreshed session cookie) the
+response is `Cache-Control: no-store`; otherwise the origin's directives are
+kept but made `private` (`public`, `s-maxage` and `proxy-revalidate` are
+dropped). An origin `no-store` always stays `no-store`. A `HEAD` request
 gets the same status and headers, including `Content-Length`, without a body.
 Denied requests never reach the upstream, a mirror target, or a retry.
 Auth-response headers the auth service nominates as hop-by-hop through

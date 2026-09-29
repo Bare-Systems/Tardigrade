@@ -242,6 +242,7 @@ fn writeStreamedUpstreamResponseHeadFromHeadersDirect(
     for (upstream_headers) |header| {
         if (gph.shouldSkipUpstreamResponseHeader(header.name, null)) continue;
         if (gph.anyConnectionHeaderReferencesHeader(upstream_headers, header.name)) continue;
+        if (http.security_headers.requestScopeReplacesHeader(header.name)) continue;
         try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     if (sticky_set_cookie) |cookie| {
@@ -452,6 +453,7 @@ pub fn writeBufferedUpstreamResponseHead(
         // populated through a code path that bypasses shouldSkipUpstreamResponseHeader).
         if (gph.shouldSkipUpstreamResponseHeader(header.name, null)) continue;
         if (gph.anyConnectionHeaderReferencesHeader(upstream_response.headers, header.name)) continue;
+        if (http.security_headers.requestScopeReplacesHeader(header.name)) continue;
         try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     if (sticky_set_cookie) |cookie| {
@@ -555,6 +557,20 @@ pub fn writeSecurityHeadersFiltered(
         try writer.print("Cross-Origin-Resource-Policy: {s}\r\n", .{sec.cross_origin_resource_policy});
     for (http.security_headers.requestScopedHeaders()) |scoped| {
         try writer.print("{s}: {s}\r\n", .{ scoped.name, scoped.value });
+    }
+    // A forward_auth-protected response replaces the origin's cache policy
+    // (whose field the caller skipped) with a non-shared one (#761).
+    const cache_policy = http.security_headers.requestCachePolicy();
+    if (cache_policy != .none) {
+        var origin_cache_control: ?[]const u8 = null;
+        for (upstream_headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "cache-control")) {
+                origin_cache_control = h.value;
+                break;
+            }
+        }
+        var buf: [256]u8 = undefined;
+        try writer.print("Cache-Control: {s}\r\n", .{http.security_headers.protectedCacheControl(&buf, origin_cache_control, cache_policy)});
     }
 }
 

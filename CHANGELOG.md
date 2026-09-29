@@ -17,7 +17,11 @@ All notable user-facing changes to Tardigrade are documented here.
   4xx, or a redirect with a `Location`, is relayed to the client with its
   body, `Location`, `WWW-Authenticate` and the same allowlisted headers; a
   304 or other non-redirect 3xx fails closed, and conditional/range headers
-  are never sent to the auth service. Every denial is
+  are never sent to the auth service. Responses to allowed requests are
+  never shared-cacheable, since a CDN would otherwise serve them without the
+  auth check: `Cache-Control: no-store` when the auth service added headers
+  such as a session cookie, otherwise the origin's directives made `private`.
+  Every denial is
   `Cache-Control: no-store` (which the allowlists cannot name), and `HEAD`
   gets the head without a body.
   Timeouts, connect failures, 1xx/5xx and malformed responses fail closed with

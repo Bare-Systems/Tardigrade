@@ -59,25 +59,13 @@ pub const unixSocketPathFromEndpoint = gpt.unixSocketPathFromEndpoint;
 const maxBufferedUpstreamResponseBytes = gs.maxBufferedUpstreamResponseBytes;
 const CancellationToken = http.cancellation.CancellationToken;
 
-fn setSocketRecvTimeoutMs(fd: std.posix.fd_t, timeout_ms: u32) !void {
-    const tv = std.posix.timeval{
-        .sec = @intCast(timeout_ms / 1000),
-        .usec = @intCast((timeout_ms % 1000) * 1000),
-    };
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+fn setSocketRecvTimeoutMs(fd: std.posix.fd_t, timeout_ms: u32) compat.SocketOptionError!void {
+    const tv = compat.timevalFromMs(timeout_ms);
+    try compat.setSocketOption(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
 }
 
-fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) !void {
-    const recv_tv = std.posix.timeval{
-        .sec = @intCast(recv_timeout_ms / 1000),
-        .usec = @intCast((recv_timeout_ms % 1000) * 1000),
-    };
-    const send_tv = std.posix.timeval{
-        .sec = @intCast(send_timeout_ms / 1000),
-        .usec = @intCast((send_timeout_ms % 1000) * 1000),
-    };
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_tv));
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_tv));
+fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) compat.SocketOptionError!void {
+    try compat.setSocketTimeoutsMsChecked(fd, recv_timeout_ms, send_timeout_ms);
 }
 
 fn isHttpMethodIdempotent(method: []const u8) bool {
@@ -4906,8 +4894,8 @@ test "http1 upload relay reports a slow origin as a downstream read pause" {
     // Shrink both ends so the origin's window fills well before the upload is
     // done, whatever the platform default happens to be.
     const small: c_int = 4096;
-    std.posix.setsockopt(client_fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&small)) catch {};
-    std.posix.setsockopt(peer_fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&small)) catch {};
+    compat.setSocketOption(client_fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&small)) catch {};
+    compat.setSocketOption(peer_fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&small)) catch {};
 
     const payload = try std.testing.allocator.alloc(u8, 64 * 1024);
     defer std.testing.allocator.free(payload);
@@ -6070,6 +6058,71 @@ test "unix-socket upstream connections pool and reuse across requests (#239)" {
     defer http.upstream_pool.freeHostSnapshots(allocator, snaps);
     try std.testing.expectEqual(@as(usize, 1), snaps.len);
     try std.testing.expect(std.mem.startsWith(u8, snaps[0].host, "unix:/tmp/tardigrade-pool-"));
+}
+
+// Regression: macOS returns EINVAL from setsockopt on a socket that can
+// neither send nor receive (peer gone, or fully shut down), and
+// `std.posix.setsockopt` maps EINVAL to `unreachable`, which aborted the
+// process even behind `catch {}`. `shutdown(SHUT_RDWR)` reproduces that
+// state deterministically. Every OS must return (not panic); macOS must
+// report the socket as unusable.
+test "socket timeout helpers report a shut-down Unix socket instead of panicking" {
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer _ = std.c.close(fds[0]);
+    _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+    _ = std.c.close(fds[1]);
+
+    const recv_result = setSocketRecvTimeoutMs(fds[0], 1_000);
+    const both_result = setSocketTimeoutMs(fds[0], 1_000, 1_000);
+    // The best-effort form used by adapters and pools must simply return.
+    compat.setSocketTimeoutsMs(fds[0], 1_000, 1_000);
+
+    if (builtin.os.tag.isDarwin()) {
+        try std.testing.expectError(error.ConnectionResetByPeer, recv_result);
+        try std.testing.expectError(error.ConnectionResetByPeer, both_result);
+    } else {
+        recv_result catch {};
+        both_result catch {};
+    }
+}
+
+test "setSocketOption reports a shut-down TCP connection instead of panicking" {
+    const listener = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    try std.testing.expect(listener >= 0);
+    defer _ = std.c.close(listener);
+    var addr: std.c.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        .zero = [_]u8{0} ** 8,
+    };
+    try std.testing.expectEqual(@as(c_int, 0), std.c.bind(listener, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.listen(listener, 1));
+    var addr_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(listener, @ptrCast(&addr), &addr_len));
+
+    const client = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    try std.testing.expect(client >= 0);
+    defer _ = std.c.close(client);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.connect(client, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)));
+    const accepted = std.c.accept(listener, null, null);
+    try std.testing.expect(accepted >= 0);
+    // The accepted side stands in for a downstream client connection whose
+    // peer vanished before TCP_NODELAY / timeouts were applied.
+    _ = std.c.shutdown(accepted, std.posix.SHUT.RDWR);
+    defer _ = std.c.close(accepted);
+
+    const one: c_int = 1;
+    const nodelay = compat.setSocketOption(accepted, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one));
+    const timeouts = compat.setSocketTimeoutsMsChecked(accepted, 1_000, 1_000);
+    if (builtin.os.tag.isDarwin()) {
+        try std.testing.expectError(error.ConnectionResetByPeer, nodelay);
+        try std.testing.expectError(error.ConnectionResetByPeer, timeouts);
+    } else {
+        nodelay catch {};
+        timeouts catch {};
+    }
 }
 
 test "connectBlockingUnix + exchange round-trips a Unix-socket origin" {

@@ -43,6 +43,22 @@ All notable user-facing changes to Tardigrade are documented here.
   `tardigrade_forward_auth_total{protocol,outcome}`. See
   [examples/forward-auth](examples/forward-auth/README.md).
 
+### Fixed
+
+- **A peer that disconnects at the wrong moment can no longer abort the
+  gateway on macOS.** macOS returns `EINVAL` from `setsockopt` on a socket
+  whose peer has already shut down, and Zig's `std.posix.setsockopt` treats
+  `EINVAL` as unreachable, so setting a socket timeout or `TCP_NODELAY` on
+  such a connection crashed the process. A `catch` around the call could not
+  prevent this. It could hit accepted client connections, upstream and
+  Unix-socket origins, FastCGI/SCGI/uWSGI adapters, and pooled connections,
+  and it surfaced as an intermittent macOS CI abort. These calls now go
+  through a setter that reports the failure: a best-effort timeout is skipped
+  and the next read or write sees the closed connection, and a required one
+  fails that connection or upstream request (502) instead of the process.
+  HTTP/3's advisory UDP socket-option probes use the same setter, so a kernel
+  that rejects an option reads as unsupported.
+
 ### Security
 
 - **A location `rewrite` can no longer reach a protected resource around its

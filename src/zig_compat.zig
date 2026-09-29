@@ -461,18 +461,47 @@ fn connectFdBounded(sock: std.posix.fd_t, addr: *const std.c.sockaddr, addr_len:
     if (std.c.fcntl(sock, std.posix.F.SETFL, flags) < 0) return error.ConnectionFailed;
 }
 
+pub const SocketOptionError = error{
+    /// The connection is no longer usable: the peer shut it down or reset it.
+    ConnectionResetByPeer,
+    /// Any other `setsockopt(2)` failure.
+    SocketOptionFailed,
+};
+
+/// `setsockopt(2)` that reports every failure as an error. Use this for any
+/// socket that may be connected. `std.posix.setsockopt` treats `EINVAL`
+/// (and `EBADF`/`ENOTSOCK`) as `unreachable`, but macOS returns `EINVAL` for
+/// SO_RCVTIMEO/SO_SNDTIMEO/TCP_NODELAY on a socket whose peer has already shut
+/// down, so a client or origin that disconnects at the wrong moment would abort
+/// the whole process; `catch {}` around the std call cannot prevent that.
+pub fn setSocketOption(fd: std.posix.fd_t, level: i32, optname: u32, opt: []const u8) SocketOptionError!void {
+    const rc = std.c.setsockopt(fd, level, optname, opt.ptr, @intCast(opt.len));
+    return switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        .INVAL, .NOTCONN, .CONNRESET, .PIPE => error.ConnectionResetByPeer,
+        else => error.SocketOptionFailed,
+    };
+}
+
+pub fn timevalFromMs(timeout_ms: u32) std.posix.timeval {
+    return .{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+}
+
 /// Set SO_RCVTIMEO / SO_SNDTIMEO (0 disables the respective timeout).
+pub fn setSocketTimeoutsMsChecked(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) SocketOptionError!void {
+    const recv_tv = timevalFromMs(recv_timeout_ms);
+    const send_tv = timevalFromMs(send_timeout_ms);
+    try setSocketOption(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_tv));
+    try setSocketOption(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_tv));
+}
+
+/// Best-effort `setSocketTimeoutsMsChecked`: a socket that cannot take a
+/// timeout is already unusable, and the next read or write reports it.
 pub fn setSocketTimeoutsMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) void {
-    const recv_tv = std.posix.timeval{
-        .sec = @intCast(recv_timeout_ms / 1000),
-        .usec = @intCast((recv_timeout_ms % 1000) * 1000),
-    };
-    const send_tv = std.posix.timeval{
-        .sec = @intCast(send_timeout_ms / 1000),
-        .usec = @intCast((send_timeout_ms % 1000) * 1000),
-    };
-    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_tv)) catch {};
-    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_tv)) catch {};
+    setSocketTimeoutsMsChecked(fd, recv_timeout_ms, send_timeout_ms) catch {};
 }
 
 /// Connect a *blocking* Unix-domain socket via std.c, bypassing the std.Io

@@ -208,6 +208,8 @@ return, rewrite, or static.
 | `proxy_websocket` | enum | `off` | `on` relays HTTP/1.1 WebSocket upgrades through this location's `proxy_pass`; valid only with `proxy_pass`. Off keeps stripping `Upgrade` and refusing an upstream `101`. See [WebSocket proxying](#websocket-proxying-proxy_websocket). | `proxy_websocket on;` |
 | `proxy_websocket_idle_timeout_ms` | ms | `60000` | Close a tunnel after this long with no bytes moving in either direction. Requires `proxy_websocket on`. | `proxy_websocket_idle_timeout_ms 300000;` |
 | `proxy_websocket_max_lifetime_ms` | ms | `0` (unlimited) | Close a tunnel this long after it opened. Requires `proxy_websocket on`. | `proxy_websocket_max_lifetime_ms 3600000;` |
+| `proxy_websocket_reload` | enum | top-level value, else `preserve` | What a successful hot reload does to open tunnels: `preserve` keeps them under their admission configuration, `drain` closes them `proxy_websocket_reload_timeout_ms` after the reload. Also valid at top level. Requires `proxy_websocket on`. See [WebSocket proxying](#websocket-proxying-proxy_websocket). | `proxy_websocket_reload drain;` |
+| `proxy_websocket_reload_timeout_ms` | ms | top-level value, else `30000` | Drain window for `drain` tunnels, from the reload that superseded their configuration. Also valid at top level. Requires `proxy_websocket on`. | `proxy_websocket_reload_timeout_ms 10000;` |
 | `proxy_websocket_origins` | origins | any | Browser origins (`scheme://host[:port]`) allowed to open a WebSocket; others get 403 before the upstream is contacted. Handshakes without `Origin` are allowed. Requires `proxy_websocket on`. | `proxy_websocket_origins https://app.example.com;` |
 
 Parser-valid matcher examples:
@@ -396,10 +398,51 @@ block every other request. Deployments
 that expect many long-lived WebSockets should raise
 `TARDIGRADE_WORKER_THREADS` and the cap together.
 
-**Reload and shutdown.** Hot reload does not close tunnels; a tunnel keeps the
-location settings it was opened with. On graceful shutdown, open tunnels keep
-relaying for `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` and are then closed, so
-they never hold the process open.
+**Hot reload.** A tunnel is admitted under the configuration generation its
+handshake leased, and everything about it comes from that snapshot: its
+location's settings and its reload behavior. `proxy_websocket_reload` decides
+what a successful reload does to tunnels that are already open:
+
+- `preserve` (default): the tunnel keeps relaying under its admission
+  configuration until a peer closes it, a timeout ends it, or the process
+  shuts down. **This holds even if the reload changed or removed its
+  location**, restricted its `auth`/`forward_auth`/ACL/Origin rules, or
+  pointed it at another origin: an established connection is not
+  re-authorized. Use `drain` where a reload must also revoke open sessions.
+- `drain`: the tunnel keeps relaying for `proxy_websocket_reload_timeout_ms`
+  (default 30000) after the first successful reload that supersedes its
+  admission configuration, then both hops are closed
+  (`tunnel_close_reason` `reload`). The deadline starts at that reload and is
+  never extended: later reloads, including ones that change the timeout,
+  do not move it. `0` closes the tunnel at the reload.
+
+Set `proxy_websocket_reload` and `proxy_websocket_reload_timeout_ms` at top
+level for a default and in a location to override either one. Both are read
+from the admission configuration, so a reload that changes them affects only
+tunnels opened after it. A reload that fails or is rejected publishes
+nothing and never affects open tunnels. New handshakes use the new
+configuration as soon as the reload is applied.
+
+```nginx
+proxy_websocket_reload drain;
+proxy_websocket_reload_timeout_ms 30000;
+
+location /ws/ {
+    proxy_pass http://127.0.0.1:9000;
+    proxy_websocket on;
+}
+
+location /live-feed/ {
+    proxy_pass http://127.0.0.1:9001;
+    proxy_websocket on;
+    proxy_websocket_reload preserve;
+}
+```
+
+**Shutdown.** Graceful shutdown overrides `preserve`: every open tunnel keeps
+relaying for `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` and is then closed, so
+tunnels never hold the process open. A `drain` tunnel that is already inside
+a reload drain closes at whichever deadline comes first.
 
 **Protocols.** WebSocket relaying is HTTP/1.1 only, over plaintext or
 Tardigrade's native TLS (`wss://`). HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220)
@@ -908,6 +951,8 @@ WebSockets are relayed per location with `proxy_websocket on;` (see
 
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
+| `TARDIGRADE_PROXY_WEBSOCKET_RELOAD` | enum | `preserve` | Default hot-reload behavior for open tunnels, `preserve` or `drain`; a location's `proxy_websocket_reload` overrides it. Config directive: `proxy_websocket_reload`. | `TARDIGRADE_PROXY_WEBSOCKET_RELOAD=drain` |
+| `TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS` | u32 ms | `30000` | Default drain window for `drain` tunnels. Config directive: `proxy_websocket_reload_timeout_ms`. | `TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS=10000` |
 | `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS` | u32 | `0` (half the worker threads, rounded down; none with one worker) | Maximum concurrent WebSocket tunnels per process. A handshake over the cap gets 503 before the origin is contacted. Config directive: `proxy_websocket_max_tunnels`. | `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS=256` |
 
 Server-sent events need no special setting: proxy them as a streamed response

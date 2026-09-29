@@ -64,8 +64,11 @@ A relayed WebSocket (`proxy_websocket`, #812) leaves HTTP's request phases once
 the origin's 101 is relayed. The handshake itself uses the ordinary upstream
 connect and response timeouts. The tunnel is then bounded by
 `proxy_websocket_idle_timeout_ms` (default 60 s, no bytes either way),
-`proxy_websocket_max_lifetime_ms` (default unlimited), and the shutdown drain
-window; `TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS` does not apply to it.
+`proxy_websocket_max_lifetime_ms` (default unlimited), the shutdown drain
+window, and, for `proxy_websocket_reload drain` tunnels,
+`proxy_websocket_reload_timeout_ms` (default 30 s) from the reload that
+superseded their configuration; `TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS` does not
+apply to it.
 
 ## Lifecycle / operations
 

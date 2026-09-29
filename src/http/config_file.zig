@@ -109,6 +109,8 @@ const LocationBlockBuilder = struct {
     proxy_websocket_idle_timeout_ms: ?u32 = null,
     proxy_websocket_max_lifetime_ms: ?u32 = null,
     proxy_websocket_origins: ?[]u8 = null,
+    proxy_websocket_reload: ?location_router.WebSocketReloadPolicy = null,
+    proxy_websocket_reload_timeout_ms: ?u32 = null,
     error_pages: std.ArrayList(ErrorPageBuilder) = .empty,
     proxy_set_headers: std.ArrayList(ProxySetHeaderBuilder) = .empty,
 
@@ -959,6 +961,20 @@ fn parseLocationStatement(
         };
         return;
     }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_websocket_reload")) {
+        builder.proxy_websocket_reload = location_router.WebSocketReloadPolicy.parse(value_interp) orelse {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_websocket_reload must be 'preserve' or 'drain'", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        };
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_websocket_reload_timeout_ms")) {
+        builder.proxy_websocket_reload_timeout_ms = std.fmt.parseInt(u32, value_interp, 10) catch {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_websocket_reload_timeout_ms must be a number of milliseconds", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        };
+        return;
+    }
     if (std.ascii.eqlIgnoreCase(directive, "proxy_websocket_origins")) {
         const joined = try joinWebSocketOrigins(allocator, file_path, line_no, value_interp);
         defer allocator.free(joined);
@@ -1175,9 +1191,13 @@ fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlock
         if (builder.proxy_websocket_idle_timeout_ms) |timeout_ms| try ws_entry.print(allocator, "|websocket_idle_timeout_ms:{d}", .{timeout_ms});
         if (builder.proxy_websocket_max_lifetime_ms) |lifetime_ms| try ws_entry.print(allocator, "|websocket_max_lifetime_ms:{d}", .{lifetime_ms});
         if (builder.proxy_websocket_origins) |origins| try ws_entry.print(allocator, "|websocket_origins:{s}", .{origins});
+        if (builder.proxy_websocket_reload) |policy| try ws_entry.print(allocator, "|websocket_reload:{s}", .{@tagName(policy)});
+        if (builder.proxy_websocket_reload_timeout_ms) |timeout_ms| try ws_entry.print(allocator, "|websocket_reload_timeout_ms:{d}", .{timeout_ms});
         allocator.free(entry);
         entry = try ws_entry.toOwnedSlice(allocator);
-    } else if (builder.proxy_websocket_idle_timeout_ms != null or builder.proxy_websocket_max_lifetime_ms != null or builder.proxy_websocket_origins != null) {
+    } else if (builder.proxy_websocket_idle_timeout_ms != null or builder.proxy_websocket_max_lifetime_ms != null or builder.proxy_websocket_origins != null or
+        builder.proxy_websocket_reload != null or builder.proxy_websocket_reload_timeout_ms != null)
+    {
         logConfigSyntaxDiagnostic("config syntax error: location '{s}' sets proxy_websocket_* options without proxy_websocket on", .{builder.pattern});
         allocator.free(entry);
         return error.InvalidConfigSyntax;
@@ -1776,6 +1796,8 @@ test "location block serializes proxy_websocket directives (#812)" {
         \\    proxy_websocket_idle_timeout_ms 1500;
         \\    proxy_websocket_max_lifetime_ms 60000;
         \\    proxy_websocket_origins https://app.example.test, http://127.0.0.1:8080;
+        \\    proxy_websocket_reload drain;
+        \\    proxy_websocket_reload_timeout_ms 2500;
         \\}
         \\location /api/ {
         \\    proxy_pass http://127.0.0.1:9000;
@@ -1786,6 +1808,7 @@ test "location block serializes proxy_websocket directives (#812)" {
     try std.testing.expectEqualStrings(
         "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_idle_timeout_ms:1500" ++
             "|websocket_max_lifetime_ms:60000|websocket_origins:https://app.example.test,http://127.0.0.1:8080" ++
+            "|websocket_reload:drain|websocket_reload_timeout_ms:2500" ++
             ";prefix|/api/|proxy_pass|http://127.0.0.1:9000",
         overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
     );
@@ -1799,6 +1822,9 @@ test "location block rejects unsafe proxy_websocket directives (#812)" {
         "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket yes;\n}\n",
         "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket on;\n    proxy_websocket_idle_timeout_ms 0;\n}\n",
         "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket on;\n    proxy_websocket_origins app.example.test;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket on;\n    proxy_websocket_reload restart;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket_reload drain;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket on;\n    proxy_websocket_reload_timeout_ms soon;\n}\n",
     };
     for (cases) |data| {
         var overrides = Overrides.init(allocator);

@@ -188,11 +188,31 @@ test "isProtectedForwardAuthHeader rejects trust and framing headers" {
     try std.testing.expect(!isProtectedForwardAuthHeader("Set-Cookie"));
 }
 
+/// What happens to an open WebSocket tunnel when a hot reload publishes a
+/// new configuration (#812). Decided from the configuration the tunnel was
+/// admitted under, never from the one that superseded it.
+pub const WebSocketReloadPolicy = enum {
+    /// Keep relaying under the admission configuration until a close,
+    /// timeout, or process shutdown.
+    preserve,
+    /// Close within the reload timeout of the first successful reload that
+    /// supersedes the admission configuration.
+    drain,
+
+    pub fn parse(raw: []const u8) ?WebSocketReloadPolicy {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(value, "preserve")) return .preserve;
+        if (std.ascii.eqlIgnoreCase(value, "drain")) return .drain;
+        return null;
+    }
+};
+
 /// Per-location WebSocket upgrade relaying (`proxy_websocket on`, #812).
 /// Present only on locations that opted in; everything else keeps stripping
 /// `Upgrade` and rejecting an upstream `101`.
 pub const WebSocketProxy = struct {
     pub const DEFAULT_IDLE_TIMEOUT_MS: u32 = 60_000;
+    pub const DEFAULT_RELOAD_TIMEOUT_MS: u32 = 30_000;
 
     /// Close a tunnel after this long with no bytes moving either way.
     idle_timeout_ms: u32 = DEFAULT_IDLE_TIMEOUT_MS,
@@ -200,6 +220,11 @@ pub const WebSocketProxy = struct {
     max_lifetime_ms: u32 = 0,
     /// Browser origins allowed to open a WebSocket; empty allows any.
     origins: []const []const u8 = &.{},
+    /// `proxy_websocket_reload` for this location; null inherits the
+    /// top-level setting.
+    reload: ?WebSocketReloadPolicy = null,
+    /// `proxy_websocket_reload_timeout_ms` for this location; null inherits.
+    reload_timeout_ms: ?u32 = null,
 
     pub fn deinit(self: *WebSocketProxy, allocator: std.mem.Allocator) void {
         for (self.origins) |origin| allocator.free(origin);
@@ -224,6 +249,13 @@ pub fn isValidWebSocketOrigin(origin: []const u8) bool {
         if (!ok) return false;
     }
     return true;
+}
+
+test "WebSocketReloadPolicy parses preserve and drain only (#812)" {
+    try std.testing.expectEqual(WebSocketReloadPolicy.preserve, WebSocketReloadPolicy.parse("preserve").?);
+    try std.testing.expectEqual(WebSocketReloadPolicy.drain, WebSocketReloadPolicy.parse(" DRAIN ").?);
+    try std.testing.expect(WebSocketReloadPolicy.parse("close") == null);
+    try std.testing.expect(WebSocketReloadPolicy.parse("") == null);
 }
 
 test "isValidWebSocketOrigin accepts serialized origins only" {

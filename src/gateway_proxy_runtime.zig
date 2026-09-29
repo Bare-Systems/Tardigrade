@@ -1132,11 +1132,21 @@ pub fn handleLocationWebSocketProxyPass(
             state.metricsRecord(101);
             ctx.setUpstreamResult(resolved.upstream_host, 101, 0);
             state.logger.debug(correlation_id, "websocket tunnel opened: {s} -> {s}", .{ request.uri.path, upstream_url.value });
+            // Reload behavior is fixed here, at admission, from this request's
+            // own configuration: a later reload can end the tunnel (drain) but
+            // never change which policy or timeout applies to it.
+            const reload_policy = websocket.reload orelse cfg.proxy_websocket_reload;
+            const reload_timeout_ms = websocket.reload_timeout_ms orelse cfg.proxy_websocket_reload_timeout_ms;
+            const reload_drain: ?http.tunnel.ReloadDrain = switch (reload_policy) {
+                .preserve => null,
+                .drain => if (ctx.config_superseded_at) |stamp| .{ .superseded_at_ms = stamp, .timeout_ms = reload_timeout_ms } else null,
+            };
             const stats = upgraded.relay(downstreamTunnelEndpoint(downstream_conn), downstream_initial, .{
                 .idle_timeout_ms = websocket.idle_timeout_ms,
                 .max_lifetime_ms = websocket.max_lifetime_ms,
                 .drain_timeout_ms = cfg.shutdown_drain_timeout_ms,
                 .shutdown_requested = http.shutdown.isShutdownRequested,
+                .reload_drain = reload_drain,
             });
             state.metricsRecordWebSocketTunnelClosed(stats);
             ctx.tunnel = stats;

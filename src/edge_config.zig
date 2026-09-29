@@ -499,6 +499,13 @@ pub const EdgeConfig = struct {
     /// Maximum concurrent WebSocket tunnels (#812). Zero derives the cap from
     /// the worker count. Set via TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS.
     proxy_websocket_max_tunnels: u32 = 0,
+    /// What a hot reload does to WebSocket tunnels whose location sets no
+    /// `proxy_websocket_reload` of its own (#812). Read from the configuration
+    /// a tunnel was admitted under. Set via TARDIGRADE_PROXY_WEBSOCKET_RELOAD.
+    proxy_websocket_reload: http.location_router.WebSocketReloadPolicy = .preserve,
+    /// Drain window for `drain` tunnels, likewise overridable per location.
+    /// Set via TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS.
+    proxy_websocket_reload_timeout_ms: u32 = http.location_router.WebSocketProxy.DEFAULT_RELOAD_TIMEOUT_MS,
     /// Idle keep-alive timeout for client connections (ms, 0 = disabled).
     keep_alive_timeout_ms: u32,
     /// Overall request deadline from first byte received to response fully written (ms, 0 = disabled).
@@ -1370,6 +1377,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const max_in_flight_requests = parseIntEnv(u32, allocator, "TARDIGRADE_MAX_IN_FLIGHT_REQUESTS", 0);
     const proxy_websocket_max_tunnels = parseIntEnv(u32, allocator, "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", 0);
+    const proxy_websocket_reload_str = envOrDefault(allocator, "TARDIGRADE_PROXY_WEBSOCKET_RELOAD", "preserve") catch unreachable;
+    defer allocator.free(proxy_websocket_reload_str);
+    const proxy_websocket_reload = http.location_router.WebSocketReloadPolicy.parse(proxy_websocket_reload_str) orelse {
+        logConfigDiagnostic("config validation failed: proxy_websocket_reload must be one of preserve, drain", .{});
+        return error.InvalidConfigValue;
+    };
+    const proxy_websocket_reload_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS", http.location_router.WebSocketProxy.DEFAULT_RELOAD_TIMEOUT_MS);
 
     const keep_alive_timeout_str = envOrDefault(allocator, "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", "5000") catch unreachable;
     defer allocator.free(keep_alive_timeout_str);
@@ -1793,6 +1807,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .max_active_connections = max_active_connections,
         .max_in_flight_requests = max_in_flight_requests,
         .proxy_websocket_max_tunnels = proxy_websocket_max_tunnels,
+        .proxy_websocket_reload = proxy_websocket_reload,
+        .proxy_websocket_reload_timeout_ms = proxy_websocket_reload_timeout_ms,
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
         .request_total_timeout_ms = request_total_timeout_ms,
         .tls_handshake_timeout_ms = tls_handshake_timeout_ms,
@@ -2693,6 +2709,12 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
                 websocket_options_seen = true;
             } else if (std.mem.startsWith(u8, option, "websocket_max_lifetime_ms:")) {
                 websocket.max_lifetime_ms = std.fmt.parseInt(u32, option["websocket_max_lifetime_ms:".len..], 10) catch return error.InvalidLocationBlockFormat;
+                websocket_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "websocket_reload:")) {
+                websocket.reload = http.location_router.WebSocketReloadPolicy.parse(option["websocket_reload:".len..]) orelse return error.InvalidLocationBlockFormat;
+                websocket_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "websocket_reload_timeout_ms:")) {
+                websocket.reload_timeout_ms = std.fmt.parseInt(u32, option["websocket_reload_timeout_ms:".len..], 10) catch return error.InvalidLocationBlockFormat;
                 websocket_options_seen = true;
             } else if (std.mem.startsWith(u8, option, "websocket_origins:")) {
                 websocket_origins = option["websocket_origins:".len..];
@@ -4347,6 +4369,7 @@ test "parse location blocks read proxy_websocket options (#812)" {
         allocator,
         "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_idle_timeout_ms:1500" ++
             "|websocket_max_lifetime_ms:60000|websocket_origins:https://app.example.test,http://127.0.0.1:8080" ++
+            "|websocket_reload:drain|websocket_reload_timeout_ms:2500" ++
             ";prefix|/api/|proxy_pass|http://127.0.0.1:9000",
     );
     defer {
@@ -4358,6 +4381,8 @@ test "parse location blocks read proxy_websocket options (#812)" {
     try std.testing.expectEqual(@as(u32, 60000), ws.max_lifetime_ms);
     try std.testing.expectEqual(@as(usize, 2), ws.origins.len);
     try std.testing.expectEqualStrings("http://127.0.0.1:8080", ws.origins[1]);
+    try std.testing.expectEqual(http.location_router.WebSocketReloadPolicy.drain, ws.reload.?);
+    try std.testing.expectEqual(@as(u32, 2500), ws.reload_timeout_ms.?);
     try std.testing.expect(blocks[1].websocket == null);
 }
 
@@ -4370,6 +4395,8 @@ test "parse location blocks reject unsafe proxy_websocket configuration (#812)" 
         "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_idle_timeout_ms:0",
         "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_origins:app.example.test",
         "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_origins:",
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_reload:sometimes",
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket_reload:drain",
     };
     for (cases) |raw| {
         try std.testing.expectError(error.InvalidLocationBlockFormat, parseLocationBlocks(std.testing.allocator, raw));

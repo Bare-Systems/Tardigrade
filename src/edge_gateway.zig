@@ -1287,10 +1287,13 @@ fn serveOneRequest(
     served: *u32,
     enable_proxy_protocol: bool,
 ) ServeOutcome {
+    // The lease is held for the whole request, including any WebSocket
+    // tunnel it becomes, so the generation (and its supersession stamp) stays
+    // alive for as long as anything admitted under it runs.
     var live_cfg_lease = ctx.acquireConfig();
     defer live_cfg_lease.release();
     const live_cfg = live_cfg_lease.cfg;
-    return serveOneRequestWithConfig(ctx, conn, session, live_cfg, connection_ip, served, enable_proxy_protocol);
+    return serveOneRequestWithConfig(ctx, conn, session, live_cfg, &live_cfg_lease.version.superseded_at_ms, connection_ip, served, enable_proxy_protocol);
 }
 
 fn serveOneRequestWithConfig(
@@ -1298,6 +1301,8 @@ fn serveOneRequestWithConfig(
     conn: anytype,
     session: *ConnectionSession,
     cfg: *const edge_config.EdgeConfig,
+    /// `cfg`'s generation supersession stamp (see `ManagedConfigVersion`).
+    config_superseded_at: *const std.atomic.Value(u64),
     connection_ip: []const u8,
     served: *u32,
     enable_proxy_protocol: bool,
@@ -1317,7 +1322,7 @@ fn serveOneRequestWithConfig(
     const is_last_allowed_request = max_requests_per_connection > 0 and served.* + 1 >= max_requests_per_connection;
 
     var keep_alive = false;
-    handleConnection(conn, session, cfg, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol, is_last_allowed_request) catch |err| {
+    handleConnection(conn, session, cfg, config_superseded_at, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol, is_last_allowed_request) catch |err| {
         if (isBenignDisconnect(err)) {
             ctx.state.logger.debug(null, "keepalive connection closed by peer: {}", .{err});
         } else {
@@ -4647,7 +4652,7 @@ fn setConnTimeouts(conn: anytype, read_timeout_ms: u32, write_timeout_ms: u32) v
     }
 }
 
-fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool, is_last_allowed_request: bool) !void {
+fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, config_superseded_at: ?*const std.atomic.Value(u64), state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool, is_last_allowed_request: bool) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
     defer keep_alive_out.* = keep_alive;
@@ -5057,6 +5062,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // Client bytes that arrived behind this head. Only a WebSocket upgrade
     // consumes them, as the first tunnel bytes (#812).
     ctx.downstream_buffered_input = pending_buf[pending_start..][0..session.pending_len];
+    ctx.config_superseded_at = config_superseded_at;
     defer if (ctx.tunnel != null) {
         session.pending_len = 0;
         session.pending_early_prefix_len = 0;

@@ -129,6 +129,10 @@ pub const RequestContext = struct {
     downstream_buffered_input: []const u8 = &.{},
     /// Set when the request became a WebSocket tunnel and it has closed (#812).
     tunnel: ?tunnel.Stats = null,
+    /// Supersession stamp of the configuration generation this request is
+    /// leased on (0 while current). A `drain`-mode WebSocket tunnel times its
+    /// reload drain from it (#812).
+    config_superseded_at: ?*const std.atomic.Value(u64) = null,
 
     pub fn init(allocator: Allocator, request_id: []const u8, client_ip: []const u8) RequestContext {
         return .{

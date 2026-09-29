@@ -23873,3 +23873,435 @@ test "server-sent events stream through proxy_streaming response without bufferi
     // The upstream's clean end of stream ends the client's response cleanly.
     try std.testing.expect(std.mem.endsWith(u8, seen.items, "0\r\n\r\n"));
 }
+
+// ---- WebSocket tunnels across hot reload (#812) ----------------------------
+
+fn wsLogCount(allocator: std.mem.Allocator, path: []const u8, needle: []const u8) !usize {
+    const contents = try compat.cwd().readFileAlloc(allocator, path, 4 * 1024 * 1024);
+    defer allocator.free(contents);
+    return std.mem.count(u8, contents, needle);
+}
+
+fn wsWaitLogCount(allocator: std.mem.Allocator, path: []const u8, needle: []const u8, at_least: usize, timeout_ms: u64) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        if (try wsLogCount(allocator, path, needle) >= at_least) return;
+        compat.sleepNs(10 * std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+/// Publish `text` with SIGHUP and wait until the process reports that this
+/// reload was applied. Returns the time the signal was sent.
+fn wsReload(allocator: std.mem.Allocator, tardigrade: *TardigradeProcess, text: []const u8) !i64 {
+    const applied = try wsLogCount(allocator, tardigrade.log_path, "configuration hot-reload applied");
+    try tardigrade.rewriteConfig(text);
+    const sent = compat.milliTimestamp();
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    try wsWaitLogCount(allocator, tardigrade.log_path, "configuration hot-reload applied", applied + 1, 5_000);
+    return sent;
+}
+
+/// Wait until the peer closes; returns when that was observed.
+fn wsClosedAt(peer: *WsPeer, timeout_ms: i32) !i64 {
+    try peer.expectClosed(timeout_ms);
+    return compat.milliTimestamp();
+}
+
+fn wsGlobalBufferedBytes(allocator: std.mem.Allocator, port: u16) !u64 {
+    var metrics = try wsMetrics(allocator, port);
+    defer metrics.deinit();
+    return wsMetricValue(metrics.body, "tardigrade_buffered_bytes_current", "direction=\"upstream_to_downstream\",scope=\"global\"") +
+        wsMetricValue(metrics.body, "tardigrade_buffered_bytes_current", "direction=\"downstream_to_upstream\",scope=\"global\"");
+}
+
+test "hot reload preserves open WebSocket tunnels by default, even for removed locations (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    // A reload timeout is set, but the default policy (preserve) ignores it.
+    const initial = try std.fmt.allocPrint(allocator,
+        \\proxy_websocket_reload_timeout_ms 200;
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /ws/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+        \\location /changed/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port(), test_host, origin.port() });
+    defer allocator.free(initial);
+    // /ws/ is gone and /changed/ no longer relays upgrades.
+    const reloaded = try std.fmt.allocPrint(allocator,
+        \\proxy_websocket_reload_timeout_ms 200;
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /changed/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(reloaded);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = initial, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var removed = try wsHandshake(allocator, tardigrade.port, "/ws/kept", &.{}, "");
+    defer removed.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), removed.status);
+    var changed = try wsHandshake(allocator, tardigrade.port, "/changed/kept", &.{}, "");
+    defer changed.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), changed.status);
+
+    _ = try wsReload(allocator, &tardigrade, reloaded);
+    compat.sleepNs(800 * std.time.ns_per_ms);
+
+    // Both established tunnels keep relaying under their admission config.
+    try wsExpectEcho(allocator, removed.peer, .text, "location removed, tunnel kept");
+    try wsExpectEcho(allocator, changed.peer, .text, "location changed, tunnel kept");
+
+    // New handshakes get the new configuration immediately.
+    var gone = try wsHandshake(allocator, tardigrade.port, "/ws/new", &.{}, "");
+    defer gone.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 404), gone.status);
+    var not_relayed = try wsHandshake(allocator, tardigrade.port, "/changed/new", &.{}, "");
+    defer not_relayed.deinit(allocator);
+    try std.testing.expect(not_relayed.status != 101);
+    try std.testing.expect(not_relayed.header("Upgrade") == null);
+
+    var metrics = try wsMetrics(allocator, tardigrade.port);
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u64, 2), prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active").?);
+    try std.testing.expectEqual(@as(u64, 0), wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"reload\""));
+}
+
+test "proxy_websocket_reload drain closes superseded tunnels after the timeout; failed reloads do nothing (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\proxy_websocket_reload drain;
+        \\proxy_websocket_reload_timeout_ms 600;
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /ws/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_a);
+    // Same routes, one extra location: an ordinary, successful reload.
+    const config_b = try std.fmt.allocPrint(allocator, "{s}\nlocation = /new {{\n    return 200 new;\n}}\n", .{config_a});
+    defer allocator.free(config_b);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_a, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+    const baseline_connections = blk: {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        break :blk prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0;
+    };
+    try std.testing.expectEqual(@as(u64, 0), try wsGlobalBufferedBytes(allocator, tardigrade.port));
+
+    var hs = try wsHandshake(allocator, tardigrade.port, "/ws/drain", &.{}, "");
+    defer hs.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), hs.status);
+    try std.testing.expect(try wsGlobalBufferedBytes(allocator, tardigrade.port) > 0);
+
+    // A rejected reload publishes nothing: the tunnel outlives the timeout.
+    const failures = try wsLogCount(allocator, tardigrade.log_path, "config reload failed");
+    try tardigrade.rewriteConfig("location /ws/ {\n    proxy_websocket_reload sometimes;\n");
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    try wsWaitLogCount(allocator, tardigrade.log_path, "config reload failed", failures + 1, 5_000);
+    compat.sleepNs(1_200 * std.time.ns_per_ms);
+    try wsExpectEcho(allocator, hs.peer, .text, "still here after a failed reload");
+
+    // A successful reload starts the drain; traffic flows inside the window.
+    const reloaded_at = try wsReload(allocator, &tardigrade, config_b);
+    try wsExpectEcho(allocator, hs.peer, .text, "draining");
+    const closed_at = try wsClosedAt(hs.peer, 5_000);
+    const elapsed = closed_at - reloaded_at;
+    try std.testing.expect(elapsed >= 500);
+    try std.testing.expect(elapsed < 2_600);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "\"tunnel_close_reason\":\"reload\"", 2_000);
+
+    // New handshakes under the current generation are admitted normally.
+    var fresh = try wsHandshake(allocator, tardigrade.port, "/ws/fresh", &.{}, "");
+    try std.testing.expectEqual(@as(u16, 101), fresh.status);
+    try wsExpectEcho(allocator, fresh.peer, .text, "admitted after reload");
+    fresh.deinit(allocator);
+
+    // Every resource returns to its baseline once the tunnels are gone.
+    const deadline = compat.milliTimestamp() + 5_000;
+    while (true) {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        const active = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 0;
+        const connections = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0;
+        const buffered = try wsGlobalBufferedBytes(allocator, tardigrade.port);
+        if (active == 0 and connections <= baseline_connections and buffered == 0) {
+            try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"reload\""));
+            break;
+        }
+        if (compat.milliTimestamp() > deadline) {
+            std.debug.print("unsettled after reload drain: active={d} connections={d} baseline={d} buffered={d}\n", .{ active, connections, baseline_connections, buffered });
+            return error.TunnelsDidNotSettle;
+        }
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+}
+
+test "repeated reloads never extend a WebSocket reload drain deadline (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\proxy_websocket_reload drain;
+        \\proxy_websocket_reload_timeout_ms 2000;
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /ws/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_a);
+    const config_b = try std.fmt.allocPrint(allocator, "{s}\nlocation = /b {{\n    return 200 b;\n}}\n", .{config_a});
+    defer allocator.free(config_b);
+    // The second reload also raises the timeout: the tunnel keeps the one it
+    // was admitted with.
+    const config_c = try std.mem.replaceOwned(u8, allocator, config_b, "proxy_websocket_reload_timeout_ms 2000;", "proxy_websocket_reload_timeout_ms 60000;");
+    defer allocator.free(config_c);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_a, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var hs = try wsHandshake(allocator, tardigrade.port, "/ws/once", &.{}, "");
+    defer hs.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), hs.status);
+
+    const first_reload = try wsReload(allocator, &tardigrade, config_b);
+    compat.sleepNs(1_400 * std.time.ns_per_ms);
+    _ = try wsReload(allocator, &tardigrade, config_c);
+    try wsExpectEcho(allocator, hs.peer, .text, "between reloads");
+    const closed_at = try wsClosedAt(hs.peer, 6_000);
+    const elapsed = closed_at - first_reload;
+    // Measured from the first reload: an extended deadline would land near
+    // 3400 ms (second reload + 2000) or 61 s (new timeout).
+    try std.testing.expect(elapsed >= 1_800);
+    try std.testing.expect(elapsed < 3_000);
+}
+
+test "per-location proxy_websocket_reload settings override the top-level default (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\proxy_websocket_reload drain;
+        \\proxy_websocket_reload_timeout_ms 60000;
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /keep/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\    proxy_websocket_reload preserve;
+        \\}}
+        \\location /fast/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\    proxy_websocket_reload_timeout_ms 300;
+        \\}}
+        \\location /slow/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port(), test_host, origin.port(), test_host, origin.port() });
+    defer allocator.free(config_a);
+    const config_b = try std.fmt.allocPrint(allocator, "{s}\nlocation = /b {{\n    return 200 b;\n}}\n", .{config_a});
+    defer allocator.free(config_b);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_a, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var keep = try wsHandshake(allocator, tardigrade.port, "/keep/x", &.{}, "");
+    defer keep.deinit(allocator);
+    var fast = try wsHandshake(allocator, tardigrade.port, "/fast/x", &.{}, "");
+    defer fast.deinit(allocator);
+    var slow = try wsHandshake(allocator, tardigrade.port, "/slow/x", &.{}, "");
+    defer slow.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), keep.status);
+    try std.testing.expectEqual(@as(u16, 101), fast.status);
+    try std.testing.expectEqual(@as(u16, 101), slow.status);
+
+    const reloaded_at = try wsReload(allocator, &tardigrade, config_b);
+    // Location timeout override: drains after ~300 ms.
+    const fast_closed = try wsClosedAt(fast.peer, 5_000);
+    try std.testing.expect(fast_closed - reloaded_at < 2_000);
+    compat.sleepNs(500 * std.time.ns_per_ms);
+    // Location policy override (preserve), and the inherited 60 s drain.
+    try wsExpectEcho(allocator, keep.peer, .text, "preserved by location");
+    try wsExpectEcho(allocator, slow.peer, .text, "inside the inherited drain window");
+}
+
+test "shutdown overrides preserve and honors the earlier of the reload and shutdown deadlines (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /early-reload/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\    proxy_websocket_reload drain;
+        \\    proxy_websocket_reload_timeout_ms 400;
+        \\}}
+        \\location /late-reload/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\    proxy_websocket_reload drain;
+        \\    proxy_websocket_reload_timeout_ms 60000;
+        \\}}
+        \\location /preserved/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port(), test_host, origin.port(), test_host, origin.port() });
+    defer allocator.free(config_a);
+    const config_b = try std.fmt.allocPrint(allocator, "{s}\nlocation = /b {{\n    return 200 b;\n}}\n", .{config_a});
+    defer allocator.free(config_b);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_a,
+        .ready_path = "/healthz",
+        .extra_env = &.{ ws_worker_env, .{ .name = "TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS", .value = "2500" } },
+    });
+    defer tardigrade.stop();
+
+    var early = try wsHandshake(allocator, tardigrade.port, "/early-reload/x", &.{}, "");
+    defer early.deinit(allocator);
+    var late = try wsHandshake(allocator, tardigrade.port, "/late-reload/x", &.{}, "");
+    defer late.deinit(allocator);
+    var preserved = try wsHandshake(allocator, tardigrade.port, "/preserved/x", &.{}, "");
+    defer preserved.deinit(allocator);
+
+    const reloaded_at = try wsReload(allocator, &tardigrade, config_b);
+    tardigrade.sendSignal(std.posix.SIG.TERM);
+    const shutdown_at = compat.milliTimestamp();
+
+    // The reload deadline (400 ms) is earlier than the shutdown one (2500 ms).
+    const early_closed = try wsClosedAt(early.peer, 5_000);
+    try std.testing.expect(early_closed - reloaded_at < 1_800);
+    // The 60 s reload drain and the preserved tunnel both end at shutdown.
+    const late_closed = try wsClosedAt(late.peer, 8_000);
+    const preserved_closed = try wsClosedAt(preserved.peer, 8_000);
+    try std.testing.expect(late_closed - shutdown_at >= 2_000);
+    try std.testing.expect(late_closed - shutdown_at < 5_000);
+    try std.testing.expect(preserved_closed - shutdown_at >= 2_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "\"tunnel_close_reason\":\"reload\"", 2_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "\"tunnel_close_reason\":\"shutdown\"", 2_000);
+    try waitForPortClosed(tardigrade.port, 5_000);
+}
+
+test "proxy_websocket_reload drain closes a native TLS (wss://) tunnel after reload (#812)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /ws/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\    proxy_websocket_reload drain;
+        \\    proxy_websocket_reload_timeout_ms 500;
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_a);
+    const config_b = try std.fmt.allocPrint(allocator, "{s}\nlocation = /b {{\n    return 200 b;\n}}\n", .{config_a});
+    defer allocator.free(config_b);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_a,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", "tardigrade.test");
+    defer client.destroy();
+    try client.writeAllPlain("GET /ws/tls HTTP/1.1\r\nHost: tardigrade.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " ++ ws_test_key ++ "\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    const head = try wssReadHead(client, allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 101), try parseStatusCode(head));
+    try wssExpectEcho(client, allocator, "before reload");
+
+    const reloaded_at = try wsReload(allocator, &tardigrade, config_b);
+    try wssExpectEcho(client, allocator, "inside the drain window");
+    // After the window the server closes the TLS connection.
+    var byte: [1]u8 = undefined;
+    const closed = if (client.readExactPlain(&byte, 5_000)) |_| false else |err| switch (err) {
+        error.ReadTimeout => false,
+        else => true,
+    };
+    try std.testing.expect(closed);
+    try std.testing.expect(compat.milliTimestamp() - reloaded_at < 4_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "\"tunnel_close_reason\":\"reload\"", 2_000);
+}
+
+test "tardi check rejects an invalid proxy_websocket_reload (#812)" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "proxy_websocket_reload sometimes;\nlocation / {\n    return 200 ok;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9;\n    proxy_websocket on;\n    proxy_websocket_reload sometimes;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9;\n    proxy_websocket_reload drain;\n}\n",
+    };
+    for (cases, 0..) |data, i| {
+        const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-ws-reload-{d}-{d}.conf", .{ compat.nanoTimestamp(), i });
+        defer {
+            compat.cwd().deleteFile(config_rel) catch {};
+            allocator.free(config_rel);
+        }
+        try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = data });
+        var env_map = try inheritedEnvMap(allocator);
+        defer env_map.deinit();
+        const result = try std.process.run(allocator, compat.io(), .{
+            .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+            .environ_map = &env_map,
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expect(result.term != .exited or result.term.exited != 0);
+    }
+}

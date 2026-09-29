@@ -13,6 +13,8 @@ Maturity: `experimental` (see [SUPPORT_MATRIX.md](../../docs/SUPPORT_MATRIX.md))
 - The idle timeout, a maximum tunnel lifetime and the per-process tunnel cap.
 - An `Origin` allowlist that stops cross-site WebSocket hijacking.
 - `proxy_set_header` applied to the upstream handshake.
+- Hot-reload behavior: tunnels are preserved by default, while the
+  browser-facing location drains its tunnels 10 s after a reload.
 
 ## Quick start
 
@@ -62,8 +64,15 @@ upstream TLS verification rules.
   upgrades with 503; raise both together for many long-lived sockets.
 - Quiet connections are closed after `proxy_websocket_idle_timeout_ms`
   (default 60 s). Send pings more often than that.
+- On `tardi reload`, `proxy_websocket_reload preserve` keeps open tunnels
+  under the configuration they were opened with, even if you removed or
+  locked down their location, while `drain` closes them
+  `proxy_websocket_reload_timeout_ms` after the reload. Try it: open a
+  socket on `/app-socket/`, run `tardi reload`, and the client is
+  disconnected about 10 s later, while `/ws/echo` stays open.
 - On `tardi stop`, open tunnels keep working for the drain window
-  (`TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS`) and are then closed.
+  (`TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS`) and are then closed, whatever
+  their reload setting.
 - HTTP/2 and HTTP/3 extended CONNECT are not supported; browsers open
   WebSockets over HTTP/1.1.
 

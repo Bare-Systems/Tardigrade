@@ -79,7 +79,7 @@ pub const WebSocketUpgradeOutcome = enum {
     capacity,
 };
 /// #812: why a WebSocket tunnel closed; mirrors `tunnel.CloseReason.label`.
-pub const WebSocketCloseReason = enum { client, upstream, idle, lifetime, shutdown, @"error" };
+pub const WebSocketCloseReason = enum { client, upstream, idle, lifetime, shutdown, reload, @"error" };
 pub const EarlyDataSource = enum { transport, header, both };
 pub const EarlyDataDecision = enum { accepted, too_early, deferred, forwarded };
 pub const EarlyDataUpstream425Action = enum { forwarded, retried };

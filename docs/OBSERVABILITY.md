@@ -16,7 +16,7 @@ Runtime logs and access logs are JSON by default.
   `early_data_replay_exposed`. A WebSocket handshake that became a tunnel
   (#812) is logged once, when the tunnel closes, with status 101 plus
   `tunnel_close_reason` (`client`, `upstream`, `idle`, `lifetime`,
-  `shutdown`, `error`), `tunnel_duration_ms`,
+  `shutdown`, `reload`, `error`), `tunnel_duration_ms`,
   `tunnel_client_to_upstream_bytes` and `tunnel_upstream_to_client_bytes`
   (plain format: `tunnel_close=`, `tunnel_ms=`, `tunnel_in=`, `tunnel_out=`).
 
@@ -180,7 +180,8 @@ logs are written through `src/http/logger.zig`.
   `client_to_upstream`/`upstream_to_client`; the
   `tardigrade_websocket_tunnel_duration_seconds` summary (`_sum`, `_count`);
   and `tardigrade_websocket_tunnel_closes_total{reason}` with `client`,
-  `upstream`, `idle`, `lifetime`, `shutdown` and `error`. A relayed handshake
+  `upstream`, `idle`, `lifetime`, `shutdown`, `reload` (a
+  `proxy_websocket_reload drain` window elapsed) and `error`. A relayed handshake
   counts once in `tardigrade_requests_total` and in no status-class total.
 - native TLS/QUIC 0-RTT anti-replay store outcomes (#368):
   `tardigrade_tls_early_data_replay_total{outcome}` with fixed outcomes

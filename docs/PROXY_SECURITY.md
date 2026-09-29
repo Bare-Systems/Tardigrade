@@ -51,7 +51,12 @@ carry the `Sec-WebSocket-Accept` computed from the client's key, so an origin
 (or an attacker in front of one) cannot switch a connection the client did
 not ask to switch. Handshakes carrying a body or body framing are rejected,
 and `proxy_websocket_origins` blocks cross-site WebSocket hijacking from
-browsers.
+browsers. Authorization happens once, at the handshake: with the default
+`proxy_websocket_reload preserve`, a hot reload that tightens a location's
+auth, ACL or Origin rules (or removes it) does not revoke tunnels that are
+already open. Use `proxy_websocket_reload drain` with a short
+`proxy_websocket_reload_timeout_ms` where a configuration change must also
+end existing sessions, or restart the process.
 
 Additionally, any header named by the inbound `Connection` header value is
 treated as hop-by-hop and removed. Example: if the client sends

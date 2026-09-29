@@ -20,6 +20,7 @@
 //!   readable (already-decrypted plaintext, or a received TLS close).
 
 const std = @import("std");
+const compat = @import("zig_compat");
 const builtin = @import("builtin");
 const encrypted_stream_connection = @import("encrypted_stream_connection.zig");
 const upstream_tls = @import("upstream_tls.zig");
@@ -39,6 +40,9 @@ pub const CloseReason = enum {
     lifetime,
     /// Graceful shutdown's drain window elapsed.
     shutdown,
+    /// A hot reload superseded the tunnel's configuration and its
+    /// `proxy_websocket_reload drain` window elapsed.
+    reload,
     /// A read or write on the client failed.
     client_error,
     /// A read or write on the origin failed.
@@ -61,10 +65,25 @@ pub const Options = struct {
     drain_timeout_ms: u64 = 0,
     /// Checked at least every `poll_interval_ms`.
     shutdown_requested: *const fn () bool,
+    /// Set for tunnels admitted with `proxy_websocket_reload drain`.
+    reload_drain: ?ReloadDrain = null,
     poll_interval_ms: u32 = 250,
     /// After one side closes, how long bytes already read from it may take to
     /// reach the other side before the tunnel is torn down anyway.
     close_flush_timeout_ms: u32 = 1_000,
+};
+
+/// How a `drain`-mode tunnel learns that a hot reload superseded the
+/// configuration it was admitted under (#812).
+pub const ReloadDrain = struct {
+    /// The admission configuration generation's supersession time
+    /// (`event_loop.monotonicMs`), 0 while it is current. Published once by
+    /// the reload that replaces it and never changed afterwards, so the
+    /// deadline derived from it cannot be extended by later reloads.
+    superseded_at_ms: *const std.atomic.Value(u64),
+    /// How long the tunnel keeps relaying after that, from the admission
+    /// configuration.
+    timeout_ms: u32,
 };
 
 pub const Stats = struct {
@@ -305,6 +324,7 @@ pub fn relay(
     var last_activity = started;
     const lifetime_deadline: ?u64 = if (opts.max_lifetime_ms > 0) started + opts.max_lifetime_ms else null;
     var shutdown_deadline: ?u64 = null;
+    var reload_deadline: ?u64 = null;
     // Set once a side has closed: the other direction's already-read bytes
     // get a bounded flush, and nothing more is read from either side.
     var closing: ?CloseReason = null;
@@ -350,7 +370,13 @@ pub fn relay(
         if (opts.idle_timeout_ms > 0 and now -| last_activity >= opts.idle_timeout_ms) break :loop .idle;
         if (lifetime_deadline) |at| if (now >= at) break :loop .lifetime;
         if (shutdown_deadline == null and opts.shutdown_requested()) shutdown_deadline = now + opts.drain_timeout_ms;
-        if (shutdown_deadline) |at| if (now >= at) break :loop .shutdown;
+        if (reload_deadline == null) if (opts.reload_drain) |drain| {
+            const superseded_at = drain.superseded_at_ms.load(.acquire);
+            if (superseded_at != 0) reload_deadline = superseded_at + drain.timeout_ms;
+        };
+        // Shutdown and reload drains are independent; whichever deadline is
+        // earlier ends the tunnel.
+        if (earliestDue(now, shutdown_deadline, reload_deadline)) |why| break :loop why;
         if (progressed) continue;
 
         // Nothing moved: sleep until a socket can make progress or a timer
@@ -367,7 +393,7 @@ pub fn relay(
         };
         var wait_deadline = now + opts.poll_interval_ms;
         if (opts.idle_timeout_ms > 0) wait_deadline = @min(wait_deadline, last_activity + opts.idle_timeout_ms);
-        wait_deadline = minDeadline(wait_deadline, minDeadline(lifetime_deadline, minDeadline(shutdown_deadline, closing_deadline))).?;
+        wait_deadline = minDeadline(wait_deadline, minDeadline(lifetime_deadline, minDeadline(shutdown_deadline, minDeadline(reload_deadline, closing_deadline)))).?;
         const timeout: i32 = @intCast(@min(remainingMs(now, wait_deadline).?, @as(u64, std.math.maxInt(i32))));
         _ = std.posix.poll(&fds, timeout) catch {};
         if (hungUp(fds[0])) client_hup = true;
@@ -380,6 +406,17 @@ pub fn relay(
         .duration_ms = event_loop.monotonicMs() -| started,
         .close_reason = reason,
     };
+}
+
+/// The drain whose deadline has passed, preferring the earlier deadline when
+/// both have.
+fn earliestDue(now: u64, shutdown_deadline: ?u64, reload_deadline: ?u64) ?CloseReason {
+    const shutdown_due = if (shutdown_deadline) |at| now >= at else false;
+    const reload_due = if (reload_deadline) |at| now >= at else false;
+    if (shutdown_due and reload_due) return if (reload_deadline.? < shutdown_deadline.?) .reload else .shutdown;
+    if (shutdown_due) return .shutdown;
+    if (reload_due) return .reload;
+    return null;
 }
 
 fn pollEntry(fd: std.posix.fd_t, want_in: bool, want_out: bool) std.posix.pollfd {
@@ -618,9 +655,75 @@ test "relay never buffers more than one direction buffer for a stalled reader" {
     try std.testing.expect(tunnel.stats.upstream_to_client_bytes <= accepted);
 }
 
+test "relay keeps a drain-mode tunnel open until its configuration is superseded, then for the reload timeout (#812)" {
+    var superseded = std.atomic.Value(u64).init(0);
+    var tunnel = try TestTunnel.init(.{
+        .idle_timeout_ms = 5_000,
+        .shutdown_requested = neverShutdown,
+        .reload_drain = .{ .superseded_at_ms = &superseded, .timeout_ms = 120 },
+        .poll_interval_ms = 10,
+    });
+    defer tunnel.deinit();
+    try tunnel.start();
+
+    // Still current: traffic flows and nothing closes.
+    compat.sleepNs(150 * std.time.ns_per_ms);
+    try testWriteAll(tunnel.clientPeer(), "before");
+    var got: [6]u8 = undefined;
+    try testReadExact(tunnel.upstreamPeer(), &got);
+
+    const reloaded_at = event_loop.monotonicMs();
+    superseded.store(reloaded_at, .release);
+    // Inside the window the tunnel still carries traffic.
+    try testWriteAll(tunnel.clientPeer(), "during");
+    try testReadExact(tunnel.upstreamPeer(), &got);
+    try std.testing.expectEqualStrings("during", &got);
+    tunnel.join();
+    const closed_after = event_loop.monotonicMs() - reloaded_at;
+    try std.testing.expectEqual(CloseReason.reload, tunnel.stats.close_reason);
+    try std.testing.expect(closed_after >= 120);
+    try std.testing.expect(closed_after < 1_000);
+}
+
+test "relay honors whichever of the reload and shutdown drains ends first (#812)" {
+    // An earlier reload deadline beats a later shutdown deadline.
+    test_shutdown_flag.store(false, .release);
+    defer test_shutdown_flag.store(false, .release);
+    var early_reload = std.atomic.Value(u64).init(event_loop.monotonicMs());
+    var reload_first = try TestTunnel.init(.{
+        .idle_timeout_ms = 5_000,
+        .drain_timeout_ms = 5_000,
+        .shutdown_requested = testShutdown,
+        .reload_drain = .{ .superseded_at_ms = &early_reload, .timeout_ms = 80 },
+        .poll_interval_ms = 10,
+    });
+    defer reload_first.deinit();
+    test_shutdown_flag.store(true, .release);
+    try reload_first.start();
+    reload_first.join();
+    try std.testing.expectEqual(CloseReason.reload, reload_first.stats.close_reason);
+    try std.testing.expect(reload_first.stats.duration_ms < 2_000);
+
+    // A shutdown whose window ends first beats a long reload drain.
+    var late_reload = std.atomic.Value(u64).init(event_loop.monotonicMs());
+    var shutdown_first = try TestTunnel.init(.{
+        .idle_timeout_ms = 5_000,
+        .drain_timeout_ms = 60,
+        .shutdown_requested = testShutdown,
+        .reload_drain = .{ .superseded_at_ms = &late_reload, .timeout_ms = 5_000 },
+        .poll_interval_ms = 10,
+    });
+    defer shutdown_first.deinit();
+    try shutdown_first.start();
+    shutdown_first.join();
+    try std.testing.expectEqual(CloseReason.shutdown, shutdown_first.stats.close_reason);
+    try std.testing.expect(shutdown_first.stats.duration_ms < 2_000);
+}
+
 test "CloseReason labels collapse I/O failures into one error label" {
     try std.testing.expectEqualStrings("client", CloseReason.client.label());
     try std.testing.expectEqualStrings("error", CloseReason.client_error.label());
     try std.testing.expectEqualStrings("error", CloseReason.upstream_error.label());
     try std.testing.expectEqualStrings("shutdown", CloseReason.shutdown.label());
+    try std.testing.expectEqualStrings("reload", CloseReason.reload.label());
 }

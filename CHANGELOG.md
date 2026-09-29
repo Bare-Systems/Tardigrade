@@ -28,7 +28,17 @@ All notable user-facing changes to Tardigrade are documented here.
   after `proxy_websocket_idle_timeout_ms` (default 60 s), after the optional
   `proxy_websocket_max_lifetime_ms`, or at the end of the shutdown drain
   window. `proxy_websocket_origins` adds an `Origin` allowlist against
-  cross-site WebSocket hijacking. Each tunnel holds a worker thread, so
+  cross-site WebSocket hijacking. Hot reload behavior is configurable with
+  `proxy_websocket_reload` (top-level default, per-location override):
+  `preserve` (the default) keeps open tunnels relaying under the
+  configuration they were admitted with, even if the reload changed or
+  removed their location, while `drain` closes them
+  `proxy_websocket_reload_timeout_ms` (default 30 s) after the first
+  successful reload that supersedes that configuration. The policy and
+  timeout are fixed when the tunnel opens, later reloads never extend a
+  drain deadline, failed reloads never affect open tunnels, and shutdown
+  still closes every tunnel at the earlier of its reload and shutdown
+  deadlines. Each tunnel holds a worker thread, so
   `proxy_websocket_max_tunnels` (`TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS`)
   caps them per process (default: half the worker threads, rounded down, so
   a single-worker process refuses upgrades instead of letting one tunnel
@@ -42,7 +52,8 @@ All notable user-facing changes to Tardigrade are documented here.
   `tardigrade_websocket_tunnels_active`,
   `tardigrade_websocket_tunnel_bytes_total{direction}`,
   `tardigrade_websocket_tunnel_duration_seconds` and
-  `tardigrade_websocket_tunnel_closes_total{reason}`; the handshake's access
+  `tardigrade_websocket_tunnel_closes_total{reason}` (including `reload`);
+  the handshake's access
   log line is written when the tunnel closes, with `tunnel_close_reason`,
   `tunnel_duration_ms` and byte counts. See
   [examples/websocket-proxy](examples/websocket-proxy/README.md).

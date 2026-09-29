@@ -43,10 +43,12 @@ kill %1; curl -i http://localhost:8080/admin/                          # → 503
    streamed, static or local, including after a rewrite or `try_files`
    fallback. If a rewrite leads to another protected location that denies the
    request, no earlier grant's headers are sent.
-4. **3xx / 4xx** denies it. The auth service's status, body, `Content-Type`,
-   `Location` (3xx), `WWW-Authenticate` (401) and any
-   `forward_auth_client_headers` are returned to the client.
-5. **Anything else** — connect failure, timeout, 1xx/5xx, malformed or
+4. **A redirect (301, 302, 303, 307, 308 with a `Location`) or any 4xx**
+   denies it. The auth service's status, body, `Content-Type`, `Location`,
+   `WWW-Authenticate` (401) and any `forward_auth_client_headers` are
+   returned to the client.
+5. **Anything else** — connect failure, timeout, 1xx/5xx, a `304` or other
+   non-redirect 3xx, a redirect without a `Location`, a malformed or
    oversized (>64 KiB) response — fails closed with
    `forward_auth_failure_status` (default 503) and a JSON error
    (`auth_unavailable` or `auth_timeout`).
@@ -81,7 +83,12 @@ is `Authorization` and `Cookie`: they are the client's credentials, so the
 auth service always receives them, even when `forward_auth_upstream_headers`
 names them. In that case only the upstream request gets the auth service's
 value, which enables token exchange (verify the client's bearer token, send
-the origin a different one).
+the origin a different one). Across a rewrite chain every verifier, including
+built-in `auth required`, judges the client's own credentials, never a token
+an earlier location's auth service minted for the origin, and never a client
+copy of a header an earlier location asserted. Conditional and range headers
+(`If-None-Match`, `If-Modified-Since`, `Range`, ...) are not forwarded, so the
+auth service is asked for a decision rather than a representation.
 
 ## Key directives
 
@@ -104,8 +111,10 @@ an access decision cacheable.
 
 - A `rewrite` that leads into a protected location is authorized against the
   rewritten target before anything is served, and asserted headers from an
-  earlier hop stay in place; a rewrite never reaches protected content
-  around `forward_auth`.
+  earlier hop stay in place for the origin; a rewrite never reaches
+  protected content around `forward_auth`. This includes a rewrite back into
+  the same protected location: its `forward_auth` is asked again about the
+  rewritten target before the static root answers.
 - Only the protected location strips client copies of
   `forward_auth_upstream_headers`. If other, unprotected locations reach the
   same upstream, make sure it does not trust those headers from them.

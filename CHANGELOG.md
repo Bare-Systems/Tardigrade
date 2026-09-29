@@ -14,8 +14,10 @@ All notable user-facing changes to Tardigrade are documented here.
   `X-Original-Method/-URI`, the request ID and a W3C `traceparent`. A 2xx
   allows the request, and `forward_auth_client_headers` (for example a
   refreshed `Set-Cookie`) are added to the response the client receives. A
-  3xx/4xx is relayed to the client with its body, `Location`,
-  `WWW-Authenticate` and the same allowlisted headers; every denial is
+  4xx, or a redirect with a `Location`, is relayed to the client with its
+  body, `Location`, `WWW-Authenticate` and the same allowlisted headers; a
+  304 or other non-redirect 3xx fails closed, and conditional/range headers
+  are never sent to the auth service. Every denial is
   `Cache-Control: no-store` (which the allowlists cannot name), and `HEAD`
   gets the head without a body.
   Timeouts, connect failures, 1xx/5xx and malformed responses fail closed with
@@ -48,9 +50,12 @@ All notable user-facing changes to Tardigrade are documented here.
   every location in a rewrite chain enforces its own `auth`, `forward_auth`
   and path policy against the rewritten target, and `forward_auth` sees the
   rewritten URI. HTTP/3 keeps auth-asserted request headers across a
-  rewrite instead of reverting to the client's. A rewrite back into the same
-  location is served from the server `root` as before; a chain longer than
-  4 locations fails with 508 instead of falling back to the static root. A
+  rewrite instead of reverting to the client's, while every verifier in the
+  chain (including built-in `auth required`) judges the client's original
+  credentials, never a token an earlier hop minted for the origin. A rewrite
+  back into the same location re-runs that location's gates against the
+  rewritten target before the server `root` answers; a chain longer than 4
+  locations fails with 508 instead of falling back to the static root. A
   `?query` in a location rewrite's replacement now replaces the request query
   on both protocols (HTTP/3 previously dropped it).
 

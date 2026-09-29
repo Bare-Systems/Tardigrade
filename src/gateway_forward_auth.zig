@@ -8,9 +8,10 @@
 //!   copies of those names are always removed first so they cannot be forged.
 //!   Headers named by `forward_auth_client_headers` (for example a refreshed
 //!   `Set-Cookie`) are added to the final response the client receives.
-//! - 3xx and 4xx deny it. The auth service's status, body, `Content-Type`,
-//!   `Location` (3xx), `WWW-Authenticate` (401) and any
-//!   `forward_auth_client_headers` are relayed to the client.
+//! - A redirect (301/302/303/307/308 with a `Location`) or a 4xx denies it.
+//!   The auth service's status, body, `Content-Type`, `Location`,
+//!   `WWW-Authenticate` (401) and any `forward_auth_client_headers` are
+//!   relayed to the client. Any other 3xx (notably 304) is not a decision.
 //! - Anything else (timeout, connect failure, 1xx/5xx, malformed or oversized
 //!   response) fails closed with the configured `forward_auth_failure_status`.
 //!
@@ -49,6 +50,10 @@ pub const Input = struct {
     /// The buffered request body, or null when it is not available (a
     /// streamed upload). Only consulted when `max_body_bytes > 0`.
     body: ?[]const u8,
+    /// Header names earlier locations in a rewrite chain asserted upstream.
+    /// `headers` must be the client's original headers, so client copies of
+    /// these names are forged and are withheld from this verifier too.
+    asserted_names: []const []const u8 = &.{},
 };
 
 pub const Header = http.security_headers.ScopedHeader;
@@ -184,7 +189,7 @@ pub fn authorize(
     // even for an empty body, so the auth service sees one route per policy.
     const forwards_body = fa.max_body_bytes > 0;
     var headers = std.array_list.Managed(std.http.Header).init(arena);
-    try appendAuthRequestHeaders(&headers, input, forwards_body, fa.upstream_headers);
+    try appendAuthRequestHeaders(&headers, input, forwards_body, fa.upstream_headers, input.asserted_names);
     // The bounded transport only declares a length for a non-empty body; an
     // empty POST must still be explicitly framed (RFC 9110 §8.6).
     if (forwards_body and send_body.len == 0) try headers.append(.{ .name = "Content-Length", .value = "0" });
@@ -221,7 +226,7 @@ pub fn authorize(
         decision.client_headers = try collectHeaders(arena, &response, fa.client_headers, &.{});
         return decision;
     }
-    if (status >= 300 and status < 500) {
+    if (isRelayableDenial(status, response.headerValue("location"))) {
         decision.outcome = .denied;
         decision.status = status;
         const implicit: []const []const u8 = if (status == 401)
@@ -240,6 +245,19 @@ pub fn authorize(
     var failed = failWith(decision, if (status >= 500) .unavailable else .invalid_response, fa.failure_status);
     failed.cause = if (status >= 500) "auth service 5xx" else "unexpected auth status";
     return failed;
+}
+
+/// Statuses relayed to the client as a denial: any 4xx, and real redirects
+/// that carry a `Location`. A 304 (the auth service validating a cached
+/// representation of its own endpoint), 300, 305 or a redirect without a
+/// target is not an authorization decision; relaying a 304 would tell the
+/// client its cached copy of the protected resource is still valid.
+fn isRelayableDenial(status: u16, location: ?[]const u8) bool {
+    if (status >= 400 and status < 500) return true;
+    return switch (status) {
+        301, 302, 303, 307, 308 => if (location) |value| value.len > 0 and http.headers.isValidHeaderValue(value) else false,
+        else => false,
+    };
 }
 
 fn failWith(decision: Decision, outcome: Outcome, status: u16) Decision {
@@ -294,6 +312,7 @@ fn appendAuthRequestHeaders(
     input: Input,
     has_body: bool,
     identity_names: []const []const u8,
+    asserted_names: []const []const u8,
 ) !void {
     const arena = headers.allocator;
     const request_headers = input.headers.iterator();
@@ -303,6 +322,11 @@ fn appendAuthRequestHeaders(
         if (gph.anyConnectionHeaderReferencesHeader(request_headers, header.name)) continue;
         if (isAssertedAuthRequestHeader(header.name)) continue;
         if (nameListed(header.name, identity_names) and !isClientCredentialHeader(header.name)) continue;
+        if (nameListed(header.name, asserted_names) and !isClientCredentialHeader(header.name)) continue;
+        // The subrequest asks for a decision, not a representation: a
+        // conditional or range request could make the auth service answer
+        // 304/206 about its own endpoint instead.
+        if (isConditionalOrRangeHeader(header.name)) continue;
         if (!has_body and isBodyHeader(header.name)) continue;
         try headers.append(.{ .name = header.name, .value = header.value });
     }
@@ -343,6 +367,14 @@ fn isAssertedAuthRequestHeader(name: []const u8) bool {
         std.ascii.startsWithIgnoreCase(name, "x-original-")) return true;
     const asserted = [_][]const u8{ "forwarded", "x-real-ip", "traceparent", "tracestate", "expect" };
     for (asserted) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+    }
+    return false;
+}
+
+fn isConditionalOrRangeHeader(name: []const u8) bool {
+    const names = [_][]const u8{ "if-match", "if-none-match", "if-modified-since", "if-unmodified-since", "if-range", "range" };
+    for (names) |candidate| {
         if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
     }
     return false;
@@ -754,7 +786,7 @@ test "credential headers reach the auth service even when named as upstream iden
     try request_headers.append("Cookie", "session=browser");
     try request_headers.append("X-Auth-User", "forged");
     var headers = std.array_list.Managed(std.http.Header).init(arena_state.allocator());
-    try appendAuthRequestHeaders(&headers, testInput(&request_headers, null), false, &.{ "Authorization", "Cookie", "X-Auth-User" });
+    try appendAuthRequestHeaders(&headers, testInput(&request_headers, null), false, &.{ "Authorization", "Cookie", "X-Auth-User" }, &.{});
     var saw_authorization = false;
     var saw_cookie = false;
     for (headers.items) |h| {
@@ -763,6 +795,52 @@ test "credential headers reach the auth service even when named as upstream iden
         try std.testing.expect(!std.ascii.eqlIgnoreCase(h.name, "x-auth-user"));
     }
     try std.testing.expect(saw_authorization and saw_cookie);
+}
+
+test "earlier-hop asserted names and conditional validators never reach a verifier" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var request_headers = http.Headers.init(allocator);
+    defer request_headers.deinit();
+    try request_headers.append("Authorization", "Bearer client-inbound");
+    try request_headers.append("X-Auth-User", "forged");
+    try request_headers.append("If-None-Match", "\"v1\"");
+    try request_headers.append("If-Modified-Since", "Mon, 01 Jan 2024 00:00:00 GMT");
+    try request_headers.append("Range", "bytes=0-1");
+    var headers = std.array_list.Managed(std.http.Header).init(arena_state.allocator());
+    try appendAuthRequestHeaders(&headers, testInput(&request_headers, null), false, &.{}, &.{ "X-Auth-User", "Authorization" });
+    var saw_client_token = false;
+    for (headers.items) |h| {
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(h.name, "x-auth-user"));
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(h.name, "if-none-match"));
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(h.name, "if-modified-since"));
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(h.name, "range"));
+        if (std.ascii.eqlIgnoreCase(h.name, "authorization")) saw_client_token = std.mem.eql(u8, h.value, "Bearer client-inbound");
+    }
+    try std.testing.expect(saw_client_token);
+}
+
+test "authorize fails closed on 304 and redirects without a Location" {
+    const allocator = std.testing.allocator;
+    var server = try TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer server.stop();
+    try server.run();
+    var url_buf: [64]u8 = undefined;
+    const fa = ForwardAuth{ .url = server.url(&url_buf, "/verify"), .failure_status = 502 };
+    var headers = http.Headers.init(allocator);
+    defer headers.deinit();
+    var cfg = testConfig();
+    inline for (0..2) |_| {
+        var decision = try authorize(allocator, &cfg, &fa, testInput(&headers, null));
+        defer decision.deinit();
+        try std.testing.expectEqual(Outcome.invalid_response, decision.outcome);
+        try std.testing.expectEqual(@as(u16, 502), decision.status);
+        try std.testing.expect(!decision.relaysAuthResponse());
+    }
 }
 
 test "generated forward_auth failures are never cacheable" {
@@ -850,7 +928,7 @@ test "auth request forwards client credentials and asserts original request meta
         .correlation_id = "req-1",
         .headers = &request_headers,
         .body = null,
-    }, false, &.{"X-Auth-Request-User"});
+    }, false, &.{"X-Auth-Request-User"}, &.{});
 
     const Lookup = struct {
         fn count(items: []const std.http.Header, name: []const u8) usize {

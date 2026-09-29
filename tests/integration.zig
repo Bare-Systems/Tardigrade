@@ -13845,6 +13845,102 @@ test "forward_auth cannot be bypassed by rewriting into a protected location" {
     try std.testing.expectEqualStrings("/admin/secret.txt", auth.capturedHeader("X-Forwarded-Uri").?);
 }
 
+test "forward_auth re-authorizes a self-rewrite against the rewritten file" {
+    const allocator = std.testing.allocator;
+
+    // Path-sensitive verifier: allows /admin/public, denies /admin/private.txt.
+    var auth = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 200, .body = "" },
+        .{ .status_code = 403, .body = "denied" },
+    });
+    defer auth.stop();
+    try auth.run();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).makePath("admin");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "admin/private.txt", .data = "private-file-bytes" });
+    const site_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(site_root);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\root {s};
+        \\
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /admin/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    rewrite ^ /admin/private.txt last;
+        \\}}
+    , .{ site_root, test_host, auth.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+    try auth.resetCapture();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/admin/public", .body = null, .headers = &.{} });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 403), response.status_code);
+    try std.testing.expect(std.mem.find(u8, response.body, "private-file-bytes") == null);
+    try std.testing.expectEqual(@as(u32, 2), auth.requestCount());
+    // The final decision was about the file actually requested.
+    try std.testing.expectEqualStrings("/admin/private.txt", auth.capturedHeader("X-Forwarded-Uri").?);
+}
+
+test "forward_auth fails closed when the auth service answers a conditional request with 304" {
+    const allocator = std.testing.allocator;
+
+    var auth = try UpstreamServer.start(allocator, &.{.{ .status_code = 304, .body = "", .headers = &.{.{ .name = "ETag", .value = "\"v1\"" }} }});
+    defer auth.stop();
+    try auth.run();
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "protected-representation" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /admin/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, auth.port(), test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/admin/resource",
+        .body = null,
+        .headers = &.{.{ .name = "If-None-Match", .value = "\"v1\"" }},
+    });
+    defer response.deinit();
+    // Not 304: the client must never be told its cached protected copy is valid.
+    try std.testing.expectEqual(@as(u16, 503), response.status_code);
+    try std.testing.expectEqualStrings("no-store", response.header("Cache-Control").?);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+    // Validators are not forwarded to the auth subrequest.
+    try std.testing.expect(auth.capturedHeader("If-None-Match") == null);
+}
+
 test "forward_auth fails closed when the auth service is unreachable or slow" {
     const allocator = std.testing.allocator;
 

@@ -734,6 +734,8 @@ pub fn routeRequest(
     // are freed.
     var grants = gfa.Grants{};
     defer grants.deinit(allocator);
+    var client_view = H1ClientAuthView{};
+    defer client_view.deinit(allocator);
     defer http.security_headers.clearRequestScopedHeaders();
 
     switch (resolveRoute(allocator, cfg, request)) {
@@ -756,10 +758,18 @@ pub fn routeRequest(
             // location, or fall into the static root, around its gates.
             var matched = first_match;
             var hops: usize = 1;
+            // Set when a rewrite lands back in the same location: its gates
+            // must be re-run for the rewritten target, but its rewrite action
+            // must not run again.
+            var gate_only = false;
             while (true) {
                 // Refusals on this hop must not carry an earlier hop's grants.
                 http.security_headers.clearRequestScopedHeaders();
-                if (try enforceLocationAuth(allocator, writer, cfg, state, ctx, request, matched, correlation_id, keep_alive.*, client_ip)) |status| {
+                // Built-in auth checks the caller's own credentials, never an
+                // earlier hop's auth-asserted replacement.
+                var verifier_request = request.*;
+                verifier_request.headers = client_view.headers(request).*;
+                if (try enforceLocationAuth(allocator, writer, cfg, state, ctx, &verifier_request, matched, correlation_id, keep_alive.*, client_ip)) |status| {
                     // Tardigrade denied this request itself. The body must not
                     // reach a mirror target, so say so explicitly instead of
                     // leaving the caller to infer it from `status`.
@@ -767,11 +777,14 @@ pub fn routeRequest(
                     return .{ .status = status, .mirror_allowed = false };
                 }
                 var allowed: ?gfa.Decision = null;
-                if (try enforceLocationForwardAuth(allocator, writer, cfg, state, request, matched, correlation_id, keep_alive, client_ip, streaming_request_body != null, &allowed)) |status| {
+                if (try enforceLocationForwardAuth(allocator, writer, cfg, state, request, matched, correlation_id, keep_alive, client_ip, streaming_request_body != null, &client_view, &allowed)) |status| {
                     grants.clear();
                     return .{ .status = status, .mirror_allowed = false };
                 }
                 if (allowed) |decision| try grants.add(allocator, decision);
+                if (gate_only) {
+                    return try finishRoute(allocator, conn, cfg, state, ctx, request, correlation_id, keep_alive.*, &grants);
+                }
 
                 const rewrite_rule = switch (matched.block.action) {
                     .rewrite => |rule| rule,
@@ -789,12 +802,11 @@ pub fn routeRequest(
                     // unprotected static root can answer it.
                     return try finishRoute(allocator, conn, cfg, state, ctx, request, correlation_id, keep_alive.*, &grants);
                 };
-                // A rewrite back into the same location has already passed
-                // that location's gates; serve it from the static root
-                // rather than looping.
-                if (next.index == matched.index) {
-                    return try finishRoute(allocator, conn, cfg, state, ctx, request, correlation_id, keep_alive.*, &grants);
-                }
+                // A rewrite back into the same location is served from the
+                // static root rather than looping, but only after that
+                // location's gates pass again for the rewritten target: an
+                // auth decision about the old path says nothing about the new.
+                if (next.index == matched.index) gate_only = true;
                 if (hops >= gfa.MAX_ROUTE_HOPS) {
                     grants.clear();
                     try sendApiError(allocator, writer, .loop_detected, "rewrite_loop", "Rewrite limit exceeded", correlation_id, keep_alive.*, state);
@@ -911,6 +923,35 @@ fn enforceLocationAuth(
     return auth_status_code;
 }
 
+/// What verifiers see of an HTTP/1.1 request across rewrite hops (#761).
+/// `forward_auth` rewrites `request.headers` in place with auth-asserted
+/// values meant for the origin; later verifiers (another `forward_auth`, or
+/// built-in `auth required`) must still judge the caller's own credentials,
+/// never a token an earlier auth service minted. `snapshot` holds the
+/// client's headers from before the first assertion, and `asserted_names`
+/// every name asserted so far, whose client copies are forged.
+const H1ClientAuthView = struct {
+    snapshot: ?http.Headers = null,
+    asserted_names: std.ArrayList([]const u8) = .empty,
+
+    fn headers(self: *const H1ClientAuthView, request: *const http.Request) *const http.Headers {
+        return if (self.snapshot) |*snapshot| snapshot else &request.headers;
+    }
+
+    fn preserve(self: *H1ClientAuthView, allocator: std.mem.Allocator, request: *const http.Request) !void {
+        if (self.snapshot != null) return;
+        var copy = http.Headers.init(allocator);
+        errdefer copy.deinit();
+        for (request.headers.iterator()) |header| try copy.append(header.name, header.value);
+        self.snapshot = copy;
+    }
+
+    fn deinit(self: *H1ClientAuthView, allocator: std.mem.Allocator) void {
+        if (self.snapshot) |*snapshot| snapshot.deinit();
+        self.asserted_names.deinit(allocator);
+    }
+};
+
 /// Protocol-neutral request target (`path[?query]`) for the auth service.
 fn forwardAuthRequestTarget(allocator: std.mem.Allocator, path: []const u8, query: ?[]const u8) ![]u8 {
     if (query) |q| return std.fmt.allocPrint(allocator, "{s}?{s}", .{ path, q });
@@ -933,6 +974,7 @@ fn enforceLocationForwardAuth(
     keep_alive: *bool,
     client_ip: []const u8,
     body_unread: bool,
+    client_view: *H1ClientAuthView,
     allowed_out: *?gfa.Decision,
 ) !?u16 {
     const fa = if (matched.block.forward_auth) |*fa| fa else return null;
@@ -945,13 +987,20 @@ fn enforceLocationForwardAuth(
         .proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http",
         .client_ip = client_ip,
         .correlation_id = correlation_id,
-        .headers = &request.headers,
+        .headers = client_view.headers(request),
         .body = request.body,
+        .asserted_names = client_view.asserted_names.items,
     });
     var decision_owned = true;
     defer if (decision_owned) decision.deinit();
     state.metricsRecordForwardAuth(.h1, decision.outcome);
     if (decision.allowed()) {
+        if (fa.upstream_headers.len > 0) {
+            // Keep the caller's original headers for any later verifier
+            // before replacing them with this service's assertions.
+            try client_view.preserve(allocator, request);
+            try client_view.asserted_names.appendSlice(allocator, fa.upstream_headers);
+        }
         try gfa.applyUpstreamHeaders(&request.headers, fa, &decision);
         allowed_out.* = decision;
         decision_owned = false;
@@ -3342,7 +3391,8 @@ fn enforceHttp3ForwardAuth(
     allowed_out: *?gfa.Decision,
 ) !bool {
     // Authorize what will actually be served: the effective (possibly
-    // rewritten) target, with the verified headers of earlier hops.
+    // rewritten) target, judged on the caller's own headers -- never on a
+    // credential an earlier hop's auth service minted for the origin.
     const target = if (route.query) |q|
         try std.fmt.allocPrint(allocator, "{s}?{s}", .{ route.path, q })
     else
@@ -3355,8 +3405,9 @@ fn enforceHttp3ForwardAuth(
         .proto = "https",
         .client_ip = ctx.client_ip,
         .correlation_id = correlation_id,
-        .headers = route.requestHeaders(request),
+        .headers = &request.headers,
         .body = request.body,
+        .asserted_names = route.asserted_names.items,
     });
     var decision_owned = true;
     defer if (decision_owned) decision.deinit();
@@ -3364,6 +3415,7 @@ fn enforceHttp3ForwardAuth(
     if (decision.allowed()) {
         if (fa.upstream_headers.len > 0) {
             try gfa.applyUpstreamHeaders(try route.verifiedHeaders(allocator, request), fa, &decision);
+            try route.asserted_names.appendSlice(allocator, fa.upstream_headers);
         }
         allowed_out.* = decision;
         decision_owned = false;
@@ -3397,8 +3449,14 @@ const Http3RouteState = struct {
     query: ?[]const u8,
     /// Owned copy of the request headers once a `forward_auth` hop asserts
     /// upstream headers; null while the client's headers are unmodified.
+    /// Origin-facing only: verifiers always judge `request.headers`.
     headers: ?http.Headers = null,
+    /// Names earlier hops asserted upstream; client copies are forged.
+    asserted_names: std.ArrayList([]const u8) = .empty,
     grants: gfa.Grants = .{},
+    /// Set when a rewrite lands back in the same location: re-run its gates
+    /// for the rewritten target, then fall back without re-running its action.
+    gate_only: bool = false,
 
     fn init(request: *const http.http3_session.StreamRequest) Http3RouteState {
         const path, const query = splitHttp3PathAndQuery(request.path);
@@ -3407,11 +3465,8 @@ const Http3RouteState = struct {
 
     fn deinit(self: *Http3RouteState, allocator: std.mem.Allocator) void {
         if (self.headers) |*headers| headers.deinit();
+        self.asserted_names.deinit(allocator);
         self.grants.deinit(allocator);
-    }
-
-    fn requestHeaders(self: *const Http3RouteState, request: *const http.http3_session.StreamRequest) *const http.Headers {
-        return if (self.headers) |*headers| headers else &request.headers;
     }
 
     fn verifiedHeaders(self: *Http3RouteState, allocator: std.mem.Allocator, request: *const http.http3_session.StreamRequest) !*http.Headers {
@@ -3526,6 +3581,7 @@ fn routeHttp3Hop(
         }
         if (allowed) |grant| try route.grants.add(allocator, grant);
     }
+    if (route.gate_only) return .not_handled;
     return executeHttp3LocationAction(allocator, request, response, ctx, matched, request_path, route.query, correlation_id, &early_ctx, forward_early_data, if (route.headers) |*headers| headers else null);
 }
 
@@ -4806,6 +4862,81 @@ test "H3 grants never decorate a later auth required denial" {
     try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
 }
 
+test "H3 self-rewrite re-authorizes the rewritten target before the static fallback" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).makePath("admin");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "admin/private.txt", .data = "private-bytes" });
+    const root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/admin/",
+        .priority = 0,
+        .action = .{ .rewrite = .{ .replacement = "/admin/private.txt", .flag = .last } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/admin/landing", &response, .{ .doc_root = root });
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.find(u8, response.body orelse "", "private-bytes") == null);
+    try std.testing.expectEqual(@as(usize, 2), auth_server.requestCount());
+    try std.testing.expect(auth_server.requestContains(1, "X-Forwarded-Uri: /admin/private.txt"));
+}
+
+test "H3 later verifiers judge the caller's credential, not an earlier hop's minted one" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nAuthorization: Bearer service-minted\r\nX-Auth-User: alice\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    const auth_url = auth_server.url(&url_buf, "/verify");
+    var blocks = [_]http.location_router.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/public",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/admin", .flag = .last } },
+            .forward_auth = .{ .url = auth_url, .upstream_headers = &.{ "Authorization", "X-Auth-User" } },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/admin",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+            .forward_auth = .{ .url = auth_url },
+        },
+    };
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try runH3ForwardAuthRequestWith(allocator, blocks[0..], "GET", "/public", &response, .{ .request_headers = &.{
+        .{ .name = "Authorization", .value = "Bearer client-inbound" },
+        .{ .name = "X-Auth-User", .value = "forged-admin" },
+    } });
+
+    try std.testing.expectEqual(@as(u16, 403), @intFromEnum(response.status));
+    try std.testing.expect(auth_server.requestContains(1, "Bearer client-inbound"));
+    try std.testing.expect(!auth_server.requestContains(1, "service-minted"));
+    // Hop A's asserted names are withheld from hop B too, so the client's
+    // forged copy never reaches it.
+    try std.testing.expect(!auth_server.requestContains(1, "forged-admin"));
+}
+
 test "H3 forward_auth HEAD denial keeps Content-Length and drops the body" {
     const allocator = std.testing.allocator;
     var auth_server = try gfa.TestAuthServer.start(allocator, &.{
@@ -5226,15 +5357,16 @@ fn handleHttp3Connection(
             .rewritten => |next| {
                 route.path = next.path;
                 if (next.query) |query| route.query = query;
-                if (ga.evaluatePolicy(ctx.state, ctx.cfg, request.method, route.path, ctx.identity, ctx.device_id, route.requestHeaders(request))) |reason| {
+                if (ga.evaluatePolicy(ctx.state, ctx.cfg, request.method, route.path, ctx.identity, ctx.device_id, &request.headers)) |reason| {
                     route.grants.clear();
                     try rejectHttp3ProxyError(allocator, response, ctx, .forbidden, "forbidden", reason, correlation_id);
                     return;
                 }
                 const next_match = http.location_router.matchLocation(allocator, route.path, ctx.cfg.location_blocks) orelse break;
-                // A rewrite back into the same location already passed its
-                // gates; answer from the static root instead of looping.
-                if (next_match.index == next.from_index) break;
+                // A rewrite back into the same location is answered from the
+                // static root rather than looping, but only after its gates
+                // pass again for the rewritten target.
+                if (next_match.index == next.from_index) route.gate_only = true;
                 if (hops >= gfa.MAX_ROUTE_HOPS) {
                     route.grants.clear();
                     try rejectHttp3ProxyError(allocator, response, ctx, .loop_detected, "rewrite_loop", "Rewrite limit exceeded", correlation_id);

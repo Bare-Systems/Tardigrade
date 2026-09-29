@@ -7765,6 +7765,117 @@ test "H1 path policy and the rewrite budget apply to rewritten targets" {
     try std.testing.expect(std.mem.find(u8, loop_conn.out.written(), "too-deep") == null);
 }
 
+test "H1 self-rewrite re-authorizes the rewritten target before serving it" {
+    const allocator = std.testing.allocator;
+    // Path-sensitive verifier: allows the landing URI, denies the file.
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).makePath("admin");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "admin/private.txt", .data = "private-bytes" });
+    const doc_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(doc_root);
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/admin/",
+        .priority = 0,
+        .action = .{ .rewrite = .{ .replacement = "/admin/private.txt", .flag = .last } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+    }};
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.doc_root = doc_root;
+    cfg.try_files = "";
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+
+    const outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /admin/public HTTP/1.1\r\nHost: example.test\r\n\r\n", &conn, &effects, &state);
+
+    try std.testing.expectEqual(@as(u16, 403), outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, conn.out.written(), "private-bytes") == null);
+    try std.testing.expectEqual(@as(usize, 2), auth_server.requestCount());
+    try std.testing.expect(auth_server.requestContains(0, "X-Forwarded-Uri: /admin/public"));
+    try std.testing.expect(auth_server.requestContains(1, "X-Forwarded-Uri: /admin/private.txt"));
+}
+
+test "H1 later verifiers judge the caller's credential, not an earlier hop's minted one" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        // Hop A allows the client and mints a privileged origin token.
+        "HTTP/1.1 200 OK\r\nAuthorization: Bearer service-minted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        // Hop B would deny the client's own token.
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+        // Second request: hop A again, minting the gateway's valid token.
+        "HTTP/1.1 200 OK\r\nAuthorization: Bearer integration-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    const auth_url = auth_server.url(&url_buf, "/verify");
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/public",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/admin", .flag = .last } },
+            .forward_auth = .{ .url = auth_url, .upstream_headers = &.{"Authorization"} },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/admin",
+            .priority = 1,
+            .action = .{ .return_response = .{ .status = 200, .body = "admin-secret" } },
+            .forward_auth = .{ .url = auth_url },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/builtin",
+            .priority = 2,
+            .action = .{ .rewrite = .{ .replacement = "/private", .flag = .last } },
+            .forward_auth = .{ .url = auth_url, .upstream_headers = &.{"Authorization"} },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/private",
+            .priority = 3,
+            .action = .{ .return_response = .{ .status = 200, .body = "private-secret" } },
+            .auth = .required,
+        },
+    };
+    // sha256("integration-token"): the minted token would pass built-in auth.
+    var token_hashes = [_][]const u8{"521bc8ca01307d0189b55a19da738e39c7204f7077e0076e803026e32b2f9383"};
+    var cfg: edge_config.EdgeConfig = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.auth_token_hashes = token_hashes[0..];
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+
+    var chain_conn = H2DispatchTestConn.init(allocator);
+    defer chain_conn.deinit();
+    const chain = try runH1ForwardAuthRequest(allocator, &cfg, "GET /public HTTP/1.1\r\nHost: example.test\r\nAuthorization: Bearer client-inbound\r\n\r\n", &chain_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 403), chain.route_status);
+    try std.testing.expect(std.mem.find(u8, chain_conn.out.written(), "admin-secret") == null);
+    try std.testing.expect(auth_server.requestContains(1, "Bearer client-inbound"));
+    try std.testing.expect(!auth_server.requestContains(1, "service-minted"));
+
+    var builtin_conn = H2DispatchTestConn.init(allocator);
+    defer builtin_conn.deinit();
+    const builtin_outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /builtin HTTP/1.1\r\nHost: example.test\r\nAuthorization: Bearer client-wrong\r\n\r\n", &builtin_conn, &effects, &state);
+    // An invalid bearer is 403 in built-in auth; the point is it is refused.
+    try std.testing.expectEqual(@as(u16, 403), builtin_outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, builtin_conn.out.written(), "private-secret") == null);
+}
+
 test "H1 forward_auth HEAD denial sends the challenge head without a body" {
     const allocator = std.testing.allocator;
     var auth_server = try gfa.TestAuthServer.start(allocator, &.{

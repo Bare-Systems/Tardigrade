@@ -71,6 +71,7 @@ pub const http3_handler = @import("http/http3_handler.zig");
 pub const http3_session = @import("http/http3_session.zig");
 pub const http3_runtime = @import("http/http3_runtime.zig");
 pub const websocket = @import("http/websocket.zig");
+pub const tunnel = @import("http/tunnel.zig");
 pub const event_hub = @import("http/event_hub.zig");
 pub const rewrite = @import("http/rewrite.zig");
 pub const location_router = @import("http/location_router.zig");

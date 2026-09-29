@@ -775,11 +775,13 @@ pub fn routeRequest(
                     // reach a mirror target, so say so explicitly instead of
                     // leaving the caller to infer it from `status`.
                     grants.clear();
+                    if (isWebSocketAttempt(matched.block, request)) state.metricsRecordWebSocketUpgrade(.denied);
                     return .{ .status = status, .mirror_allowed = false };
                 }
                 var allowed: ?gfa.Decision = null;
                 if (try enforceLocationForwardAuth(allocator, writer, cfg, state, request, matched, correlation_id, keep_alive, client_ip, streaming_request_body != null, &client_view, &allowed)) |status| {
                     grants.clear();
+                    if (isWebSocketAttempt(matched.block, request)) state.metricsRecordWebSocketUpgrade(.denied);
                     return .{ .status = status, .mirror_allowed = false };
                 }
                 if (allowed) |decision| try grants.add(allocator, decision);
@@ -818,6 +820,9 @@ pub fn routeRequest(
                 matched = next;
             }
             http.security_headers.setRequestScope(grants.client_headers.items, grants.cachePolicy());
+            // A WebSocket handshake is never mirrored: a mirror would open a
+            // second, unrelated upgrade against another origin (#812).
+            const websocket_attempt = isWebSocketAttempt(matched.block, request);
             if (try executeLocationAction(
                 conn,
                 allocator,
@@ -831,7 +836,7 @@ pub fn routeRequest(
                 client_ip,
                 streaming_request_body,
             )) |status| {
-                return .{ .status = status };
+                return .{ .status = status, .mirror_allowed = !websocket_attempt };
             }
         },
     }
@@ -1114,6 +1119,14 @@ fn executeLocationAction(
     const writer = conn.writer();
     switch (matched.block.action) {
         .proxy_pass => |target| {
+            if (matched.block.websocket) |*websocket| {
+                if (isWebSocketAttempt(matched.block, request)) {
+                    // Whatever happens, this connection never carries another
+                    // HTTP request: it either becomes a tunnel or refused one.
+                    keep_alive.* = false;
+                    return try handleWebSocketUpgrade(conn, allocator, cfg, state, ctx, request, matched, target, websocket, correlation_id, client_ip);
+                }
+            }
             var downstream_broken = false;
             const status = try handleLocationProxyPass(
                 allocator,
@@ -1170,6 +1183,107 @@ fn executeLocationAction(
             return null;
         },
     }
+}
+
+/// True when `request` asks for a WebSocket upgrade on a location that relays
+/// them (#812). Such a request is never mirrored or retried.
+pub fn isWebSocketAttempt(block: *const http.location_router.LocationBlock, request: *const http.Request) bool {
+    if (block.websocket == null) return false;
+    for (request.headers.iterator()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "upgrade") and http.websocket.headerHasToken(header.value, "websocket")) return true;
+    }
+    return false;
+}
+
+/// Count a Tardigrade refusal of a WebSocket upgrade (auth, forward_auth,
+/// rate limit, policy) under `tardigrade_websocket_upgrades_total{outcome="denied"}`.
+pub fn recordWebSocketDenial(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, state: *GatewayState, request: *const http.Request) void {
+    const matched = http.location_router.matchLocation(allocator, request.uri.path, cfg.location_blocks) orelse return;
+    if (isWebSocketAttempt(matched.block, request)) state.metricsRecordWebSocketUpgrade(.denied);
+}
+
+/// The WebSocket half of a `proxy_websocket` location (#812): validate the
+/// handshake and the location's own WebSocket rules, then relay it. Runs
+/// after every ordinary gate has passed for this location.
+fn handleWebSocketUpgrade(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *http.Request,
+    matched: http.location_router.MatchResult,
+    target: []const u8,
+    websocket: *const http.location_router.WebSocketProxy,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+) !u16 {
+    const writer = conn.writer();
+    const handshake = http.websocket.classifyClientHandshake(request.method == .GET, request.version == .http11, &request.headers);
+    switch (handshake) {
+        .not_websocket => unreachable, // isWebSocketAttempt checked Upgrade
+        .invalid => |reason| {
+            state.metricsRecordWebSocketUpgrade(.invalid);
+            try sendApiError(allocator, writer, .bad_request, "invalid_websocket_handshake", reason, correlation_id, false, state);
+            return 400;
+        },
+        .unsupported_version => {
+            state.metricsRecordWebSocketUpgrade(.invalid);
+            return try sendWebSocketVersionRequired(allocator, writer, state, correlation_id);
+        },
+        .valid => |valid| {
+            if (!http.websocket.originAllowed(websocket.origins, request.headers.get("origin"))) {
+                state.metricsRecordWebSocketUpgrade(.denied);
+                try sendApiError(allocator, writer, .forbidden, "websocket_origin_denied", "WebSocket origin not allowed", correlation_id, false, state);
+                return 403;
+            }
+            // Opening an upstream connection is a side effect a replayed
+            // 0-RTT handshake must never cause.
+            if (ctx.early_data.replayExposed()) {
+                state.metricsRecordWebSocketUpgrade(.denied);
+                ctx.early_data_action = .too_early;
+                return try writeTooEarlyResponse(allocator, writer, state, ctx, correlation_id, false);
+            }
+            return try gproxy_runtime.handleLocationWebSocketProxyPass(
+                allocator,
+                conn,
+                writer,
+                cfg,
+                state,
+                ctx,
+                request,
+                target,
+                proxySuffixPathForLocation(request.uri.path, matched, cfg.location_blocks),
+                valid.key,
+                correlation_id,
+                client_ip,
+                request.headers.get("host"),
+                matched.block.pattern,
+                matched.block,
+                websocket,
+                ctx.downstream_buffered_input,
+            );
+        },
+    }
+}
+
+/// 426 with `Sec-WebSocket-Version: 13` for a handshake asking for another
+/// protocol version (RFC 6455 §4.4).
+fn sendWebSocketVersionRequired(allocator: std.mem.Allocator, writer: anytype, state: *GatewayState, correlation_id: []const u8) !u16 {
+    const payload = try buildApiErrorJson(allocator, "invalid_websocket_handshake", "Unsupported Sec-WebSocket-Version", correlation_id);
+    defer allocator.free(payload);
+    var response = http.Response.json(allocator, payload);
+    defer response.deinit();
+    _ = response
+        .setStatus(.upgrade_required)
+        .setConnection(false)
+        .setHeader("Sec-WebSocket-Version", "13");
+    setRequestIdHeaders(&response, correlation_id);
+    applyResponseHeaders(state, &response);
+    try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+    state.metricsRecord(426);
+    state.metricsRecordErrorCode("invalid_request");
+    return 426;
 }
 
 pub fn primeRequestAuthContext(
@@ -5704,6 +5818,12 @@ pub fn logAccess(state: *GatewayState, ctx: *const http.request_context.RequestC
         .early_data_action = @tagName(ctx.early_data_action),
         .early_data_retry_result = @tagName(ctx.early_data_retry_result),
         .early_data_replay_exposed = ctx.early_data.replayExposed(),
+        .tunnel = if (ctx.tunnel) |tunnel| .{
+            .close_reason = tunnel.close_reason.label(),
+            .duration_ms = tunnel.duration_ms,
+            .client_to_upstream_bytes = tunnel.client_to_upstream_bytes,
+            .upstream_to_client_bytes = tunnel.upstream_to_client_bytes,
+        } else null,
     };
     entry.log();
 }

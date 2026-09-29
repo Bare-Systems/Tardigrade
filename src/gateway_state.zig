@@ -532,6 +532,12 @@ pub const GatewayState = struct {
     /// this limit are rejected with 503 before any work is done. cfg snapshot;
     /// updated on reload [runtime_mutex].
     max_in_flight_requests: u32,
+    /// Open (or opening) WebSocket tunnels (#812). Lock-free.
+    websocket_tunnels: std.atomic.Value(u32) = .init(0),
+    /// Tunnel cap used when `proxy_websocket_max_tunnels` is 0: half the
+    /// worker threads, at least one, so tunnels can never hold every worker.
+    /// Set once at startup.
+    websocket_default_max_tunnels: u32 = 1,
     active_ws_streams: usize, // runtime accounting [connection_mutex]
     active_sse_streams: usize, // runtime accounting [connection_mutex]
     active_mux_connections: usize, // runtime accounting [connection_mutex]
@@ -832,6 +838,23 @@ pub const GatewayState = struct {
     pub fn releaseRequestSlot(self: *GatewayState) void {
         if (self.max_in_flight_requests == 0) return;
         _ = self.in_flight_requests.fetchSub(1, .acq_rel);
+    }
+
+    /// Reserve a WebSocket tunnel slot (#812) before the upstream is
+    /// contacted. `configured_max` is `proxy_websocket_max_tunnels`; zero uses
+    /// the worker-derived default.
+    pub fn tryAcquireWebSocketTunnel(self: *GatewayState, configured_max: u32) bool {
+        const cap = if (configured_max > 0) configured_max else self.websocket_default_max_tunnels;
+        const prev = self.websocket_tunnels.fetchAdd(1, .acq_rel);
+        if (prev >= cap) {
+            _ = self.websocket_tunnels.fetchSub(1, .acq_rel);
+            return false;
+        }
+        return true;
+    }
+
+    pub fn releaseWebSocketTunnel(self: *GatewayState) void {
+        _ = self.websocket_tunnels.fetchSub(1, .acq_rel);
     }
 
     /// HOT PATH: taken once per request when rate limiting is enabled.
@@ -1575,6 +1598,19 @@ pub const GatewayState = struct {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
         self.metrics.recordForwardAuth(protocol, outcome);
+    }
+
+    pub fn metricsRecordWebSocketUpgrade(self: *GatewayState, outcome: http.metrics.WebSocketUpgradeOutcome) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordWebSocketUpgrade(outcome);
+    }
+
+    pub fn metricsRecordWebSocketTunnelClosed(self: *GatewayState, stats: http.tunnel.Stats) void {
+        const reason = std.meta.stringToEnum(http.metrics.WebSocketCloseReason, stats.close_reason.label()) orelse .@"error";
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordWebSocketTunnelClosed(reason, stats.client_to_upstream_bytes, stats.upstream_to_client_bytes, stats.duration_ms);
     }
 
     pub fn metricsRecordEarlyDataDecision(self: *GatewayState, protocol: http.metrics.HttpProtocol, decision: http.metrics.EarlyDataDecision) void {

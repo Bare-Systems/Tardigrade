@@ -97,6 +97,45 @@ including the client certificate and key — as the buffered path. A Unix-socket
 upstream always uses HTTP/1.1: there is no origin for the HTTP/2 pool to key or
 ALPN-negotiate.
 
+## Server-sent events
+
+Server-sent events (`text/event-stream`) are an ordinary HTTP response that
+never ends on its own, so they are proxied by the response-streaming path
+rather than a dedicated feature. Enable it for the route:
+
+```nginx
+location /events/ {
+    proxy_pass http://127.0.0.1:9000;
+    proxy_streaming response;
+}
+```
+
+- **Prompt delivery.** Each chunk the origin sends is written to the client
+  as it arrives; nothing waits for the end of the response. The response is
+  re-chunked downstream, and `Content-Type`, `Cache-Control` and the origin's
+  other end-to-end headers pass through.
+- **Bounded memory.** A slow client holds at most the relay buffer for its
+  stream (see [Memory](#memory)); after that Tardigrade stops reading the
+  origin, so the origin sees TCP backpressure rather than Tardigrade queueing
+  events.
+- **Upstream stalls.** `TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS` (or
+  `TARDIGRADE_UPSTREAM_TIMEOUT_MS`) bounds each wait for the next upstream
+  bytes, so an origin that goes silent longer than that ends the stream.
+  Origins that are legitimately quiet should send periodic comment lines
+  (`: keep-alive`) more often than the timeout.
+- **Close and reconnect.** When the origin ends the response, the client
+  receives the terminating chunk and reconnects with `Last-Event-ID` on its
+  own; Tardigrade forwards that header like any other. If the origin
+  connection fails mid-stream, the client connection is closed without a
+  terminating chunk, which EventSource clients also treat as a reason to
+  reconnect.
+- **Reload and shutdown.** Hot reload leaves open streams alone. Graceful
+  shutdown stops new streams, but an open stream is only ended by the
+  upstream response timeout, the origin, the client, or the supervisor's stop
+  timeout: the TCP drain timeout is a soft cap (see
+  [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md)). Set systemd `TimeoutStopSec`
+  accordingly when serving long-lived streams.
+
 ## Fallback reasons
 
 When a request cannot stream, it takes the bounded buffered path and the reason

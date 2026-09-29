@@ -205,6 +205,10 @@ return, rewrite, or static.
 | `forward_auth_body` | bytes / `off` | `off` | Send the subrequest as a `POST` carrying bodies up to this size (an empty body is sent with `Content-Length: 0`); larger bodies get 413. `off` sends a bodyless `GET`. A non-zero limit disables upload streaming for the location. | `forward_auth_body 8192;` |
 | `forward_auth_timeout_ms` | ms | upstream response timeout, else `5000` | Connect and response deadline for the subrequest. Responses are capped at 64 KiB. | `forward_auth_timeout_ms 500;` |
 | `forward_auth_failure_status` | status | `503` | Status for timeouts, connect failures, 1xx/5xx and malformed responses: 401, 403, 500, 502, 503 or 504. | `forward_auth_failure_status 502;` |
+| `proxy_websocket` | enum | `off` | `on` relays HTTP/1.1 WebSocket upgrades through this location's `proxy_pass`; valid only with `proxy_pass`. Off keeps stripping `Upgrade` and refusing an upstream `101`. See [WebSocket proxying](#websocket-proxying-proxy_websocket). | `proxy_websocket on;` |
+| `proxy_websocket_idle_timeout_ms` | ms | `60000` | Close a tunnel after this long with no bytes moving in either direction. Requires `proxy_websocket on`. | `proxy_websocket_idle_timeout_ms 300000;` |
+| `proxy_websocket_max_lifetime_ms` | ms | `0` (unlimited) | Close a tunnel this long after it opened. Requires `proxy_websocket on`. | `proxy_websocket_max_lifetime_ms 3600000;` |
+| `proxy_websocket_origins` | origins | any | Browser origins (`scheme://host[:port]`) allowed to open a WebSocket; others get 403 before the upstream is contacted. Handshakes without `Origin` are allowed. Requires `proxy_websocket on`. | `proxy_websocket_origins https://app.example.com;` |
 
 Parser-valid matcher examples:
 
@@ -314,6 +318,102 @@ equivalent of nginx's `proxy_buffer_size` to raise.
   limits cannot admit fails with 503.
 
 Large response heads from HTTP/2 upstreams have not been verified end to end.
+
+## WebSocket Proxying (`proxy_websocket`)
+
+`proxy_websocket on;` lets a `proxy_pass` location relay WebSocket
+connections (RFC 6455) to its origin, the way NGINX does with
+`proxy_http_version 1.1` plus `Upgrade`/`Connection` headers. It is off by
+default, and without it Tardigrade keeps stripping `Upgrade` and refuses an
+upstream `101`, so a client cannot switch protocols on a location that did not
+opt in.
+
+```nginx
+location /ws/ {
+    proxy_pass http://127.0.0.1:9000;
+    proxy_websocket on;
+    proxy_websocket_idle_timeout_ms 120000;
+    proxy_websocket_origins https://app.example.com;
+}
+```
+
+How a handshake is handled:
+
+1. **Every ordinary gate runs first.** Rate limits, ACL/geo, `auth required`,
+   `forward_auth`, path policy and the 0-RTT checks apply exactly as for any
+   request. A denied handshake gets the normal denial response and no
+   upstream connection is opened. A replay-exposed (0-RTT) handshake gets
+   425.
+2. **The handshake is validated strictly.** It must be a `GET` over HTTP/1.1
+   with `Connection: upgrade`, `Upgrade: websocket`, exactly one
+   `Sec-WebSocket-Key` that decodes to 16 bytes, and no body or body framing
+   (`Content-Length` other than 0, or any `Transfer-Encoding`). Anything else
+   gets 400; a `Sec-WebSocket-Version` other than 13 gets 426 with
+   `Sec-WebSocket-Version: 13`. When `proxy_websocket_origins` is set, a
+   browser `Origin` that is not listed gets 403 (cross-site WebSocket
+   hijacking protection).
+3. **A tunnel slot is reserved** before the origin is contacted (see the cap
+   below). Over the cap, the client gets 503.
+4. **A fresh HTTP/1.1 connection** is opened to the origin (`ws://` as
+   `http://`, `wss://` as `https://` under the usual upstream TLS
+   verification rules; TLS origins are offered only `http/1.1`). Upgrade
+   connections never come from or return to the keep-alive pool, are never
+   retried or replayed, and are never mirrored. The origin gets the same
+   forwarding, request-ID, trace, identity and `proxy_set_header` headers as
+   any proxied request, with `Upgrade: websocket` and `Connection: Upgrade`
+   set by Tardigrade. `Sec-WebSocket-Protocol` and `Sec-WebSocket-Extensions`
+   pass through unchanged, in both directions.
+5. **The origin's answer decides.** A `101` must carry `Upgrade: websocket`,
+   `Connection: upgrade` and a `Sec-WebSocket-Accept` matching the client's
+   key, or the client gets 502 and never sees it. A valid `101` is relayed
+   (with the origin's other end-to-end headers, the request ID, and any
+   `forward_auth_client_headers`), and both hops then carry raw bytes until
+   either side closes. Any other status is relayed as an ordinary response,
+   and the client connection is closed afterwards.
+
+**Tunnels.** Tardigrade does not parse frames: ping/pong, fragmentation,
+close handshakes, subprotocols and extensions are between the client and the
+origin. Each direction has one fixed buffer
+(`TARDIGRADE_PROXY_STREAM_BUFFER_SIZE`, at least 16 KiB), charged to the
+proxy-buffer limits before the origin is contacted. A slow reader on one side
+stops Tardigrade reading the other side, so TCP flow control pushes back on
+the sender instead of memory growing. A tunnel ends when either side closes
+(the other side's bytes already read are flushed first), after
+`proxy_websocket_idle_timeout_ms` with no traffic, after
+`proxy_websocket_max_lifetime_ms`, on an I/O error, or at shutdown. Idle and
+lifetime limits close the TCP connections without a WebSocket close frame
+(clients see close code 1006), so applications that stay quiet longer than
+the idle timeout should send pings.
+
+**Capacity.** Each open tunnel holds one worker thread for its whole
+lifetime, and counts as an active connection and an in-flight request.
+`proxy_websocket_max_tunnels` / `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS`
+caps concurrent tunnels per process; the default (`0`) is half the worker
+threads, at least one, so tunnels can never occupy every worker. Deployments
+that expect many long-lived WebSockets should raise
+`TARDIGRADE_WORKER_THREADS` and the cap together.
+
+**Reload and shutdown.** Hot reload does not close tunnels; a tunnel keeps the
+location settings it was opened with. On graceful shutdown, open tunnels keep
+relaying for `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` and are then closed, so
+they never hold the process open.
+
+**Protocols.** WebSocket relaying is HTTP/1.1 only, over plaintext or
+Tardigrade's native TLS (`wss://`). HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220)
+extended CONNECT are not supported: Tardigrade never advertises
+`SETTINGS_ENABLE_CONNECT_PROTOCOL`, so browsers open WebSockets over a
+separate HTTP/1.1 connection even when the page itself uses HTTP/2 or HTTP/3.
+An HTTP/2 or HTTP/3 request carrying `Upgrade` is not upgraded.
+
+**Observability.** `tardigrade_websocket_upgrades_total{outcome}`,
+`tardigrade_websocket_tunnels_active`,
+`tardigrade_websocket_tunnel_bytes_total{direction}`,
+`tardigrade_websocket_tunnel_duration_seconds` and
+`tardigrade_websocket_tunnel_closes_total{reason}`; the handshake's access-log
+line is written when the tunnel closes, with status 101 and
+`tunnel_close_reason`, `tunnel_duration_ms` and byte counts. See
+[OBSERVABILITY.md](OBSERVABILITY.md#metrics) and the runnable
+[examples/websocket-proxy](../examples/websocket-proxy/README.md).
 
 ## Top-Level Routing Directives
 
@@ -800,19 +900,22 @@ stable HTTP/1.1, HTTP/2, and HTTP/3/QUIC Core v1 edge contract unless the
 
 ### WebSocket And SSE
 
-These are configurable in-tree surfaces outside the stable Core v1 baseline.
+WebSockets are relayed per location with `proxy_websocket on;` (see
+[WebSocket proxying](#websocket-proxying-proxy_websocket)); the one global knob is:
 
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
-| `TARDIGRADE_WEBSOCKET_ENABLED` | bool | `false` | Enables WebSocket handling. | `TARDIGRADE_WEBSOCKET_ENABLED=true` |
-| `TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS` | u32 ms | `30000` | WebSocket idle timeout. | `TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS=60000` |
-| `TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE` | bytes | `65536` | Maximum WebSocket frame size. | `TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE=131072` |
-| `TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS` | u32 ms | `15000` | Ping interval. | `TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS=30000` |
-| `TARDIGRADE_SSE_ENABLED` | bool | `false` | Enables SSE handling. | `TARDIGRADE_SSE_ENABLED=true` |
-| `TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC` | usize | `128` | Retained events per topic. | `TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC=1024` |
-| `TARDIGRADE_SSE_POLL_INTERVAL_MS` | u32 ms | `250` | SSE poll interval. | `TARDIGRADE_SSE_POLL_INTERVAL_MS=500` |
-| `TARDIGRADE_SSE_MAX_BACKLOG` | u32 | `128` | Maximum SSE backlog. | `TARDIGRADE_SSE_MAX_BACKLOG=512` |
-| `TARDIGRADE_SSE_IDLE_TIMEOUT_MS` | u32 ms | `30000` | SSE idle timeout. | `TARDIGRADE_SSE_IDLE_TIMEOUT_MS=60000` |
+| `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS` | u32 | `0` (half the worker threads, at least 1) | Maximum concurrent WebSocket tunnels per process. A handshake over the cap gets 503 before the origin is contacted. Config directive: `proxy_websocket_max_tunnels`. | `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS=256` |
+
+Server-sent events need no special setting: proxy them as a streamed response
+(`proxy_streaming response;` on the location, or
+`TARDIGRADE_PROXY_STREAMING_MODE=response`). See
+[PROXY_STREAMING.md](PROXY_STREAMING.md#server-sent-events).
+
+The older `TARDIGRADE_WEBSOCKET_ENABLED`, `TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS`,
+`TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE`, `TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS`
+and `TARDIGRADE_SSE_*` keys belonged to built-in realtime endpoints that were
+removed. They are still parsed but have no effect, and are being retired.
 
 ### DNS Discovery
 

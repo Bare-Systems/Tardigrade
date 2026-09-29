@@ -200,6 +200,14 @@ drain timeout elapsed; force-closed N queued connection(s)
 Graceful shutdown complete (forced_closes=N drain_timed_out=true)
 ```
 
+WebSocket tunnels (`proxy_websocket`, #812) are the exception to the soft
+cap: an open tunnel keeps relaying for the drain window after shutdown is
+requested and is then closed by Tardigrade itself (logged with
+`tunnel_close_reason` `shutdown`), so a long-lived WebSocket never holds the
+process open. Hot reload leaves tunnels open under the location settings they
+were opened with. Streamed responses such as server-sent events are ordinary
+handlers and follow the soft cap above.
+
 Related knobs:
 
 | Env var | Default | Effect |

@@ -496,6 +496,9 @@ pub const EdgeConfig = struct {
     /// one connection but may serve many sequential requests.
     /// Returns 503 when exceeded. Set via TARDIGRADE_MAX_IN_FLIGHT_REQUESTS.
     max_in_flight_requests: u32,
+    /// Maximum concurrent WebSocket tunnels (#812). Zero derives the cap from
+    /// the worker count. Set via TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS.
+    proxy_websocket_max_tunnels: u32 = 0,
     /// Idle keep-alive timeout for client connections (ms, 0 = disabled).
     keep_alive_timeout_ms: u32,
     /// Overall request deadline from first byte received to response fully written (ms, 0 = disabled).
@@ -1366,6 +1369,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const max_active_connections = std.fmt.parseInt(u32, max_active_conn_str, 10) catch 0;
 
     const max_in_flight_requests = parseIntEnv(u32, allocator, "TARDIGRADE_MAX_IN_FLIGHT_REQUESTS", 0);
+    const proxy_websocket_max_tunnels = parseIntEnv(u32, allocator, "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", 0);
 
     const keep_alive_timeout_str = envOrDefault(allocator, "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", "5000") catch unreachable;
     defer allocator.free(keep_alive_timeout_str);
@@ -1788,6 +1792,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .max_connections_per_ip = max_connections_per_ip,
         .max_active_connections = max_active_connections,
         .max_in_flight_requests = max_in_flight_requests,
+        .proxy_websocket_max_tunnels = proxy_websocket_max_tunnels,
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
         .request_total_timeout_ms = request_total_timeout_ms,
         .tls_handshake_timeout_ms = tls_handshake_timeout_ms,
@@ -2674,9 +2679,25 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         var fa_timeout_ms: u32 = 0;
         var fa_failure_status: u16 = http.location_router.ForwardAuth.DEFAULT_FAILURE_STATUS;
         var fa_options_seen = false;
+        var websocket_on = false;
+        var websocket: http.location_router.WebSocketProxy = .{};
+        var websocket_origins: ?[]const u8 = null;
+        var websocket_options_seen = false;
         while (fields.next()) |option_raw| {
             const option = std.mem.trim(u8, option_raw, " \t\r\n");
-            if (std.mem.startsWith(u8, option, "forward_auth:")) {
+            if (std.mem.eql(u8, option, "websocket:on")) {
+                websocket_on = true;
+            } else if (std.mem.startsWith(u8, option, "websocket_idle_timeout_ms:")) {
+                websocket.idle_timeout_ms = std.fmt.parseInt(u32, option["websocket_idle_timeout_ms:".len..], 10) catch return error.InvalidLocationBlockFormat;
+                if (websocket.idle_timeout_ms == 0) return error.InvalidLocationBlockFormat;
+                websocket_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "websocket_max_lifetime_ms:")) {
+                websocket.max_lifetime_ms = std.fmt.parseInt(u32, option["websocket_max_lifetime_ms:".len..], 10) catch return error.InvalidLocationBlockFormat;
+                websocket_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "websocket_origins:")) {
+                websocket_origins = option["websocket_origins:".len..];
+                websocket_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "forward_auth:")) {
                 const url = option["forward_auth:".len..];
                 validateForwardAuthUrl(url) catch return error.InvalidLocationBlockFormat;
                 if (forward_auth != null) return error.InvalidLocationBlockFormat;
@@ -2728,6 +2749,12 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         } else if (fa_options_seen) {
             return error.InvalidLocationBlockFormat;
         }
+        if (websocket_on) switch (action) {
+            .proxy_pass => {},
+            else => return error.InvalidLocationBlockFormat,
+        } else if (websocket_options_seen) return error.InvalidLocationBlockFormat;
+        if (websocket_origins) |raw_origins| websocket.origins = try parseWebSocketOrigins(allocator, raw_origins);
+        errdefer websocket.deinit(allocator);
 
         try out.append(allocator, .{
             .match_type = match_type,
@@ -2741,9 +2768,11 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .proxy_early_data = proxy_early_data,
             .proxy_set_headers = &.{},
             .forward_auth = forward_auth,
+            .websocket = if (websocket_on) websocket else null,
         });
         action_owned = false;
         forward_auth = null;
+        websocket = .{};
         if (set_headers.items.len > 0) {
             out.items[out.items.len - 1].proxy_set_headers = try set_headers.toOwnedSlice(allocator);
         } else {
@@ -2790,6 +2819,21 @@ fn validateForwardAuthUrl(raw: []const u8) !void {
     }
     const uri = std.Uri.parse(raw) catch return error.InvalidConfigUrl;
     if (uri.user != null or uri.password != null or uri.fragment != null) return error.InvalidConfigUrl;
+}
+
+fn parseWebSocketOrigins(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    var origins = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (origins.items) |origin| allocator.free(origin);
+        origins.deinit(allocator);
+    }
+    var it = std.mem.tokenizeAny(u8, raw, ", \t");
+    while (it.next()) |origin| {
+        if (!http.location_router.isValidWebSocketOrigin(origin)) return error.InvalidLocationBlockFormat;
+        try origins.append(allocator, try allocator.dupe(u8, origin));
+    }
+    if (origins.items.len == 0) return error.InvalidLocationBlockFormat;
+    return origins.toOwnedSlice(allocator);
 }
 
 fn parseForwardAuthHeaderNames(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
@@ -4295,6 +4339,41 @@ test "parse location blocks read forward_auth options" {
     try std.testing.expectEqual(@as(u32, 750), fa.timeout_ms);
     try std.testing.expectEqual(@as(u16, 502), fa.failure_status);
     try std.testing.expect(blocks[1].forward_auth == null);
+}
+
+test "parse location blocks read proxy_websocket options (#812)" {
+    const allocator = std.testing.allocator;
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_idle_timeout_ms:1500" ++
+            "|websocket_max_lifetime_ms:60000|websocket_origins:https://app.example.test,http://127.0.0.1:8080" ++
+            ";prefix|/api/|proxy_pass|http://127.0.0.1:9000",
+    );
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+    const ws = blocks[0].websocket.?;
+    try std.testing.expectEqual(@as(u32, 1500), ws.idle_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 60000), ws.max_lifetime_ms);
+    try std.testing.expectEqual(@as(usize, 2), ws.origins.len);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080", ws.origins[1]);
+    try std.testing.expect(blocks[1].websocket == null);
+}
+
+test "parse location blocks reject unsafe proxy_websocket configuration (#812)" {
+    const cases = [_][]const u8{
+        // Only proxy_pass locations can relay an upgrade.
+        "prefix|/ws/|return|200|ok|websocket:on",
+        // Options without the opt-in.
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket_idle_timeout_ms:10",
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_idle_timeout_ms:0",
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_origins:app.example.test",
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_origins:",
+    };
+    for (cases) |raw| {
+        try std.testing.expectError(error.InvalidLocationBlockFormat, parseLocationBlocks(std.testing.allocator, raw));
+    }
 }
 
 test "parse location blocks reject unsafe forward_auth configuration" {

@@ -13,7 +13,12 @@ Runtime logs and access logs are JSON by default.
   `status`, `latency_ms`, `client_ip`, `upstream_addr`, `upstream_status`,
   `identity`, `bytes_sent`, `response_bytes`, `error_category`,
   `early_data_source`, `early_data_action`, `early_data_retry_result`, and
-  `early_data_replay_exposed`
+  `early_data_replay_exposed`. A WebSocket handshake that became a tunnel
+  (#812) is logged once, when the tunnel closes, with status 101 plus
+  `tunnel_close_reason` (`client`, `upstream`, `idle`, `lifetime`,
+  `shutdown`, `error`), `tunnel_duration_ms`,
+  `tunnel_client_to_upstream_bytes` and `tunnel_upstream_to_client_bytes`
+  (plain format: `tunnel_close=`, `tunnel_ms=`, `tunnel_in=`, `tunnel_out=`).
 
 Early-data access-log fields are bounded enums/booleans only:
 
@@ -164,6 +169,19 @@ logs are written through `src/http/logger.zig`.
   `h1`/`h2`/`h3` and fixed outcomes `allowed`, `denied`, `timeout`,
   `unavailable`, `invalid_response`, and `body_too_large`. Every fail-closed
   outcome also logs a `WARN` line naming the outcome, cause and location.
+- WebSocket relaying on `proxy_websocket` locations (#812):
+  `tardigrade_websocket_upgrades_total{outcome}` with fixed outcomes
+  `relayed`, `upstream_refused` (the origin answered with something other
+  than 101), `upstream_error` (connect failure, timeout, or an invalid 101),
+  `denied` (auth, `forward_auth`, rate limit, policy, Origin allowlist or
+  0-RTT), `invalid` (not a valid RFC 6455 handshake) and `capacity` (tunnel
+  cap or proxy-buffer capacity); the `tardigrade_websocket_tunnels_active`
+  gauge; `tardigrade_websocket_tunnel_bytes_total{direction}` with
+  `client_to_upstream`/`upstream_to_client`; the
+  `tardigrade_websocket_tunnel_duration_seconds` summary (`_sum`, `_count`);
+  and `tardigrade_websocket_tunnel_closes_total{reason}` with `client`,
+  `upstream`, `idle`, `lifetime`, `shutdown` and `error`. A relayed handshake
+  counts once in `tardigrade_requests_total` and in no status-class total.
 - native TLS/QUIC 0-RTT anti-replay store outcomes (#368):
   `tardigrade_tls_early_data_replay_total{outcome}` with fixed outcomes
   `accepted`, `duplicate`, `capacity_rejected`, `expired`, `unavailable`, and

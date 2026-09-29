@@ -62,6 +62,24 @@ pub const ProxyStreamingFallbackReason = enum {
 /// #761: per-location `forward_auth` subrequest outcomes. Closed enum; the
 /// Prometheus label is the tag name.
 pub const ForwardAuthOutcome = enum { allowed, denied, timeout, unavailable, invalid_response, body_too_large };
+/// #812: WebSocket upgrade outcomes on `proxy_websocket` locations. Closed
+/// enum; the Prometheus label is the tag name.
+pub const WebSocketUpgradeOutcome = enum {
+    /// The origin answered 101 and the tunnel opened.
+    relayed,
+    /// The origin answered with anything but 101; relayed as a response.
+    upstream_refused,
+    /// Connect failure, timeout, or a malformed or unverifiable 101.
+    upstream_error,
+    /// Refused by a Tardigrade gate (auth, forward_auth, policy, Origin, 0-RTT).
+    denied,
+    /// Not a valid RFC 6455 handshake.
+    invalid,
+    /// The tunnel cap was reached.
+    capacity,
+};
+/// #812: why a WebSocket tunnel closed; mirrors `tunnel.CloseReason.label`.
+pub const WebSocketCloseReason = enum { client, upstream, idle, lifetime, shutdown, @"error" };
 pub const EarlyDataSource = enum { transport, header, both };
 pub const EarlyDataDecision = enum { accepted, too_early, deferred, forwarded };
 pub const EarlyDataUpstream425Action = enum { forwarded, retried };
@@ -149,6 +167,8 @@ const ticket_result_count = 3;
 const ticket_key_reload_outcome_count = 4;
 const http_protocol_count = 3;
 const forward_auth_outcome_count = std.meta.fields(ForwardAuthOutcome).len;
+const websocket_upgrade_outcome_count = std.meta.fields(WebSocketUpgradeOutcome).len;
+const websocket_close_reason_count = std.meta.fields(WebSocketCloseReason).len;
 const response_write_mode_count = 4;
 const accept_error_reason_count = 2;
 const early_data_source_count = 3;
@@ -314,6 +334,16 @@ pub const Metrics = struct {
     tls_ticket_key_reload_total: [ticket_key_reload_outcome_count]u64,
     /// #761: `forward_auth` subrequest outcomes by downstream protocol.
     forward_auth_total: [http_protocol_count][forward_auth_outcome_count]u64,
+    /// #812: WebSocket upgrade attempts on opted-in locations, by outcome.
+    websocket_upgrades_total: [websocket_upgrade_outcome_count]u64,
+    /// #812: WebSocket tunnels currently open.
+    websocket_tunnels_active: u64,
+    /// #812: bytes delivered through tunnels, client->upstream and back.
+    websocket_tunnel_bytes_client_to_upstream: u64,
+    websocket_tunnel_bytes_upstream_to_client: u64,
+    /// #812: closed-tunnel lifetime, summed, and closes by reason.
+    websocket_tunnel_duration_ms_sum: u64,
+    websocket_tunnel_closes_total: [websocket_close_reason_count]u64,
     /// HTTP early-data replay-exposed requests by protocol and source.
     http_early_data_requests_total: [http_protocol_count][early_data_source_count]u64,
     response_write_mode_total: [response_write_mode_count]u64,
@@ -535,6 +565,12 @@ pub const Metrics = struct {
             .tls_ticket_resolve_total = .{.{0} ** ticket_result_count} ** resumption_mode_count,
             .tls_ticket_key_reload_total = .{0} ** ticket_key_reload_outcome_count,
             .forward_auth_total = .{.{0} ** forward_auth_outcome_count} ** http_protocol_count,
+            .websocket_upgrades_total = .{0} ** websocket_upgrade_outcome_count,
+            .websocket_tunnels_active = 0,
+            .websocket_tunnel_bytes_client_to_upstream = 0,
+            .websocket_tunnel_bytes_upstream_to_client = 0,
+            .websocket_tunnel_duration_ms_sum = 0,
+            .websocket_tunnel_closes_total = .{0} ** websocket_close_reason_count,
             .http_early_data_requests_total = .{.{0} ** early_data_source_count} ** http_protocol_count,
             .response_write_mode_total = .{0} ** response_write_mode_count,
             .response_writev_iovecs_total = 0,
@@ -702,6 +738,19 @@ pub const Metrics = struct {
 
     pub fn recordForwardAuth(self: *Metrics, protocol: HttpProtocol, outcome: ForwardAuthOutcome) void {
         self.forward_auth_total[httpProtocolIndex(protocol)][@intFromEnum(outcome)] += 1;
+    }
+
+    pub fn recordWebSocketUpgrade(self: *Metrics, outcome: WebSocketUpgradeOutcome) void {
+        self.websocket_upgrades_total[@intFromEnum(outcome)] += 1;
+        if (outcome == .relayed) self.websocket_tunnels_active += 1;
+    }
+
+    pub fn recordWebSocketTunnelClosed(self: *Metrics, reason: WebSocketCloseReason, client_to_upstream: u64, upstream_to_client: u64, duration_ms: u64) void {
+        self.websocket_tunnels_active -|= 1;
+        self.websocket_tunnel_bytes_client_to_upstream += client_to_upstream;
+        self.websocket_tunnel_bytes_upstream_to_client += upstream_to_client;
+        self.websocket_tunnel_duration_ms_sum += duration_ms;
+        self.websocket_tunnel_closes_total[@intFromEnum(reason)] += 1;
     }
 
     pub fn recordHttpEarlyDataDecision(self: *Metrics, protocol: HttpProtocol, decision: EarlyDataDecision) void {
@@ -1348,6 +1397,7 @@ pub const Metrics = struct {
         try self.appendQuicH3Prometheus(&out);
         try self.appendHttpEarlyDataPrometheus(&out);
         try self.appendForwardAuthPrometheus(&out);
+        try self.appendWebSocketPrometheus(&out);
         try self.appendEarlyDataReplayPrometheus(&out);
 
         try out.print(
@@ -1815,6 +1865,48 @@ pub const Metrics = struct {
                 ticketKeyReloadOutcomeLabel(outcome),
                 self.tls_ticket_key_reload_total[ticketKeyReloadOutcomeIndex(outcome)],
             });
+        }
+    }
+
+    fn appendWebSocketPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        try out.appendSlice(
+            \\# HELP tardigrade_websocket_upgrades_total WebSocket upgrade attempts on proxy_websocket locations by outcome
+            \\# TYPE tardigrade_websocket_upgrades_total counter
+            \\
+        );
+        inline for (comptime std.enums.values(WebSocketUpgradeOutcome)) |outcome| {
+            try out.print("tardigrade_websocket_upgrades_total{{outcome=\"{s}\"}} {d}\n", .{ @tagName(outcome), self.websocket_upgrades_total[@intFromEnum(outcome)] });
+        }
+        const closed = blk: {
+            var total: u64 = 0;
+            for (self.websocket_tunnel_closes_total) |count| total += count;
+            break :blk total;
+        };
+        try out.print(
+            \\# HELP tardigrade_websocket_tunnels_active WebSocket tunnels currently open
+            \\# TYPE tardigrade_websocket_tunnels_active gauge
+            \\tardigrade_websocket_tunnels_active {d}
+            \\# HELP tardigrade_websocket_tunnel_bytes_total Bytes delivered through WebSocket tunnels by direction
+            \\# TYPE tardigrade_websocket_tunnel_bytes_total counter
+            \\tardigrade_websocket_tunnel_bytes_total{{direction="client_to_upstream"}} {d}
+            \\tardigrade_websocket_tunnel_bytes_total{{direction="upstream_to_client"}} {d}
+            \\# HELP tardigrade_websocket_tunnel_duration_seconds Lifetime of closed WebSocket tunnels
+            \\# TYPE tardigrade_websocket_tunnel_duration_seconds summary
+            \\tardigrade_websocket_tunnel_duration_seconds_sum {d}.{d:0>3}
+            \\tardigrade_websocket_tunnel_duration_seconds_count {d}
+            \\# HELP tardigrade_websocket_tunnel_closes_total Closed WebSocket tunnels by reason
+            \\# TYPE tardigrade_websocket_tunnel_closes_total counter
+            \\
+        , .{
+            self.websocket_tunnels_active,
+            self.websocket_tunnel_bytes_client_to_upstream,
+            self.websocket_tunnel_bytes_upstream_to_client,
+            self.websocket_tunnel_duration_ms_sum / 1000,
+            self.websocket_tunnel_duration_ms_sum % 1000,
+            closed,
+        });
+        inline for (comptime std.enums.values(WebSocketCloseReason)) |reason| {
+            try out.print("tardigrade_websocket_tunnel_closes_total{{reason=\"{s}\"}} {d}\n", .{ @tagName(reason), self.websocket_tunnel_closes_total[@intFromEnum(reason)] });
         }
     }
 
@@ -2895,6 +2987,31 @@ test "reload and drain counters appear in Prometheus and JSON output (#170)" {
     defer allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"reload_attempts_total\":1") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"drain_forced_closes_total\":2") != null);
+}
+
+test "Metrics renders WebSocket tunnel series (#812)" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+    m.recordWebSocketUpgrade(.relayed);
+    m.recordWebSocketUpgrade(.relayed);
+    m.recordWebSocketUpgrade(.capacity);
+    m.recordWebSocketTunnelClosed(.idle, 10, 20, 1500);
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+    inline for (.{
+        "tardigrade_websocket_upgrades_total{outcome=\"relayed\"} 2\n",
+        "tardigrade_websocket_upgrades_total{outcome=\"capacity\"} 1\n",
+        "tardigrade_websocket_upgrades_total{outcome=\"invalid\"} 0\n",
+        "tardigrade_websocket_tunnels_active 1\n",
+        "tardigrade_websocket_tunnel_bytes_total{direction=\"client_to_upstream\"} 10\n",
+        "tardigrade_websocket_tunnel_bytes_total{direction=\"upstream_to_client\"} 20\n",
+        "tardigrade_websocket_tunnel_duration_seconds_sum 1.500\n",
+        "tardigrade_websocket_tunnel_duration_seconds_count 1\n",
+        "tardigrade_websocket_tunnel_closes_total{reason=\"idle\"} 1\n",
+        "tardigrade_websocket_tunnel_closes_total{reason=\"error\"} 0\n",
+    }) |needle| {
+        try std.testing.expect(std.mem.find(u8, prom, needle) != null);
+    }
 }
 
 test "Metrics toPrometheus produces valid Prometheus text" {

@@ -20,6 +20,7 @@ is not represented here, check the
 | [health-checks](health-checks/README.md) | Active upstream health probing with automatic failover. |
 | [rate-limiting](rate-limiting/README.md) | Per-client request-rate caps with burst allowance. |
 | [forward-auth](forward-auth/README.md) | Delegate access decisions to an external auth service (`auth_request`/`forward_auth` style). |
+| [websocket-proxy](websocket-proxy/README.md) | Relay WebSocket connections through `proxy_pass` with `proxy_websocket`. |
 | [access-logs](access-logs/README.md) | Structured JSON access logging with optional syslog forwarding. |
 | [prometheus-metrics](prometheus-metrics/README.md) | Built-in Prometheus metrics endpoint. |
 | [graceful-reload](graceful-reload/README.md) | Hot-reload config and drain connections on shutdown. |

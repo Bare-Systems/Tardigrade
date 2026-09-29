@@ -96,6 +96,9 @@ check "production-baseline" \
 check "forward-auth" \
     examples/forward-auth/tardigrade.conf
 
+check "websocket-proxy" \
+    examples/websocket-proxy/tardigrade.conf
+
 check "bearclaw" \
     examples/bearclaw/tardigrade.conf \
     "TARDIGRADE_TLS_CERT_PATH=$FIXTURE_CERT" \

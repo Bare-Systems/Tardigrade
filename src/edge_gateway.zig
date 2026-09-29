@@ -536,6 +536,12 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             cfg.worker_threads;
         break :blk @intCast(@max(configured, @as(u32, 1)));
     };
+    // Each WebSocket tunnel holds a worker for its lifetime (#812): unless the
+    // operator sets a cap, never let tunnels take more than half of them.
+    state.websocket_default_max_tunnels = @intCast(@max(worker_count / 2, 1));
+    if (cfg.proxy_websocket_max_tunnels > 0 and cfg.proxy_websocket_max_tunnels >= worker_count) {
+        state.logger.warn(null, "proxy_websocket_max_tunnels={d} can hold every worker thread ({d}); ordinary requests may stall while that many tunnels are open", .{ cfg.proxy_websocket_max_tunnels, worker_count });
+    }
     var worker_ctx = WorkerContext{
         .config_store = &config_store,
         .state = &state,
@@ -2043,6 +2049,11 @@ const WaitingEncryptedHttpConnection = struct {
 
     pub fn rawFd(self: *const WaitingEncryptedHttpConnection) std.posix.fd_t {
         return self.inner.rawFd();
+    }
+
+    /// The non-blocking view a WebSocket tunnel drives directly (#812).
+    pub fn tunnelEndpoint(self: *WaitingEncryptedHttpConnection) http.tunnel.EncryptedEndpoint {
+        return .{ .conn = &self.inner };
     }
 
     pub fn setReadTimeoutMs(self: *WaitingEncryptedHttpConnection, timeout_ms: u32) void {
@@ -4504,6 +4515,7 @@ fn executeH1PostPreflightOrchestration(
         .too_early, .defer_until_handshake => {
             ctx.early_data_action = if (early_decision == .defer_until_handshake) .deferred else .too_early;
             state.metricsRecordEarlyDataDecision(.h1, if (ctx.early_data_action == .deferred) .deferred else .too_early);
+            ghandlers.recordWebSocketDenial(allocator, cfg, state, request);
             const status = try hooks.rejectEarly(allocator, writer, state, ctx, request, correlation_id, keep_alive.*);
             return .{ .terminal_status = status };
         },
@@ -4512,10 +4524,12 @@ fn executeH1PostPreflightOrchestration(
     try hooks.auth(allocator, cfg, state, ctx, &request.headers);
 
     if (try hooks.middleware(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*)) {
+        ghandlers.recordWebSocketDenial(allocator, cfg, state, request);
         return .logged_terminal;
     }
 
     if (ga.evaluatePolicy(state, cfg, request.method.toString(), request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |reason| {
+        ghandlers.recordWebSocketDenial(allocator, cfg, state, request);
         try gp.sendApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive.*, state);
         state.metricsRecord(403);
         state.metricsRecordErrorCode("forbidden");
@@ -4652,6 +4666,14 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     }
 
     h2BeginReadScope(conn);
+    // Bytes read past this request (a pipelined request, or the first
+    // WebSocket frames) stay at `pending_buf[pending_start..]` until the
+    // request is done: its parsed path and headers are slices of the same
+    // buffer, so moving them to the front any earlier would corrupt it.
+    var pending_start: usize = 0;
+    defer if (pending_start > 0 and session.pending_len > 0) {
+        std.mem.copyForwards(u8, pending_buf[0..session.pending_len], pending_buf[pending_start..][0..session.pending_len]);
+    };
     var streaming_request_body: ?gproxy_runtime.StreamingRequestBody = null;
     var request: http.Request = undefined;
     var request_initialized = false;
@@ -4716,13 +4738,8 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 };
                 const bytes_consumed = parse_result.bytes_consumed;
                 const request_transport_early = h1ConsumeRequestEarlyProvenance(session, old_pending_len, total_read, bytes_consumed, h2LastReadEarlyPrefixLenBounded(conn, total_read));
-                if (bytes_consumed < total_read) {
-                    const remaining = total_read - bytes_consumed;
-                    std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
-                    session.pending_len = remaining;
-                } else {
-                    session.pending_len = 0;
-                }
+                pending_start = bytes_consumed;
+                session.pending_len = total_read - bytes_consumed;
                 if (session.pending_len < session.pending_early_prefix_len) session.pending_early_prefix_len = session.pending_len;
                 request = parse_result.request;
                 request_initialized = true;
@@ -4747,13 +4764,8 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         };
         const bytes_consumed = parse_result.bytes_consumed;
         const request_transport_early = h1ConsumeRequestEarlyProvenance(session, old_pending_len, total_read, bytes_consumed, h2LastReadEarlyPrefixLenBounded(conn, total_read));
-        if (bytes_consumed < total_read) {
-            const remaining = total_read - bytes_consumed;
-            std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
-            session.pending_len = remaining;
-        } else {
-            session.pending_len = 0;
-        }
+        pending_start = bytes_consumed;
+        session.pending_len = total_read - bytes_consumed;
         if (session.pending_len < session.pending_early_prefix_len) session.pending_early_prefix_len = session.pending_len;
 
         request = parse_result.request;
@@ -5024,6 +5036,13 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         effective_cfg.named_locations,
     );
 
+    // Client bytes that arrived behind this head. Only a WebSocket upgrade
+    // consumes them, as the first tunnel bytes (#812).
+    ctx.downstream_buffered_input = pending_buf[pending_start..][0..session.pending_len];
+    defer if (ctx.tunnel != null) {
+        session.pending_len = 0;
+        session.pending_early_prefix_len = 0;
+    };
     const outcome = try executeH1PostPreflightOrchestration(
         conn,
         allocator,

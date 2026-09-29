@@ -42,6 +42,17 @@ Removed unconditionally before the upstream request is sent:
 | `Content-Length` | Re-calculated by Tardigrade |
 | `Host` | Replaced with the upstream host |
 
+`Upgrade` and `Connection` are stripped on every location. On a location with
+`proxy_websocket on` (#812), a validated WebSocket handshake gets
+`Upgrade: websocket` and `Connection: Upgrade` set by Tardigrade on the
+upstream hop, never the client's own values; other locations never forward an
+upgrade and refuse an upstream `101` as a protocol error. A relayed `101` must
+carry the `Sec-WebSocket-Accept` computed from the client's key, so an origin
+(or an attacker in front of one) cannot switch a connection the client did
+not ask to switch. Handshakes carrying a body or body framing are rejected,
+and `proxy_websocket_origins` blocks cross-site WebSocket hijacking from
+browsers.
+
 Additionally, any header named by the inbound `Connection` header value is
 treated as hop-by-hop and removed. Example: if the client sends
 `Connection: X-My-Custom-Header`, Tardigrade strips `X-My-Custom-Header`

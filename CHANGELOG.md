@@ -2,6 +2,70 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [0.8.2] - 2026-09-29
+
+### Added
+
+- **WebSocket relaying through `proxy_pass` (#812)** — a location with
+  `proxy_websocket on;` relays HTTP/1.1 WebSocket connections (RFC 6455) to
+  its origin, so applications behind Tardigrade can use WebSockets without a
+  second proxy. The handshake runs every gate an ordinary request does (rate
+  limits, ACLs, `auth required`, `forward_auth`, path policy) before a fresh
+  upstream connection is opened; a denied handshake never reaches the origin,
+  and a replay-exposed (0-RTT) handshake gets 425. Handshakes are validated
+  strictly (GET over HTTP/1.1, `Connection: upgrade`, a 16-byte
+  `Sec-WebSocket-Key`, version 13, no body or body framing): 400 otherwise,
+  426 with `Sec-WebSocket-Version: 13` for another version. The origin gets
+  the usual forwarding, request-ID, trace, identity and `proxy_set_header`
+  headers with `Upgrade: websocket` and `Connection: Upgrade` set by
+  Tardigrade; subprotocol and extension negotiation pass through. Its `101`
+  must carry the matching `Sec-WebSocket-Accept` (502 otherwise); any other
+  answer is relayed as an ordinary response. Upgrade connections are never
+  pooled, retried, replayed or mirrored. After the `101`, bytes are tunneled
+  both ways without frame parsing, with one fixed buffer per direction
+  charged to the proxy-buffer limits, so a slow reader backpressures the
+  sender instead of growing memory. Tunnels close on either side's close,
+  after `proxy_websocket_idle_timeout_ms` (default 60 s), after the optional
+  `proxy_websocket_max_lifetime_ms`, or at the end of the shutdown drain
+  window. `proxy_websocket_origins` adds an `Origin` allowlist against
+  cross-site WebSocket hijacking. Each tunnel holds a worker thread, so
+  `proxy_websocket_max_tunnels` (`TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS`)
+  caps them per process (default: half the worker threads) and an
+  over-capacity handshake gets 503 before the origin is contacted. `wss://`
+  works on both hops over the native TLS stack. HTTP/2 and HTTP/3 extended
+  CONNECT are not supported and not advertised, so browsers use HTTP/1.1 for
+  WebSockets. Without `proxy_websocket`, `Upgrade` is still stripped and an
+  upstream `101` is still refused. New metrics:
+  `tardigrade_websocket_upgrades_total{outcome}`,
+  `tardigrade_websocket_tunnels_active`,
+  `tardigrade_websocket_tunnel_bytes_total{direction}`,
+  `tardigrade_websocket_tunnel_duration_seconds` and
+  `tardigrade_websocket_tunnel_closes_total{reason}`; the handshake's access
+  log line is written when the tunnel closes, with `tunnel_close_reason`,
+  `tunnel_duration_ms` and byte counts. See
+  [examples/websocket-proxy](examples/websocket-proxy/README.md).
+
+### Fixed
+
+- **Pipelined HTTP/1.1 requests are no longer dropped.** When a client sent
+  more than one request in a single write, only the first was answered: the
+  bytes read behind it were discarded, and the connection then sat idle
+  until its timeout. They are now kept and served in order. Moving those
+  bytes to the front of the connection buffer now waits until the current
+  request is finished, since its parsed path and headers point into that
+  buffer.
+
+### Documentation
+
+- WebSocket and server-sent events (#762): `docs/CONFIGURATION.md` documents
+  `proxy_websocket`, `docs/PROXY_STREAMING.md` documents proxying SSE as a
+  streamed response (prompt flushing, bounded slow readers, upstream stalls,
+  reconnects, and the shutdown caveat for long-lived streams), and
+  `docs/SUPPORT_MATRIX.md` replaces the stale "WebSocket, SSE, and mux
+  realtime paths" entry. The `TARDIGRADE_WEBSOCKET_*` and `TARDIGRADE_SSE_*`
+  settings, left over from removed built-in endpoints, are documented as
+  having no effect.
+
 ## [0.8.1] - 2026-09-28
 
 ### Added

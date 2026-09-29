@@ -22697,3 +22697,1138 @@ test "explain never touches a config file: an invalid TARDIGRADE_CONFIG_PATH doe
     try assertContains(res.stdout, "listen");
     try std.testing.expectEqualStrings("", res.stderr);
 }
+
+// ---- WebSocket upgrade relaying through proxy_pass (#812) ------------------
+
+const ws_test_key = "dGhlIHNhbXBsZSBub25jZQ==";
+const ws_test_accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+
+/// One side of a WebSocket connection over a plain socket, with its own read
+/// buffer so bytes that arrive behind an HTTP head (pipelined frames) are
+/// never lost.
+const WsPeer = struct {
+    stream: compat.NetStream,
+    buf: [16 * 1024]u8 = undefined,
+    start: usize = 0,
+    end: usize = 0,
+
+    fn fill(self: *WsPeer) !void {
+        if (self.start == self.end) {
+            self.start = 0;
+            self.end = 0;
+        } else if (self.end == self.buf.len) {
+            std.mem.copyForwards(u8, self.buf[0 .. self.end - self.start], self.buf[self.start..self.end]);
+            self.end -= self.start;
+            self.start = 0;
+        }
+        const n = try readSocketWithPoll(self.stream.handle, self.buf[self.end..], 10_000);
+        if (n == 0) return error.ConnectionClosed;
+        self.end += n;
+    }
+
+    fn readHead(self: *WsPeer, allocator: std.mem.Allocator) ![]u8 {
+        while (true) {
+            if (std.mem.find(u8, self.buf[self.start..self.end], "\r\n\r\n")) |idx| {
+                const head = try allocator.dupe(u8, self.buf[self.start .. self.start + idx + 4]);
+                self.start += idx + 4;
+                return head;
+            }
+            if (self.end - self.start == self.buf.len) return error.HeadTooLarge;
+            try self.fill();
+        }
+    }
+
+    fn readExact(self: *WsPeer, out: []u8) !void {
+        var off: usize = 0;
+        while (off < out.len) {
+            if (self.start == self.end) try self.fill();
+            const n = @min(out.len - off, self.end - self.start);
+            @memcpy(out[off..][0..n], self.buf[self.start..][0..n]);
+            self.start += n;
+            off += n;
+        }
+    }
+
+    fn readFrame(self: *WsPeer, allocator: std.mem.Allocator, max_payload: usize) !WebSocketFrame {
+        var hdr: [2]u8 = undefined;
+        try self.readExact(&hdr);
+        var len: usize = hdr[1] & 0x7F;
+        if (len == 126) {
+            var ext: [2]u8 = undefined;
+            try self.readExact(&ext);
+            len = std.mem.readInt(u16, &ext, .big);
+        } else if (len == 127) {
+            var ext: [8]u8 = undefined;
+            try self.readExact(&ext);
+            len = @intCast(std.mem.readInt(u64, &ext, .big));
+        }
+        if (len > max_payload) return error.FrameTooLarge;
+        var mask_key: [4]u8 = .{ 0, 0, 0, 0 };
+        const masked = (hdr[1] & 0x80) != 0;
+        if (masked) try self.readExact(&mask_key);
+        const payload = try allocator.alloc(u8, len);
+        errdefer allocator.free(payload);
+        try self.readExact(payload);
+        if (masked) for (payload, 0..) |*byte, i| {
+            byte.* ^= mask_key[i % 4];
+        };
+        return .{ .fin = (hdr[0] & 0x80) != 0, .opcode = @enumFromInt(@as(u4, @truncate(hdr[0]))), .payload = payload };
+    }
+
+    fn writeFrame(self: *WsPeer, allocator: std.mem.Allocator, opcode: WebSocketOpCode, payload: []const u8, fin: bool, masked: bool) !void {
+        const bytes = try encodeWsFrame(allocator, opcode, payload, fin, masked);
+        defer allocator.free(bytes);
+        try self.stream.writeAll(bytes);
+    }
+
+    /// Everything until the peer closes.
+    fn readToEnd(self: *WsPeer, allocator: std.mem.Allocator) ![]u8 {
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+        while (true) {
+            try out.appendSlice(self.buf[self.start..self.end]);
+            self.start = self.end;
+            self.fill() catch |err| switch (err) {
+                error.ConnectionClosed, error.ConnectionResetByPeer => break,
+                else => return err,
+            };
+        }
+        return out.toOwnedSlice();
+    }
+
+    /// True once the peer has closed its side (reads return EOF).
+    fn expectClosed(self: *WsPeer, timeout_ms: i32) !void {
+        var tmp: [256]u8 = undefined;
+        const deadline = compat.milliTimestamp() + timeout_ms;
+        while (compat.milliTimestamp() < deadline) {
+            const n = readSocketWithPoll(self.stream.handle, &tmp, 200) catch |err| switch (err) {
+                error.ReadTimeout => continue,
+                error.ConnectionResetByPeer => return,
+                else => return err,
+            };
+            if (n == 0) return;
+        }
+        return error.StillOpen;
+    }
+};
+
+/// Encode one frame; clients mask (RFC 6455 §5.3), servers do not.
+fn encodeWsFrame(allocator: std.mem.Allocator, opcode: WebSocketOpCode, payload: []const u8, fin: bool, masked: bool) ![]u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    var first: u8 = @intFromEnum(opcode);
+    if (fin) first |= 0x80;
+    try out.append(first);
+    const mask_bit: u8 = if (masked) 0x80 else 0;
+    if (payload.len < 126) {
+        try out.append(mask_bit | @as(u8, @intCast(payload.len)));
+    } else if (payload.len <= std.math.maxInt(u16)) {
+        try out.append(mask_bit | 126);
+        var ext: [2]u8 = undefined;
+        std.mem.writeInt(u16, &ext, @intCast(payload.len), .big);
+        try out.appendSlice(&ext);
+    } else {
+        try out.append(mask_bit | 127);
+        var ext: [8]u8 = undefined;
+        std.mem.writeInt(u64, &ext, payload.len, .big);
+        try out.appendSlice(&ext);
+    }
+    const mask_key = [_]u8{ 0x37, 0xfa, 0x21, 0x3d };
+    if (masked) try out.appendSlice(&mask_key);
+    const start = out.items.len;
+    try out.appendSlice(payload);
+    if (masked) for (out.items[start..], 0..) |*byte, i| {
+        byte.* ^= mask_key[i % 4];
+    };
+    return out.toOwnedSlice();
+}
+
+fn wsAcceptFor(key: []const u8, out: *[28]u8) []const u8 {
+    var sha = std.crypto.hash.Sha1.init(.{});
+    sha.update(key);
+    sha.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    var digest: [20]u8 = undefined;
+    sha.final(&digest);
+    return std.base64.standard.Encoder.encode(out, &digest);
+}
+
+const WsOriginMode = enum {
+    /// 101 with the correct Sec-WebSocket-Accept, then echo frames.
+    echo,
+    /// 101 with a wrong Sec-WebSocket-Accept.
+    bad_accept,
+    /// A plain 403 with a body.
+    refuse,
+};
+
+/// A minimal RFC 6455 origin: one thread per connection, so several tunnels
+/// can be open at once. Echoes data frames, answers pings, and completes the
+/// close handshake by echoing the close frame and closing TCP.
+const WsOrigin = struct {
+    allocator: std.mem.Allocator,
+    server: compat.NetServer,
+    mode: WsOriginMode,
+    subprotocol: ?[]const u8 = null,
+    /// A text frame sent in the same write as the 101 head.
+    greeting: ?[]const u8 = null,
+    thread: ?std.Thread = null,
+    stop_flag: std.atomic.Value(bool) = .init(false),
+    mutex: compat.Mutex = .{},
+    handshakes: u32 = 0,
+    last_head: ?[]u8 = null,
+    conn_threads: std.array_list.Managed(std.Thread),
+    conn_fds: std.array_list.Managed(std.posix.fd_t),
+
+    fn start(allocator: std.mem.Allocator, mode: WsOriginMode) !*WsOrigin {
+        const origin = try allocator.create(WsOrigin);
+        errdefer allocator.destroy(origin);
+        origin.* = .{
+            .allocator = allocator,
+            .server = try compat.listenTcp(test_host, 0),
+            .mode = mode,
+            .conn_threads = .init(allocator),
+            .conn_fds = .init(allocator),
+        };
+        return origin;
+    }
+
+    fn run(self: *WsOrigin) !void {
+        self.thread = try std.Thread.spawn(.{}, wsOriginAcceptLoop, .{self});
+    }
+
+    fn port(self: *const WsOrigin) u16 {
+        return self.server.port();
+    }
+
+    fn stop(self: *WsOrigin) void {
+        self.stop_flag.store(true, .seq_cst);
+        self.mutex.lock();
+        for (self.conn_fds.items) |fd| _ = std.c.shutdown(fd, std.posix.SHUT.RDWR);
+        self.mutex.unlock();
+        wakeListener(self.port());
+        if (self.thread) |thread| thread.join();
+        for (self.conn_threads.items) |thread| thread.join();
+        self.conn_threads.deinit();
+        self.conn_fds.deinit();
+        self.server.deinit();
+        if (self.last_head) |head| self.allocator.free(head);
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    fn handshakeCount(self: *WsOrigin) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.handshakes;
+    }
+
+    /// Value of `name` on the last handshake the origin received, or null.
+    fn handshakeHeader(self: *WsOrigin, allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const head = self.last_head orelse return null;
+        const value = headerValue(head, name) orelse return null;
+        return try allocator.dupe(u8, value);
+    }
+
+    fn handshakeHeaderCount(self: *WsOrigin, name: []const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return countHeaderOccurrences(self.last_head orelse return 0, name);
+    }
+};
+
+fn wsOriginAcceptLoop(origin: *WsOrigin) void {
+    while (!origin.stop_flag.load(.seq_cst)) {
+        const conn = origin.server.accept() catch {
+            if (origin.stop_flag.load(.seq_cst)) return;
+            continue;
+        };
+        if (origin.stop_flag.load(.seq_cst)) {
+            var stream = conn.stream;
+            stream.close();
+            return;
+        }
+        origin.mutex.lock();
+        defer origin.mutex.unlock();
+        origin.conn_fds.append(conn.stream.handle) catch {};
+        const thread = std.Thread.spawn(.{}, wsOriginServe, .{ origin, conn.stream }) catch {
+            var stream = conn.stream;
+            stream.close();
+            continue;
+        };
+        origin.conn_threads.append(thread) catch thread.detach();
+    }
+}
+
+fn wsOriginServe(origin: *WsOrigin, stream: compat.NetStream) void {
+    wsOriginHandle(origin, stream) catch {};
+    origin.mutex.lock();
+    for (origin.conn_fds.items, 0..) |fd, i| {
+        if (fd == stream.handle) {
+            _ = origin.conn_fds.swapRemove(i);
+            break;
+        }
+    }
+    origin.mutex.unlock();
+    var owned = stream;
+    owned.close();
+}
+
+fn wsOriginHandle(origin: *WsOrigin, stream: compat.NetStream) !void {
+    const allocator = std.heap.page_allocator;
+    var peer = WsPeer{ .stream = stream };
+    const head = try peer.readHead(allocator);
+    {
+        origin.mutex.lock();
+        defer origin.mutex.unlock();
+        origin.handshakes += 1;
+        if (origin.last_head) |old| origin.allocator.free(old);
+        origin.last_head = try origin.allocator.dupe(u8, head);
+    }
+    defer allocator.free(head);
+
+    switch (origin.mode) {
+        .refuse => {
+            try stream.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: close\r\n\r\norigin-denied");
+            return;
+        },
+        .bad_accept => {
+            try stream.writeAll("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n");
+            peer.expectClosed(5_000) catch {};
+            return;
+        },
+        .echo => {},
+    }
+
+    var accept_buf: [28]u8 = undefined;
+    const accept = wsAcceptFor(headerValue(head, "Sec-WebSocket-Key") orelse return error.MissingKey, &accept_buf);
+    var reply = std.array_list.Managed(u8).init(allocator);
+    defer reply.deinit();
+    try reply.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSet-Cookie: origin-session=1\r\n", .{accept});
+    if (origin.subprotocol) |protocol| try reply.print("Sec-WebSocket-Protocol: {s}\r\n", .{protocol});
+    try reply.appendSlice("\r\n");
+    if (origin.greeting) |greeting| {
+        const frame = try encodeWsFrame(allocator, .text, greeting, true, false);
+        defer allocator.free(frame);
+        try reply.appendSlice(frame);
+    }
+    try stream.writeAll(reply.items);
+
+    while (true) {
+        var frame = peer.readFrame(allocator, 4 * 1024 * 1024) catch return;
+        defer frame.deinit(allocator);
+        switch (frame.opcode) {
+            .ping => try peer.writeFrame(allocator, .pong, frame.payload, true, false),
+            .pong => {},
+            .close => {
+                try peer.writeFrame(allocator, .close, frame.payload, true, false);
+                return;
+            },
+            .text, .binary, .continuation => try peer.writeFrame(allocator, frame.opcode, frame.payload, frame.fin, false),
+        }
+    }
+}
+
+const WsHandshake = struct {
+    peer: *WsPeer,
+    head: []u8,
+    status: u16,
+
+    fn deinit(self: *WsHandshake, allocator: std.mem.Allocator) void {
+        var stream = self.peer.stream;
+        stream.close();
+        allocator.destroy(self.peer);
+        allocator.free(self.head);
+    }
+
+    fn header(self: *const WsHandshake, name: []const u8) ?[]const u8 {
+        return headerValue(self.head, name);
+    }
+};
+
+/// Send a WebSocket handshake (plus `trailing` bytes in the same write) and
+/// read the response head, whatever its status.
+fn wsHandshake(allocator: std.mem.Allocator, port: u16, path: []const u8, headers: []const RequestHeader, trailing: []const u8) !WsHandshake {
+    var stream = try compat.tcpConnectToHost(allocator, test_host, port);
+    errdefer stream.close();
+    try setStreamTimeouts(&stream, 10_000);
+    var request = std.array_list.Managed(u8).init(allocator);
+    defer request.deinit();
+    try request.print("GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {s}\r\nSec-WebSocket-Version: 13\r\n", .{ path, test_host, port, ws_test_key });
+    for (headers) |header| try request.print("{s}: {s}\r\n", .{ header.name, header.value });
+    try request.appendSlice("\r\n");
+    try request.appendSlice(trailing);
+    try stream.writeAll(request.items);
+
+    const peer = try allocator.create(WsPeer);
+    errdefer allocator.destroy(peer);
+    peer.* = .{ .stream = stream };
+    const head = try peer.readHead(allocator);
+    errdefer allocator.free(head);
+    return .{ .peer = peer, .head = head, .status = try parseStatusCode(head) };
+}
+
+fn wsExpectEcho(allocator: std.mem.Allocator, peer: *WsPeer, opcode: WebSocketOpCode, payload: []const u8) !void {
+    try peer.writeFrame(allocator, opcode, payload, true, true);
+    var echoed = try peer.readFrame(allocator, 4 * 1024 * 1024);
+    defer echoed.deinit(allocator);
+    try std.testing.expectEqual(opcode, echoed.opcode);
+    try std.testing.expect(echoed.fin);
+    try std.testing.expectEqualSlices(u8, payload, echoed.payload);
+}
+
+fn wsProxyConfig(allocator: std.mem.Allocator, origin_port: u16, extra_ws_directives: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /ws/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\    proxy_set_header X-Pinned "pinned-$remote_addr";
+        \\{s}
+        \\}}
+        \\
+        \\location /plain/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin_port, extra_ws_directives, test_host, origin_port });
+}
+
+fn wsMetrics(allocator: std.mem.Allocator, port: u16) !HttpResponse {
+    return sendRequest(allocator, port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+}
+
+fn wsMetricValue(body: []const u8, name: []const u8, label: []const u8) u64 {
+    return prometheusLabeledMetricValue(body, name, &.{label}) orelse 0;
+}
+
+/// Tunnels hold a worker each; give the process room for several plus the
+/// metrics and health requests the tests make alongside them.
+const ws_worker_env = EnvPair{ .name = "TARDIGRADE_WORKER_THREADS", .value = "8" };
+
+test "proxy_websocket relays text, binary, ping/pong, fragments and large messages both ways (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    origin.subprotocol = "chat.v2";
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var hs = try wsHandshake(allocator, tardigrade.port, "/ws/chat?room=1", &.{
+        .{ .name = "Sec-WebSocket-Protocol", .value = "chat.v1, chat.v2" },
+        .{ .name = "Sec-WebSocket-Extensions", .value = "x-test-ext" },
+    }, "");
+    defer hs.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), hs.status);
+    try std.testing.expectEqualStrings(ws_test_accept, hs.header("Sec-WebSocket-Accept").?);
+    try std.testing.expectEqualStrings("chat.v2", hs.header("Sec-WebSocket-Protocol").?);
+    try std.testing.expect(headerHasToken(hs.head, "Upgrade", "websocket"));
+    try std.testing.expect(headerHasToken(hs.head, "Connection", "upgrade"));
+    try std.testing.expectEqualStrings("origin-session=1", hs.header("Set-Cookie").?);
+    try std.testing.expect(hs.header("X-Request-ID") != null);
+
+    // The origin saw a real handshake with Tardigrade's forwarding headers.
+    inline for (.{
+        .{ "Upgrade", "websocket" },
+        .{ "Connection", "Upgrade" },
+        .{ "Sec-WebSocket-Key", ws_test_key },
+        .{ "Sec-WebSocket-Version", "13" },
+        .{ "Sec-WebSocket-Protocol", "chat.v1, chat.v2" },
+        .{ "Sec-WebSocket-Extensions", "x-test-ext" },
+        .{ "X-Pinned", "pinned-127.0.0.1" },
+        .{ "X-Forwarded-For", "127.0.0.1" },
+        .{ "X-Real-IP", "127.0.0.1" },
+        .{ "X-Forwarded-Proto", "http" },
+    }) |pair| {
+        const value = (try origin.handshakeHeader(allocator, pair[0])) orelse {
+            std.debug.print("origin handshake missing {s}\n", .{pair[0]});
+            return error.MissingHeader;
+        };
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings(pair[1], value);
+    }
+    try std.testing.expectEqual(@as(usize, 1), origin.handshakeHeaderCount("Upgrade"));
+    try std.testing.expectEqual(@as(usize, 1), origin.handshakeHeaderCount("Connection"));
+    const origin_path = blk: {
+        origin.mutex.lock();
+        defer origin.mutex.unlock();
+        break :blk try allocator.dupe(u8, origin.last_head.?[0..std.mem.findScalar(u8, origin.last_head.?, '\r').?]);
+    };
+    defer allocator.free(origin_path);
+    // The location prefix is stripped exactly as for ordinary proxying.
+    try std.testing.expectEqualStrings("GET /chat?room=1 HTTP/1.1", origin_path);
+
+    const peer = hs.peer;
+    try wsExpectEcho(allocator, peer, .text, "hello through tardigrade");
+    try wsExpectEcho(allocator, peer, .binary, &[_]u8{ 0, 1, 2, 0xff, 0xfe });
+
+    // Ping reaches the origin and its pong comes back.
+    try peer.writeFrame(allocator, .ping, "are-you-there", true, true);
+    var pong = try peer.readFrame(allocator, 1024);
+    defer pong.deinit(allocator);
+    try std.testing.expectEqual(WebSocketOpCode.pong, pong.opcode);
+    try std.testing.expectEqualStrings("are-you-there", pong.payload);
+
+    // A fragmented message: frames are relayed as-is, never reassembled.
+    try peer.writeFrame(allocator, .text, "frag-one|", false, true);
+    try peer.writeFrame(allocator, .continuation, "frag-two", true, true);
+    var first = try peer.readFrame(allocator, 1024);
+    defer first.deinit(allocator);
+    var second = try peer.readFrame(allocator, 1024);
+    defer second.deinit(allocator);
+    try std.testing.expect(!first.fin and first.opcode == .text);
+    try std.testing.expect(second.fin and second.opcode == .continuation);
+    const reassembled = try std.mem.concat(allocator, u8, &.{ first.payload, second.payload });
+    defer allocator.free(reassembled);
+    try std.testing.expectEqualStrings("frag-one|frag-two", reassembled);
+
+    // Far larger than the relay buffers in both directions.
+    const big = try allocator.alloc(u8, 3 * 1024 * 1024 + 17);
+    defer allocator.free(big);
+    for (big, 0..) |*byte, i| byte.* = @truncate(i *% 31);
+    try wsExpectEcho(allocator, peer, .binary, big);
+
+    // Client-initiated close handshake: the origin echoes the close and hangs up.
+    try peer.writeFrame(allocator, .close, &[_]u8{ 0x03, 0xe8 }, true, true);
+    var close_reply = try peer.readFrame(allocator, 1024);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(WebSocketOpCode.close, close_reply.opcode);
+    try peer.expectClosed(5_000);
+
+    try waitForLogSubstring(allocator, tardigrade.log_path, "\"tunnel_close_reason\":\"upstream\"", 5_000);
+    var metrics = try wsMetrics(allocator, tardigrade.port);
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"relayed\""));
+    try std.testing.expectEqual(@as(u64, 0), prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active").?);
+    try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"upstream\""));
+    try std.testing.expect(wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_bytes_total", "direction=\"client_to_upstream\"") > big.len);
+    try std.testing.expect(wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_bytes_total", "direction=\"upstream_to_client\"") > big.len);
+}
+
+test "proxy_websocket relays a frame pipelined behind the handshake and one sent with the 101 (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    origin.greeting = "origin-hello";
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    const early = try encodeWsFrame(allocator, .text, "client-sent-early", true, true);
+    defer allocator.free(early);
+    var hs = try wsHandshake(allocator, tardigrade.port, "/ws/early", &.{}, early);
+    defer hs.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), hs.status);
+
+    var greeting = try hs.peer.readFrame(allocator, 1024);
+    defer greeting.deinit(allocator);
+    try std.testing.expectEqualStrings("origin-hello", greeting.payload);
+    var echoed = try hs.peer.readFrame(allocator, 1024);
+    defer echoed.deinit(allocator);
+    try std.testing.expectEqualStrings("client-sent-early", echoed.payload);
+}
+
+test "locations without proxy_websocket strip Upgrade and never relay an upstream 101 (#812)" {
+    const allocator = std.testing.allocator;
+    // This origin answers 101 to anything, like a hostile or confused upstream.
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var hs = try wsHandshake(allocator, tardigrade.port, "/plain/socket", &.{}, "");
+    defer hs.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 502), hs.status);
+    try std.testing.expect(hs.header("Upgrade") == null);
+    try std.testing.expect(try origin.handshakeHeader(allocator, "Upgrade") == null);
+    try std.testing.expect(!headerHasToken(origin.last_head.?, "Connection", "upgrade"));
+}
+
+test "proxy_websocket rejects malformed handshakes before contacting the origin (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    const bad_requests = [_]struct { raw: []const u8, status: u16 }{
+        // No key.
+        .{ .raw = "GET /ws/x HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n", .status = 400 },
+        // A key that is not 16 base64 bytes.
+        .{ .raw = "GET /ws/x HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: short\r\nSec-WebSocket-Version: 13\r\n\r\n", .status = 400 },
+        // Not GET.
+        .{ .raw = "POST /ws/x HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n", .status = 400 },
+        // A body on the handshake (request smuggling shape).
+        .{ .raw = "GET /ws/x HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nContent-Length: 5\r\n\r\nhello", .status = 400 },
+        // Upgrade without Connection: Upgrade.
+        .{ .raw = "GET /ws/x HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", .status = 400 },
+    };
+    for (bad_requests) |case| {
+        var response = try sendRawRequest(allocator, tardigrade.port, case.raw);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status_code);
+    }
+
+    var old_version = try sendRawRequest(allocator, tardigrade.port, "GET /ws/x HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n");
+    defer old_version.deinit();
+    try std.testing.expectEqual(@as(u16, 426), old_version.status_code);
+    try std.testing.expectEqualStrings("13", old_version.header("Sec-WebSocket-Version").?);
+
+    try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
+    var metrics = try wsMetrics(allocator, tardigrade.port);
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u64, bad_requests.len + 1), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"invalid\""));
+}
+
+test "proxy_websocket relays a non-101 origin answer and refuses a 101 with a wrong accept (#812)" {
+    const allocator = std.testing.allocator;
+    const refusing = try WsOrigin.start(allocator, .refuse);
+    defer refusing.stop();
+    try refusing.run();
+    const lying = try WsOrigin.start(allocator, .bad_accept);
+    defer lying.stop();
+    try lying.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /refuse/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+        \\location /lie/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, refusing.port(), test_host, lying.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var refused = try wsHandshake(allocator, tardigrade.port, "/refuse/x", &.{}, "");
+    defer refused.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 403), refused.status);
+    try std.testing.expect(refused.header("Upgrade") == null);
+    // The ordinary response is complete, and the connection is not switched:
+    // it ends after the body.
+    const rest = try refused.peer.readToEnd(allocator);
+    defer allocator.free(rest);
+    const body = if (headerHasToken(refused.head, "Transfer-Encoding", "chunked"))
+        try decodeChunkedHttpBody(allocator, rest)
+    else
+        try allocator.dupe(u8, rest);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("origin-denied", body);
+
+    var lied = try wsHandshake(allocator, tardigrade.port, "/lie/x", &.{}, "");
+    defer lied.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 502), lied.status);
+    try std.testing.expect(lied.header("Sec-WebSocket-Accept") == null);
+
+    var metrics = try wsMetrics(allocator, tardigrade.port);
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"upstream_refused\""));
+    try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"upstream_error\""));
+    try std.testing.expectEqual(@as(u64, 0), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"relayed\""));
+}
+
+test "proxy_websocket runs auth, forward_auth and Origin checks before any upstream connection (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+    var auth = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 401, .body = "log in first", .connection_header = "close", .headers = &.{
+            .{ .name = "WWW-Authenticate", .value = "Bearer realm=\"ws\"" },
+        } },
+        .{ .status_code = 200, .body = "", .connection_header = "close", .headers = &.{
+            .{ .name = "X-Auth-Request-User", .value = "ws-alice" },
+            .{ .name = "Set-Cookie", .value = "auth-refreshed=1" },
+        } },
+    });
+    defer auth.stop();
+    try auth.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /guarded/ {{
+        \\    auth required;
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+        \\location /fa/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_upstream_headers X-Auth-Request-User;
+        \\    forward_auth_client_headers Set-Cookie;
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+        \\location /origin-locked/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\    proxy_websocket_origins https://app.example.test;
+        \\}}
+    , .{ test_host, origin.port(), test_host, auth.port(), test_host, origin.port(), test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var unauthenticated = try wsHandshake(allocator, tardigrade.port, "/guarded/x", &.{}, "");
+    defer unauthenticated.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 401), unauthenticated.status);
+
+    var fa_denied = try wsHandshake(allocator, tardigrade.port, "/fa/x", &.{
+        .{ .name = "X-Auth-Request-User", .value = "forged" },
+    }, "");
+    defer fa_denied.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 401), fa_denied.status);
+    try std.testing.expectEqualStrings("Bearer realm=\"ws\"", fa_denied.header("WWW-Authenticate").?);
+
+    var cross_site = try wsHandshake(allocator, tardigrade.port, "/origin-locked/x", &.{
+        .{ .name = "Origin", .value = "https://evil.example.test" },
+    }, "");
+    defer cross_site.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 403), cross_site.status);
+
+    // No gate let a denied handshake reach the origin.
+    try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
+
+    // forward_auth allow: auth-asserted headers go upstream (the client's
+    // forgery does not), and the auth cookie decorates the relayed 101.
+    var fa_allowed = try wsHandshake(allocator, tardigrade.port, "/fa/x", &.{
+        .{ .name = "X-Auth-Request-User", .value = "forged" },
+    }, "");
+    defer fa_allowed.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), fa_allowed.status);
+    try std.testing.expect(countHeaderOccurrences(fa_allowed.head, "Set-Cookie") == 2);
+    try std.testing.expect(std.mem.find(u8, fa_allowed.head, "auth-refreshed=1") != null);
+    const asserted = (try origin.handshakeHeader(allocator, "X-Auth-Request-User")).?;
+    defer allocator.free(asserted);
+    try std.testing.expectEqualStrings("ws-alice", asserted);
+    try std.testing.expectEqual(@as(usize, 1), origin.handshakeHeaderCount("X-Auth-Request-User"));
+    try wsExpectEcho(allocator, fa_allowed.peer, .text, "authorized");
+
+    var same_site = try wsHandshake(allocator, tardigrade.port, "/origin-locked/x", &.{
+        .{ .name = "Origin", .value = "https://app.example.test" },
+    }, "");
+    defer same_site.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), same_site.status);
+
+    var metrics = try wsMetrics(allocator, tardigrade.port);
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u64, 3), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"denied\""));
+}
+
+test "proxy_websocket handshakes count against rate limits and are denied before the origin (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .rate_limit_rps = "1",
+        .rate_limit_burst = "1",
+        .extra_env = &.{ws_worker_env},
+    });
+    defer tardigrade.stop();
+
+    var limited: ?u16 = null;
+    var attempts: usize = 0;
+    while (attempts < 5 and limited == null) : (attempts += 1) {
+        var hs = try wsHandshake(allocator, tardigrade.port, "/ws/limited", &.{}, "");
+        defer hs.deinit(allocator);
+        if (hs.status == 429) limited = hs.status;
+    }
+    try std.testing.expectEqual(@as(?u16, 429), limited);
+    try std.testing.expect(origin.handshakeCount() < attempts);
+}
+
+test "proxy_websocket closes idle tunnels and caps concurrent tunnels with a clean 503 (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "    proxy_websocket_idle_timeout_ms 400;");
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{ ws_worker_env, .{ .name = "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", .value = "1" } },
+    });
+    defer tardigrade.stop();
+
+    var first = try wsHandshake(allocator, tardigrade.port, "/ws/one", &.{}, "");
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), first.status);
+    try wsExpectEcho(allocator, first.peer, .text, "keep me");
+
+    var second = try wsHandshake(allocator, tardigrade.port, "/ws/two", &.{}, "");
+    defer second.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 503), second.status);
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+
+    // Nothing moves on the first tunnel: the idle timeout closes it.
+    try first.peer.expectClosed(5_000);
+
+    // Its slot is free again.
+    var third = try wsHandshake(allocator, tardigrade.port, "/ws/three", &.{}, "");
+    defer third.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), third.status);
+
+    var metrics = try wsMetrics(allocator, tardigrade.port);
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"capacity\""));
+    try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"idle\""));
+}
+
+test "proxy_websocket tunnels drain within the shutdown window and the process exits (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{ ws_worker_env, .{ .name = "TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS", .value = "1500" } },
+    });
+    defer tardigrade.stop();
+
+    var hs = try wsHandshake(allocator, tardigrade.port, "/ws/drain", &.{}, "");
+    defer hs.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), hs.status);
+
+    const started = compat.milliTimestamp();
+    tardigrade.sendSignal(std.posix.SIG.TERM);
+    compat.sleepNs(200 * std.time.ns_per_ms);
+    // Inside the drain window the tunnel still works.
+    try wsExpectEcho(allocator, hs.peer, .text, "still here while draining");
+    // Then it is closed, and the process exits instead of waiting forever.
+    try hs.peer.expectClosed(5_000);
+    try std.testing.expect(compat.milliTimestamp() - started >= 1_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "\"tunnel_close_reason\":\"shutdown\"", 2_000);
+    try waitForPortClosed(tardigrade.port, 5_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "Graceful shutdown complete", 5_000);
+}
+
+test "proxy_websocket soak: repeated connect/close settles tunnels and connections (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    const rounds = 120;
+    var i: usize = 0;
+    while (i < rounds) : (i += 1) {
+        var hs = try wsHandshake(allocator, tardigrade.port, "/ws/soak", &.{}, "");
+        defer hs.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 101), hs.status);
+        try wsExpectEcho(allocator, hs.peer, .text, "soak");
+        // Alternate a clean close handshake with an abrupt client EOF.
+        if (i % 2 == 0) {
+            try hs.peer.writeFrame(allocator, .close, "", true, true);
+            var reply = try hs.peer.readFrame(allocator, 128);
+            reply.deinit(allocator);
+        }
+    }
+
+    const deadline = compat.milliTimestamp() + 5_000;
+    while (true) {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        const active = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 0;
+        var closed: u64 = 0;
+        inline for (.{ "client", "upstream", "idle", "lifetime", "shutdown", "error" }) |reason| {
+            closed += wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"" ++ reason ++ "\"");
+        }
+        const connections = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0;
+        if (active == 0 and closed == rounds and connections <= 1) {
+            try std.testing.expectEqual(@as(u64, rounds), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"relayed\""));
+            break;
+        }
+        if (compat.milliTimestamp() > deadline) {
+            std.debug.print("unsettled: active={d} closed={d} connections={d}\n", .{ active, closed, connections });
+            return error.TunnelsDidNotSettle;
+        }
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+}
+
+test "HTTP/1.1 pipelined requests in one write are all answered (#812)" {
+    const allocator = std.testing.allocator;
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        \\location = /first {
+        \\    return 200 first-body;
+        \\}
+        \\location = /second {
+        \\    return 200 second-body;
+        \\}
+        ,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll("GET /first HTTP/1.1\r\nHost: t\r\n\r\nGET /second HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    var peer = WsPeer{ .stream = stream };
+    const all = try peer.readToEnd(allocator);
+    defer allocator.free(all);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, all, "HTTP/1.1 200"));
+    try assertContains(all, "first-body");
+    try assertContains(all, "second-body");
+}
+
+fn wssReadHead(client: *PureZigTlsClient, allocator: std.mem.Allocator) ![]u8 {
+    var head = std.array_list.Managed(u8).init(allocator);
+    errdefer head.deinit();
+    var byte: [1]u8 = undefined;
+    while (!std.mem.endsWith(u8, head.items, "\r\n\r\n")) {
+        try client.readExactPlain(&byte, 5_000);
+        try head.append(byte[0]);
+        if (head.items.len > 16 * 1024) return error.HeadTooLarge;
+    }
+    return head.toOwnedSlice();
+}
+
+fn wssExpectEcho(client: *PureZigTlsClient, allocator: std.mem.Allocator, payload: []const u8) !void {
+    const frame = try encodeWsFrame(allocator, .text, payload, true, true);
+    defer allocator.free(frame);
+    try client.writeAllPlain(frame);
+    var hdr: [2]u8 = undefined;
+    try client.readExactPlain(&hdr, 5_000);
+    try std.testing.expectEqual(@as(u8, 0x81), hdr[0]);
+    var len: usize = hdr[1] & 0x7f;
+    if (len == 126) {
+        var ext: [2]u8 = undefined;
+        try client.readExactPlain(&ext, 5_000);
+        len = std.mem.readInt(u16, &ext, .big);
+    }
+    const echoed = try allocator.alloc(u8, len);
+    defer allocator.free(echoed);
+    try client.readExactPlain(echoed, 5_000);
+    try std.testing.expectEqualStrings(payload, echoed);
+}
+
+test "proxy_websocket carries wss:// clients over native TLS to a wss:// origin (#812)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    // The TLS origin is a second Tardigrade (CA-issued certificate) relaying
+    // to the plain WebSocket origin, so both of the edge's hops are TLS.
+    const ca_cert = try upstreamTlsFixture("native_ed25519_ca.crt", allocator);
+    defer allocator.free(ca_cert);
+    const chain_cert = try upstreamTlsFixture("native_ed25519_chain.crt", allocator);
+    defer allocator.free(chain_cert);
+    const key = try upstreamTlsFixture("native_ed25519.key", allocator);
+    defer allocator.free(key);
+    const inner_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /inner/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(inner_config);
+    var inner = try TardigradeProcess.start(allocator, .{
+        .config_text = inner_config,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = chain_cert },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = key },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+        },
+    });
+    defer inner.stop();
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const edge_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /ws/ {{
+        \\    proxy_pass https://{s}:{d}/inner/;
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, inner.port });
+    defer allocator.free(edge_config);
+    var edge = try TardigradeProcess.start(allocator, .{
+        .config_text = edge_config,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = ca_cert },
+        },
+    });
+    defer edge.stop();
+
+    const client = try PureZigTlsClient.createWithServerName(allocator, edge.port, "http/1.1", "tardigrade.test");
+    defer client.destroy();
+    const request = "GET /ws/secure HTTP/1.1\r\nHost: tardigrade.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " ++ ws_test_key ++ "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    try client.writeAllPlain(request);
+    const head = try wssReadHead(client, allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 101), try parseStatusCode(head));
+    try std.testing.expectEqualStrings(ws_test_accept, headerValue(head, "Sec-WebSocket-Accept").?);
+
+    try wssExpectEcho(client, allocator, "over tls both ways");
+    const medium = "m" ** 5000;
+    try wssExpectEcho(client, allocator, medium);
+
+    // The inner hop saw X-Forwarded-Proto https from the TLS edge.
+    const proto = (try origin.handshakeHeader(allocator, "X-Forwarded-Proto")).?;
+    defer allocator.free(proto);
+    try std.testing.expectEqualStrings("https", proto);
+}
+
+// ---- Server-sent events through the streaming proxy (#762) -----------------
+
+/// Serves one SSE response: the first event immediately, the second only
+/// after the test releases the gate, then a clean end of stream.
+const SseOrigin = struct {
+    server: compat.NetServer,
+    thread: ?std.Thread = null,
+    release: std.atomic.Value(bool) = .init(false),
+    served: std.atomic.Value(bool) = .init(false),
+
+    fn start() !SseOrigin {
+        return .{ .server = try compat.listenTcp(test_host, 0) };
+    }
+
+    fn run(self: *SseOrigin) !void {
+        self.thread = try std.Thread.spawn(.{}, sseOriginMain, .{self});
+    }
+
+    fn stop(self: *SseOrigin) void {
+        self.release.store(true, .seq_cst);
+        if (!self.served.load(.seq_cst)) wakeListener(self.server.port());
+        if (self.thread) |thread| thread.join();
+        self.server.deinit();
+    }
+};
+
+fn sseOriginMain(origin: *SseOrigin) void {
+    var conn = while (true) {
+        break origin.server.accept() catch |err| {
+            if (origin.release.load(.seq_cst)) return;
+            std.debug.print("sse origin accept failed: {}\n", .{err});
+            continue;
+        };
+    };
+    defer conn.stream.close();
+    var peer = WsPeer{ .stream = conn.stream };
+    const head = peer.readHead(std.heap.page_allocator) catch return;
+    std.heap.page_allocator.free(head);
+    origin.served.store(true, .seq_cst);
+    conn.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n") catch return;
+    const first = "id: 1\nevent: tick\ndata: one\n\n";
+    var line_buf: [32]u8 = undefined;
+    conn.stream.writeAll(std.fmt.bufPrint(&line_buf, "{x}\r\n", .{first.len}) catch return) catch return;
+    conn.stream.writeAll(first ++ "\r\n") catch return;
+    const deadline = compat.milliTimestamp() + 10_000;
+    while (!origin.release.load(.seq_cst) and compat.milliTimestamp() < deadline) compat.sleepNs(10 * std.time.ns_per_ms);
+    const second = "id: 2\nevent: tick\ndata: two\n\n";
+    conn.stream.writeAll(std.fmt.bufPrint(&line_buf, "{x}\r\n", .{second.len}) catch return) catch return;
+    conn.stream.writeAll(second ++ "\r\n0\r\n\r\n") catch return;
+}
+
+test "server-sent events stream through proxy_streaming response without buffering (#762)" {
+    const allocator = std.testing.allocator;
+    var origin = try SseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, origin.server.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz" });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 10_000);
+    try stream.writeAll("GET /events/feed HTTP/1.1\r\nHost: t\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n");
+    var peer = WsPeer{ .stream = stream };
+    const head = try peer.readHead(allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
+    try std.testing.expectEqualStrings("text/event-stream", headerValue(head, "Content-Type").?);
+    try std.testing.expectEqualStrings("no-cache", headerValue(head, "Cache-Control").?);
+
+    // The first event reaches the client while the origin is still holding
+    // the rest of the stream open: nothing waits for the whole response.
+    var seen = std.array_list.Managed(u8).init(allocator);
+    defer seen.deinit();
+    while (true) {
+        try seen.appendSlice(peer.buf[peer.start..peer.end]);
+        peer.start = peer.end;
+        if (std.mem.find(u8, seen.items, "data: one") != null) break;
+        try peer.fill();
+    }
+    try std.testing.expect(std.mem.find(u8, seen.items, "data: two") == null);
+
+    origin.release.store(true, .seq_cst);
+    const rest = try peer.readToEnd(allocator);
+    defer allocator.free(rest);
+    try seen.appendSlice(rest);
+    try assertContains(seen.items, "data: two");
+    // The upstream's clean end of stream ends the client's response cleanly.
+    try std.testing.expect(std.mem.endsWith(u8, seen.items, "0\r\n\r\n"));
+}

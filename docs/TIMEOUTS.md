@@ -58,6 +58,15 @@ Two principles, from the #196/#141 arc:
 | Passive-health / breaker windows | `UPSTREAM_FAIL_TIMEOUT_MS`, `CB_TIMEOUT_MS` | 10000 / 30000 | policy timers | backend skipped / breaker half-open | ✅ (policy windows, not I/O deadlines) |
 | Mail/memcached protocol proxies | — (hardcoded) | 10000 / 2000 | `SO_*TIMEO` after connect | 502 | 🟡 bounded but not configurable |
 
+## WebSocket tunnels
+
+A relayed WebSocket (`proxy_websocket`, #812) leaves HTTP's request phases once
+the origin's 101 is relayed. The handshake itself uses the ordinary upstream
+connect and response timeouts. The tunnel is then bounded by
+`proxy_websocket_idle_timeout_ms` (default 60 s, no bytes either way),
+`proxy_websocket_max_lifetime_ms` (default unlimited), and the shutdown drain
+window; `TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS` does not apply to it.
+
 ## Lifecycle / operations
 
 | Class | Knob (`TARDIGRADE_…`) | Default | Enforcement | Semantics | Status |

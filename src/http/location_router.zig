@@ -188,6 +188,54 @@ test "isProtectedForwardAuthHeader rejects trust and framing headers" {
     try std.testing.expect(!isProtectedForwardAuthHeader("Set-Cookie"));
 }
 
+/// Per-location WebSocket upgrade relaying (`proxy_websocket on`, #812).
+/// Present only on locations that opted in; everything else keeps stripping
+/// `Upgrade` and rejecting an upstream `101`.
+pub const WebSocketProxy = struct {
+    pub const DEFAULT_IDLE_TIMEOUT_MS: u32 = 60_000;
+
+    /// Close a tunnel after this long with no bytes moving either way.
+    idle_timeout_ms: u32 = DEFAULT_IDLE_TIMEOUT_MS,
+    /// Close a tunnel this long after it opened. Zero means unlimited.
+    max_lifetime_ms: u32 = 0,
+    /// Browser origins allowed to open a WebSocket; empty allows any.
+    origins: []const []const u8 = &.{},
+
+    pub fn deinit(self: *WebSocketProxy, allocator: std.mem.Allocator) void {
+        for (self.origins) |origin| allocator.free(origin);
+        if (self.origins.len > 0) allocator.free(self.origins);
+        self.* = undefined;
+    }
+};
+
+/// A serialized origin as browsers send it in `Origin`: `http://` or
+/// `https://`, a host, an optional port, and nothing else. Also keeps the
+/// value safe inside the `|`/`;`/`,`-delimited location encoding.
+pub fn isValidWebSocketOrigin(origin: []const u8) bool {
+    const rest = if (std.ascii.startsWithIgnoreCase(origin, "https://"))
+        origin["https://".len..]
+    else if (std.ascii.startsWithIgnoreCase(origin, "http://"))
+        origin["http://".len..]
+    else
+        return false;
+    if (rest.len == 0) return false;
+    for (rest) |byte| {
+        const ok = std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-' or byte == ':' or byte == '[' or byte == ']';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+test "isValidWebSocketOrigin accepts serialized origins only" {
+    try std.testing.expect(isValidWebSocketOrigin("https://app.example.com"));
+    try std.testing.expect(isValidWebSocketOrigin("http://127.0.0.1:8080"));
+    try std.testing.expect(!isValidWebSocketOrigin("app.example.com"));
+    try std.testing.expect(!isValidWebSocketOrigin("https://app.example.com/"));
+    try std.testing.expect(!isValidWebSocketOrigin("https://a|b"));
+    try std.testing.expect(!isValidWebSocketOrigin("https://"));
+    try std.testing.expect(!isValidWebSocketOrigin("null"));
+}
+
 pub const ProxyEarlyDataPolicy = enum {
     off,
     rfc8470,
@@ -318,11 +366,14 @@ pub const LocationBlock = struct {
     /// the enclosing `server` block's rules (#809).
     proxy_set_headers: []ProxySetHeader = &.{},
     forward_auth: ?ForwardAuth = null,
+    /// Set when the location relays WebSocket upgrades (#812).
+    websocket: ?WebSocketProxy = null,
 
     pub fn deinit(self: *LocationBlock, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);
         self.action.deinit(allocator);
         if (self.forward_auth) |*fa| fa.deinit(allocator);
+        if (self.websocket) |*ws| ws.deinit(allocator);
         for (self.error_pages) |*rule| rule.deinit(allocator);
         if (self.error_pages.len > 0) allocator.free(self.error_pages);
         for (self.proxy_set_headers) |*rule| rule.deinit(allocator);

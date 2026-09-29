@@ -3265,7 +3265,9 @@ fn configureNoFragment(fd: std.c.fd_t, sa_family: u32) bool {
     const level = if (is_v6) options.level_v6 else options.level_v4;
     const option = if (is_v6) options.option_v6 else options.option_v4;
     const value = options.value;
-    posix.setsockopt(fd, @intCast(level), @intCast(option), std.mem.asBytes(&value)) catch return false;
+    // Advisory probes use the non-panicking setter: an option or value this
+    // kernel rejects with EINVAL must read as "unsupported", not abort.
+    compat.setSocketOption(fd, @intCast(level), @intCast(option), std.mem.asBytes(&value)) catch return false;
     return true;
 }
 
@@ -3407,7 +3409,7 @@ fn configureEcnReceive(fd: std.c.fd_t, sa_family: u32) bool {
     const is_v6 = sa_family == posix.AF.INET6;
     const option = if (is_v6) options.recv_enable_v6 else options.recv_enable_v4;
     const value: c_int = 1;
-    posix.setsockopt(fd, if (is_v6) posix.IPPROTO.IPV6 else posix.IPPROTO.IP, @intCast(option), std.mem.asBytes(&value)) catch return false;
+    compat.setSocketOption(fd, if (is_v6) posix.IPPROTO.IPV6 else posix.IPPROTO.IP, @intCast(option), std.mem.asBytes(&value)) catch return false;
     return true;
 }
 
@@ -3605,7 +3607,7 @@ fn tuneSocketBuffer(fd: std.c.fd_t, option: u32, requested: ?usize) quic.udp.Buf
         return quic.udp.classifyBufferOutcome(null, false, .{ .reported_bytes = socketBufferBytes(fd, option) });
     const clamped = quic.udp.clampBufferBytes(want);
     const value: c_int = @intCast(clamped);
-    const accepted = if (posix.setsockopt(fd, posix.SOL.SOCKET, option, std.mem.asBytes(&value))) |_| true else |_| false;
+    const accepted = if (compat.setSocketOption(fd, posix.SOL.SOCKET, option, std.mem.asBytes(&value))) |_| true else |_| false;
     const reported = socketBufferBytes(fd, option);
     return quic.udp.classifyBufferOutcome(clamped, accepted, .{
         .reported_bytes = reported,

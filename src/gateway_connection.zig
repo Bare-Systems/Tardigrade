@@ -64,8 +64,8 @@ pub fn clientIpFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) ![]const
     return clientIpFromAddress(allocator, &peer_addr);
 }
 
-pub fn setNoDelay(fd: std.posix.fd_t) !void {
-    try std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&@as(c_int, 1)));
+pub fn setNoDelay(fd: std.posix.fd_t) compat.SocketOptionError!void {
+    try compat.setSocketOption(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&@as(c_int, 1)));
 }
 
 pub fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
@@ -81,18 +81,8 @@ pub fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
     if (std.c.fcntl(fd, std.posix.F.SETFL, @as(c_int, @intCast(flags))) < 0) return error.Unexpected;
 }
 
-pub fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) !void {
-    const recv_tv = std.posix.timeval{
-        .sec = @intCast(recv_timeout_ms / 1000),
-        .usec = @intCast((recv_timeout_ms % 1000) * 1000),
-    };
-    const send_tv = std.posix.timeval{
-        .sec = @intCast(send_timeout_ms / 1000),
-        .usec = @intCast((send_timeout_ms % 1000) * 1000),
-    };
-
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_tv));
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_tv));
+pub fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) compat.SocketOptionError!void {
+    try compat.setSocketTimeoutsMsChecked(fd, recv_timeout_ms, send_timeout_ms);
 }
 
 pub fn maybeConsumeProxyProtocolPreface(

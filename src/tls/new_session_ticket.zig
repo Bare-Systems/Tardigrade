@@ -161,7 +161,7 @@ pub fn buildClientTicketState(
 
     const hash = algorithms.transcriptHash(connection.cipher_suite);
     var psk: [session.max_psk_len]u8 = undefined;
-    defer crypto.secureZero(u8, &psk);
+    defer provider.secureZero(&psk);
     try key_schedule.KeySchedule.resumptionPsk(
         crypto_provider,
         hash,
@@ -231,7 +231,7 @@ pub fn buildServerRecoverableStateNoIdentity(
     if (params.ticket_lifetime == 0) return error.InvalidLifetime;
     const hash = algorithms.transcriptHash(connection.cipher_suite);
     var psk: [session.max_psk_len]u8 = undefined;
-    defer crypto.secureZero(u8, &psk);
+    defer provider.secureZero(&psk);
     try key_schedule.KeySchedule.resumptionPsk(
         crypto_provider,
         hash,

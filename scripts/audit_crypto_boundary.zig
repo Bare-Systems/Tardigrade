@@ -72,6 +72,34 @@
 //!      one of them — the same "mechanical conversion" #375 and #554 both
 //!      warn against. Scoped instead, named-exception style, to the exact
 //!      three files/functions #375 found and fixed.
+//!   6. Bypasses of the canonical secret-zeroization helpers (#784,
+//!      following #750/#751). Two rules:
+//!      a. No production `std.crypto.secureZero` anywhere in `src/crypto`,
+//!         `src/tls`, `src/quic`, `src/pki`, `src/http`, or `src/http3` —
+//!         the direct spelling, a call through a local `std.crypto` alias
+//!         (`const crypto = std.crypto;` then `crypto.secureZero(u8, buf)`,
+//!         the shape #784 itself migrated ~100 sites off), or any
+//!         `secureZero(T, buf)` call with the stdlib's two-argument typed
+//!         signature under whatever qualifier. The canonical
+//!         `crypto.secrets.secureZero`/`crypto.provider.secureZero` take one
+//!         `[]u8` argument, so the argument count alone identifies the
+//!         stdlib form without depending on how its namespace was spelled.
+//!         Comments, string literals, `test` blocks, and `*_tests.zig`
+//!         files are exempt (test fixtures, not production wipes);
+//!         `src/crypto/secrets.zig` is exempt here because the narrower
+//!         point-5 check above already confines any raw call in that file
+//!         to `secureZero`'s own body. This supersedes point 5's "not a
+//!         project-wide rule" caveat: #750 made `secureZero` a separate
+//!         implementation rather than a wrapper, so a raw call is now a
+//!         real (non-elision and performance) divergence, not a synonym.
+//!      b. No plain `@memset` anywhere inside a short, named list of
+//!         secret-bearing storage declarations (`ByteQueue` in
+//!         `encrypted_stream.zig`, the CRYPTO buffers in `tls_adapter.zig`)
+//!         — the exact regression #751 fixed. Deliberately *not* a global
+//!         `@memset` ban: `PlaintextProvenanceQueue` and plenty of other
+//!         non-secret buffers use `@memset` correctly. Fails closed if a
+//!         named file or declaration disappears, so a rename cannot
+//!         silently drop the protection.
 
 const std = @import("std");
 const compat = @import("zig_compat");
@@ -1383,6 +1411,299 @@ const zero_then_free_checks_375 = [_]ZeroThenFreeDirCheck{
     },
 };
 
+// ---------------------------------------------------------------------------
+// #784: canonical secret-zeroization bypasses (file-level doc, point 6)
+// ---------------------------------------------------------------------------
+
+/// Length-preserving copy of `contents` with `//` comments, string and
+/// character literal contents, and multiline `\\` string lines blanked to
+/// spaces, so neither prose about `std.crypto.secureZero` nor a `{`/`}`
+/// inside a format string can affect matching or brace counting. Quote
+/// characters themselves are kept so offsets and token boundaries survive.
+fn blankCommentsAndStrings(allocator: std.mem.Allocator, contents: []const u8) ![]u8 {
+    const out = try allocator.dupe(u8, contents);
+    var i: usize = 0;
+    while (i < out.len) {
+        const c = out[i];
+        if (c == '/' and i + 1 < out.len and out[i + 1] == '/') {
+            while (i < out.len and out[i] != '\n') : (i += 1) out[i] = ' ';
+        } else if (c == '\\' and i + 1 < out.len and out[i + 1] == '\\') {
+            while (i < out.len and out[i] != '\n') : (i += 1) out[i] = ' ';
+        } else if (c == '"' or c == '\'') {
+            i += 1;
+            while (i < out.len and out[i] != c and out[i] != '\n') : (i += 1) {
+                if (out[i] == '\\' and i + 1 < out.len and out[i + 1] != '\n') {
+                    out[i] = ' ';
+                    i += 1;
+                }
+                out[i] = ' ';
+            }
+            if (i < out.len) i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    return out;
+}
+
+/// Index of the `}` matching the first `{` at or after `from`, or null.
+/// Expects a `blankCommentsAndStrings` view.
+fn matchingBraceEnd(view: []const u8, from: usize) ?usize {
+    const open = std.mem.indexOfScalarPos(u8, view, from, '{') orelse return null;
+    var depth: usize = 0;
+    var i = open;
+    while (i < view.len) : (i += 1) {
+        switch (view[i]) {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Blanks every top-level `test` declaration (`test "name" { ... }`,
+/// `test name { ... }`, `test { ... }`) in a `blankCommentsAndStrings` view.
+fn blankTestBlocks(view: []u8) void {
+    var line_start: usize = 0;
+    while (line_start < view.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, view, line_start, '\n') orelse view.len;
+        const rest = view[line_start..];
+        if (std.mem.startsWith(u8, rest, "test") and rest.len > 4 and !isIdentCont(rest[4])) {
+            if (matchingBraceEnd(view, line_start)) |close| {
+                @memset(view[line_start .. close + 1], ' ');
+                line_start = close + 1;
+                continue;
+            }
+        }
+        line_start = line_end + 1;
+    }
+}
+
+/// Number of top-level (depth-0) positional arguments in a call's `args`.
+fn topLevelArgCount(args: []const u8) usize {
+    if (std.mem.trim(u8, args, " \t\r\n").len == 0) return 0;
+    var depth: i32 = 0;
+    var count: usize = 1;
+    var last_comma: ?usize = null;
+    for (args, 0..) |c, i| switch (c) {
+        '(', '[', '{' => depth += 1,
+        ')', ']', '}' => depth -= 1,
+        ',' => if (depth == 0) {
+            count += 1;
+            last_comma = i;
+        },
+        else => {},
+    };
+    // A trailing comma (`f(a, b,)`) does not introduce another argument.
+    if (last_comma) |lc| {
+        if (std.mem.trim(u8, args[lc + 1 ..], " \t\r\n").len == 0) count -= 1;
+    }
+    return count;
+}
+
+/// Whether `view[pos..]` starts a token, i.e. is not the tail of a longer
+/// identifier or a member access (`foo.bar` when looking for `bar`).
+fn isTokenStart(view: []const u8, pos: usize) bool {
+    return pos == 0 or !(isIdentCont(view[pos - 1]) or view[pos - 1] == '.');
+}
+
+/// The first way `view` (a production-only `blankCommentsAndStrings` view)
+/// reaches the stdlib `secureZero` instead of the canonical helper, or null.
+fn firstRawSecureZeroBypass(view: []const u8) ?[]const u8 {
+    // The direct spelling, called or bound as a function value; also
+    // `@import("std").crypto.secureZero` (the import string is blanked).
+    if (std.mem.indexOf(u8, view, "std.crypto.secureZero") != null) return "std.crypto.secureZero";
+    if (std.mem.indexOf(u8, view, "\").crypto.secureZero") != null) return "@import(\"std\").crypto.secureZero";
+
+    // Any local alias of the `std.crypto` namespace, then `<alias>.secureZero`.
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, view, search_from, "std.crypto")) |rel| {
+        search_from = rel + 1;
+        const after = rel + "std.crypto".len;
+        if (after < view.len and isIdentCont(view[after])) continue;
+        // `const NAME = std.crypto;` — walk back over `=` to the bound name.
+        const stmt_end = std.mem.indexOfScalarPos(u8, view, after, ';') orelse continue;
+        if (!isAllWhitespace(view[after..stmt_end])) continue;
+        var j = rel;
+        while (j > 0 and std.ascii.isWhitespace(view[j - 1])) j -= 1;
+        if (j == 0 or view[j - 1] != '=') continue;
+        j -= 1;
+        while (j > 0 and std.ascii.isWhitespace(view[j - 1])) j -= 1;
+        const name_end = j;
+        while (j > 0 and isIdentCont(view[j - 1])) j -= 1;
+        if (j == name_end) continue;
+        const name = view[j..name_end];
+        var alias_from: usize = 0;
+        while (std.mem.indexOfPos(u8, view, alias_from, name)) |use| {
+            alias_from = use + 1;
+            if (!isTokenStart(view, use)) continue;
+            const tail = view[use + name.len ..];
+            if (std.mem.startsWith(u8, tail, ".secureZero") and
+                (tail.len == ".secureZero".len or !isIdentCont(tail[".secureZero".len])))
+                return "std.crypto alias .secureZero";
+        }
+    }
+
+    // The stdlib's typed two-argument signature, `secureZero(T, buf)`, under
+    // any qualifier: the canonical helpers only ever take one `[]u8`.
+    search_from = 0;
+    while (findNextCall(view, search_from, "secureZero")) |m| {
+        search_from = m + 1;
+        if (m > 0 and isIdentCont(view[m - 1])) continue;
+        const args = extractCallArgs(view, m + "secureZero".len) orelse continue;
+        if (topLevelArgCount(args) >= 2) return "secureZero(T, buf)";
+    }
+    return null;
+}
+
+const RawSecureZeroDirCheck = struct {
+    dir: []const u8,
+    excluded_paths: []const []const u8 = &.{},
+};
+
+const raw_secure_zero_rationale = "Production code must wipe secrets through crypto.secrets.secureZero/secureZeroAndFree (or the crypto.provider.secureZero wrapper), never std.crypto.secureZero: since #750 the canonical helper is a separate wide-volatile-store implementation, not a synonym, and the stdlib form lowers to a byte-at-a-time compiler_rt.memset on x86_64 (#784). Test blocks and *_tests.zig fixtures are exempt.";
+
+const raw_secure_zero_checks_784 = [_]RawSecureZeroDirCheck{
+    // secrets.zig owns the canonical implementation; the point-5
+    // FileCheckWithExceptions above already confines any raw call there to
+    // `secureZero`'s own body.
+    .{ .dir = "src/crypto", .excluded_paths = &.{"src/crypto/secrets.zig"} },
+    .{ .dir = "src/tls" },
+    .{ .dir = "src/quic" },
+    .{ .dir = "src/pki" },
+    .{ .dir = "src/http" },
+    .{ .dir = "src/http3" },
+};
+
+/// `firstRawSecureZeroBypass` over the production view of raw file `contents`.
+fn rawSecureZeroViolation(allocator: std.mem.Allocator, contents: []const u8) !?[]const u8 {
+    const view = try blankCommentsAndStrings(allocator, contents);
+    defer allocator.free(view);
+    blankTestBlocks(view);
+    return firstRawSecureZeroBypass(view);
+}
+
+fn checkRawSecureZeroFile(allocator: std.mem.Allocator, root: compat.DirCompat, path: []const u8, violations: *std.ArrayList(Violation)) !void {
+    const contents = root.readFileAlloc(allocator, path, 16 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(contents);
+    if (try rawSecureZeroViolation(allocator, contents)) |needle| {
+        try violations.append(allocator, .{ .path = try allocator.dupe(u8, path), .needle = needle, .rationale = raw_secure_zero_rationale });
+    }
+}
+
+fn checkRawSecureZeroDir(allocator: std.mem.Allocator, root: compat.DirCompat, check: RawSecureZeroDirCheck, dir_path: []const u8, violations: *std.ArrayList(Violation)) !void {
+    var dir = root.openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next(compat.io())) |entry| {
+        const rel = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(rel);
+        var excluded = false;
+        for (check.excluded_paths) |excluded_path| {
+            if (std.mem.eql(u8, rel, excluded_path)) {
+                excluded = true;
+                break;
+            }
+        }
+        if (excluded) continue;
+        switch (entry.kind) {
+            .directory => try checkRawSecureZeroDir(allocator, root, check, rel, violations),
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+                // Test-only companion files (e.g. `key_schedule_tests.zig`)
+                // are fixtures, not production wipes.
+                if (std.mem.endsWith(u8, entry.name, "_tests.zig")) continue;
+                try checkRawSecureZeroFile(allocator, root, rel, violations);
+            },
+            else => {},
+        }
+    }
+}
+
+/// A named declaration whose storage holds secret material: no plain
+/// `@memset` may appear anywhere inside it (#751). Matched by `const NAME`
+/// (a struct) or `fn NAME(` (a type-returning generic), brace-matched to the
+/// end of the declaration.
+const SecretStorageCheck = struct {
+    path: []const u8,
+    decl: []const u8,
+    rationale: []const u8,
+};
+
+const secret_storage_checks_784 = [_]SecretStorageCheck{
+    .{
+        .path = "src/tls/encrypted_stream.zig",
+        .decl = "ByteQueue",
+        .rationale = "ByteQueue backs inbound_plaintext/inbound_handshake/inbound_carrier/outbound_ciphertext; every wipe of it (discard, clear, the compaction tail) must go through crypto.secrets.secureZero, because the wiped bytes are outside the queue's live slice and a plain @memset there is a dead store ReleaseFast may drop (#751). PlaintextProvenanceQueue holds bool bookkeeping and correctly keeps @memset.",
+    },
+    .{
+        .path = "src/quic/tls_adapter.zig",
+        .decl = "CryptoStream",
+        .rationale = "CryptoStream buffers QUIC CRYPTO-frame handshake bytes; consumed and compacted extents must be wiped with crypto.secrets.secureZero, not a plain @memset the optimizer may elide (#750/#751).",
+    },
+    .{
+        .path = "src/quic/tls_adapter.zig",
+        .decl = "CryptoReassembler",
+        .rationale = "CryptoReassembler.deinit must wipe its 265 KB of handshake state through crypto.secrets.secureZero; a plain @memset (including a `self.* = .{}` reset's) lowers to compiler_rt's byte loop on x86_64 and is elidable (#750).",
+    },
+    .{
+        .path = "src/quic/tls_adapter.zig",
+        .decl = "CryptoOutput",
+        .rationale = "CryptoOutput holds outbound handshake bytes; drained and reset extents must be wiped with crypto.secrets.secureZero, not a plain @memset (#750).",
+    },
+};
+
+/// The body of declaration `name` (`const name` or `fn name(`) in a
+/// `blankCommentsAndStrings` view, from the name through its closing brace.
+fn findDeclarationBody(view: []const u8, name: []const u8) ?[]const u8 {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, view, search_from, name)) |rel| {
+        search_from = rel + 1;
+        const after = rel + name.len;
+        if (after < view.len and isIdentCont(view[after])) continue;
+        const is_const = rel >= "const ".len and std.mem.eql(u8, view[rel - "const ".len .. rel], "const ");
+        const is_fn = rel >= "fn ".len and std.mem.eql(u8, view[rel - "fn ".len .. rel], "fn ") and
+            after < view.len and view[after] == '(';
+        if (!is_const and !is_fn) continue;
+        const close = matchingBraceEnd(view, after) orelse return null;
+        return view[rel .. close + 1];
+    }
+    return null;
+}
+
+/// Why `decl` in `contents` violates the secret-storage rule, or null.
+fn secretStorageViolation(allocator: std.mem.Allocator, contents: []const u8, decl: []const u8) !?[]const u8 {
+    const view = try blankCommentsAndStrings(allocator, contents);
+    defer allocator.free(view);
+    const body = findDeclarationBody(view, decl) orelse return "<secret-bearing declaration missing>";
+    if (findNextCall(body, 0, "@memset") != null) return "@memset on secret-bearing storage";
+    return null;
+}
+
+fn checkSecretStorage(allocator: std.mem.Allocator, root: compat.DirCompat, check: SecretStorageCheck, violations: *std.ArrayList(Violation)) !void {
+    const contents = root.readFileAlloc(allocator, check.path, 16 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => {
+            try violations.append(allocator, .{ .path = try allocator.dupe(u8, check.path), .needle = "<file missing>", .rationale = check.rationale });
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(contents);
+    if (try secretStorageViolation(allocator, contents, check.decl)) |n| {
+        try violations.append(allocator, .{ .path = try allocator.dupe(u8, check.path), .needle = n, .rationale = check.rationale });
+    }
+}
+
 fn checkFileWithExceptions(allocator: std.mem.Allocator, root: compat.DirCompat, check: FileCheckWithExceptions, violations: *std.ArrayList(Violation)) !void {
     const contents = root.readFileAlloc(allocator, check.path, 16 * 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => {
@@ -1477,6 +1798,12 @@ fn runAudit(allocator: std.mem.Allocator, root: compat.DirCompat) !std.ArrayList
     }
     for (zero_then_free_checks_375) |check| {
         try checkZeroThenFreeDir(allocator, root, check, check.dir, &violations);
+    }
+    for (raw_secure_zero_checks_784) |check| {
+        try checkRawSecureZeroDir(allocator, root, check, check.dir, &violations);
+    }
+    for (secret_storage_checks_784) |check| {
+        try checkSecretStorage(allocator, root, check, &violations);
     }
     try checkBoundedSecretFile(
         allocator,
@@ -2086,6 +2413,28 @@ const clean_tls_adapter_fixture =
     \\    }
     \\};
     \\
+    \\pub const CryptoStream = struct {
+    \\    buffer: [64]u8 = undefined,
+    \\    pub fn discardContiguous(self: *CryptoStream, n: usize) void {
+    \\        crypto_secrets.secureZero(self.buffer[0..n]);
+    \\    }
+    \\};
+    \\
+    \\pub const CryptoReassembler = struct {
+    \\    streams: [4]CryptoStream = .{ .{}, .{}, .{}, .{} },
+    \\    pub fn deinit(self: *CryptoReassembler) void {
+    \\        // Not a plain `@memset(...)`: see #750.
+    \\        crypto_secrets.secureZero(std.mem.asBytes(self));
+    \\    }
+    \\};
+    \\
+    \\pub const CryptoOutput = struct {
+    \\    buffer: [64]u8 = undefined,
+    \\    pub fn deinit(self: *CryptoOutput) void {
+    \\        crypto_secrets.secureZero(std.mem.asBytes(self));
+    \\    }
+    \\};
+    \\
     \\const testing = std.testing;
     \\
     \\test "differential vector" {
@@ -2326,6 +2675,132 @@ const secrets_zig_deinit_rawfree_regression_fixture =
     \\
 ;
 
+/// A trimmed `encrypted_stream.zig`: the secret-bearing `ByteQueue` wipes
+/// through the canonical helper, while `PlaintextProvenanceQueue`'s `bool`
+/// bookkeeping legitimately keeps `@memset` (#751).
+const clean_encrypted_stream_fixture =
+    \\fn PlaintextProvenanceQueue(comptime capacity: usize) type {
+    \\    return struct {
+    \\        buf: [capacity]bool = undefined,
+    \\        fn clear(self: *@This()) void {
+    \\            @memset(self.buf[0..], false);
+    \\        }
+    \\    };
+    \\}
+    \\
+    \\/// Every wipe here goes through `crypto.secrets.secureZero`, never a plain
+    \\/// `@memset(...)` -- comments mentioning it must not trip the audit.
+    \\fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
+    \\    return struct {
+    \\        buf: [capacity]u8 = undefined,
+    \\        fn clear(self: *@This()) void {
+    \\            crypto.secrets.secureZero(self.buf[0..]);
+    \\        }
+    \\        fn describe() []const u8 {
+    \\            return "not @memset(buf, 0) {";
+    \\        }
+    \\    };
+    \\}
+    \\
+;
+
+/// `clean_encrypted_stream_fixture` with `ByteQueue.clear` regressed to a
+/// plain `@memset` — the exact #751 defect 3 shape.
+const byte_queue_memset_regression_fixture =
+    \\fn PlaintextProvenanceQueue(comptime capacity: usize) type {
+    \\    return struct {
+    \\        buf: [capacity]bool = undefined,
+    \\        fn clear(self: *@This()) void {
+    \\            @memset(self.buf[0..], false);
+    \\        }
+    \\    };
+    \\}
+    \\
+    \\fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {
+    \\    return struct {
+    \\        buf: [capacity]u8 = undefined,
+    \\        fn clear(self: *@This()) void {
+    \\            @memset(self.buf[0..], 0);
+    \\        }
+    \\    };
+    \\}
+    \\
+;
+
+test "raw secureZero guard flags the direct std.crypto spelling, called or bound as a value" {
+    const a = testing.allocator;
+    try testing.expectEqualStrings("std.crypto.secureZero", (try rawSecureZeroViolation(a, "fn wipe(b: []u8) void { std.crypto.secureZero(u8, b); }\n")).?);
+    try testing.expectEqualStrings("std.crypto.secureZero", (try rawSecureZeroViolation(a, "const wipe = std.crypto.secureZero;\n")).?);
+    try testing.expectEqualStrings("@import(\"std\").crypto.secureZero", (try rawSecureZeroViolation(a, "fn wipe(b: []u8) void { @import(\"std\").crypto.secureZero(u8, b); }\n")).?);
+}
+
+test "raw secureZero guard follows a local std.crypto namespace alias" {
+    const a = testing.allocator;
+    // The shape #784 migrated ~100 production sites off.
+    try testing.expectEqualStrings("std.crypto alias .secureZero", (try rawSecureZeroViolation(a, "const crypto = std.crypto;\nfn wipe(k: *[32]u8) void { defer crypto.secureZero(u8, k); }\n")).?);
+    // A function-value binding through the alias, then a one-argument call.
+    try testing.expectEqualStrings("std.crypto alias .secureZero", (try rawSecureZeroViolation(a, "const c = std.crypto;\nconst z = c.secureZero;\n")).?);
+    // An alias used only for other primitives is fine.
+    try testing.expect((try rawSecureZeroViolation(a, "const crypto = std.crypto;\nconst Sha256 = crypto.hash.sha2.Sha256;\n")) == null);
+}
+
+test "raw secureZero guard flags the stdlib's typed two-argument call under any qualifier" {
+    const a = testing.allocator;
+    try testing.expectEqualStrings("secureZero(T, buf)", (try rawSecureZeroViolation(a, "fn wipe(b: []u8) void { sc.secureZero(u8, b); }\n")).?);
+    try testing.expectEqualStrings("secureZero(T, buf)", (try rawSecureZeroViolation(a, "fn wipe(b: []u8) void { ns.inner.secureZero(\n    u8,\n    b[0..f(1, 2)],\n); }\n")).?);
+}
+
+test "raw secureZero guard allows canonical helpers, prose, strings, and test fixtures" {
+    const a = testing.allocator;
+    const clean =
+        \\//! Never `std.crypto.secureZero(u8, buf)` directly -- see #750.
+        \\const provider = @import("crypto").provider;
+        \\const secrets = @import("crypto").secrets;
+        \\fn wipe(k: *[32]u8, buf: []u8, allocator: std.mem.Allocator) void {
+        \\    provider.secureZero(k);
+        \\    secrets.secureZero(buf[0..f(1, 2)]);
+        \\    defer secrets.secureZeroAndFree(allocator, buf);
+        \\    const msg = "std.crypto.secureZero(u8, x)";
+        \\    _ = msg;
+        \\}
+        \\test "fixture may wipe with the stdlib form" {
+        \\    var k: [4]u8 = .{ 1, 2, 3, 4 };
+        \\    if (true) { std.crypto.secureZero(u8, &k); }
+        \\}
+        \\
+    ;
+    try testing.expect((try rawSecureZeroViolation(a, clean)) == null);
+}
+
+test "raw secureZero guard does not treat a test-named identifier as a test block" {
+    const a = testing.allocator;
+    const src =
+        \\fn testing_helper() void {}
+        \\test_value: u8 = 0,
+        \\fn wipe(b: []u8) void { std.crypto.secureZero(u8, b); }
+        \\
+    ;
+    try testing.expect((try rawSecureZeroViolation(a, src)) != null);
+}
+
+test "secret-storage guard rejects @memset inside ByteQueue but not in PlaintextProvenanceQueue" {
+    const a = testing.allocator;
+    try testing.expect((try secretStorageViolation(a, clean_encrypted_stream_fixture, "ByteQueue")) == null);
+    try testing.expect((try secretStorageViolation(a, clean_encrypted_stream_fixture, "PlaintextProvenanceQueue")) != null);
+    try testing.expectEqualStrings("@memset on secret-bearing storage", (try secretStorageViolation(a, byte_queue_memset_regression_fixture, "ByteQueue")).?);
+}
+
+test "secret-storage guard covers the tls_adapter CRYPTO buffers and fails closed when one disappears" {
+    const a = testing.allocator;
+    for ([_][]const u8{ "CryptoStream", "CryptoReassembler", "CryptoOutput" }) |decl| {
+        try testing.expect((try secretStorageViolation(a, clean_tls_adapter_fixture, decl)) == null);
+    }
+    const regressed = "pub const CryptoReassembler = struct {\n    pub fn deinit(self: *CryptoReassembler) void {\n        @memset(std.mem.asBytes(self), 0);\n    }\n};\n";
+    try testing.expect((try secretStorageViolation(a, regressed, "CryptoReassembler")) != null);
+    // Renamed away: the protection must not silently lapse.
+    try testing.expectEqualStrings("<secret-bearing declaration missing>", (try secretStorageViolation(a, "pub const CryptoReassemblerV2 = struct {};\n", "CryptoReassembler")).?);
+}
+
 test "end-to-end: the audit fails against a fixture tree reproducing each bypass, and passes once fixed" {
     const allocator = testing.allocator;
 
@@ -2354,6 +2829,9 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
     try root.writeFile(.{ .sub_path = "src/crypto/secrets.zig", .data = clean_secrets_zig_fixture });
     try root.writeFile(.{ .sub_path = "src/tls/ticket_key_snapshot.zig", .data = "" });
     try root.writeFile(.{ .sub_path = "src/tls/sni_provider.zig", .data = "" });
+
+    // #784's protected secret-bearing storage declarations.
+    try root.writeFile(.{ .sub_path = "src/tls/encrypted_stream.zig", .data = clean_encrypted_stream_fixture });
 
     const bypass_cases = [_]struct { rel: []const u8, contents: []const u8 }{
         .{ .rel = "src/quic/connection.zig", .contents = "const mask = Aes128.initEnc(self.hp);\n" },
@@ -2500,6 +2978,18 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
         // have named `rawFree`, since it's the *correct* spelling inside
         // secureZeroAndFree's own implementation.
         .{ .rel = "src/crypto/secrets.zig", .contents = secrets_zig_deinit_rawfree_regression_fixture },
+
+        // #784: a direct production std.crypto.secureZero, the std.crypto
+        // namespace-alias form, and the typed two-argument form under an
+        // unrelated qualifier, each in a file this tool names nowhere
+        // (including src/http, which the older checks do not scan).
+        .{ .rel = "src/tls/raw_secure_zero_site.zig", .contents = "pub fn wipe(buf: []u8) void {\n    std.crypto.secureZero(u8, buf);\n}\n" },
+        .{ .rel = "src/crypto/raw_secure_zero_alias_site.zig", .contents = "const crypto = std.crypto;\npub fn wipe(k: *[32]u8) void {\n    defer crypto.secureZero(u8, k);\n}\n" },
+        .{ .rel = "src/http/raw_secure_zero_typed_site.zig", .contents = "pub fn wipe(buf: []u8) void {\n    zeroing.secureZero(u8, buf);\n}\n" },
+        // #751's regression: ByteQueue wiping with a plain @memset.
+        .{ .rel = "src/tls/encrypted_stream.zig", .contents = byte_queue_memset_regression_fixture },
+        // Renaming a protected declaration away must fail, not pass.
+        .{ .rel = "src/tls/encrypted_stream.zig", .contents = "fn RenamedQueue(comptime capacity: usize) type { return struct {}; }\n" },
     };
 
     for (bypass_cases) |case| {
@@ -2514,6 +3004,8 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
             clean_tls_adapter_fixture
         else if (std.mem.eql(u8, case.rel, "src/crypto/secrets.zig"))
             clean_secrets_zig_fixture
+        else if (std.mem.eql(u8, case.rel, "src/tls/encrypted_stream.zig"))
+            clean_encrypted_stream_fixture
         else if (std.mem.eql(u8, case.rel, "src/http/http3_runtime.zig"))
             ""
         else
@@ -2533,6 +3025,9 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
     try root.deleteFile("src/quic/defer_order_zero_free_site.zig");
     try root.deleteFile("src/pki/manual_clear_zero_free_site.zig");
     try root.deleteFile("src/crypto/rsa_chained_alias_zero_free_site.zig");
+    try root.deleteFile("src/tls/raw_secure_zero_site.zig");
+    try root.deleteFile("src/crypto/raw_secure_zero_alias_site.zig");
+    try root.deleteFile("src/http/raw_secure_zero_typed_site.zig");
 
     var clean_violations = try runAudit(allocator, root);
     defer clean_violations.deinit(allocator);

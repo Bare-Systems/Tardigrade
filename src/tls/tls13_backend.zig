@@ -190,8 +190,8 @@ const PostHandshakeInput = struct {
 
     fn deinit(self: *PostHandshakeInput) void {
         if (self.buf.len > 0) crypto_pkg.secrets.secureZeroAndFree(self.buf_allocator.?, self.buf);
-        if (self.inline_len > 0) crypto.secureZero(u8, self.inline_buf[0..self.inline_len]);
-        if (self.header_len > 0) crypto.secureZero(u8, self.header[0..self.header_len]);
+        if (self.inline_len > 0) crypto_pkg.secrets.secureZero(self.inline_buf[0..self.inline_len]);
+        if (self.header_len > 0) crypto_pkg.secrets.secureZero(self.header[0..self.header_len]);
         self.* = .{};
     }
 
@@ -239,7 +239,7 @@ const PostHandshakeInput = struct {
                 }
                 @memcpy(self.writable()[0..handshake_header_len], &self.header);
                 self.len = handshake_header_len;
-                crypto.secureZero(u8, &self.header);
+                crypto_pkg.secrets.secureZero(&self.header);
                 self.header_len = 0;
             }
             const take = @min(self.capacity() - self.len, rest.len);
@@ -266,7 +266,7 @@ const PostHandshakeInput = struct {
         const cap = self.capacity();
         if (cap == 0 or len != cap) return error.MalformedHandshake;
         if (self.inline_len > 0) {
-            crypto.secureZero(u8, self.inline_buf[0..self.inline_len]);
+            crypto_pkg.secrets.secureZero(self.inline_buf[0..self.inline_len]);
             self.inline_len = 0;
         } else {
             crypto_pkg.secrets.secureZeroAndFree(self.buf_allocator.?, self.buf);
@@ -1065,9 +1065,9 @@ pub const Tls13Backend = struct {
         /// invalidated optional's payload, not necessarily this method's
         /// effect.
         pub fn wipe(self: *ClientHelloPskCapture) void {
-            crypto.secureZero(u8, self.message[0..self.message_len]);
+            crypto_pkg.secrets.secureZero(self.message[0..self.message_len]);
             self.message_len = 0;
-            crypto.secureZero(u8, &self.binder_transcript_hash);
+            crypto_pkg.secrets.secureZero(&self.binder_transcript_hash);
         }
     };
 
@@ -1104,7 +1104,7 @@ pub const Tls13Backend = struct {
         cookie_len: usize = 0,
 
         pub fn wipe(self: *RetryContext) void {
-            crypto.secureZero(u8, self.cookie[0..self.cookie_len]);
+            crypto_pkg.secrets.secureZero(self.cookie[0..self.cookie_len]);
             self.cookie_len = 0;
             self.request = null;
         }
@@ -1994,10 +1994,10 @@ pub const Tls13Backend = struct {
         // Cancel and release any parked async operation (and held credential)
         // exactly once before tearing down the rest.
         self.cancelPendingAuth();
-        crypto.secureZero(u8, &self.pending_signature);
-        crypto.secureZero(u8, &self.pending_client_session_id);
+        crypto_pkg.secrets.secureZero(&self.pending_signature);
+        crypto_pkg.secrets.secureZero(&self.pending_client_session_id);
         self.pending_client_session_id_len = 0;
-        crypto.secureZero(u8, std.mem.asBytes(&self.pending_client_share));
+        crypto_pkg.secrets.secureZero(std.mem.asBytes(&self.pending_client_share));
         self.pending_client_hello_ready = false;
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
@@ -2008,10 +2008,10 @@ pub const Tls13Backend = struct {
         self.psk_now_fn = null;
         self.psk_resolver = null;
         self.connection_auth_binding = null;
-        crypto.secureZero(u8, &self.application_compat_bytes);
+        crypto_pkg.secrets.secureZero(&self.application_compat_bytes);
         self.application_compat_present = false;
         self.application_compat_len = 0;
-        crypto.secureZero(u8, &self.early_application_compat_bytes);
+        crypto_pkg.secrets.secureZero(&self.early_application_compat_bytes);
         self.early_application_compat_present = false;
         self.early_application_compat_len = 0;
         self.last_psk_age_skew = null;
@@ -2038,18 +2038,18 @@ pub const Tls13Backend = struct {
         self.retry.wipe();
         self.hello_retry_cookie_provider = .{};
         self.client_hrr_selection = null;
-        crypto.secureZero(u8, &self.expected_client_verify);
+        crypto_pkg.secrets.secureZero(&self.expected_client_verify);
         self.wipeEphemeral();
         self.wipeIdentity();
-        crypto.secureZero(u8, &self.peer_chain);
+        crypto_pkg.secrets.secureZero(&self.peer_chain);
         self.peer_chain_count = 0;
         self.peer_chain_len = 0;
-        crypto.secureZero(u8, std.mem.asBytes(&self.peer_sig_schemes));
+        crypto_pkg.secrets.secureZero(std.mem.asBytes(&self.peer_sig_schemes));
         self.peer_sig_scheme_count = 0;
-        crypto.secureZero(u8, &self.server_name);
+        crypto_pkg.secrets.secureZero(&self.server_name);
         self.server_name_len = 0;
         self.server_name_present = false;
-        crypto.secureZero(u8, &self.selected_alpn);
+        crypto_pkg.secrets.secureZero(&self.selected_alpn);
         self.selected_alpn_len = 0;
         self.selected_alpn_present = false;
         self.negotiated_version = .tls13;
@@ -2060,26 +2060,26 @@ pub const Tls13Backend = struct {
         // provider/verifier vtables borrow caller storage; drop the references.
         self.external_provider = null;
         self.external_verifier = null;
-        crypto.secureZero(u8, &self.peer_transport_extension);
+        crypto_pkg.secrets.secureZero(&self.peer_transport_extension);
         self.peer_transport_extension_len = 0;
         self.peer_transport_extension_pending = false;
-        crypto.secureZero(u8, std.mem.asBytes(&self.initial_input));
-        crypto.secureZero(u8, std.mem.asBytes(&self.handshake_input));
+        crypto_pkg.secrets.secureZero(std.mem.asBytes(&self.initial_input));
+        crypto_pkg.secrets.secureZero(std.mem.asBytes(&self.handshake_input));
         self.application_input.deinit();
         self.initial_input = .{};
         self.handshake_input = .{};
-        crypto.secureZero(u8, std.mem.asBytes(&self.core));
+        crypto_pkg.secrets.secureZero(std.mem.asBytes(&self.core));
         self.core = tls_handshake_codec.Core.init(self.role);
         self.core.handshake_lifecycle = .failed;
     }
 
     fn wipeEphemeral(self: *Tls13Backend) void {
-        crypto.secureZero(u8, std.mem.asBytes(&self.key_pair));
+        crypto_pkg.secrets.secureZero(std.mem.asBytes(&self.key_pair));
         self.key_pair_present = false;
     }
 
     fn wipeIdentity(self: *Tls13Backend) void {
-        crypto.secureZero(u8, std.mem.asBytes(&self.identity));
+        crypto_pkg.secrets.secureZero(std.mem.asBytes(&self.identity));
         self.identity_present = false;
     }
 
@@ -2768,7 +2768,7 @@ pub const Tls13Backend = struct {
         // their binders once patched in below — wiped after the sink and
         // transcript have their own copies, regardless of how the function
         // returns.
-        defer crypto.secureZero(u8, &buf);
+        defer crypto_pkg.secrets.secureZero(&buf);
         var w = Writer{ .buf = &buf };
         try w.u8_(@intFromEnum(MessageType.client_hello));
         const message_len = try w.reserve(3);
@@ -2920,7 +2920,7 @@ pub const Tls13Backend = struct {
         // side. Distinct tickets may legally carry distinct hashes, so
         // `psk_hashes` tracks one per offered identity alongside its secret.
         var psk_secrets: [pre_shared_key.max_offered_identities][max_digest_len]u8 = undefined;
-        defer crypto.secureZero(u8, std.mem.asBytes(&psk_secrets));
+        defer crypto_pkg.secrets.secureZero(std.mem.asBytes(&psk_secrets));
         var psk_hashes: [pre_shared_key.max_offered_identities]crypto_provider_pkg.Hash = undefined;
         var psk_cipher_suites: [pre_shared_key.max_offered_identities]tls_algorithms.CipherSuite = undefined;
         var psk_count: usize = 0;
@@ -2980,7 +2980,7 @@ pub const Tls13Backend = struct {
             for (0..psk_count) |i| {
                 const n = psk_hashes[i].digestLength();
                 var binder: [max_digest_len]u8 = undefined;
-                defer crypto.secureZero(u8, &binder);
+                defer crypto_pkg.secrets.secureZero(&binder);
                 pre_shared_key.deriveBinder(psk_hashes[i], psk_secrets[i][0..n], prefix, binder[0..n]) catch return error.SecretExportFailed;
                 const slot = offer.slots[i];
                 @memcpy(buf[slot.offset..][0..slot.len], binder[0..n]);
@@ -3006,7 +3006,7 @@ pub const Tls13Backend = struct {
             }
 
             var early: [max_digest_len]u8 = undefined;
-            defer crypto.secureZero(u8, &early);
+            defer crypto_pkg.secrets.secureZero(&early);
             KeySchedule.clientEarlyTrafficSecret(self.crypto_provider, psk_hashes[0], psk_secrets[0][0..n0], client_hello_hash[0..n0], early[0..n0]) catch
                 return error.SecretExportFailed;
 
@@ -3494,7 +3494,7 @@ pub const Tls13Backend = struct {
             // wrong-length secret.
             if (psk_slice.len != self.negotiatedDigestLen()) return error.IllegalParameter;
             var buf: [max_digest_len]u8 = undefined;
-            defer crypto.secureZero(u8, &buf);
+            defer crypto_pkg.secrets.secureZero(&buf);
             @memcpy(buf[0..psk_slice.len], psk_slice);
             psk_secret = buf;
         } else {
@@ -3522,7 +3522,7 @@ pub const Tls13Backend = struct {
             try sink.emitCertificate(.valid);
             const n = self.negotiatedDigestLen();
             try self.installScheduleWithPsk(psk[0..n], shared[0..shared_len], self.core.transcriptHash().slice());
-            crypto.secureZero(u8, psk);
+            crypto_pkg.secrets.secureZero(psk);
         } else {
             try self.installSchedule(shared[0..shared_len], self.core.transcriptHash().slice());
         }
@@ -3578,7 +3578,7 @@ pub const Tls13Backend = struct {
         self.core.transcript.selectFamily(self.negotiatedHash());
 
         var buf: [max_message_len]u8 = undefined;
-        defer crypto.secureZero(u8, &buf);
+        defer crypto_pkg.secrets.secureZero(&buf);
         var w = Writer{ .buf = &buf };
         try w.u8_(@intFromEnum(MessageType.client_hello));
         const message_len = try w.reserve(3);
@@ -3721,7 +3721,7 @@ pub const Tls13Backend = struct {
         // #564: same per-ticket-hash reasoning as `sendClientHello`'s
         // ClientHello1 offer — see its comment on `psk_hashes`.
         var psk_secrets: [pre_shared_key.max_offered_identities][max_digest_len]u8 = undefined;
-        defer crypto.secureZero(u8, std.mem.asBytes(&psk_secrets));
+        defer crypto_pkg.secrets.secureZero(std.mem.asBytes(&psk_secrets));
         var psk_hashes: [pre_shared_key.max_offered_identities]crypto_provider_pkg.Hash = undefined;
         var psk_count: usize = 0;
         var psk_offer_write: ?pre_shared_key.ClientOfferWrite = null;
@@ -3800,7 +3800,7 @@ pub const Tls13Backend = struct {
             for (0..psk_count) |i| {
                 const n = psk_hashes[i].digestLength();
                 var binder: [max_digest_len]u8 = undefined;
-                defer crypto.secureZero(u8, &binder);
+                defer crypto_pkg.secrets.secureZero(&binder);
                 if (psk_hashes[i] == negotiated_hash) {
                     pre_shared_key.deriveBinderFromTranscriptHash(psk_hashes[i], psk_secrets[i][0..n], negotiated_rebound.slice(), binder[0..n]) catch
                         return error.SecretExportFailed;
@@ -4271,7 +4271,7 @@ pub const Tls13Backend = struct {
         if (body.len != n) return error.MalformedHandshake;
         var expected: [max_digest_len]u8 = undefined;
         KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.server_handshake_traffic[0..n], transcript_before.slice(), expected[0..n]) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, expected[0..n]);
+        defer crypto_pkg.secrets.secureZero(expected[0..n]);
         if (!crypto_pkg.provider.constantTimeEqual(expected[0..n], body[0..n])) return error.DecryptError;
 
         // 1-RTT secrets exist from the transcript through server Finished,
@@ -4320,7 +4320,7 @@ pub const Tls13Backend = struct {
         const message_len = try w.reserve(3);
         var client_verify: [max_digest_len]u8 = undefined;
         KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.client_handshake_traffic[0..n], finished_transcript_hash.slice(), client_verify[0..n]) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, client_verify[0..n]);
+        defer crypto_pkg.secrets.secureZero(client_verify[0..n]);
         try w.bytes(client_verify[0..n]);
         w.patch(3, message_len);
         const message = buf[0..w.len];
@@ -4472,7 +4472,7 @@ pub const Tls13Backend = struct {
             try w.bytes(self.pending_signature[0..sig_len]);
             w.patch(2, sig_slot);
             w.patch(3, verify_len);
-            crypto.secureZero(u8, &self.pending_signature);
+            crypto_pkg.secrets.secureZero(&self.pending_signature);
             self.core.recordSent(buf[0..w.len]) catch |err| return mapCoreError(err);
         }
 
@@ -4483,7 +4483,7 @@ pub const Tls13Backend = struct {
         const n = schedule.digestLen();
         var client_verify: [max_digest_len]u8 = undefined;
         KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.client_handshake_traffic[0..n], self.core.transcriptHash().slice(), client_verify[0..n]) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, client_verify[0..n]);
+        defer crypto_pkg.secrets.secureZero(client_verify[0..n]);
         try w.bytes(client_verify[0..n]);
         w.patch(3, finished_len);
         self.core.recordSent(buf[finished_start..w.len]) catch |err| return mapCoreError(err);
@@ -4899,11 +4899,11 @@ pub const Tls13Backend = struct {
         const credential_info = try self.inspectSelectedServerCredential(credential);
         self.connection_auth_binding = credential_info.binding;
         var psk_selected = try self.selectPsk(credential_info.binding, sink);
-        defer if (psk_selected) |*sel| crypto.secureZero(u8, &sel.psk);
+        defer if (psk_selected) |*sel| crypto_pkg.secrets.secureZero(&sel.psk);
 
         // ServerHello (Initial level).
         var hello_buf: [256]u8 = undefined;
-        defer crypto.secureZero(u8, &hello_buf);
+        defer crypto_pkg.secrets.secureZero(&hello_buf);
         var hello = Writer{ .buf = &hello_buf };
         try hello.u8_(@intFromEnum(MessageType.server_hello));
         const hello_len = try hello.reserve(3);
@@ -5032,7 +5032,7 @@ pub const Tls13Backend = struct {
             const psk_slice = hit.state.common.resumption_psk.slice();
             if (psk_slice.len != n) return error.InvalidHandshakeState;
             var psk_buf: [max_digest_len]u8 = undefined;
-            defer crypto.secureZero(u8, &psk_buf);
+            defer crypto_pkg.secrets.secureZero(&psk_buf);
             @memcpy(psk_buf[0..n], psk_slice);
 
             // #485: verify against the digest captured at parse time
@@ -5119,7 +5119,7 @@ pub const Tls13Backend = struct {
                 }
 
                 var early: [max_digest_len]u8 = undefined;
-                defer crypto.secureZero(u8, &early);
+                defer crypto_pkg.secrets.secureZero(&early);
                 KeySchedule.clientEarlyTrafficSecret(self.crypto_provider, early_hash, psk_buf[0..n], client_hello_hash[0..n], early[0..n]) catch
                     return error.SecretExportFailed;
 
@@ -5279,7 +5279,7 @@ pub const Tls13Backend = struct {
         const finished_len = try fw.reserve(3);
         var server_verify: [max_digest_len]u8 = undefined;
         KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.server_handshake_traffic[0..n], self.core.transcriptHash().slice(), server_verify[0..n]) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, server_verify[0..n]);
+        defer crypto_pkg.secrets.secureZero(server_verify[0..n]);
         try fw.bytes(server_verify[0..n]);
         fw.patch(3, finished_len);
         const finished = fbuf[0..fw.len];
@@ -5441,7 +5441,7 @@ pub const Tls13Backend = struct {
         w.patch(2, sig_len_slot);
         w.patch(3, verify_len);
         const certificate_verify = buf[0..w.len];
-        crypto.secureZero(u8, &self.pending_signature);
+        crypto_pkg.secrets.secureZero(&self.pending_signature);
         self.core.recordSent(certificate_verify) catch |err| return mapCoreError(err);
 
         // Finished covers the transcript through CertificateVerify.
@@ -5451,7 +5451,7 @@ pub const Tls13Backend = struct {
         const n = schedule.digestLen();
         var server_verify: [max_digest_len]u8 = undefined;
         KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.server_handshake_traffic[0..n], self.core.transcriptHash().slice(), server_verify[0..n]) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, server_verify[0..n]);
+        defer crypto_pkg.secrets.secureZero(server_verify[0..n]);
         try w.bytes(server_verify[0..n]);
         w.patch(3, finished_len);
         const finished = buf[finished_start..w.len];
@@ -5684,7 +5684,7 @@ pub const Tls13Backend = struct {
         // server flight was sent.
         var expected: [max_digest_len]u8 = undefined;
         KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.client_handshake_traffic[0..n], transcript_before.slice(), expected[0..n]) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, expected[0..n]);
+        defer crypto_pkg.secrets.secureZero(expected[0..n]);
         if (!crypto_pkg.provider.constantTimeEqual(expected[0..n], body[0..n])) return error.DecryptError;
         // Client Finished confirms the handshake for the server (RFC 8446 §4.4.4).
         try self.captureResumptionMasterSecret();
@@ -5785,7 +5785,7 @@ pub const Tls13Backend = struct {
         const schedule = &(self.schedule orelse return error.InvalidHandshakeState);
         const n = schedule.digestLen();
         var rms: [max_digest_len]u8 = undefined;
-        defer crypto.secureZero(u8, rms[0..n]);
+        defer crypto_pkg.secrets.secureZero(rms[0..n]);
         schedule.resumptionMasterSecret(self.core.transcriptHash().slice(), rms[0..n]) catch return error.SecretExportFailed;
         self.resumption_master_secret.replace(rms[0..n]) catch return error.SecretExportFailed;
     }
@@ -5979,7 +5979,7 @@ pub const Tls13Backend = struct {
         /// `state` away (leaving it zero-valued and this a no-op).
         pub fn deinit(self: *PreparedNewSessionTicket) void {
             self.state.deinit();
-            crypto.secureZero(u8, &self.ticket_nonce_buf);
+            crypto_pkg.secrets.secureZero(&self.ticket_nonce_buf);
             self.* = undefined;
         }
     };
@@ -6103,7 +6103,7 @@ pub const Tls13Backend = struct {
     fn finish(self: *Tls13Backend) void {
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
-        crypto.secureZero(u8, &self.expected_client_verify);
+        crypto_pkg.secrets.secureZero(&self.expected_client_verify);
     }
 };
 

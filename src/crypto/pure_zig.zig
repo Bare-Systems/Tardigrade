@@ -138,7 +138,7 @@ fn extractWith(comptime Hmac: type, salt: []const u8, ikm: []const u8, out: []u8
     var prk: [Hmac.mac_length]u8 = undefined;
     Hmac.create(&prk, ikm, salt);
     @memcpy(out, &prk);
-    crypto.secureZero(u8, &prk);
+    secrets.secureZero(&prk);
 }
 
 fn hkdfExpandLabelImpl(
@@ -196,15 +196,15 @@ fn expandLabelWith(
 
     var prk: [mac_len]u8 = undefined;
     @memcpy(&prk, secret);
-    defer crypto.secureZero(u8, &prk);
+    defer secrets.secureZero(&prk);
 
     // HKDF-Expand: T(i) = HMAC(PRK, T(i-1) || info || i), truncated to out.len.
     // Both `block` (a raw output block) and `message` (which carries T(i-1))
     // hold secret-derived material, so wipe them on every exit path.
     var block: [mac_len]u8 = undefined;
     var message: [mac_len + info.len + 1]u8 = undefined;
-    defer crypto.secureZero(u8, &block);
-    defer crypto.secureZero(u8, &message);
+    defer secrets.secureZero(&block);
+    defer secrets.secureZero(&message);
     var have_previous = false;
     var counter: usize = 1;
     var written: usize = 0;
@@ -266,7 +266,7 @@ fn sealWith(
     var n: [Cipher.nonce_length]u8 = undefined;
     @memcpy(&k, key);
     @memcpy(&n, nonce);
-    defer crypto.secureZero(u8, &k);
+    defer secrets.secureZero(&k);
 
     var t: [Cipher.tag_length]u8 = undefined;
     Cipher.encrypt(ciphertext, &t, plaintext, associated_data, n, k);
@@ -311,11 +311,11 @@ fn openWith(
     @memcpy(&k, key);
     @memcpy(&n, nonce);
     @memcpy(&t, tag);
-    defer crypto.secureZero(u8, &k);
+    defer secrets.secureZero(&k);
 
     Cipher.decrypt(plaintext, ciphertext, t, associated_data, n, k) catch {
         // Never leak partial plaintext on authentication failure.
-        crypto.secureZero(u8, plaintext);
+        secrets.secureZero(plaintext);
         return error.AuthenticationFailed;
     };
 }
@@ -338,25 +338,25 @@ fn quicHeaderProtectionMaskImpl(
             var s: [provider.quic_header_protection_sample_len]u8 = undefined;
             @memcpy(k[0..key.len], key);
             @memcpy(&s, sample);
-            defer crypto.secureZero(u8, &k);
-            defer crypto.secureZero(u8, &s);
+            defer secrets.secureZero(&k);
+            defer secrets.secureZero(&s);
 
             var block: [provider.quic_header_protection_sample_len]u8 = undefined;
             switch (hp) {
                 .aes_128 => {
                     var aes = Aes128.initEnc(k[0..16].*);
-                    defer crypto.secureZero(u8, std.mem.asBytes(&aes));
+                    defer secrets.secureZero(std.mem.asBytes(&aes));
                     aes.encrypt(&block, &s);
                 },
                 .aes_256 => {
                     var aes = Aes256.initEnc(k[0..32].*);
-                    defer crypto.secureZero(u8, std.mem.asBytes(&aes));
+                    defer secrets.secureZero(std.mem.asBytes(&aes));
                     aes.encrypt(&block, &s);
                 },
                 .chacha20 => unreachable,
             }
             @memcpy(mask, block[0..provider.quic_header_protection_mask_len]);
-            crypto.secureZero(u8, &block);
+            secrets.secureZero(&block);
         },
         .chacha20 => {
             if (key.len != provider.QuicHeaderProtection.chacha20.keyLength()) return error.InvalidInput;
@@ -368,13 +368,13 @@ fn quicHeaderProtectionMaskImpl(
             @memcpy(&k, key);
             @memcpy(&nonce, sample[4..16]);
             const counter = std.mem.readInt(u32, sample[0..4], .little);
-            defer crypto.secureZero(u8, &k);
-            defer crypto.secureZero(u8, &nonce);
+            defer secrets.secureZero(&k);
+            defer secrets.secureZero(&nonce);
 
             var block: [ChaCha20IETF.block_length]u8 = undefined;
             ChaCha20IETF.stream(&block, counter, k, nonce);
             @memcpy(mask, block[0..provider.quic_header_protection_mask_len]);
-            crypto.secureZero(u8, &block);
+            secrets.secureZero(&block);
         },
     }
 }
@@ -401,13 +401,13 @@ fn generateKeyShareImpl(
             var seed: [X25519.seed_length]u8 = undefined;
             // Register the wipe before filling, so a source that partially
             // fills and then fails does not leave seed bytes on the stack.
-            defer crypto.secureZero(u8, &seed);
+            defer secrets.secureZero(&seed);
             self.entropy.fill(&seed) catch return error.EntropyFailure;
 
             var key_pair = X25519.KeyPair.generateDeterministic(seed) catch return error.ProviderFailure;
             // The local key pair keeps a copy of the private scalar after it is
             // handed to the caller; scrub it on return.
-            defer crypto.secureZero(u8, &key_pair.secret_key);
+            defer secrets.secureZero(&key_pair.secret_key);
             @memcpy(public_out, &key_pair.public_key);
             @memcpy(private_out, &key_pair.secret_key);
         },
@@ -416,7 +416,7 @@ fn generateKeyShareImpl(
             if (private_out.len != provider.max_private_scalar_len) return error.InvalidInput;
 
             var scalar_bytes: [provider.max_private_scalar_len]u8 = undefined;
-            defer crypto.secureZero(u8, &scalar_bytes);
+            defer secrets.secureZero(&scalar_bytes);
 
             var attempts: usize = 0;
             while (attempts < p256_keygen_attempts) : (attempts += 1) {
@@ -424,7 +424,7 @@ fn generateKeyShareImpl(
                 _ = validateP256ScalarBytes(scalar_bytes) catch continue;
 
                 var public_point = P256.basePoint.mul(scalar_bytes, .big) catch return error.ProviderFailure;
-                defer crypto.secureZero(u8, std.mem.asBytes(&public_point));
+                defer secrets.secureZero(std.mem.asBytes(&public_point));
                 const sec1 = public_point.toUncompressedSec1();
                 @memcpy(public_out, &sec1);
                 @memcpy(private_out, &scalar_bytes);
@@ -453,14 +453,14 @@ fn deriveSharedSecretImpl(
             var point: [X25519.public_length]u8 = undefined;
             @memcpy(&scalar, private_scalar);
             @memcpy(&point, peer_public);
-            defer crypto.secureZero(u8, &scalar);
+            defer secrets.secureZero(&scalar);
 
             // scalarmult rejects the low-order / all-zero points that would
             // yield an all-zero (identity) shared secret: peer input error.
             var shared = X25519.scalarmult(scalar, point) catch return error.InvalidInput;
             // The shared secret is a backend-created temporary; scrub our copy
             // once it has been handed to the caller.
-            defer crypto.secureZero(u8, &shared);
+            defer secrets.secureZero(&shared);
             @memcpy(out, &shared);
         },
         .secp256r1 => {
@@ -471,21 +471,21 @@ fn deriveSharedSecretImpl(
 
             var scalar: [provider.max_private_scalar_len]u8 = undefined;
             @memcpy(&scalar, private_scalar);
-            defer crypto.secureZero(u8, &scalar);
+            defer secrets.secureZero(&scalar);
             try validateP256ScalarBytes(scalar);
 
             var peer = P256.fromSec1(peer_public) catch return error.InvalidInput;
-            defer crypto.secureZero(u8, std.mem.asBytes(&peer));
+            defer secrets.secureZero(std.mem.asBytes(&peer));
             peer.rejectIdentity() catch return error.InvalidInput;
             const canonical = peer.toUncompressedSec1();
             if (!std.mem.eql(u8, &canonical, peer_public)) return error.InvalidInput;
 
             var shared_point = peer.mul(scalar, .big) catch return error.InvalidInput;
-            defer crypto.secureZero(u8, std.mem.asBytes(&shared_point));
+            defer secrets.secureZero(std.mem.asBytes(&shared_point));
             var affine = shared_point.affineCoordinates();
-            defer crypto.secureZero(u8, std.mem.asBytes(&affine));
+            defer secrets.secureZero(std.mem.asBytes(&affine));
             var shared_x = affine.x.toBytes(.big);
-            defer crypto.secureZero(u8, &shared_x);
+            defer secrets.secureZero(&shared_x);
             @memcpy(out, &shared_x);
         },
     }
@@ -493,7 +493,7 @@ fn deriveSharedSecretImpl(
 
 fn validateP256ScalarBytes(bytes: [provider.max_private_scalar_len]u8) provider.InputError!void {
     var scalar = P256Scalar.fromBytes(bytes, .big) catch return error.InvalidInput;
-    defer crypto.secureZero(u8, std.mem.asBytes(&scalar));
+    defer secrets.secureZero(std.mem.asBytes(&scalar));
     if (scalar.isZero()) return error.InvalidInput;
 }
 
@@ -584,7 +584,7 @@ pub const SoftwareSigningKey = struct {
         // been derived from it, matching the wipe-after-use pattern used for
         // key-share seeds elsewhere in this file.
         var local_seed = seed;
-        defer crypto.secureZero(u8, &local_seed);
+        defer secrets.secureZero(&local_seed);
         const key_pair = Ed25519.KeyPair.generateDeterministic(local_seed) catch return error.ProviderFailure;
         return .{ .key_pair = key_pair };
     }
@@ -598,7 +598,7 @@ pub const SoftwareSigningKey = struct {
     /// is created at this boundary.
     pub fn fromSeedSecret(seed: *secrets.FixedSecret(Ed25519.KeyPair.seed_length)) provider.SignError!SoftwareSigningKey {
         var bridge: [Ed25519.KeyPair.seed_length]u8 = undefined;
-        defer crypto.secureZero(u8, &bridge);
+        defer secrets.secureZero(&bridge);
         @memcpy(&bridge, seed.slice());
         seed.deinit();
         const key_pair = Ed25519.KeyPair.generateDeterministic(bridge) catch return error.ProviderFailure;
@@ -609,7 +609,7 @@ pub const SoftwareSigningKey = struct {
     /// the key is no longer needed; letting the value go out of scope does not
     /// scrub its bytes.
     pub fn deinit(self: *SoftwareSigningKey) void {
-        crypto.secureZero(u8, &self.key_pair.secret_key.bytes);
+        secrets.secureZero(&self.key_pair.secret_key.bytes);
     }
 
     pub fn format(
@@ -676,7 +676,7 @@ pub const SoftwareEcdsaP256SigningKey = struct {
     /// frame's seed copy after derivation.
     pub fn fromSeed(seed: [EcdsaP256Sha256.KeyPair.seed_length]u8) provider.SignError!SoftwareEcdsaP256SigningKey {
         var local_seed = seed;
-        defer crypto.secureZero(u8, &local_seed);
+        defer secrets.secureZero(&local_seed);
         const key_pair = EcdsaP256Sha256.KeyPair.generateDeterministic(local_seed) catch return error.ProviderFailure;
         return .{ .key_pair = key_pair };
     }
@@ -687,7 +687,7 @@ pub const SoftwareEcdsaP256SigningKey = struct {
         defer seed.deinit();
         if (seed.len != EcdsaP256Sha256.KeyPair.seed_length) return error.InvalidInput;
         var bridge: [EcdsaP256Sha256.KeyPair.seed_length]u8 = undefined;
-        defer crypto.secureZero(u8, &bridge);
+        defer secrets.secureZero(&bridge);
         @memcpy(&bridge, seed.slice());
         seed.deinit();
         const key_pair = EcdsaP256Sha256.KeyPair.generateDeterministic(bridge) catch return error.ProviderFailure;
@@ -700,10 +700,10 @@ pub const SoftwareEcdsaP256SigningKey = struct {
     pub fn fromScalarBytes(scalar: []const u8) provider.SignError!SoftwareEcdsaP256SigningKey {
         if (scalar.len != EcdsaP256Sha256.SecretKey.encoded_length) return error.InvalidInput;
         var local_scalar: [EcdsaP256Sha256.SecretKey.encoded_length]u8 = undefined;
-        defer crypto.secureZero(u8, &local_scalar);
+        defer secrets.secureZero(&local_scalar);
         @memcpy(&local_scalar, scalar);
         var secret_key = try validatedSecretKey(local_scalar);
-        defer crypto.secureZero(u8, &secret_key.bytes);
+        defer secrets.secureZero(&secret_key.bytes);
         return deriveValidatedSecretKey(&secret_key);
     }
 
@@ -713,18 +713,18 @@ pub const SoftwareEcdsaP256SigningKey = struct {
         defer scalar.deinit();
         if (scalar.len != EcdsaP256Sha256.SecretKey.encoded_length) return error.InvalidInput;
         var bridge: [EcdsaP256Sha256.SecretKey.encoded_length]u8 = undefined;
-        defer crypto.secureZero(u8, &bridge);
+        defer secrets.secureZero(&bridge);
         @memcpy(&bridge, scalar.slice());
         scalar.deinit();
         var secret_key = try validatedSecretKey(bridge);
-        defer crypto.secureZero(u8, &secret_key.bytes);
+        defer secrets.secureZero(&secret_key.bytes);
         return deriveValidatedSecretKey(&secret_key);
     }
 
     /// Load from an already-parsed P-256 private scalar, consuming and wiping
     /// the caller-owned typed secret before returning.
     pub fn fromSecretKey(secret_key: *EcdsaP256Sha256.SecretKey) provider.SignError!SoftwareEcdsaP256SigningKey {
-        defer crypto.secureZero(u8, &secret_key.bytes);
+        defer secrets.secureZero(&secret_key.bytes);
         try validateScalarBytes(secret_key.bytes);
         return deriveValidatedSecretKey(secret_key);
     }
@@ -750,7 +750,7 @@ pub const SoftwareEcdsaP256SigningKey = struct {
     /// the key is no longer needed; letting the value go out of scope does not
     /// scrub its bytes.
     pub fn deinit(self: *SoftwareEcdsaP256SigningKey) void {
-        crypto.secureZero(u8, &self.key_pair.secret_key.bytes);
+        secrets.secureZero(&self.key_pair.secret_key.bytes);
     }
 
     pub fn format(
@@ -792,12 +792,12 @@ pub const SoftwareEcdsaP256SigningKey = struct {
         if (out.len < EcdsaP256Sha256.Signature.der_encoded_length_max) return error.InvalidInput;
 
         var noise: [EcdsaP256Sha256.noise_length]u8 = undefined;
-        defer crypto.secureZero(u8, &noise);
+        defer secrets.secureZero(&noise);
         entropy.fill(&noise) catch return error.EntropyFailure;
 
         const signature = self.key_pair.sign(message, noise) catch return error.ProviderFailure;
         var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
-        defer crypto.secureZero(u8, &der_buf);
+        defer secrets.secureZero(&der_buf);
         const der = signature.toDer(&der_buf);
         @memcpy(out[0..der.len], der);
         return der.len;
@@ -873,7 +873,7 @@ pub const SoftwareRsaSigningKey = struct {
         if (out.len < self.key.modulusLen()) return error.InvalidInput;
 
         var salt: [rsa.pss_salt_len]u8 = undefined;
-        defer crypto.secureZero(u8, &salt);
+        defer secrets.secureZero(&salt);
         entropy.fill(&salt) catch return error.EntropyFailure;
 
         return rsa.signPssSha256(&self.key, message, salt, out) catch return error.InvalidInput;
@@ -1538,7 +1538,7 @@ test "SoftwareEcdsaP256SigningKey uses injected entropy and emits canonical DER"
     const actual_len = try signer.sign(message, fixed_entropy.entropy(), &actual_der);
     const direct_signature = try key.key_pair.sign(message, fixed_noise);
     var expected_der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
-    defer crypto.secureZero(u8, &expected_der_buf);
+    defer secrets.secureZero(&expected_der_buf);
     const expected_der = direct_signature.toDer(&expected_der_buf);
     try testing.expectEqualSlices(u8, expected_der, actual_der[0..actual_len]);
 
@@ -1551,7 +1551,7 @@ test "SoftwareEcdsaP256SigningKey uses injected entropy and emits canonical DER"
     @memcpy(alternate_raw[32..64], &alternate_s);
     const alternate_signature = EcdsaP256Sha256.Signature.fromBytes(alternate_raw);
     var alternate_der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
-    defer crypto.secureZero(u8, &alternate_der_buf);
+    defer secrets.secureZero(&alternate_der_buf);
     const alternate_der = alternate_signature.toDer(&alternate_der_buf);
     try expectCanonicalEcdsaDer(alternate_der);
     try cp.verify(.ecdsa_secp256r1_sha256, &public_key, message, alternate_der);

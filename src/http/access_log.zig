@@ -27,6 +27,16 @@ pub const AccessLogEntry = struct {
     early_data_retry_result: []const u8 = "none",
     /// True when this request is replay-exposed by transport or prior-hop marker.
     early_data_replay_exposed: bool = false,
+    /// Set for a WebSocket handshake that became a tunnel (#812): why the
+    /// tunnel closed, how long it lived, and the bytes it moved each way.
+    tunnel: ?Tunnel = null,
+
+    pub const Tunnel = struct {
+        close_reason: []const u8,
+        duration_ms: u64,
+        client_to_upstream_bytes: u64,
+        upstream_to_client_bytes: u64,
+    };
 
     pub fn log(self: AccessLogEntry) void {
         emit(self);
@@ -189,29 +199,42 @@ fn appendEntry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cfg: Confi
     const ts = logger.formatTimestamp(&ts_buf);
 
     switch (cfg.format) {
-        .json => try out.print(allocator, "{f}\n", .{std.json.fmt(.{
-            .type = "access",
-            .ts = ts,
-            .request_id = entry.correlation_id,
-            .correlation_id = entry.correlation_id,
-            .method = entry.method,
-            .path = entry.path,
-            .status = entry.status,
-            .latency_ms = entry.latency_ms,
-            .client_ip = entry.client_ip,
-            .upstream_addr = entry.upstream_addr,
-            .upstream_status = entry.upstream_status,
-            .identity = entry.identity,
-            .user_agent = entry.user_agent,
-            .bytes_sent = entry.bytes_sent,
-            .response_bytes = entry.response_bytes,
-            .error_category = entry.error_category,
-            .cancel_reason = entry.cancel_reason,
-            .early_data_source = entry.early_data_source,
-            .early_data_action = entry.early_data_action,
-            .early_data_retry_result = entry.early_data_retry_result,
-            .early_data_replay_exposed = entry.early_data_replay_exposed,
-        }, .{})}),
+        .json => {
+            try out.print(allocator, "{f}", .{std.json.fmt(.{
+                .type = "access",
+                .ts = ts,
+                .request_id = entry.correlation_id,
+                .correlation_id = entry.correlation_id,
+                .method = entry.method,
+                .path = entry.path,
+                .status = entry.status,
+                .latency_ms = entry.latency_ms,
+                .client_ip = entry.client_ip,
+                .upstream_addr = entry.upstream_addr,
+                .upstream_status = entry.upstream_status,
+                .identity = entry.identity,
+                .user_agent = entry.user_agent,
+                .bytes_sent = entry.bytes_sent,
+                .response_bytes = entry.response_bytes,
+                .error_category = entry.error_category,
+                .cancel_reason = entry.cancel_reason,
+                .early_data_source = entry.early_data_source,
+                .early_data_action = entry.early_data_action,
+                .early_data_retry_result = entry.early_data_retry_result,
+                .early_data_replay_exposed = entry.early_data_replay_exposed,
+            }, .{})});
+            if (entry.tunnel) |tunnel| {
+                // Extend the object rather than repeat every field above.
+                _ = out.pop();
+                try out.print(allocator, ",\"tunnel_close_reason\":{f},\"tunnel_duration_ms\":{d},\"tunnel_client_to_upstream_bytes\":{d},\"tunnel_upstream_to_client_bytes\":{d}}}", .{
+                    std.json.fmt(tunnel.close_reason, .{}),
+                    tunnel.duration_ms,
+                    tunnel.client_to_upstream_bytes,
+                    tunnel.upstream_to_client_bytes,
+                });
+            }
+            try out.append(allocator, '\n');
+        },
         .plain => try appendPlainEntry(allocator, out, entry),
         .custom => try appendTemplate(allocator, out, if (cfg.custom_template.len > 0) cfg.custom_template else "{method} {path} {status}", ts, entry),
     }
@@ -255,7 +278,13 @@ fn appendPlainEntry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), entry
     try appendLogValue(allocator, out, entry.early_data_action);
     try out.appendSlice(allocator, " early_retry=");
     try appendLogValue(allocator, out, entry.early_data_retry_result);
-    try out.print(allocator, " replay_exposed={}\n", .{entry.early_data_replay_exposed});
+    try out.print(allocator, " replay_exposed={}", .{entry.early_data_replay_exposed});
+    if (entry.tunnel) |tunnel| {
+        try out.appendSlice(allocator, " tunnel_close=");
+        try appendLogValue(allocator, out, tunnel.close_reason);
+        try out.print(allocator, " tunnel_ms={d} tunnel_in={d} tunnel_out={d}", .{ tunnel.duration_ms, tunnel.client_to_upstream_bytes, tunnel.upstream_to_client_bytes });
+    }
+    try out.append(allocator, '\n');
 }
 
 fn appendTemplate(allocator: std.mem.Allocator, out: *std.ArrayList(u8), template: []const u8, ts: []const u8, entry: AccessLogEntry) !void {
@@ -463,6 +492,39 @@ test "formatEntry json contains required fields" {
     try std.testing.expect(std.mem.find(u8, line, "\"early_data_action\":\"ordinary\"") != null);
     try std.testing.expect(std.mem.find(u8, line, "\"early_data_retry_result\":\"none\"") != null);
     try std.testing.expect(std.mem.find(u8, line, "\"early_data_replay_exposed\":false") != null);
+}
+
+test "formatEntry adds WebSocket tunnel fields only for tunnels (#812)" {
+    var entry = AccessLogEntry{
+        .method = "GET",
+        .path = "/ws/chat",
+        .status = 101,
+        .latency_ms = 1500,
+        .client_ip = "10.0.0.1",
+        .correlation_id = "ws-1",
+        .upstream_addr = "127.0.0.1:9000",
+        .upstream_status = 101,
+        .identity = "-",
+        .user_agent = "",
+        .bytes_sent = 0,
+        .response_bytes = 0,
+        .error_category = "-",
+    };
+    const plain_json = try formatEntry(std.testing.allocator, .{}, entry);
+    defer std.testing.allocator.free(plain_json);
+    try std.testing.expect(std.mem.find(u8, plain_json, "tunnel") == null);
+
+    entry.tunnel = .{ .close_reason = "idle", .duration_ms = 1499, .client_to_upstream_bytes = 42, .upstream_to_client_bytes = 7 };
+    const json = try formatEntry(std.testing.allocator, .{}, entry);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.endsWith(u8, json, ",\"tunnel_close_reason\":\"idle\",\"tunnel_duration_ms\":1499,\"tunnel_client_to_upstream_bytes\":42,\"tunnel_upstream_to_client_bytes\":7}\n"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 101), parsed.value.object.get("status").?.integer);
+
+    const plain = try formatEntry(std.testing.allocator, .{ .format = .plain }, entry);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.endsWith(u8, plain, " tunnel_close=idle tunnel_ms=1499 tunnel_in=42 tunnel_out=7\n"));
 }
 
 test "formatEntry json preserves early_data_retry_result failure label" {

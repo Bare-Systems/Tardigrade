@@ -496,6 +496,16 @@ pub const EdgeConfig = struct {
     /// one connection but may serve many sequential requests.
     /// Returns 503 when exceeded. Set via TARDIGRADE_MAX_IN_FLIGHT_REQUESTS.
     max_in_flight_requests: u32,
+    /// Maximum concurrent WebSocket tunnels (#812). Zero derives the cap from
+    /// the worker count. Set via TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS.
+    proxy_websocket_max_tunnels: u32 = 0,
+    /// What a hot reload does to WebSocket tunnels whose location sets no
+    /// `proxy_websocket_reload` of its own (#812). Read from the configuration
+    /// a tunnel was admitted under. Set via TARDIGRADE_PROXY_WEBSOCKET_RELOAD.
+    proxy_websocket_reload: http.location_router.WebSocketReloadPolicy = .preserve,
+    /// Drain window for `drain` tunnels, likewise overridable per location.
+    /// Set via TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS.
+    proxy_websocket_reload_timeout_ms: u32 = http.location_router.WebSocketProxy.DEFAULT_RELOAD_TIMEOUT_MS,
     /// Idle keep-alive timeout for client connections (ms, 0 = disabled).
     keep_alive_timeout_ms: u32,
     /// Overall request deadline from first byte received to response fully written (ms, 0 = disabled).
@@ -1366,6 +1376,17 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const max_active_connections = std.fmt.parseInt(u32, max_active_conn_str, 10) catch 0;
 
     const max_in_flight_requests = parseIntEnv(u32, allocator, "TARDIGRADE_MAX_IN_FLIGHT_REQUESTS", 0);
+    const proxy_websocket_max_tunnels = try parseStrictU32Env(allocator, "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", 0, "proxy_websocket_max_tunnels");
+    const proxy_websocket_reload_str = envOrDefault(allocator, "TARDIGRADE_PROXY_WEBSOCKET_RELOAD", "preserve") catch unreachable;
+    defer allocator.free(proxy_websocket_reload_str);
+    const proxy_websocket_reload = http.location_router.WebSocketReloadPolicy.parse(proxy_websocket_reload_str) orelse {
+        logConfigDiagnostic("config validation failed: proxy_websocket_reload must be one of preserve, drain", .{});
+        return error.InvalidConfigValue;
+    };
+    // Strict: a malformed value must fail config load (and so reject a hot
+    // reload) rather than silently become the default, which would publish a
+    // generation and start draining open `drain` tunnels (#812).
+    const proxy_websocket_reload_timeout_ms = try parseStrictU32Env(allocator, "TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS", http.location_router.WebSocketProxy.DEFAULT_RELOAD_TIMEOUT_MS, "proxy_websocket_reload_timeout_ms");
 
     const keep_alive_timeout_str = envOrDefault(allocator, "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", "5000") catch unreachable;
     defer allocator.free(keep_alive_timeout_str);
@@ -1788,6 +1809,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .max_connections_per_ip = max_connections_per_ip,
         .max_active_connections = max_active_connections,
         .max_in_flight_requests = max_in_flight_requests,
+        .proxy_websocket_max_tunnels = proxy_websocket_max_tunnels,
+        .proxy_websocket_reload = proxy_websocket_reload,
+        .proxy_websocket_reload_timeout_ms = proxy_websocket_reload_timeout_ms,
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
         .request_total_timeout_ms = request_total_timeout_ms,
         .tls_handshake_timeout_ms = tls_handshake_timeout_ms,
@@ -2148,6 +2172,69 @@ fn parseProxyStreamingModeConfig(raw: []const u8) !ProxyStreamingMode {
         logConfigDiagnostic("config validation failed: proxy_streaming_mode must be one of off, buffered, response, full, request-response", .{});
         return error.InvalidConfigValue;
     };
+}
+
+/// The configured value of `key` with `envOrDefault`'s precedence
+/// (environment, then config file, then secrets), or null when it is not
+/// configured anywhere. Unlike a default sentinel, this keeps "set to an
+/// empty value" distinct from "not set".
+fn lookupConfigValue(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+    if (compat.getEnvVarOwned(allocator, key)) |owned| {
+        return owned;
+    } else |_| {}
+    if (active_file_overrides) |ov| {
+        if (ov.map.get(key)) |value| return try allocator.dupe(u8, value);
+    }
+    if (active_secret_overrides) |ov| {
+        if (ov.map.get(key)) |value| return try allocator.dupe(u8, value);
+    }
+    return null;
+}
+
+/// An unsigned millisecond/count setting that rejects malformed values
+/// instead of falling back to `default_value` like `parseIntEnv`. Only an
+/// absent setting takes the default; an explicitly empty one is invalid.
+fn parseStrictU32Env(allocator: std.mem.Allocator, key: []const u8, default_value: u32, directive: []const u8) !u32 {
+    const raw = (try lookupConfigValue(allocator, key)) orelse return default_value;
+    defer allocator.free(raw);
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return parseStrictU32(value) orelse {
+        logConfigDiagnostic("config validation failed: {s} must be an unsigned integer, got '{s}'", .{ directive, value });
+        return error.InvalidConfigValue;
+    };
+}
+
+fn parseStrictU32(value: []const u8) ?u32 {
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return null;
+    return std.fmt.parseInt(u32, value, 10) catch null;
+}
+
+test "strict u32 settings reject malformed values and keep zero (#812)" {
+    try std.testing.expectEqual(@as(?u32, 0), parseStrictU32("0"));
+    try std.testing.expectEqual(@as(?u32, 30000), parseStrictU32("30000"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("250ms"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("-1"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("+5"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("99999999999"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32(""));
+}
+
+test "strict u32 settings default only when absent, and reject an explicit empty value (#812)" {
+    const allocator = std.testing.allocator;
+    var overrides = http.config_file.Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    const previous = active_file_overrides;
+    defer active_file_overrides = previous;
+    active_file_overrides = &overrides;
+
+    const key = "TARDIGRADE_TEST_STRICT_U32_812";
+    try std.testing.expectEqual(@as(u32, 30000), try parseStrictU32Env(allocator, key, 30000, "test"));
+    try overrides.map.put(try allocator.dupe(u8, key), try allocator.dupe(u8, "0"));
+    try std.testing.expectEqual(@as(u32, 0), try parseStrictU32Env(allocator, key, 30000, "test"));
+    const entry = overrides.map.getEntry(key).?;
+    allocator.free(entry.value_ptr.*);
+    entry.value_ptr.* = try allocator.dupe(u8, "");
+    try std.testing.expectError(error.InvalidConfigValue, parseStrictU32Env(allocator, key, 30000, "test"));
 }
 
 fn logConfigDiagnostic(comptime fmt: []const u8, args: anytype) void {
@@ -2674,9 +2761,31 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         var fa_timeout_ms: u32 = 0;
         var fa_failure_status: u16 = http.location_router.ForwardAuth.DEFAULT_FAILURE_STATUS;
         var fa_options_seen = false;
+        var websocket_on = false;
+        var websocket: http.location_router.WebSocketProxy = .{};
+        var websocket_origins: ?[]const u8 = null;
+        var websocket_options_seen = false;
         while (fields.next()) |option_raw| {
             const option = std.mem.trim(u8, option_raw, " \t\r\n");
-            if (std.mem.startsWith(u8, option, "forward_auth:")) {
+            if (std.mem.eql(u8, option, "websocket:on")) {
+                websocket_on = true;
+            } else if (std.mem.startsWith(u8, option, "websocket_idle_timeout_ms:")) {
+                websocket.idle_timeout_ms = std.fmt.parseInt(u32, option["websocket_idle_timeout_ms:".len..], 10) catch return error.InvalidLocationBlockFormat;
+                if (websocket.idle_timeout_ms == 0) return error.InvalidLocationBlockFormat;
+                websocket_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "websocket_max_lifetime_ms:")) {
+                websocket.max_lifetime_ms = std.fmt.parseInt(u32, option["websocket_max_lifetime_ms:".len..], 10) catch return error.InvalidLocationBlockFormat;
+                websocket_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "websocket_reload:")) {
+                websocket.reload = http.location_router.WebSocketReloadPolicy.parse(option["websocket_reload:".len..]) orelse return error.InvalidLocationBlockFormat;
+                websocket_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "websocket_reload_timeout_ms:")) {
+                websocket.reload_timeout_ms = std.fmt.parseInt(u32, option["websocket_reload_timeout_ms:".len..], 10) catch return error.InvalidLocationBlockFormat;
+                websocket_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "websocket_origins:")) {
+                websocket_origins = option["websocket_origins:".len..];
+                websocket_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "forward_auth:")) {
                 const url = option["forward_auth:".len..];
                 validateForwardAuthUrl(url) catch return error.InvalidLocationBlockFormat;
                 if (forward_auth != null) return error.InvalidLocationBlockFormat;
@@ -2728,6 +2837,12 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         } else if (fa_options_seen) {
             return error.InvalidLocationBlockFormat;
         }
+        if (websocket_on) switch (action) {
+            .proxy_pass => {},
+            else => return error.InvalidLocationBlockFormat,
+        } else if (websocket_options_seen) return error.InvalidLocationBlockFormat;
+        if (websocket_origins) |raw_origins| websocket.origins = try parseWebSocketOrigins(allocator, raw_origins);
+        errdefer websocket.deinit(allocator);
 
         try out.append(allocator, .{
             .match_type = match_type,
@@ -2741,9 +2856,11 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .proxy_early_data = proxy_early_data,
             .proxy_set_headers = &.{},
             .forward_auth = forward_auth,
+            .websocket = if (websocket_on) websocket else null,
         });
         action_owned = false;
         forward_auth = null;
+        websocket = .{};
         if (set_headers.items.len > 0) {
             out.items[out.items.len - 1].proxy_set_headers = try set_headers.toOwnedSlice(allocator);
         } else {
@@ -2790,6 +2907,21 @@ fn validateForwardAuthUrl(raw: []const u8) !void {
     }
     const uri = std.Uri.parse(raw) catch return error.InvalidConfigUrl;
     if (uri.user != null or uri.password != null or uri.fragment != null) return error.InvalidConfigUrl;
+}
+
+fn parseWebSocketOrigins(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    var origins = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (origins.items) |origin| allocator.free(origin);
+        origins.deinit(allocator);
+    }
+    var it = std.mem.tokenizeAny(u8, raw, ", \t");
+    while (it.next()) |origin| {
+        if (!http.location_router.isValidWebSocketOrigin(origin)) return error.InvalidLocationBlockFormat;
+        try origins.append(allocator, try allocator.dupe(u8, origin));
+    }
+    if (origins.items.len == 0) return error.InvalidLocationBlockFormat;
+    return origins.toOwnedSlice(allocator);
 }
 
 fn parseForwardAuthHeaderNames(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
@@ -4295,6 +4427,46 @@ test "parse location blocks read forward_auth options" {
     try std.testing.expectEqual(@as(u32, 750), fa.timeout_ms);
     try std.testing.expectEqual(@as(u16, 502), fa.failure_status);
     try std.testing.expect(blocks[1].forward_auth == null);
+}
+
+test "parse location blocks read proxy_websocket options (#812)" {
+    const allocator = std.testing.allocator;
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_idle_timeout_ms:1500" ++
+            "|websocket_max_lifetime_ms:60000|websocket_origins:https://app.example.test,http://127.0.0.1:8080" ++
+            "|websocket_reload:drain|websocket_reload_timeout_ms:2500" ++
+            ";prefix|/api/|proxy_pass|http://127.0.0.1:9000",
+    );
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+    const ws = blocks[0].websocket.?;
+    try std.testing.expectEqual(@as(u32, 1500), ws.idle_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 60000), ws.max_lifetime_ms);
+    try std.testing.expectEqual(@as(usize, 2), ws.origins.len);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080", ws.origins[1]);
+    try std.testing.expectEqual(http.location_router.WebSocketReloadPolicy.drain, ws.reload.?);
+    try std.testing.expectEqual(@as(u32, 2500), ws.reload_timeout_ms.?);
+    try std.testing.expect(blocks[1].websocket == null);
+}
+
+test "parse location blocks reject unsafe proxy_websocket configuration (#812)" {
+    const cases = [_][]const u8{
+        // Only proxy_pass locations can relay an upgrade.
+        "prefix|/ws/|return|200|ok|websocket:on",
+        // Options without the opt-in.
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket_idle_timeout_ms:10",
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_idle_timeout_ms:0",
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_origins:app.example.test",
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_origins:",
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_reload:sometimes",
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket_reload:drain",
+    };
+    for (cases) |raw| {
+        try std.testing.expectError(error.InvalidLocationBlockFormat, parseLocationBlocks(std.testing.allocator, raw));
+    }
 }
 
 test "parse location blocks reject unsafe forward_auth configuration" {

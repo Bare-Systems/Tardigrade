@@ -956,6 +956,211 @@ pub fn handleLocationProxyPass(
     return status_code;
 }
 
+/// True when `Conn` (the HTTP/1.1 downstream connection type) can carry a
+/// WebSocket tunnel: a native TLS connection that exposes a tunnel endpoint,
+/// or a plain socket stream.
+fn supportsTunnel(comptime Conn: type) bool {
+    if (@typeInfo(Conn) == .pointer) {
+        const Child = std.meta.Child(Conn);
+        return @hasDecl(Child, "tunnelEndpoint") or @hasField(Child, "handle");
+    }
+    return @typeInfo(Conn) == .@"struct" and @hasField(Conn, "handle");
+}
+
+fn downstreamTunnelEndpoint(conn: anytype) if (@typeInfo(@TypeOf(conn)) == .pointer and @hasDecl(std.meta.Child(@TypeOf(conn)), "tunnelEndpoint"))
+    http.tunnel.EncryptedEndpoint
+else
+    http.tunnel.SocketEndpoint {
+    const Conn = @TypeOf(conn);
+    if (comptime @typeInfo(Conn) == .pointer and @hasDecl(std.meta.Child(Conn), "tunnelEndpoint")) return conn.tunnelEndpoint();
+    return .{ .handle = conn.handle };
+}
+
+/// Relay a validated WebSocket handshake on a `proxy_websocket` location to
+/// the origin and, on a verified 101, tunnel bytes until either side closes
+/// (#812). Every gate (rate limits, ACLs, `auth required`, `forward_auth`,
+/// path policy, Origin, 0-RTT) has already passed. The tunnel slot is taken
+/// before the upstream is contacted, so an over-capacity handshake gets a
+/// clean 503. `downstream_initial` is client data that arrived with the
+/// handshake. Records `ctx.tunnel` when a tunnel ran; the connection must
+/// not be reused afterwards.
+pub fn handleLocationWebSocketProxyPass(
+    allocator: std.mem.Allocator,
+    downstream_conn: anytype,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    target: []const u8,
+    suffix_path: ?[]const u8,
+    client_key: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    incoming_host: ?[]const u8,
+    location_id: []const u8,
+    matched_block: *const edge_config.EdgeConfig.LocationBlock,
+    websocket: *const http.location_router.WebSocketProxy,
+    downstream_initial: []const u8,
+) !u16 {
+    if (comptime !supportsTunnel(@TypeOf(downstream_conn))) {
+        state.metricsRecordWebSocketUpgrade(.upstream_error);
+        try sendApiError(allocator, writer, .not_implemented, "websocket_unsupported", "WebSocket relaying is not available on this connection", correlation_id, false, state);
+        return @intFromEnum(http.Status.not_implemented);
+    }
+    if (!state.tryAcquireWebSocketTunnel(cfg.proxy_websocket_max_tunnels)) {
+        state.metricsRecordWebSocketUpgrade(.capacity);
+        try sendApiError(allocator, writer, .service_unavailable, "websocket_capacity", "WebSocket tunnel limit reached", correlation_id, false, state);
+        return @intFromEnum(http.Status.service_unavailable);
+    }
+    defer state.releaseWebSocketTunnel();
+
+    const upstream_pool = upstreamPoolForScope(cfg, .global);
+    var temp_arena = std.heap.ArenaAllocator.init(allocator);
+    defer temp_arena.deinit();
+    const temp_allocator = temp_arena.allocator();
+    var sticky_affinity = try prepareStickyAffinityRequest(temp_allocator, cfg, upstream_pool, &request.headers, incoming_host, location_id, target);
+    const upstream_hash_key = if (suffix_path) |suffix| suffix else target;
+    const selection: StickyUpstreamSelection = if (sticky_affinity) |*value|
+        state.nextStickyUpstreamBaseUrl(cfg, upstream_pool, client_ip, upstream_hash_key, value.requested_upstream)
+    else
+        .{ .base_url = state.nextUpstreamBaseUrl(cfg, upstream_pool, client_ip, upstream_hash_key), .used_requested = false };
+    const absolute_target = isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"));
+    const selected_base_url = if (absolute_target) cfg.upstream_base_url else selection.base_url;
+    const resolved = try resolveProxyTarget(temp_allocator, selected_base_url, target, suffix_path);
+    const upstream_url = try appendProxyQueryString(temp_allocator, resolved.url, request.uri.query);
+
+    const circuit_permit = state.circuitTryAcquirePermit() orelse {
+        state.metricsRecordWebSocketUpgrade(.upstream_error);
+        try sendApiError(allocator, writer, .service_unavailable, "upstream_circuit_open", "Upstream circuit breaker open", correlation_id, false, state);
+        ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
+        return @intFromEnum(http.Status.service_unavailable);
+    };
+    // Least-connections balancing sees a tunnel as in flight for its whole life.
+    state.recordUpstreamAttemptStart(selection.base_url);
+    defer state.recordUpstreamAttemptEnd(selection.base_url);
+
+    var accept_buf: [http.websocket.ACCEPT_KEY_LEN]u8 = undefined;
+    const accept_key = http.websocket.computeAcceptKey(client_key, &accept_buf);
+    var downstream_committed = false;
+    const opened = gp.openWebSocketUpstream(
+        allocator,
+        cfg,
+        upstream_url.value,
+        resolved.unix_socket_path,
+        &request.headers,
+        accept_key,
+        .{
+            .request_headers = &request.headers,
+            .correlation_id = correlation_id,
+            .client_ip = client_ip,
+            .forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http",
+            .incoming_host = incoming_host,
+            .proxy_set_headers = matched_block.proxy_set_headers,
+            .auth_identity = ctx.identity,
+            .auth_user_id = ctx.user_id,
+            .auth_device_id = ctx.device_id,
+            .auth_scopes = ctx.scopes,
+        },
+        &state.security_headers,
+        state.http3_alt_svc,
+        if (ctx.lifecycle) |lc| &lc.token else null,
+        state.proxyBufferObserver(),
+        state.proxyBufferGlobalAccount(),
+        &state.upstream_pool,
+        downstream_conn,
+        writer,
+        &downstream_committed,
+    ) catch |err| {
+        if (err == error.OutOfMemory) {
+            state.circuitReleasePermit(circuit_permit);
+            return err;
+        }
+        if (err == error.ProxyBufferCapacityUnavailable) {
+            state.circuitReleasePermit(circuit_permit);
+            state.metricsRecordWebSocketUpgrade(.capacity);
+            try sendApiError(allocator, writer, .service_unavailable, "proxy_buffer_saturated", "Proxy buffer capacity exhausted", correlation_id, false, state);
+            ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
+            return @intFromEnum(http.Status.service_unavailable);
+        }
+        if (err == error.ClientAborted) {
+            state.circuitReleasePermit(circuit_permit);
+            state.metricsRecordProxyClientAbort();
+            return err;
+        }
+        if (absolute_target) {
+            state.circuitRecordFailurePermit(circuit_permit);
+        } else {
+            state.recordProxyUpstreamFailure(cfg, selection.base_url, circuit_permit);
+        }
+        state.metricsRecordWebSocketUpgrade(.upstream_error);
+        const upstream_err: UpstreamErrorResponse = if (err == error.InvalidWebSocketHandshake) .{
+            .status = .bad_gateway,
+            .code = "upstream_websocket_invalid",
+            .message = "Upstream sent an invalid WebSocket handshake",
+        } else classifyUpstreamError(err);
+        state.logger.warn(correlation_id, "websocket upstream handshake failed: {}", .{err});
+        const status: u16 = @intFromEnum(upstream_err.status);
+        if (downstream_committed) {
+            // A refused handshake's response already went out; never write a
+            // second one on top of it.
+            state.metricsRecord(status);
+        } else {
+            try sendApiError(allocator, writer, upstream_err.status, upstream_err.code, upstream_err.message, correlation_id, false, state);
+        }
+        ctx.setUpstreamResult(resolved.upstream_host, status, 0);
+        return status;
+    };
+
+    switch (opened) {
+        .refused => |refused| {
+            recordStreamingProxyOutcome(state, cfg, selection.base_url, absolute_target, circuit_permit, refused.status_code, refused.upstream_aborted, refused.local_capacity_aborted, correlation_id);
+            state.metricsRecordWebSocketUpgrade(.upstream_refused);
+            ctx.setUpstreamResult(resolved.upstream_host, refused.status_code, refused.response_body_bytes);
+            state.metricsRecord(refused.status_code);
+            try propagateStreamingDownstreamAbortAfterStatus(state, &refused);
+            return refused.status_code;
+        },
+        .switched => |upgraded| {
+            defer upgraded.deinit();
+            recordStreamingProxyOutcome(state, cfg, selection.base_url, absolute_target, circuit_permit, 101, false, false, correlation_id);
+            upgraded.writeSwitchingProtocols(allocator, writer, accept_key, correlation_id) catch |err| {
+                state.metricsRecordProxyClientAbort();
+                return err;
+            };
+            state.metricsRecordWebSocketUpgrade(.relayed);
+            state.metricsRecord(101);
+            ctx.setUpstreamResult(resolved.upstream_host, 101, 0);
+            state.logger.debug(correlation_id, "websocket tunnel opened: {s} -> {s}", .{ request.uri.path, upstream_url.value });
+            // Reload behavior is fixed here, at admission, from this request's
+            // own configuration: a later reload can end the tunnel (drain) but
+            // never change which policy or timeout applies to it.
+            const reload_policy = websocket.reload orelse cfg.proxy_websocket_reload;
+            const reload_timeout_ms = websocket.reload_timeout_ms orelse cfg.proxy_websocket_reload_timeout_ms;
+            const reload_drain: ?http.tunnel.ReloadDrain = switch (reload_policy) {
+                .preserve => null,
+                .drain => if (ctx.config_superseded_at) |stamp| .{ .superseded_at_ms = stamp, .timeout_ms = reload_timeout_ms } else null,
+            };
+            const stats = upgraded.relay(downstreamTunnelEndpoint(downstream_conn), downstream_initial, .{
+                .idle_timeout_ms = websocket.idle_timeout_ms,
+                .max_lifetime_ms = websocket.max_lifetime_ms,
+                .drain_timeout_ms = cfg.shutdown_drain_timeout_ms,
+                .shutdown_requested = http.shutdown.isShutdownRequested,
+                .reload_drain = reload_drain,
+            });
+            state.metricsRecordWebSocketTunnelClosed(stats);
+            ctx.tunnel = stats;
+            state.logger.debug(correlation_id, "websocket tunnel closed: reason={s} duration_ms={d} client_to_upstream={d} upstream_to_client={d}", .{
+                stats.close_reason.label(),
+                stats.duration_ms,
+                stats.client_to_upstream_bytes,
+                stats.upstream_to_client_bytes,
+            });
+            return 101;
+        },
+    }
+}
+
 /// Returns true for HTTP methods that are safe to retry on failure without
 /// risk of double-applying a non-idempotent side effect (RFC 9110 §9.2).
 /// GET, HEAD, PUT, DELETE, OPTIONS, and TRACE are idempotent.

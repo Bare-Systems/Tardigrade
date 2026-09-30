@@ -260,13 +260,18 @@ fn parseProxyHeaderV2(buf: []const u8, strict: bool, client_ip_buf: *[64]u8) Pro
     }
 }
 
+/// Read until `buf` holds at least one complete request. Returns every byte
+/// buffered, which may include the start of a pipelined request (or, after a
+/// WebSocket handshake, the first frames): the caller parses the first
+/// request and keeps the rest pending. Returning only the first request's
+/// length used to make callers drop those bytes.
 pub fn readHttpRequest(conn: anytype, buf: []u8, pending_len: *usize) !usize {
     var total_read = pending_len.*;
 
     while (total_read <= buf.len) {
-        if (firstRequestCompleteLen(buf[0..total_read])) |request_len| {
+        if (firstRequestCompleteLen(buf[0..total_read]) != null) {
             pending_len.* = total_read;
-            return @min(total_read, request_len);
+            return total_read;
         }
         if (total_read == buf.len) break;
 
@@ -406,6 +411,25 @@ pub fn parseContentLength(headers: []const u8) ?usize {
         return std.fmt.parseInt(usize, value, 10) catch null;
     }
     return null;
+}
+
+test "readHttpRequest keeps bytes behind the first complete request" {
+    const Fake = struct {
+        data: []const u8,
+        off: usize = 0,
+        pub fn read(self: *@This(), out: []u8) !usize {
+            const n = @min(out.len, self.data.len - self.off);
+            @memcpy(out[0..n], self.data[self.off..][0..n]);
+            self.off += n;
+            return n;
+        }
+    };
+    const wire = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+    var fake = Fake{ .data = wire };
+    var buf: [256]u8 = undefined;
+    var pending: usize = 0;
+    try std.testing.expectEqual(wire.len, try readHttpRequest(&fake, &buf, &pending));
+    try std.testing.expectEqual(wire.len, pending);
 }
 
 test "parse proxy protocol v1 header extracts source ip" {

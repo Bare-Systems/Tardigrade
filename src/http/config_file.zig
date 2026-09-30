@@ -105,6 +105,12 @@ const LocationBlockBuilder = struct {
     forward_auth_body: ?usize = null,
     forward_auth_timeout_ms: ?u32 = null,
     forward_auth_failure_status: ?u16 = null,
+    proxy_websocket: ?bool = null,
+    proxy_websocket_idle_timeout_ms: ?u32 = null,
+    proxy_websocket_max_lifetime_ms: ?u32 = null,
+    proxy_websocket_origins: ?[]u8 = null,
+    proxy_websocket_reload: ?location_router.WebSocketReloadPolicy = null,
+    proxy_websocket_reload_timeout_ms: ?u32 = null,
     error_pages: std.ArrayList(ErrorPageBuilder) = .empty,
     proxy_set_headers: std.ArrayList(ProxySetHeaderBuilder) = .empty,
 
@@ -140,6 +146,7 @@ const LocationBlockBuilder = struct {
         if (self.forward_auth) |value| allocator.free(value);
         if (self.forward_auth_upstream_headers) |value| allocator.free(value);
         if (self.forward_auth_client_headers) |value| allocator.free(value);
+        if (self.proxy_websocket_origins) |value| allocator.free(value);
         for (self.error_pages.items) |entry| {
             allocator.free(entry.status_codes_csv);
             allocator.free(entry.target);
@@ -338,6 +345,7 @@ fn parseStatement(
         return error.InvalidConfigSyntax;
     }
     const trimmed_value = std.mem.trim(u8, value_raw, " \t\"'");
+    try rejectEmptyStrictValue(allocator, file_path, line_no, directive, trimmed_value, vars);
 
     // Core directive aliases (phase 3.2)
     if (std.ascii.eqlIgnoreCase(directive, "worker_processes")) {
@@ -927,6 +935,106 @@ fn parseLocationStatement(
         try replaceOptionalOwned(allocator, &builder.proxy_early_data, value_interp);
         return;
     }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_websocket")) {
+        if (std.ascii.eqlIgnoreCase(value_interp, "on")) {
+            builder.proxy_websocket = true;
+        } else if (std.ascii.eqlIgnoreCase(value_interp, "off")) {
+            builder.proxy_websocket = false;
+        } else {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_websocket must be 'on' or 'off'", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        }
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_websocket_idle_timeout_ms")) {
+        const timeout_ms = std.fmt.parseInt(u32, value_interp, 10) catch 0;
+        if (timeout_ms == 0) {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_websocket_idle_timeout_ms must be a positive number of milliseconds", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        }
+        builder.proxy_websocket_idle_timeout_ms = timeout_ms;
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_websocket_max_lifetime_ms")) {
+        builder.proxy_websocket_max_lifetime_ms = std.fmt.parseInt(u32, value_interp, 10) catch {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_websocket_max_lifetime_ms must be a number of milliseconds (0 = unlimited)", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        };
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_websocket_reload")) {
+        builder.proxy_websocket_reload = location_router.WebSocketReloadPolicy.parse(value_interp) orelse {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_websocket_reload must be 'preserve' or 'drain'", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        };
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_websocket_reload_timeout_ms")) {
+        builder.proxy_websocket_reload_timeout_ms = std.fmt.parseInt(u32, value_interp, 10) catch {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_websocket_reload_timeout_ms must be a number of milliseconds", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        };
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_websocket_origins")) {
+        const joined = try joinWebSocketOrigins(allocator, file_path, line_no, value_interp);
+        defer allocator.free(joined);
+        try replaceOptionalOwned(allocator, &builder.proxy_websocket_origins, joined);
+        return;
+    }
+}
+
+/// Top-level settings that must never silently take their default: an
+/// empty value (`""`, or a variable that expands to nothing) is an error
+/// rather than "unset", because accepting it would let an invalid reload
+/// publish and start draining WebSocket tunnels (#812).
+const strict_numeric_env_keys = [_][]const u8{
+    "TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS",
+    "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS",
+};
+
+fn rejectEmptyStrictValue(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    line_no: usize,
+    directive: []const u8,
+    trimmed_value: []const u8,
+    vars: *std.StringHashMap([]const u8),
+) !void {
+    const env_key = try normalizeDirectiveToEnv(allocator, directive);
+    defer allocator.free(env_key);
+    for (strict_numeric_env_keys) |key| {
+        if (!std.mem.eql(u8, env_key, key)) continue;
+        const expanded = try interpolate(allocator, trimmed_value, vars);
+        defer allocator.free(expanded);
+        if (std.mem.trim(u8, expanded, " \t\r\n").len == 0) {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: {s} must be an unsigned integer, not empty", .{ file_path, line_no, directive });
+            return error.InvalidConfigSyntax;
+        }
+        return;
+    }
+}
+
+/// Normalize `proxy_websocket_origins` (origins separated by spaces or
+/// commas) into the comma-joined form the location encoding carries. Each
+/// entry is a serialized origin, `scheme://host[:port]`, compared exactly
+/// (case-insensitively) against the handshake's `Origin`.
+fn joinWebSocketOrigins(allocator: std.mem.Allocator, file_path: []const u8, line_no: usize, value: []const u8) ![]u8 {
+    var origins = std.ArrayList([]const u8).empty;
+    defer origins.deinit(allocator);
+    var toks = std.mem.tokenizeAny(u8, value, " \t,");
+    while (toks.next()) |origin| {
+        if (!location_router.isValidWebSocketOrigin(origin)) {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_websocket_origins entry '{s}' must be an origin like https://app.example.com", .{ file_path, line_no, origin });
+            return error.InvalidConfigSyntax;
+        }
+        try origins.append(allocator, origin);
+    }
+    if (origins.items.len == 0) {
+        logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_websocket_origins needs at least one origin", .{ file_path, line_no });
+        return error.InvalidConfigSyntax;
+    }
+    return std.mem.join(allocator, ",", origins.items);
 }
 
 fn isForwardAuthFailureStatus(status: u16) bool {
@@ -1100,6 +1208,29 @@ fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlock
         builder.forward_auth_body != null or builder.forward_auth_timeout_ms != null or builder.forward_auth_failure_status != null)
     {
         logConfigSyntaxDiagnostic("config syntax error: location '{s}' sets forward_auth_* options without forward_auth", .{builder.pattern});
+        allocator.free(entry);
+        return error.InvalidConfigSyntax;
+    }
+    if (builder.proxy_websocket orelse false) {
+        if (builder.proxy_pass == null) {
+            logConfigSyntaxDiagnostic("config syntax error: location '{s}' uses proxy_websocket without proxy_pass", .{builder.pattern});
+            allocator.free(entry);
+            return error.InvalidConfigSyntax;
+        }
+        var ws_entry: std.ArrayList(u8) = .empty;
+        defer ws_entry.deinit(allocator);
+        try ws_entry.print(allocator, "{s}|websocket:on", .{entry});
+        if (builder.proxy_websocket_idle_timeout_ms) |timeout_ms| try ws_entry.print(allocator, "|websocket_idle_timeout_ms:{d}", .{timeout_ms});
+        if (builder.proxy_websocket_max_lifetime_ms) |lifetime_ms| try ws_entry.print(allocator, "|websocket_max_lifetime_ms:{d}", .{lifetime_ms});
+        if (builder.proxy_websocket_origins) |origins| try ws_entry.print(allocator, "|websocket_origins:{s}", .{origins});
+        if (builder.proxy_websocket_reload) |policy| try ws_entry.print(allocator, "|websocket_reload:{s}", .{@tagName(policy)});
+        if (builder.proxy_websocket_reload_timeout_ms) |timeout_ms| try ws_entry.print(allocator, "|websocket_reload_timeout_ms:{d}", .{timeout_ms});
+        allocator.free(entry);
+        entry = try ws_entry.toOwnedSlice(allocator);
+    } else if (builder.proxy_websocket_idle_timeout_ms != null or builder.proxy_websocket_max_lifetime_ms != null or builder.proxy_websocket_origins != null or
+        builder.proxy_websocket_reload != null or builder.proxy_websocket_reload_timeout_ms != null)
+    {
+        logConfigSyntaxDiagnostic("config syntax error: location '{s}' sets proxy_websocket_* options without proxy_websocket on", .{builder.pattern});
         allocator.free(entry);
         return error.InvalidConfigSyntax;
     }
@@ -1684,6 +1815,54 @@ test "location block serializes forward_auth directives" {
             "|forward_auth_body:0|forward_auth_timeout_ms:750|forward_auth_failure_status:502",
         overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
     );
+}
+
+test "location block serializes proxy_websocket directives (#812)" {
+    const allocator = std.testing.allocator;
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    try parseLocationConfigForTest(allocator,
+        \\location /ws/ {
+        \\    proxy_pass http://127.0.0.1:9000;
+        \\    proxy_websocket on;
+        \\    proxy_websocket_idle_timeout_ms 1500;
+        \\    proxy_websocket_max_lifetime_ms 60000;
+        \\    proxy_websocket_origins https://app.example.test, http://127.0.0.1:8080;
+        \\    proxy_websocket_reload drain;
+        \\    proxy_websocket_reload_timeout_ms 2500;
+        \\}
+        \\location /api/ {
+        \\    proxy_pass http://127.0.0.1:9000;
+        \\    proxy_websocket off;
+        \\}
+    , &overrides);
+
+    try std.testing.expectEqualStrings(
+        "prefix|/ws/|proxy_pass|http://127.0.0.1:9000|websocket:on|websocket_idle_timeout_ms:1500" ++
+            "|websocket_max_lifetime_ms:60000|websocket_origins:https://app.example.test,http://127.0.0.1:8080" ++
+            "|websocket_reload:drain|websocket_reload_timeout_ms:2500" ++
+            ";prefix|/api/|proxy_pass|http://127.0.0.1:9000",
+        overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
+    );
+}
+
+test "location block rejects unsafe proxy_websocket directives (#812)" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "location /ws/ {\n    proxy_websocket on;\n    return 200 ok;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket_idle_timeout_ms 100;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket yes;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket on;\n    proxy_websocket_idle_timeout_ms 0;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket on;\n    proxy_websocket_origins app.example.test;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket on;\n    proxy_websocket_reload restart;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket_reload drain;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_websocket on;\n    proxy_websocket_reload_timeout_ms soon;\n}\n",
+    };
+    for (cases) |data| {
+        var overrides = Overrides.init(allocator);
+        defer overrides.deinit(allocator);
+        try std.testing.expectError(error.InvalidConfigSyntax, parseLocationConfigForTest(allocator, data, &overrides));
+    }
 }
 
 test "location block rejects unsafe forward_auth directives" {

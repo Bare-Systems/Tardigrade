@@ -532,6 +532,12 @@ pub const GatewayState = struct {
     /// this limit are rejected with 503 before any work is done. cfg snapshot;
     /// updated on reload [runtime_mutex].
     max_in_flight_requests: u32,
+    /// Open (or opening) WebSocket tunnels (#812). Lock-free.
+    websocket_tunnels: std.atomic.Value(u32) = .init(0),
+    /// Tunnel cap used when `proxy_websocket_max_tunnels` is 0: half the
+    /// worker threads, rounded down, so tunnels can never hold every worker
+    /// (zero with a single worker). Set once at startup.
+    websocket_default_max_tunnels: u32 = 0,
     active_ws_streams: usize, // runtime accounting [connection_mutex]
     active_sse_streams: usize, // runtime accounting [connection_mutex]
     active_mux_connections: usize, // runtime accounting [connection_mutex]
@@ -832,6 +838,23 @@ pub const GatewayState = struct {
     pub fn releaseRequestSlot(self: *GatewayState) void {
         if (self.max_in_flight_requests == 0) return;
         _ = self.in_flight_requests.fetchSub(1, .acq_rel);
+    }
+
+    /// Reserve a WebSocket tunnel slot (#812) before the upstream is
+    /// contacted. `configured_max` is `proxy_websocket_max_tunnels`; zero uses
+    /// the worker-derived default.
+    pub fn tryAcquireWebSocketTunnel(self: *GatewayState, configured_max: u32) bool {
+        const cap = if (configured_max > 0) configured_max else self.websocket_default_max_tunnels;
+        const prev = self.websocket_tunnels.fetchAdd(1, .acq_rel);
+        if (prev >= cap) {
+            _ = self.websocket_tunnels.fetchSub(1, .acq_rel);
+            return false;
+        }
+        return true;
+    }
+
+    pub fn releaseWebSocketTunnel(self: *GatewayState) void {
+        _ = self.websocket_tunnels.fetchSub(1, .acq_rel);
     }
 
     /// HOT PATH: taken once per request when rate limiting is enabled.
@@ -1575,6 +1598,19 @@ pub const GatewayState = struct {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
         self.metrics.recordForwardAuth(protocol, outcome);
+    }
+
+    pub fn metricsRecordWebSocketUpgrade(self: *GatewayState, outcome: http.metrics.WebSocketUpgradeOutcome) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordWebSocketUpgrade(outcome);
+    }
+
+    pub fn metricsRecordWebSocketTunnelClosed(self: *GatewayState, stats: http.tunnel.Stats) void {
+        const reason = std.meta.stringToEnum(http.metrics.WebSocketCloseReason, stats.close_reason.label()) orelse .@"error";
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordWebSocketTunnelClosed(reason, stats.client_to_upstream_bytes, stats.upstream_to_client_bytes, stats.duration_ms);
     }
 
     pub fn metricsRecordEarlyDataDecision(self: *GatewayState, protocol: http.metrics.HttpProtocol, decision: http.metrics.EarlyDataDecision) void {
@@ -3165,6 +3201,13 @@ pub const ManagedConfigVersion = struct {
     owned_cfg: ?*edge_config.EdgeConfig,
     ref_count: usize,
     generation: u64,
+    /// Monotonic time (ms) at which a successful reload replaced this
+    /// generation, or 0 while it is current. Written once, by the install
+    /// that supersedes it: a failed reload never installs, and a later reload
+    /// replaces a newer generation, so the value is never moved. Long-lived
+    /// work leased on this generation (WebSocket tunnels in `drain` mode,
+    /// #812) reads it to time its own shutdown.
+    superseded_at_ms: std.atomic.Value(u64) = .init(0),
     /// Parsed IP access-control policy for THIS configuration generation.
     ///
     /// The ACL lives here, not on `GatewayState`, because authorization state
@@ -3302,6 +3345,8 @@ pub const ReloadableConfigStore = struct {
         }
         self.next_generation = @max(self.next_generation, new_version.generation);
         self.current = new_version;
+        // Never 0, which means "still current".
+        _ = old_version.superseded_at_ms.cmpxchgStrong(0, @max(http.event_loop.monotonicMs(), 1), .acq_rel, .acquire);
         self.retired.appendAssumeCapacity(old_version);
         std.debug.assert(old_version.ref_count > 0);
         old_version.ref_count -= 1;
@@ -4618,6 +4663,44 @@ test "an in-flight config lease keeps enforcing its own ACL across a reload" {
     // Releasing the last old lease is what retires the old generation and frees
     // its ACL — never while a request could still be inside `check()`.
     in_flight.release();
+}
+
+test "a successful reload stamps the superseded generation once; failed reloads never do (#812)" {
+    const allocator = std.testing.allocator;
+    var first_cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    first_cfg.access_control_rules = "";
+    var store = try ReloadableConfigStore.initBorrowed(allocator, &first_cfg);
+    defer store.deinit();
+
+    // A tunnel admitted under the first generation holds its lease.
+    var tunnel_lease = store.acquire();
+    defer tunnel_lease.release();
+    try std.testing.expectEqual(@as(u64, 0), tunnel_lease.version.superseded_at_ms.load(.acquire));
+
+    // A reload that is prepared but rejected is destroyed, never installed.
+    const rejected_cfg = try allocator.create(edge_config.EdgeConfig);
+    rejected_cfg.* = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    rejected_cfg.access_control_rules = "";
+    store.destroyVersion(try store.prepareOwned(rejected_cfg));
+    try std.testing.expectEqual(@as(u64, 0), tunnel_lease.version.superseded_at_ms.load(.acquire));
+
+    const second_cfg = try allocator.create(edge_config.EdgeConfig);
+    second_cfg.* = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    second_cfg.access_control_rules = "";
+    const second = try store.prepareOwned(second_cfg);
+    store.installPrepared(second);
+    const first_stamp = tunnel_lease.version.superseded_at_ms.load(.acquire);
+    try std.testing.expect(first_stamp != 0);
+    try std.testing.expectEqual(@as(u64, 0), second.superseded_at_ms.load(.acquire));
+
+    // A later reload supersedes the second generation; the first generation's
+    // stamp, and so any drain deadline derived from it, does not move.
+    compat.sleepNs(5 * std.time.ns_per_ms);
+    const third_cfg = try allocator.create(edge_config.EdgeConfig);
+    third_cfg.* = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    third_cfg.access_control_rules = "";
+    store.installPrepared(try store.prepareOwned(third_cfg));
+    try std.testing.expectEqual(first_stamp, tunnel_lease.version.superseded_at_ms.load(.acquire));
 }
 
 test "a reloaded ACL is published atomically with its own generation" {

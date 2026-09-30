@@ -5,6 +5,7 @@ const Request = @import("request.zig").Request;
 const Headers = @import("headers.zig").Headers;
 const RequestLifecycle = @import("request_lifecycle.zig").RequestLifecycle;
 const access_control = @import("access_control.zig");
+const tunnel = @import("tunnel.zig");
 
 pub const EarlyDataContext = struct {
     transport_early: bool = false,
@@ -122,6 +123,16 @@ pub const RequestContext = struct {
     /// Request lifecycle tracker (deadline, cancellation). Null for short-circuit paths
     /// that return before a full lifecycle is created (e.g. 400/405 early rejections).
     lifecycle: ?*RequestLifecycle,
+    /// HTTP/1.1 client bytes already read past this request's head, i.e. a
+    /// pipelined request or, after a WebSocket handshake, the first frames.
+    /// Only an upgrade consumes them (#812).
+    downstream_buffered_input: []const u8 = &.{},
+    /// Set when the request became a WebSocket tunnel and it has closed (#812).
+    tunnel: ?tunnel.Stats = null,
+    /// Supersession stamp of the configuration generation this request is
+    /// leased on (0 while current). A `drain`-mode WebSocket tunnel times its
+    /// reload drain from it (#812).
+    config_superseded_at: ?*const std.atomic.Value(u64) = null,
 
     pub fn init(allocator: Allocator, request_id: []const u8, client_ip: []const u8) RequestContext {
         return .{

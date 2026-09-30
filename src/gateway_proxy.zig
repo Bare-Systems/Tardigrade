@@ -2589,6 +2589,41 @@ fn readUpstreamHead(
     method: []const u8,
     spill: HeadSpill,
 ) !ParsedUpstreamHead {
+    return readUpstreamHeadMode(arena, rb, transport, fd, deadline_ms, method, spill, null);
+}
+
+/// The fields of an upstream `101 Switching Protocols` that decide whether
+/// it completes a WebSocket handshake (#812). They are hop-by-hop or
+/// handshake-owned, so `ParsedUpstreamHead.headers` never carries them.
+const SwitchingHead = struct {
+    upgrade_websocket: bool = false,
+    connection_upgrade: bool = false,
+    /// Arena-owned `Sec-WebSocket-Accept`; null when absent.
+    accept: ?[]const u8 = null,
+    accept_fields: usize = 0,
+
+    /// True when the 101 answers the handshake whose expected accept value is
+    /// `expected_accept` (RFC 6455 §4.1, client steps 2-4).
+    fn completesHandshake(self: *const SwitchingHead, expected_accept: []const u8) bool {
+        if (!self.upgrade_websocket or !self.connection_upgrade or self.accept_fields != 1) return false;
+        return std.mem.eql(u8, self.accept.?, expected_accept);
+    }
+};
+
+/// `readUpstreamHead`, except that with `switching` set a `101` is a valid
+/// final head (the upgrade handshake's answer, framing `.none`) whose
+/// handshake fields are recorded into `switching`. Without it a `101` is
+/// rejected as before.
+fn readUpstreamHeadMode(
+    arena: std.mem.Allocator,
+    rb: *StreamReadBuf,
+    transport: anytype,
+    fd: std.posix.fd_t,
+    deadline_ms: u32,
+    method: []const u8,
+    spill: HeadSpill,
+    switching: ?*SwitchingHead,
+) !ParsedUpstreamHead {
     var slab: ?[]u8 = null;
     defer if (slab) |buf| {
         spill.allocator.free(buf);
@@ -2661,6 +2696,18 @@ fn readUpstreamHead(
         if (!http.headers.isValidHeaderName(name) or !http.headers.isValidHeaderValue(value)) {
             return error.UpstreamProtocolError;
         }
+        if (switching != null and status_code == 101) {
+            const sw = switching.?;
+            if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
+                if (http.websocket.headerHasToken(value, "websocket")) sw.upgrade_websocket = true;
+            } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+                if (http.websocket.headerHasToken(value, "upgrade")) sw.connection_upgrade = true;
+            } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-accept")) {
+                sw.accept_fields += 1;
+                sw.accept = try arena.dupe(u8, value);
+                continue;
+            }
+        }
         if (gph.shouldSkipUpstreamResponseHeader(name, null)) continue;
         // See parseBufferedUpstreamResponse: scan the same header-lines
         // view this loop itself iterates (starting after the status
@@ -2668,7 +2715,11 @@ fn readUpstreamHead(
         if (gph.anyRawConnectionHeaderReferencesHeader(header_block[@min(status_line.header_lines_start, header_block.len)..], name)) continue;
         try headers.append(.{ .name = try arena.dupe(u8, name), .value = try arena.dupe(u8, value) });
     }
-    const framing = try detectResponseFraming(header_block, method);
+    // An upgrade's 101 ends the HTTP exchange: its "body" is the new
+    // protocol, which the tunnel relays. It must be HTTP/1.1 (RFC 9110 §7.8).
+    const switched = switching != null and status_code == 101;
+    if (switched and !http_1_1) return error.UpstreamProtocolError;
+    const framing: ResponseFraming = if (switched) .none else try detectResponseFraming(header_block, method);
     rb.consume(head_end + 4);
     return .{
         .status_code = status_code,
@@ -3057,7 +3108,7 @@ fn streamProxyOverTransport(
     proxy_buffer_limits: proxy_buffer_account.Limits,
     proxy_buffer_observer: proxy_buffer_account.Observer,
     proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity,
-) !struct { result: StreamingProxyResult, reusable: bool } {
+) !StreamedExchange {
     if (connect_timeout_ms > 0) setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
     try sendStreamingProxyRequest(
         allocator,
@@ -3141,7 +3192,32 @@ fn streamProxyOverTransport(
         head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method, .{ .allocator = allocator, .reservation = &response_reservation });
     }
     const ttfb_ms = http.event_loop.monotonicMs() - ttfb_start_ms;
+    return relayStreamedFinalResponse(allocator, &rb, transport, fd, &head, method, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, read_deadline_ms, cancel_token, wrote_downstream, ttfb_ms);
+}
 
+const StreamedExchange = struct { result: StreamingProxyResult, reusable: bool };
+
+/// Relay an upstream final response head already read into `head`, then its
+/// body from `rb`/`transport`, to the client. Shared by the streaming proxy
+/// and a WebSocket handshake the origin refused (#812).
+fn relayStreamedFinalResponse(
+    allocator: std.mem.Allocator,
+    rb: *StreamReadBuf,
+    transport: anytype,
+    fd: std.posix.fd_t,
+    head: *const ParsedUpstreamHead,
+    method: []const u8,
+    downstream_writer: anytype,
+    security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
+    sticky_set_cookie: ?[]const u8,
+    correlation_id: []const u8,
+    downstream_keep_alive: bool,
+    read_deadline_ms: u32,
+    cancel_token: ?*const CancellationToken,
+    wrote_downstream: *bool,
+    ttfb_ms: u64,
+) !StreamedExchange {
     const reason = gpres.upstreamReasonPhrase(@enumFromInt(head.status_code));
     const body_allowed = gpres.responseBodyAllowed(method, head.status_code);
 
@@ -3181,7 +3257,7 @@ fn streamProxyOverTransport(
     // or a full ghost response.
     var reusable = body_allowed and head.http_1_1 and !head.connection_close;
     if (body_allowed) {
-        const outcome = relayUpstreamBody(&rb, transport, fd, read_deadline_ms, head.framing, &downstream_write, downstream_writer, cancel_token) catch |err| {
+        const outcome = relayUpstreamBody(rb, transport, fd, read_deadline_ms, head.framing, &downstream_write, downstream_writer, cancel_token) catch |err| {
             if (err == error.ClientAborted) {
                 return .{
                     .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
@@ -3317,30 +3393,20 @@ pub fn executeStreamingHttpProxyRequest(
     var extra_headers = std.array_list.Managed(std.http.Header).init(extra_headers_allocator);
     defer extra_headers.deinit();
     try extra_headers.ensureUnusedCapacity(request_headers.count() + proxy_extra_header_slack);
-    try gph.appendProxyRequestHeaders(&extra_headers, request_headers);
-    try gph.appendRequestIdHeaders(&extra_headers, correlation_id);
-    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for.value });
-    try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
-    try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
-    if (incoming_host) |value| {
-        const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        if (trimmed.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = trimmed });
-    }
-    try gph.appendAssertedIdentityHeaders(&extra_headers, auth_identity, auth_user_id, auth_device_id, auth_scopes);
     var traceparent_buf: [55]u8 = undefined;
-    if (request_headers.get("traceparent") == null) {
-        const tc = http.trace_context.generate();
-        const tp = tc.format(&traceparent_buf);
-        if (tp.len > 0) try extra_headers.append(.{ .name = "traceparent", .value = tp });
-    }
     var set_header_arena = std.heap.ArenaAllocator.init(allocator);
     defer set_header_arena.deinit();
-    try gph.applyProxySetHeaders(set_header_arena.allocator(), &extra_headers, proxy_set_headers, .{
-        .host = incoming_host,
-        .remote_addr = client_ip,
-        .scheme = forwarded_proto,
-        .proxy_add_x_forwarded_for = forwarded_for.value,
-        .request_id = correlation_id,
+    try appendForwardedProxyHeaders(&extra_headers, set_header_arena.allocator(), forwarded_for.value, &traceparent_buf, .{
+        .request_headers = request_headers,
+        .correlation_id = correlation_id,
+        .client_ip = client_ip,
+        .forwarded_proto = forwarded_proto,
+        .incoming_host = incoming_host,
+        .proxy_set_headers = proxy_set_headers,
+        .auth_identity = auth_identity,
+        .auth_user_id = auth_user_id,
+        .auth_device_id = auth_device_id,
+        .auth_scopes = auth_scopes,
     });
 
     // The relay buffer's size, not the buffer: the h2 path allocates its own
@@ -3494,6 +3560,322 @@ pub fn executeStreamingHttpProxyRequest(
         if (pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - exchange_start_ms);
         return res.result;
     }
+}
+
+/// What an HTTP/1.1 proxy request says about the client and the route.
+const ForwardedHeaderInputs = struct {
+    request_headers: *const http.Headers,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    forwarded_proto: []const u8,
+    incoming_host: ?[]const u8,
+    proxy_set_headers: []const http.location_router.ProxySetHeader,
+    auth_identity: ?[]const u8,
+    auth_user_id: ?[]const u8,
+    auth_device_id: ?[]const u8,
+    auth_scopes: ?[]const u8,
+};
+
+/// The origin-facing header set of a streamed or upgraded HTTP/1.1 proxy
+/// request: the client's end-to-end headers, request IDs, forwarding
+/// headers, asserted identity, a `traceparent` when the client sent none,
+/// and finally the location's `proxy_set_header` rules (#809).
+/// `forwarded_for` and `traceparent_buf` must outlive `extra_headers`.
+fn appendForwardedProxyHeaders(
+    extra_headers: *std.array_list.Managed(std.http.Header),
+    set_header_allocator: std.mem.Allocator,
+    forwarded_for: []const u8,
+    traceparent_buf: *[55]u8,
+    in: ForwardedHeaderInputs,
+) !void {
+    try gph.appendProxyRequestHeaders(extra_headers, in.request_headers);
+    try gph.appendRequestIdHeaders(extra_headers, in.correlation_id);
+    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
+    try extra_headers.append(.{ .name = "X-Real-IP", .value = in.client_ip });
+    try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = in.forwarded_proto });
+    if (in.incoming_host) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = trimmed });
+    }
+    try gph.appendAssertedIdentityHeaders(extra_headers, in.auth_identity, in.auth_user_id, in.auth_device_id, in.auth_scopes);
+    if (in.request_headers.get("traceparent") == null) {
+        const tc = http.trace_context.generate();
+        const tp = tc.format(traceparent_buf);
+        if (tp.len > 0) try extra_headers.append(.{ .name = "traceparent", .value = tp });
+    }
+    try gph.applyProxySetHeaders(set_header_allocator, extra_headers, in.proxy_set_headers, .{
+        .host = in.incoming_host,
+        .remote_addr = in.client_ip,
+        .scheme = in.forwarded_proto,
+        .proxy_add_x_forwarded_for = forwarded_for,
+        .request_id = in.correlation_id,
+    });
+}
+
+/// An origin connection that answered a WebSocket handshake with a valid
+/// `101` (#812). It owns the socket, the parsed head, both tunnel direction
+/// buffers and their proxy-buffer reservations; `deinit` releases all of
+/// them and closes the connection. It is never pooled.
+pub const UpgradedUpstream = struct {
+    allocator: std.mem.Allocator,
+    fd: std.posix.fd_t,
+    tls: ?*http.upstream_tls.UpstreamTlsConn,
+    head_arena: std.heap.ArenaAllocator,
+    head: ParsedUpstreamHead,
+    /// Origin bytes that arrived with the 101 head (its first frames). They
+    /// live in `to_client_buf` and are delivered before anything else.
+    early_upstream_bytes: []const u8,
+    to_upstream_buf: []u8,
+    to_client_buf: []u8,
+    to_upstream_reservation: ProxyBufferReservation,
+    to_client_reservation: ProxyBufferReservation,
+
+    pub fn deinit(self: *UpgradedUpstream) void {
+        const allocator = self.allocator;
+        if (self.tls) |tls| {
+            tls.deinit();
+            allocator.destroy(tls);
+        }
+        _ = std.c.close(self.fd);
+        self.head_arena.deinit();
+        allocator.free(self.to_upstream_buf);
+        allocator.free(self.to_client_buf);
+        self.to_upstream_reservation.releaseAll();
+        self.to_client_reservation.releaseAll();
+        allocator.destroy(self);
+    }
+
+    /// Relay the origin's 101 to the client: the verified handshake fields,
+    /// the origin's other end-to-end headers (subprotocol, extensions,
+    /// cookies), request IDs, and any request-scoped headers such as
+    /// `forward_auth_client_headers`.
+    pub fn writeSwitchingProtocols(self: *const UpgradedUpstream, allocator: std.mem.Allocator, writer: anytype, accept_key: []const u8, correlation_id: []const u8) !void {
+        var head: std.Io.Writer.Allocating = .init(allocator);
+        defer head.deinit();
+        const w = &head.writer;
+        try w.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n", .{accept_key});
+        for (self.head.headers) |header| {
+            // A 101 has no body, and request IDs are Tardigrade's own.
+            if (std.ascii.eqlIgnoreCase(header.name, "content-length") or
+                std.ascii.eqlIgnoreCase(header.name, http.correlation.REQUEST_HEADER_NAME) or
+                std.ascii.eqlIgnoreCase(header.name, http.correlation.HEADER_NAME)) continue;
+            try w.print("{s}: {s}\r\n", .{ header.name, header.value });
+        }
+        try gph.writeRequestIdHeaders(w, correlation_id);
+        for (http.security_headers.requestScopedHeaders()) |scoped| {
+            try w.print("{s}: {s}\r\n", .{ scoped.name, scoped.value });
+        }
+        try w.writeAll("\r\n");
+        try writer.writeAll(head.written());
+    }
+
+    /// Run the tunnel between `downstream` (a `tunnel` endpoint) and this
+    /// origin until either side closes or a limit ends it.
+    pub fn relay(self: *UpgradedUpstream, downstream: anytype, initial_to_upstream: []const u8, opts: http.tunnel.Options) http.tunnel.Stats {
+        if (self.tls) |tls| {
+            return http.tunnel.relay(downstream, http.tunnel.UpstreamTlsEndpoint{ .tls = tls }, self.to_upstream_buf, self.to_client_buf, initial_to_upstream, self.early_upstream_bytes, opts);
+        }
+        return http.tunnel.relay(downstream, http.tunnel.SocketEndpoint{ .handle = self.fd }, self.to_upstream_buf, self.to_client_buf, initial_to_upstream, self.early_upstream_bytes, opts);
+    }
+};
+
+pub const WebSocketUpstreamResult = union(enum) {
+    /// The origin switched protocols; the caller relays the 101 and tunnels.
+    switched: *UpgradedUpstream,
+    /// The origin answered with a final non-101 response, already relayed to
+    /// the client as an ordinary response.
+    refused: StreamingProxyResult,
+};
+
+/// Open a fresh HTTP/1.1 connection to the origin and send it the client's
+/// WebSocket handshake (#812). Upgrade connections never come from or go back
+/// to the keep-alive pool, are never retried or replayed, and always use
+/// HTTP/1.1 (TLS origins are offered only `http/1.1`).
+///
+/// The request carries the same forwarding, identity, trace and
+/// `proxy_set_header` headers as any proxied request, with `Upgrade:
+/// websocket` and `Connection: Upgrade` re-asserted last. A `101` must carry
+/// `Upgrade: websocket`, `Connection: upgrade` and exactly one
+/// `Sec-WebSocket-Accept` equal to `expected_accept`, or the exchange fails
+/// with `error.InvalidWebSocketHandshake` before anything reaches the
+/// client. Any other final status is relayed through the streaming response
+/// path. `downstream_committed` is set once response bytes reach the client.
+pub fn openWebSocketUpstream(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    url: []const u8,
+    unix_socket_path: ?[]const u8,
+    request_headers: *const http.Headers,
+    expected_accept: []const u8,
+    forwarded: ForwardedHeaderInputs,
+    security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
+    cancel_token: ?*const CancellationToken,
+    proxy_buffer_observer: proxy_buffer_account.Observer,
+    proxy_buffer_global: ?*proxy_buffer_account.Aggregate,
+    pool: ?*http.upstream_pool.UpstreamPool,
+    downstream_conn: anytype,
+    downstream_writer: anytype,
+    downstream_committed: *bool,
+) !WebSocketUpstreamResult {
+    if (cancelStopped(cancel_token)) return error.RequestCancelled;
+    const uri = try std.Uri.parse(url);
+    const is_https = unix_socket_path == null and std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    const host = if (uri.host) |h| uriComponentBytes(h) else return error.UpstreamProtocolError;
+    const port: u16 = uri.port orelse (if (is_https) @as(u16, 443) else 80);
+    const connect_timeout_ms: u32 = if (cfg.upstream_connect_timeout_ms > 0) cfg.upstream_connect_timeout_ms else cfg.upstream_timeout_ms;
+    const base_read_ms: u32 = if (cfg.upstream_response_timeout_ms > 0) cfg.upstream_response_timeout_ms else cfg.upstream_timeout_ms;
+    const read_deadline_ms: u32 = if (cancel_token) |tok| tok.effectiveTimeoutMs(base_read_ms) else base_read_ms;
+
+    var forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), forwarded.client_ip);
+    defer forwarded_for.deinit(allocator);
+    var extra_headers = std.array_list.Managed(std.http.Header).init(allocator);
+    defer extra_headers.deinit();
+    var traceparent_buf: [55]u8 = undefined;
+    var set_header_arena = std.heap.ArenaAllocator.init(allocator);
+    defer set_header_arena.deinit();
+    try appendForwardedProxyHeaders(&extra_headers, set_header_arena.allocator(), forwarded_for.value, &traceparent_buf, forwarded);
+    try extra_headers.append(.{ .name = "Upgrade", .value = "websocket" });
+    try extra_headers.append(.{ .name = "Connection", .value = "Upgrade" });
+
+    // Both direction buffers are charged before either exists, per-stream and
+    // against the origin and process aggregates (#140), so a flood of
+    // upgrades is refused with a clean 503 instead of growing memory.
+    const relay_bytes = @max(cfg.proxy_stream_buffer_size, 16 * 1024);
+    var key_buf: [512]u8 = undefined;
+    const key = if (unix_socket_path) |socket_path|
+        std.fmt.bufPrint(&key_buf, "unix:{s}", .{socket_path}) catch socket_path
+    else
+        std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_https) "https" else "http", host, port }) catch host;
+    const capacity = proxy_buffer_account.AggregateCapacity{
+        .origin = if (pool) |p| p.originBufferAccount(key) catch return error.ProxyBufferCapacityUnavailable else null,
+        .global = proxy_buffer_global,
+    };
+    var to_upstream_reservation = ProxyBufferReservation.init(.downstream_to_upstream, cfg.proxy_buffer_limits, proxy_buffer_observer, capacity);
+    errdefer to_upstream_reservation.releaseAll();
+    var to_client_reservation = ProxyBufferReservation.init(.upstream_to_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, capacity);
+    errdefer to_client_reservation.releaseAll();
+    to_upstream_reservation.reserve(relay_bytes) catch return error.ProxyBufferCapacityUnavailable;
+    to_client_reservation.reserve(relay_bytes) catch return error.ProxyBufferCapacityUnavailable;
+    const to_upstream_buf = try allocator.alloc(u8, relay_bytes);
+    errdefer allocator.free(to_upstream_buf);
+    const to_client_buf = try allocator.alloc(u8, relay_bytes);
+    errdefer allocator.free(to_client_buf);
+
+    const fd = try (if (unix_socket_path) |socket_path|
+        compat.connectBoundedUnix(socket_path, connect_timeout_ms)
+    else
+        compat.connectBoundedTcp(host, port, connect_timeout_ms));
+    errdefer _ = std.c.close(fd);
+    if (connect_timeout_ms > 0) setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
+    var tls: ?*http.upstream_tls.UpstreamTlsConn = null;
+    errdefer if (tls) |t| {
+        t.deinit();
+        allocator.destroy(t);
+    };
+    if (is_https) {
+        const tls_ptr = try allocator.create(http.upstream_tls.UpstreamTlsConn);
+        tls_ptr.* = http.upstream_tls.UpstreamTlsConn.connect(fd, host, .{
+            .skip_verify = !cfg.upstream_tls_verify,
+            .ca_bundle_path = cfg.upstream_tls_ca_bundle,
+            .sni_override = cfg.upstream_tls_server_name,
+            .client_cert_path = cfg.upstream_tls_client_cert,
+            .client_key_path = cfg.upstream_tls_client_key,
+            .alpn_policy = .require_http1,
+        }) catch |err| {
+            allocator.destroy(tls_ptr);
+            return err;
+        };
+        tls = tls_ptr;
+    }
+
+    var head_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer head_arena.deinit();
+    var switching = SwitchingHead{};
+    var rb = StreamReadBuf{ .buf = to_client_buf };
+    var head: ParsedUpstreamHead = undefined;
+    if (tls) |t| {
+        head = try sendWebSocketHandshake(allocator, t, fd, uri, extra_headers.items, downstream_conn, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, capacity, read_deadline_ms, &head_arena, &rb, &to_client_reservation, &switching);
+    } else {
+        head = try sendWebSocketHandshake(allocator, compat.netStreamFromFd(fd), fd, uri, extra_headers.items, downstream_conn, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, capacity, read_deadline_ms, &head_arena, &rb, &to_client_reservation, &switching);
+    }
+
+    if (head.status_code != 101) {
+        // The origin declined the upgrade: relay its answer as an ordinary
+        // response on a connection that is then closed (the client asked for
+        // a protocol switch, not a keep-alive exchange).
+        var wrote_downstream = false;
+        const exchange = (if (tls) |t|
+            relayStreamedFinalResponse(allocator, &rb, t, fd, &head, "GET", downstream_writer, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, &wrote_downstream, 0)
+        else
+            relayStreamedFinalResponse(allocator, &rb, compat.netStreamFromFd(fd), fd, &head, "GET", downstream_writer, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, &wrote_downstream, 0)) catch |err| {
+            downstream_committed.* = wrote_downstream;
+            return err;
+        };
+        downstream_committed.* = wrote_downstream;
+        if (tls) |t| {
+            t.deinit();
+            allocator.destroy(t);
+        }
+        _ = std.c.close(fd);
+        head_arena.deinit();
+        allocator.free(to_upstream_buf);
+        allocator.free(to_client_buf);
+        to_upstream_reservation.releaseAll();
+        to_client_reservation.releaseAll();
+        return .{ .refused = exchange.result };
+    }
+    if (!switching.completesHandshake(expected_accept)) return error.InvalidWebSocketHandshake;
+
+    const upgraded = try allocator.create(UpgradedUpstream);
+    upgraded.* = .{
+        .allocator = allocator,
+        .fd = fd,
+        .tls = tls,
+        .head_arena = head_arena,
+        .head = head,
+        .early_upstream_bytes = rb.available(),
+        .to_upstream_buf = to_upstream_buf,
+        .to_client_buf = to_client_buf,
+        .to_upstream_reservation = to_upstream_reservation,
+        .to_client_reservation = to_client_reservation,
+    };
+    return .{ .switched = upgraded };
+}
+
+/// Write the handshake request and read the origin's answer, skipping
+/// interim responses other than 101 exactly as the streaming relay does.
+fn sendWebSocketHandshake(
+    allocator: std.mem.Allocator,
+    transport: anytype,
+    fd: std.posix.fd_t,
+    uri: std.Uri,
+    extra_headers: []const std.http.Header,
+    downstream_conn: anytype,
+    cancel_token: ?*const CancellationToken,
+    proxy_buffer_limits: proxy_buffer_account.Limits,
+    proxy_buffer_observer: proxy_buffer_account.Observer,
+    proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity,
+    read_deadline_ms: u32,
+    head_arena: *std.heap.ArenaAllocator,
+    rb: *StreamReadBuf,
+    head_reservation: *ProxyBufferReservation,
+    switching: *SwitchingHead,
+) !ParsedUpstreamHead {
+    try sendStreamingProxyRequest(allocator, transport, fd, uri, "GET", extra_headers, "", null, downstream_conn, cancel_token, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity);
+    if (read_deadline_ms > 0) setSocketRecvTimeoutMs(fd, read_deadline_ms) catch {};
+    const spill = HeadSpill{ .allocator = allocator, .reservation = head_reservation };
+    var head = try readUpstreamHeadMode(head_arena.allocator(), rb, transport, fd, read_deadline_ms, "GET", spill, switching);
+    var interim_responses: usize = 0;
+    while (head.status_code >= 100 and head.status_code < 200 and head.status_code != 101) {
+        if (cancelStopped(cancel_token)) return error.RequestCancelled;
+        interim_responses += 1;
+        if (interim_responses > max_interim_upstream_responses) return error.UpstreamProtocolError;
+        _ = head_arena.reset(.free_all);
+        switching.* = .{};
+        head = try readUpstreamHeadMode(head_arena.allocator(), rb, transport, fd, read_deadline_ms, "GET", spill, switching);
+    }
+    return head;
 }
 
 pub fn upstreamResponseHasNoStore(response: std.http.Client.Response.Head) bool {

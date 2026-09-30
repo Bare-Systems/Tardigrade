@@ -536,6 +536,16 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             cfg.worker_threads;
         break :blk @intCast(@max(configured, @as(u32, 1)));
     };
+    // Each WebSocket tunnel holds a worker for its lifetime (#812): unless the
+    // operator sets a cap, tunnels never take more than half of them, so a
+    // single worker allows none (upgrades get 503) rather than letting one
+    // tunnel starve every other request.
+    state.websocket_default_max_tunnels = @intCast(worker_count / 2);
+    if (cfg.proxy_websocket_max_tunnels > 0 and cfg.proxy_websocket_max_tunnels >= worker_count) {
+        state.logger.warn(null, "proxy_websocket_max_tunnels={d} can hold every worker thread ({d}); ordinary requests may stall while that many tunnels are open", .{ cfg.proxy_websocket_max_tunnels, worker_count });
+    } else if (cfg.proxy_websocket_max_tunnels == 0 and state.websocket_default_max_tunnels == 0 and configRelaysWebSockets(cfg)) {
+        state.logger.warn(null, "proxy_websocket is configured but there is only {d} worker thread; WebSocket upgrades will be refused with 503. Set TARDIGRADE_WORKER_THREADS to 2 or more, or set proxy_websocket_max_tunnels to accept that a tunnel can block every other request", .{worker_count});
+    }
     var worker_ctx = WorkerContext{
         .config_store = &config_store,
         .state = &state,
@@ -975,6 +985,16 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     state.logger.info(null, "Graceful shutdown complete (forced_closes={d} drain_timed_out={})", .{ drain_result.forced_closes, drain_result.timed_out });
 }
 
+/// True when any location, top-level or in a server block, sets
+/// `proxy_websocket on`.
+fn configRelaysWebSockets(cfg: *const edge_config.EdgeConfig) bool {
+    for (cfg.location_blocks) |block| if (block.websocket != null) return true;
+    for (cfg.server_blocks) |server| {
+        for (server.location_blocks) |block| if (block.websocket != null) return true;
+    }
+    return false;
+}
+
 const Http3AdvertisementPhase = enum {
     steady,
     draining,
@@ -1267,10 +1287,13 @@ fn serveOneRequest(
     served: *u32,
     enable_proxy_protocol: bool,
 ) ServeOutcome {
+    // The lease is held for the whole request, including any WebSocket
+    // tunnel it becomes, so the generation (and its supersession stamp) stays
+    // alive for as long as anything admitted under it runs.
     var live_cfg_lease = ctx.acquireConfig();
     defer live_cfg_lease.release();
     const live_cfg = live_cfg_lease.cfg;
-    return serveOneRequestWithConfig(ctx, conn, session, live_cfg, connection_ip, served, enable_proxy_protocol);
+    return serveOneRequestWithConfig(ctx, conn, session, live_cfg, &live_cfg_lease.version.superseded_at_ms, connection_ip, served, enable_proxy_protocol);
 }
 
 fn serveOneRequestWithConfig(
@@ -1278,6 +1301,8 @@ fn serveOneRequestWithConfig(
     conn: anytype,
     session: *ConnectionSession,
     cfg: *const edge_config.EdgeConfig,
+    /// `cfg`'s generation supersession stamp (see `ManagedConfigVersion`).
+    config_superseded_at: *const std.atomic.Value(u64),
     connection_ip: []const u8,
     served: *u32,
     enable_proxy_protocol: bool,
@@ -1297,7 +1322,7 @@ fn serveOneRequestWithConfig(
     const is_last_allowed_request = max_requests_per_connection > 0 and served.* + 1 >= max_requests_per_connection;
 
     var keep_alive = false;
-    handleConnection(conn, session, cfg, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol, is_last_allowed_request) catch |err| {
+    handleConnection(conn, session, cfg, config_superseded_at, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol, is_last_allowed_request) catch |err| {
         if (isBenignDisconnect(err)) {
             ctx.state.logger.debug(null, "keepalive connection closed by peer: {}", .{err});
         } else {
@@ -1513,9 +1538,13 @@ fn closeNewConnection(
     fd: std.posix.fd_t,
     session: *ConnectionSession,
 ) void {
+    // Release the slot while this connection still owns the fd number. The
+    // slot table is keyed by fd, and once it is closed the acceptor may hand
+    // the same number to a new connection: releasing afterwards would drop
+    // that connection's entry and leak one active-connection count.
+    ctx.state.releaseConnectionSlot(fd);
     _ = std.c.close(fd);
     ctx.session_pool.release(session);
-    ctx.state.releaseConnectionSlot(fd);
 }
 
 /// Park a freshly-idle new connection off the worker pool and arm the event
@@ -2043,6 +2072,11 @@ const WaitingEncryptedHttpConnection = struct {
 
     pub fn rawFd(self: *const WaitingEncryptedHttpConnection) std.posix.fd_t {
         return self.inner.rawFd();
+    }
+
+    /// The non-blocking view a WebSocket tunnel drives directly (#812).
+    pub fn tunnelEndpoint(self: *WaitingEncryptedHttpConnection) http.tunnel.EncryptedEndpoint {
+        return .{ .conn = &self.inner };
     }
 
     pub fn setReadTimeoutMs(self: *WaitingEncryptedHttpConnection, timeout_ms: u32) void {
@@ -4504,6 +4538,7 @@ fn executeH1PostPreflightOrchestration(
         .too_early, .defer_until_handshake => {
             ctx.early_data_action = if (early_decision == .defer_until_handshake) .deferred else .too_early;
             state.metricsRecordEarlyDataDecision(.h1, if (ctx.early_data_action == .deferred) .deferred else .too_early);
+            ghandlers.recordWebSocketDenial(allocator, cfg, state, request);
             const status = try hooks.rejectEarly(allocator, writer, state, ctx, request, correlation_id, keep_alive.*);
             return .{ .terminal_status = status };
         },
@@ -4512,10 +4547,12 @@ fn executeH1PostPreflightOrchestration(
     try hooks.auth(allocator, cfg, state, ctx, &request.headers);
 
     if (try hooks.middleware(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*)) {
+        ghandlers.recordWebSocketDenial(allocator, cfg, state, request);
         return .logged_terminal;
     }
 
     if (ga.evaluatePolicy(state, cfg, request.method.toString(), request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |reason| {
+        ghandlers.recordWebSocketDenial(allocator, cfg, state, request);
         try gp.sendApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive.*, state);
         state.metricsRecord(403);
         state.metricsRecordErrorCode("forbidden");
@@ -4615,7 +4652,7 @@ fn setConnTimeouts(conn: anytype, read_timeout_ms: u32, write_timeout_ms: u32) v
     }
 }
 
-fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool, is_last_allowed_request: bool) !void {
+fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, config_superseded_at: ?*const std.atomic.Value(u64), state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool, is_last_allowed_request: bool) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
     defer keep_alive_out.* = keep_alive;
@@ -4652,6 +4689,14 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     }
 
     h2BeginReadScope(conn);
+    // Bytes read past this request (a pipelined request, or the first
+    // WebSocket frames) stay at `pending_buf[pending_start..]` until the
+    // request is done: its parsed path and headers are slices of the same
+    // buffer, so moving them to the front any earlier would corrupt it.
+    var pending_start: usize = 0;
+    defer if (pending_start > 0 and session.pending_len > 0) {
+        std.mem.copyForwards(u8, pending_buf[0..session.pending_len], pending_buf[pending_start..][0..session.pending_len]);
+    };
     var streaming_request_body: ?gproxy_runtime.StreamingRequestBody = null;
     var request: http.Request = undefined;
     var request_initialized = false;
@@ -4716,13 +4761,8 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 };
                 const bytes_consumed = parse_result.bytes_consumed;
                 const request_transport_early = h1ConsumeRequestEarlyProvenance(session, old_pending_len, total_read, bytes_consumed, h2LastReadEarlyPrefixLenBounded(conn, total_read));
-                if (bytes_consumed < total_read) {
-                    const remaining = total_read - bytes_consumed;
-                    std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
-                    session.pending_len = remaining;
-                } else {
-                    session.pending_len = 0;
-                }
+                pending_start = bytes_consumed;
+                session.pending_len = total_read - bytes_consumed;
                 if (session.pending_len < session.pending_early_prefix_len) session.pending_early_prefix_len = session.pending_len;
                 request = parse_result.request;
                 request_initialized = true;
@@ -4747,13 +4787,8 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         };
         const bytes_consumed = parse_result.bytes_consumed;
         const request_transport_early = h1ConsumeRequestEarlyProvenance(session, old_pending_len, total_read, bytes_consumed, h2LastReadEarlyPrefixLenBounded(conn, total_read));
-        if (bytes_consumed < total_read) {
-            const remaining = total_read - bytes_consumed;
-            std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
-            session.pending_len = remaining;
-        } else {
-            session.pending_len = 0;
-        }
+        pending_start = bytes_consumed;
+        session.pending_len = total_read - bytes_consumed;
         if (session.pending_len < session.pending_early_prefix_len) session.pending_early_prefix_len = session.pending_len;
 
         request = parse_result.request;
@@ -5024,6 +5059,14 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         effective_cfg.named_locations,
     );
 
+    // Client bytes that arrived behind this head. Only a WebSocket upgrade
+    // consumes them, as the first tunnel bytes (#812).
+    ctx.downstream_buffered_input = pending_buf[pending_start..][0..session.pending_len];
+    ctx.config_superseded_at = config_superseded_at;
+    defer if (ctx.tunnel != null) {
+        session.pending_len = 0;
+        session.pending_early_prefix_len = 0;
+    };
     const outcome = try executeH1PostPreflightOrchestration(
         conn,
         allocator,

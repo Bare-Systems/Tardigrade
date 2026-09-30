@@ -416,6 +416,51 @@ pub const UpstreamTlsConn = struct {
         }
     }
 
+    /// `read` for a caller that polls the fd itself (the upgraded-connection
+    /// tunnel, #812): `null` instead of waiting when no plaintext is ready.
+    pub fn readNonBlocking(self: *UpstreamTlsConn, buf: []u8) TlsError!?usize {
+        const record = &self.state.record;
+        while (true) {
+            if (record.inbound_plaintext.len > 0) {
+                return record.readPlaintext(buf) catch return error.TlsReadFailed;
+            }
+            if (record.peer_closed) {
+                return record.readPlaintext(buf) catch |err| switch (err) {
+                    error.EndOfStream => return 0,
+                    else => return error.TlsReadFailed,
+                };
+            }
+            const result = record.drive() catch return error.TlsReadFailed;
+            if (record.inbound_plaintext.len > 0 or record.peer_closed) continue;
+            if (!result.made_progress) return null;
+        }
+    }
+
+    /// Accept as much of `data` as the record layer takes without waiting
+    /// and push what the socket will take; `0` when it is backpressured.
+    pub fn writeNonBlocking(self: *UpstreamTlsConn, data: []const u8) TlsError!usize {
+        const written = self.state.record.writePlaintext(data) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return error.TlsWriteFailed,
+        };
+        try self.flushNonBlocking();
+        return written;
+    }
+
+    /// Push queued ciphertext until the socket stops taking it.
+    pub fn flushNonBlocking(self: *UpstreamTlsConn) TlsError!void {
+        const record = &self.state.record;
+        while (record.queuedCiphertextLen() > 0) {
+            const result = record.drive() catch return error.TlsWriteFailed;
+            if (!result.made_progress) return;
+        }
+    }
+
+    /// Ciphertext is queued for the socket.
+    pub fn hasQueuedOutput(self: *const UpstreamTlsConn) bool {
+        return self.state.record.queuedCiphertextLen() > 0;
+    }
+
     /// Bytes already decrypted and buffered by the record layer, not yet
     /// consumed by `read` — the native analogue of OpenSSL's `SSL_pending`.
     pub fn pending(self: *const UpstreamTlsConn) usize {

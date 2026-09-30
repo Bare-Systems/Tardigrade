@@ -108,6 +108,50 @@ stripped() {
     fi
 }
 
+# Zig source for @import scanning only: comments stripped, and the bodies of
+# string/char literals and `\\` multiline-string lines blanked, so import-like
+# text inside a literal (e.g. a test fixture string containing
+# `@import(\"std\")`) is never mistaken for an import. The literal that is
+# @import's own argument -- the text right after `@import(`, even when split
+# across lines -- is kept intact. Deliberately separate from `stripped`, which
+# keeps string contents so the forbidden-library text scans still see them.
+zig_import_view() {
+    stripped "$1" | awk '
+    BEGIN { dq = sprintf("%c", 34); sq = sprintf("%c", 39); recent = "" }
+    {
+        line = $0
+        tmp = line
+        sub(/^[ \t]+/, "", tmp)
+        if (substr(tmp, 1, 2) == "\\\\") { print ""; next }
+        out = ""; inq = ""; keep = 0; n = length(line); i = 1
+        while (i <= n) {
+            ch = substr(line, i, 1)
+            if (inq != "") {
+                if (ch == "\\" && i < n) {
+                    out = out (keep ? ch substr(line, i + 1, 1) : "  ")
+                    i += 2; continue
+                }
+                if (ch == inq) { inq = ""; out = out ch; i++; continue }
+                out = out (keep ? ch : " ")
+                i++; continue
+            }
+            if (ch == dq || ch == sq) {
+                inq = ch
+                keep = (ch == dq && recent ~ /@import\($/)
+                out = out ch; i++; continue
+            }
+            out = out ch
+            if (ch != " " && ch != "\t") {
+                r = recent ch
+                if (length(r) > 16) r = substr(r, length(r) - 15)
+                recent = r
+            }
+            i++
+        }
+        print out
+    }'
+}
+
 relpath() {
     local path="$1"
     case "$path" in
@@ -117,7 +161,7 @@ relpath() {
 }
 
 zig_import_paths() {
-    stripped "$1" |
+    zig_import_view "$1" |
         tr '\n' ' ' |
         grep -oE '@import[[:space:]]*\([[:space:]]*"[^"]+\.zig"[[:space:]]*\)' |
         sed -E 's/.*@import[[:space:]]*\([[:space:]]*"([^"]+)"[[:space:]]*\).*/\1/' || true
@@ -358,7 +402,7 @@ scan_nonproduction_zig_imports() {
             if is_nonproduction_zig_file "$target"; then
                 fail "production Zig source imports non-production source root $target from $rel"
             fi
-        done < <(stripped "$zigfile" | tr '\n' ' ' | grep -oE '@import[[:space:]]*\([[:space:]]*[^)]*\)' || true)
+        done < <(zig_import_view "$zigfile" | tr '\n' ' ' | grep -oE '@import[[:space:]]*\([[:space:]]*[^)]*\)' || true)
     done < <(find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -path "$REPO_ROOT/.zig" -prune -o -path "$REPO_ROOT/.zig-cache" -prune -o -path "$REPO_ROOT/zig-out" -prune -o -name '*.zig' -type f -print | sort)
 }
 
@@ -548,7 +592,7 @@ scan_build_production_graph() {
 
 validate_build_imports() {
     local file="$1" imports line
-    if imports="$(stripped "$REPO_ROOT/$file" | tr '\n' ' ' | grep -oE '@import[[:space:]]*\([[:space:]]*[^)]*\)' | grep -vE '@import[[:space:]]*\([[:space:]]*"[^"]+"' || true)"; then
+    if imports="$(zig_import_view "$REPO_ROOT/$file" | tr '\n' ' ' | grep -oE '@import[[:space:]]*\([[:space:]]*[^)]*\)' | grep -vE '@import[[:space:]]*\([[:space:]]*"[^"]+"' || true)"; then
         while IFS= read -r line; do
             [ -z "$line" ] && continue
             fail "production build helper import uses unresolved non-literal expression in $file: $line"
@@ -1408,6 +1452,30 @@ EOF
         mkdir -p "$root/scripts/interop"
         printf 'const std = @import("std");\npub fn load() void { _ = std.DynLib.open("libforeigncodec.so") catch return; }\n' >"$root/scripts/interop/product.zig"
         ;;
+    pass-import-text-in-string-literals)
+        # A test fixture's string/multiline literal containing @import text
+        # (escaped quotes included) is not an import (#824 CI regression).
+        cat >"$root/src/main.zig" <<'EOF'
+const std = @import("std");
+const fixture = "const c = @import(\"std\").crypto; const p = @import(path);";
+const quote = '"';
+const multi =
+    \\const x = @import(\"crypto\");
+    \\const y = @import(computed_path);
+;
+pub fn main() void { _ = fixture; _ = quote; _ = multi; }
+EOF
+        ;;
+    fail-real-import-beside-string-literal)
+        # Blanking literal text must not hide a real computed import on the
+        # same line as a string.
+        mkdir -p "$root/benchmarks"
+        printf 'pub fn load() void {}\n' >"$root/benchmarks/product.zig"
+        cat >"$root/src/main.zig" <<'EOF'
+const product_path = "../benchmarks/product.zig"; const product = @import(product_path);
+pub fn main() void { product.load(); }
+EOF
+        ;;
     pass-pure-zig)
         mkdir -p "$root/vendor/pure_zig"
         cat >"$root/build.zig.zon" <<'EOF'
@@ -1436,14 +1504,14 @@ run_self_test() {
     tmp="$(mktemp -d)"
     SELF_TEST_TMP="$tmp"
     trap 'rm -rf "$SELF_TEST_TMP"' EXIT
-    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-build-helper-computed-import fail-build-helper-split-import fail-test-looking-production-target fail-tests-support-object-reached fail-evp-oracle-name-production-object fail-tests-interop-object-reached fail-nonproduction-source-imported fail-split-nonproduction-source-imported fail-nonliteral-production-source-import fail-named-nonproduction-module-import fail-anonymous-nonproduction-module-import fail-computed-tardi-name fail-install-artifact-alias fail-add-install-artifact fail-reachable-computed-module-root fail-reachable-module-alias fail-inline-add-import-module fail-oracle-module-installed fail-oracle-object-bridged fail-static-library-bridged fail-evp-oracle-name-production-link fail-assembly-file fail-cinclude-computed fail-cimport-split-foreign-header fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-quoted-dependency-key-c fail-inline-zon-dependency fail-compose-preload fail-unknown-package fail-unknown-package-after-ca fail-unknown-package-after-rpm fail-homebrew-linux-plus-dependency fail-nonproduction-helper-reached-broad fail-release-reusable-workflow fail-dlopen; do
+    for kind in fail-cimport fail-link fail-link-multiline fail-link-indirect fail-csource fail-build-csource-multiline fail-build-helper-computed-import fail-build-helper-split-import fail-test-looking-production-target fail-tests-support-object-reached fail-evp-oracle-name-production-object fail-tests-interop-object-reached fail-nonproduction-source-imported fail-split-nonproduction-source-imported fail-nonliteral-production-source-import fail-named-nonproduction-module-import fail-anonymous-nonproduction-module-import fail-computed-tardi-name fail-install-artifact-alias fail-add-install-artifact fail-reachable-computed-module-root fail-reachable-module-alias fail-inline-add-import-module fail-oracle-module-installed fail-oracle-object-bridged fail-static-library-bridged fail-evp-oracle-name-production-link fail-assembly-file fail-cinclude-computed fail-cimport-split-foreign-header fail-translate-c fail-package fail-docker-multiline fail-test-helper-reached fail-allowlisted-helper-reached fail-outside-src-runtime-loading fail-neutral-dependency-c fail-quoted-dependency-key-c fail-inline-zon-dependency fail-compose-preload fail-unknown-package fail-unknown-package-after-ca fail-unknown-package-after-rpm fail-homebrew-linux-plus-dependency fail-nonproduction-helper-reached-broad fail-release-reusable-workflow fail-dlopen fail-real-import-beside-string-literal; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if "$0" --root "$tmp/$kind" >/dev/null 2>&1; then
             echo "self-test failed: $kind unexpectedly passed" >&2
             return 1
         fi
     done
-    for kind in pass-platform pass-platform-split-cimport pass-test-peer pass-benchmark-gdrive-upload pass-isolated-nonproduction-zig pass-pure-zig pass-toolchain-install-dir; do
+    for kind in pass-platform pass-platform-split-cimport pass-test-peer pass-benchmark-gdrive-upload pass-isolated-nonproduction-zig pass-pure-zig pass-toolchain-install-dir pass-import-text-in-string-literals; do
         make_fixture_repo "$tmp/$kind" "$kind"
         if ! "$0" --root "$tmp/$kind" >/dev/null; then
             rc=$?

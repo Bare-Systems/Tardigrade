@@ -2378,16 +2378,37 @@ test "adapter deinit resets every field to its default, keeps the provider, and 
     adapter.markAlpn("h3");
     adapter.setCertificateState(.valid);
     try adapter.installNegotiatedParameters(.{ .cipher_suite = @intFromEnum(tls_algorithms.CipherSuite.tls_aes_128_gcm_sha256), .transcript_hash = .sha256 });
+    try adapter.installEarlyDataParameters(.{ .cipher_suite = @intFromEnum(tls_algorithms.CipherSuite.tls_aes_128_gcm_sha256), .transcript_hash = .sha256 });
     const secret = hexBytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
     adapter.installSecret(try Secret.init(.application, .write, &secret));
     adapter.installSecret(try Secret.init(.application, .read, &secret));
     var sealed: [128]u8 = undefined;
-    _ = try adapter.sealPacketPayload(.application, .write, 1, "hdr", "payload", &sealed);
+    var opened: [128]u8 = undefined;
+    const app_packet = try adapter.sealPacketPayload(.application, .write, 1, "hdr", "payload", &sealed);
+    _ = try adapter.openPacketPayload(.application, .read, 1, "hdr", app_packet, &opened);
     try adapter.updateApplicationWriteKeys();
+    try adapter.commitApplicationReadKeyUpdate();
     try adapter.receiveCrypto(.handshake, 0, "secret-crypto-input");
+    try adapter.discardHandshakeInput(.handshake, 5);
     try adapter.queueHandshakeOutput(.handshake, "secret-crypto-output");
-    try testing.expect(adapter.application_write_key_phase != 0);
-    try testing.expect(adapter.metrics.packets_protected != 0);
+    try adapter.discardHandshakeOutput(.handshake, 5);
+
+    // Precondition, not decoration: every field the generic reset loop owns
+    // really is off its default, so a missed reset can't pass by accident.
+    // A field added later without being exercised here fails this loop.
+    inline for (@typeInfo(QuicTlsAdapter).@"struct".fields) |field| {
+        if (comptime QuicTlsAdapter.isSelfResettingField(field.name)) continue;
+        if (std.meta.eql(comptime field.defaultValue().?, @field(adapter, field.name))) {
+            std.debug.print("QuicTlsAdapter.{s} was not moved off its default\n", .{field.name});
+            return error.TestExpectedNonDefaultField;
+        }
+    }
+    try testing.expect(adapter.zeroRttCipherSuite() != null);
+    try testing.expectEqual(@as(u1, 1), adapter.applicationReadKeyPhase());
+    try testing.expect(adapter.metrics.packets_deprotected != 0);
+    const hs = EncryptionLevel.handshake.index();
+    try testing.expect(adapter.reassembler.streams[hs].consumed_offset != 0);
+    try testing.expect(adapter.outbound[hs].next_offset != 0);
 
     adapter.deinit();
 
@@ -2414,6 +2435,12 @@ test "adapter deinit resets every field to its default, keeps the provider, and 
     try testing.expectEqual(CertificateState.not_checked, adapter.certificateState());
     try testing.expectEqual(@as(?tls_algorithms.CipherSuite, null), adapter.negotiatedCipherSuite());
     try testing.expectEqual(@as(u1, 0), adapter.applicationWriteKeyPhase());
+    try testing.expectEqual(@as(u1, 0), adapter.applicationReadKeyPhase());
+    try testing.expectEqual(@as(?tls_algorithms.CipherSuite, null), adapter.zeroRttCipherSuite());
+    try testing.expectEqual(@as(u64, 0), adapter.metrics.packets_deprotected);
+    try testing.expectEqual(@as(u64, 0), adapter.reassembler.streams[hs].consumed_offset);
+    try testing.expectEqual(@as(u64, 0), adapter.reassembler.streams[hs].base_offset);
+    try testing.expectEqual(@as(u64, 0), adapter.outbound[hs].next_offset);
 
     // The injected provider survives, so the adapter is reusable as-is.
     try testing.expectEqual(provider.context, adapter.provider.context);
@@ -2422,7 +2449,6 @@ test "adapter deinit resets every field to its default, keeps the provider, and 
     _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
     var reused_secrets = try adapter.installInitialSecrets(.client, &dcid);
     defer reused_secrets.deinit();
-    var opened: [128]u8 = undefined;
     const protected = try adapter.sealPacketPayload(.initial, .write, 0, "hdr", "reused", &sealed);
     var peer = QuicTlsAdapter{ .provider = provider };
     defer peer.deinit();

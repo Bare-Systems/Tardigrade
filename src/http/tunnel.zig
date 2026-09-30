@@ -19,6 +19,9 @@
 //! - `pendingOutput() bool`: ciphertext is still queued for the socket.
 //! - `bufferedInput() bool`: `read` can return without the socket becoming
 //!   readable (already-decrypted plaintext, or a received TLS close).
+//! - `yielded() bool`: the last call stopped on its TLS drive budget with
+//!   record-layer work possibly left (#818); the relay retries it right
+//!   after other tunnels get a turn instead of waiting for the socket.
 
 const std = @import("std");
 const compat = @import("zig_compat");
@@ -153,6 +156,10 @@ pub const SocketEndpoint = struct {
     pub fn bufferedInput(_: SocketEndpoint) bool {
         return false;
     }
+
+    pub fn yielded(_: SocketEndpoint) bool {
+        return false;
+    }
 };
 
 /// A downstream connection on Tardigrade's native TLS stack, whose socket is
@@ -165,7 +172,7 @@ pub const EncryptedEndpoint = struct {
     }
 
     pub fn read(self: EncryptedEndpoint, buf: []u8) Error!?usize {
-        return self.conn.read(buf) catch |err| switch (err) {
+        return self.conn.readBounded(buf, budget) catch |err| switch (err) {
             error.WouldBlock => null,
             // A peer that closes without close_notify ends the tunnel the same
             // way: WebSocket framing, not TLS, tells the application whether
@@ -176,14 +183,14 @@ pub const EncryptedEndpoint = struct {
     }
 
     pub fn write(self: EncryptedEndpoint, bytes: []const u8) Error!usize {
-        return self.conn.write(bytes) catch |err| switch (err) {
+        return self.conn.writeBounded(bytes, budget) catch |err| switch (err) {
             error.WouldBlock => 0,
             else => error.TunnelIoFailed,
         };
     }
 
     pub fn flush(self: EncryptedEndpoint) Error!void {
-        self.conn.flush() catch |err| switch (err) {
+        self.conn.flushBounded(budget) catch |err| switch (err) {
             error.WouldBlock => {},
             else => return error.TunnelIoFailed,
         };
@@ -196,6 +203,12 @@ pub const EncryptedEndpoint = struct {
     pub fn bufferedInput(self: EncryptedEndpoint) bool {
         return self.conn.pendingPlaintext() > 0 or self.conn.readiness().peer_closed;
     }
+
+    pub fn yielded(self: EncryptedEndpoint) bool {
+        return self.conn.drive_budget_exhausted;
+    }
+
+    const budget = encrypted_stream_connection.EncryptedStreamHttpConnection.tunnel_drive_budget;
 };
 
 /// An upstream `wss://` connection on the native upstream TLS client.
@@ -224,6 +237,10 @@ pub const UpstreamTlsEndpoint = struct {
 
     pub fn bufferedInput(self: UpstreamTlsEndpoint) bool {
         return self.tls.readReady();
+    }
+
+    pub fn yielded(self: UpstreamTlsEndpoint) bool {
+        return self.tls.drive_budget_exhausted;
     }
 };
 
@@ -276,6 +293,12 @@ pub const AnyEndpoint = union(enum) {
             inline else => |e| e.bufferedInput(),
         };
     }
+
+    pub fn yielded(self: AnyEndpoint) bool {
+        return switch (self) {
+            inline else => |e| e.yielded(),
+        };
+    }
 };
 
 pub fn setNonBlocking(fd: std.posix.fd_t) void {
@@ -315,14 +338,23 @@ const StepFailure = struct { side: Side };
 /// starve the other or the timers.
 const max_moves_per_step = 16;
 
+const StepResult = union(enum) {
+    progressed: struct { moved: bool, yielded: bool },
+    failed: Side,
+};
+
 /// Move bytes `src` -> `dst` until neither can make progress. Returns whether
-/// anything moved, or which side failed.
-fn step(dir: *Direction, src: anytype, src_side: Side, dst: anytype, dst_side: Side, reading: bool) union(enum) { progressed: bool, failed: Side } {
+/// anything moved and whether a TLS endpoint stopped on its drive budget
+/// (sampled after each call, since the next call clears it), or which side
+/// failed.
+fn step(dir: *Direction, src: anytype, src_side: Side, dst: anytype, dst_side: Side, reading: bool) StepResult {
     var progressed = false;
+    var yielded = false;
     var moves: usize = 0;
     while (moves < max_moves_per_step) : (moves += 1) {
         if (dir.pending.len > 0) {
             const n = dst.write(dir.pending) catch return .{ .failed = dst_side };
+            if (dst.yielded()) yielded = true;
             if (n == 0) break;
             dir.pending = dir.pending[n..];
             dir.delivered += n;
@@ -331,6 +363,7 @@ fn step(dir: *Direction, src: anytype, src_side: Side, dst: anytype, dst_side: S
         }
         if (!reading or dir.eof) break;
         const read = src.read(dir.buf) catch return .{ .failed = src_side };
+        if (src.yielded()) yielded = true;
         const n = read orelse break;
         progressed = true;
         if (n == 0) {
@@ -340,7 +373,8 @@ fn step(dir: *Direction, src: anytype, src_side: Side, dst: anytype, dst_side: S
         dir.pending = dir.buf[0..n];
     }
     dst.flush() catch return .{ .failed = dst_side };
-    return .{ .progressed = progressed };
+    if (dst.yielded()) yielded = true;
+    return .{ .progressed = .{ .moved = progressed, .yielded = yielded } };
 }
 
 fn minDeadline(a: ?u64, b: ?u64) ?u64 {
@@ -455,13 +489,22 @@ pub fn Relay(comptime Client: type, comptime Upstream: type) type {
                 const c2u_step = step(&self.c2u, self.client, .client, self.upstream, .upstream, reading);
                 const u2c_step = step(&self.u2c, self.upstream, .upstream, self.client, .client, reading);
                 var progressed = false;
+                // A TLS endpoint stopped on its drive budget: more work may
+                // be waiting in the record layer, not on the socket.
+                var yielded = false;
                 switch (c2u_step) {
                     .failed => |side| return self.finish(if (side == .client) .client_error else .upstream_error),
-                    .progressed => |p| progressed = progressed or p,
+                    .progressed => |p| {
+                        progressed = progressed or p.moved;
+                        yielded = yielded or p.yielded;
+                    },
                 }
                 switch (u2c_step) {
                     .failed => |side| return self.finish(if (side == .client) .client_error else .upstream_error),
-                    .progressed => |p| progressed = progressed or p,
+                    .progressed => |p| {
+                        progressed = progressed or p.moved;
+                        yielded = yielded or p.yielded;
+                    },
                 }
 
                 const now = event_loop.monotonicMs();
@@ -498,7 +541,7 @@ pub fn Relay(comptime Client: type, comptime Upstream: type) type {
                 const wants_upstream_in = reading and !self.u2c.eof and self.u2c.pending.len == 0;
                 const buffered = (wants_client_in and self.client.bufferedInput()) or
                     (wants_upstream_in and self.upstream.bufferedInput());
-                if (progressed or buffered) {
+                if (progressed or buffered or yielded) {
                     rounds += 1;
                     if (rounds < max_rounds_per_advance) continue;
                 }
@@ -516,7 +559,7 @@ pub fn Relay(comptime Client: type, comptime Upstream: type) type {
                         .out = self.c2u.pending.len > 0 or self.upstream.pendingOutput(),
                     },
                     .deadline_ms = deadline,
-                    .ready_now = progressed or buffered,
+                    .ready_now = progressed or buffered or yielded,
                 } };
             }
         }

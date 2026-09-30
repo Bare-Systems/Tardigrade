@@ -9,6 +9,10 @@ pub const EncryptedStreamHttpConnection = struct {
     read_transport_early_fn: ?*const fn (*anyopaque) bool = null,
     read_early_prefix_len_fn: ?*const fn (*anyopaque) usize = null,
     handshake_complete_fn: ?*const fn (*anyopaque) bool = null,
+    /// The last bounded (`*Bounded`) call stopped on its drive budget with
+    /// record-layer work possibly left (#818); retry soon rather than wait
+    /// for the socket.
+    drive_budget_exhausted: bool = false,
 
     pub fn init(stream: encrypted_stream.EncryptedStream) EncryptedStreamHttpConnection {
         return .{ .stream = stream };
@@ -53,6 +57,71 @@ pub const EncryptedStreamHttpConnection = struct {
             }
             if (driven.readiness.peer_closed) return error.EndOfStream;
             if (!driven.made_progress) return error.WouldBlock;
+        }
+    }
+
+    /// Most `drive()` calls one bounded operation makes (#818). A WebSocket
+    /// reactor thread relays many tunnels, so a peer that keeps the record
+    /// layer busy without application data must not hold the thread.
+    pub const tunnel_drive_budget = 8;
+
+    /// `read` for the tunnel reactor (#818): drives at most `max_drives`
+    /// times, then returns `WouldBlock` with `drive_budget_exhausted` set.
+    pub fn readBounded(self: *EncryptedStreamHttpConnection, out: []u8, max_drives: usize) encrypted_stream.Error!usize {
+        self.drive_budget_exhausted = false;
+        if (out.len == 0) return 0;
+        if (self.stream.readiness().can_read_plaintext) {
+            return self.stream.read(out) catch |err| mapReadError(err);
+        }
+        var drives: usize = 0;
+        while (drives < max_drives) : (drives += 1) {
+            const driven = try self.stream.drive();
+            if (driven.readiness.can_read_plaintext) {
+                return self.stream.read(out) catch |err| mapReadError(err);
+            }
+            if (driven.readiness.peer_closed) return error.EndOfStream;
+            if (!driven.made_progress) return error.WouldBlock;
+        }
+        self.drive_budget_exhausted = true;
+        return error.WouldBlock;
+    }
+
+    /// `write` for the tunnel reactor (#818), bounded like `readBounded`.
+    pub fn writeBounded(self: *EncryptedStreamHttpConnection, bytes: []const u8, max_drives: usize) encrypted_stream.Error!usize {
+        self.drive_budget_exhausted = false;
+        if (bytes.len == 0) return 0;
+        var drives: usize = 0;
+        while (true) {
+            if (self.stream.readiness().can_write_plaintext) {
+                const n = try self.stream.write(bytes);
+                self.flushBounded(max_drives) catch |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => return err,
+                };
+                return n;
+            }
+            if (drives == max_drives) {
+                self.drive_budget_exhausted = true;
+                return error.WouldBlock;
+            }
+            drives += 1;
+            const driven = try self.stream.drive();
+            if (!driven.made_progress and !driven.readiness.can_write_plaintext) return error.WouldBlock;
+        }
+    }
+
+    /// `flush` for the tunnel reactor (#818), bounded like `readBounded`.
+    pub fn flushBounded(self: *EncryptedStreamHttpConnection, max_drives: usize) encrypted_stream.Error!void {
+        self.drive_budget_exhausted = false;
+        var drives: usize = 0;
+        while (self.stream.readiness().wants_write) {
+            if (drives == max_drives) {
+                self.drive_budget_exhausted = true;
+                return error.WouldBlock;
+            }
+            drives += 1;
+            const driven = try self.stream.drive();
+            if (!driven.made_progress and driven.readiness.wants_write) return error.WouldBlock;
         }
     }
 
@@ -242,10 +311,42 @@ test "adapter writeAll returns WouldBlock without owning response cursor" {
     try std.testing.expectEqualStrings("abcdef", fake.written[0..fake.written_len]);
 }
 
+test "bounded tunnel read, write and flush stop on the drive budget for a peer that never yields data (#818)" {
+    // Every drive makes progress but never produces plaintext, frees write
+    // space or drains output: a peer streaming post-handshake records.
+    var fake = FakeStream{ .spin = true, .readiness_state = .{ .wants_write = true } };
+    var conn = EncryptedStreamHttpConnection.init(fake.stream());
+    const budget = EncryptedStreamHttpConnection.tunnel_drive_budget;
+    var buf: [8]u8 = undefined;
+
+    try std.testing.expectError(error.WouldBlock, conn.readBounded(&buf, budget));
+    try std.testing.expect(conn.drive_budget_exhausted);
+    try std.testing.expectEqual(@as(usize, budget), fake.drive_calls);
+
+    fake.drive_calls = 0;
+    try std.testing.expectError(error.WouldBlock, conn.flushBounded(budget));
+    try std.testing.expect(conn.drive_budget_exhausted);
+    try std.testing.expectEqual(@as(usize, budget), fake.drive_calls);
+
+    fake.drive_calls = 0;
+    try std.testing.expectError(error.WouldBlock, conn.writeBounded("x", budget));
+    try std.testing.expect(conn.drive_budget_exhausted);
+    try std.testing.expectEqual(@as(usize, budget), fake.drive_calls);
+
+    // Ready plaintext is returned without driving, and clears the flag.
+    fake.drive_calls = 0;
+    fake.readiness_state.can_read_plaintext = true;
+    try std.testing.expectEqual(@as(usize, 4), try conn.readBounded(&buf, budget));
+    try std.testing.expect(!conn.drive_budget_exhausted);
+    try std.testing.expectEqual(@as(usize, 0), fake.drive_calls);
+}
+
 const FakeStream = struct {
     payload: []const u8 = "pong",
     readiness_state: encrypted_stream.Readiness = .{},
     drive_calls: usize = 0,
+    /// Every drive reports progress without changing readiness.
+    spin: bool = false,
     write_budget: usize = std.math.maxInt(usize),
     max_chunk: usize = std.math.maxInt(usize),
     written: [128 * 1024]u8 = undefined,
@@ -292,7 +393,7 @@ const FakeStream = struct {
     fn drive(ptr: *anyopaque) encrypted_stream.Error!encrypted_stream.DriveResult {
         const self: *FakeStream = @ptrCast(@alignCast(ptr));
         self.drive_calls += 1;
-        return .{ .made_progress = false, .readiness = self.readiness_state };
+        return .{ .made_progress = self.spin, .readiness = self.readiness_state };
     }
 
     fn bufferSnapshot(ptr: *anyopaque) encrypted_stream.BufferSnapshot {

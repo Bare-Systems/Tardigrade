@@ -20,6 +20,8 @@ const compat = @import("zig_compat");
 const builtin = @import("builtin");
 const tunnel = @import("tunnel.zig");
 const event_loop = @import("event_loop.zig");
+const encrypted_stream_connection = @import("encrypted_stream_connection.zig");
+const encrypted_stream = @import("tls_core").encrypted_stream;
 
 pub const Job = struct {
     vtable: *const VTable,
@@ -45,10 +47,14 @@ pub const Job = struct {
 
 pub const Options = struct {
     threads: u16,
-    /// Polled at every wakeup so shutdown drains start even if `wakeAll` is
-    /// never called; the fallback wakeup interval bounds how late.
+    /// Checked at every wakeup; a change makes the shard advance every
+    /// tunnel so shutdown drains start. Production calls `wakeAll` when
+    /// shutdown or a hot reload happens, so no periodic check is needed.
     shutdown_requested: *const fn () bool,
-    fallback_wakeup_ms: u32 = 250,
+    /// Optional safety-net wakeup interval. Zero (the default) disables it:
+    /// a shard sleeps until a socket is ready, a tunnel's own earliest
+    /// deadline, a handoff, or `wakeAll`, so idle tunnels cost nothing.
+    fallback_wakeup_ms: u32 = 0,
 };
 
 pub const ShardSnapshot = struct {
@@ -159,17 +165,19 @@ const Shard = struct {
             };
             pfds.clearRetainingCapacity();
             pfds.appendAssumeCapacity(.{ .fd = self.wake_read, .events = std.posix.POLL.IN, .revents = 0 });
-            var deadline: u64 = now + self.reactor.opts.fallback_wakeup_ms;
+            const fallback = self.reactor.opts.fallback_wakeup_ms;
+            var deadline: ?u64 = if (fallback > 0) now + fallback else null;
             var ready_now = false;
             for (jobs.items) |job| {
                 const fds = job.vtable.fds(job);
                 pfds.appendAssumeCapacity(tunnel.pollEntry(fds[0], job.wait.client));
                 pfds.appendAssumeCapacity(tunnel.pollEntry(fds[1], job.wait.upstream));
                 if (job.wait.ready_now) ready_now = true;
-                if (job.wait.deadline_ms) |at| deadline = @min(deadline, at);
+                if (job.wait.deadline_ms) |at| deadline = if (deadline) |d| @min(d, at) else at;
             }
             const after = event_loop.monotonicMs();
-            const timeout: i32 = if (ready_now) 0 else @intCast(@min(deadline -| after, @as(u64, std.math.maxInt(i32))));
+            // No deadline: sleep until a socket or the wake pipe.
+            const timeout: i32 = if (ready_now) 0 else if (deadline) |at| @intCast(@min(at -| after, @as(u64, std.math.maxInt(i32)))) else -1;
             _ = std.posix.poll(pfds.items, timeout) catch {};
             _ = self.wakeups_total.fetchAdd(1, .monotonic);
             if (pfds.items[0].revents != 0) self.drainWake();
@@ -505,7 +513,7 @@ test "reactor relays many tunnels on a fixed number of threads (#818)" {
 
 test "reactor enforces per-tunnel idle timers without a periodic tick (#818)" {
     var reactor: Reactor = undefined;
-    try reactor.start(std.testing.allocator, .{ .threads = 1, .shutdown_requested = neverShutdown, .fallback_wakeup_ms = 5_000 });
+    try reactor.start(std.testing.allocator, .{ .threads = 1, .shutdown_requested = neverShutdown });
     defer reactor.deinit();
     var done = std.atomic.Value(u32).init(0);
     var reason = std.atomic.Value(u8).init(0);
@@ -518,13 +526,13 @@ test "reactor enforces per-tunnel idle timers without a periodic tick (#818)" {
     const elapsed = event_loop.monotonicMs() - started;
     try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.idle), reason.load(.acquire));
     try std.testing.expect(elapsed >= 60);
-    // The idle deadline itself woke the shard, not the 5 s fallback.
+    // The idle deadline itself woke the shard (there is no fallback tick).
     try std.testing.expect(elapsed < 2_000);
 }
 
 test "reactor wakeAll lets drain-mode tunnels see a reload stamp immediately (#818)" {
     var reactor: Reactor = undefined;
-    try reactor.start(std.testing.allocator, .{ .threads = 2, .shutdown_requested = neverShutdown, .fallback_wakeup_ms = 10_000 });
+    try reactor.start(std.testing.allocator, .{ .threads = 2, .shutdown_requested = neverShutdown });
     defer reactor.deinit();
     var done = std.atomic.Value(u32).init(0);
     var reason = std.atomic.Value(u8).init(0);
@@ -550,7 +558,7 @@ test "reactor wakeAll lets drain-mode tunnels see a reload stamp immediately (#8
     reactor.wakeAll();
     try waitFor(&done, 4, 3_000);
     try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.reload), reason.load(.acquire));
-    // Well before the 10 s fallback wakeup.
+    // Promptly, with no fallback tick.
     try std.testing.expect(event_loop.monotonicMs() - reloaded_at < 3_000);
 }
 
@@ -558,7 +566,7 @@ test "reactor drains tunnels for the shutdown window, then stopAndJoin returns (
     test_shutdown_flag.store(false, .release);
     defer test_shutdown_flag.store(false, .release);
     var reactor: Reactor = undefined;
-    try reactor.start(std.testing.allocator, .{ .threads = 2, .shutdown_requested = testShutdown, .fallback_wakeup_ms = 10_000 });
+    try reactor.start(std.testing.allocator, .{ .threads = 2, .shutdown_requested = testShutdown });
     defer reactor.deinit();
     var done = std.atomic.Value(u32).init(0);
     var reason = std.atomic.Value(u8).init(0);
@@ -622,4 +630,199 @@ test "reactor keeps one buffer per direction for a stalled reader (#818)" {
     try std.testing.expect(stalled);
     try waitFor(&done, 1, 3_000);
     try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.idle), reason.load(.acquire));
+}
+
+test "reactor shards stay asleep while their tunnels are idle, then wake for wakeAll and timers (#818)" {
+    const limit = raiseFdLimit(4096);
+    const budget = if (limit > 128) (limit - 64) / 4 else 0;
+    const count: usize = @intCast(@min(budget, 400));
+    try std.testing.expect(count >= 32);
+
+    var reactor: Reactor = undefined;
+    try reactor.start(std.testing.allocator, .{ .threads = 2, .shutdown_requested = neverShutdown });
+    defer reactor.deinit();
+    var done = std.atomic.Value(u32).init(0);
+    var reason = std.atomic.Value(u8).init(0);
+    var freed = std.atomic.Value(u32).init(0);
+    const peers = try std.testing.allocator.alloc(PeerPair, count);
+    defer std.testing.allocator.free(peers);
+    const quiet = tunnel.Options{ .idle_timeout_ms = 60_000, .shutdown_requested = neverShutdown, .poll_interval_ms = 0 };
+    for (peers) |*p| p.* = try submitTestTunnel(&reactor, quiet, &done, &reason, &freed);
+    defer for (peers) |p| {
+        _ = std.c.close(p.client_peer);
+        _ = std.c.close(p.upstream_peer);
+    };
+
+    // Let the handoffs settle, then watch a quiet period much shorter than
+    // any tunnel deadline: no shard wakes at all.
+    compat.sleepNs(100 * std.time.ns_per_ms);
+    const before = reactor.snapshot().wakeups_total;
+    compat.sleepNs(600 * std.time.ns_per_ms);
+    try std.testing.expectEqual(before, reactor.snapshot().wakeups_total);
+
+    // wakeAll still reaches every shard...
+    reactor.wakeAll();
+    const until = event_loop.monotonicMs() + 2_000;
+    while (reactor.snapshot().wakeups_total < before + 2) {
+        if (event_loop.monotonicMs() > until) return error.Timeout;
+        compat.sleepNs(2 * std.time.ns_per_ms);
+    }
+    // ...and a tunnel's own deadline still wakes its shard on time.
+    const started = event_loop.monotonicMs();
+    const short = try submitTestTunnel(&reactor, .{ .idle_timeout_ms = 80, .shutdown_requested = neverShutdown, .poll_interval_ms = 0 }, &done, &reason, &freed);
+    defer _ = std.c.close(short.client_peer);
+    defer _ = std.c.close(short.upstream_peer);
+    try waitFor(&done, 1, 2_000);
+    try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.idle), reason.load(.acquire));
+    try std.testing.expect(event_loop.monotonicMs() - started >= 80);
+    // The quiet tunnels are all still open and relaying.
+    try testWriteAll(peers[0].client_peer, "ok");
+    var got: [2]u8 = undefined;
+    try testReadExact(peers[0].upstream_peer, &got);
+    try std.testing.expectEqualStrings("ok", &got);
+}
+
+/// A native TLS stream whose peer keeps the record layer busy forever
+/// (every drive makes progress) without ever producing application data.
+const SpinningTlsStream = struct {
+    drives: std.atomic.Value(u64) = .init(0),
+
+    fn stream(self: *SpinningTlsStream) encrypted_stream.EncryptedStream {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn backend(_: *anyopaque) encrypted_stream.BackendKind {
+        return .pure_zig_record;
+    }
+
+    fn read(_: *anyopaque, _: []u8) encrypted_stream.Error!usize {
+        return error.WouldBlock;
+    }
+
+    fn write(_: *anyopaque, _: []const u8) encrypted_stream.Error!usize {
+        return error.WouldBlock;
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    fn readiness(_: *anyopaque) encrypted_stream.Readiness {
+        return .{};
+    }
+
+    fn drive(ptr: *anyopaque) encrypted_stream.Error!encrypted_stream.DriveResult {
+        const self: *SpinningTlsStream = @ptrCast(@alignCast(ptr));
+        _ = self.drives.fetchAdd(1, .monotonic);
+        return .{ .made_progress = true, .readiness = .{} };
+    }
+
+    fn bufferSnapshot(_: *anyopaque) encrypted_stream.BufferSnapshot {
+        return .{};
+    }
+
+    const vtable = encrypted_stream.EncryptedStream.VTable{
+        .backendFn = backend,
+        .readFn = read,
+        .writeFn = write,
+        .closeFn = close,
+        .readinessFn = readiness,
+        .driveFn = drive,
+        .bufferSnapshotFn = bufferSnapshot,
+    };
+};
+
+const TlsSpinJob = struct {
+    job: Job = .{ .vtable = &vtable },
+    spin: SpinningTlsStream = .{},
+    conn: encrypted_stream_connection.EncryptedStreamHttpConnection = undefined,
+    relay: AnyRelay = undefined,
+    c2u: [64]u8 = undefined,
+    u2c: [64]u8 = undefined,
+    fds_: [2]std.posix.fd_t,
+    done: *std.atomic.Value(u32),
+    reason: *std.atomic.Value(u8),
+
+    const AnyRelay = tunnel.Relay(tunnel.AnyEndpoint, tunnel.AnyEndpoint);
+    const vtable = Job.VTable{ .fds = fds, .observe = observe, .advance = advance, .finish = finish };
+
+    fn from(job: *Job) *TlsSpinJob {
+        return @fieldParentPtr("job", job);
+    }
+
+    fn fds(job: *Job) [2]std.posix.fd_t {
+        return from(job).fds_;
+    }
+
+    fn observe(job: *Job, c: i16, u: i16) void {
+        from(job).relay.observe(c, u);
+    }
+
+    fn advance(job: *Job) tunnel.Progress {
+        return from(job).relay.advance();
+    }
+
+    fn finish(job: *Job) void {
+        const self = from(job);
+        self.reason.store(@intFromEnum(self.relay.stats().close_reason), .release);
+        _ = self.done.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "a TLS peer that keeps the record layer busy cannot starve the rest of its shard (#818)" {
+    var reactor: Reactor = undefined;
+    try reactor.start(std.testing.allocator, .{ .threads = 1, .shutdown_requested = neverShutdown });
+    defer reactor.deinit();
+
+    // The spinning tunnel: a native TLS client endpoint whose record layer
+    // always has more to do. Its sockets exist only so it can be polled.
+    const c = try testSocketPair();
+    defer for (c) |fd| {
+        _ = std.c.close(fd);
+    };
+    const u = try testSocketPair();
+    defer for (u) |fd| {
+        _ = std.c.close(fd);
+    };
+    var spin_done = std.atomic.Value(u32).init(0);
+    var spin_reason = std.atomic.Value(u8).init(0);
+    var spinner = TlsSpinJob{ .fds_ = .{ c[0], u[0] }, .done = &spin_done, .reason = &spin_reason };
+    spinner.conn = encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(spinner.spin.stream(), c[0]);
+    spinner.relay = TlsSpinJob.AnyRelay.init(
+        .{ .encrypted = .{ .conn = &spinner.conn } },
+        .{ .socket = .{ .handle = u[0] } },
+        &spinner.c2u,
+        &spinner.u2c,
+        "",
+        "",
+        .{ .idle_timeout_ms = 400, .shutdown_requested = neverShutdown, .poll_interval_ms = 0 },
+    );
+    try reactor.submit(&spinner.job);
+
+    // A plaintext neighbour on the same (only) shard.
+    var done = std.atomic.Value(u32).init(0);
+    var reason = std.atomic.Value(u8).init(0);
+    var freed = std.atomic.Value(u32).init(0);
+    const p = try submitTestTunnel(&reactor, .{ .idle_timeout_ms = 150, .shutdown_requested = neverShutdown, .poll_interval_ms = 0 }, &done, &reason, &freed);
+    defer _ = std.c.close(p.client_peer);
+    defer _ = std.c.close(p.upstream_peer);
+
+    // The neighbour's traffic still moves promptly while the spinner is
+    // being driven...
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const sent = event_loop.monotonicMs();
+        try testWriteAll(p.client_peer, "ping");
+        var got: [4]u8 = undefined;
+        try testReadExact(p.upstream_peer, &got);
+        try std.testing.expect(event_loop.monotonicMs() - sent < 100);
+    }
+    try std.testing.expect(spinner.spin.drives.load(.monotonic) > 0);
+    // ...and its short idle deadline still fires on time.
+    const quiet_from = event_loop.monotonicMs();
+    try waitFor(&done, 1, 2_000);
+    try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.idle), reason.load(.acquire));
+    try std.testing.expect(event_loop.monotonicMs() - quiet_from < 1_000);
+
+    // The spinner moved no bytes, so its own idle timeout ends it.
+    try waitFor(&spin_done, 1, 3_000);
+    try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.idle), spin_reason.load(.acquire));
 }

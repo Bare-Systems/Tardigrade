@@ -36,8 +36,11 @@ All notable user-facing changes to Tardigrade are documented here.
   goes back to serving requests. Each reactor thread relays many tunnels
   from one `poll()` with the same fixed per-direction buffers,
   backpressure, idle/lifetime timeouts, reload `preserve`/`drain` behavior
-  and shutdown drain as before; hot reloads and shutdown wake the reactor
-  immediately. Plaintext and native TLS (`wss://`) clients are both handed
+  and shutdown drain as before. Idle tunnels cost no wakeups: a reactor
+  thread sleeps until a socket is ready, a tunnel's own earliest deadline, a
+  handoff, or a hot reload or shutdown (which wake it immediately). TLS work
+  per tunnel per turn is bounded, so a peer that keeps the TLS record layer
+  busy without sending data cannot stall the other tunnels on its thread. Plaintext and native TLS (`wss://`) clients are both handed
   off, and the handshake's access-log line is still written once, at close.
   New `proxy_websocket_reactor_threads` /
   `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS` (default one per four CPUs,

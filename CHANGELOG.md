@@ -18,6 +18,15 @@ All notable user-facing changes to Tardigrade are documented here.
   secret-bearing TLS record queues or QUIC CRYPTO buffers are cleared with a
   plain `@memset`.
 
+- **Session-ticket identity scratch buffers are now wiped reliably when
+  released (#783).** TLS (native listener) and HTTP/3 session-ticket
+  issuance zeroed the buffer holding the serialized ticket identity, then
+  released it with an ordinary free. Safety builds overwrite freed memory
+  with a poison pattern after the wipe, and ReleaseFast builds are allowed
+  to drop the wipe entirely. Both issuers now release it through the
+  canonical secure zero-and-free helper, so the allocator always receives
+  zeroed memory, on success and failure paths alike.
+
 ## [0.8.2] - 2026-09-29
 
 ### Added

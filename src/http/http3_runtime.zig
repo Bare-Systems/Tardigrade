@@ -2334,10 +2334,8 @@ pub const Runtime = struct {
         defer prepared.deinit();
 
         const scratch = try allocator.alloc(u8, runtime.maxIdentityLen());
-        defer {
-            crypto_pkg.secrets.secureZero(scratch);
-            allocator.free(scratch);
-        }
+        // Canonical wipe-and-free, same as the native TLS issuer (#783).
+        defer crypto_pkg.secrets.secureZeroAndFree(allocator, scratch);
         var identity = try runtime.createIdentity(&prepared.state, now_unix_ms, scratch);
         defer identity.deinit();
 

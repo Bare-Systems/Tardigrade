@@ -413,11 +413,14 @@ pub const NativeTlsConnection = struct {
         }, limits);
         defer prepared.deinit();
 
+        // The scratch buffer receives the serialized ticket identity (sealed
+        // stateless envelope or stateful handle). Release it through the
+        // canonical wipe-and-free (#783): an ordinary `allocator.free` would
+        // re-scribble the wiped bytes with `undefined` before the backing
+        // allocator sees them, and in ReleaseFast that scribble — and a
+        // preceding wipe of now-dead memory — carries no guarantee.
         const scratch = try self.allocator.alloc(u8, runtime.maxIdentityLen());
-        defer {
-            @import("crypto").secrets.secureZero(scratch);
-            self.allocator.free(scratch);
-        }
+        defer @import("crypto").secrets.secureZeroAndFree(self.allocator, scratch);
         var identity = try runtime.createIdentity(&prepared.state, now_unix_ms, scratch);
         defer identity.deinit();
 
@@ -1118,6 +1121,92 @@ test "native TLS post-handshake queue pressure rolls back inserted stateful hand
     const written = try conn.record.stream().write("still-open");
     try std.testing.expectEqual(@as(usize, "still-open".len), written);
     try std.testing.expect(conn.record.queuedCiphertextLen() > 0);
+}
+
+/// Test allocator that observes every release of a buffer with exactly
+/// `target_len` bytes and records whether it was all-zero at that moment.
+/// `Allocator.free` scribbles `undefined` (0xaa in safe builds) before the
+/// backing allocator sees the bytes, so only a release through
+/// `secureZeroAndFree` (which calls `rawFree`) arrives zeroed (#783).
+const ScratchReleaseProbe = struct {
+    backing: std.mem.Allocator,
+    target_len: usize,
+    released: usize = 0,
+    released_nonzero: usize = 0,
+
+    fn allocator(self: *ScratchReleaseProbe) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ScratchReleaseProbe = @ptrCast(@alignCast(ctx));
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ScratchReleaseProbe = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *ScratchReleaseProbe = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ScratchReleaseProbe = @ptrCast(@alignCast(ctx));
+        if (memory.len == self.target_len) {
+            self.released += 1;
+            if (!std.mem.allEqual(u8, memory, 0)) self.released_nonzero += 1;
+        }
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "native TLS ticket issuance releases identity scratch zeroed on success and on queue-pressure failure (#783)" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+
+    for ([_]bool{ false, true }) |force_queue_failure| {
+        const fds = try testSocketPair();
+        defer closeFd(fds[1]);
+        var runtime = try testResumptionRuntime(std.testing.allocator);
+        defer runtime.deinit();
+        var issue_probe = TicketIssueProbe{};
+        runtime.setObserver(issue_probe.observer());
+
+        const conn = try NativeTlsConnection.createWithOptions(
+            std.testing.allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            fixed.provider(),
+            .{ .resumption_runtime = &runtime },
+        );
+        defer conn.destroy();
+        try armNativeTicketIssuer(conn);
+
+        // Route only the issuance call through the probe; it forwards to the
+        // same backing allocator, so ownership is unchanged either side.
+        var probe = ScratchReleaseProbe{ .backing = conn.allocator, .target_len = runtime.maxIdentityLen() };
+        const saved_allocator = conn.allocator;
+        conn.allocator = probe.allocator();
+        defer conn.allocator = saved_allocator;
+
+        if (force_queue_failure)
+            conn.record.outbound_ciphertext.len = encrypted_stream.PureZigRecordStream.max_ciphertext_queue - 1;
+        conn.maybeIssueSessionTicket();
+        conn.allocator = saved_allocator;
+        if (force_queue_failure) conn.record.outbound_ciphertext.len = 0;
+
+        try std.testing.expect(conn.ticket_issue_attempted);
+        try std.testing.expectEqual(@as(usize, 1), issue_probe.count);
+        try std.testing.expectEqual(
+            if (force_queue_failure) tls.resumption_runtime.TicketResult.failed else tls.resumption_runtime.TicketResult.success,
+            issue_probe.result,
+        );
+        try std.testing.expect(probe.released >= 1);
+        try std.testing.expectEqual(@as(usize, 0), probe.released_nonzero);
+    }
 }
 
 test "native TLS never attempts ticket issuance before application data opens" {

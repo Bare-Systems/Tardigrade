@@ -193,6 +193,10 @@ pub const UpstreamTlsConn = struct {
     /// through `state.record`'s carrier.
     fd: std.posix.fd_t = -1,
     protocol: NegotiatedProtocol = .http1_1,
+    /// The last non-blocking tunnel call stopped on its drive budget with
+    /// record-layer work possibly left (#818); the caller should retry soon
+    /// rather than wait for the socket.
+    drive_budget_exhausted: bool = false,
 
     /// Bounds the handshake pump loop (`driveUntilHandshakeComplete`)
     /// against a stuck/misbehaving peer independent of the socket-level
@@ -416,24 +420,20 @@ pub const UpstreamTlsConn = struct {
         }
     }
 
+    /// Most `drive()` calls one non-blocking tunnel operation makes (#818).
+    /// A reactor thread relays many tunnels, so a peer that keeps the record
+    /// layer busy without producing application data (a long run of
+    /// post-handshake records) must not hold the thread: past this budget
+    /// the call returns as if the socket were drained and sets
+    /// `drive_budget_exhausted`, and the relay retries it after serving the
+    /// shard's other tunnels.
+    pub const tunnel_drive_budget = 8;
+
     /// `read` for a caller that polls the fd itself (the upgraded-connection
-    /// tunnel, #812): `null` instead of waiting when no plaintext is ready.
+    /// tunnel, #812): `null` instead of waiting when no plaintext is ready,
+    /// or when the drive budget ran out first.
     pub fn readNonBlocking(self: *UpstreamTlsConn, buf: []u8) TlsError!?usize {
-        const record = &self.state.record;
-        while (true) {
-            if (record.inbound_plaintext.len > 0) {
-                return record.readPlaintext(buf) catch return error.TlsReadFailed;
-            }
-            if (record.peer_closed) {
-                return record.readPlaintext(buf) catch |err| switch (err) {
-                    error.EndOfStream => return 0,
-                    else => return error.TlsReadFailed,
-                };
-            }
-            const result = record.drive() catch return error.TlsReadFailed;
-            if (record.inbound_plaintext.len > 0 or record.peer_closed) continue;
-            if (!result.made_progress) return null;
-        }
+        return boundedRead(&self.state.record, buf, tunnel_drive_budget, &self.drive_budget_exhausted);
     }
 
     /// Accept as much of `data` as the record layer takes without waiting
@@ -447,13 +447,10 @@ pub const UpstreamTlsConn = struct {
         return written;
     }
 
-    /// Push queued ciphertext until the socket stops taking it.
+    /// Push queued ciphertext until the socket stops taking it or the drive
+    /// budget runs out.
     pub fn flushNonBlocking(self: *UpstreamTlsConn) TlsError!void {
-        const record = &self.state.record;
-        while (record.queuedCiphertextLen() > 0) {
-            const result = record.drive() catch return error.TlsWriteFailed;
-            if (!result.made_progress) return;
-        }
+        return boundedFlush(&self.state.record, tunnel_drive_budget, &self.drive_budget_exhausted);
     }
 
     /// Ciphertext is queued for the socket.
@@ -581,6 +578,49 @@ pub const UpstreamTlsConn = struct {
 /// busy spin — so a call that reports no progress and for which `waitForFd`
 /// times out means the peer genuinely went quiet past the caller's
 /// configured socket timeout; that is a bounded failure.
+/// The tunnel read loop over any record layer with `drive`,
+/// `inbound_plaintext`, `peer_closed` and `readPlaintext` (#818). Drives at
+/// most `max_drives` times; running out with progress still being made sets
+/// `exhausted` and returns `null`.
+fn boundedRead(record: anytype, buf: []u8, max_drives: usize, exhausted: *bool) TlsError!?usize {
+    exhausted.* = false;
+    var drives: usize = 0;
+    while (true) {
+        if (record.inbound_plaintext.len > 0) {
+            return record.readPlaintext(buf) catch return error.TlsReadFailed;
+        }
+        if (record.peer_closed) {
+            return record.readPlaintext(buf) catch |err| switch (err) {
+                error.EndOfStream => return 0,
+                else => return error.TlsReadFailed,
+            };
+        }
+        if (drives == max_drives) {
+            exhausted.* = true;
+            return null;
+        }
+        drives += 1;
+        const result = record.drive() catch return error.TlsReadFailed;
+        if (record.inbound_plaintext.len > 0 or record.peer_closed) continue;
+        if (!result.made_progress) return null;
+    }
+}
+
+/// The tunnel flush loop (#818), bounded like `boundedRead`.
+fn boundedFlush(record: anytype, max_drives: usize, exhausted: *bool) TlsError!void {
+    exhausted.* = false;
+    var drives: usize = 0;
+    while (record.queuedCiphertextLen() > 0) {
+        if (drives == max_drives) {
+            exhausted.* = true;
+            return;
+        }
+        drives += 1;
+        const result = record.drive() catch return error.TlsWriteFailed;
+        if (!result.made_progress) return;
+    }
+}
+
 fn driveUntilHandshakeComplete(record: *encrypted_stream.PureZigRecordStream, fd: std.posix.fd_t) TlsError!void {
     var iterations: usize = 0;
     while (!record.applicationDataOpen()) {
@@ -736,4 +776,52 @@ test "native upstream TLS connect deinitializes the backend when client mTLS cre
         .client_cert_path = "unused.crt",
         .client_key_path = "",
     }));
+}
+
+/// A record layer that always makes progress and never yields plaintext or
+/// drains: a peer streaming post-handshake records forever.
+const SpinningRecord = struct {
+    inbound_plaintext: []const u8 = "",
+    peer_closed: bool = false,
+    queued: usize = 1,
+    drives: usize = 0,
+
+    const DriveResult = struct { made_progress: bool };
+
+    fn drive(self: *SpinningRecord) !DriveResult {
+        self.drives += 1;
+        return .{ .made_progress = true };
+    }
+
+    fn readPlaintext(self: *SpinningRecord, buf: []u8) error{ EndOfStream, BadRecord }!usize {
+        if (self.inbound_plaintext.len == 0) return error.EndOfStream;
+        return @min(buf.len, self.inbound_plaintext.len);
+    }
+
+    fn queuedCiphertextLen(self: *const SpinningRecord) usize {
+        return self.queued;
+    }
+};
+
+test "upstream tunnel read and flush stop on the drive budget for a record stream that never yields data (#818)" {
+    var record = SpinningRecord{};
+    var exhausted = false;
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, null), try boundedRead(&record, &buf, UpstreamTlsConn.tunnel_drive_budget, &exhausted));
+    try std.testing.expect(exhausted);
+    try std.testing.expectEqual(@as(usize, UpstreamTlsConn.tunnel_drive_budget), record.drives);
+
+    record.drives = 0;
+    exhausted = false;
+    try boundedFlush(&record, UpstreamTlsConn.tunnel_drive_budget, &exhausted);
+    try std.testing.expect(exhausted);
+    try std.testing.expectEqual(@as(usize, UpstreamTlsConn.tunnel_drive_budget), record.drives);
+
+    // Plaintext that is already decrypted is returned without driving and
+    // clears the flag.
+    record.drives = 0;
+    record.inbound_plaintext = "x";
+    try std.testing.expectEqual(@as(?usize, 1), try boundedRead(&record, &buf, UpstreamTlsConn.tunnel_drive_budget, &exhausted));
+    try std.testing.expect(!exhausted);
+    try std.testing.expectEqual(@as(usize, 0), record.drives);
 }

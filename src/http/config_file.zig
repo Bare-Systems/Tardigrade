@@ -991,6 +991,7 @@ fn parseLocationStatement(
 const strict_numeric_env_keys = [_][]const u8{
     "TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS",
     "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS",
+    "TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS",
 };
 
 fn rejectEmptyStrictValue(

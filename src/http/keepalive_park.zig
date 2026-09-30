@@ -189,6 +189,17 @@ pub const ParkedRegistry = struct {
         self.mutex.unlock();
     }
 
+    /// Hand a checked-out connection's socket to a new owner (a WebSocket
+    /// tunnel, #818): release its pooled session and slot, but leave the fd
+    /// open and skip the close hook, so the connection slot it holds moves
+    /// with the fd. Returns the fd. Caller must NOT hold the mutex.
+    pub fn detach(self: *ParkedRegistry, pc: *ParkedConnection) std.posix.fd_t {
+        const fd = pc.fd;
+        self.session_pool.release(pc.session);
+        self.allocator.destroy(pc);
+        return fd;
+    }
+
     /// Close connections idle in the `.parked` state longer than `timeout_ms`.
     /// Runs on the event-loop thread from the timer tick. Returns the count
     /// reaped. `timeout_ms == 0` disables reaping.

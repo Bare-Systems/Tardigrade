@@ -856,6 +856,7 @@ fn initControlPlaneProxyTestConfig(upstream_base_url: []const u8) edge_config.Ed
 
 fn initControlPlaneProxyTestState(state: *GatewayState, allocator: std.mem.Allocator) void {
     state.allocator = allocator;
+    state.tunnel_reactor = null;
     state.upstream_mutex = .{};
     state.circuit_mutex = .{};
     state.metrics_mutex = .{};

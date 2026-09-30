@@ -2174,13 +2174,30 @@ fn parseProxyStreamingModeConfig(raw: []const u8) !ProxyStreamingMode {
     };
 }
 
+/// The configured value of `key` with `envOrDefault`'s precedence
+/// (environment, then config file, then secrets), or null when it is not
+/// configured anywhere. Unlike a default sentinel, this keeps "set to an
+/// empty value" distinct from "not set".
+fn lookupConfigValue(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+    if (compat.getEnvVarOwned(allocator, key)) |owned| {
+        return owned;
+    } else |_| {}
+    if (active_file_overrides) |ov| {
+        if (ov.map.get(key)) |value| return try allocator.dupe(u8, value);
+    }
+    if (active_secret_overrides) |ov| {
+        if (ov.map.get(key)) |value| return try allocator.dupe(u8, value);
+    }
+    return null;
+}
+
 /// An unsigned millisecond/count setting that rejects malformed values
-/// instead of falling back to `default_value` like `parseIntEnv`.
+/// instead of falling back to `default_value` like `parseIntEnv`. Only an
+/// absent setting takes the default; an explicitly empty one is invalid.
 fn parseStrictU32Env(allocator: std.mem.Allocator, key: []const u8, default_value: u32, directive: []const u8) !u32 {
-    const raw = envOrDefault(allocator, key, "") catch return default_value;
+    const raw = (try lookupConfigValue(allocator, key)) orelse return default_value;
     defer allocator.free(raw);
     const value = std.mem.trim(u8, raw, " \t\r\n");
-    if (value.len == 0) return default_value;
     return parseStrictU32(value) orelse {
         logConfigDiagnostic("config validation failed: {s} must be an unsigned integer, got '{s}'", .{ directive, value });
         return error.InvalidConfigValue;
@@ -2199,6 +2216,25 @@ test "strict u32 settings reject malformed values and keep zero (#812)" {
     try std.testing.expectEqual(@as(?u32, null), parseStrictU32("-1"));
     try std.testing.expectEqual(@as(?u32, null), parseStrictU32("+5"));
     try std.testing.expectEqual(@as(?u32, null), parseStrictU32("99999999999"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32(""));
+}
+
+test "strict u32 settings default only when absent, and reject an explicit empty value (#812)" {
+    const allocator = std.testing.allocator;
+    var overrides = http.config_file.Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    const previous = active_file_overrides;
+    defer active_file_overrides = previous;
+    active_file_overrides = &overrides;
+
+    const key = "TARDIGRADE_TEST_STRICT_U32_812";
+    try std.testing.expectEqual(@as(u32, 30000), try parseStrictU32Env(allocator, key, 30000, "test"));
+    try overrides.map.put(try allocator.dupe(u8, key), try allocator.dupe(u8, "0"));
+    try std.testing.expectEqual(@as(u32, 0), try parseStrictU32Env(allocator, key, 30000, "test"));
+    const entry = overrides.map.getEntry(key).?;
+    allocator.free(entry.value_ptr.*);
+    entry.value_ptr.* = try allocator.dupe(u8, "");
+    try std.testing.expectError(error.InvalidConfigValue, parseStrictU32Env(allocator, key, 30000, "test"));
 }
 
 fn logConfigDiagnostic(comptime fmt: []const u8, args: anytype) void {

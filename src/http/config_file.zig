@@ -345,6 +345,7 @@ fn parseStatement(
         return error.InvalidConfigSyntax;
     }
     const trimmed_value = std.mem.trim(u8, value_raw, " \t\"'");
+    try rejectEmptyStrictValue(allocator, file_path, line_no, directive, trimmed_value, vars);
 
     // Core directive aliases (phase 3.2)
     if (std.ascii.eqlIgnoreCase(directive, "worker_processes")) {
@@ -979,6 +980,37 @@ fn parseLocationStatement(
         const joined = try joinWebSocketOrigins(allocator, file_path, line_no, value_interp);
         defer allocator.free(joined);
         try replaceOptionalOwned(allocator, &builder.proxy_websocket_origins, joined);
+        return;
+    }
+}
+
+/// Top-level settings that must never silently take their default: an
+/// empty value (`""`, or a variable that expands to nothing) is an error
+/// rather than "unset", because accepting it would let an invalid reload
+/// publish and start draining WebSocket tunnels (#812).
+const strict_numeric_env_keys = [_][]const u8{
+    "TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS",
+    "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS",
+};
+
+fn rejectEmptyStrictValue(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    line_no: usize,
+    directive: []const u8,
+    trimmed_value: []const u8,
+    vars: *std.StringHashMap([]const u8),
+) !void {
+    const env_key = try normalizeDirectiveToEnv(allocator, directive);
+    defer allocator.free(env_key);
+    for (strict_numeric_env_keys) |key| {
+        if (!std.mem.eql(u8, env_key, key)) continue;
+        const expanded = try interpolate(allocator, trimmed_value, vars);
+        defer allocator.free(expanded);
+        if (std.mem.trim(u8, expanded, " \t\r\n").len == 0) {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: {s} must be an unsigned integer, not empty", .{ file_path, line_no, directive });
+            return error.InvalidConfigSyntax;
+        }
         return;
     }
 }

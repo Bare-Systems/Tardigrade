@@ -24319,6 +24319,17 @@ test "an invalid top-level reload timeout rejects the reload and never drains; 0
     compat.sleepNs(1_500 * std.time.ns_per_ms);
     try wsExpectEcho(allocator, hs.peer, .text, "alive after a rejected reload");
 
+    // An explicitly empty timeout (here via a variable that expands to
+    // nothing) is rejected the same way, never taken as "use the default".
+    const empty = try std.fmt.allocPrint(allocator, "set $ms \"\";\nproxy_websocket_reload drain;\nproxy_websocket_reload_timeout_ms ${{ms}};\n{s}\n", .{locations});
+    defer allocator.free(empty);
+    try tardigrade.rewriteConfig(empty);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    try wsWaitLogCount(allocator, tardigrade.log_path, "config reload failed", failures + 2, 5_000);
+    try std.testing.expectEqual(applied, try wsLogCount(allocator, tardigrade.log_path, "configuration hot-reload applied"));
+    compat.sleepNs(1_000 * std.time.ns_per_ms);
+    try wsExpectEcho(allocator, hs.peer, .text, "alive after an empty-value reload");
+
     // A valid reload publishes; the tunnel keeps its admission timeout (600 ms),
     // while tunnels opened after it get 0 and close at the next reload.
     const reloaded_at = try wsReload(allocator, &tardigrade, immediate);
@@ -24347,6 +24358,11 @@ test "tardi check rejects an invalid proxy_websocket_reload (#812)" {
         "proxy_websocket_reload_timeout_ms 250ms;\nlocation / {\n    return 200 ok;\n}\n",
         "proxy_websocket_reload_timeout_ms -1;\nlocation / {\n    return 200 ok;\n}\n",
         "proxy_websocket_max_tunnels lots;\nlocation / {\n    return 200 ok;\n}\n",
+        // An explicit empty value is invalid, never "unset".
+        "proxy_websocket_reload_timeout_ms \"\";\nlocation / {\n    return 200 ok;\n}\n",
+        "set $ms \"\";\nproxy_websocket_reload_timeout_ms ${ms};\nlocation / {\n    return 200 ok;\n}\n",
+        "proxy_websocket_max_tunnels \"\";\nlocation / {\n    return 200 ok;\n}\n",
+        "location /ws/ {\n    proxy_pass http://127.0.0.1:9;\n    proxy_websocket on;\n    proxy_websocket_reload_timeout_ms \"\";\n}\n",
     };
     for (cases, 0..) |data, i| {
         const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-ws-reload-{d}-{d}.conf", .{ compat.nanoTimestamp(), i });

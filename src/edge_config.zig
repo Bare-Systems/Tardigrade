@@ -1376,14 +1376,17 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const max_active_connections = std.fmt.parseInt(u32, max_active_conn_str, 10) catch 0;
 
     const max_in_flight_requests = parseIntEnv(u32, allocator, "TARDIGRADE_MAX_IN_FLIGHT_REQUESTS", 0);
-    const proxy_websocket_max_tunnels = parseIntEnv(u32, allocator, "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", 0);
+    const proxy_websocket_max_tunnels = try parseStrictU32Env(allocator, "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", 0, "proxy_websocket_max_tunnels");
     const proxy_websocket_reload_str = envOrDefault(allocator, "TARDIGRADE_PROXY_WEBSOCKET_RELOAD", "preserve") catch unreachable;
     defer allocator.free(proxy_websocket_reload_str);
     const proxy_websocket_reload = http.location_router.WebSocketReloadPolicy.parse(proxy_websocket_reload_str) orelse {
         logConfigDiagnostic("config validation failed: proxy_websocket_reload must be one of preserve, drain", .{});
         return error.InvalidConfigValue;
     };
-    const proxy_websocket_reload_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS", http.location_router.WebSocketProxy.DEFAULT_RELOAD_TIMEOUT_MS);
+    // Strict: a malformed value must fail config load (and so reject a hot
+    // reload) rather than silently become the default, which would publish a
+    // generation and start draining open `drain` tunnels (#812).
+    const proxy_websocket_reload_timeout_ms = try parseStrictU32Env(allocator, "TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS", http.location_router.WebSocketProxy.DEFAULT_RELOAD_TIMEOUT_MS, "proxy_websocket_reload_timeout_ms");
 
     const keep_alive_timeout_str = envOrDefault(allocator, "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", "5000") catch unreachable;
     defer allocator.free(keep_alive_timeout_str);
@@ -2169,6 +2172,33 @@ fn parseProxyStreamingModeConfig(raw: []const u8) !ProxyStreamingMode {
         logConfigDiagnostic("config validation failed: proxy_streaming_mode must be one of off, buffered, response, full, request-response", .{});
         return error.InvalidConfigValue;
     };
+}
+
+/// An unsigned millisecond/count setting that rejects malformed values
+/// instead of falling back to `default_value` like `parseIntEnv`.
+fn parseStrictU32Env(allocator: std.mem.Allocator, key: []const u8, default_value: u32, directive: []const u8) !u32 {
+    const raw = envOrDefault(allocator, key, "") catch return default_value;
+    defer allocator.free(raw);
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len == 0) return default_value;
+    return parseStrictU32(value) orelse {
+        logConfigDiagnostic("config validation failed: {s} must be an unsigned integer, got '{s}'", .{ directive, value });
+        return error.InvalidConfigValue;
+    };
+}
+
+fn parseStrictU32(value: []const u8) ?u32 {
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return null;
+    return std.fmt.parseInt(u32, value, 10) catch null;
+}
+
+test "strict u32 settings reject malformed values and keep zero (#812)" {
+    try std.testing.expectEqual(@as(?u32, 0), parseStrictU32("0"));
+    try std.testing.expectEqual(@as(?u32, 30000), parseStrictU32("30000"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("250ms"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("-1"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("+5"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("99999999999"));
 }
 
 fn logConfigDiagnostic(comptime fmt: []const u8, args: anytype) void {

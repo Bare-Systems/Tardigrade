@@ -24278,12 +24278,75 @@ test "proxy_websocket_reload drain closes a native TLS (wss://) tunnel after rel
     try waitForLogSubstring(allocator, tardigrade.log_path, "\"tunnel_close_reason\":\"reload\"", 2_000);
 }
 
+test "an invalid top-level reload timeout rejects the reload and never drains; 0 drains at once (#812)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const locations = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /ws/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(locations);
+    const config_a = try std.fmt.allocPrint(allocator, "proxy_websocket_reload drain;\nproxy_websocket_reload_timeout_ms 600;\n{s}\n", .{locations});
+    defer allocator.free(config_a);
+    const invalid = try std.fmt.allocPrint(allocator, "proxy_websocket_reload drain;\nproxy_websocket_reload_timeout_ms 250ms;\n{s}\n", .{locations});
+    defer allocator.free(invalid);
+    const immediate = try std.fmt.allocPrint(allocator, "proxy_websocket_reload drain;\nproxy_websocket_reload_timeout_ms 0;\n{s}\nlocation = /b {{\n    return 200 b;\n}}\n", .{locations});
+    defer allocator.free(immediate);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_a, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var hs = try wsHandshake(allocator, tardigrade.port, "/ws/strict", &.{}, "");
+    defer hs.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), hs.status);
+
+    // The malformed timeout fails config load, so no generation is published
+    // and the 600 ms drain never starts.
+    const failures = try wsLogCount(allocator, tardigrade.log_path, "config reload failed");
+    const applied = try wsLogCount(allocator, tardigrade.log_path, "configuration hot-reload applied");
+    try tardigrade.rewriteConfig(invalid);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    try wsWaitLogCount(allocator, tardigrade.log_path, "config reload failed", failures + 1, 5_000);
+    try std.testing.expectEqual(applied, try wsLogCount(allocator, tardigrade.log_path, "configuration hot-reload applied"));
+    compat.sleepNs(1_500 * std.time.ns_per_ms);
+    try wsExpectEcho(allocator, hs.peer, .text, "alive after a rejected reload");
+
+    // A valid reload publishes; the tunnel keeps its admission timeout (600 ms),
+    // while tunnels opened after it get 0 and close at the next reload.
+    const reloaded_at = try wsReload(allocator, &tardigrade, immediate);
+    const closed_at = try wsClosedAt(hs.peer, 5_000);
+    try std.testing.expect(closed_at - reloaded_at >= 500);
+    try std.testing.expect(closed_at - reloaded_at < 2_600);
+
+    var zero = try wsHandshake(allocator, tardigrade.port, "/ws/zero", &.{}, "");
+    defer zero.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 101), zero.status);
+    try wsExpectEcho(allocator, zero.peer, .text, "admitted with a zero drain");
+    const again = try std.fmt.allocPrint(allocator, "{s}\nlocation = /c {{\n    return 200 c;\n}}\n", .{immediate});
+    defer allocator.free(again);
+    const zero_reload = try wsReload(allocator, &tardigrade, again);
+    const zero_closed = try wsClosedAt(zero.peer, 5_000);
+    try std.testing.expect(zero_closed - zero_reload < 1_500);
+}
+
 test "tardi check rejects an invalid proxy_websocket_reload (#812)" {
     const allocator = std.testing.allocator;
     const cases = [_][]const u8{
         "proxy_websocket_reload sometimes;\nlocation / {\n    return 200 ok;\n}\n",
         "location /ws/ {\n    proxy_pass http://127.0.0.1:9;\n    proxy_websocket on;\n    proxy_websocket_reload sometimes;\n}\n",
         "location /ws/ {\n    proxy_pass http://127.0.0.1:9;\n    proxy_websocket_reload drain;\n}\n",
+        // Top-level numeric settings are strict: no silent fallback to the default.
+        "proxy_websocket_reload_timeout_ms 250ms;\nlocation / {\n    return 200 ok;\n}\n",
+        "proxy_websocket_reload_timeout_ms -1;\nlocation / {\n    return 200 ok;\n}\n",
+        "proxy_websocket_max_tunnels lots;\nlocation / {\n    return 200 ok;\n}\n",
     };
     for (cases, 0..) |data, i| {
         const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-ws-reload-{d}-{d}.conf", .{ compat.nanoTimestamp(), i });

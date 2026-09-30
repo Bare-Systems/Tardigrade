@@ -420,7 +420,9 @@ Set `proxy_websocket_reload` and `proxy_websocket_reload_timeout_ms` at top
 level for a default and in a location to override either one. Both are read
 from the admission configuration, so a reload that changes them affects only
 tunnels opened after it. A reload that fails or is rejected publishes
-nothing and never affects open tunnels. New handshakes use the new
+nothing and never affects open tunnels; malformed values for either setting
+(for example `proxy_websocket_reload_timeout_ms 250ms;`) fail `tardi check`
+and reject the reload instead of falling back to a default. New handshakes use the new
 configuration as soon as the reload is applied.
 
 ```nginx

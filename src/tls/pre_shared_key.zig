@@ -326,17 +326,17 @@ pub fn deriveBinderFromTranscriptHash(
 
             var psk_fixed: [Sha256.digest_length]u8 = undefined;
             @memcpy(&psk_fixed, psk);
-            defer crypto.secureZero(u8, &psk_fixed);
+            defer provider.secureZero(&psk_fixed);
 
             var early_secret = HkdfSha256.extract("", &psk_fixed);
-            defer crypto.secureZero(u8, &early_secret);
+            defer provider.secureZero(&early_secret);
             var binder_key = tls.hkdfExpandLabel(HkdfSha256, early_secret, "res binder", &empty_hash, Sha256.digest_length);
-            defer crypto.secureZero(u8, &binder_key);
+            defer provider.secureZero(&binder_key);
             var finished_key = tls.hkdfExpandLabel(HkdfSha256, binder_key, "finished", "", Sha256.digest_length);
-            defer crypto.secureZero(u8, &finished_key);
+            defer provider.secureZero(&finished_key);
 
             var mac: [HmacSha256.mac_length]u8 = undefined;
-            defer crypto.secureZero(u8, &mac);
+            defer provider.secureZero(&mac);
             HmacSha256.create(&mac, transcript_hash[0..Sha256.digest_length], &finished_key);
             @memcpy(out, &mac);
         },
@@ -346,17 +346,17 @@ pub fn deriveBinderFromTranscriptHash(
 
             var psk_fixed: [HmacSha384.mac_length]u8 = undefined;
             @memcpy(&psk_fixed, psk);
-            defer crypto.secureZero(u8, &psk_fixed);
+            defer provider.secureZero(&psk_fixed);
 
             var early_secret = HkdfSha384.extract("", &psk_fixed);
-            defer crypto.secureZero(u8, &early_secret);
+            defer provider.secureZero(&early_secret);
             var binder_key = tls.hkdfExpandLabel(HkdfSha384, early_secret, "res binder", &empty_hash, HmacSha384.mac_length);
-            defer crypto.secureZero(u8, &binder_key);
+            defer provider.secureZero(&binder_key);
             var finished_key = tls.hkdfExpandLabel(HkdfSha384, binder_key, "finished", "", HmacSha384.mac_length);
-            defer crypto.secureZero(u8, &finished_key);
+            defer provider.secureZero(&finished_key);
 
             var mac: [HmacSha384.mac_length]u8 = undefined;
-            defer crypto.secureZero(u8, &mac);
+            defer provider.secureZero(&mac);
             HmacSha384.create(&mac, transcript_hash[0..Sha384.digest_length], &finished_key);
             @memcpy(out, &mac);
         },
@@ -377,7 +377,7 @@ pub fn verifyBinderFromTranscriptHash(
 ) BinderError!bool {
     var computed: [provider.max_digest_len]u8 = undefined;
     const out = computed[0..hash.digestLength()];
-    defer crypto.secureZero(u8, out);
+    defer provider.secureZero(out);
     try deriveBinderFromTranscriptHash(hash, psk, transcript_hash, out);
     // Length is public wire framing (RFC 8446 §4.2.11.2 fixes it to the
     // hash's digest length), so the length check is an ordinary branch;

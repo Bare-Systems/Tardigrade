@@ -2,6 +2,22 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [Unreleased]
+
+### Security
+
+- **Every production secret wipe now uses the canonical zeroization helper,
+  and the crypto-boundary audit enforces it (#784).** About 100 remaining
+  wipes in the pure-Zig crypto provider and the TLS 1.3 backend
+  (handshake secrets, PSK binders, key-exchange scalars, record buffers)
+  called the standard library's `secureZero` directly. They now use the
+  project's own helper, which cannot be optimized away and is far faster on
+  x86_64 (see #750). `zig build audit-crypto-boundary` now fails if
+  production crypto, TLS, QUIC, PKI or HTTP code calls
+  `std.crypto.secureZero` in any spelling. It also fails if the
+  secret-bearing TLS record queues or QUIC CRYPTO buffers are cleared with a
+  plain `@memset`.
+
 ## [0.8.2] - 2026-09-29
 
 ### Added

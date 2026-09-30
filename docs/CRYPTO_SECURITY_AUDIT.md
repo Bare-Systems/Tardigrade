@@ -390,20 +390,48 @@ before the story closes:
     rule, which would immediately misfire on this same file's own tests
     calling `secret.deinit()` (the type's own, correct, public API, not a
     bypass).
-  - Still not a project-wide ban on the raw `std.crypto.secureZero` spelling
-    on its own (a separate, narrower named-file check retained for
-    `ticket_key_snapshot.zig`/`sni_provider.zig`/`secrets.zig`): many call
-    sites throughout `src/tls`/`src/quic`/`src/http` legitimately zero a
-    stack-local buffer with no accompanying free at all (see this document's
-    toolchain-assumptions section above) — banning the raw spelling
-    everywhere would flag every one of them, the same "mechanical
-    conversion" this section's opening paragraph warns against.
+  - ~~Still not a project-wide ban on the raw `std.crypto.secureZero`
+    spelling~~ — superseded by #784, below. Once #750 made
+    `crypto.secrets.secureZero` its own wide-volatile-store implementation
+    rather than a wrapper, a raw stdlib call stopped being a synonym for the
+    canonical helper, so stack-local wipes no longer justify an exemption.
   - Not a claim of soundness against arbitrary aliasing depth for the
     zero-and-free scanner (unlike the `timing_safe` token match, which is
     complete for that one narrower question): buffer/callee alias
     resolution goes one hop, and no lexical scan can fully replace real
     semantic analysis. Each mechanism is scoped to catch the specific
     bypasses found in review, not to prove no lexical bypass can ever exist.
+- **#784** — guard against bypassing the canonical secret-zeroization
+  helpers (follow-up to #750/#751). `scripts/audit_crypto_boundary.zig`
+  (file-level doc, point 6) now:
+  - Rejects any production `std.crypto.secureZero` in `src/crypto`,
+    `src/tls`, `src/quic`, `src/pki`, `src/http`, and `src/http3`: the direct
+    spelling (called or bound as a function value), `<alias>.secureZero` through
+    any simple local alias of the stdlib root or its `crypto` namespace
+    (`const c = std.crypto;`, `const c = @import("std").crypto;`,
+    `const s = @import("std"); const c = s.crypto;`, flagged even when bound as
+    a function value and later called indirectly), and any `secureZero(T, buf)` call
+    with the stdlib's typed two-argument signature, whatever it is qualified with.
+    The canonical helpers take a single `[]u8`, so counting the arguments
+    identifies the stdlib form however its namespace was reached. Comments,
+    string literals, `test` blocks (at any indentation, including tests nested
+    in a container), and `*_tests.zig` files are exempt, as is
+    `src/crypto/secrets.zig`, whose narrower point-5 check already limits raw
+    calls there to `secureZero`'s own body. The guard landed together with the
+    migration of the ~100 remaining `crypto.secureZero(u8, …)` production
+    call sites (`pure_zig.zig`, `tls13_backend.zig`, `pre_shared_key.zig`,
+    `credentials.zig`, `new_session_ticket.zig`) onto
+    `secrets.secureZero`/`provider.secureZero`.
+  - Rejects any plain `@memset` inside a short named list of secret-bearing
+    storage declarations: `ByteQueue` (`src/tls/encrypted_stream.zig`, #751)
+    and `CryptoStream`/`CryptoReassembler`/`CryptoOutput`
+    (`src/quic/tls_adapter.zig`, #750). A simple type alias of a protected
+    name is followed to its real container. A missing file, a missing
+    declaration, or an initializer that can't be resolved to a container
+    fails closed. It deliberately does not ban `@memset`
+    globally: `PlaintextProvenanceQueue`'s `bool` bookkeeping and other
+    non-secret buffers use it correctly, and a fixture proves they stay
+    allowed.
 - **#555** — consolidate the duplicate RFC 9001 §5.8 Retry-integrity-tag
   implementations in `src/quic/packet.zig` (production) and `src/quic/path.zig`
   (unreachable, KAT-fixture-only). Both copies were fixed for constant-time

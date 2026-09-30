@@ -575,7 +575,7 @@ pub const Identity = struct {
         } else |_| {}
         if (ecdsaP256KeyFromPkcs8(pkcs8_key_der)) |scalar_local| {
             var scalar = scalar_local;
-            defer crypto.secureZero(u8, &scalar);
+            defer crypto_pkg.secrets.secureZero(&scalar);
             var scalar_secret = crypto_pkg.secrets.FixedSecret(32).init(&scalar) catch return error.InvalidPrivateKey;
             defer scalar_secret.deinit();
             const software_key = pure_zig.SoftwareEcdsaP256SigningKey.fromScalarSecret(&scalar_secret) catch return error.InvalidPrivateKey;
@@ -798,7 +798,7 @@ pub const FixedCredentialProvider = struct {
 
     /// Securely clear the private key material.
     pub fn deinit(self: *FixedCredentialProvider) void {
-        crypto.secureZero(u8, std.mem.asBytes(&self.identity.key));
+        crypto_pkg.secrets.secureZero(std.mem.asBytes(&self.identity.key));
     }
 
     const vtable = CredentialProvider.VTable{ .select = select };

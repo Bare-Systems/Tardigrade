@@ -534,10 +534,13 @@ pub const GatewayState = struct {
     max_in_flight_requests: u32,
     /// Open (or opening) WebSocket tunnels (#812). Lock-free.
     websocket_tunnels: std.atomic.Value(u32) = .init(0),
-    /// Tunnel cap used when `proxy_websocket_max_tunnels` is 0: half the
-    /// worker threads, rounded down, so tunnels can never hold every worker
-    /// (zero with a single worker). Set once at startup.
+    /// Tunnel cap used when `proxy_websocket_max_tunnels` is 0: derived from
+    /// the descriptor limit (#818). Set once at startup.
     websocket_default_max_tunnels: u32 = 0,
+    /// Reactor that owns established WebSocket tunnels (#818), so they do not
+    /// hold a worker thread each. Null in unit tests and when a tunnel must
+    /// run inline. Set once at startup; outlives every worker.
+    tunnel_reactor: ?*http.tunnel_reactor.Reactor = null,
     active_ws_streams: usize, // runtime accounting [connection_mutex]
     active_sse_streams: usize, // runtime accounting [connection_mutex]
     active_mux_connections: usize, // runtime accounting [connection_mutex]
@@ -842,7 +845,7 @@ pub const GatewayState = struct {
 
     /// Reserve a WebSocket tunnel slot (#812) before the upstream is
     /// contacted. `configured_max` is `proxy_websocket_max_tunnels`; zero uses
-    /// the worker-derived default.
+    /// the startup default.
     pub fn tryAcquireWebSocketTunnel(self: *GatewayState, configured_max: u32) bool {
         const cap = if (configured_max > 0) configured_max else self.websocket_default_max_tunnels;
         const prev = self.websocket_tunnels.fetchAdd(1, .acq_rel);
@@ -2164,6 +2167,20 @@ pub const GatewayState = struct {
         return out.toOwnedSlice();
     }
 
+    /// Live WebSocket reactor load (#818), read from the reactor's own
+    /// atomics at scrape time.
+    fn overlayWebSocketReactorStats(self: *GatewayState, metrics_snapshot: *http.metrics.Metrics) void {
+        const reactor = self.tunnel_reactor orelse return;
+        const snapshot = reactor.snapshot();
+        metrics_snapshot.setWebSocketReactorStats(.{
+            .threads = snapshot.threads,
+            .tunnels = snapshot.tunnels,
+            .max_thread_tunnels = snapshot.max_shard_tunnels,
+            .handoffs_total = snapshot.handoffs_total,
+            .wakeups_total = snapshot.wakeups_total,
+        });
+    }
+
     pub fn metricsToPrometheus(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
         const mux_snapshot = try self.muxMetricsSnapshot(allocator);
         defer deinitMuxMetricsSnapshot(allocator, mux_snapshot.device_counts);
@@ -2173,6 +2190,7 @@ pub const GatewayState = struct {
         self.metrics_mutex.unlock();
         self.overlayUpstreamPoolStats(&metrics_snapshot);
         self.overlayQuicTransportSnapshot(&metrics_snapshot);
+        self.overlayWebSocketReactorStats(&metrics_snapshot);
 
         const base = try metrics_snapshot.toPrometheus(allocator);
         defer allocator.free(base);
@@ -3779,6 +3797,7 @@ test "reloadable config store retires old config after last lease" {
 
 fn initSlotTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.allocator = allocator;
+    gs.tunnel_reactor = null;
     gs.connection_mutex = .{};
     gs.metrics_mutex = .{};
     gs.runtime_mutex = .{};
@@ -3935,6 +3954,7 @@ test "in-flight request slot is unlimited and release is a no-op when disabled" 
 
 fn initUpstreamTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.allocator = allocator;
+    gs.tunnel_reactor = null;
     gs.upstream_mutex = .{};
     gs.circuit_mutex = .{};
     gs.metrics_mutex = .{};
@@ -4087,6 +4107,7 @@ test "gateway proxy outcome accounting drives live circuit breaker" {
 
 fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.allocator = allocator;
+    gs.tunnel_reactor = null;
     gs.connection_mutex = .{};
     gs.metrics_mutex = .{};
     gs.runtime_mutex = .{};
@@ -4340,6 +4361,7 @@ test "command lifecycle creation releases every partial allocation on OOM" {
         fn run(allocator: std.mem.Allocator) !void {
             var gs: GatewayState = undefined;
             gs.allocator = allocator;
+            gs.tunnel_reactor = null;
             gs.command_mutex = .{};
             gs.command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(allocator);
             defer deinitCommandLifecycleTestMap(&gs);
@@ -4353,6 +4375,7 @@ test "approval creation releases every partial allocation on OOM" {
         fn run(allocator: std.mem.Allocator) !void {
             var gs: GatewayState = undefined;
             gs.allocator = allocator;
+            gs.tunnel_reactor = null;
             gs.approval_mutex = .{};
             gs.approval_persist_mutex = .{};
             gs.approvals = std.StringHashMap(ApprovalEntry).init(allocator);
@@ -4470,6 +4493,7 @@ test "served Prometheus metrics reflect updated proxy buffer limit snapshot" {
 
 fn initApprovalTestState(gs: *GatewayState, allocator: std.mem.Allocator, store_path: []const u8) void {
     gs.allocator = allocator;
+    gs.tunnel_reactor = null;
     gs.approval_mutex = .{};
     gs.approval_persist_mutex = .{};
     gs.approvals = std.StringHashMap(ApprovalEntry).init(allocator);

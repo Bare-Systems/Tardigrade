@@ -26,6 +26,7 @@ const ghandlers = @import("gateway_handlers.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
 const gprotocol_policy = @import("gateway_protocol_policy.zig");
 const gp = @import("gateway_proxy.zig");
+const gws_tunnel = @import("gateway_websocket_tunnel.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const ga = @import("gateway_auth.zig");
 const gfa = @import("gateway_forward_auth.zig");
@@ -536,16 +537,19 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             cfg.worker_threads;
         break :blk @intCast(@max(configured, @as(u32, 1)));
     };
-    // Each WebSocket tunnel holds a worker for its lifetime (#812): unless the
-    // operator sets a cap, tunnels never take more than half of them, so a
-    // single worker allows none (upgrades get 503) rather than letting one
-    // tunnel starve every other request.
-    state.websocket_default_max_tunnels = @intCast(worker_count / 2);
-    if (cfg.proxy_websocket_max_tunnels > 0 and cfg.proxy_websocket_max_tunnels >= worker_count) {
-        state.logger.warn(null, "proxy_websocket_max_tunnels={d} can hold every worker thread ({d}); ordinary requests may stall while that many tunnels are open", .{ cfg.proxy_websocket_max_tunnels, worker_count });
-    } else if (cfg.proxy_websocket_max_tunnels == 0 and state.websocket_default_max_tunnels == 0 and configRelaysWebSockets(cfg)) {
-        state.logger.warn(null, "proxy_websocket is configured but there is only {d} worker thread; WebSocket upgrades will be refused with 503. Set TARDIGRADE_WORKER_THREADS to 2 or more, or set proxy_websocket_max_tunnels to accept that a tunnel can block every other request", .{worker_count});
-    }
+    // Established WebSocket tunnels run on a few reactor threads, not on the
+    // request workers (#818): a worker runs the handshake and admission, then
+    // hands the tunnel over. Declared before the worker pool so it outlives
+    // every worker that can hand it a tunnel. Always started: a reload can
+    // add `proxy_websocket` locations.
+    const reactor_threads: u16 = @intCast(if (cfg.proxy_websocket_reactor_threads > 0)
+        cfg.proxy_websocket_reactor_threads
+    else
+        std.math.clamp((std.Thread.getCpuCount() catch 1) / 4, 1, 4));
+    var tunnel_reactor: http.tunnel_reactor.Reactor = undefined;
+    try tunnel_reactor.start(state_allocator, .{ .threads = reactor_threads, .shutdown_requested = http.shutdown.isShutdownRequested });
+    defer tunnel_reactor.deinit();
+    state.tunnel_reactor = &tunnel_reactor;
     var worker_ctx = WorkerContext{
         .config_store = &config_store,
         .state = &state,
@@ -718,6 +722,14 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         if (applied) |limit| {
             state.logger.info(null, "FD soft limit configured: {d}", .{limit});
         }
+    }
+    // Read after the soft limit is applied: each tunnel holds two sockets.
+    state.websocket_default_max_tunnels = defaultWebSocketTunnelCap();
+    if (configRelaysWebSockets(cfg) or cfg.proxy_websocket_max_tunnels > 0) {
+        state.logger.info(null, "WebSocket tunnels: reactor_threads={d} max_tunnels={d}", .{
+            reactor_threads,
+            if (cfg.proxy_websocket_max_tunnels > 0) cfg.proxy_websocket_max_tunnels else state.websocket_default_max_tunnels,
+        });
     }
     state.logger.info(null, "Keep-alive configured: timeout={d}ms max_requests={d}", .{ cfg.keep_alive_timeout_ms, cfg.max_requests_per_connection });
     state.logger.info(null, "Connection session pool configured: max_cached={d}", .{cfg.connection_pool_size});
@@ -918,6 +930,9 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             }
             if (http.shutdown.consumeReloadRequested()) {
                 gshutdown.hotReloadConfig(state_allocator, &worker_ctx, &state, &http3_dispatch_ctx);
+                // Drain-mode tunnels read the supersession stamp the reload
+                // just published; wake them rather than wait for a socket.
+                tunnel_reactor.wakeAll();
             }
             var current_cfg_lease = worker_ctx.acquireConfig();
             defer current_cfg_lease.release();
@@ -972,7 +987,13 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         updateHttp3Advertisement(&state, cfg, runtime, .draining);
         runtime.beginDrain(h3_deadline_us);
     }
+    // Start every tunnel's shutdown drain now; they close within the drain
+    // window while workers finish their requests.
+    tunnel_reactor.wakeAll();
     const drain_result = worker_pool.shutdownAndJoin(cfg.shutdown_drain_timeout_ms);
+    // Workers are joined, so no more tunnels can arrive; wait for the ones
+    // the reactor owns to reach their drain deadline.
+    tunnel_reactor.stopAndJoin();
     if (http3_runtime) |*runtime| {
         while (!runtime.isDrained() and http.http3_runtime.Runtime.nowUsPublic() < h3_deadline_us) {
             std.Io.sleep(compat.io(), .fromMilliseconds(10), .awake) catch {};
@@ -983,6 +1004,15 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         state.logger.warn(null, "drain timeout elapsed; force-closed {d} queued connection(s)", .{drain_result.forced_closes});
     }
     state.logger.info(null, "Graceful shutdown complete (forced_closes={d} drain_timed_out={})", .{ drain_result.forced_closes, drain_result.timed_out });
+}
+
+/// Tunnel cap when `proxy_websocket_max_tunnels` is 0 (#818): a quarter of
+/// the descriptor soft limit (each tunnel holds two sockets, leaving the rest
+/// for ordinary connections), at most 4096.
+fn defaultWebSocketTunnelCap() u32 {
+    const limits = std.posix.getrlimit(std.posix.rlimit_resource.NOFILE) catch return 256;
+    const soft: u64 = @intCast(limits.cur);
+    return @intCast(std.math.clamp(soft / 4, 1, 4096));
 }
 
 /// True when any location, top-level or in a server block, sets
@@ -1237,13 +1267,17 @@ fn checkoutActiveForWorkerAt(
 }
 
 /// Outcome of serving one request on a keepalive HTTP/1.1 connection.
-const ServeOutcome = enum {
+const ServeOutcome = union(enum) {
     /// Buffered (pipelined) data is already available; serve another request now.
     serve_again,
     /// Connection is idle and keep-alive; park it off the worker pool.
     park,
     /// Connection should be closed (no keep-alive, shutdown, max-requests, error).
     close,
+    /// The request became a WebSocket tunnel (#818). The caller detaches the
+    /// connection from its own bookkeeping (keeping the socket and its
+    /// connection slot open), `attach`es it to the job, and `submit`s it.
+    tunnel: *gws_tunnel.TunnelJob,
 };
 
 fn hasBufferedHttp1Work(conn: anytype, session: *const ConnectionSession) bool {
@@ -1286,14 +1320,27 @@ fn serveOneRequest(
     connection_ip: []const u8,
     served: *u32,
     enable_proxy_protocol: bool,
+    /// The caller handles `.tunnel` (#818); otherwise a WebSocket tunnel runs
+    /// inline on this worker.
+    allow_tunnel_handoff: bool,
 ) ServeOutcome {
     // The lease is held for the whole request, including any WebSocket
     // tunnel it becomes, so the generation (and its supersession stamp) stays
-    // alive for as long as anything admitted under it runs.
+    // alive for as long as anything admitted under it runs. A handed-off
+    // tunnel takes the lease with it.
     var live_cfg_lease = ctx.acquireConfig();
-    defer live_cfg_lease.release();
+    var lease_transferred = false;
+    defer if (!lease_transferred) live_cfg_lease.release();
     const live_cfg = live_cfg_lease.cfg;
-    return serveOneRequestWithConfig(ctx, conn, session, live_cfg, &live_cfg_lease.version.superseded_at_ms, connection_ip, served, enable_proxy_protocol);
+    const outcome = serveOneRequestWithConfig(ctx, conn, session, live_cfg, &live_cfg_lease.version.superseded_at_ms, connection_ip, served, enable_proxy_protocol, allow_tunnel_handoff);
+    switch (outcome) {
+        .tunnel => |job| {
+            job.adoptConfigLease(live_cfg_lease);
+            lease_transferred = true;
+        },
+        else => {},
+    }
+    return outcome;
 }
 
 fn serveOneRequestWithConfig(
@@ -1306,6 +1353,7 @@ fn serveOneRequestWithConfig(
     connection_ip: []const u8,
     served: *u32,
     enable_proxy_protocol: bool,
+    allow_tunnel_handoff: bool,
 ) ServeOutcome {
     const header_timeout_ms = cfg.request_limits.effectiveHeaderTimeout();
     const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0)
@@ -1322,7 +1370,8 @@ fn serveOneRequestWithConfig(
     const is_last_allowed_request = max_requests_per_connection > 0 and served.* + 1 >= max_requests_per_connection;
 
     var keep_alive = false;
-    handleConnection(conn, session, cfg, config_superseded_at, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol, is_last_allowed_request) catch |err| {
+    var tunnel_handoff: ?*gws_tunnel.TunnelJob = null;
+    handleConnection(conn, session, cfg, config_superseded_at, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol, is_last_allowed_request, if (allow_tunnel_handoff) &tunnel_handoff else null) catch |err| {
         if (isBenignDisconnect(err)) {
             ctx.state.logger.debug(null, "keepalive connection closed by peer: {}", .{err});
         } else {
@@ -1331,6 +1380,7 @@ fn serveOneRequestWithConfig(
         return .close;
     };
     served.* += 1;
+    if (tunnel_handoff) |job| return .{ .tunnel = job };
 
     if (!keep_alive or http.shutdown.isShutdownRequested()) return .close;
     if (max_requests_per_connection > 0 and served.* >= max_requests_per_connection) return .close;
@@ -1464,7 +1514,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
         }
         const stream = compat.netStreamFromFd(client_fd);
         var served: u32 = 0;
-        while (true) switch (serveOneRequest(ctx, stream, session, connection_ip, &served, true)) {
+        while (true) switch (serveOneRequest(ctx, stream, session, connection_ip, &served, true, true)) {
             .serve_again => {},
             .park => {
                 transferred = true;
@@ -1472,6 +1522,14 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
                 return;
             },
             .close => return,
+            .tunnel => |job| {
+                // The tunnel owns the socket and its connection slot now.
+                transferred = true;
+                ctx.session_pool.release(session);
+                job.attach(.{ .plaintext = client_fd });
+                job.submit();
+                return;
+            },
         };
     }
 }
@@ -1479,7 +1537,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
 fn resumeParkedConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedConnection) void {
     var served = pc.served;
     const stream = compat.netStreamFromFd(pc.fd);
-    while (true) switch (serveOneRequest(ctx, stream, pc.session, pc.ip(), &served, false)) {
+    while (true) switch (serveOneRequest(ctx, stream, pc.session, pc.ip(), &served, false, true)) {
         .serve_again => {},
         .park => {
             pc.served = served;
@@ -1488,6 +1546,12 @@ fn resumeParkedConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedCo
         },
         .close => {
             ctx.parked.closeSlot(pc, .peer);
+            return;
+        },
+        .tunnel => |job| {
+            // The tunnel owns the socket and its connection slot now.
+            job.attach(.{ .plaintext = ctx.parked.detach(pc) });
+            job.submit();
             return;
         },
     };
@@ -1522,7 +1586,7 @@ const GatewayHttpRuntime = struct {
     served: *u32,
 
     pub fn serveHttp1(self: *@This(), conn: anytype) !Outcome {
-        return serveOneRequest(self.ctx, conn, self.session, self.connection_ip, self.served, false);
+        return serveOneRequest(self.ctx, conn, self.session, self.connection_ip, self.served, false, false);
     }
 
     pub fn handleHttp2(self: *@This(), conn: anytype) !void {
@@ -2174,7 +2238,7 @@ fn advanceNativeHttp1(ctx: *WorkerContext, managed: *http.downstream_connection.
     };
 
     while (true) {
-        switch (serveOneRequest(ctx, &adapter, session, connection_ip, &served, false)) {
+        switch (serveOneRequest(ctx, &adapter, session, connection_ip, &served, false, true)) {
             .serve_again => continue,
             .park => {
                 if (managed.phase == .native_http1) {
@@ -2196,6 +2260,15 @@ fn advanceNativeHttp1(ctx: *WorkerContext, managed: *http.downstream_connection.
             },
             .close => {
                 managed.deinit();
+                return;
+            },
+            .tunnel => |job| {
+                // The tunnel owns the TLS connection, its socket, connection
+                // slot and connection config lease now; only the pooled
+                // request session goes back.
+                managed.releaseSession();
+                job.attach(.{ .native = managed.* });
+                job.submit();
                 return;
             },
         }
@@ -4652,7 +4725,11 @@ fn setConnTimeouts(conn: anytype, read_timeout_ms: u32, write_timeout_ms: u32) v
     }
 }
 
-fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, config_superseded_at: ?*const std.atomic.Value(u64), state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool, is_last_allowed_request: bool) !void {
+/// `tunnel_handoff_out`, when non-null, lets a WebSocket upgrade hand its
+/// established tunnel to the reactor (#818): on return it holds the pending
+/// job, which the caller must attach to the connection and submit (or
+/// abandon). The connection is then the tunnel's and must not be reused.
+fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, config_superseded_at: ?*const std.atomic.Value(u64), state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool, is_last_allowed_request: bool, tunnel_handoff_out: ?*?*gws_tunnel.TunnelJob) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
     defer keep_alive_out.* = keep_alive;
@@ -5063,7 +5140,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // consumes them, as the first tunnel bytes (#812).
     ctx.downstream_buffered_input = pending_buf[pending_start..][0..session.pending_len];
     ctx.config_superseded_at = config_superseded_at;
-    defer if (ctx.tunnel != null) {
+    ctx.tunnel_handoff_allowed = tunnel_handoff_out != null;
+    errdefer if (ctx.tunnel_handoff) |raw| {
+        const job: *gws_tunnel.TunnelJob = @ptrCast(@alignCast(raw));
+        job.abandon();
+    };
+    defer if (ctx.tunnel != null or ctx.tunnel_handoff != null) {
         session.pending_len = 0;
         session.pending_early_prefix_len = 0;
     };
@@ -5085,6 +5167,14 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     switch (outcome) {
         .terminal_status, .logged_terminal => return,
         .route_status => |route_status| {
+            if (ctx.tunnel_handoff) |raw| {
+                // The access-log line is written when the tunnel closes.
+                const job: *gws_tunnel.TunnelJob = @ptrCast(@alignCast(raw));
+                job.captureAccessLog(&ctx, &request, route_status) catch
+                    ghandlers.logAccessForRequest(state, &ctx, &request, route_status);
+                tunnel_handoff_out.?.* = job;
+                return;
+            }
             ghandlers.logAccessForRequest(state, &ctx, &request, route_status);
             return;
         },

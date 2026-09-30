@@ -59,9 +59,10 @@ upstream TLS verification rules.
 
 ## Operating notes
 
-- Each open tunnel holds a worker thread. The default cap is half of
-  `worker_threads`, rounded down, so a single-worker process refuses
-  upgrades with 503; raise both together for many long-lived sockets.
+- Open tunnels run on a few WebSocket reactor threads, not on request
+  workers, so idle sockets do not hold up ordinary requests. The tunnel cap
+  defaults to a quarter of the descriptor limit (at most 4096); this example
+  sets it to 4 so the 503 is easy to see.
 - Quiet connections are closed after `proxy_websocket_idle_timeout_ms`
   (default 60 s). Send pings more often than that.
 - On `tardi reload`, `proxy_websocket_reload preserve` keeps open tunnels

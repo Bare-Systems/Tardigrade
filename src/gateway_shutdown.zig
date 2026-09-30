@@ -839,6 +839,7 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
 
     var state: GatewayState = undefined;
     state.allocator = allocator;
+    state.tunnel_reactor = null;
     state.rate_limiter_mutex = .{};
     state.rate_limiter = null;
     state.proxy_cache_mutex = .{};

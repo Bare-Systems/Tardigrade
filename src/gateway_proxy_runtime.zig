@@ -13,6 +13,7 @@ const gpt = @import("gateway_proxy_target.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const gcp = @import("gateway_control_plane_proxy.zig");
 const gs = @import("gateway_state.zig");
+const gws_tunnel = @import("gateway_websocket_tunnel.zig");
 
 const GatewayState = gs.GatewayState;
 const BufferedUpstreamResponse = gp.BufferedUpstreamResponse;
@@ -1013,7 +1014,10 @@ pub fn handleLocationWebSocketProxyPass(
         try sendApiError(allocator, writer, .service_unavailable, "websocket_capacity", "WebSocket tunnel limit reached", correlation_id, false, state);
         return @intFromEnum(http.Status.service_unavailable);
     }
-    defer state.releaseWebSocketTunnel();
+    // The slot, the upstream in-flight count and the upgraded connection
+    // move to a tunnel job when the tunnel is handed to the reactor (#818).
+    var tunnel_handed_off = false;
+    defer if (!tunnel_handed_off) state.releaseWebSocketTunnel();
 
     const upstream_pool = upstreamPoolForScope(cfg, .global);
     var temp_arena = std.heap.ArenaAllocator.init(allocator);
@@ -1038,13 +1042,16 @@ pub fn handleLocationWebSocketProxyPass(
     };
     // Least-connections balancing sees a tunnel as in flight for its whole life.
     state.recordUpstreamAttemptStart(selection.base_url);
-    defer state.recordUpstreamAttemptEnd(selection.base_url);
+    defer if (!tunnel_handed_off) state.recordUpstreamAttemptEnd(selection.base_url);
 
     var accept_buf: [http.websocket.ACCEPT_KEY_LEN]u8 = undefined;
     const accept_key = http.websocket.computeAcceptKey(client_key, &accept_buf);
     var downstream_committed = false;
+    // A tunnel handed to the reactor outlives this request's arena (#818).
+    const hand_off = ctx.tunnel_handoff_allowed and state.tunnel_reactor != null;
     const opened = gp.openWebSocketUpstream(
         allocator,
+        if (hand_off) state.allocator else allocator,
         cfg,
         upstream_url.value,
         resolved.unix_socket_path,
@@ -1122,7 +1129,7 @@ pub fn handleLocationWebSocketProxyPass(
             return refused.status_code;
         },
         .switched => |upgraded| {
-            defer upgraded.deinit();
+            defer if (!tunnel_handed_off) upgraded.deinit();
             recordStreamingProxyOutcome(state, cfg, selection.base_url, absolute_target, circuit_permit, 101, false, false, correlation_id);
             upgraded.writeSwitchingProtocols(allocator, writer, accept_key, correlation_id) catch |err| {
                 state.metricsRecordProxyClientAbort();
@@ -1141,13 +1148,27 @@ pub fn handleLocationWebSocketProxyPass(
                 .preserve => null,
                 .drain => if (ctx.config_superseded_at) |stamp| .{ .superseded_at_ms = stamp, .timeout_ms = reload_timeout_ms } else null,
             };
-            const stats = upgraded.relay(downstreamTunnelEndpoint(downstream_conn), downstream_initial, .{
+            const tunnel_opts = http.tunnel.Options{
                 .idle_timeout_ms = websocket.idle_timeout_ms,
                 .max_lifetime_ms = websocket.max_lifetime_ms,
                 .drain_timeout_ms = cfg.shutdown_drain_timeout_ms,
                 .shutdown_requested = http.shutdown.isShutdownRequested,
                 .reload_drain = reload_drain,
-            });
+            };
+            if (hand_off) {
+                // The connection loop finishes the handoff (#818): it attaches
+                // the client connection and submits the job to the reactor,
+                // and this worker goes back to serving requests. The reactor
+                // wakes on its own timers and on reload/shutdown, so it needs
+                // no periodic tick.
+                var reactor_opts = tunnel_opts;
+                reactor_opts.poll_interval_ms = 0;
+                const job = try gws_tunnel.TunnelJob.create(state.allocator, state, upgraded, selection.base_url, downstream_initial, reactor_opts);
+                tunnel_handed_off = true;
+                ctx.tunnel_handoff = job;
+                return 101;
+            }
+            const stats = upgraded.relay(downstreamTunnelEndpoint(downstream_conn), downstream_initial, tunnel_opts);
             state.metricsRecordWebSocketTunnelClosed(stats);
             ctx.tunnel = stats;
             state.logger.debug(correlation_id, "websocket tunnel closed: reason={s} duration_ms={d} client_to_upstream={d} upstream_to_client={d}", .{
@@ -1583,6 +1604,7 @@ test "ProductionBufferedProxyAttemptExecutor keeps absolute target failures out 
     const allocator = std.testing.allocator;
     var state: GatewayState = undefined;
     state.allocator = allocator;
+    state.tunnel_reactor = null;
     state.upstream_mutex = .{};
     state.circuit_mutex = .{};
     state.metrics_mutex = .{};
@@ -1633,6 +1655,7 @@ test "streaming absolute target local capacity abort releases circuit permit fir
     const allocator = std.testing.allocator;
     var state: GatewayState = undefined;
     state.allocator = allocator;
+    state.tunnel_reactor = null;
     state.upstream_mutex = .{};
     state.circuit_mutex = .{};
     state.metrics_mutex = .{};
@@ -1672,6 +1695,7 @@ test "streaming downstream abort after known 500 records outcome then propagates
     const allocator = std.testing.allocator;
     var state: GatewayState = undefined;
     state.allocator = allocator;
+    state.tunnel_reactor = null;
     state.upstream_mutex = .{};
     state.circuit_mutex = .{};
     state.metrics_mutex = .{};

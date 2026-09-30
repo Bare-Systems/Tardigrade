@@ -2,11 +2,12 @@
 //!
 //! After a WebSocket handshake is relayed, Tardigrade stops speaking HTTP on
 //! both hops and copies bytes between the client and the origin until either
-//! side closes. `relay` never parses frames. It runs on the worker thread
-//! that handled the handshake, drives both endpoints non-blocking from one
-//! `poll()` loop, and holds at most one fixed buffer per direction: a slow
+//! side closes. The relay never parses frames. `Relay` drives both endpoints
+//! non-blocking and holds at most one fixed buffer per direction: a slow
 //! reader stops the relay from reading the other side, so TCP flow control
-//! pushes back on the fast writer instead of memory growing.
+//! pushes back on the fast writer instead of memory growing. Established
+//! tunnels run on `tunnel_reactor` threads, many per thread (#818); `relay`
+//! runs one on the calling thread.
 //!
 //! An endpoint is any value with these methods:
 //!
@@ -226,7 +227,58 @@ pub const UpstreamTlsEndpoint = struct {
     }
 };
 
-fn setNonBlocking(fd: std.posix.fd_t) void {
+/// Any of the endpoint kinds above, so one `Relay` type can carry every
+/// plaintext/TLS combination of client and origin (#818).
+pub const AnyEndpoint = union(enum) {
+    socket: SocketEndpoint,
+    encrypted: EncryptedEndpoint,
+    upstream_tls: UpstreamTlsEndpoint,
+
+    pub fn fd(self: AnyEndpoint) std.posix.fd_t {
+        return switch (self) {
+            inline else => |e| e.fd(),
+        };
+    }
+
+    pub fn begin(self: AnyEndpoint) void {
+        switch (self) {
+            .socket => |e| e.begin(),
+            else => {},
+        }
+    }
+
+    pub fn read(self: AnyEndpoint, buf: []u8) Error!?usize {
+        return switch (self) {
+            inline else => |e| e.read(buf),
+        };
+    }
+
+    pub fn write(self: AnyEndpoint, bytes: []const u8) Error!usize {
+        return switch (self) {
+            inline else => |e| e.write(bytes),
+        };
+    }
+
+    pub fn flush(self: AnyEndpoint) Error!void {
+        return switch (self) {
+            inline else => |e| e.flush(),
+        };
+    }
+
+    pub fn pendingOutput(self: AnyEndpoint) bool {
+        return switch (self) {
+            inline else => |e| e.pendingOutput(),
+        };
+    }
+
+    pub fn bufferedInput(self: AnyEndpoint) bool {
+        return switch (self) {
+            inline else => |e| e.bufferedInput(),
+        };
+    }
+};
+
+pub fn setNonBlocking(fd: std.posix.fd_t) void {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         const flags = linux.fcntl(fd, linux.F.GETFL, 0);
@@ -291,22 +343,203 @@ fn step(dir: *Direction, src: anytype, src_side: Side, dst: anytype, dst_side: S
     return .{ .progressed = progressed };
 }
 
-fn remainingMs(now: u64, deadline: ?u64) ?u64 {
-    const at = deadline orelse return null;
-    return if (at > now) at - now else 0;
-}
-
 fn minDeadline(a: ?u64, b: ?u64) ?u64 {
     if (a == null) return b;
     if (b == null) return a;
     return @min(a.?, b.?);
 }
 
-/// Relay bytes between `client` and `upstream` until the tunnel closes.
-/// `initial_to_upstream` / `initial_to_client` are bytes already read past
-/// the handshake on either hop; they are delivered first and need not live
-/// in the direction buffers. Never returns an error: every way a tunnel can
-/// end is a `CloseReason`.
+/// What one endpoint's socket must be watched for.
+pub const Interest = struct {
+    in: bool = false,
+    out: bool = false,
+
+    pub fn any(self: Interest) bool {
+        return self.in or self.out;
+    }
+};
+
+/// Where a live tunnel is parked until something can move.
+pub const Wait = struct {
+    client: Interest,
+    upstream: Interest,
+    /// Monotonic ms at which the tunnel must be advanced even if neither
+    /// socket is ready; null when no timer is armed.
+    deadline_ms: ?u64,
+    /// Work is already possible (buffered TLS plaintext, or the per-advance
+    /// budget ran out): advance again without waiting.
+    ready_now: bool = false,
+};
+
+pub const Progress = union(enum) {
+    wait: Wait,
+    closed: CloseReason,
+};
+
+/// Rounds of both-direction work one `advance` does before yielding, so a
+/// reactor that owns many tunnels serves them all fairly.
+const max_rounds_per_advance = 4;
+
+/// The tunnel relay as a resumable state machine (#818). `advance` moves
+/// whatever can move without blocking, checks every timer, and says either
+/// why the tunnel ended or what it is waiting for. `relay` drives one from a
+/// dedicated thread; `tunnel_reactor` drives many from a few threads. Both
+/// share the same buffering, backpressure and close rules.
+pub fn Relay(comptime Client: type, comptime Upstream: type) type {
+    return struct {
+        const Self = @This();
+
+        client: Client,
+        upstream: Upstream,
+        c2u: Direction,
+        u2c: Direction,
+        opts: Options,
+        started: u64,
+        last_activity: u64,
+        lifetime_deadline: ?u64,
+        shutdown_deadline: ?u64 = null,
+        reload_deadline: ?u64 = null,
+        /// Set once a side has closed: the other direction's already-read
+        /// bytes get a bounded flush, and nothing more is read from either
+        /// side.
+        closing: ?CloseReason = null,
+        closing_deadline: ?u64 = null,
+        /// A side whose socket reported hang-up while the relay was not
+        /// reading it is left out of the next wait (it would wake it
+        /// forever) and read again once its direction has room.
+        client_hup: bool = false,
+        upstream_hup: bool = false,
+        result: ?CloseReason = null,
+
+        /// `initial_to_upstream` / `initial_to_client` are bytes already read
+        /// past the handshake on either hop; they are delivered first and
+        /// need not live in the direction buffers.
+        pub fn init(
+            client: Client,
+            upstream: Upstream,
+            client_to_upstream_buf: []u8,
+            upstream_to_client_buf: []u8,
+            initial_to_upstream: []const u8,
+            initial_to_client: []const u8,
+            opts: Options,
+        ) Self {
+            beginEndpoint(client);
+            beginEndpoint(upstream);
+            const started = event_loop.monotonicMs();
+            return .{
+                .client = client,
+                .upstream = upstream,
+                .c2u = .{ .buf = client_to_upstream_buf, .pending = initial_to_upstream },
+                .u2c = .{ .buf = upstream_to_client_buf, .pending = initial_to_client },
+                .opts = opts,
+                .started = started,
+                .last_activity = started,
+                .lifetime_deadline = if (opts.max_lifetime_ms > 0) started + opts.max_lifetime_ms else null,
+            };
+        }
+
+        /// Record what `poll` reported for each socket since the last wait.
+        pub fn observe(self: *Self, client_revents: i16, upstream_revents: i16) void {
+            if (hungUpEvents(client_revents)) self.client_hup = true;
+            if (hungUpEvents(upstream_revents)) self.upstream_hup = true;
+        }
+
+        /// Move bytes and check timers without blocking. Once it returns
+        /// `.closed` the tunnel is over and `advance` must not be called
+        /// again.
+        pub fn advance(self: *Self) Progress {
+            std.debug.assert(self.result == null);
+            var rounds: usize = 0;
+            while (true) {
+                const reading = self.closing == null;
+                const c2u_step = step(&self.c2u, self.client, .client, self.upstream, .upstream, reading);
+                const u2c_step = step(&self.u2c, self.upstream, .upstream, self.client, .client, reading);
+                var progressed = false;
+                switch (c2u_step) {
+                    .failed => |side| return self.finish(if (side == .client) .client_error else .upstream_error),
+                    .progressed => |p| progressed = progressed or p,
+                }
+                switch (u2c_step) {
+                    .failed => |side| return self.finish(if (side == .client) .client_error else .upstream_error),
+                    .progressed => |p| progressed = progressed or p,
+                }
+
+                const now = event_loop.monotonicMs();
+                if (progressed) {
+                    self.last_activity = now;
+                    self.client_hup = false;
+                    self.upstream_hup = false;
+                }
+                if (self.closing == null) {
+                    if (self.c2u.eof) {
+                        self.closing = .client;
+                    } else if (self.u2c.eof) {
+                        self.closing = .upstream;
+                    }
+                    if (self.closing != null) self.closing_deadline = now + self.opts.close_flush_timeout_ms;
+                }
+                const flushed = self.c2u.pending.len == 0 and self.u2c.pending.len == 0 and
+                    !self.client.pendingOutput() and !self.upstream.pendingOutput();
+                if (self.closing) |why| {
+                    if (flushed or now >= self.closing_deadline.?) return self.finish(why);
+                }
+                if (self.opts.idle_timeout_ms > 0 and now -| self.last_activity >= self.opts.idle_timeout_ms) return self.finish(.idle);
+                if (self.lifetime_deadline) |at| if (now >= at) return self.finish(.lifetime);
+                if (self.shutdown_deadline == null and self.opts.shutdown_requested()) self.shutdown_deadline = now + self.opts.drain_timeout_ms;
+                if (self.reload_deadline == null) if (self.opts.reload_drain) |drain| {
+                    const superseded_at = drain.superseded_at_ms.load(.acquire);
+                    if (superseded_at != 0) self.reload_deadline = superseded_at + drain.timeout_ms;
+                };
+                // Shutdown and reload drains are independent; whichever
+                // deadline is earlier ends the tunnel.
+                if (earliestDue(now, self.shutdown_deadline, self.reload_deadline)) |why| return self.finish(why);
+
+                const wants_client_in = reading and !self.c2u.eof and self.c2u.pending.len == 0;
+                const wants_upstream_in = reading and !self.u2c.eof and self.u2c.pending.len == 0;
+                const buffered = (wants_client_in and self.client.bufferedInput()) or
+                    (wants_upstream_in and self.upstream.bufferedInput());
+                if (progressed or buffered) {
+                    rounds += 1;
+                    if (rounds < max_rounds_per_advance) continue;
+                }
+
+                var deadline: ?u64 = if (self.opts.poll_interval_ms > 0) now + self.opts.poll_interval_ms else null;
+                if (self.opts.idle_timeout_ms > 0) deadline = minDeadline(deadline, self.last_activity + self.opts.idle_timeout_ms);
+                deadline = minDeadline(deadline, minDeadline(self.lifetime_deadline, minDeadline(self.shutdown_deadline, minDeadline(self.reload_deadline, self.closing_deadline))));
+                return .{ .wait = .{
+                    .client = .{
+                        .in = wants_client_in and !self.client_hup,
+                        .out = self.u2c.pending.len > 0 or self.client.pendingOutput(),
+                    },
+                    .upstream = .{
+                        .in = wants_upstream_in and !self.upstream_hup,
+                        .out = self.c2u.pending.len > 0 or self.upstream.pendingOutput(),
+                    },
+                    .deadline_ms = deadline,
+                    .ready_now = progressed or buffered,
+                } };
+            }
+        }
+
+        fn finish(self: *Self, reason: CloseReason) Progress {
+            self.result = reason;
+            return .{ .closed = reason };
+        }
+
+        pub fn stats(self: *const Self) Stats {
+            return .{
+                .client_to_upstream_bytes = self.c2u.delivered,
+                .upstream_to_client_bytes = self.u2c.delivered,
+                .duration_ms = event_loop.monotonicMs() -| self.started,
+                .close_reason = self.result orelse .shutdown,
+            };
+        }
+    };
+}
+
+/// Relay bytes between `client` and `upstream` on the calling thread until
+/// the tunnel closes. Never returns an error: every way a tunnel can end is
+/// a `CloseReason`.
 pub fn relay(
     client: anytype,
     upstream: anytype,
@@ -316,96 +549,26 @@ pub fn relay(
     initial_to_client: []const u8,
     opts: Options,
 ) Stats {
-    beginEndpoint(client);
-    beginEndpoint(upstream);
-    var c2u = Direction{ .buf = client_to_upstream_buf, .pending = initial_to_upstream };
-    var u2c = Direction{ .buf = upstream_to_client_buf, .pending = initial_to_client };
-    const started = event_loop.monotonicMs();
-    var last_activity = started;
-    const lifetime_deadline: ?u64 = if (opts.max_lifetime_ms > 0) started + opts.max_lifetime_ms else null;
-    var shutdown_deadline: ?u64 = null;
-    var reload_deadline: ?u64 = null;
-    // Set once a side has closed: the other direction's already-read bytes
-    // get a bounded flush, and nothing more is read from either side.
-    var closing: ?CloseReason = null;
-    var closing_deadline: ?u64 = null;
-    // A side whose socket reported hang-up while the relay was not reading
-    // it is left out of `poll` (it would wake it forever) and read again
-    // once its direction has room.
-    var client_hup = false;
-    var upstream_hup = false;
-
-    const reason: CloseReason = loop: while (true) {
-        const reading = closing == null;
-        const c2u_step = step(&c2u, client, .client, upstream, .upstream, reading);
-        const u2c_step = step(&u2c, upstream, .upstream, client, .client, reading);
-        var progressed = false;
-        switch (c2u_step) {
-            .failed => |side| break :loop if (side == .client) .client_error else .upstream_error,
-            .progressed => |p| progressed = progressed or p,
-        }
-        switch (u2c_step) {
-            .failed => |side| break :loop if (side == .client) .client_error else .upstream_error,
-            .progressed => |p| progressed = progressed or p,
-        }
-
-        const now = event_loop.monotonicMs();
-        if (progressed) {
-            last_activity = now;
-            client_hup = false;
-            upstream_hup = false;
-        }
-        if (closing == null) {
-            if (c2u.eof) {
-                closing = .client;
-            } else if (u2c.eof) {
-                closing = .upstream;
-            }
-            if (closing != null) closing_deadline = now + opts.close_flush_timeout_ms;
-        }
-        const flushed = c2u.pending.len == 0 and u2c.pending.len == 0 and !client.pendingOutput() and !upstream.pendingOutput();
-        if (closing) |why| {
-            if (flushed or now >= closing_deadline.?) break :loop why;
-        }
-        if (opts.idle_timeout_ms > 0 and now -| last_activity >= opts.idle_timeout_ms) break :loop .idle;
-        if (lifetime_deadline) |at| if (now >= at) break :loop .lifetime;
-        if (shutdown_deadline == null and opts.shutdown_requested()) shutdown_deadline = now + opts.drain_timeout_ms;
-        if (reload_deadline == null) if (opts.reload_drain) |drain| {
-            const superseded_at = drain.superseded_at_ms.load(.acquire);
-            if (superseded_at != 0) reload_deadline = superseded_at + drain.timeout_ms;
+    var state = Relay(@TypeOf(client), @TypeOf(upstream)).init(client, upstream, client_to_upstream_buf, upstream_to_client_buf, initial_to_upstream, initial_to_client, opts);
+    while (true) {
+        const wait = switch (state.advance()) {
+            .closed => break,
+            .wait => |wait| wait,
         };
-        // Shutdown and reload drains are independent; whichever deadline is
-        // earlier ends the tunnel.
-        if (earliestDue(now, shutdown_deadline, reload_deadline)) |why| break :loop why;
-        if (progressed) continue;
-
-        // Nothing moved: sleep until a socket can make progress or a timer
-        // is due.
-        const wants_client_in = reading and !c2u.eof and c2u.pending.len == 0;
-        const wants_upstream_in = reading and !u2c.eof and u2c.pending.len == 0;
-        if ((wants_client_in and client.bufferedInput()) or (wants_upstream_in and upstream.bufferedInput())) continue;
-        const wants_client_out = u2c.pending.len > 0 or client.pendingOutput();
-        const wants_upstream_out = c2u.pending.len > 0 or upstream.pendingOutput();
-
+        if (wait.ready_now) continue;
         var fds = [2]std.posix.pollfd{
-            pollEntry(client.fd(), wants_client_in and !client_hup, wants_client_out),
-            pollEntry(upstream.fd(), wants_upstream_in and !upstream_hup, wants_upstream_out),
+            pollEntry(client.fd(), wait.client),
+            pollEntry(upstream.fd(), wait.upstream),
         };
-        var wait_deadline = now + opts.poll_interval_ms;
-        if (opts.idle_timeout_ms > 0) wait_deadline = @min(wait_deadline, last_activity + opts.idle_timeout_ms);
-        wait_deadline = minDeadline(wait_deadline, minDeadline(lifetime_deadline, minDeadline(shutdown_deadline, minDeadline(reload_deadline, closing_deadline)))).?;
-        const timeout: i32 = @intCast(@min(remainingMs(now, wait_deadline).?, @as(u64, std.math.maxInt(i32))));
+        const now = event_loop.monotonicMs();
+        const timeout: i32 = if (wait.deadline_ms) |at|
+            @intCast(@min(at -| now, @as(u64, std.math.maxInt(i32))))
+        else
+            -1;
         _ = std.posix.poll(&fds, timeout) catch {};
-        if (hungUp(fds[0])) client_hup = true;
-        if (hungUp(fds[1])) upstream_hup = true;
-    };
-
-    return .{
-        .client_to_upstream_bytes = c2u.delivered,
-        .upstream_to_client_bytes = u2c.delivered,
-        .duration_ms = event_loop.monotonicMs() -| started,
-        .close_reason = reason,
-    };
+        state.observe(fds[0].revents, fds[1].revents);
+    }
+    return state.stats();
 }
 
 /// The drain whose deadline has passed, preferring the earlier deadline when
@@ -419,10 +582,10 @@ fn earliestDue(now: u64, shutdown_deadline: ?u64, reload_deadline: ?u64) ?CloseR
     return null;
 }
 
-fn pollEntry(fd: std.posix.fd_t, want_in: bool, want_out: bool) std.posix.pollfd {
+pub fn pollEntry(fd: std.posix.fd_t, interest: Interest) std.posix.pollfd {
     var events: i16 = 0;
-    if (want_in) events |= std.posix.POLL.IN;
-    if (want_out) events |= std.posix.POLL.OUT;
+    if (interest.in) events |= std.posix.POLL.IN;
+    if (interest.out) events |= std.posix.POLL.OUT;
     // A negative fd is ignored by poll, so a side the relay is not waiting on
     // cannot wake it with a hang-up.
     return .{ .fd = if (events == 0) -1 else fd, .events = events, .revents = 0 };
@@ -430,9 +593,9 @@ fn pollEntry(fd: std.posix.fd_t, want_in: bool, want_out: bool) std.posix.pollfd
 
 /// Hang-up or error reported without readable data: the next read on that
 /// side decides what it means, but polling it again would spin.
-fn hungUp(entry: std.posix.pollfd) bool {
+fn hungUpEvents(revents: i16) bool {
     const bad = std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL;
-    return (entry.revents & bad) != 0 and (entry.revents & std.posix.POLL.IN) == 0;
+    return (revents & bad) != 0 and (revents & std.posix.POLL.IN) == 0;
 }
 
 // Tests

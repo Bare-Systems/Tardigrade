@@ -183,6 +183,13 @@ logs are written through `src/http/logger.zig`.
   `upstream`, `idle`, `lifetime`, `shutdown`, `reload` (a
   `proxy_websocket_reload drain` window elapsed) and `error`. A relayed handshake
   counts once in `tardigrade_requests_total` and in no status-class total.
+  Established tunnels run on reactor threads, not request workers (#818):
+  `tardigrade_websocket_reactor_threads` (gauge),
+  `tardigrade_websocket_reactor_tunnels` (tunnels the reactor owns),
+  `tardigrade_websocket_reactor_thread_tunnels_max` (most on any one thread,
+  i.e. load skew), `tardigrade_websocket_reactor_handoffs_total` and
+  `tardigrade_websocket_reactor_wakeups_total`. Request-worker load stays in
+  the `tardigrade_worker_*` series.
 - native TLS/QUIC 0-RTT anti-replay store outcomes (#368):
   `tardigrade_tls_early_data_replay_total{outcome}` with fixed outcomes
   `accepted`, `duplicate`, `capacity_rejected`, `expired`, `unavailable`, and

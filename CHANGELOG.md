@@ -2,7 +2,7 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
-## [0.8.3] - 2026-09-30
+## [Unreleased]
 
 ### Security
 

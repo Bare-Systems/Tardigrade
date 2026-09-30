@@ -406,12 +406,16 @@ before the story closes:
   (file-level doc, point 6) now:
   - Rejects any production `std.crypto.secureZero` in `src/crypto`,
     `src/tls`, `src/quic`, `src/pki`, `src/http`, and `src/http3`: the direct
-    spelling (called or bound as a function value), `<alias>.secureZero` after
-    a local `const <alias> = std.crypto;`, and any `secureZero(T, buf)` call
+    spelling (called or bound as a function value), `<alias>.secureZero` through
+    any simple local alias of the stdlib root or its `crypto` namespace
+    (`const c = std.crypto;`, `const c = @import("std").crypto;`,
+    `const s = @import("std"); const c = s.crypto;`, flagged even when bound as
+    a function value and later called indirectly), and any `secureZero(T, buf)` call
     with the stdlib's typed two-argument signature, whatever it is qualified with.
     The canonical helpers take a single `[]u8`, so counting the arguments
     identifies the stdlib form however its namespace was reached. Comments,
-    string literals, `test` blocks, and `*_tests.zig` files are exempt, as is
+    string literals, `test` blocks (at any indentation, including tests nested
+    in a container), and `*_tests.zig` files are exempt, as is
     `src/crypto/secrets.zig`, whose narrower point-5 check already limits raw
     calls there to `secureZero`'s own body. The guard landed together with the
     migration of the ~100 remaining `crypto.secureZero(u8, …)` production
@@ -421,8 +425,10 @@ before the story closes:
   - Rejects any plain `@memset` inside a short named list of secret-bearing
     storage declarations: `ByteQueue` (`src/tls/encrypted_stream.zig`, #751)
     and `CryptoStream`/`CryptoReassembler`/`CryptoOutput`
-    (`src/quic/tls_adapter.zig`, #750). The check fails closed if a named
-    file or declaration disappears. It deliberately does not ban `@memset`
+    (`src/quic/tls_adapter.zig`, #750). A simple type alias of a protected
+    name is followed to its real container. A missing file, a missing
+    declaration, or an initializer that can't be resolved to a container
+    fails closed. It deliberately does not ban `@memset`
     globally: `PlaintextProvenanceQueue`'s `bool` bookkeeping and other
     non-secret buffers use it correctly, and a fixture proves they stay
     allowed.

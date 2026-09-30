@@ -27,6 +27,16 @@ All notable user-facing changes to Tardigrade are documented here.
   canonical secure zero-and-free helper, so the allocator always receives
   zeroed memory, on success and failure paths alike.
 
+### Performance
+
+- **Cheaper QUIC connection teardown (#782).** Closing a QUIC connection
+  used to write over its ~530 KB TLS adapter state three times: once while
+  wiping the handshake buffers, then with a second whole-struct wipe, then
+  with a full reset. The buffers are now wiped exactly once and only the
+  small remaining fields are reset, cutting adapter teardown by about 3x in
+  ReleaseFast (≈22 µs to ≈7 µs on aarch64). Secrets are still securely
+  wiped, and the adapter keeps its crypto provider for reuse.
+
 ## [0.8.2] - 2026-09-29
 
 ### Added

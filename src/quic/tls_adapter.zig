@@ -936,14 +936,40 @@ pub const QuicTlsAdapter = struct {
         self.provider = provider;
     }
 
+    /// Wipes and releases every secret-bearing member, then returns the
+    /// adapter to its default state with the injected `provider` retained,
+    /// so it can be reused without re-validating the provider.
+    ///
+    /// The two bulk CRYPTO buffers (`reassembler`, `outbound`: ~99.9% of the
+    /// adapter's ~530 KB) are wiped exactly once, by their own `deinit`,
+    /// which already leaves them in their default state (pinned by the
+    /// "... deinit leaves the default state" tests). Everything else is small
+    /// and is wiped and then reset field by field to its declared default.
+    /// This used to finish with a whole-struct `secureZero` followed by
+    /// `self.* = .{ .provider = provider }`, i.e. two more full-width passes
+    /// over the bulk buffers they had just wiped (#782, following #750).
     pub fn deinit(self: *QuicTlsAdapter) void {
         self.secrets.deinit();
         self.discardApplicationHeaderProtection();
         self.reassembler.deinit();
         for (&self.outbound) |*out| out.deinit();
-        const provider = self.provider;
-        crypto_secrets.secureZero(std.mem.asBytes(self));
-        self.* = .{ .provider = provider };
+        inline for (@typeInfo(QuicTlsAdapter).@"struct".fields) |field| {
+            if (comptime isSelfResettingField(field.name)) continue;
+            crypto_secrets.secureZero(std.mem.asBytes(&@field(self, field.name)));
+            // Explicit defaults, not the zero bit pattern: optionals and
+            // enums (`certificate_state`) aren't assumed to be all-zero.
+            @field(self, field.name) = comptime field.defaultValue() orelse
+                @compileError("QuicTlsAdapter." ++ field.name ++ " has no default; decide how deinit resets it");
+        }
+    }
+
+    /// Fields `deinit` must not reset through the generic loop: the bulk
+    /// buffers, already wiped to their defaults by their own `deinit`, and
+    /// the retained `provider`, which has no default.
+    fn isSelfResettingField(comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "reassembler") or
+            std.mem.eql(u8, name, "outbound") or
+            std.mem.eql(u8, name, "provider");
     }
 
     pub fn setLocalTransportParameters(self: *QuicTlsAdapter, params: config.TransportParameters) void {
@@ -2337,6 +2363,76 @@ test "crypto output deinit leaves the default state" {
     try testing.expectEqual(fresh.end, out.end);
     try testing.expectEqual(fresh.next_offset, out.next_offset);
     for (out.buffer) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "adapter deinit resets every field to its default, keeps the provider, and leaves the adapter reusable (#782)" {
+    const provider = test_quic_crypto.testDefaultProvider();
+    var adapter = QuicTlsAdapter{ .provider = provider };
+
+    // Move every field off its default.
+    const params = try (config.Config{}).transportParameters();
+    adapter.setLocalTransportParameters(params);
+    adapter.setPeerTransportParameters(params);
+    adapter.authenticatePeerTransportParameters();
+    adapter.setZeroRttEnabled(true);
+    adapter.markAlpn("h3");
+    adapter.setCertificateState(.valid);
+    try adapter.installNegotiatedParameters(.{ .cipher_suite = @intFromEnum(tls_algorithms.CipherSuite.tls_aes_128_gcm_sha256), .transcript_hash = .sha256 });
+    const secret = hexBytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    adapter.installSecret(try Secret.init(.application, .write, &secret));
+    adapter.installSecret(try Secret.init(.application, .read, &secret));
+    var sealed: [128]u8 = undefined;
+    _ = try adapter.sealPacketPayload(.application, .write, 1, "hdr", "payload", &sealed);
+    try adapter.updateApplicationWriteKeys();
+    try adapter.receiveCrypto(.handshake, 0, "secret-crypto-input");
+    try adapter.queueHandshakeOutput(.handshake, "secret-crypto-output");
+    try testing.expect(adapter.application_write_key_phase != 0);
+    try testing.expect(adapter.metrics.packets_protected != 0);
+
+    adapter.deinit();
+
+    // Every field the generic reset loop owns is back at its declared
+    // default — compared against the declaration, not the zero pattern.
+    inline for (@typeInfo(QuicTlsAdapter).@"struct".fields) |field| {
+        if (comptime QuicTlsAdapter.isSelfResettingField(field.name)) continue;
+        try testing.expectEqualDeep(comptime field.defaultValue().?, @field(adapter, field.name));
+    }
+    // The bulk buffers were wiped by their own deinit, once.
+    for (&adapter.reassembler.streams) |*stream| {
+        try testing.expectEqual(@as(usize, 0), stream.range_count);
+        for (stream.buffer) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    }
+    for (&adapter.outbound) |*out| {
+        try testing.expectEqual(@as(usize, 0), out.pending());
+        for (out.buffer) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    }
+    // Observable post-deinit state through the public API.
+    try testing.expect(adapter.secret(.application, .write) == null);
+    try testing.expect(adapter.secret(.application, .read) == null);
+    try testing.expect(adapter.peerTransportParameters() == null);
+    try testing.expect(!adapter.negotiatedH3());
+    try testing.expectEqual(CertificateState.not_checked, adapter.certificateState());
+    try testing.expectEqual(@as(?tls_algorithms.CipherSuite, null), adapter.negotiatedCipherSuite());
+    try testing.expectEqual(@as(u1, 0), adapter.applicationWriteKeyPhase());
+
+    // The injected provider survives, so the adapter is reusable as-is.
+    try testing.expectEqual(provider.context, adapter.provider.context);
+    try testing.expectEqual(provider.vtable, adapter.provider.vtable);
+    var dcid: [8]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
+    var reused_secrets = try adapter.installInitialSecrets(.client, &dcid);
+    defer reused_secrets.deinit();
+    var opened: [128]u8 = undefined;
+    const protected = try adapter.sealPacketPayload(.initial, .write, 0, "hdr", "reused", &sealed);
+    var peer = QuicTlsAdapter{ .provider = provider };
+    defer peer.deinit();
+    var peer_secrets = try peer.installInitialSecrets(.server, &dcid);
+    defer peer_secrets.deinit();
+    try testing.expectEqualStrings("reused", try peer.openPacketPayload(.initial, .read, 0, "hdr", protected, &opened));
+
+    // Deinit is idempotent.
+    adapter.deinit();
+    adapter.deinit();
 }
 
 test "adapter wipes consumed CRYPTO input and drained output bytes" {

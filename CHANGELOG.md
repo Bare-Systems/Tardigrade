@@ -58,6 +58,14 @@ All notable user-facing changes to Tardigrade are documented here.
   `tunnel_duration_ms` and byte counts. See
   [examples/websocket-proxy](examples/websocket-proxy/README.md).
 
+### Changed
+
+- **CI now runs in two changelog-driven modes, smoke and full (#806)** — PRs
+  get a fast smoke run unless they add a numbered release heading to
+  `CHANGELOG.md`, which (like a push promoting a release to `main`, or a manual
+  `mode=full` dispatch) runs the complete suite. Require the single `CI result`
+  check in branch protection; see `docs/CI.md`.
+
 ### Fixed
 
 - **`tardigrade_active_connections` no longer drifts upward under connection

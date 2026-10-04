@@ -74,7 +74,12 @@ pub const Snapshot = struct {
     max_shard_tunnels: u32,
 };
 
-const WakeWriteResult = enum { written, interrupted, already_pending, failed };
+const WakeWriteResult = enum {
+    written,
+    interrupted,
+    already_pending,
+    failed,
+};
 const WakeWriter = *const fn (std.posix.fd_t) WakeWriteResult;
 
 fn systemWakeWrite(fd: std.posix.fd_t) WakeWriteResult {

@@ -37,11 +37,14 @@ pub const Job = struct {
         observe: *const fn (*Job, client_revents: i16, upstream_revents: i16) void,
         /// Move bytes and check timers (see `Relay.advance`).
         advance: *const fn (*Job) tunnel.Progress,
-        /// The tunnel is over: release everything it owns, including the
-        /// `Job` itself. Called exactly once, on a reactor thread, after
-        /// `advance` returned `.closed`, or by `submit`'s caller when the
-        /// reactor refused it.
+        /// The tunnel is over after `advance` returned `.closed`: release
+        /// everything it owns, including the `Job` itself.
         finish: *const fn (*Job) void,
+        /// The reactor accepted ownership but could not begin serving the
+        /// tunnel (for example, registry bookkeeping OOM). Release it with an
+        /// explicit error close reason instead of inferring one from an
+        /// unstarted relay.
+        abort: *const fn (*Job, tunnel.CloseReason) void,
     };
 };
 
@@ -71,6 +74,21 @@ pub const Snapshot = struct {
     max_shard_tunnels: u32,
 };
 
+const WakeWriteResult = enum { written, interrupted, already_pending, failed };
+const WakeWriter = *const fn (std.posix.fd_t) WakeWriteResult;
+
+fn systemWakeWrite(fd: std.posix.fd_t) WakeWriteResult {
+    const byte = [1]u8{1};
+    const rc = std.c.write(fd, &byte, byte.len);
+    if (rc == 1) return .written;
+    if (rc < 0) return switch (std.posix.errno(rc)) {
+        .INTR => .interrupted,
+        .AGAIN => .already_pending,
+        else => .failed,
+    };
+    return .failed;
+}
+
 const Shard = struct {
     reactor: *Reactor,
     index: usize,
@@ -88,10 +106,12 @@ const Shard = struct {
     /// Set by `wakeAll`: advance every tunnel at the next wakeup.
     broadcast: std.atomic.Value(bool) = .init(false),
 
-    fn wake(self: *Shard) void {
-        const byte = [1]u8{1};
-        // A full pipe already guarantees a wakeup.
-        _ = std.c.write(self.wake_write, &byte, 1);
+    fn wake(self: *Shard) error{ReactorWakeFailed}!void {
+        while (true) switch (self.reactor.wake_writer(self.wake_write)) {
+            .written, .already_pending => return,
+            .interrupted => continue,
+            .failed => return error.ReactorWakeFailed,
+        };
     }
 
     fn drainWake(self: *Shard) void {
@@ -117,12 +137,7 @@ const Shard = struct {
             while (incoming) |job| {
                 incoming = job.next_inbox;
                 job.next_inbox = null;
-                job.wait = .{ .client = .{}, .upstream = .{}, .deadline_ms = null, .ready_now = true };
-                jobs.append(allocator, job) catch {
-                    // Out of memory for bookkeeping: the tunnel cannot be
-                    // served, so end it as an error rather than leak it.
-                    self.finishJob(job);
-                };
+                _ = self.adoptJob(&jobs, job);
             }
             if (stopping and jobs.items.len == 0) break;
 
@@ -187,9 +202,25 @@ const Shard = struct {
         }
     }
 
+    fn adoptJob(self: *Shard, jobs: *std.ArrayList(*Job), job: *Job) bool {
+        job.wait = .{ .client = .{}, .upstream = .{}, .deadline_ms = null, .ready_now = true };
+        jobs.append(self.reactor.allocator, job) catch {
+            // Accepted ownership but failed reactor bookkeeping: this is an
+            // internal error, never a graceful shutdown.
+            self.abortJob(job, .upstream_error);
+            return false;
+        };
+        return true;
+    }
+
     fn finishJob(self: *Shard, job: *Job) void {
         _ = self.tunnels.fetchSub(1, .acq_rel);
         job.vtable.finish(job);
+    }
+
+    fn abortJob(self: *Shard, job: *Job, reason: tunnel.CloseReason) void {
+        _ = self.tunnels.fetchSub(1, .acq_rel);
+        job.vtable.abort(job, reason);
     }
 };
 
@@ -197,15 +228,20 @@ pub const Reactor = struct {
     allocator: std.mem.Allocator,
     opts: Options,
     shards: []Shard,
+    wake_writer: WakeWriter,
     handoffs_total: std.atomic.Value(u64) = .init(0),
     stopped: std.atomic.Value(bool) = .init(false),
 
-    pub const SubmitError = error{ReactorStopped};
+    pub const SubmitError = error{ ReactorStopped, ReactorWakeFailed };
 
     /// Start `opts.threads` reactor threads. `self` must not move afterwards.
     pub fn start(self: *Reactor, allocator: std.mem.Allocator, opts: Options) !void {
+        try self.startWithWakeWriter(allocator, opts, systemWakeWrite);
+    }
+
+    fn startWithWakeWriter(self: *Reactor, allocator: std.mem.Allocator, opts: Options, wake_writer: WakeWriter) !void {
         std.debug.assert(opts.threads > 0);
-        self.* = .{ .allocator = allocator, .opts = opts, .shards = try allocator.alloc(Shard, opts.threads) };
+        self.* = .{ .allocator = allocator, .opts = opts, .shards = try allocator.alloc(Shard, opts.threads), .wake_writer = wake_writer };
         var made: usize = 0;
         errdefer {
             for (self.shards[0..made]) |*shard| {
@@ -228,7 +264,7 @@ pub const Reactor = struct {
                 shard.mutex.lock();
                 shard.stopping = true;
                 shard.mutex.unlock();
-                shard.wake();
+                shard.wake() catch @panic("tunnel reactor wake pipe failed during start rollback");
                 shard.thread.?.join();
             }
         }
@@ -258,9 +294,18 @@ pub const Reactor = struct {
         job.next_inbox = best.inbox;
         best.inbox = job;
         _ = best.tunnels.fetchAdd(1, .acq_rel);
+        // Keep the mutex until the signal succeeds. The shard cannot remove
+        // this head concurrently, so an unexpected wake failure can roll
+        // ownership back cleanly to the caller.
+        best.wake() catch |err| {
+            best.inbox = job.next_inbox;
+            job.next_inbox = null;
+            _ = best.tunnels.fetchSub(1, .acq_rel);
+            best.mutex.unlock();
+            return err;
+        };
         best.mutex.unlock();
         _ = self.handoffs_total.fetchAdd(1, .monotonic);
-        best.wake();
     }
 
     /// Make every shard advance all of its tunnels now, so they observe a
@@ -269,7 +314,9 @@ pub const Reactor = struct {
     pub fn wakeAll(self: *Reactor) void {
         for (self.shards) |*shard| {
             shard.broadcast.store(true, .release);
-            shard.wake();
+            // Ownership has already transferred. Silently losing this wake
+            // could violate reload/shutdown deadlines, so fail closed.
+            shard.wake() catch @panic("tunnel reactor wake pipe failed after ownership transfer");
         }
     }
 
@@ -284,7 +331,7 @@ pub const Reactor = struct {
             shard.stopping = true;
             shard.mutex.unlock();
             shard.broadcast.store(true, .release);
-            shard.wake();
+            shard.wake() catch @panic("tunnel reactor wake pipe failed during shutdown");
         }
         for (self.shards) |*shard| {
             if (shard.thread) |thread| thread.join();
@@ -342,7 +389,7 @@ const TestJob = struct {
     last_reason: *std.atomic.Value(u8),
     freed: *std.atomic.Value(u32),
 
-    const vtable = Job.VTable{ .fds = fds, .observe = observe, .advance = advance, .finish = finish };
+    const vtable = Job.VTable{ .fds = fds, .observe = observe, .advance = advance, .finish = finish, .abort = abort };
 
     fn create(client_fd: std.posix.fd_t, upstream_fd: std.posix.fd_t, opts: tunnel.Options, done: *std.atomic.Value(u32), last_reason: *std.atomic.Value(u8), freed: *std.atomic.Value(u32)) !*TestJob {
         const self = try std.testing.allocator.create(TestJob);
@@ -377,7 +424,15 @@ const TestJob = struct {
 
     fn finish(job: *Job) void {
         const self = from(job);
-        self.last_reason.store(@intFromEnum(self.relay.stats().close_reason), .release);
+        self.release(self.relay.stats().close_reason);
+    }
+
+    fn abort(job: *Job, reason: tunnel.CloseReason) void {
+        from(job).release(reason);
+    }
+
+    fn release(self: *TestJob, reason: tunnel.CloseReason) void {
+        self.last_reason.store(@intFromEnum(reason), .release);
         _ = std.c.close(self.client_fd);
         _ = std.c.close(self.upstream_fd);
         _ = self.freed.fetchAdd(1, .acq_rel);
@@ -456,6 +511,103 @@ fn submitTestTunnel(reactor: *Reactor, opts: tunnel.Options, done: *std.atomic.V
     const job = try TestJob.create(c[0], u[0], opts, done, reason, freed);
     try reactor.submit(&job.job);
     return .{ .client_peer = c[1], .upstream_peer = u[1] };
+}
+
+
+var test_wake_writer_calls = std.atomic.Value(u32).init(0);
+
+fn interruptOnceWakeWriter(fd: std.posix.fd_t) WakeWriteResult {
+    const call = test_wake_writer_calls.fetchAdd(1, .acq_rel);
+    if (call == 0) return .interrupted;
+    return systemWakeWrite(fd);
+}
+
+fn failedWakeWriter(_: std.posix.fd_t) WakeWriteResult {
+    return .failed;
+}
+
+test "reactor retries an interrupted wake write with fallback polling disabled (#818)" {
+    test_wake_writer_calls.store(0, .release);
+    var reactor: Reactor = undefined;
+    try reactor.startWithWakeWriter(std.testing.allocator, .{ .threads = 1, .shutdown_requested = neverShutdown }, interruptOnceWakeWriter);
+    defer reactor.deinit();
+
+    var done = std.atomic.Value(u32).init(0);
+    var reason = std.atomic.Value(u8).init(0);
+    var freed = std.atomic.Value(u32).init(0);
+    const p = try submitTestTunnel(&reactor, .{ .idle_timeout_ms = 30_000, .shutdown_requested = neverShutdown, .poll_interval_ms = 0 }, &done, &reason, &freed);
+    defer _ = std.c.close(p.client_peer);
+    defer _ = std.c.close(p.upstream_peer);
+
+    try testWriteAll(p.client_peer, "wake");
+    var got: [4]u8 = undefined;
+    try testReadExact(p.upstream_peer, &got);
+    try std.testing.expectEqualStrings("wake", &got);
+    try std.testing.expect(test_wake_writer_calls.load(.acquire) >= 2);
+
+    _ = std.c.shutdown(p.client_peer, std.posix.SHUT.RDWR);
+    try waitFor(&done, 1, 2_000);
+}
+
+test "reactor submit rolls ownership back when the wake pipe fails (#818)" {
+    var reactor: Reactor = undefined;
+    try reactor.startWithWakeWriter(std.testing.allocator, .{ .threads = 1, .shutdown_requested = neverShutdown }, failedWakeWriter);
+    defer {
+        // The test-only writer intentionally fails. Restore the production
+        // writer so teardown can wake and join the shard.
+        reactor.wake_writer = systemWakeWrite;
+        reactor.deinit();
+    }
+
+    var done = std.atomic.Value(u32).init(0);
+    var reason = std.atomic.Value(u8).init(0);
+    var freed = std.atomic.Value(u32).init(0);
+    const c = try testSocketPair();
+    const u = try testSocketPair();
+    const job = try TestJob.create(c[0], u[0], .{ .idle_timeout_ms = 30_000, .shutdown_requested = neverShutdown, .poll_interval_ms = 0 }, &done, &reason, &freed);
+
+    try std.testing.expectError(error.ReactorWakeFailed, reactor.submit(&job.job));
+    try std.testing.expectEqual(@as(u32, 0), reactor.snapshot().tunnels);
+    try std.testing.expectEqual(@as(u64, 0), reactor.snapshot().handoffs_total);
+    job.job.vtable.finish(&job.job);
+    _ = std.c.close(c[1]);
+    _ = std.c.close(u[1]);
+    try std.testing.expectEqual(@as(u32, 1), freed.load(.acquire));
+}
+
+test "reactor registry OOM aborts an accepted handoff as an error (#818)" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var no_shards: [0]Shard = .{};
+    var fake_reactor = Reactor{
+        .allocator = failing.allocator(),
+        .opts = .{ .threads = 1, .shutdown_requested = neverShutdown },
+        .shards = &no_shards,
+        .wake_writer = systemWakeWrite,
+    };
+    var shard = Shard{
+        .reactor = &fake_reactor,
+        .index = 0,
+        .wake_read = -1,
+        .wake_write = -1,
+    };
+
+    var done = std.atomic.Value(u32).init(0);
+    var reason = std.atomic.Value(u8).init(0);
+    var freed = std.atomic.Value(u32).init(0);
+    const c = try testSocketPair();
+    const u = try testSocketPair();
+    const job = try TestJob.create(c[0], u[0], .{ .idle_timeout_ms = 30_000, .shutdown_requested = neverShutdown, .poll_interval_ms = 0 }, &done, &reason, &freed);
+    var jobs: std.ArrayList(*Job) = .empty;
+    defer jobs.deinit(failing.allocator());
+
+    shard.tunnels.store(1, .release);
+    try std.testing.expect(!shard.adoptJob(&jobs, &job.job));
+    try std.testing.expectEqual(@as(u32, 0), shard.tunnels.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), done.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), freed.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.upstream_error), reason.load(.acquire));
+    _ = std.c.close(c[1]);
+    _ = std.c.close(u[1]);
 }
 
 test "reactor relays many tunnels on a fixed number of threads (#818)" {
@@ -742,7 +894,7 @@ const TlsSpinJob = struct {
     reason: *std.atomic.Value(u8),
 
     const AnyRelay = tunnel.Relay(tunnel.AnyEndpoint, tunnel.AnyEndpoint);
-    const vtable = Job.VTable{ .fds = fds, .observe = observe, .advance = advance, .finish = finish };
+    const vtable = Job.VTable{ .fds = fds, .observe = observe, .advance = advance, .finish = finish, .abort = abort };
 
     fn from(job: *Job) *TlsSpinJob {
         return @fieldParentPtr("job", job);
@@ -763,6 +915,12 @@ const TlsSpinJob = struct {
     fn finish(job: *Job) void {
         const self = from(job);
         self.reason.store(@intFromEnum(self.relay.stats().close_reason), .release);
+        _ = self.done.fetchAdd(1, .acq_rel);
+    }
+
+    fn abort(job: *Job, reason: tunnel.CloseReason) void {
+        const self = from(job);
+        self.reason.store(@intFromEnum(reason), .release);
         _ = self.done.fetchAdd(1, .acq_rel);
     }
 };

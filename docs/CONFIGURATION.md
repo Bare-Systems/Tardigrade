@@ -392,7 +392,7 @@ hands the established tunnel to a WebSocket reactor thread and goes back to
 serving requests (#818). A small fixed pool of reactor threads
 (`proxy_websocket_reactor_threads` /
 `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS`, default one per four CPUs,
-between 1 and 4; read at startup only) relays every open tunnel, each thread
+between 1 and 4; read at startup only, and reload rejects changes) relays every open tunnel, each thread
 sleeping in one `poll()` over the sockets it owns, so thousands of mostly idle
 WebSockets cost sockets and buffers, not threads, and do not slow ordinary
 requests. An open tunnel still counts as an active connection
@@ -967,7 +967,7 @@ WebSockets are relayed per location with `proxy_websocket on;` (see
 | `TARDIGRADE_PROXY_WEBSOCKET_RELOAD` | enum | `preserve` | Default hot-reload behavior for open tunnels, `preserve` or `drain`; a location's `proxy_websocket_reload` overrides it. Config directive: `proxy_websocket_reload`. | `TARDIGRADE_PROXY_WEBSOCKET_RELOAD=drain` |
 | `TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS` | u32 ms | `30000` | Default drain window for `drain` tunnels. Config directive: `proxy_websocket_reload_timeout_ms`. | `TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS=10000` |
 | `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS` | u32 | `0` (a quarter of the descriptor soft limit, at most 4096) | Maximum concurrent WebSocket tunnels per process. A handshake over the cap gets 503 before the origin is contacted. Config directive: `proxy_websocket_max_tunnels`. | `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS=256` |
-| `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS` | u32 | `0` (one per four CPUs, between 1 and 4) | Threads that relay established WebSocket tunnels; each owns many tunnels. Read at startup only (0-64). Config directive: `proxy_websocket_reactor_threads`. | `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS=2` |
+| `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS` | u32 | `0` (one per four CPUs, between 1 and 4) | Threads that relay established WebSocket tunnels; each owns many tunnels. Read at startup only (0-64); a hot reload that changes it is rejected and requires restart. Config directive: `proxy_websocket_reactor_threads`. | `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS=2` |
 
 Server-sent events need no special setting: proxy them as a streamed response
 (`proxy_streaming response;` on the location, or

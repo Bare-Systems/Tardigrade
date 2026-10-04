@@ -72,10 +72,11 @@ pub const TunnelJob = struct {
         early_data_replay_exposed: bool = false,
     };
 
-    const vtable = http.tunnel_reactor.Job.VTable{ .fds = fds, .observe = observe, .advance = advance, .finish = finishJob };
+    const vtable = http.tunnel_reactor.Job.VTable{ .fds = fds, .observe = observe, .advance = advance, .finish = finishJob, .abort = abortJob };
 
-    /// Take ownership of `upgraded`, the caller's tunnel slot and its
-    /// upstream in-flight count. On error the caller keeps all three.
+    /// Prepare a possible handoff. This allocates only job-private metadata;
+    /// the caller keeps ownership of `upgraded`, the tunnel slot and the
+    /// upstream in-flight count until the downstream 101 has been committed.
     pub fn create(
         allocator: std.mem.Allocator,
         state: *GatewayState,
@@ -99,6 +100,19 @@ pub const TunnelJob = struct {
             .access_arena = std.heap.ArenaAllocator.init(allocator),
         };
         return self;
+    }
+
+    /// Free a prepared handoff before shared ownership transfers. This never
+    /// touches the origin connection, tunnel slot, or upstream in-flight
+    /// count; those still belong to the request path.
+    pub fn discardPrepared(self: *TunnelJob) void {
+        std.debug.assert(self.downstream == .none);
+        std.debug.assert(self.config_lease == null);
+        const allocator = self.allocator;
+        allocator.free(self.upstream_base_url);
+        allocator.free(self.initial_to_upstream);
+        self.access_arena.deinit();
+        allocator.destroy(self);
     }
 
     /// Record the handshake's access-log fields; the line itself is written
@@ -215,8 +229,15 @@ pub const TunnelJob = struct {
         from(job).finish();
     }
 
+    fn abortJob(job: *http.tunnel_reactor.Job, reason: http.tunnel.CloseReason) void {
+        from(job).finishWithStats(.{ .close_reason = reason });
+    }
+
     fn finish(self: *TunnelJob) void {
-        const stats = self.relay.stats();
+        self.finishWithStats(self.relay.stats());
+    }
+
+    fn finishWithStats(self: *TunnelJob, stats: http.tunnel.Stats) void {
         const state = self.state;
         state.metricsRecordWebSocketTunnelClosed(stats);
         state.logger.debug(if (self.access.captured) self.access.correlation_id else null, "websocket tunnel closed: reason={s} duration_ms={d} client_to_upstream={d} upstream_to_client={d}", .{
@@ -285,3 +306,26 @@ pub const TunnelJob = struct {
         entry.log();
     }
 };
+
+
+fn neverShutdownForPreparationTest() bool {
+    return false;
+}
+
+test "TunnelJob preparation is allocation-failure clean before handoff commit (#827)" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var state: GatewayState = undefined;
+            var upgraded: gp.UpgradedUpstream = undefined;
+            const job = try TunnelJob.create(
+                allocator,
+                &state,
+                &upgraded,
+                "http://origin.example",
+                "queued-client-bytes",
+                .{ .idle_timeout_ms = 30_000, .shutdown_requested = neverShutdownForPreparationTest },
+            );
+            job.discardPrepared();
+        }
+    }.run, .{});
+}

@@ -23620,6 +23620,58 @@ test "proxy_websocket runs hundreds of tunnels on reactor threads while one work
     }
 }
 
+
+test "proxy_websocket rejects reactor thread-count changes on hot reload (#818)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const base_config = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(base_config);
+    const initial_config = try std.fmt.allocPrint(allocator,
+        \\proxy_websocket_reactor_threads 2;
+        \\{s}
+    , .{base_config});
+    defer allocator.free(initial_config);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = initial_config,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+
+    {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        try std.testing.expectEqual(@as(?u64, 2), prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_threads"));
+    }
+
+    const updated_config = try std.fmt.allocPrint(allocator,
+        \\proxy_websocket_reactor_threads 4;
+        \\{s}
+    , .{base_config});
+    defer allocator.free(updated_config);
+    try tardigrade.rewriteConfig(updated_config);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "WebSocket reactor topology", 5_000);
+
+    var reload_status = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/tardigrade/reload/status",
+        .body = null,
+        .headers = &.{},
+    });
+    defer reload_status.deinit();
+    try std.testing.expectEqual(@as(u16, 200), reload_status.status_code);
+    try assertContains(reload_status.body, "\"ok\":false");
+    try assertContains(reload_status.body, "restart required");
+
+    var metrics = try wsMetrics(allocator, tardigrade.port);
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(?u64, 2), prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_threads"));
+}
+
 test "proxy_websocket tunnels drain within the shutdown window and the process exits (#812)" {
     const allocator = std.testing.allocator;
     const origin = try WsOrigin.start(allocator, .echo);

@@ -138,6 +138,23 @@ pub fn hotReloadConfig(
         }
     }
     {
+        var current_lease = worker_ctx.config_store.acquire();
+        const reactor_threads_changed = websocketReactorConfigChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (reactor_threads_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "WebSocket reactor thread count changed; restart required", .{}) catch "WebSocket reactor thread count changed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS changed; restart the process to change WebSocket reactor topology", .{});
+            return;
+        }
+    }
+    {
         // #368 Slice 3: the process-owned early-data replay store/gate are
         // constructed once in `edge_gateway.run()` from the startup config
         // and shared for the process lifetime — there is no in-place
@@ -454,6 +471,14 @@ pub fn listenerShardConfigChanged(
     return current.listener_shards != proposed.listener_shards;
 }
 
+/// The WebSocket reactor is process-owned and constructed once at startup.
+pub fn websocketReactorConfigChanged(
+    current: *const edge_config.EdgeConfig,
+    proposed: *const edge_config.EdgeConfig,
+) bool {
+    return current.proxy_websocket_reactor_threads != proposed.proxy_websocket_reactor_threads;
+}
+
 pub fn circuitBreakerConfigChanged(
     current: *const edge_config.EdgeConfig,
     proposed: *const edge_config.EdgeConfig,
@@ -572,6 +597,27 @@ test "listenerShardConfigChanged requires restart for listener topology changes"
 
     proposed.listener_shards = 4;
     try std.testing.expect(listenerShardConfigChanged(&base, &proposed));
+}
+
+test "websocketReactorConfigChanged requires restart for reactor topology changes" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    base.proxy_websocket_reactor_threads = 0;
+    proposed.proxy_websocket_reactor_threads = 0;
+    try std.testing.expect(!websocketReactorConfigChanged(&base, &proposed));
+
+    proposed.proxy_websocket_reactor_threads = 2;
+    try std.testing.expect(websocketReactorConfigChanged(&base, &proposed));
+
+    base.proxy_websocket_reactor_threads = 2;
+    try std.testing.expect(!websocketReactorConfigChanged(&base, &proposed));
+
+    proposed.proxy_websocket_reactor_threads = 4;
+    try std.testing.expect(websocketReactorConfigChanged(&base, &proposed));
 }
 
 test "computeReloadedHttp3Advertisement withdraws active auto advertisement when reloaded off" {

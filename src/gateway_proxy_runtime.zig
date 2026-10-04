@@ -1131,14 +1131,6 @@ pub fn handleLocationWebSocketProxyPass(
         .switched => |upgraded| {
             defer if (!tunnel_handed_off) upgraded.deinit();
             recordStreamingProxyOutcome(state, cfg, selection.base_url, absolute_target, circuit_permit, 101, false, false, correlation_id);
-            upgraded.writeSwitchingProtocols(allocator, writer, accept_key, correlation_id) catch |err| {
-                state.metricsRecordProxyClientAbort();
-                return err;
-            };
-            state.metricsRecordWebSocketUpgrade(.relayed);
-            state.metricsRecord(101);
-            ctx.setUpstreamResult(resolved.upstream_host, 101, 0);
-            state.logger.debug(correlation_id, "websocket tunnel opened: {s} -> {s}", .{ request.uri.path, upstream_url.value });
             // Reload behavior is fixed here, at admission, from this request's
             // own configuration: a later reload can end the tunnel (drain) but
             // never change which policy or timeout applies to it.
@@ -1155,15 +1147,34 @@ pub fn handleLocationWebSocketProxyPass(
                 .shutdown_requested = http.shutdown.isShutdownRequested,
                 .reload_drain = reload_drain,
             };
+
+            // Allocate every piece of handoff metadata before committing the
+            // downstream 101. If preparation fails, the request still owns
+            // every shared resource and its existing defers roll back cleanly.
+            var prepared_job: ?*gws_tunnel.TunnelJob = null;
             if (hand_off) {
-                // The connection loop finishes the handoff (#818): it attaches
-                // the client connection and submits the job to the reactor,
-                // and this worker goes back to serving requests. The reactor
-                // wakes on its own timers and on reload/shutdown, so it needs
-                // no periodic tick.
                 var reactor_opts = tunnel_opts;
                 reactor_opts.poll_interval_ms = 0;
-                const job = try gws_tunnel.TunnelJob.create(state.allocator, state, upgraded, selection.base_url, downstream_initial, reactor_opts);
+                prepared_job = try gws_tunnel.TunnelJob.create(state.allocator, state, upgraded, selection.base_url, downstream_initial, reactor_opts);
+            }
+            defer {
+                if (prepared_job) |job| {
+                    if (!tunnel_handed_off) job.discardPrepared();
+                }
+            }
+
+            upgraded.writeSwitchingProtocols(allocator, writer, accept_key, correlation_id) catch |err| {
+                state.metricsRecordProxyClientAbort();
+                return err;
+            };
+            state.metricsRecordWebSocketUpgrade(.relayed);
+            state.metricsRecord(101);
+            ctx.setUpstreamResult(resolved.upstream_host, 101, 0);
+            state.logger.debug(correlation_id, "websocket tunnel opened: {s} -> {s}", .{ request.uri.path, upstream_url.value });
+            if (prepared_job) |job| {
+                // 101 is committed and there are no further fallible handoff
+                // allocations. Transfer the origin/slot/upstream accounting
+                // to the job and let the connection loop attach the client.
                 tunnel_handed_off = true;
                 ctx.tunnel_handoff = job;
                 return 101;

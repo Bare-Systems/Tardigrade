@@ -521,7 +521,6 @@ fn submitTestTunnel(reactor: *Reactor, opts: tunnel.Options, done: *std.atomic.V
     return .{ .client_peer = c[1], .upstream_peer = u[1] };
 }
 
-
 var test_wake_writer_calls = std.atomic.Value(u32).init(0);
 
 fn interruptOnceWakeWriter(fd: std.posix.fd_t) WakeWriteResult {

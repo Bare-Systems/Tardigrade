@@ -237,7 +237,10 @@ pub const Reactor = struct {
     handoffs_total: std.atomic.Value(u64) = .init(0),
     stopped: std.atomic.Value(bool) = .init(false),
 
-    pub const SubmitError = error{ ReactorStopped, ReactorWakeFailed };
+    pub const SubmitError = error{
+        ReactorStopped,
+        ReactorWakeFailed,
+    };
 
     /// Start `opts.threads` reactor threads. `self` must not move afterwards.
     pub fn start(self: *Reactor, allocator: std.mem.Allocator, opts: Options) !void {

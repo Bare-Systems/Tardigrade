@@ -307,7 +307,6 @@ pub const TunnelJob = struct {
     }
 };
 
-
 fn neverShutdownForPreparationTest() bool {
     return false;
 }

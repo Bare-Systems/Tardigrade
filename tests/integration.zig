@@ -23620,7 +23620,6 @@ test "proxy_websocket runs hundreds of tunnels on reactor threads while one work
     }
 }
 
-
 test "proxy_websocket rejects reactor thread-count changes on hot reload (#818)" {
     const allocator = std.testing.allocator;
     const origin = try WsOrigin.start(allocator, .echo);

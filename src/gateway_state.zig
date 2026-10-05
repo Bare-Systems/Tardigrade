@@ -592,8 +592,8 @@ pub const GatewayState = struct {
     /// Borrowed from startup cfg; restart-only (warns on change at reload). [transcript_mutex guards appends]
     transcript_store_path: []const u8,
     /// DNS-based upstream discovery state. Active when
-    /// cfg.upstream_dns_discovery_host is non-empty. Owned; self-synchronized;
-    /// refreshed by the main event loop.
+    /// cfg.upstream_dns_discovery_host or cfg.upstream_srv_name is non-empty.
+    /// Owned; self-synchronized; refreshed by a detached background thread.
     dns_discovery: http.dns_discovery.DnsDiscovery,
     /// Reload state: set by hotReloadConfig on every attempt so operators can
     /// query the outcome without tailing logs. [reload_mutex]
@@ -2341,27 +2341,77 @@ pub const GatewayState = struct {
         self.upstream_mutex.lock();
         defer self.upstream_mutex.unlock();
         const now_ms = http.event_loop.monotonicMs();
-        // When the pool has no static primaries, check DNS-discovered upstreams first.
         if (pool.primary_urls.len == 0) {
-            if (self.selectDiscoveredUpstreamLocked(now_ms)) |discovered| return discovered;
+            if (self.selectDiscoveredLocked(cfg, client_ip, hash_key, null, now_ms)) |picked| return picked.base_url;
         }
         return self.nextUpstreamBaseUrlLocked(cfg, pool, client_ip, hash_key, now_ms);
     }
 
-    /// Select a URL from the DNS-discovered upstream set in round-robin order.
-    /// Must be called while holding upstream_mutex. Returns null when discovery
-    /// is inactive or the discovered set is empty.
-    pub fn selectDiscoveredUpstreamLocked(self: *GatewayState, now_ms: u64) ?[]const u8 {
-        _ = now_ms;
-        // We need to read dns_discovery.urls. Since dns_discovery has its own mutex
-        // and we already hold upstream_mutex, we must not block — tryLock instead.
-        if (!self.dns_discovery.mutex.tryLock()) return null;
-        defer self.dns_discovery.mutex.unlock();
-        const urls = self.dns_discovery.urls.items;
-        if (urls.len == 0) return null;
-        const idx = self.upstream_rr_index % urls.len;
-        self.upstream_rr_index = (idx + 1) % urls.len;
-        return urls[idx];
+    fn discoveredHealthy(ctx: DiscoveredHealthCtx, url: []const u8) bool {
+        return ctx.state.isUpstreamHealthyLocked(ctx.cfg, url, ctx.now_ms);
+    }
+
+    const DiscoveredHealthCtx = struct {
+        state: *GatewayState,
+        cfg: *const edge_config.EdgeConfig,
+        now_ms: u64,
+    };
+
+    /// Select from the DNS-discovered live set (static pool has no primaries).
+    /// Priority groups stay first-class: only the first group with a healthy
+    /// endpoint is ever considered, so lower-priority groups are unreachable
+    /// while a higher one has any healthy member. `round_robin` uses smooth
+    /// weighted RR over SRV targets (exact weights) with address rotation; the
+    /// other algorithms select among the active group's addresses via the
+    /// normal pool machinery (they treat addresses equally). `requested`
+    /// (sticky affinity) is honoured only while it is healthy and in the active
+    /// group. Returns null when discovery has no live set.
+    ///
+    /// Caller holds upstream_mutex. The discovery mutex is taken (blocking) for
+    /// a short critical section; lock order is upstream_mutex then
+    /// dns_discovery.mutex, and the refresh worker only ever takes the latter,
+    /// never blocking under it. Returned slices are interned strings that stay
+    /// valid after the lock is released.
+    fn selectDiscoveredLocked(
+        self: *GatewayState,
+        cfg: *const edge_config.EdgeConfig,
+        client_ip: []const u8,
+        hash_key: []const u8,
+        requested: ?[]const u8,
+        now_ms: u64,
+    ) ?StickyUpstreamSelection {
+        const d = &self.dns_discovery;
+        d.mutex.lock();
+        defer d.mutex.unlock();
+        if (d.groupCount() == 0) return null;
+        const ctx: DiscoveredHealthCtx = .{ .state = self, .cfg = cfg, .now_ms = now_ms };
+        // No healthy endpoint anywhere: keep traffic on the primary group so a
+        // recovering backend is re-probed rather than leaving the discovered set.
+        const g = d.firstHealthyGroup(ctx, discoveredHealthy) orelse 0;
+        const group = d.groupUrls(g);
+        if (group.len == 0) return null;
+
+        if (requested) |candidate| {
+            for (group) |u| {
+                if (std.mem.eql(u8, u, candidate) and discoveredHealthy(ctx, u)) {
+                    return .{ .base_url = u, .used_requested = true };
+                }
+            }
+        }
+
+        if (cfg.upstream_lb_algorithm == .round_robin) {
+            if (d.pickWeighted(g, ctx, discoveredHealthy)) |u| return .{ .base_url = u, .used_requested = false };
+            const idx = self.upstream_rr_index % group.len;
+            self.upstream_rr_index = (idx + 1) % group.len;
+            return .{ .base_url = group[idx], .used_requested = false };
+        }
+        const view: UpstreamPoolView = .{
+            .fallback_url = group[0],
+            .primary_urls = group,
+            .primary_weights = &.{},
+            .backup_urls = &.{},
+        };
+        return .{ .base_url = self.nextUpstreamBaseUrlLocked(cfg, view, client_ip, hash_key, now_ms), .used_requested = false };
     }
 
     pub fn nextStickyUpstreamBaseUrl(
@@ -2375,6 +2425,10 @@ pub const GatewayState = struct {
         self.upstream_mutex.lock();
         defer self.upstream_mutex.unlock();
         const now_ms = http.event_loop.monotonicMs();
+
+        if (pool.primary_urls.len == 0) {
+            if (self.selectDiscoveredLocked(cfg, client_ip, hash_key, requested_upstream, now_ms)) |picked| return picked;
+        }
 
         if (requested_upstream) |candidate| {
             if (self.isStickyUpstreamHealthyLocked(cfg, pool, candidate, now_ms)) {
@@ -3043,6 +3097,11 @@ fn stickyCookieSecret(cfg: *const edge_config.EdgeConfig) []const u8 {
 fn stickyAffinityEligible(cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, proxy_pass_target: []const u8) bool {
     if (stickyCookieSecret(cfg).len == 0) return false;
     if (isAbsoluteHttpUrl(std.mem.trim(u8, proxy_pass_target, " \t\r\n"))) return false;
+
+    // A discovery-only pool has no static primaries; its endpoint count is not
+    // known here, so treat it as eligible (a single endpoint makes the cookie
+    // harmless).
+    if (pool.primary_urls.len == 0 and (cfg.upstream_srv_name.len > 0 or cfg.upstream_dns_discovery_host.len > 0)) return true;
 
     var upstreams: usize = pool.primary_urls.len + pool.backup_urls.len;
     if (upstreams == 0 and pool.fallback_url.len > 0) upstreams = 1;
@@ -4924,4 +4983,62 @@ test "a reloaded ACL is published atomically with its own generation" {
 
     strict_lease.release();
     permissive_lease.release();
+}
+
+test "discovery-only pool: sticky affinity and priority groups (#766)" {
+    const allocator = std.testing.allocator;
+    var cfg = try edge_config.loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    const original_srv_name = cfg.upstream_srv_name;
+    cfg.upstream_srv_name = "_api._tcp.service.test";
+    defer cfg.upstream_srv_name = original_srv_name; // cfg.deinit frees the original
+
+    var gs: GatewayState = undefined;
+    gs.upstream_mutex = .{};
+    gs.metrics_mutex = .{};
+    gs.metrics = http.metrics.Metrics.init();
+    gs.upstream_rr_index = 0;
+    gs.upstream_health = std.StringHashMap(UpstreamHealth).init(allocator);
+    defer {
+        var it = gs.upstream_health.iterator();
+        while (it.next()) |e| allocator.free(e.key_ptr.*);
+        gs.upstream_health.deinit();
+    }
+    gs.upstream_active_requests = std.StringHashMap(usize).init(allocator);
+    defer gs.upstream_active_requests.deinit();
+    gs.dns_discovery = http.dns_discovery.DnsDiscovery.init(allocator, .{ .srv_name = "_api._tcp.service.test" });
+    defer gs.dns_discovery.deinit();
+    gs.dns_discovery.applySuccess(1, &.{
+        .{ .priority = 10, .weight = 1, .target_id = 0, .url = "https://10.0.0.1:443" },
+        .{ .priority = 10, .weight = 1, .target_id = 1, .url = "https://10.0.0.2:443" },
+        .{ .priority = 20, .weight = 1, .target_id = 2, .url = "https://10.0.0.9:443" },
+    }, 10_000);
+
+    const empty_pool: UpstreamPoolView = .{ .fallback_url = "http://static.invalid", .primary_urls = &.{}, .primary_weights = &.{}, .backup_urls = &.{} };
+    // Sticky request stays on its endpoint while it is in the active group.
+    const sticky = gs.nextStickyUpstreamBaseUrl(&cfg, empty_pool, "1.2.3.4", "k", "https://10.0.0.2:443");
+    try std.testing.expect(sticky.used_requested);
+    try std.testing.expectEqualStrings("https://10.0.0.2:443", sticky.base_url);
+    // A lower-priority endpoint is never honoured while group 10 is healthy.
+    const lower = gs.nextStickyUpstreamBaseUrl(&cfg, empty_pool, "1.2.3.4", "k", "https://10.0.0.9:443");
+    try std.testing.expect(!lower.used_requested);
+    try std.testing.expect(!std.mem.eql(u8, lower.base_url, "https://10.0.0.9:443"));
+    // Every algorithm stays inside the active group.
+    inline for (.{ .round_robin, .least_connections, .ip_hash, .generic_hash, .random_two_choices }) |algo| {
+        cfg.upstream_lb_algorithm = algo;
+        for (0..20) |_| {
+            const url = gs.nextUpstreamBaseUrl(&cfg, empty_pool, "1.2.3.4", "k");
+            try std.testing.expect(!std.mem.eql(u8, url, "https://10.0.0.9:443"));
+            try std.testing.expect(!std.mem.eql(u8, url, "http://static.invalid"));
+        }
+    }
+    // Both primaries unhealthy: group 20 becomes active and the dead sticky
+    // endpoint is rejected.
+    cfg.upstream_lb_algorithm = .round_robin;
+    for ([_][]const u8{ "https://10.0.0.1:443", "https://10.0.0.2:443" }) |u| {
+        try gs.upstream_health.put(try allocator.dupe(u8, u), .{ .unhealthy_until_ms = std.math.maxInt(u64) });
+    }
+    const down = gs.nextStickyUpstreamBaseUrl(&cfg, empty_pool, "1.2.3.4", "k", "https://10.0.0.1:443");
+    try std.testing.expect(!down.used_requested);
+    try std.testing.expectEqualStrings("https://10.0.0.9:443", down.base_url);
 }

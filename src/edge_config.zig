@@ -673,6 +673,20 @@ pub const EdgeConfig = struct {
     upstream_dns_discovery_tls: bool,
     /// How often to re-resolve the discovery hostname in milliseconds (TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS).
     upstream_dns_refresh_interval_ms: u64,
+    /// SRV owner name for DNS SRV upstream discovery, e.g. `_api._tcp.service.internal`
+    /// (TARDIGRADE_UPSTREAM_SRV_NAME). Takes precedence over the A/AAAA host (#766).
+    upstream_srv_name: []const u8,
+    /// Use HTTPS for SRV-discovered upstreams (TARDIGRADE_UPSTREAM_SRV_TLS).
+    upstream_srv_tls: bool,
+    /// Lower bound of the TTL-derived SRV refresh interval (TARDIGRADE_UPSTREAM_SRV_MIN_REFRESH_MS).
+    upstream_srv_min_refresh_ms: u64,
+    /// How long the last good SRV set survives DNS failure (TARDIGRADE_UPSTREAM_SRV_STALE_MAX_MS).
+    upstream_srv_stale_max_ms: u64,
+    /// Per-nameserver SRV query timeout (TARDIGRADE_UPSTREAM_SRV_TIMEOUT_MS).
+    upstream_srv_timeout_ms: u32,
+    /// Comma-separated nameservers for SRV queries; empty uses /etc/resolv.conf
+    /// (TARDIGRADE_UPSTREAM_SRV_NAMESERVERS).
+    upstream_srv_nameservers: []const u8,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -838,6 +852,8 @@ pub const EdgeConfig = struct {
         allocator.free(self.transcript_store_path);
         allocator.free(self.otel_endpoint);
         allocator.free(self.upstream_dns_discovery_host);
+        allocator.free(self.upstream_srv_name);
+        allocator.free(self.upstream_srv_nameservers);
         self.* = undefined;
     }
 };
@@ -965,8 +981,20 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const upstream_tls_verify = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_TLS_VERIFY", true);
     const upstream_tls_ca_bundle = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", "") catch unreachable;
     errdefer allocator.free(upstream_tls_ca_bundle);
-    const upstream_tls_server_name = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", "") catch unreachable;
+    var upstream_tls_server_name = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", "") catch unreachable;
     errdefer allocator.free(upstream_tls_server_name);
+    // SRV TLS identity (#766): discovered endpoints are dialed by IP, so
+    // verification needs an explicit name. Default to the logical service
+    // name (the SRV owner name minus `_service._proto.`), not the SRV target.
+    if (upstream_tls_server_name.len == 0 and parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_SRV_TLS", false)) {
+        const srv = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_SRV_NAME", "") catch unreachable;
+        defer allocator.free(srv);
+        const logical = srvLogicalServiceName(srv);
+        if (logical.len > 0) {
+            allocator.free(upstream_tls_server_name);
+            upstream_tls_server_name = allocator.dupe(u8, logical) catch unreachable;
+        }
+    }
     const upstream_tls_client_cert = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT", "") catch unreachable;
     errdefer allocator.free(upstream_tls_client_cert);
     const upstream_tls_client_key = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY", "") catch unreachable;
@@ -1368,6 +1396,18 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const upstream_dns_discovery_port = parseIntEnv(u16, allocator, "TARDIGRADE_UPSTREAM_DNS_DISCOVERY_PORT", 80);
     const upstream_dns_discovery_tls = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_DNS_DISCOVERY_TLS", false);
     const upstream_dns_refresh_interval_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS", 30_000);
+    const upstream_srv_name = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_SRV_NAME", "") catch unreachable;
+    errdefer allocator.free(upstream_srv_name);
+    const upstream_srv_nameservers = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_SRV_NAMESERVERS", "") catch unreachable;
+    errdefer allocator.free(upstream_srv_nameservers);
+    // Reject a malformed explicit list at load/reload time (fail closed).
+    if (http.dns_srv.parseNameserverList(allocator, upstream_srv_nameservers)) |parsed| {
+        allocator.free(parsed);
+    } else |_| return error.InvalidConfigValue;
+    const upstream_srv_tls = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_SRV_TLS", false);
+    const upstream_srv_min_refresh_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_SRV_MIN_REFRESH_MS", 5_000);
+    const upstream_srv_stale_max_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_SRV_STALE_MAX_MS", 300_000);
+    const upstream_srv_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_UPSTREAM_SRV_TIMEOUT_MS", 2_000);
 
     const fd_soft_limit_str = envOrDefault(allocator, "TARDIGRADE_FD_SOFT_LIMIT", "0") catch unreachable;
     defer allocator.free(fd_soft_limit_str);
@@ -1911,6 +1951,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_dns_discovery_port = upstream_dns_discovery_port,
         .upstream_dns_discovery_tls = upstream_dns_discovery_tls,
         .upstream_dns_refresh_interval_ms = upstream_dns_refresh_interval_ms,
+        .upstream_srv_name = upstream_srv_name,
+        .upstream_srv_tls = upstream_srv_tls,
+        .upstream_srv_min_refresh_ms = upstream_srv_min_refresh_ms,
+        .upstream_srv_stale_max_ms = upstream_srv_stale_max_ms,
+        .upstream_srv_timeout_ms = upstream_srv_timeout_ms,
+        .upstream_srv_nameservers = upstream_srv_nameservers,
     };
 }
 
@@ -2327,6 +2373,25 @@ test "response-stream config rejects zero, malformed, and empty values (#841)" {
 
 fn logConfigDiagnostic(comptime fmt: []const u8, args: anytype) void {
     if (!builtin.is_test) std.log.err(fmt, args);
+}
+
+/// `_api._tcp.service.internal` -> `service.internal`. Returns "" when the
+/// name does not start with the `_service._proto.` labels.
+pub fn srvLogicalServiceName(srv: []const u8) []const u8 {
+    var rest = std.mem.trimEnd(u8, srv, ".");
+    var labels: usize = 0;
+    while (labels < 2 and rest.len > 0 and rest[0] == '_') : (labels += 1) {
+        const dot = std.mem.findScalar(u8, rest, '.') orelse return "";
+        rest = rest[dot + 1 ..];
+    }
+    return if (labels == 2) rest else "";
+}
+
+test "srvLogicalServiceName strips service and proto labels" {
+    try std.testing.expectEqualStrings("service.internal", srvLogicalServiceName("_api._tcp.service.internal"));
+    try std.testing.expectEqualStrings("service.internal", srvLogicalServiceName("_api._tcp.service.internal."));
+    try std.testing.expectEqualStrings("", srvLogicalServiceName("service.internal"));
+    try std.testing.expectEqualStrings("", srvLogicalServiceName("_api._tcp"));
 }
 
 fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []const u8) ![]u8 {

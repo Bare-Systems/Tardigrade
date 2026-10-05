@@ -6,6 +6,15 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **DNS SRV upstream discovery (#766).** `TARDIGRADE_UPSTREAM_SRV_NAME`
+  resolves `_service._proto.name` SRV records, resolves each target to
+  A/AAAA, and builds the upstream pool from SRV priority (lowest = primary,
+  higher = ordered backups) and weight. Refresh follows the record TTL within
+  configurable bounds with jitter, runs off the event loop, and swaps the live
+  set atomically. DNS failures keep the last good set for a bounded stale
+  window; NXDOMAIN clears it. TLS upstreams verify the logical service name.
+  Discovery state is exported as `tardigrade_upstream_discovery_*` metrics.
+
 - **Shared lifecycle controls for long-lived streamed HTTP responses (#841).**
   Added a strict process-wide active-stream cap (default 256), generation-bound
   reload `preserve`/`drain` policy with per-location overrides, and a 30-second
@@ -16,6 +25,12 @@ All notable user-facing changes to Tardigrade are documented here.
   `timeout`, `reload`, `shutdown`, or `capacity` close reasons. This is the
   protocol-neutral control plane; HTTP/1 and HTTP/2 relay integration remains
   tracked separately under #842 and #843.
+
+### Fixed
+
+- DNS A/AAAA discovery now resolves hostnames (it previously only parsed IP
+  literals), and discovered URL strings are no longer freed under in-flight
+  requests when the set changes. Discovered endpoints now honour health state.
 
 ### Security
 

@@ -2109,6 +2109,17 @@ fn transportReadNeedsRetry(transport: anytype) bool {
     return false;
 }
 
+/// TLS reads can produce control records that must be flushed before more
+/// application plaintext can emerge. A tracked read therefore needs write
+/// readiness whenever the transport reports queued ciphertext.
+fn transportHasQueuedOutput(transport: anytype) bool {
+    const T = @TypeOf(transport);
+    const info = @typeInfo(T);
+    const Target = if (info == .pointer) info.pointer.child else T;
+    if (@hasDecl(Target, "hasQueuedOutput")) return transport.hasQueuedOutput();
+    return false;
+}
+
 /// The raw downstream socket used only for peer-close observation while an
 /// admitted response stream is otherwise idle. Plain streams expose `handle`;
 /// the native-TLS HTTP adapter exposes `rawFd()`. Test transports without a
@@ -2137,7 +2148,7 @@ fn pollFdReadable(fd: std.posix.fd_t, timeout_ms: u32) !bool {
     return ready != 0;
 }
 
-const ResponseReadiness = enum { upstream, client_closed, timeout };
+const ResponseReadiness = enum { upstream, client_closed, client_data, timeout };
 
 fn socketPeerClosed(fd: std.posix.fd_t, revents: i16) bool {
     if ((revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) return true;
@@ -2159,10 +2170,16 @@ fn pollResponseReadiness(
     upstream_fd: std.posix.fd_t,
     downstream_fd: ?std.posix.fd_t,
     timeout_ms: u32,
+    upstream_write: bool,
+    observe_client_data: bool,
 ) !ResponseReadiness {
+    var upstream_events: i16 = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR;
+    if (upstream_write) upstream_events |= std.posix.POLL.OUT;
+    var downstream_events: i16 = std.posix.POLL.HUP | std.posix.POLL.ERR;
+    if (observe_client_data) downstream_events |= std.posix.POLL.IN;
     var pfds = [_]std.posix.pollfd{
-        .{ .fd = upstream_fd, .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR, .revents = 0 },
-        .{ .fd = downstream_fd orelse -1, .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR, .revents = 0 },
+        .{ .fd = upstream_fd, .events = upstream_events, .revents = 0 },
+        .{ .fd = downstream_fd orelse -1, .events = downstream_events, .revents = 0 },
     };
     const count: usize = if (downstream_fd != null) 2 else 1;
     const ready = std.posix.poll(pfds[0..count], @intCast(@min(timeout_ms, std.math.maxInt(i32)))) catch |err| switch (err) {
@@ -2172,6 +2189,7 @@ fn pollResponseReadiness(
     if (ready == 0) return .timeout;
     if (downstream_fd) |client_fd| {
         if (socketPeerClosed(client_fd, pfds[1].revents)) return .client_closed;
+        if (observe_client_data and (pfds[1].revents & std.posix.POLL.IN) != 0 and pfds[0].revents == 0) return .client_data;
     }
     if (pfds[0].revents != 0) return .upstream;
     return .timeout;
@@ -2912,26 +2930,169 @@ fn fillResponseBody(
     tracked: ?*TrackedResponseStream,
 ) !bool {
     const tracker = tracked orelse return rb.fill(transport, fd, deadline_ms);
+    return fillTrackedResponseBody(rb, transport, fd, deadline_ms, tracker);
+}
+
+/// Generic tracked-read core so the readiness/deadline behavior can be tested
+/// with a minimal tracker and transport rather than a full GatewayState lease.
+fn fillTrackedResponseBody(
+    rb: *StreamReadBuf,
+    transport: anytype,
+    fd: std.posix.fd_t,
+    deadline_ms: u32,
+    tracker: anytype,
+) !bool {
     const started_ms = http.event_loop.monotonicMs();
     while (true) {
         const now_ms = http.event_loop.monotonicMs();
         try tracker.stopError(now_ms);
+
+        // This check precedes all immediate TLS work. A peer can keep the
+        // record layer busy indefinitely without yielding application bytes;
+        // such progress must not extend the configured response deadline.
+        const elapsed_ms = now_ms -| started_ms;
+        if (deadline_ms > 0 and elapsed_ms >= deadline_ms) return error.Timeout;
+
         if (transportHasBufferedInput(transport) or transportReadNeedsRetry(transport)) {
             if (try rb.fillReady(transport)) |filled| return filled;
             continue;
         }
 
-        const elapsed_ms = now_ms -| started_ms;
-        if (deadline_ms > 0 and elapsed_ms >= deadline_ms) return error.Timeout;
         const existing_remaining_ms: ?u64 = if (deadline_ms > 0) @as(u64, deadline_ms) - elapsed_ms else null;
-        switch (try pollResponseReadiness(fd, tracker.downstream_fd, tracker.pollWaitMs(now_ms, existing_remaining_ms))) {
+        const wait_ms = tracker.pollWaitMs(now_ms, existing_remaining_ms);
+        const wait_started_ms = now_ms;
+        var readiness = try pollResponseReadiness(
+            fd,
+            tracker.downstream_fd,
+            wait_ms,
+            transportHasQueuedOutput(transport),
+            true,
+        );
+        if (readiness == .client_data) {
+            // Leave pipelined HTTP or TLS bytes untouched for the connection
+            // loop, but do not immediately watch the permanently-readable fd
+            // again. Spend the rest of this lifecycle slice waiting only for
+            // upstream progress or a downstream HUP/ERR.
+            const after_client_data_ms = http.event_loop.monotonicMs();
+            const spent_ms = after_client_data_ms -| wait_started_ms;
+            if (spent_ms < wait_ms) {
+                readiness = try pollResponseReadiness(
+                    fd,
+                    tracker.downstream_fd,
+                    @intCast(@as(u64, wait_ms) - spent_ms),
+                    transportHasQueuedOutput(transport),
+                    false,
+                );
+            } else {
+                continue;
+            }
+        }
+        switch (readiness) {
             .client_closed => return error.ClientAborted,
-            .timeout => continue,
+            .client_data, .timeout => continue,
             .upstream => {},
         }
-        try tracker.stopError(http.event_loop.monotonicMs());
+        const after_wait_ms = http.event_loop.monotonicMs();
+        try tracker.stopError(after_wait_ms);
+        if (deadline_ms > 0 and after_wait_ms -| started_ms >= deadline_ms) return error.Timeout;
         if (try rb.fillReady(transport)) |filled| return filled;
     }
+}
+
+const TestResponseReadTracker = struct {
+    downstream_fd: ?std.posix.fd_t = null,
+
+    fn stopError(_: *const TestResponseReadTracker, _: u64) !void {}
+
+    fn pollWaitMs(_: *const TestResponseReadTracker, _: u64, existing_remaining_ms: ?u64) u32 {
+        return @intCast(@min(existing_remaining_ms orelse response_stream_lifecycle_poll_slice_ms, response_stream_lifecycle_poll_slice_ms));
+    }
+};
+
+test "tracked response wait does not spin on unread downstream data (#842 review)" {
+    const upstream = try makeBlockingSocketpair();
+    defer _ = std.c.close(upstream[0]);
+    defer _ = std.c.close(upstream[1]);
+    const downstream = try makeBlockingSocketpair();
+    defer _ = std.c.close(downstream[0]);
+    defer _ = std.c.close(downstream[1]);
+
+    const pipelined = "G";
+    try std.testing.expectEqual(@as(isize, pipelined.len), std.c.write(downstream[1], pipelined.ptr, pipelined.len));
+
+    var storage: [16]u8 = undefined;
+    var rb = StreamReadBuf{ .buf = &storage };
+    const transport = compat.netStreamFromFd(upstream[0]);
+    const tracker = TestResponseReadTracker{ .downstream_fd = downstream[0] };
+    const started_ms = http.event_loop.monotonicMs();
+    try std.testing.expectError(error.Timeout, fillTrackedResponseBody(&rb, transport, upstream[0], 80, &tracker));
+    const elapsed_ms = http.event_loop.monotonicMs() -| started_ms;
+    try std.testing.expect(elapsed_ms >= response_stream_lifecycle_poll_slice_ms);
+    try std.testing.expect(elapsed_ms < 1_000);
+
+    // The response relay only peeked; the connection loop can still consume
+    // the pipelined byte after the SSE response ends.
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 1), std.c.read(downstream[0], &byte, byte.len));
+    try std.testing.expectEqual(@as(u8, 'G'), byte[0]);
+}
+
+test "tracked response wait polls TLS write readiness for queued control output (#842 review)" {
+    const FakeTlsTransport = struct {
+        queued_output: bool = true,
+        reads: usize = 0,
+
+        fn hasQueuedOutput(self: *const @This()) bool {
+            return self.queued_output;
+        }
+
+        fn readNonBlocking(self: *@This(), out: []u8) !?usize {
+            self.reads += 1;
+            self.queued_output = false;
+            out[0] = 'x';
+            return 1;
+        }
+    };
+
+    const upstream = try makeBlockingSocketpair();
+    defer _ = std.c.close(upstream[0]);
+    defer _ = std.c.close(upstream[1]);
+    var transport = FakeTlsTransport{};
+    var storage: [16]u8 = undefined;
+    var rb = StreamReadBuf{ .buf = &storage };
+    const tracker = TestResponseReadTracker{};
+
+    try std.testing.expect(try fillTrackedResponseBody(&rb, &transport, upstream[0], 1_000, &tracker));
+    try std.testing.expectEqual(@as(usize, 1), transport.reads);
+    try std.testing.expectEqualStrings("x", rb.available());
+}
+
+test "tracked response immediate TLS retries still obey the read deadline (#842 review)" {
+    const YieldingTlsTransport = struct {
+        drive_budget_exhausted: bool = true,
+        reads: usize = 0,
+
+        fn readNonBlocking(self: *@This(), _: []u8) !?usize {
+            self.reads += 1;
+            self.drive_budget_exhausted = true;
+            return null;
+        }
+    };
+
+    const upstream = try makeBlockingSocketpair();
+    defer _ = std.c.close(upstream[0]);
+    defer _ = std.c.close(upstream[1]);
+    var transport = YieldingTlsTransport{};
+    var storage: [16]u8 = undefined;
+    var rb = StreamReadBuf{ .buf = &storage };
+    const tracker = TestResponseReadTracker{};
+    const started_ms = http.event_loop.monotonicMs();
+
+    try std.testing.expectError(error.Timeout, fillTrackedResponseBody(&rb, &transport, upstream[0], 10, &tracker));
+    const elapsed_ms = http.event_loop.monotonicMs() -| started_ms;
+    try std.testing.expect(transport.reads > 0);
+    try std.testing.expect(elapsed_ms >= 10);
+    try std.testing.expect(elapsed_ms < 1_000);
 }
 
 fn readChunkSize(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32, tracked: ?*TrackedResponseStream) !?usize {

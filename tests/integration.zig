@@ -24196,6 +24196,13 @@ test "quiet SSE releases admission promptly when the client disconnects (#842)" 
     defer allocator.free(head);
     try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
 
+    // Leave a byte of a pipelined next request readable while the origin is
+    // quiet. The lifecycle poll must not consume it or spin on POLLIN; the
+    // focused socketpair regression in gateway_proxy.zig asserts the bounded
+    // wait directly, while this exercises the real admitted SSE path.
+    try stream.writeAll("G");
+    compat.sleepNs(125 * std.time.ns_per_ms);
+
     // The origin sends no further bytes after its first event. The relay must
     // observe this RST on the downstream socket itself rather than waiting for
     // the five-second upstream response timeout.

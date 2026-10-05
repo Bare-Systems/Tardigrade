@@ -1340,6 +1340,29 @@ fn streamViaH2Pool(
                 const reason = gpres.upstreamReasonPhrase(@enumFromInt(status));
                 const body_allowed = gpres.responseBodyAllowed(method, status);
 
+                // HTTP/2 gives us decoded headers before any downstream byte
+                // is committed. Classify and admit SSE at that boundary so a
+                // full process-wide lifecycle cap is a clean 503 and resets
+                // only this upstream stream; sibling streams keep using the
+                // multiplexed connection.
+                var tracked: ?TrackedResponseStream = null;
+                var response_stream_close_reason: http.response_stream_lifecycle.CloseReason = .upstream;
+                if (body_allowed and responseHeadersAreEventStream(stream.headers.items)) {
+                    if (response_stream_control) |control| {
+                        const admission = control.state.tryAcquireResponseStream(
+                            control.config_lease,
+                            control.location,
+                            http.event_loop.monotonicMs(),
+                        ) orelse {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return error.ResponseStreamCapacityUnavailable;
+                        };
+                        tracked = .{ .state = control.state, .admission = admission, .downstream = downstreamCloseProbe(downstream_conn) };
+                    }
+                }
+                defer if (tracked) |*response_stream| response_stream.finish(response_stream_close_reason);
+
                 // The response relay copies queued DATA out of the stream into
                 // `read_buf`, and the queue's own reservation is not released
                 // until `acknowledgeStreamingBody` — which runs *after* the
@@ -1432,13 +1455,83 @@ fn streamViaH2Pool(
                 var aborted = false;
                 var local_capacity_aborted = false;
                 if (body_allowed) {
-                    while (true) {
+                    var upstream_body_deadline_ms: ?u64 = null;
+                    body_loop: while (true) {
                         if (cancelStopped(cancel_token)) {
+                            response_stream_close_reason = responseStreamCloseReason(error.RequestCancelled, cancel_token);
                             conn.finishStreaming(stream);
                             h2_pool.release(conn);
                             return error.RequestCancelled;
                         }
-                        const n = conn.readStreamingBody(stream, response_buf.?) catch |err| {
+                        const n = if (tracked) |*response_stream| read: {
+                            const now_ms = http.event_loop.monotonicMs();
+                            response_stream.stopError(now_ms) catch |err| {
+                                response_stream_close_reason = responseStreamCloseReason(err, cancel_token);
+                                conn.finishStreaming(stream);
+                                h2_pool.release(conn);
+                                return .{
+                                    .status_code = status,
+                                    .reason = reason,
+                                    .response_body_bytes = body_bytes,
+                                    .upstream_ttfb_ms = ttfb_ms,
+                                    .response_stream_drained = true,
+                                };
+                            };
+                            if (upstream_body_deadline_ms == null and read_deadline_ms > 0) {
+                                upstream_body_deadline_ms = now_ms + @as(u64, read_deadline_ms);
+                            }
+                            const remaining_ms: ?u64 = if (upstream_body_deadline_ms) |body_deadline_ms|
+                                body_deadline_ms -| now_ms
+                            else
+                                null;
+                            if (remaining_ms) |remaining| {
+                                if (remaining == 0) {
+                                    response_stream_close_reason = .timeout;
+                                    aborted = true;
+                                    break :body_loop;
+                                }
+                            }
+                            const wait_ms = response_stream.pollWaitMs(now_ms, remaining_ms);
+                            const read_result = conn.readStreamingBodyInterruptible(stream, response_buf.?, wait_ms) catch |err| {
+                                if (err == error.Http2ReadWaitElapsed) {
+                                    // The wait slice ended without changing H2
+                                    // state. Re-check lifecycle policy and the
+                                    // original upstream response deadline;
+                                    // neither is reset by these short polls.
+                                    response_stream.stopError(http.event_loop.monotonicMs()) catch |stop_err| {
+                                        response_stream_close_reason = responseStreamCloseReason(stop_err, cancel_token);
+                                        conn.finishStreaming(stream);
+                                        h2_pool.release(conn);
+                                        return .{
+                                            .status_code = status,
+                                            .reason = reason,
+                                            .response_body_bytes = body_bytes,
+                                            .upstream_ttfb_ms = ttfb_ms,
+                                            .response_stream_drained = true,
+                                        };
+                                    };
+                                    if (upstream_body_deadline_ms) |body_deadline_ms| {
+                                        if (http.event_loop.monotonicMs() >= body_deadline_ms) {
+                                            response_stream_close_reason = .timeout;
+                                            aborted = true;
+                                            break :body_loop;
+                                        }
+                                    }
+                                    continue :body_loop;
+                                }
+                                // Failed mid-body after the head went downstream:
+                                // report an aborted relay (the client sees the
+                                // truncated chunked body); other streams on the
+                                // connection are unaffected unless the whole
+                                // connection died (handled below).
+                                local_capacity_aborted = err == error.BufferLimitExceeded;
+                                response_stream_close_reason = responseStreamCloseReason(err, cancel_token);
+                                aborted = true;
+                                break :body_loop;
+                            };
+                            upstream_body_deadline_ms = null;
+                            break :read read_result;
+                        } else conn.readStreamingBody(stream, response_buf.?) catch |err| {
                             // Failed mid-body after the head went downstream:
                             // report an aborted relay (the client sees the
                             // truncated chunked body); other streams on the
@@ -1451,16 +1544,19 @@ fn streamViaH2Pool(
                             // origin for it would let local memory pressure
                             // trip a healthy origin's failure policy.
                             local_capacity_aborted = err == error.BufferLimitExceeded;
+                            response_stream_close_reason = responseStreamCloseReason(err, cancel_token);
                             aborted = true;
-                            break;
+                            break :body_loop;
                         };
-                        if (n == 0) break;
+                        if (n == 0) break :body_loop;
                         downstream_write.beginChunk(response_buf.?[0..n]) catch {
+                            response_stream_close_reason = .client;
                             conn.finishStreaming(stream);
                             h2_pool.release(conn);
                             return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
                         };
                         gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch {
+                            response_stream_close_reason = .client;
                             conn.finishStreaming(stream);
                             h2_pool.release(conn);
                             return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
@@ -1470,11 +1566,13 @@ fn streamViaH2Pool(
                     }
                     if (!aborted) {
                         downstream_write.beginTerminalChunk() catch {
+                            response_stream_close_reason = .client;
                             conn.finishStreaming(stream);
                             h2_pool.release(conn);
                             return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
                         };
                         gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch {
+                            response_stream_close_reason = .client;
                             conn.finishStreaming(stream);
                             h2_pool.release(conn);
                             return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
@@ -1482,6 +1580,7 @@ fn streamViaH2Pool(
                     }
                 } else {
                     downstream_write.finishWithoutBody() catch {
+                        response_stream_close_reason = .client;
                         conn.finishStreaming(stream);
                         h2_pool.release(conn);
                         return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
@@ -2779,12 +2878,33 @@ fn isEventStreamContentType(raw: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value[0..semicolon], " \t"), "text/event-stream");
 }
 
+/// HTTP/2 has already decoded its response head into HPACK fields by the time
+/// the streaming relay gets control. Keep classification at that same
+/// response-head boundary as HTTP/1: headers only, before downstream commit.
+fn responseHeadersAreEventStream(headers: []const http.hpack.HeaderField) bool {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "content-type") and isEventStreamContentType(header.value)) return true;
+    }
+    return false;
+}
+
 test "SSE detection uses only the response Content-Type media type (#842)" {
     try std.testing.expect(isEventStreamContentType("text/event-stream"));
     try std.testing.expect(isEventStreamContentType(" Text/Event-Stream ; charset=utf-8"));
     try std.testing.expect(!isEventStreamContentType("application/json"));
     try std.testing.expect(!isEventStreamContentType("text/event-streaming"));
     try std.testing.expect(!isEventStreamContentType("application/mcp+json; profile=text/event-stream"));
+}
+
+test "HTTP/2 SSE detection classifies decoded response headers (#843)" {
+    const headers = [_]http.hpack.HeaderField{
+        .{ .name = "content-type", .value = "Text/Event-Stream; charset=utf-8" },
+    };
+    try std.testing.expect(responseHeadersAreEventStream(headers[0..]));
+    const non_sse = [_]http.hpack.HeaderField{
+        .{ .name = "content-type", .value = "application/json" },
+    };
+    try std.testing.expect(!responseHeadersAreEventStream(non_sse[0..]));
 }
 
 /// Largest upstream response head the streaming relay accepts (#809). A head
@@ -2977,21 +3097,36 @@ const TrackedResponseStream = struct {
     state: *gs.GatewayState,
     admission: gs.ResponseStreamAdmission,
     downstream: DownstreamCloseProbe,
+    shutdown_deadline_ms: ?u64 = null,
     finished: bool = false,
 
-    fn stopError(self: *const TrackedResponseStream, now_ms: u64) !void {
-        // Shutdown is intentionally not keyed off the process-global flag:
-        // #844 owns the grace-window deadline after which admitted streams
-        // are actively terminated. Closing here would skip that window.
-        if (self.admission.reloadDeadlineMs()) |deadline_ms| {
-            if (now_ms >= deadline_ms) return error.ResponseStreamReload;
+    fn stopError(self: *TrackedResponseStream, now_ms: u64) !void {
+        // The shutdown deadline starts when this admitted stream first sees
+        // shutdown, matching the tunnel drain contract. It is captured from
+        // the admission generation rather than a newer config snapshot.
+        if (self.shutdown_deadline_ms == null and http.shutdown.isShutdownRequested()) {
+            self.shutdown_deadline_ms = now_ms +| self.admission.config_lease.cfg.shutdown_drain_timeout_ms;
+        }
+
+        const reload_deadline = self.admission.reloadDeadlineMs();
+        const shutdown_deadline = self.shutdown_deadline_ms;
+        if (reload_deadline) |deadline_ms| {
+            if (now_ms >= deadline_ms and (shutdown_deadline == null or deadline_ms <= shutdown_deadline.?)) {
+                return error.ResponseStreamReload;
+            }
+        }
+        if (shutdown_deadline) |deadline_ms| {
+            if (now_ms >= deadline_ms) return error.ResponseStreamShutdown;
         }
     }
 
-    fn pollWaitMs(self: *const TrackedResponseStream, now_ms: u64, existing_remaining_ms: ?u64) u32 {
+    fn pollWaitMs(self: *TrackedResponseStream, now_ms: u64, existing_remaining_ms: ?u64) u32 {
         var wait_ms: u64 = response_stream_lifecycle_poll_slice_ms;
         if (existing_remaining_ms) |remaining| wait_ms = @min(wait_ms, @max(remaining, 1));
         if (self.admission.reloadDeadlineMs()) |deadline_ms| {
+            wait_ms = @min(wait_ms, @max(deadline_ms -| now_ms, 1));
+        }
+        if (self.shutdown_deadline_ms) |deadline_ms| {
             wait_ms = @min(wait_ms, @max(deadline_ms -| now_ms, 1));
         }
         return @intCast(@min(wait_ms, @as(u64, std.math.maxInt(u32))));
@@ -3804,7 +3939,7 @@ fn responseStreamCloseReason(err: anyerror, cancel_token: ?*const CancellationTo
         }
         return .timeout;
     }
-    if (err == error.Timeout or err == error.TimedOut or err == error.WouldBlock) return .timeout;
+    if (err == error.Timeout or err == error.TimedOut or err == error.WouldBlock or err == error.Http2Timeout) return .timeout;
     return .upstream;
 }
 

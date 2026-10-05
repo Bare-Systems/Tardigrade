@@ -863,27 +863,22 @@ pub fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
 /// Refresh DNS-discovered upstreams when the refresh interval has elapsed.
 /// Discovered addresses supplement the statically configured upstream pool
 /// via GatewayState.dns_discovery; the selection functions read from both.
-/// Resolution blocks (UDP timeouts), so it runs on a detached thread guarded
-/// by `refreshing`; the event loop only schedules it.
+/// Resolution blocks (UDP timeouts), so it runs on the discovery's joinable
+/// worker thread (`DnsDiscovery.startRefresh`); the event loop only schedules.
 pub fn runDnsDiscoveryRefresh(_: *const edge_config.EdgeConfig, state: *GatewayState) void {
     if (!state.dns_discovery.enabled()) return;
     publishDiscoveryMetrics(state);
     const now_ms = http.event_loop.monotonicMs();
     if (!state.dns_discovery.needsRefresh(now_ms)) return;
-    if (state.dns_discovery.refreshing.swap(true, .acq_rel)) return;
-    const thread = std.Thread.spawn(.{}, dnsDiscoveryRefreshThread, .{state}) catch {
-        state.dns_discovery.refreshing.store(false, .release);
-        return;
-    };
-    thread.detach();
+    state.dns_discovery.startRefresh();
 }
 
 fn publishDiscoveryMetrics(state: *GatewayState) void {
     const disc = &state.dns_discovery;
-    if (!disc.mutex.tryLock()) return;
+    disc.mutex.lock();
     const stats: http.metrics.DiscoveryStats = .{
-        .primary = disc.urls.items.len,
-        .backup = disc.backup_urls.items.len,
+        .primary = disc.primaryCount(),
+        .backup = disc.urls.items.len - disc.primaryCount(),
         .stale = disc.stale,
         .refresh_total = disc.refresh_total,
         .failures_total = disc.refresh_failures_total,
@@ -893,12 +888,6 @@ fn publishDiscoveryMetrics(state: *GatewayState) void {
     state.metrics_mutex.lock();
     state.metrics.discovery = stats;
     state.metrics_mutex.unlock();
-}
-
-fn dnsDiscoveryRefreshThread(state: *GatewayState) void {
-    const disc = &state.dns_discovery;
-    defer disc.refreshing.store(false, .release);
-    disc.refresh(http.event_loop.monotonicMs());
 }
 
 test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
@@ -1032,7 +1021,7 @@ fn activeHealthProbeThread(task: *HealthProbeTask) void {
         probeSingleUpstream(cfg, state, base_url);
     }
 
-    // Also probe DNS-discovered upstreams (primaries and SRV backups) when
+    // Also probe DNS-discovered upstreams (every priority group) when
     // active health checks are enabled.
     if (state.dns_discovery.enabled()) {
         // Copy the strings: the live set may be swapped while probing.
@@ -1042,23 +1031,6 @@ fn activeHealthProbeThread(task: *HealthProbeTask) void {
             if (discovered.len > 0) state.allocator.free(discovered);
         }
         for (discovered) |url| probeSingleUpstream(cfg, state, url);
-        state.dns_discovery.mutex.lock();
-        const backups = state.allocator.alloc([]u8, state.dns_discovery.backup_urls.items.len) catch null;
-        var nb: usize = 0;
-        if (backups) |buf| {
-            for (state.dns_discovery.backup_urls.items) |u| {
-                buf[nb] = state.allocator.dupe(u8, u) catch break;
-                nb += 1;
-            }
-        }
-        state.dns_discovery.mutex.unlock();
-        if (backups) |buf| {
-            defer state.allocator.free(buf);
-            for (buf[0..nb]) |u| {
-                probeSingleUpstream(cfg, state, u);
-                state.allocator.free(u);
-            }
-        }
     }
 
     state.metrics_mutex.lock();

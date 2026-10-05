@@ -2295,39 +2295,67 @@ pub const GatewayState = struct {
         self.upstream_mutex.lock();
         defer self.upstream_mutex.unlock();
         const now_ms = http.event_loop.monotonicMs();
-        // When the pool has no static primaries, check DNS-discovered upstreams first.
-        if (pool.primary_urls.len == 0) {
-            if (self.selectDiscoveredUpstreamLocked(cfg, now_ms)) |discovered| return discovered;
-        }
-        return self.nextUpstreamBaseUrlLocked(cfg, pool, client_ip, hash_key, now_ms);
+        var lease = self.acquireDiscoveredPoolLocked(cfg, pool, now_ms);
+        defer lease.release();
+        return self.nextUpstreamBaseUrlLocked(cfg, lease.pool, client_ip, hash_key, now_ms);
     }
 
-    /// Select a URL from the DNS-discovered upstream set: weighted round-robin
-    /// over the primary slots, skipping unhealthy endpoints, then the ordered
-    /// backups (SRV higher priorities). Must be called while holding
-    /// upstream_mutex. Returns null when discovery is inactive, the set is
-    /// empty, or every discovered endpoint is unhealthy.
-    pub fn selectDiscoveredUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) ?[]const u8 {
-        // dns_discovery has its own mutex and we already hold upstream_mutex,
-        // so never block here — tryLock instead.
-        if (!self.dns_discovery.mutex.tryLock()) return null;
-        defer self.dns_discovery.mutex.unlock();
-        const urls = self.dns_discovery.urls.items;
-        const slots = self.dns_discovery.slots.items;
-        if (urls.len == 0 or slots.len == 0) return null;
-        const start = self.upstream_rr_index % slots.len;
-        var offset: usize = 0;
-        while (offset < slots.len) : (offset += 1) {
-            const idx = (start + offset) % slots.len;
-            const candidate = urls[slots[idx]];
-            if (!self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) continue;
-            self.upstream_rr_index = (idx + 1) % slots.len;
-            return candidate;
+    /// A pool view that may borrow the DNS-discovery snapshot. While the lease
+    /// is live `dns_discovery.mutex` is held (lock order: upstream_mutex, then
+    /// dns_discovery.mutex; the refresh worker only ever takes the latter and
+    /// never blocks under it), so the borrowed arrays cannot be swapped.
+    const DiscoveredPoolLease = struct {
+        pool: UpstreamPoolView,
+        mutex: ?*compat.Mutex,
+
+        fn release(self: *DiscoveredPoolLease) void {
+            if (self.mutex) |m| m.unlock();
+            self.mutex = null;
         }
-        for (self.dns_discovery.backup_urls.items) |candidate| {
-            if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) return candidate;
+    };
+
+    /// When the static pool has no primaries and discovery has a live set,
+    /// return a view over the first SRV priority group that has a healthy
+    /// endpoint (group 0 when none do), with the lower-precedence groups as
+    /// backups. The view then flows through the normal pool selection, so every
+    /// LB algorithm, sticky affinity, slow start and weights behave as for a
+    /// static pool. Otherwise returns `pool` unchanged. Caller holds
+    /// upstream_mutex and must release the lease.
+    fn acquireDiscoveredPoolLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, now_ms: u64) DiscoveredPoolLease {
+        if (pool.primary_urls.len != 0) return .{ .pool = pool, .mutex = null };
+        const d = &self.dns_discovery;
+        // The refresh worker holds this mutex only for the O(n) snapshot swap,
+        // so a short bounded spin suffices; never block the request path on
+        // it. (Tests that build GatewayState from undefined leave this mutex
+        // "held", so they fall through to the static pool here.)
+        var spins: usize = 0;
+        while (!d.mutex.tryLock()) : (spins += 1) {
+            if (spins >= 64) return .{ .pool = pool, .mutex = null };
+            std.Thread.yield() catch {};
         }
-        return null;
+        const groups = d.group_ends.items.len;
+        if (groups == 0) {
+            d.mutex.unlock();
+            return .{ .pool = pool, .mutex = null };
+        }
+        var active: usize = 0;
+        find: while (active < groups) : (active += 1) {
+            for (d.urls.items[d.groupStart(active)..d.group_ends.items[active]]) |u| {
+                if (self.isUpstreamHealthyLocked(cfg, u, now_ms)) break :find;
+            }
+        }
+        if (active == groups) active = 0;
+        const lo = d.groupStart(active);
+        const hi = d.group_ends.items[active];
+        return .{
+            .pool = .{
+                .fallback_url = pool.fallback_url,
+                .primary_urls = d.urls.items[lo..hi],
+                .primary_weights = d.weights.items[lo..hi],
+                .backup_urls = d.urls.items[hi..],
+            },
+            .mutex = &d.mutex,
+        };
     }
 
     pub fn nextStickyUpstreamBaseUrl(
@@ -2341,15 +2369,18 @@ pub const GatewayState = struct {
         self.upstream_mutex.lock();
         defer self.upstream_mutex.unlock();
         const now_ms = http.event_loop.monotonicMs();
+        var lease = self.acquireDiscoveredPoolLocked(cfg, pool, now_ms);
+        defer lease.release();
+        const eff = lease.pool;
 
         if (requested_upstream) |candidate| {
-            if (self.isStickyUpstreamHealthyLocked(cfg, pool, candidate, now_ms)) {
+            if (self.isStickyUpstreamHealthyLocked(cfg, eff, candidate, now_ms)) {
                 return .{ .base_url = candidate, .used_requested = true };
             }
         }
 
         return .{
-            .base_url = self.nextUpstreamBaseUrlLocked(cfg, pool, client_ip, hash_key, now_ms),
+            .base_url = self.nextUpstreamBaseUrlLocked(cfg, eff, client_ip, hash_key, now_ms),
             .used_requested = false,
         };
     }

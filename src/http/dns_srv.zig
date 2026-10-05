@@ -14,7 +14,6 @@ const compat = @import("zig_compat");
 pub const max_records = 32;
 const max_name_len = 255;
 const type_srv: u16 = 33;
-var query_counter = std.atomic.Value(usize).init(1);
 
 pub const Error = error{
     Malformed,
@@ -188,6 +187,9 @@ pub fn parseResolvConf(text: []const u8, out: []std.Io.net.IpAddress) usize {
     return n;
 }
 
+/// One UDP query/response with `ns`. The socket is connect()ed to the
+/// nameserver so the kernel drops datagrams from any other source address or
+/// port; the caller additionally checks the transaction id.
 fn exchange(ns: std.Io.net.IpAddress, query: []const u8, resp: []u8, timeout_ms: u32) Error!usize {
     const fam: c_uint = switch (ns) {
         .ip4 => std.posix.AF.INET,
@@ -201,7 +203,7 @@ fn exchange(ns: std.Io.net.IpAddress, query: []const u8, resp: []u8, timeout_ms:
         .usec = @intCast((timeout_ms % 1000) * 1000),
     };
     _ = std.c.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(std.c.timeval));
-    const sent = switch (ns) {
+    const rc = switch (ns) {
         .ip4 => |ip4| blk: {
             const sin = std.c.sockaddr.in{
                 .family = std.posix.AF.INET,
@@ -209,7 +211,7 @@ fn exchange(ns: std.Io.net.IpAddress, query: []const u8, resp: []u8, timeout_ms:
                 .addr = @bitCast(ip4.bytes),
                 .zero = [_]u8{0} ** 8,
             };
-            break :blk std.c.sendto(sock, query.ptr, query.len, 0, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in));
+            break :blk std.c.connect(sock, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in));
         },
         .ip6 => |ip6| blk: {
             const sin6 = std.c.sockaddr.in6{
@@ -219,31 +221,39 @@ fn exchange(ns: std.Io.net.IpAddress, query: []const u8, resp: []u8, timeout_ms:
                 .addr = ip6.bytes,
                 .scope_id = 0,
             };
-            break :blk std.c.sendto(sock, query.ptr, query.len, 0, @ptrCast(&sin6), @sizeOf(std.c.sockaddr.in6));
+            break :blk std.c.connect(sock, @ptrCast(&sin6), @sizeOf(std.c.sockaddr.in6));
         },
     };
-    if (sent < 0) return error.SocketFailed;
+    if (rc < 0) return error.SocketFailed;
+    if (std.c.send(sock, query.ptr, query.len, 0) < 0) return error.SocketFailed;
     const got = std.c.recv(sock, resp.ptr, resp.len, 0);
     if (got < 0) return error.Timeout;
     return @intCast(got);
 }
 
-/// Resolve SRV records for `name` via the system nameservers, trying each in
-/// order. SERVFAIL/timeouts move on to the next nameserver; NXDOMAIN is
-/// authoritative and returned immediately.
+/// Resolve SRV records for `name` via the system nameservers (resolv.conf).
 pub fn lookupSrv(allocator: std.mem.Allocator, name: []const u8, timeout_ms: u32) (Error || error{OutOfMemory})!Response {
     const text = compat.cwd().readFileAlloc(allocator, "/etc/resolv.conf", 64 * 1024) catch return error.NoNameserver;
     defer allocator.free(text);
     var servers: [3]std.Io.net.IpAddress = undefined;
     const ns_count = parseResolvConf(text, &servers);
-    if (ns_count == 0) return error.NoNameserver;
+    return lookupSrvVia(allocator, servers[0..ns_count], name, timeout_ms);
+}
 
+/// Resolve SRV records via an explicit nameserver list, trying each in order.
+/// SERVFAIL, timeouts and spoofed/mismatched replies move on to the next
+/// nameserver; NXDOMAIN is authoritative and returned immediately. The query
+/// id is a fresh random 16-bit value.
+pub fn lookupSrvVia(allocator: std.mem.Allocator, servers: []const std.Io.net.IpAddress, name: []const u8, timeout_ms: u32) (Error || error{OutOfMemory})!Response {
+    if (servers.len == 0) return error.NoNameserver;
     var qbuf: [512]u8 = undefined;
     var rbuf: [4096]u8 = undefined;
-    const id: u16 = @truncate((query_counter.fetchAdd(1, .monotonic) *% 0x9E37) ^ @intFromPtr(&qbuf));
+    var id_bytes: [2]u8 = undefined;
+    compat.randomBytes(&id_bytes);
+    const id = std.mem.readInt(u16, &id_bytes, .big);
     const query = try buildQuery(&qbuf, id, name);
     var last: Error = error.Timeout;
-    for (servers[0..ns_count]) |ns| {
+    for (servers) |ns| {
         const n = exchange(ns, query, &rbuf, timeout_ms) catch |e| {
             last = e;
             continue;

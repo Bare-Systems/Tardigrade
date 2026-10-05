@@ -1000,20 +1000,25 @@ TARDIGRADE_UPSTREAM_SRV_NAME=_api._tcp.service.internal
 TARDIGRADE_UPSTREAM_SRV_TLS=true
 ```
 
-- **Priority/weight:** the lowest-priority group is the primary set, served by
-  smooth weighted round-robin (weight 0 gets a minimal share; a target's weight
-  is split across its addresses). Every higher-priority group is a backup,
-  tried in ascending priority only when all primaries are unhealthy. Active and
-  passive health checks, `slow_start` and the pool apply to each `ip:port`.
+- **Priority/weight:** each SRV priority is a group with its own weights. The
+  first group that has a healthy endpoint is fed through the normal pool
+  selection (round-robin, `least_connections`, `ip_hash`, `generic_hash`,
+  `random_two_choices`, sticky affinity, slow start, health checks); later
+  groups are only used once every endpoint of the current group is unhealthy.
+  The SRV *target* is the weighted unit: its weight is split across its
+  A/AAAA addresses, so a weight-1 target with 8 addresses gets the same share
+  as a weight-1 target with one (weight 0 is treated as 1).
 - **Refresh:** TTL-driven, clamped to `[SRV_MIN_REFRESH_MS, DNS_REFRESH_INTERVAL_MS]`
-  with ±10% jitter. Resolution runs on a background thread; the live set is
+  with ±10% jitter. Resolution runs on a joinable background thread (shutdown
+  waits for it); the live set is
   swapped atomically, and removed endpoint strings stay valid for 10 minutes so
   in-flight requests are never corrupted.
 - **Stale policy:** NXDOMAIN, an empty answer or the RFC 2782 `.` target clears
   the set immediately. SERVFAIL, timeouts and "no target resolved" keep the last
   good set for up to `SRV_STALE_MAX_MS` after the last success (retrying with
   backoff), then clear it. Truncated UDP answers are used as received; there is
-  no TCP fallback. At most 32 SRV records and 64 endpoints are kept.
+  no TCP fallback. Replies must come from the queried nameserver (connected UDP
+  socket) and carry a matching random query id. At most 32 SRV records and 64 endpoints are kept.
 - **TLS identity:** endpoints are dialed by IP, so verification uses
   `TARDIGRADE_UPSTREAM_TLS_SERVER_NAME` if set, otherwise the logical service
   name (the SRV name without `_service._proto.`, e.g. `service.internal`) —

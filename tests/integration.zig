@@ -24651,10 +24651,14 @@ fn runSrvTlsScenario(
     defer allocator.free(leaf_crt);
     const san_cnf = try dir.joinAbs("san.cnf");
     defer allocator.free(san_cnf);
+    // Signing state stays in the per-test directory so the shared fixture CA
+    // directory is never written.
+    const ca_serial = try dir.joinAbs("ca.srl");
+    defer allocator.free(ca_serial);
 
     const steps = [_][]const []const u8{
         &.{ "openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", leaf_key, "-out", leaf_csr, "-subj", "/CN=service.test" },
-        &.{ "openssl", "x509", "-req", "-in", leaf_csr, "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial", "-out", leaf_crt, "-days", "2", "-extfile", san_cnf },
+        &.{ "openssl", "x509", "-req", "-in", leaf_csr, "-CA", ca_cert, "-CAkey", ca_key, "-CAserial", ca_serial, "-CAcreateserial", "-out", leaf_crt, "-days", "2", "-extfile", san_cnf },
     };
     for (steps) |argv| {
         var result = try bounded_process.run(allocator, .{

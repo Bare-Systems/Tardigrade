@@ -7,17 +7,15 @@ const compat = @import("zig_compat");
 ///  * SRV mode (`srv_name`, #766): resolves `_service._proto.name` SRV records,
 ///    resolves each target to A/AAAA, and builds priority groups.
 ///
-/// Live set: `urls`/`weights` hold every endpoint ordered by SRV priority;
-/// `group_ends` marks priority-group boundaries. Group 0 is the primary set,
-/// later groups are backups. The gateway feeds the first group that has a
-/// healthy endpoint through the normal pool machinery (all LB algorithms,
-/// sticky affinity, slow start), so RFC 2782 weights apply inside whichever
-/// priority group is active, and lower-precedence groups are only used once
-/// every endpoint of the current group is unavailable.
-///
-/// Weights: the SRV *target* is the weighted unit. A target's weight is split
-/// evenly over its resolved addresses (fixed-point, exact for <= 8 addresses)
-/// so its aggregate share is independent of how many addresses it has.
+/// Live set: priority groups are first-class. Each group holds weighted
+/// *targets* (the SRV target is the weighted unit), each target holds its
+/// resolved addresses; `urls` is the flat, interned address list ordered
+/// group -> target -> address. Selection only ever looks inside the first
+/// group that has a healthy endpoint, so lower-priority groups are never
+/// reachable while a higher-priority one has any healthy member. Inside the
+/// group, `pickWeighted` runs nginx-style smooth weighted round-robin over the
+/// targets with their exact SRV weights (O(targets), no ratio quantization)
+/// and then rotates over the chosen target's addresses.
 ///
 /// Stale policy (SRV mode): NXDOMAIN, or an SRV answer that is empty / the
 /// RFC 2782 "." target, is authoritative and clears the live set at once.
@@ -42,10 +40,6 @@ pub const retire_grace_ms: u64 = 10 * 60 * 1000;
 /// Hard caps keeping the live set bounded.
 pub const max_endpoints = 64;
 const max_addrs_per_target = 8;
-/// Fixed-point factor: divisible by every address count 1..8.
-const weight_scale: u32 = 840;
-/// Upper bound on a group's total weight (the pool machinery walks tickets).
-const max_group_weight: u32 = 1024;
 
 pub const Config = struct {
     /// Hostname to resolve for A/AAAA mode (empty string disables it).
@@ -66,6 +60,21 @@ pub const Config = struct {
     query_timeout_ms: u32 = 2_000,
     /// SRV: explicit nameservers; empty means /etc/resolv.conf.
     nameservers: []const std.Io.net.IpAddress = &.{},
+    /// Optional A/AAAA resolver for SRV targets (tests); null uses the system
+    /// resolver. Returns the addresses (empty = resolution failed).
+    target_resolver: ?TargetResolver = null,
+};
+
+pub const TargetResolver = struct {
+    ctx: ?*anyopaque,
+    resolve: *const fn (ctx: ?*anyopaque, host: []const u8, port: u16, out: *[compat.max_resolved_addresses]std.Io.net.IpAddress) []const std.Io.net.IpAddress,
+};
+
+/// A weighted SRV target and the span of `urls` holding its addresses.
+pub const Target = struct {
+    weight: u32,
+    first: u32,
+    count: u32,
 };
 
 /// One resolved endpoint, before grouping.
@@ -82,12 +91,16 @@ pub const DnsDiscovery = struct {
     allocator: std.mem.Allocator,
     config: Config,
     mutex: compat.Mutex,
-    /// All endpoints ordered by priority group, then URL (interned strings).
+    /// All endpoints ordered group -> target -> URL (interned strings).
     urls: std.ArrayList([]const u8),
-    /// Pool weight per endpoint (parallel to `urls`).
-    weights: std.ArrayList(u32),
-    /// Exclusive end index of each priority group in `urls`.
+    /// Weighted targets in the same order; each spans `count` entries of `urls`.
+    targets: std.ArrayList(Target),
+    /// Exclusive end index of each priority group in `targets`.
     group_ends: std.ArrayList(usize),
+    /// Smooth-WRR running weight and address rotor per target (selection
+    /// state, reset whenever a new snapshot is installed).
+    wrr_current: std.ArrayList(i64),
+    rotor: std.ArrayList(u32),
     /// Interned URL strings with retirement time (0 = live).
     interned: std.ArrayList(Interned),
     /// Monotonic ms of the last successful resolution.
@@ -115,8 +128,10 @@ pub const DnsDiscovery = struct {
             .config = config,
             .mutex = .{},
             .urls = .empty,
-            .weights = .empty,
+            .targets = .empty,
             .group_ends = .empty,
+            .wrr_current = .empty,
+            .rotor = .empty,
             .interned = .empty,
             .last_refresh_ms = 0,
             .next_refresh_ms = 0,
@@ -137,8 +152,10 @@ pub const DnsDiscovery = struct {
         for (self.interned.items) |e| self.allocator.free(e.url);
         self.interned.deinit(self.allocator);
         self.urls.deinit(self.allocator);
-        self.weights.deinit(self.allocator);
+        self.targets.deinit(self.allocator);
         self.group_ends.deinit(self.allocator);
+        self.wrr_current.deinit(self.allocator);
+        self.rotor.deinit(self.allocator);
     }
 
     pub fn enabled(self: *const DnsDiscovery) bool {
@@ -228,7 +245,10 @@ pub const DnsDiscovery = struct {
     /// Resolve `host` to A/AAAA and append `Endpoint`s for it.
     fn collectAddrs(self: *DnsDiscovery, host: []const u8, port: u16, priority: u16, weight: u16, target_id: u16, eps: *std.ArrayList(Endpoint)) void {
         var addrs: [compat.max_resolved_addresses]std.Io.net.IpAddress = undefined;
-        const resolved = compat.resolveHostAddresses(host, port, &addrs) catch return;
+        const resolved = if (self.config.target_resolver) |r|
+            r.resolve(r.ctx, host, port, &addrs)
+        else
+            compat.resolveHostAddresses(host, port, &addrs) catch return;
         for (resolved[0..@min(resolved.len, max_addrs_per_target)]) |a| {
             if (eps.items.len >= max_endpoints) return;
             const url = formatUrl(self.allocator, self.config.tls, a) catch return;
@@ -243,8 +263,8 @@ pub const DnsDiscovery = struct {
     pub fn applySuccess(self: *DnsDiscovery, now_ms: u64, eps: []const Endpoint, ttl_ms: u64) void {
         var urls: std.ArrayList([]const u8) = .empty;
         defer urls.deinit(self.allocator);
-        var weights: std.ArrayList(u32) = .empty;
-        defer weights.deinit(self.allocator);
+        var targets: std.ArrayList(Target) = .empty;
+        defer targets.deinit(self.allocator);
         var ends: std.ArrayList(usize) = .empty;
         defer ends.deinit(self.allocator);
 
@@ -256,22 +276,60 @@ pub const DnsDiscovery = struct {
             };
             if (prio == std.math.maxInt(u32)) break;
             floor = prio + 1;
-            const start = urls.items.len;
+
+            // Distinct targets of this priority, ordered by their lowest URL
+            // so snapshots compare deterministically.
+            var tids: [max_endpoints]u16 = undefined;
+            var tmin: [max_endpoints][]const u8 = undefined;
+            var tw: [max_endpoints]u16 = undefined;
+            var nt: usize = 0;
             for (eps) |e| if (e.priority == prio) {
-                const url = self.intern(e.url) orelse return;
-                if (containsUrl(urls.items[start..], url)) continue;
-                // Target weight split over the target's addresses.
-                var n: u32 = 0;
-                for (eps) |o| if (o.priority == prio and o.target_id == e.target_id) {
-                    n += 1;
+                var found: ?usize = null;
+                for (tids[0..nt], 0..) |id, i| if (id == e.target_id) {
+                    found = i;
                 };
-                urls.append(self.allocator, url) catch return;
-                weights.append(self.allocator, @max(e.weight, 1) * weight_scale / @max(n, 1)) catch return;
+                if (found) |i| {
+                    if (std.mem.lessThan(u8, e.url, tmin[i])) tmin[i] = e.url;
+                } else {
+                    tids[nt] = e.target_id;
+                    tmin[nt] = e.url;
+                    tw[nt] = e.weight;
+                    nt += 1;
+                }
             };
-            sortGroup(urls.items[start..], weights.items[start..]);
-            normalizeWeights(weights.items[start..]);
-            ends.append(self.allocator, urls.items.len) catch return;
+            var order: [max_endpoints]usize = undefined;
+            for (0..nt) |i| order[i] = i;
+            var oi: usize = 1;
+            while (oi < nt) : (oi += 1) {
+                var j = oi;
+                while (j > 0 and std.mem.lessThan(u8, tmin[order[j]], tmin[order[j - 1]])) : (j -= 1) {
+                    std.mem.swap(usize, &order[j], &order[j - 1]);
+                }
+            }
+            for (order[0..nt]) |ti| {
+                const first = urls.items.len;
+                for (eps) |e| if (e.priority == prio and e.target_id == tids[ti]) {
+                    const url = self.intern(e.url) orelse return;
+                    if (containsUrl(urls.items[first..], url)) continue;
+                    urls.append(self.allocator, url) catch return;
+                };
+                sortUrls(urls.items[first..]);
+                if (urls.items.len == first) continue;
+                targets.append(self.allocator, .{
+                    .weight = @max(tw[ti], 1), // RFC 2782: weight 0 still gets a small share
+                    .first = @intCast(first),
+                    .count = @intCast(urls.items.len - first),
+                }) catch return;
+            }
+            ends.append(self.allocator, targets.items.len) catch return;
         }
+
+        var wrr: std.ArrayList(i64) = .empty;
+        defer wrr.deinit(self.allocator);
+        var rotor: std.ArrayList(u32) = .empty;
+        defer rotor.deinit(self.allocator);
+        wrr.appendNTimes(self.allocator, 0, targets.items.len) catch return;
+        rotor.appendNTimes(self.allocator, 0, targets.items.len) catch return;
 
         self.refresh_total += 1;
         self.consecutive_failures = 0;
@@ -281,13 +339,17 @@ pub const DnsDiscovery = struct {
         self.next_refresh_ms = now_ms + self.nextDelay(now_ms, ttl_ms);
 
         const changed = !std.mem.eql(usize, self.group_ends.items, ends.items) or
-            !std.mem.eql(u32, self.weights.items, weights.items) or
+            !targetsEqual(self.targets.items, targets.items) or
             !orderedUrlsEqual(self.urls.items, urls.items);
         // Atomic swap of every live-set field (caller holds the mutex).
         std.mem.swap(std.ArrayList([]const u8), &self.urls, &urls);
-        std.mem.swap(std.ArrayList(u32), &self.weights, &weights);
+        std.mem.swap(std.ArrayList(Target), &self.targets, &targets);
         std.mem.swap(std.ArrayList(usize), &self.group_ends, &ends);
         if (changed) {
+            // Selection state only resets when routing actually changed so an
+            // unchanged refresh does not perturb the rotation.
+            std.mem.swap(std.ArrayList(i64), &self.wrr_current, &wrr);
+            std.mem.swap(std.ArrayList(u32), &self.rotor, &rotor);
             self.change_count += 1;
             std.debug.print("dns_discovery: {s} resolved to {d} upstream(s) in {d} priority group(s) (change #{d})\n", .{
                 self.sourceName(), self.urls.items.len, self.group_ends.items.len, self.change_count,
@@ -309,8 +371,10 @@ pub const DnsDiscovery = struct {
         const expired = self.last_refresh_ms == 0 or now_ms -| self.last_refresh_ms > self.config.stale_max_ms;
         if (have and (authoritative or expired)) {
             self.urls.clearRetainingCapacity();
-            self.weights.clearRetainingCapacity();
+            self.targets.clearRetainingCapacity();
             self.group_ends.clearRetainingCapacity();
+            self.wrr_current.clearRetainingCapacity();
+            self.rotor.clearRetainingCapacity();
             self.change_count += 1;
             self.stale = false;
             std.debug.print("dns_discovery: {s} cleared ({s})\n", .{ self.sourceName(), reason });
@@ -320,13 +384,70 @@ pub const DnsDiscovery = struct {
         }
     }
 
-    /// Number of endpoints in the primary (first) priority group.
-    pub fn primaryCount(self: *const DnsDiscovery) usize {
-        return if (self.group_ends.items.len > 0) self.group_ends.items[0] else 0;
+    pub fn groupCount(self: *const DnsDiscovery) usize {
+        return self.group_ends.items.len;
     }
 
-    pub fn groupStart(self: *const DnsDiscovery, g: usize) usize {
+    fn groupTargetStart(self: *const DnsDiscovery, g: usize) usize {
         return if (g == 0) 0 else self.group_ends.items[g - 1];
+    }
+
+    /// The addresses of priority group `g`.
+    pub fn groupUrls(self: *const DnsDiscovery, g: usize) []const []const u8 {
+        const ts = self.groupTargetStart(g);
+        const te = self.group_ends.items[g];
+        if (ts == te) return &.{};
+        const last = self.targets.items[te - 1];
+        return self.urls.items[self.targets.items[ts].first .. last.first + last.count];
+    }
+
+    /// Number of endpoints in the primary (first) priority group.
+    pub fn primaryCount(self: *const DnsDiscovery) usize {
+        return if (self.groupCount() > 0) self.groupUrls(0).len else 0;
+    }
+
+    /// Index of the first priority group with any healthy endpoint.
+    /// `isHealthy(ctx, url)`; caller holds `mutex`.
+    pub fn firstHealthyGroup(self: *const DnsDiscovery, ctx: anytype, comptime isHealthy: fn (@TypeOf(ctx), []const u8) bool) ?usize {
+        for (0..self.groupCount()) |g| {
+            for (self.groupUrls(g)) |u| if (isHealthy(ctx, u)) return g;
+        }
+        return null;
+    }
+
+    /// Smooth weighted round-robin over group `g`'s targets using their exact
+    /// SRV weights, then rotation over the chosen target's addresses. Targets
+    /// without a healthy address are skipped. Caller holds `mutex`.
+    pub fn pickWeighted(self: *DnsDiscovery, g: usize, ctx: anytype, comptime isHealthy: fn (@TypeOf(ctx), []const u8) bool) ?[]const u8 {
+        const ts = self.groupTargetStart(g);
+        const te = self.group_ends.items[g];
+        var total: i64 = 0;
+        var best: ?usize = null;
+        for (ts..te) |t| {
+            const tg = self.targets.items[t];
+            if (!self.targetHasHealthy(tg, ctx, isHealthy)) continue;
+            self.wrr_current.items[t] += tg.weight;
+            total += tg.weight;
+            if (best == null or self.wrr_current.items[t] > self.wrr_current.items[best.?]) best = t;
+        }
+        const b = best orelse return null;
+        self.wrr_current.items[b] -= total;
+        const tg = self.targets.items[b];
+        const start = self.rotor.items[b] % tg.count;
+        var off: u32 = 0;
+        while (off < tg.count) : (off += 1) {
+            const idx = (start + off) % tg.count;
+            const url = self.urls.items[tg.first + idx];
+            if (!isHealthy(ctx, url)) continue;
+            self.rotor.items[b] = idx + 1;
+            return url;
+        }
+        return null;
+    }
+
+    fn targetHasHealthy(self: *const DnsDiscovery, tg: Target, ctx: anytype, comptime isHealthy: fn (@TypeOf(ctx), []const u8) bool) bool {
+        for (self.urls.items[tg.first .. tg.first + tg.count]) |u| if (isHealthy(ctx, u)) return true;
+        return false;
     }
 
     fn sourceName(self: *const DnsDiscovery) []const u8 {
@@ -418,43 +539,22 @@ fn orderedUrlsEqual(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
-/// Insertion sort by URL (groups are tiny) so snapshots compare deterministically.
-fn sortGroup(urls: [][]const u8, weights: []u32) void {
+fn targetsEqual(a: []const Target, b: []const Target) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.weight != y.weight or x.first != y.first or x.count != y.count) return false;
+    }
+    return true;
+}
+
+/// Insertion sort by URL (a target has at most 8 addresses).
+fn sortUrls(urls: [][]const u8) void {
     var i: usize = 1;
     while (i < urls.len) : (i += 1) {
         var j = i;
         while (j > 0 and std.mem.lessThan(u8, urls[j], urls[j - 1])) : (j -= 1) {
             std.mem.swap([]const u8, &urls[j], &urls[j - 1]);
-            std.mem.swap(u32, &weights[j], &weights[j - 1]);
         }
-    }
-}
-
-fn gcd(a: u32, b: u32) u32 {
-    var x = a;
-    var y = b;
-    while (y != 0) {
-        const t = x % y;
-        x = y;
-        y = t;
-    }
-    return x;
-}
-
-/// Reduce a group's weights by their GCD, then scale down proportionally
-/// (never below 1) so the total stays <= `max_group_weight`.
-fn normalizeWeights(weights: []u32) void {
-    if (weights.len == 0) return;
-    var g: u32 = 0;
-    for (weights) |w| g = gcd(g, w);
-    var total: u32 = 0;
-    for (weights) |*w| {
-        w.* = @max(w.* / g, 1);
-        total += w.*;
-    }
-    if (total > max_group_weight) {
-        const div = (total + max_group_weight - 1) / max_group_weight;
-        for (weights) |*w| w.* = @max(1, w.* / div);
     }
 }
 
@@ -506,50 +606,107 @@ test "needsRefresh respects interval" {
     try testing.expect(disc.needsRefresh(10_000 + 30_000));
 }
 
-
 fn ep(prio: u16, weight: u16, target: u16, url: []const u8) Endpoint {
     return .{ .priority = prio, .weight = weight, .target_id = target, .url = url };
 }
 
-test "target weight is preserved regardless of address count (1:8)" {
+const Health = struct {
+    down: []const []const u8 = &.{},
+
+    fn check(self: *const Health, url: []const u8) bool {
+        for (self.down) |d| if (std.mem.eql(u8, d, url)) return false;
+        return true;
+    }
+};
+
+fn countPicks(d: *DnsDiscovery, g: usize, h: *const Health, picks: usize, hits: []usize, urls: []const []const u8) void {
+    for (0..picks) |_| {
+        const u = d.pickWeighted(g, h, Health.check) orelse continue;
+        for (urls, 0..) |want, i| if (std.mem.eql(u8, u, want)) {
+            hits[i] += 1;
+        };
+    }
+}
+
+test "extreme target weight ratio is exact: 65535 (1 addr) vs 1 (8 addrs)" {
     var d = DnsDiscovery.init(testing.allocator, .{ .srv_name = "_a._tcp.x.test" });
     defer d.deinit();
     var eps: [9]Endpoint = undefined;
-    var urls: [8][24]u8 = undefined;
+    var bufs: [8][24]u8 = undefined;
     for (0..8) |i| {
-        const u = std.fmt.bufPrint(&urls[i], "http://10.0.0.{d}:80", .{i + 1}) catch unreachable;
-        eps[i] = ep(0, 1, 0, u); // target A: weight 1, 8 addresses
+        eps[i] = ep(0, 1, 1, std.fmt.bufPrint(&bufs[i], "http://10.0.1.{d}:80", .{i + 1}) catch unreachable);
     }
-    eps[8] = ep(0, 8, 1, "http://10.0.1.1:80"); // target B: weight 8, one address
+    eps[8] = ep(0, 65535, 0, "http://10.0.0.1:80");
     d.applySuccess(1_000, &eps, 30_000);
-    try testing.expectEqual(@as(usize, 9), d.urls.items.len);
-    var a: u32 = 0;
-    var b: u32 = 0;
-    for (d.urls.items, d.weights.items) |u, w| {
-        if (std.mem.startsWith(u8, u, "http://10.0.1.")) b += w else a += w;
+    const h: Health = .{};
+    var a: usize = 0;
+    var b: usize = 0;
+    for (0..65536) |_| {
+        const u = d.pickWeighted(0, &h, Health.check).?;
+        if (std.mem.startsWith(u8, u, "http://10.0.0.")) a += 1 else b += 1;
     }
-    try testing.expectEqual(b, a * 8);
+    try testing.expectEqual(@as(usize, 65535), a);
+    try testing.expectEqual(@as(usize, 1), b);
 }
 
-test "priority groups keep their own weights and ordering" {
+test "weight does not multiply with address count (1:8) and addresses rotate" {
+    var d = DnsDiscovery.init(testing.allocator, .{ .srv_name = "_a._tcp.x.test" });
+    defer d.deinit();
+    var eps: [9]Endpoint = undefined;
+    var bufs: [8][24]u8 = undefined;
+    for (0..8) |i| {
+        eps[i] = ep(0, 1, 0, std.fmt.bufPrint(&bufs[i], "http://10.0.0.{d}:80", .{i + 1}) catch unreachable);
+    }
+    eps[8] = ep(0, 8, 1, "http://10.0.1.1:80");
+    d.applySuccess(1_000, &eps, 30_000);
+    const h: Health = .{};
+    var a: usize = 0;
+    var b: usize = 0;
+    var seen = [_]usize{0} ** 8;
+    for (0..90) |_| {
+        const u = d.pickWeighted(0, &h, Health.check).?;
+        if (std.mem.startsWith(u8, u, "http://10.0.1.")) {
+            b += 1;
+        } else {
+            a += 1;
+            seen[u["http://10.0.0.".len] - '1'] += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 10), a); // 1/9 of 90
+    try testing.expectEqual(@as(usize, 80), b);
+    for (seen) |c| try testing.expect(c >= 1);
+}
+
+test "selection stays inside the first group with a healthy endpoint" {
     var d = DnsDiscovery.init(testing.allocator, .{ .srv_name = "_a._tcp.x.test" });
     defer d.deinit();
     d.applySuccess(1_000, &.{
-        ep(20, 3, 0, "http://10.0.0.3:80"),
-        ep(10, 1, 1, "http://10.0.0.1:80"),
-        ep(20, 1, 2, "http://10.0.0.4:80"),
-        ep(10, 1, 3, "http://10.0.0.2:80"),
-        ep(30, 1, 4, "http://10.0.0.5:80"),
+        ep(10, 1, 0, "http://10.0.0.1:80"),
+        ep(10, 1, 1, "http://10.0.0.2:80"),
+        ep(10, 1, 2, "http://10.0.0.3:80"),
+        ep(20, 3, 3, "http://10.0.0.4:80"),
+        ep(20, 1, 4, "http://10.0.0.5:80"),
     }, 30_000);
-    try testing.expectEqual(@as(usize, 3), d.group_ends.items.len);
-    try testing.expectEqual(@as(usize, 2), d.primaryCount());
-    // Group 1 (priority 20) is sorted by URL and keeps its 3:1 weights.
-    try testing.expectEqualStrings("http://10.0.0.3:80", d.urls.items[2]);
-    try testing.expectEqualStrings("http://10.0.0.4:80", d.urls.items[3]);
-    try testing.expectEqual(d.weights.items[2], d.weights.items[3] * 3);
-    try testing.expectEqual(@as(usize, 2), d.groupStart(1));
-    try testing.expectEqual(@as(usize, 4), d.groupStart(2));
-    try testing.expectEqualStrings("http://10.0.0.5:80", d.urls.items[4]);
+    try testing.expectEqual(@as(usize, 2), d.groupCount());
+    try testing.expectEqual(@as(usize, 3), d.primaryCount());
+    var h: Health = .{};
+    try testing.expectEqual(@as(?usize, 0), d.firstHealthyGroup(&h, Health.check));
+    // Two of three primaries down: the survivor takes everything, never group 20.
+    h.down = &.{ "http://10.0.0.1:80", "http://10.0.0.2:80" };
+    var hits = [_]usize{0} ** 5;
+    const all = [_][]const u8{ "http://10.0.0.1:80", "http://10.0.0.2:80", "http://10.0.0.3:80", "http://10.0.0.4:80", "http://10.0.0.5:80" };
+    countPicks(&d, 0, &h, 100, &hits, &all);
+    try testing.expectEqual(@as(usize, 100), hits[2]);
+    // All primaries down: group 1 becomes active, weighted 3:1.
+    h.down = &.{ "http://10.0.0.1:80", "http://10.0.0.2:80", "http://10.0.0.3:80" };
+    try testing.expectEqual(@as(?usize, 1), d.firstHealthyGroup(&h, Health.check));
+    hits = [_]usize{0} ** 5;
+    countPicks(&d, 1, &h, 40, &hits, &all);
+    try testing.expectEqual(@as(usize, 30), hits[3]);
+    try testing.expectEqual(@as(usize, 10), hits[4]);
+    // Primaries recover: back to group 0 immediately.
+    h.down = &.{};
+    try testing.expectEqual(@as(?usize, 0), d.firstHealthyGroup(&h, Health.check));
 }
 
 test "routing-only changes (weights, priority order) count as changes" {
@@ -570,9 +727,9 @@ test "srv refresh delay follows TTL within bounds and jitter" {
     var d = DnsDiscovery.init(testing.allocator, .{ .srv_name = "_a._tcp.x.test", .refresh_interval_ms = 60_000, .min_refresh_ms = 5_000 });
     defer d.deinit();
     const cases = [_]struct { ttl: u64, lo: u64, hi: u64 }{
-        .{ .ttl = 1_000, .lo = 4_500, .hi = 5_500 }, // raised to min
+        .{ .ttl = 1_000, .lo = 4_500, .hi = 5_500 },
         .{ .ttl = 20_000, .lo = 18_000, .hi = 22_000 },
-        .{ .ttl = 900_000, .lo = 54_000, .hi = 66_000 }, // capped to max
+        .{ .ttl = 900_000, .lo = 54_000, .hi = 66_000 },
         .{ .ttl = 0, .lo = 54_000, .hi = 66_000 },
     };
     for (cases, 0..) |c, i| {
@@ -593,9 +750,9 @@ test "srv stale policy keeps last good set until stale_max_ms, NXDOMAIN clears" 
     try testing.expectEqual(@as(usize, 2), d.urls.items.len);
     d.applyFailure(50_000, false, "ServFail");
     try testing.expectEqual(@as(usize, 2), d.urls.items.len);
-    d.applyFailure(62_000, false, "ServFail"); // > 60s since success
+    d.applyFailure(62_000, false, "ServFail");
     try testing.expectEqual(@as(usize, 0), d.urls.items.len);
-    try testing.expectEqual(@as(usize, 0), d.group_ends.items.len);
+    try testing.expectEqual(@as(usize, 0), d.groupCount());
     try testing.expect(!d.stale);
     d.applySuccess(70_000, &.{ep(0, 1, 0, "http://10.0.0.1:80")}, 10_000);
     try testing.expectEqual(@as(u32, 0), d.consecutive_failures);
@@ -609,7 +766,7 @@ test "removed URLs stay valid for the grace period then are freed" {
     d.applySuccess(1_000, &.{ep(0, 1, 0, "http://10.0.0.1:80")}, 10_000);
     const held = d.urls.items[0];
     d.applySuccess(2_000, &.{ep(0, 1, 0, "http://10.0.0.2:80")}, 10_000);
-    try testing.expectEqualStrings("http://10.0.0.1:80", held); // in-flight reader still safe
+    try testing.expectEqualStrings("http://10.0.0.1:80", held);
     try testing.expectEqual(@as(usize, 2), d.interned.items.len);
     d.applySuccess(2_000 + retire_grace_ms + 1, &.{ep(0, 1, 0, "http://10.0.0.2:80")}, 10_000);
     try testing.expectEqual(@as(usize, 1), d.interned.items.len);
@@ -724,10 +881,32 @@ const Fixture = struct {
     }
 };
 
-test "dns fixture: SRV to target to port, rotation, removal, stale and recovery" {
+/// Scripted A/AAAA answers for SRV targets: the SRV names stay constant while
+/// their address sets change between refreshes.
+const TargetAnswers = struct {
+    mutex: compat.Mutex = .{},
+    backend: [2]?[4]u8 = .{ null, null },
+    other: [2]?[4]u8 = .{ null, null },
+
+    fn resolve(ctx: ?*anyopaque, host: []const u8, port: u16, out: *[compat.max_resolved_addresses]std.Io.net.IpAddress) []const std.Io.net.IpAddress {
+        const self: *TargetAnswers = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const set = if (std.mem.eql(u8, host, "backend.service.test")) self.backend else if (std.mem.eql(u8, host, "other.service.test")) self.other else return out[0..0];
+        var n: usize = 0;
+        for (set) |maybe| if (maybe) |bytes| {
+            out[n] = .{ .ip4 = .{ .bytes = bytes, .port = port } };
+            n += 1;
+        };
+        return out[0..n];
+    }
+};
+
+test "dns fixture: SRV -> target A rotation -> port, removal, stale, recovery" {
     var fx: Fixture = .{ .sock = -1, .port = 0 };
     try fx.start();
     defer fx.deinit();
+    var answers: TargetAnswers = .{};
     const ns = [_]std.Io.net.IpAddress{.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = fx.port } }};
     var d = DnsDiscovery.init(testing.allocator, .{
         .srv_name = "_api._tcp.service.test",
@@ -735,52 +914,56 @@ test "dns fixture: SRV to target to port, rotation, removal, stale and recovery"
         .query_timeout_ms = 200,
         .stale_max_ms = 10_000,
         .tls = true,
+        .target_resolver = .{ .ctx = &answers, .resolve = TargetAnswers.resolve },
     });
     defer d.deinit();
 
-    fx.set(.answer, &.{
-        .{ .prio = 10, .weight = 5, .port = 8443, .target = "127.0.0.2" },
-        .{ .prio = 10, .weight = 1, .port = 9443, .target = "127.0.0.3" },
-        .{ .prio = 20, .weight = 1, .port = 8443, .target = "127.0.0.9" },
-    });
+    const recs = [_]Fixture.Rec{
+        .{ .prio = 10, .weight = 5, .port = 8443, .target = "backend.service.test" },
+        .{ .prio = 10, .weight = 1, .port = 9443, .target = "other.service.test" },
+        .{ .prio = 20, .weight = 1, .port = 8443, .target = "backend.service.test" },
+    };
+    fx.set(.answer, &recs);
+    answers.backend = .{ .{ 10, 0, 0, 1 }, null };
+    answers.other = .{ .{ 10, 0, 1, 1 }, .{ 10, 0, 1, 2 } };
     d.refresh(1_000);
-    try testing.expectEqual(@as(usize, 3), d.urls.items.len);
-    try testing.expectEqual(@as(usize, 2), d.primaryCount());
-    try testing.expectEqualStrings("https://127.0.0.2:8443", d.urls.items[0]);
-    try testing.expectEqualStrings("https://127.0.0.3:9443", d.urls.items[1]);
-    try testing.expectEqual(d.weights.items[0], d.weights.items[1] * 5);
-    try testing.expectEqualStrings("https://127.0.0.9:8443", d.urls.items[2]);
+    try testing.expectEqual(@as(usize, 2), d.groupCount());
+    try testing.expectEqual(@as(usize, 3), d.primaryCount());
+    try testing.expectEqualStrings("https://10.0.0.1:8443", d.urls.items[0]);
+    try testing.expectEqualStrings("https://10.0.1.1:9443", d.urls.items[1]);
+    try testing.expectEqualStrings("https://10.0.1.2:9443", d.urls.items[2]);
+    try testing.expectEqualStrings("https://10.0.0.1:8443", d.urls.items[3]); // same target, backup priority
+    try testing.expectEqual(@as(u64, 1), d.change_count);
 
-    // Target A rotation + port change + target removal.
-    fx.set(.answer, &.{
-        .{ .prio = 10, .weight = 5, .port = 8444, .target = "127.0.0.7" },
-        .{ .prio = 20, .weight = 1, .port = 8443, .target = "127.0.0.9" },
-    });
+    // Only the SRV target's A set changes (same SRV answer): atomic replacement.
+    answers.backend = .{ .{ 10, 0, 0, 7 }, null };
     d.refresh(2_000);
-    try testing.expectEqual(@as(usize, 2), d.urls.items.len);
-    try testing.expectEqualStrings("https://127.0.0.7:8444", d.urls.items[0]);
+    try testing.expectEqualStrings("https://10.0.0.7:8443", d.urls.items[0]);
     try testing.expectEqual(@as(u64, 2), d.change_count);
+
+    // Target removal: only the "other" target remains in the primary group.
+    fx.set(.answer, &.{recs[0]});
+    d.refresh(3_000);
+    try testing.expectEqual(@as(usize, 1), d.groupCount());
+    try testing.expectEqual(@as(usize, 1), d.urls.items.len);
 
     // SERVFAIL and silence keep the last good set (stale)...
     fx.set(.servfail, &.{});
-    d.refresh(3_000);
-    try testing.expect(d.stale);
-    try testing.expectEqual(@as(usize, 2), d.urls.items.len);
-    fx.set(.silent, &.{});
     d.refresh(4_000);
     try testing.expect(d.stale);
-    try testing.expectEqual(@as(usize, 2), d.urls.items.len);
+    fx.set(.silent, &.{});
+    d.refresh(5_000);
+    try testing.expect(d.stale);
+    try testing.expectEqual(@as(usize, 1), d.urls.items.len);
     // ...until the stale bound passes.
-    d.refresh(2_000 + 10_001);
+    d.refresh(3_000 + 10_001);
     try testing.expectEqual(@as(usize, 0), d.urls.items.len);
 
-    // Recovery.
-    fx.set(.answer, &.{.{ .prio = 1, .weight = 1, .port = 80, .target = "127.0.0.4" }});
+    fx.set(.answer, &.{recs[0]});
     d.refresh(20_000);
     try testing.expectEqual(@as(usize, 1), d.urls.items.len);
     try testing.expect(!d.stale);
 
-    // NXDOMAIN clears immediately.
     fx.set(.nxdomain, &.{});
     d.refresh(21_000);
     try testing.expectEqual(@as(usize, 0), d.urls.items.len);
@@ -794,7 +977,7 @@ test "background refresh worker is joined before state is freed" {
     const ns = [_]std.Io.net.IpAddress{.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = fx.port } }};
     var d = DnsDiscovery.init(testing.allocator, .{ .srv_name = "_a._tcp.x.test", .nameservers = &ns, .query_timeout_ms = 300 });
     d.startRefresh();
-    d.startRefresh(); // second call while running is a no-op
-    d.deinit(); // must block until the worker (a 300ms timeout) has finished
+    d.startRefresh();
+    d.deinit();
     try testing.expect(!d.refreshing.load(.acquire));
 }

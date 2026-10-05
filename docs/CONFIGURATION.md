@@ -1019,14 +1019,17 @@ TARDIGRADE_UPSTREAM_SRV_NAME=_api._tcp.service.internal
 TARDIGRADE_UPSTREAM_SRV_TLS=true
 ```
 
-- **Priority/weight:** each SRV priority is a group with its own weights. The
-  first group that has a healthy endpoint is fed through the normal pool
-  selection (round-robin, `least_connections`, `ip_hash`, `generic_hash`,
-  `random_two_choices`, sticky affinity, slow start, health checks); later
-  groups are only used once every endpoint of the current group is unhealthy.
-  The SRV *target* is the weighted unit: its weight is split across its
-  A/AAAA addresses, so a weight-1 target with 8 addresses gets the same share
-  as a weight-1 target with one (weight 0 is treated as 1).
+- **Priority/weight:** each SRV priority is a group; only the first group that
+  has a healthy endpoint is ever used, and lower-priority groups are unreachable
+  while it has any healthy member (including for sticky affinity). Inside the
+  active group, `round_robin` runs smooth weighted round-robin over the SRV
+  *targets* with their exact weights (weight 0 counts as 1), then rotates over
+  the chosen target's A/AAAA addresses, so a target's share does not depend on
+  how many addresses it has. The other algorithms (`least_connections`,
+  `ip_hash`, `generic_hash`, `random_two_choices`) choose among the active
+  group's addresses and treat them equally. Sticky affinity works for
+  discovery-only pools. Health checks apply to each `ip:port`; slow start is not
+  applied to discovered endpoints.
 - **Refresh:** TTL-driven, clamped to `[SRV_MIN_REFRESH_MS, DNS_REFRESH_INTERVAL_MS]`
   with ±10% jitter. Resolution runs on a joinable background thread (shutdown
   waits for it); the live set is

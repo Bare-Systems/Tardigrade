@@ -12,9 +12,10 @@ All notable user-facing changes to Tardigrade are documented here.
   process-wide cap, and returns a deterministic 503 when capacity is exhausted.
   Admitted streams retain their configuration generation, honor its reload
   `preserve`/`drain` policy and drain deadline, and record exactly one close
-  reason and duration for upstream close, client close, timeout, reload, or
-  shutdown. Existing relay-buffer reservations and slow-reader backpressure
-  remain in force for plaintext and native-TLS HTTP/1 clients.
+  reason and duration for upstream close, client close, timeout, or reload.
+  Existing relay-buffer reservations and slow-reader backpressure remain in
+  force for plaintext and native-TLS HTTP/1 clients. Graceful-shutdown timing
+  for admitted streams remains the follow-up contract in #844.
 
 - **Shared lifecycle controls for long-lived streamed HTTP responses (#841).**
   Added a strict process-wide active-stream cap (default 256), generation-bound

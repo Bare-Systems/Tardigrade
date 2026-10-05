@@ -135,13 +135,14 @@ location /events/ {
   connection fails mid-stream, the client connection is closed without a
   terminating chunk, which EventSource clients also treat as a reason to
   reconnect.
-- **Reload and shutdown.** Each admitted stream retains the configuration
-  generation and per-location lifecycle policy that admitted it. The default
-  `preserve` policy leaves it open across reloads; `drain` closes it without a
-  terminal chunk when the captured reload drain deadline expires. Graceful
-  shutdown likewise closes admitted streams. Response-read waits are shortened
-  to the earlier of the ordinary upstream timeout and a lifecycle drain
-  deadline. See [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md).
+- **Reload.** Each admitted stream retains the configuration generation and
+  per-location lifecycle policy that admitted it. The default `preserve`
+  policy leaves it open across reloads; `drain` closes it without a terminal
+  chunk when the captured reload drain deadline expires. Response-read waits
+  are shortened to the earlier of the ordinary upstream timeout and that
+  reload deadline. Graceful-shutdown timing for admitted streams is tracked by
+  #844 and is not yet part of this relay contract. See
+  [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md).
 
 ## Fallback reasons
 

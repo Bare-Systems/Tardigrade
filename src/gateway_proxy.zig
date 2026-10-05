@@ -1025,13 +1025,14 @@ fn runNegotiatedH1Exchange(
     connect_timeout_ms: u32,
     read_deadline_ms: u32,
     cancel_token: ?*const CancellationToken,
+    response_stream_control: ?*const ResponseStreamControl,
     proxy_buffer_limits: proxy_buffer_account.Limits,
     proxy_buffer_observer: proxy_buffer_account.Observer,
     proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity,
     downstream_committed: *bool,
 ) !StreamingProxyResult {
     var wrote_downstream = false;
-    const res = streamProxyOverTransport(allocator, transport, fd, relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, null, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity) catch |err| {
+    const res = streamProxyOverTransport(allocator, transport, fd, relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, response_stream_control, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity) catch |err| {
         downstream_committed.* = wrote_downstream;
         return err;
     };
@@ -1070,6 +1071,7 @@ fn streamViaH2Pool(
     connect_timeout_ms: u32,
     read_deadline_ms: u32,
     cancel_token: ?*const CancellationToken,
+    response_stream_control: ?*const ResponseStreamControl,
     proxy_buffer_limits: proxy_buffer_account.Limits,
     proxy_buffer_observer: proxy_buffer_account.Observer,
     proxy_buffer_global: ?*proxy_buffer_account.Aggregate,
@@ -1116,7 +1118,7 @@ fn streamViaH2Pool(
                 // own, so this is an ordinary HTTP/1 exchange: allocate and
                 // charge at the current config's size, exactly as the h1 path
                 // below does.
-                const result = try runNegotiatedH1Exchange(allocator, tls_ptr, tls_ptr.fd, requested_relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, proxy_buffer_limits, proxy_buffer_observer, .{ .origin = h1_origin_account, .global = proxy_buffer_global }, downstream_committed);
+                const result = try runNegotiatedH1Exchange(allocator, tls_ptr, tls_ptr.fd, requested_relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, response_stream_control, proxy_buffer_limits, proxy_buffer_observer, .{ .origin = h1_origin_account, .global = proxy_buffer_global }, downstream_committed);
                 if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
                 return result;
             },
@@ -2096,6 +2098,30 @@ fn transportHasBufferedInput(transport: anytype) bool {
     return transport.pending() > 0;
 }
 
+/// A nonblocking TLS read can deliberately yield after a bounded amount of
+/// record-layer work even when more already-buffered work remains. Retry it
+/// immediately instead of waiting for another raw-fd edge that may never come.
+fn transportReadNeedsRetry(transport: anytype) bool {
+    const T = @TypeOf(transport);
+    const info = @typeInfo(T);
+    const Target = if (info == .pointer) info.pointer.child else T;
+    if (@hasField(Target, "drive_budget_exhausted")) return transport.drive_budget_exhausted;
+    return false;
+}
+
+/// The raw downstream socket used only for peer-close observation while an
+/// admitted response stream is otherwise idle. Plain streams expose `handle`;
+/// the native-TLS HTTP adapter exposes `rawFd()`. Test transports without a
+/// socket simply opt out by exposing neither.
+fn downstreamSocketFd(conn: anytype) ?std.posix.fd_t {
+    const T = @TypeOf(conn);
+    const info = @typeInfo(T);
+    const Target = if (info == .pointer) info.pointer.child else T;
+    if (@hasDecl(Target, "rawFd")) return conn.rawFd();
+    if (@hasField(Target, "handle")) return conn.handle;
+    return null;
+}
+
 /// Wait up to `timeout_ms` for `fd` to become readable. Returns false on
 /// timeout. EINTR is retried within the original deadline.
 fn pollFdReadable(fd: std.posix.fd_t, timeout_ms: u32) !bool {
@@ -2109,6 +2135,46 @@ fn pollFdReadable(fd: std.posix.fd_t, timeout_ms: u32) !bool {
         else => return err,
     };
     return ready != 0;
+}
+
+const ResponseReadiness = enum { upstream, client_closed, timeout };
+
+fn socketPeerClosed(fd: std.posix.fd_t, revents: i16) bool {
+    if ((revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) return true;
+    if ((revents & std.posix.POLL.IN) == 0) return false;
+
+    // POLLIN can be a pipelined HTTP request or TLS control/application data,
+    // neither of which this response relay may consume. A one-byte peek
+    // distinguishes an orderly FIN without disturbing those bytes.
+    const msg_peek: u32 = 2;
+    var byte: [1]u8 = undefined;
+    const n = std.c.recv(fd, @as(*anyopaque, @ptrCast(&byte)), byte.len, @intCast(msg_peek));
+    return n == 0;
+}
+
+/// Wait for upstream progress while also observing a quiet client's socket.
+/// This is used only after an SSE response has been admitted and its head has
+/// committed, when no request-body bytes remain for the downstream to send.
+fn pollResponseReadiness(
+    upstream_fd: std.posix.fd_t,
+    downstream_fd: ?std.posix.fd_t,
+    timeout_ms: u32,
+) !ResponseReadiness {
+    var pfds = [_]std.posix.pollfd{
+        .{ .fd = upstream_fd, .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR, .revents = 0 },
+        .{ .fd = downstream_fd orelse -1, .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR, .revents = 0 },
+    };
+    const count: usize = if (downstream_fd != null) 2 else 1;
+    const ready = std.posix.poll(pfds[0..count], @intCast(@min(timeout_ms, std.math.maxInt(i32)))) catch |err| switch (err) {
+        error.Unexpected => return error.Timeout,
+        else => return err,
+    };
+    if (ready == 0) return .timeout;
+    if (downstream_fd) |client_fd| {
+        if (socketPeerClosed(client_fd, pfds[1].revents)) return .client_closed;
+    }
+    if (pfds[0].revents != 0) return .upstream;
+    return .timeout;
 }
 
 /// What a zero-timeout writability check found on the upstream socket.
@@ -2526,8 +2592,7 @@ const StreamReadBuf = struct {
         }
     }
 
-    /// Read more bytes from the transport (poll-bounded). Returns false on EOF.
-    fn fill(self: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32) !bool {
+    fn writable(self: *StreamReadBuf) ![]u8 {
         if (self.start == self.end) {
             self.start = 0;
             self.end = 0;
@@ -2537,11 +2602,37 @@ const StreamReadBuf = struct {
             self.start = 0;
         }
         if (self.end == self.buf.len) return error.StreamTooLong; // window full without a delimiter
-        if (deadline_ms > 0 and !transportHasBufferedInput(transport) and !try pollFdReadable(fd, deadline_ms)) return error.Timeout;
-        const n = try transport.read(self.buf[self.end..]);
+        return self.buf[self.end..];
+    }
+
+    fn commit(self: *StreamReadBuf, n: usize) bool {
         if (n == 0) return false;
         self.end += n;
         return true;
+    }
+
+    /// Read more bytes from the transport (poll-bounded). Returns false on EOF.
+    fn fill(self: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32) !bool {
+        const out = try self.writable();
+        if (deadline_ms > 0 and !transportHasBufferedInput(transport) and !try pollFdReadable(fd, deadline_ms)) return error.Timeout;
+        return self.commit(try transport.read(out));
+    }
+
+    /// Perform one transport read after the caller has established readiness.
+    /// Native TLS exposes a genuinely nonblocking read because raw-fd
+    /// readability can be only a partial record or post-handshake traffic;
+    /// `null` means no application plaintext emerged and the caller must poll
+    /// again. Plain transports can safely perform their ordinary read here.
+    fn fillReady(self: *StreamReadBuf, transport: anytype) !?bool {
+        const out = try self.writable();
+        const T = @TypeOf(transport);
+        const info = @typeInfo(T);
+        const Target = if (info == .pointer) info.pointer.child else T;
+        if (@hasDecl(Target, "readNonBlocking")) {
+            const n = (try transport.readNonBlocking(out)) orelse return null;
+            return self.commit(n);
+        }
+        return self.commit(try transport.read(out));
     }
 };
 
@@ -2781,10 +2872,13 @@ const response_stream_lifecycle_poll_slice_ms: u32 = 50;
 const TrackedResponseStream = struct {
     state: *gs.GatewayState,
     admission: gs.ResponseStreamAdmission,
+    downstream_fd: ?std.posix.fd_t,
     finished: bool = false,
 
     fn stopError(self: *const TrackedResponseStream, now_ms: u64) !void {
-        if (http.shutdown.isShutdownRequested()) return error.ResponseStreamShutdown;
+        // Shutdown is intentionally not keyed off the process-global flag:
+        // #844 owns the grace-window deadline after which admitted streams
+        // are actively terminated. Closing here would skip that window.
         if (self.admission.reloadDeadlineMs()) |deadline_ms| {
             if (now_ms >= deadline_ms) return error.ResponseStreamReload;
         }
@@ -2807,8 +2901,8 @@ const TrackedResponseStream = struct {
 };
 
 /// Fill a response-body window while allowing a newly-published reload drain
-/// deadline (or shutdown) to shorten an already-waiting upstream read. The
-/// existing per-read timeout remains cumulative across the short lifecycle
+/// deadline or downstream close to shorten an already-waiting upstream read.
+/// The existing per-read timeout remains cumulative across the short lifecycle
 /// polling slices.
 fn fillResponseBody(
     rb: *StreamReadBuf,
@@ -2822,15 +2916,22 @@ fn fillResponseBody(
     while (true) {
         const now_ms = http.event_loop.monotonicMs();
         try tracker.stopError(now_ms);
-        if (transportHasBufferedInput(transport)) break;
+        if (transportHasBufferedInput(transport) or transportReadNeedsRetry(transport)) {
+            if (try rb.fillReady(transport)) |filled| return filled;
+            continue;
+        }
 
         const elapsed_ms = now_ms -| started_ms;
         if (deadline_ms > 0 and elapsed_ms >= deadline_ms) return error.Timeout;
         const existing_remaining_ms: ?u64 = if (deadline_ms > 0) @as(u64, deadline_ms) - elapsed_ms else null;
-        if (try pollFdReadable(fd, tracker.pollWaitMs(now_ms, existing_remaining_ms))) break;
+        switch (try pollResponseReadiness(fd, tracker.downstream_fd, tracker.pollWaitMs(now_ms, existing_remaining_ms))) {
+            .client_closed => return error.ClientAborted,
+            .timeout => continue,
+            .upstream => {},
+        }
+        try tracker.stopError(http.event_loop.monotonicMs());
+        if (try rb.fillReady(transport)) |filled| return filled;
     }
-    try tracker.stopError(http.event_loop.monotonicMs());
-    return rb.fill(transport, fd, 0);
 }
 
 fn readChunkSize(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32, tracked: ?*TrackedResponseStream) !?usize {
@@ -3294,7 +3395,7 @@ fn streamProxyOverTransport(
         head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method, .{ .allocator = allocator, .reservation = &response_reservation });
     }
     const ttfb_ms = http.event_loop.monotonicMs() - ttfb_start_ms;
-    return relayStreamedFinalResponse(allocator, &rb, transport, fd, &head, method, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, read_deadline_ms, cancel_token, response_stream_control, wrote_downstream, ttfb_ms);
+    return relayStreamedFinalResponse(allocator, &rb, transport, fd, &head, method, downstream_writer, downstreamSocketFd(downstream_conn), security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, read_deadline_ms, cancel_token, response_stream_control, wrote_downstream, ttfb_ms);
 }
 
 const StreamedExchange = struct { result: StreamingProxyResult, reusable: bool };
@@ -3310,6 +3411,7 @@ fn relayStreamedFinalResponse(
     head: *const ParsedUpstreamHead,
     method: []const u8,
     downstream_writer: anytype,
+    downstream_fd: ?std.posix.fd_t,
     security: *const http.security_headers.SecurityHeaders,
     alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
@@ -3333,7 +3435,7 @@ fn relayStreamedFinalResponse(
                 control.location,
                 http.event_loop.monotonicMs(),
             ) orelse return error.ResponseStreamCapacityUnavailable;
-            tracked = .{ .state = control.state, .admission = admission };
+            tracked = .{ .state = control.state, .admission = admission, .downstream_fd = downstream_fd };
         }
     }
     defer if (tracked) |*stream| stream.finish(close_reason);
@@ -3598,7 +3700,7 @@ pub fn executeStreamingHttpProxyRequest(
     if (stream_h2) {
         if (h2_pool) |hp| {
             const h2_opts: ?http.upstream_tls.UpstreamTlsOptions = if (is_https) tls_options.? else null;
-            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, requested_relay_bytes, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_global, downstream_committed);
+            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, requested_relay_bytes, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, response_stream_control, cfg.proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_global, downstream_committed);
         }
         if (streaming_body != null) {
             if (pool) |p| p.recordH2StreamingUploadFallback();
@@ -3982,9 +4084,9 @@ pub fn openWebSocketUpstream(
         // a protocol switch, not a keep-alive exchange).
         var wrote_downstream = false;
         const exchange = (if (tls) |t|
-            relayStreamedFinalResponse(allocator, &rb, t, fd, &head, "GET", downstream_writer, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, null, &wrote_downstream, 0)
+            relayStreamedFinalResponse(allocator, &rb, t, fd, &head, "GET", downstream_writer, null, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, null, &wrote_downstream, 0)
         else
-            relayStreamedFinalResponse(allocator, &rb, compat.netStreamFromFd(fd), fd, &head, "GET", downstream_writer, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, null, &wrote_downstream, 0)) catch |err| {
+            relayStreamedFinalResponse(allocator, &rb, compat.netStreamFromFd(fd), fd, &head, "GET", downstream_writer, null, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, null, &wrote_downstream, 0)) catch |err| {
             downstream_committed.* = wrote_downstream;
             return err;
         };
@@ -5994,6 +6096,7 @@ fn runH2ExchangeThread(ctx: *H2ExchangeCtx) void {
         2000,
         5000,
         null,
+        null,
         ctx.limits,
         ctx.observer,
         ctx.global,
@@ -6067,6 +6170,7 @@ fn runH2CancelExchangeThread(ctx: *H2ExchangeCtx, token: *CancellationToken) voi
         2000,
         5000,
         token,
+        null,
         ctx.limits,
         ctx.observer,
         ctx.global,
@@ -6303,6 +6407,7 @@ test "http2 upload capacity is refused before HEADERS reach the origin" {
             false,
             2000,
             2000,
+            null,
             null,
             limits,
             counters.observer(),
@@ -6830,6 +6935,7 @@ const Http1ResponseRelay = struct {
             0,
             self.read_deadline_ms,
             self.cancel_token,
+            null,
             self.limits,
             self.counters.observer(),
             self.capacity,
@@ -7308,6 +7414,7 @@ fn runH2GatedExchangeThread(ctx: *H2GatedExchangeCtx) void {
         true,
         2000,
         10_000,
+        null,
         null,
         ctx.limits,
         ctx.observer,
@@ -7875,6 +7982,7 @@ fn runH2TrackedExchange(ctx: *H2TrackedExchangeCtx) void {
         true,
         2000,
         10_000,
+        null,
         null,
         ctx.limits,
         ctx.counters.observer(),
@@ -8646,7 +8754,7 @@ fn runH2ReplayScenario(entry: H2EntryPoint, method: []const u8, body: []const u8
             defer captured.deinit();
             var security = http.security_headers.SecurityHeaders{};
             var downstream_committed = false;
-            if (streamViaH2Pool(allocator, &h2_pool, &h1_pool, "127.0.0.1", listener.port, null, uri, method, &.{}, body, null, relay_bytes, &source, CaptureWriter{ .list = &captured }, &security, null, null, "h2-785-test", true, 2_000, 2_000, null, uploadTestLimits(1024 * 1024), counters.observer(), &global, &downstream_committed)) |result| {
+            if (streamViaH2Pool(allocator, &h2_pool, &h1_pool, "127.0.0.1", listener.port, null, uri, method, &.{}, body, null, relay_bytes, &source, CaptureWriter{ .list = &captured }, &security, null, null, "h2-785-test", true, 2_000, 2_000, null, null, uploadTestLimits(1024 * 1024), counters.observer(), &global, &downstream_committed)) |result| {
                 status = result.status_code;
             } else |e| err = e;
         },

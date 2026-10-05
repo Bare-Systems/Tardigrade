@@ -6908,12 +6908,12 @@ test "http1 response memory is not allocated until a reservation admits it" {
     // its buffer.
     var refused: usize = 0;
     var waited: u32 = 0;
-    while (refused < 2 and waited < 30_000) : (waited += 5) {
+    while ((refused < 2 or tracker.peakLargeLive() < relay_bytes) and waited < 30_000) : (waited += 5) {
         refused = 0;
         for (&relays) |*relay| {
             if (relay.finished.load(.acquire) and relay.err != null) refused += 1;
         }
-        if (refused < 2) sleepMs(5);
+        if (refused < 2 or tracker.peakLargeLive() < relay_bytes) sleepMs(5);
     }
     try std.testing.expectEqual(@as(usize, 2), refused);
 

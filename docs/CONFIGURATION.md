@@ -972,8 +972,9 @@ WebSockets are relayed per location with `proxy_websocket on;` (see
 | `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS` | u32 | `0` (one per four CPUs, between 1 and 4) | Threads that relay established WebSocket tunnels; each owns many tunnels. Read at startup only (0-64); a hot reload that changes it is rejected and requires restart. Config directive: `proxy_websocket_reactor_threads`. | `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS=2` |
 
 Long-lived streamed HTTP responses, including SSE, have a separate generic
-control-plane contract. Identification is based on HTTP response metadata;
-Tardigrade does not inspect event or application payloads.
+lifecycle contract. The HTTP/1 streaming relay identifies them from HTTP
+response metadata before committing the downstream head; Tardigrade does not
+inspect event or application payloads.
 
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |

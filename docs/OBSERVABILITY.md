@@ -46,7 +46,7 @@ logs are written through `src/http/logger.zig`.
 - reverse-proxy streaming and buffered request counters:
   `tardigrade_proxy_streaming_requests_total` and
   `tardigrade_proxy_buffered_requests_total`
-- long-lived streamed-response lifecycle metrics (#841):
+- long-lived streamed-response lifecycle metrics (#841, HTTP/1 wiring #842):
   `tardigrade_response_streams_active`,
   `tardigrade_response_stream_admissions_total{outcome}` with fixed outcomes
   `admitted` and `capacity`, `tardigrade_response_stream_duration_seconds`,

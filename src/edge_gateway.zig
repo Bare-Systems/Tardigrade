@@ -1343,7 +1343,7 @@ fn serveOneRequest(
     var lease_transferred = false;
     defer if (!lease_transferred) live_cfg_lease.release();
     const live_cfg = live_cfg_lease.cfg;
-    const outcome = serveOneRequestWithConfig(ctx, conn, session, live_cfg, &live_cfg_lease.version.superseded_at_ms, connection_ip, served, enable_proxy_protocol, allow_tunnel_handoff);
+    const outcome = serveOneRequestWithConfig(ctx, conn, session, live_cfg, &live_cfg_lease, &live_cfg_lease.version.superseded_at_ms, connection_ip, served, enable_proxy_protocol, allow_tunnel_handoff);
     switch (outcome) {
         .tunnel => |job| {
             job.adoptConfigLease(live_cfg_lease);
@@ -1359,6 +1359,7 @@ fn serveOneRequestWithConfig(
     conn: anytype,
     session: *ConnectionSession,
     cfg: *const edge_config.EdgeConfig,
+    config_lease: ?*gs.ConfigLease,
     /// `cfg`'s generation supersession stamp (see `ManagedConfigVersion`).
     config_superseded_at: *const std.atomic.Value(u64),
     connection_ip: []const u8,
@@ -1382,7 +1383,7 @@ fn serveOneRequestWithConfig(
 
     var keep_alive = false;
     var tunnel_handoff: ?*gws_tunnel.TunnelJob = null;
-    handleConnection(conn, session, cfg, config_superseded_at, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol, is_last_allowed_request, if (allow_tunnel_handoff) &tunnel_handoff else null) catch |err| {
+    handleConnection(conn, session, cfg, config_lease, config_superseded_at, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol, is_last_allowed_request, if (allow_tunnel_handoff) &tunnel_handoff else null) catch |err| {
         if (isBenignDisconnect(err)) {
             ctx.state.logger.debug(null, "keepalive connection closed by peer: {}", .{err});
         } else {
@@ -2143,6 +2144,14 @@ const WaitingEncryptedHttpConnection = struct {
 
     pub fn pendingPlaintext(self: *const WaitingEncryptedHttpConnection) usize {
         return self.inner.pendingPlaintext();
+    }
+
+    pub fn probePeerCloseBounded(
+        self: *WaitingEncryptedHttpConnection,
+        max_drives: usize,
+    ) !http.encrypted_stream_connection.PeerCloseProbe {
+        defer self.observeTlsBufferMetrics();
+        return self.inner.probePeerCloseBounded(max_drives);
     }
 
     pub fn rawFd(self: *const WaitingEncryptedHttpConnection) std.posix.fd_t {
@@ -4740,7 +4749,7 @@ fn setConnTimeouts(conn: anytype, read_timeout_ms: u32, write_timeout_ms: u32) v
 /// established tunnel to the reactor (#818): on return it holds the pending
 /// job, which the caller must attach to the connection and submit (or
 /// abandon). The connection is then the tunnel's and must not be reused.
-fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, config_superseded_at: ?*const std.atomic.Value(u64), state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool, is_last_allowed_request: bool, tunnel_handoff_out: ?*?*gws_tunnel.TunnelJob) !void {
+fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, config_lease: ?*gs.ConfigLease, config_superseded_at: ?*const std.atomic.Value(u64), state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool, is_last_allowed_request: bool, tunnel_handoff_out: ?*?*gws_tunnel.TunnelJob) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
     defer keep_alive_out.* = keep_alive;
@@ -5151,6 +5160,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // consumes them, as the first tunnel bytes (#812).
     ctx.downstream_buffered_input = pending_buf[pending_start..][0..session.pending_len];
     ctx.config_superseded_at = config_superseded_at;
+    ctx.response_stream_config_lease = if (config_lease) |lease| @ptrCast(lease) else null;
     ctx.tunnel_handoff_allowed = tunnel_handoff_out != null;
     errdefer if (ctx.tunnel_handoff) |raw| {
         const job: *gws_tunnel.TunnelJob = @ptrCast(@alignCast(raw));

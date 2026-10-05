@@ -123,18 +123,26 @@ location /events/ {
   bytes, so an origin that goes silent longer than that ends the stream.
   Origins that are legitimately quiet should send periodic comment lines
   (`: keep-alive`) more often than the timeout.
+- **Admission.** A final HTTP/1 response whose `Content-Type` media type is
+  `text/event-stream` is admitted before its downstream response head is
+  committed. Admission uses the process-wide
+  `proxy_response_stream_max_active` cap; an excess stream receives a complete
+  `503` response, and its upstream exchange and relay-buffer reservations are
+  released.
 - **Close and reconnect.** When the origin ends the response, the client
   receives the terminating chunk and reconnects with `Last-Event-ID` on its
   own; Tardigrade forwards that header like any other. If the origin
   connection fails mid-stream, the client connection is closed without a
   terminating chunk, which EventSource clients also treat as a reason to
   reconnect.
-- **Reload and shutdown.** Hot reload leaves open streams alone. Graceful
-  shutdown stops new streams, but an open stream is only ended by the
-  upstream response timeout, the origin, the client, or the supervisor's stop
-  timeout: the TCP drain timeout is a soft cap (see
-  [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md)). Set systemd `TimeoutStopSec`
-  accordingly when serving long-lived streams.
+- **Reload.** Each admitted stream retains the configuration generation and
+  per-location lifecycle policy that admitted it. The default `preserve`
+  policy leaves it open across reloads; `drain` closes it without a terminal
+  chunk when the captured reload drain deadline expires. Response-read waits
+  are shortened to the earlier of the ordinary upstream timeout and that
+  reload deadline. Graceful-shutdown timing for admitted streams is tracked by
+  #844 and is not yet part of this relay contract. See
+  [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md).
 
 ## Fallback reasons
 

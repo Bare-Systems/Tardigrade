@@ -12939,6 +12939,24 @@ const PureZigTlsClient = struct {
         if (offset < out.len) return error.ReadTimeout;
     }
 
+    /// Send TLS `close_notify` while deliberately leaving the underlying TCP
+    /// descriptor open. This exercises server-side record-layer close
+    /// observation rather than the raw socket's FIN/HUP path.
+    fn sendCloseNotifyKeepingTcpOpen(self: *PureZigTlsClient, timeout_ms: u64) !void {
+        self.record.stream().close();
+        const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (compat.milliTimestamp() < deadline) {
+            const driven = try self.record.drive();
+            const readiness = self.record.readiness();
+            if (!readiness.wants_write and self.record.queuedCiphertextLen() == 0) return;
+            if (!driven.made_progress) self.waitForReadiness(100) catch |err| switch (err) {
+                error.WouldBlock => {},
+                else => return err,
+            };
+        }
+        return error.WriteFailed;
+    }
+
     fn writeHttp2Frame(self: *PureZigTlsClient, typ: u8, flags: u8, stream_id: u31, payload: []const u8) !void {
         var header: [9]u8 = undefined;
         header[0] = @intCast((payload.len >> 16) & 0xff);
@@ -23975,10 +23993,63 @@ fn sseOriginMain(origin: *SseOrigin) void {
     conn.stream.writeAll(std.fmt.bufPrint(&line_buf, "{x}\r\n", .{first.len}) catch return) catch return;
     conn.stream.writeAll(first ++ "\r\n") catch return;
     const deadline = compat.milliTimestamp() + 10_000;
-    while (!origin.release.load(.seq_cst) and compat.milliTimestamp() < deadline) compat.sleepNs(10 * std.time.ns_per_ms);
+    // Valid SSE comments keep an indefinitely-open response active without
+    // relying on application event semantics. They also put sustained pressure
+    // on a client that stops reading, exercising the relay's existing bounded
+    // buffer/backpressure path while lifecycle accounting remains admitted.
+    const keepalive = ":" ++ ("k" ** 2048) ++ "\n\n";
+    conn.stream.writeAll(std.fmt.bufPrint(&line_buf, "{x}\r\n", .{keepalive.len}) catch return) catch return;
+    conn.stream.writeAll(keepalive ++ "\r\n") catch return;
+    while (!origin.release.load(.seq_cst) and compat.milliTimestamp() < deadline) {
+        conn.stream.writeAll(std.fmt.bufPrint(&line_buf, "{x}\r\n", .{keepalive.len}) catch return) catch return;
+        conn.stream.writeAll(keepalive ++ "\r\n") catch return;
+        compat.sleepNs(5 * std.time.ns_per_ms);
+    }
     const second = "id: 2\nevent: tick\ndata: two\n\n";
     conn.stream.writeAll(std.fmt.bufPrint(&line_buf, "{x}\r\n", .{second.len}) catch return) catch return;
     conn.stream.writeAll(second ++ "\r\n0\r\n\r\n") catch return;
+}
+
+/// An SSE origin that becomes completely quiet after its head and first
+/// event. It exercises lifecycle wakeups that cannot rely on a later upstream
+/// byte or downstream write to discover a dead client.
+const QuietSseOrigin = struct {
+    server: compat.NetServer,
+    thread: ?std.Thread = null,
+    release: std.atomic.Value(bool) = .init(false),
+    served: std.atomic.Value(bool) = .init(false),
+
+    fn start() !QuietSseOrigin {
+        return .{ .server = try compat.listenTcp(test_host, 0) };
+    }
+
+    fn run(self: *QuietSseOrigin) !void {
+        self.thread = try std.Thread.spawn(.{}, quietSseOriginMain, .{self});
+    }
+
+    fn stop(self: *QuietSseOrigin) void {
+        self.release.store(true, .release);
+        if (!self.served.load(.acquire)) wakeListener(self.server.port());
+        if (self.thread) |thread| thread.join();
+        self.server.deinit();
+    }
+};
+
+fn quietSseOriginMain(origin: *QuietSseOrigin) void {
+    var conn = while (true) {
+        break origin.server.accept() catch {
+            if (origin.release.load(.acquire)) return;
+            continue;
+        };
+    };
+    defer conn.stream.close();
+    var peer = WsPeer{ .stream = conn.stream };
+    const head = peer.readHead(std.heap.page_allocator) catch return;
+    std.heap.page_allocator.free(head);
+    origin.served.store(true, .release);
+    conn.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1d\r\nid: 1\nevent: tick\ndata: one\n\n\r\n") catch return;
+    while (!origin.release.load(.acquire)) compat.sleepNs(5 * std.time.ns_per_ms);
+    conn.stream.writeAll("0\r\n\r\n") catch {};
 }
 
 test "server-sent events stream through proxy_streaming response without buffering (#762)" {
@@ -24028,8 +24099,550 @@ test "server-sent events stream through proxy_streaming response without bufferi
     defer allocator.free(rest);
     try seen.appendSlice(rest);
     try assertContains(seen.items, "data: two");
+    try assertContains(seen.items, ":kkkk");
     // The upstream's clean end of stream ends the client's response cleanly.
     try std.testing.expect(std.mem.endsWith(u8, seen.items, "0\r\n\r\n"));
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(?u64, 0), prometheusMetricValue(metrics.body, "tardigrade_response_streams_active"));
+    try std.testing.expectEqual(@as(?u64, 1), prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_admissions_total", &.{"outcome=\"admitted\""}));
+    try std.testing.expectEqual(@as(?u64, 1), prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"upstream\""}));
+}
+
+test "SSE capacity refusal leaves no admission or relay accounting and a slow client closes once (#842)" {
+    const allocator = std.testing.allocator;
+    var first_origin = try SseOrigin.start();
+    defer first_origin.stop();
+    try first_origin.run();
+    var second_origin = try SseOrigin.start();
+    defer second_origin.stop();
+    try second_origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\proxy_response_stream_max_active 1;
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /first/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+        \\location /second/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, first_origin.server.port(), test_host, second_origin.server.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var first = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    var first_open = true;
+    defer if (first_open) first.close();
+    try setStreamTimeouts(&first, 10_000);
+    try first.writeAll("GET /first/feed HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    var first_peer = WsPeer{ .stream = first };
+    const first_head = try first_peer.readHead(allocator);
+    defer allocator.free(first_head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(first_head));
+
+    // Do not consume the response body while the origin emits keepalive
+    // comments. The fixed relay buffer and socket backpressure, rather than an
+    // unbounded queue, carry this slow-reader interval.
+    compat.sleepNs(500 * std.time.ns_per_ms);
+
+    var refused = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/second/feed", .body = null, .headers = &.{} });
+    defer refused.deinit();
+    try std.testing.expectEqual(@as(u16, 503), refused.status_code);
+    try assertContains(refused.body, "response_stream_capacity");
+
+    var during = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+    defer during.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), prometheusMetricValue(during.body, "tardigrade_response_streams_active"));
+    try std.testing.expectEqual(@as(?u64, 1), prometheusLabeledMetricValue(during.body, "tardigrade_response_stream_admissions_total", &.{"outcome=\"capacity\""}));
+    try std.testing.expectEqual(@as(?u64, 1), prometheusLabeledMetricValue(during.body, "tardigrade_response_stream_closes_total", &.{"reason=\"capacity\""}));
+    // Only the admitted stream's fixed relay slab remains charged. The refused
+    // exchange has already unwound its own reservation before the 503 arrives.
+    try std.testing.expectEqual(@as(?u64, 16 * 1024), prometheusLabeledMetricValue(during.body, "tardigrade_buffered_bytes_current", &.{ "direction=\"upstream_to_downstream\"", "scope=\"global\"" }));
+
+    var linger = std.c.linger{ .onoff = 1, .linger = 0 };
+    _ = std.c.setsockopt(first.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, @ptrCast(&linger), @sizeOf(std.c.linger));
+    first.close();
+    first_open = false;
+    first_origin.release.store(true, .seq_cst);
+
+    const client_close_deadline = compat.milliTimestamp() + 5_000;
+    while (compat.milliTimestamp() < client_close_deadline) {
+        var metrics = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+        defer metrics.deinit();
+        const closed = prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"client\""}) orelse 0;
+        const active = prometheusMetricValue(metrics.body, "tardigrade_response_streams_active") orelse 1;
+        if (closed >= 1 and active == 0) break;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    } else return error.MetricThresholdNotReached;
+
+    var settled = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+    defer settled.deinit();
+    try std.testing.expectEqual(@as(?u64, 0), prometheusLabeledMetricValue(settled.body, "tardigrade_buffered_bytes_current", &.{ "direction=\"upstream_to_downstream\"", "scope=\"global\"" }));
+}
+
+test "quiet SSE releases admission promptly when the client disconnects (#842)" {
+    const allocator = std.testing.allocator;
+    var origin = try QuietSseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, origin.server.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll("GET /events/feed HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    var peer = WsPeer{ .stream = stream };
+    const head = try peer.readHead(allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
+
+    // Leave a byte of a pipelined next request readable while the origin is
+    // quiet. The lifecycle poll must not consume it or spin on POLLIN; the
+    // focused socketpair regression in gateway_proxy.zig asserts the bounded
+    // wait directly, while this exercises the real admitted SSE path.
+    try stream.writeAll("G");
+    compat.sleepNs(125 * std.time.ns_per_ms);
+
+    // The origin sends no further bytes after its first event. The relay must
+    // observe this RST on the downstream socket itself rather than waiting for
+    // the five-second upstream response timeout.
+    var linger = std.c.linger{ .onoff = 1, .linger = 0 };
+    _ = std.c.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, @ptrCast(&linger), @sizeOf(std.c.linger));
+    stream.close();
+
+    const deadline = compat.milliTimestamp() + 2_000;
+    while (compat.milliTimestamp() < deadline) {
+        var metrics = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+        defer metrics.deinit();
+        const active = prometheusMetricValue(metrics.body, "tardigrade_response_streams_active") orelse 1;
+        const closed = prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"client\""}) orelse 0;
+        if (active == 0 and closed >= 1) break;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    } else return error.MetricThresholdNotReached;
+}
+
+test "quiet SSE over native TLS observes close_notify without a TCP close (#842 review)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var origin = try QuietSseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, origin.server.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS", .value = "5000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", "tardigrade.test");
+    defer client.destroy();
+    try client.writeAllPlain("GET /events/feed HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const head = try wssReadHead(client, allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
+
+    var first_event = std.array_list.Managed(u8).init(allocator);
+    defer first_event.deinit();
+    while (std.mem.find(u8, first_event.items, "data: one") == null) {
+        if (first_event.items.len >= 4096) return error.MessageTooLarge;
+        var byte: [1]u8 = undefined;
+        try client.readExactPlain(&byte, 5_000);
+        try first_event.append(byte[0]);
+    }
+
+    try client.sendCloseNotifyKeepingTcpOpen(2_000);
+
+    const deadline = compat.milliTimestamp() + 2_000;
+    while (compat.milliTimestamp() < deadline) {
+        var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+        const active = prometheusMetricValue(metrics.body, "tardigrade_response_streams_active") orelse 1;
+        const closed = prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"client\""}) orelse 0;
+        metrics.deinit();
+        if (active == 0 and closed >= 1) break;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    } else return error.MetricThresholdNotReached;
+}
+
+test "abrupt native TLS SSE half-close remains a client failure (#842 review)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var origin = try QuietSseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+    var probe_origin = try UpstreamServer.start(allocator, &.{.{ .body = "healthy origin" }});
+    defer probe_origin.stop();
+    try probe_origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+        \\location /probe/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.server.port(), test_host, probe_origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS", .value = "5000" },
+            .{ .name = "TARDIGRADE_CB_THRESHOLD", .value = "1" },
+            .{ .name = "TARDIGRADE_CB_TIMEOUT_MS", .value = "30000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", "tardigrade.test");
+    defer client.destroy();
+    try client.writeAllPlain("GET /events/feed HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const head = try wssReadHead(client, allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
+
+    var first_event = std.array_list.Managed(u8).init(allocator);
+    defer first_event.deinit();
+    while (std.mem.find(u8, first_event.items, "data: one") == null) {
+        if (first_event.items.len >= 4096) return error.MessageTooLarge;
+        var byte: [1]u8 = undefined;
+        try client.readExactPlain(&byte, 5_000);
+        try first_event.append(byte[0]);
+    }
+
+    // No TLS close_notify: only half-close the TCP write side so the server
+    // observes a truncated TLS stream while this client retains its read side.
+    if (std.c.shutdown(client.stream.handle, std.posix.SHUT.WR) != 0) return error.ShutdownFailed;
+
+    const deadline = compat.milliTimestamp() + 2_000;
+    while (compat.milliTimestamp() < deadline) {
+        var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+        const active = prometheusMetricValue(metrics.body, "tardigrade_response_streams_active") orelse 1;
+        const closed = prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"client\""}) orelse 0;
+        metrics.deinit();
+        if (active == 0 and closed >= 1) break;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    } else return error.MetricThresholdNotReached;
+
+    var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(?u64, 0), prometheusMetricValue(metrics.body, "tardigrade_proxy_upstream_aborts_total"));
+
+    // With a threshold of one, misclassifying the downstream truncation as an
+    // origin failure would open the global circuit and return 503 here.
+    var probe = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/probe/after-client-close", "tardigrade.test");
+    defer probe.deinit();
+    try std.testing.expectEqual(@as(u16, 200), probe.status_code);
+    try std.testing.expectEqualStrings("healthy origin", probe.body);
+}
+
+test "SSE capacity applies to HTTPS ALPN HTTP/1 fallback (#842)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    var first_origin = try SseOrigin.start();
+    defer first_origin.stop();
+    try first_origin.run();
+    var second_origin = try SseOrigin.start();
+    defer second_origin.stop();
+    try second_origin.run();
+
+    const ca_cert = try upstreamTlsFixture("native_ed25519_ca.crt", allocator);
+    defer allocator.free(ca_cert);
+    const chain_cert = try upstreamTlsFixture("native_ed25519_chain.crt", allocator);
+    defer allocator.free(chain_cert);
+    const key = try upstreamTlsFixture("native_ed25519.key", allocator);
+    defer allocator.free(key);
+    const inner_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /first/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+        \\location /second/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, first_origin.server.port(), test_host, second_origin.server.port() });
+    defer allocator.free(inner_config);
+    var inner = try TardigradeProcess.start(allocator, .{
+        .config_text = inner_config,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = chain_cert },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = key },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+        },
+    });
+    defer inner.stop();
+
+    const edge_config = try std.fmt.allocPrint(allocator,
+        \\proxy_response_stream_max_active 1;
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /first/ {{
+        \\    proxy_pass https://{s}:{d}/first/;
+        \\    proxy_streaming response;
+        \\}}
+        \\location /second/ {{
+        \\    proxy_pass https://{s}:{d}/second/;
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, inner.port, test_host, inner.port });
+    defer allocator.free(edge_config);
+    var edge = try TardigradeProcess.start(allocator, .{
+        .config_text = edge_config,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_UPSTREAM_PROTOCOL", .value = "auto" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = ca_cert },
+        },
+    });
+    defer edge.stop();
+
+    var first = try compat.tcpConnectToHost(allocator, test_host, edge.port);
+    defer first.close();
+    try setStreamTimeouts(&first, 10_000);
+    try first.writeAll("GET /first/feed HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    var first_peer = WsPeer{ .stream = first };
+    const first_head = try first_peer.readHead(allocator);
+    defer allocator.free(first_head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(first_head));
+
+    var refused = try sendRequestWithTimeout(allocator, edge.port, .{ .method = "GET", .path = "/second/feed", .body = null, .headers = &.{} }, 10_000);
+    defer refused.deinit();
+    try std.testing.expectEqual(@as(u16, 503), refused.status_code);
+    try assertContains(refused.body, "response_stream_capacity");
+}
+
+test "SSE reload drain uses the admitted generation deadline (#842)" {
+    const allocator = std.testing.allocator;
+    var origin = try SseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\proxy_response_stream_reload drain;
+        \\proxy_response_stream_reload_timeout_ms 100;
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, origin.server.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll("GET /events/feed HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    var peer = WsPeer{ .stream = stream };
+    const head = try peer.readHead(allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
+
+    const reload_sent_ms = try wsReload(allocator, &tardigrade, config_text);
+    const remainder = try peer.readToEnd(allocator);
+    defer allocator.free(remainder);
+    const closed_ms = compat.milliTimestamp();
+    try std.testing.expect(closed_ms - reload_sent_ms >= 50);
+    try std.testing.expect(closed_ms - reload_sent_ms < 2_000);
+    try std.testing.expect(!std.mem.endsWith(u8, remainder, "0\r\n\r\n"));
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(?u64, 0), prometheusMetricValue(metrics.body, "tardigrade_response_streams_active"));
+    try std.testing.expectEqual(@as(?u64, 1), prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"reload\""}));
+}
+
+test "SSE reload drain bounds a quiet native HTTPS upstream read (#842)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    var origin = try QuietSseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+
+    const ca_cert = try upstreamTlsFixture("native_ed25519_ca.crt", allocator);
+    defer allocator.free(ca_cert);
+    const chain_cert = try upstreamTlsFixture("native_ed25519_chain.crt", allocator);
+    defer allocator.free(chain_cert);
+    const key = try upstreamTlsFixture("native_ed25519.key", allocator);
+    defer allocator.free(key);
+    const inner_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, origin.server.port() });
+    defer allocator.free(inner_config);
+    var inner = try TardigradeProcess.start(allocator, .{
+        .config_text = inner_config,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = chain_cert },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = key },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+        },
+    });
+    defer inner.stop();
+
+    const edge_config = try std.fmt.allocPrint(allocator,
+        \\proxy_response_stream_reload drain;
+        \\proxy_response_stream_reload_timeout_ms 100;
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass https://{s}:{d}/events/;
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, inner.port });
+    defer allocator.free(edge_config);
+    var edge = try TardigradeProcess.start(allocator, .{
+        .config_text = edge_config,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_UPSTREAM_PROTOCOL", .value = "auto" },
+            .{ .name = "TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS", .value = "5000" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = ca_cert },
+        },
+    });
+    defer edge.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, edge.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll("GET /events/feed HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    var peer = WsPeer{ .stream = stream };
+    const head = try peer.readHead(allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
+
+    const reload_sent_ms = try wsReload(allocator, &edge, edge_config);
+    const remainder = try peer.readToEnd(allocator);
+    defer allocator.free(remainder);
+    const elapsed_ms = compat.milliTimestamp() - reload_sent_ms;
+    try std.testing.expect(elapsed_ms >= 50);
+    try std.testing.expect(elapsed_ms < 2_000);
+    try std.testing.expect(!std.mem.endsWith(u8, remainder, "0\r\n\r\n"));
+
+    var metrics = try sendRequest(allocator, edge.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(?u64, 0), prometheusMetricValue(metrics.body, "tardigrade_response_streams_active"));
+    try std.testing.expectEqual(@as(?u64, 1), prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"reload\""}));
+}
+
+test "SSE lifecycle admission works over native TLS HTTP/1 downstream (#842)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var origin = try SseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+    origin.release.store(true, .seq_cst);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, origin.server.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/events/feed", "tardigrade.test");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("text/event-stream", response.header("Content-Type").?);
+    try assertContains(response.body, "data: one");
+    try assertContains(response.body, "data: two");
+
+    var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_admissions_total", &.{"outcome=\"admitted\""}));
+    try std.testing.expectEqual(@as(?u64, 1), prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"upstream\""}));
 }
 
 // ---- WebSocket tunnels across hot reload (#812) ----------------------------

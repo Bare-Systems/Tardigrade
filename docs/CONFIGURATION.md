@@ -986,7 +986,42 @@ removed. They are still parsed but have no effect, and are being retired.
 | `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST` | hostname | `""` | When non-empty, periodically resolves A/AAAA addresses and merges them into upstream pool. | `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST=app.service.local` |
 | `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_PORT` | u16 | `80` | Port assigned to DNS-discovered addresses. | `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_PORT=8080` |
 | `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_TLS` | bool | `false` | Use HTTPS for DNS-discovered upstreams. | `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_TLS=true` |
-| `TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS` | u64 ms | `30000` | Re-resolution interval. | `TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS=10000` |
+| `TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS` | u64 ms | `30000` | Re-resolution interval (A/AAAA); in SRV mode, the maximum refresh interval. | `TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS=10000` |
+| `TARDIGRADE_UPSTREAM_SRV_NAME` | SRV name | `""` | DNS SRV discovery (#766): resolves `_service._proto.name`, then each target's A/AAAA. Wins over `..._DNS_DISCOVERY_HOST`. | `TARDIGRADE_UPSTREAM_SRV_NAME=_api._tcp.service.internal` |
+| `TARDIGRADE_UPSTREAM_SRV_TLS` | bool | `false` | Use HTTPS for SRV-discovered upstreams. | `TARDIGRADE_UPSTREAM_SRV_TLS=true` |
+| `TARDIGRADE_UPSTREAM_SRV_MIN_REFRESH_MS` | u64 ms | `5000` | Lower bound of the TTL-derived refresh interval. | `TARDIGRADE_UPSTREAM_SRV_MIN_REFRESH_MS=2000` |
+| `TARDIGRADE_UPSTREAM_SRV_STALE_MAX_MS` | u64 ms | `300000` | How long the last good set survives SERVFAIL/timeouts. | `TARDIGRADE_UPSTREAM_SRV_STALE_MAX_MS=120000` |
+| `TARDIGRADE_UPSTREAM_SRV_TIMEOUT_MS` | u32 ms | `2000` | Per-nameserver SRV query timeout. | `TARDIGRADE_UPSTREAM_SRV_TIMEOUT_MS=1000` |
+
+#### DNS SRV upstream discovery
+
+```sh
+TARDIGRADE_UPSTREAM_SRV_NAME=_api._tcp.service.internal
+TARDIGRADE_UPSTREAM_SRV_TLS=true
+```
+
+- **Priority/weight:** the lowest-priority group is the primary set, served by
+  smooth weighted round-robin (weight 0 gets a minimal share; a target's weight
+  is split across its addresses). Every higher-priority group is a backup,
+  tried in ascending priority only when all primaries are unhealthy. Active and
+  passive health checks, `slow_start` and the pool apply to each `ip:port`.
+- **Refresh:** TTL-driven, clamped to `[SRV_MIN_REFRESH_MS, DNS_REFRESH_INTERVAL_MS]`
+  with ±10% jitter. Resolution runs on a background thread; the live set is
+  swapped atomically, and removed endpoint strings stay valid for 10 minutes so
+  in-flight requests are never corrupted.
+- **Stale policy:** NXDOMAIN, an empty answer or the RFC 2782 `.` target clears
+  the set immediately. SERVFAIL, timeouts and "no target resolved" keep the last
+  good set for up to `SRV_STALE_MAX_MS` after the last success (retrying with
+  backoff), then clear it. Truncated UDP answers are used as received; there is
+  no TCP fallback. At most 32 SRV records and 64 endpoints are kept.
+- **TLS identity:** endpoints are dialed by IP, so verification uses
+  `TARDIGRADE_UPSTREAM_TLS_SERVER_NAME` if set, otherwise the logical service
+  name (the SRV name without `_service._proto.`, e.g. `service.internal`) —
+  never the SRV target and never the IP. This name is process-wide, like the
+  existing setting. mTLS uses the existing `TARDIGRADE_UPSTREAM_TLS_CLIENT_*`.
+- **Metrics:** `tardigrade_upstream_discovery_endpoints{role}`,
+  `..._stale`, `..._refresh_total`, `..._refresh_failures_total`,
+  `..._changes_total`.
 
 ## Full Annotated Example
 

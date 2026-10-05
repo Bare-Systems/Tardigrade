@@ -173,8 +173,12 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         .dns_discovery = http.dns_discovery.DnsDiscovery.init(state_allocator, .{
             .host = cfg.upstream_dns_discovery_host,
             .port = cfg.upstream_dns_discovery_port,
-            .tls = cfg.upstream_dns_discovery_tls,
+            .tls = if (cfg.upstream_srv_name.len > 0) cfg.upstream_srv_tls else cfg.upstream_dns_discovery_tls,
             .refresh_interval_ms = cfg.upstream_dns_refresh_interval_ms,
+            .srv_name = cfg.upstream_srv_name,
+            .min_refresh_ms = cfg.upstream_srv_min_refresh_ms,
+            .stale_max_ms = cfg.upstream_srv_stale_max_ms,
+            .query_timeout_ms = cfg.upstream_srv_timeout_ms,
         }),
     };
     defer state.deinit();

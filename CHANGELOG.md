@@ -4,6 +4,23 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **DNS SRV upstream discovery (#766).** `TARDIGRADE_UPSTREAM_SRV_NAME`
+  resolves `_service._proto.name` SRV records, resolves each target to
+  A/AAAA, and builds the upstream pool from SRV priority (lowest = primary,
+  higher = ordered backups) and weight. Refresh follows the record TTL within
+  configurable bounds with jitter, runs off the event loop, and swaps the live
+  set atomically. DNS failures keep the last good set for a bounded stale
+  window; NXDOMAIN clears it. TLS upstreams verify the logical service name.
+  Discovery state is exported as `tardigrade_upstream_discovery_*` metrics.
+
+### Fixed
+
+- DNS A/AAAA discovery now resolves hostnames (it previously only parsed IP
+  literals), and discovered URL strings are no longer freed under in-flight
+  requests when the set changes. Discovered endpoints now honour health state.
+
 ### Security
 
 - **Every production secret wipe now uses the canonical zeroization helper,

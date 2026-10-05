@@ -589,8 +589,8 @@ pub const GatewayState = struct {
     /// Borrowed from startup cfg; restart-only (warns on change at reload). [transcript_mutex guards appends]
     transcript_store_path: []const u8,
     /// DNS-based upstream discovery state. Active when
-    /// cfg.upstream_dns_discovery_host is non-empty. Owned; self-synchronized;
-    /// refreshed by the main event loop.
+    /// cfg.upstream_dns_discovery_host or cfg.upstream_srv_name is non-empty.
+    /// Owned; self-synchronized; refreshed by a detached background thread.
     dns_discovery: http.dns_discovery.DnsDiscovery,
     /// Reload state: set by hotReloadConfig on every attempt so operators can
     /// query the outcome without tailing logs. [reload_mutex]
@@ -2297,25 +2297,37 @@ pub const GatewayState = struct {
         const now_ms = http.event_loop.monotonicMs();
         // When the pool has no static primaries, check DNS-discovered upstreams first.
         if (pool.primary_urls.len == 0) {
-            if (self.selectDiscoveredUpstreamLocked(now_ms)) |discovered| return discovered;
+            if (self.selectDiscoveredUpstreamLocked(cfg, now_ms)) |discovered| return discovered;
         }
         return self.nextUpstreamBaseUrlLocked(cfg, pool, client_ip, hash_key, now_ms);
     }
 
-    /// Select a URL from the DNS-discovered upstream set in round-robin order.
-    /// Must be called while holding upstream_mutex. Returns null when discovery
-    /// is inactive or the discovered set is empty.
-    pub fn selectDiscoveredUpstreamLocked(self: *GatewayState, now_ms: u64) ?[]const u8 {
-        _ = now_ms;
-        // We need to read dns_discovery.urls. Since dns_discovery has its own mutex
-        // and we already hold upstream_mutex, we must not block — tryLock instead.
+    /// Select a URL from the DNS-discovered upstream set: weighted round-robin
+    /// over the primary slots, skipping unhealthy endpoints, then the ordered
+    /// backups (SRV higher priorities). Must be called while holding
+    /// upstream_mutex. Returns null when discovery is inactive, the set is
+    /// empty, or every discovered endpoint is unhealthy.
+    pub fn selectDiscoveredUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) ?[]const u8 {
+        // dns_discovery has its own mutex and we already hold upstream_mutex,
+        // so never block here — tryLock instead.
         if (!self.dns_discovery.mutex.tryLock()) return null;
         defer self.dns_discovery.mutex.unlock();
         const urls = self.dns_discovery.urls.items;
-        if (urls.len == 0) return null;
-        const idx = self.upstream_rr_index % urls.len;
-        self.upstream_rr_index = (idx + 1) % urls.len;
-        return urls[idx];
+        const slots = self.dns_discovery.slots.items;
+        if (urls.len == 0 or slots.len == 0) return null;
+        const start = self.upstream_rr_index % slots.len;
+        var offset: usize = 0;
+        while (offset < slots.len) : (offset += 1) {
+            const idx = (start + offset) % slots.len;
+            const candidate = urls[slots[idx]];
+            if (!self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) continue;
+            self.upstream_rr_index = (idx + 1) % slots.len;
+            return candidate;
+        }
+        for (self.dns_discovery.backup_urls.items) |candidate| {
+            if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) return candidate;
+        }
+        return null;
     }
 
     pub fn nextStickyUpstreamBaseUrl(

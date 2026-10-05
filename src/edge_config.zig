@@ -497,8 +497,12 @@ pub const EdgeConfig = struct {
     /// Returns 503 when exceeded. Set via TARDIGRADE_MAX_IN_FLIGHT_REQUESTS.
     max_in_flight_requests: u32,
     /// Maximum concurrent WebSocket tunnels (#812). Zero derives the cap from
-    /// the worker count. Set via TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS.
+    /// the descriptor limit (#818). Set via TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS.
     proxy_websocket_max_tunnels: u32 = 0,
+    /// Threads that relay established WebSocket tunnels (#818). Zero picks
+    /// one per four CPUs, between 1 and 4. Read at startup only. Set via
+    /// TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS.
+    proxy_websocket_reactor_threads: u32 = 0,
     /// What a hot reload does to WebSocket tunnels whose location sets no
     /// `proxy_websocket_reload` of its own (#812). Read from the configuration
     /// a tunnel was admitted under. Set via TARDIGRADE_PROXY_WEBSOCKET_RELOAD.
@@ -1377,6 +1381,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const max_in_flight_requests = parseIntEnv(u32, allocator, "TARDIGRADE_MAX_IN_FLIGHT_REQUESTS", 0);
     const proxy_websocket_max_tunnels = try parseStrictU32Env(allocator, "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", 0, "proxy_websocket_max_tunnels");
+    const proxy_websocket_reactor_threads = try parseStrictU32Env(allocator, "TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS", 0, "proxy_websocket_reactor_threads");
+    if (proxy_websocket_reactor_threads > max_websocket_reactor_threads) {
+        logConfigDiagnostic("config validation failed: proxy_websocket_reactor_threads must be at most {d}, got {d}", .{ max_websocket_reactor_threads, proxy_websocket_reactor_threads });
+        return error.InvalidConfigValue;
+    }
     const proxy_websocket_reload_str = envOrDefault(allocator, "TARDIGRADE_PROXY_WEBSOCKET_RELOAD", "preserve") catch unreachable;
     defer allocator.free(proxy_websocket_reload_str);
     const proxy_websocket_reload = http.location_router.WebSocketReloadPolicy.parse(proxy_websocket_reload_str) orelse {
@@ -1810,6 +1819,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .max_active_connections = max_active_connections,
         .max_in_flight_requests = max_in_flight_requests,
         .proxy_websocket_max_tunnels = proxy_websocket_max_tunnels,
+        .proxy_websocket_reactor_threads = proxy_websocket_reactor_threads,
         .proxy_websocket_reload = proxy_websocket_reload,
         .proxy_websocket_reload_timeout_ms = proxy_websocket_reload_timeout_ms,
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
@@ -2194,6 +2204,9 @@ fn lookupConfigValue(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
 /// An unsigned millisecond/count setting that rejects malformed values
 /// instead of falling back to `default_value` like `parseIntEnv`. Only an
 /// absent setting takes the default; an explicitly empty one is invalid.
+/// Upper bound for `proxy_websocket_reactor_threads` (#818).
+pub const max_websocket_reactor_threads: u32 = 64;
+
 fn parseStrictU32Env(allocator: std.mem.Allocator, key: []const u8, default_value: u32, directive: []const u8) !u32 {
     const raw = (try lookupConfigValue(allocator, key)) orelse return default_value;
     defer allocator.free(raw);

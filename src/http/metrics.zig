@@ -79,6 +79,18 @@ pub const WebSocketUpgradeOutcome = enum {
     capacity,
 };
 /// #812: why a WebSocket tunnel closed; mirrors `tunnel.CloseReason.label`.
+/// #818: load of the reactor threads that relay established WebSocket
+/// tunnels.
+pub const WebSocketReactorStats = struct {
+    threads: u64 = 0,
+    /// Tunnels owned by reactor threads (handed off and not yet closed).
+    tunnels: u64 = 0,
+    /// Most tunnels on any one reactor thread.
+    max_thread_tunnels: u64 = 0,
+    handoffs_total: u64 = 0,
+    wakeups_total: u64 = 0,
+};
+
 pub const WebSocketCloseReason = enum { client, upstream, idle, lifetime, shutdown, reload, @"error" };
 pub const EarlyDataSource = enum { transport, header, both };
 pub const EarlyDataDecision = enum { accepted, too_early, deferred, forwarded };
@@ -344,6 +356,8 @@ pub const Metrics = struct {
     /// #812: closed-tunnel lifetime, summed, and closes by reason.
     websocket_tunnel_duration_ms_sum: u64,
     websocket_tunnel_closes_total: [websocket_close_reason_count]u64,
+    /// #818: WebSocket reactor load, sampled on the event-loop tick.
+    websocket_reactor: WebSocketReactorStats = .{},
     /// HTTP early-data replay-exposed requests by protocol and source.
     http_early_data_requests_total: [http_protocol_count][early_data_source_count]u64,
     response_write_mode_total: [response_write_mode_count]u64,
@@ -571,6 +585,7 @@ pub const Metrics = struct {
             .websocket_tunnel_bytes_upstream_to_client = 0,
             .websocket_tunnel_duration_ms_sum = 0,
             .websocket_tunnel_closes_total = .{0} ** websocket_close_reason_count,
+            .websocket_reactor = .{},
             .http_early_data_requests_total = .{.{0} ** early_data_source_count} ** http_protocol_count,
             .response_write_mode_total = .{0} ** response_write_mode_count,
             .response_writev_iovecs_total = 0,
@@ -743,6 +758,10 @@ pub const Metrics = struct {
     pub fn recordWebSocketUpgrade(self: *Metrics, outcome: WebSocketUpgradeOutcome) void {
         self.websocket_upgrades_total[@intFromEnum(outcome)] += 1;
         if (outcome == .relayed) self.websocket_tunnels_active += 1;
+    }
+
+    pub fn setWebSocketReactorStats(self: *Metrics, stats: WebSocketReactorStats) void {
+        self.websocket_reactor = stats;
     }
 
     pub fn recordWebSocketTunnelClosed(self: *Metrics, reason: WebSocketCloseReason, client_to_upstream: u64, upstream_to_client: u64, duration_ms: u64) void {
@@ -1908,6 +1927,25 @@ pub const Metrics = struct {
         inline for (comptime std.enums.values(WebSocketCloseReason)) |reason| {
             try out.print("tardigrade_websocket_tunnel_closes_total{{reason=\"{s}\"}} {d}\n", .{ @tagName(reason), self.websocket_tunnel_closes_total[@intFromEnum(reason)] });
         }
+        const reactor = self.websocket_reactor;
+        try out.print(
+            \\# HELP tardigrade_websocket_reactor_threads Threads relaying established WebSocket tunnels
+            \\# TYPE tardigrade_websocket_reactor_threads gauge
+            \\tardigrade_websocket_reactor_threads {d}
+            \\# HELP tardigrade_websocket_reactor_tunnels WebSocket tunnels owned by reactor threads
+            \\# TYPE tardigrade_websocket_reactor_tunnels gauge
+            \\tardigrade_websocket_reactor_tunnels {d}
+            \\# HELP tardigrade_websocket_reactor_thread_tunnels_max Most WebSocket tunnels on any one reactor thread
+            \\# TYPE tardigrade_websocket_reactor_thread_tunnels_max gauge
+            \\tardigrade_websocket_reactor_thread_tunnels_max {d}
+            \\# HELP tardigrade_websocket_reactor_handoffs_total Established WebSocket tunnels handed from workers to the reactor
+            \\# TYPE tardigrade_websocket_reactor_handoffs_total counter
+            \\tardigrade_websocket_reactor_handoffs_total {d}
+            \\# HELP tardigrade_websocket_reactor_wakeups_total Reactor thread wakeups
+            \\# TYPE tardigrade_websocket_reactor_wakeups_total counter
+            \\tardigrade_websocket_reactor_wakeups_total {d}
+            \\
+        , .{ reactor.threads, reactor.tunnels, reactor.max_thread_tunnels, reactor.handoffs_total, reactor.wakeups_total });
     }
 
     fn appendForwardAuthPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
@@ -2996,6 +3034,7 @@ test "Metrics renders WebSocket tunnel series (#812)" {
     m.recordWebSocketUpgrade(.relayed);
     m.recordWebSocketUpgrade(.capacity);
     m.recordWebSocketTunnelClosed(.idle, 10, 20, 1500);
+    m.setWebSocketReactorStats(.{ .threads = 2, .tunnels = 7, .max_thread_tunnels = 4, .handoffs_total = 9, .wakeups_total = 31 });
     const prom = try m.toPrometheus(allocator);
     defer allocator.free(prom);
     inline for (.{
@@ -3009,6 +3048,11 @@ test "Metrics renders WebSocket tunnel series (#812)" {
         "tardigrade_websocket_tunnel_duration_seconds_count 1\n",
         "tardigrade_websocket_tunnel_closes_total{reason=\"idle\"} 1\n",
         "tardigrade_websocket_tunnel_closes_total{reason=\"error\"} 0\n",
+        "tardigrade_websocket_reactor_threads 2\n",
+        "tardigrade_websocket_reactor_tunnels 7\n",
+        "tardigrade_websocket_reactor_thread_tunnels_max 4\n",
+        "tardigrade_websocket_reactor_handoffs_total 9\n",
+        "tardigrade_websocket_reactor_wakeups_total 31\n",
     }) |needle| {
         try std.testing.expect(std.mem.find(u8, prom, needle) != null);
     }

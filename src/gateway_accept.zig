@@ -288,6 +288,7 @@ const AcceptLoopTestHarness = struct {
     fn init(self: *AcceptLoopTestHarness, allocator: std.mem.Allocator) !void {
         self.* = .{ .allocator = allocator };
         self.state.allocator = allocator;
+        self.state.tunnel_reactor = null;
         self.state.connection_mutex = .{};
         self.state.metrics_mutex = .{};
         self.state.runtime_mutex = .{};

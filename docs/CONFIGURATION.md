@@ -387,16 +387,21 @@ lifetime limits close the TCP connections without a WebSocket close frame
 (clients see close code 1006), so applications that stay quiet longer than
 the idle timeout should send pings.
 
-**Capacity.** Each open tunnel holds one worker thread for its whole
-lifetime, and counts as an active connection and an in-flight request.
+**Capacity.** A worker runs the handshake and every admission check, then
+hands the established tunnel to a WebSocket reactor thread and goes back to
+serving requests (#818). A small fixed pool of reactor threads
+(`proxy_websocket_reactor_threads` /
+`TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS`, default one per four CPUs,
+between 1 and 4; read at startup only, and reload rejects changes) relays every open tunnel, each thread
+sleeping in one `poll()` over the sockets it owns, so thousands of mostly idle
+WebSockets cost sockets and buffers, not threads, and do not slow ordinary
+requests. An open tunnel still counts as an active connection
+(`max_active_connections`) but no longer as an in-flight request.
 `proxy_websocket_max_tunnels` / `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS`
-caps concurrent tunnels per process; the default (`0`) is half the worker
-threads, rounded down, so tunnels can never occupy every worker. With a single
-worker thread that is zero: every upgrade gets 503 and startup logs a warning.
-Run at least two workers, or set an explicit cap to accept that a tunnel can
-block every other request. Deployments
-that expect many long-lived WebSockets should raise
-`TARDIGRADE_WORKER_THREADS` and the cap together.
+caps concurrent tunnels per process; the default (`0`) is a quarter of the
+file-descriptor soft limit, at most 4096, since each tunnel holds two sockets.
+Raise the descriptor limit (`TARDIGRADE_FD_SOFT_LIMIT`) together with the cap for very
+large tunnel counts.
 
 **Hot reload.** A tunnel is admitted under the configuration generation its
 handshake leased, and everything about it comes from that snapshot: its
@@ -459,8 +464,11 @@ An HTTP/2 or HTTP/3 request carrying `Upgrade` is not upgraded.
 **Observability.** `tardigrade_websocket_upgrades_total{outcome}`,
 `tardigrade_websocket_tunnels_active`,
 `tardigrade_websocket_tunnel_bytes_total{direction}`,
-`tardigrade_websocket_tunnel_duration_seconds` and
-`tardigrade_websocket_tunnel_closes_total{reason}`; the handshake's access-log
+`tardigrade_websocket_tunnel_duration_seconds`,
+`tardigrade_websocket_tunnel_closes_total{reason}`, and reactor load
+(`tardigrade_websocket_reactor_threads`, `_reactor_tunnels`,
+`_reactor_thread_tunnels_max`, `_reactor_handoffs_total`,
+`_reactor_wakeups_total`); the handshake's access-log
 line is written when the tunnel closes, with status 101 and
 `tunnel_close_reason`, `tunnel_duration_ms` and byte counts. See
 [OBSERVABILITY.md](OBSERVABILITY.md#metrics) and the runnable
@@ -958,7 +966,8 @@ WebSockets are relayed per location with `proxy_websocket on;` (see
 | --- | --- | --- | --- | --- |
 | `TARDIGRADE_PROXY_WEBSOCKET_RELOAD` | enum | `preserve` | Default hot-reload behavior for open tunnels, `preserve` or `drain`; a location's `proxy_websocket_reload` overrides it. Config directive: `proxy_websocket_reload`. | `TARDIGRADE_PROXY_WEBSOCKET_RELOAD=drain` |
 | `TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS` | u32 ms | `30000` | Default drain window for `drain` tunnels. Config directive: `proxy_websocket_reload_timeout_ms`. | `TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS=10000` |
-| `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS` | u32 | `0` (half the worker threads, rounded down; none with one worker) | Maximum concurrent WebSocket tunnels per process. A handshake over the cap gets 503 before the origin is contacted. Config directive: `proxy_websocket_max_tunnels`. | `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS=256` |
+| `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS` | u32 | `0` (a quarter of the descriptor soft limit, at most 4096) | Maximum concurrent WebSocket tunnels per process. A handshake over the cap gets 503 before the origin is contacted. Config directive: `proxy_websocket_max_tunnels`. | `TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS=256` |
+| `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS` | u32 | `0` (one per four CPUs, between 1 and 4) | Threads that relay established WebSocket tunnels; each owns many tunnels. Read at startup only (0-64); a hot reload that changes it is rejected and requires restart. Config directive: `proxy_websocket_reactor_threads`. | `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS=2` |
 
 Server-sent events need no special setting: proxy them as a streamed response
 (`proxy_streaming response;` on the location, or

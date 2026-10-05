@@ -350,6 +350,19 @@ pub const ManagedConnection = struct {
         self.* = undefined;
     }
 
+    /// Return the pooled request session early, for a connection that will
+    /// carry no more HTTP requests (a WebSocket tunnel, #818). `deinit` then
+    /// has no session to release.
+    pub fn releaseSession(self: *ManagedConnection) void {
+        const lifecycle = &self.lifecycle;
+        if (lifecycle.release_session_fn) |release| {
+            if (lifecycle.release_session_ctx) |ctx| {
+                if (lifecycle.session) |session| release(ctx, session);
+            }
+        }
+        lifecycle.session = null;
+    }
+
     pub fn observeTlsBufferMetrics(self: *ManagedConnection) void {
         const metrics = self.lifecycle.metrics orelse return;
         const mutex = self.lifecycle.metrics_mutex orelse return;

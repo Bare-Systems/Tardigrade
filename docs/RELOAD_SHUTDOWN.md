@@ -61,8 +61,9 @@ On `SIGHUP`, the gateway handles reload on the maintenance tick:
 2. Validate it.
 3. Prepare reload-owned runtime resources, such as reloadable TLS credentials.
 4. Reject the reload if it changes process-owned settings that require a
-   restart, such as listener shard topology, HTTP/3 listener-owned settings,
-   native early-data replay mode/capacity, native ticket-key source mode, or
+   restart, such as listener shard topology, WebSocket reactor thread count,
+   HTTP/3 listener-owned settings, native early-data replay mode/capacity,
+   native ticket-key source mode, or
    (see "TLS Credential Identity" below) a certificate/key/SNI change on a
    build where that would leave two TLS surfaces on different identities.
 5. Publish the new config through the lease-counted config store.
@@ -201,7 +202,14 @@ Graceful shutdown complete (forced_closes=N drain_timed_out=true)
 ```
 
 WebSocket tunnels (`proxy_websocket`, #812) are the exception to the soft
-cap: an open tunnel keeps relaying for the drain window after shutdown is
+cap. Established tunnels are detached from request workers and owned by the
+fixed WebSocket reactor. Its shard count is startup-owned, so reload rejects
+changes to `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS` instead of publishing
+a topology the live process did not install. Shutdown wakes all shards before
+worker drain; after workers join, no new handoffs can arrive and the reactor
+joins only after its tunnels reach their drain deadline.
+
+An open tunnel keeps relaying for the drain window after shutdown is
 requested and is then closed by Tardigrade itself (logged with
 `tunnel_close_reason` `shutdown`), so a long-lived WebSocket never holds the
 process open. On hot reload, open tunnels follow `proxy_websocket_reload`
@@ -223,6 +231,7 @@ Related knobs:
 | --- | ---: | --- |
 | `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` | `30000` | TCP worker-pool drain window and native HTTP/3 drain deadline for graceful shutdown. The final shutdown path uses the startup value; hot reload can publish a different request-scoped value, but the process drain/H3 deadline still requires restart to change coherently today. |
 | `TARDIGRADE_WORKER_THREADS` | `0` | Startup-owned worker thread count; `0` uses the runtime default. Restart required to change. |
+| `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS` | `0` | Startup-owned WebSocket reactor shard count; `0` derives 1–4 threads from CPU count. Reload changes are rejected; restart required. |
 | `TARDIGRADE_WORKER_QUEUE_SIZE` | `1024` | Startup-owned worker queue capacity. Restart required to change. |
 | `TARDIGRADE_WORKER_MAX_QUEUE_DEPTH` | `0` | Startup-owned optional per-worker queue depth cap (`0` means unlimited beyond queue capacity behavior). Restart required to change. |
 

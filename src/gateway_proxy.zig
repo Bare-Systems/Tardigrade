@@ -3702,6 +3702,9 @@ pub const WebSocketUpstreamResult = union(enum) {
 /// path. `downstream_committed` is set once response bytes reach the client.
 pub fn openWebSocketUpstream(
     allocator: std.mem.Allocator,
+    /// Allocates what the returned `UpgradedUpstream` owns (its connection,
+    /// buffers and head), which may outlive the request (#818).
+    owned_allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     url: []const u8,
     unix_socket_path: ?[]const u8,
@@ -3757,10 +3760,10 @@ pub fn openWebSocketUpstream(
     errdefer to_client_reservation.releaseAll();
     to_upstream_reservation.reserve(relay_bytes) catch return error.ProxyBufferCapacityUnavailable;
     to_client_reservation.reserve(relay_bytes) catch return error.ProxyBufferCapacityUnavailable;
-    const to_upstream_buf = try allocator.alloc(u8, relay_bytes);
-    errdefer allocator.free(to_upstream_buf);
-    const to_client_buf = try allocator.alloc(u8, relay_bytes);
-    errdefer allocator.free(to_client_buf);
+    const to_upstream_buf = try owned_allocator.alloc(u8, relay_bytes);
+    errdefer owned_allocator.free(to_upstream_buf);
+    const to_client_buf = try owned_allocator.alloc(u8, relay_bytes);
+    errdefer owned_allocator.free(to_client_buf);
 
     const fd = try (if (unix_socket_path) |socket_path|
         compat.connectBoundedUnix(socket_path, connect_timeout_ms)
@@ -3771,10 +3774,10 @@ pub fn openWebSocketUpstream(
     var tls: ?*http.upstream_tls.UpstreamTlsConn = null;
     errdefer if (tls) |t| {
         t.deinit();
-        allocator.destroy(t);
+        owned_allocator.destroy(t);
     };
     if (is_https) {
-        const tls_ptr = try allocator.create(http.upstream_tls.UpstreamTlsConn);
+        const tls_ptr = try owned_allocator.create(http.upstream_tls.UpstreamTlsConn);
         tls_ptr.* = http.upstream_tls.UpstreamTlsConn.connect(fd, host, .{
             .skip_verify = !cfg.upstream_tls_verify,
             .ca_bundle_path = cfg.upstream_tls_ca_bundle,
@@ -3783,13 +3786,13 @@ pub fn openWebSocketUpstream(
             .client_key_path = cfg.upstream_tls_client_key,
             .alpn_policy = .require_http1,
         }) catch |err| {
-            allocator.destroy(tls_ptr);
+            owned_allocator.destroy(tls_ptr);
             return err;
         };
         tls = tls_ptr;
     }
 
-    var head_arena = std.heap.ArenaAllocator.init(allocator);
+    var head_arena = std.heap.ArenaAllocator.init(owned_allocator);
     errdefer head_arena.deinit();
     var switching = SwitchingHead{};
     var rb = StreamReadBuf{ .buf = to_client_buf };
@@ -3815,21 +3818,21 @@ pub fn openWebSocketUpstream(
         downstream_committed.* = wrote_downstream;
         if (tls) |t| {
             t.deinit();
-            allocator.destroy(t);
+            owned_allocator.destroy(t);
         }
         _ = std.c.close(fd);
         head_arena.deinit();
-        allocator.free(to_upstream_buf);
-        allocator.free(to_client_buf);
+        owned_allocator.free(to_upstream_buf);
+        owned_allocator.free(to_client_buf);
         to_upstream_reservation.releaseAll();
         to_client_reservation.releaseAll();
         return .{ .refused = exchange.result };
     }
     if (!switching.completesHandshake(expected_accept)) return error.InvalidWebSocketHandshake;
 
-    const upgraded = try allocator.create(UpgradedUpstream);
+    const upgraded = try owned_allocator.create(UpgradedUpstream);
     upgraded.* = .{
-        .allocator = allocator,
+        .allocator = owned_allocator,
         .fd = fd,
         .tls = tls,
         .head_arena = head_arena,

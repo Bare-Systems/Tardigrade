@@ -27,6 +27,32 @@ All notable user-facing changes to Tardigrade are documented here.
   canonical secure zero-and-free helper, so the allocator always receives
   zeroed memory, on success and failure paths alike.
 
+### Changed
+
+- **WebSocket tunnels no longer hold a request worker each (#818).** A
+  worker still runs the handshake and every admission check (auth,
+  `forward_auth`, rate limits, Origin, 0-RTT, tunnel cap), then hands the
+  established tunnel to a small fixed pool of WebSocket reactor threads and
+  goes back to serving requests. Each reactor thread relays many tunnels
+  from one `poll()` with the same fixed per-direction buffers,
+  backpressure, idle/lifetime timeouts, reload `preserve`/`drain` behavior
+  and shutdown drain as before. Idle tunnels cost no wakeups: a reactor
+  thread sleeps until a socket is ready, a tunnel's own earliest deadline, a
+  handoff, or a hot reload or shutdown (which wake it immediately). TLS work
+  per tunnel per turn is bounded, so a peer that keeps the TLS record layer
+  busy without sending data cannot stall the other tunnels on its thread. Plaintext and native TLS (`wss://`) clients are both handed
+  off, and the handshake's access-log line is still written once, at close.
+  New `proxy_websocket_reactor_threads` /
+  `TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS` (default one per four CPUs,
+  between 1 and 4; startup only). Because tunnels no longer take workers,
+  the default `proxy_websocket_max_tunnels` is now a quarter of the
+  descriptor soft limit (at most 4096) instead of half the worker threads,
+  a single-worker process now accepts upgrades, and an open tunnel no longer
+  counts against `max_in_flight_requests` (it still counts as an active
+  connection). New metrics: `tardigrade_websocket_reactor_threads`,
+  `_reactor_tunnels`, `_reactor_thread_tunnels_max`,
+  `_reactor_handoffs_total` and `_reactor_wakeups_total`.
+
 ### Performance
 
 - **Cheaper QUIC connection teardown (#782).** Closing a QUIC connection

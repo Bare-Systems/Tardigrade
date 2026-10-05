@@ -23105,8 +23105,8 @@ fn wsMetricValue(body: []const u8, name: []const u8, label: []const u8) u64 {
     return prometheusLabeledMetricValue(body, name, &.{label}) orelse 0;
 }
 
-/// Tunnels hold a worker each; give the process room for several plus the
-/// metrics and health requests the tests make alongside them.
+/// Room for the metrics and health requests the tests make while tunnels
+/// are opening.
 const ws_worker_env = EnvPair{ .name = "TARDIGRADE_WORKER_THREADS", .value = "8" };
 
 test "proxy_websocket relays text, binary, ping/pong, fragments and large messages both ways (#812)" {
@@ -23516,28 +23516,159 @@ test "proxy_websocket closes idle tunnels and caps concurrent tunnels with a cle
     try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"idle\""));
 }
 
-test "proxy_websocket never lets a tunnel take a single worker's only thread (#812)" {
+/// Raise this process's descriptor soft limit toward `want` (children
+/// inherit it) and return the limit now in effect.
+fn raiseFdSoftLimit(want: u64) u64 {
+    var limits = std.posix.getrlimit(std.posix.rlimit_resource.NOFILE) catch return 0;
+    if (limits.cur < want) {
+        var raised = limits;
+        raised.cur = @min(want, limits.max);
+        if (std.posix.setrlimit(std.posix.rlimit_resource.NOFILE, raised)) |_| limits = raised else |_| {}
+    }
+    return @intCast(limits.cur);
+}
+
+test "proxy_websocket runs hundreds of tunnels on reactor threads while one worker keeps serving requests (#818)" {
     const allocator = std.testing.allocator;
+    // Each tunnel costs this process two descriptors (client and origin side)
+    // and Tardigrade two more.
+    const tunnels: usize = 300;
+    if (raiseFdSoftLimit(4096) < 4 * tunnels) return error.SkipZigTest;
+
     const origin = try WsOrigin.start(allocator, .echo);
     defer origin.stop();
     try origin.run();
 
     const config_text = try wsProxyConfig(allocator, origin.port(), "");
     defer allocator.free(config_text);
-    // The harness default: one worker thread.
-    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text, .ready_path = "/healthz" });
+    // The harness default: one worker thread. Before #818 each tunnel held a
+    // worker, so this process could not open a single one.
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS", .value = "2" },
+            .{ .name = "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", .value = "1000" },
+        },
+    });
     defer tardigrade.stop();
-    try waitForLogSubstring(allocator, tardigrade.log_path, "WebSocket upgrades will be refused with 503", 2_000);
 
-    var hs = try wsHandshake(allocator, tardigrade.port, "/ws/starve", &.{}, "");
-    defer hs.deinit(allocator);
-    try std.testing.expectEqual(@as(u16, 503), hs.status);
-    try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
+    const baseline_connections = blk: {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        break :blk prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0;
+    };
 
-    // Ordinary requests are still served while that client stays connected.
-    var health = try sendRequestWithTimeout(allocator, tardigrade.port, .{ .method = "GET", .path = "/healthz", .body = null, .headers = &.{} }, 2_000);
-    defer health.deinit();
-    try std.testing.expectEqual(@as(u16, 200), health.status_code);
+    var open = std.array_list.Managed(WsHandshake).init(allocator);
+    defer {
+        for (open.items) |*hs| hs.deinit(allocator);
+        open.deinit();
+    }
+    var i: usize = 0;
+    while (i < tunnels) : (i += 1) {
+        var hs = try wsHandshake(allocator, tardigrade.port, "/ws/idle", &.{}, "");
+        errdefer hs.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 101), hs.status);
+        try open.append(hs);
+    }
+
+    {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        try std.testing.expectEqual(@as(?u64, tunnels), prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active"));
+        try std.testing.expectEqual(@as(?u64, 2), prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_threads"));
+        try std.testing.expectEqual(@as(?u64, tunnels), prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_handoffs_total"));
+        // Handed-off tunnels are spread across both reactor threads.
+        const max_per_thread = prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_thread_tunnels_max") orelse 0;
+        try std.testing.expect(max_per_thread < tunnels);
+    }
+
+    // With every tunnel open and idle, the single worker still answers
+    // ordinary requests promptly.
+    var worst_ms: i64 = 0;
+    var r: usize = 0;
+    while (r < 40) : (r += 1) {
+        const started = compat.milliTimestamp();
+        var health = try sendRequestWithTimeout(allocator, tardigrade.port, .{ .method = "GET", .path = "/healthz", .body = null, .headers = &.{} }, 2_000);
+        defer health.deinit();
+        try std.testing.expectEqual(@as(u16, 200), health.status_code);
+        worst_ms = @max(worst_ms, compat.milliTimestamp() - started);
+    }
+    try std.testing.expect(worst_ms < 1_000);
+
+    // Tunnels still carry traffic, including ones opened first.
+    var t: usize = 0;
+    while (t < tunnels) : (t += 25) try wsExpectEcho(allocator, open.items[t].peer, .text, "still relaying");
+
+    // Closing the clients releases every tunnel, socket and connection slot.
+    for (open.items) |*hs| hs.deinit(allocator);
+    open.clearRetainingCapacity();
+    const deadline = compat.milliTimestamp() + 10_000;
+    while (true) {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        const active = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 0;
+        const owned = prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_tunnels") orelse 0;
+        const connections = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0;
+        const closed_by_client = wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"client\"");
+        if (active == 0 and owned == 0 and connections <= baseline_connections and closed_by_client == tunnels) break;
+        if (compat.milliTimestamp() > deadline) {
+            std.debug.print("unsettled: active={d} reactor_owned={d} connections={d} baseline={d} client_closes={d}\n", .{ active, owned, connections, baseline_connections, closed_by_client });
+            return error.TunnelsDidNotSettle;
+        }
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+}
+
+test "proxy_websocket rejects reactor thread-count changes on hot reload (#818)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const base_config = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(base_config);
+    const initial_config = try std.fmt.allocPrint(allocator,
+        \\proxy_websocket_reactor_threads 2;
+        \\{s}
+    , .{base_config});
+    defer allocator.free(initial_config);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = initial_config,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+
+    {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        try std.testing.expectEqual(@as(?u64, 2), prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_threads"));
+    }
+
+    const updated_config = try std.fmt.allocPrint(allocator,
+        \\proxy_websocket_reactor_threads 4;
+        \\{s}
+    , .{base_config});
+    defer allocator.free(updated_config);
+    try tardigrade.rewriteConfig(updated_config);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "WebSocket reactor topology", 5_000);
+
+    var reload_status = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/tardigrade/reload/status",
+        .body = null,
+        .headers = &.{},
+    });
+    defer reload_status.deinit();
+    try std.testing.expectEqual(@as(u16, 200), reload_status.status_code);
+    try assertContains(reload_status.body, "\"ok\":false");
+    try assertContains(reload_status.body, "restart required");
+
+    var metrics = try wsMetrics(allocator, tardigrade.port);
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(?u64, 2), prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_threads"));
 }
 
 test "proxy_websocket tunnels drain within the shutdown window and the process exits (#812)" {
@@ -23754,7 +23885,8 @@ test "proxy_websocket carries wss:// clients over native TLS to a wss:// origin 
     defer edge.stop();
 
     const client = try PureZigTlsClient.createWithServerName(allocator, edge.port, "http/1.1", "tardigrade.test");
-    defer client.destroy();
+    var client_open = true;
+    defer if (client_open) client.destroy();
     const request = "GET /ws/secure HTTP/1.1\r\nHost: tardigrade.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " ++ ws_test_key ++ "\r\nSec-WebSocket-Version: 13\r\n\r\n";
     try client.writeAllPlain(request);
     const head = try wssReadHead(client, allocator);
@@ -23770,6 +23902,32 @@ test "proxy_websocket carries wss:// clients over native TLS to a wss:// origin 
     const proto = (try origin.handshakeHeader(allocator, "X-Forwarded-Proto")).?;
     defer allocator.free(proto);
     try std.testing.expectEqualStrings("https", proto);
+
+    // Both hops' tunnels were handed from a worker to a reactor thread
+    // (#818): the edge's native TLS client and wss:// origin, and the inner
+    // process's native TLS client and plain origin.
+    var edge_metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, edge.port, "/status/metrics", "tardigrade.test");
+    defer edge_metrics.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), prometheusMetricValue(edge_metrics.body, "tardigrade_websocket_reactor_handoffs_total"));
+    try std.testing.expectEqual(@as(?u64, 1), prometheusMetricValue(edge_metrics.body, "tardigrade_websocket_reactor_tunnels"));
+    var inner_metrics = try sendPureZigTlsHttp1Request(allocator, inner.port, "/status/metrics");
+    defer inner_metrics.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), prometheusMetricValue(inner_metrics.body, "tardigrade_websocket_reactor_handoffs_total"));
+
+    // A clean client close ends both tunnels and releases the edge's
+    // connection slot along with the TLS connection.
+    client_open = false;
+    client.destroy();
+    const deadline = compat.milliTimestamp() + 5_000;
+    while (true) {
+        var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, edge.port, "/status/metrics", "tardigrade.test");
+        defer metrics.deinit();
+        const owned = prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_tunnels") orelse 0;
+        const active = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 0;
+        if (owned == 0 and active == 0) break;
+        if (compat.milliTimestamp() > deadline) return error.TunnelsDidNotSettle;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
 }
 
 // ---- Server-sent events through the streaming proxy (#762) -----------------

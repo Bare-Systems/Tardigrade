@@ -133,6 +133,13 @@ pub const RequestContext = struct {
     /// leased on (0 while current). A `drain`-mode WebSocket tunnel times its
     /// reload drain from it (#812).
     config_superseded_at: ?*const std.atomic.Value(u64) = null,
+    /// True when the connection loop serving this request can hand an
+    /// established WebSocket tunnel to the tunnel reactor (#818).
+    tunnel_handoff_allowed: bool = false,
+    /// Set instead of `tunnel` when the request became a WebSocket tunnel
+    /// that was handed off rather than run inline (#818): the gateway's
+    /// pending tunnel job, which the connection loop completes and submits.
+    tunnel_handoff: ?*anyopaque = null,
 
     pub fn init(allocator: Allocator, request_id: []const u8, client_ip: []const u8) RequestContext {
         return .{

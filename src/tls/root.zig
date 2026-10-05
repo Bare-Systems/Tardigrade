@@ -1,5 +1,6 @@
 pub const alerts = @import("alerts.zig");
 pub const appliance_credentials = @import("appliance_credentials.zig");
+pub const client_identity = @import("client_identity.zig");
 pub const credentials = @import("credentials.zig");
 pub const dns_name = @import("dns_name.zig");
 pub const early_data_replay = @import("early_data_replay.zig");

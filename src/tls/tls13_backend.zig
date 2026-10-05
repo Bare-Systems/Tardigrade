@@ -834,6 +834,12 @@ pub const Tls13Backend = struct {
     peer_chain_entries: [max_peer_chain_entries]Slice = undefined,
     peer_chain_count: usize = 0,
     peer_chain_len: usize = 0,
+    /// Server role (#763): a bounded copy of the client leaf certificate DER,
+    /// recorded only once the peer verifier returned `.accepted` *and* the
+    /// CertificateVerify proof of possession passed. `peer_chain` itself is
+    /// scratch reassembly storage; this is the one durable, verified view.
+    verified_peer_leaf: [max_certificate_len]u8 = undefined,
+    verified_peer_leaf_len: usize = 0,
     /// A parked asynchronous authentication operation (an external signer,
     /// verifier, or async selector that returned `pending`). While set, the
     /// handshake is suspended: the receive loop stops consuming and the driver
@@ -1788,6 +1794,16 @@ pub const Tls13Backend = struct {
         self.selected_alpn_present = true;
     }
 
+    /// Server role (#763): the DER of the client leaf certificate that the
+    /// configured peer verifier accepted and whose CertificateVerify proved
+    /// possession of the key, or null when no client certificate was
+    /// presented and verified. Valid until the backend is torn down; never
+    /// consult a certificate's contents for a trust decision any other way.
+    pub fn verifiedPeerCertificate(self: *const Tls13Backend) ?[]const u8 {
+        if (self.verified_peer_leaf_len == 0) return null;
+        return self.verified_peer_leaf[0..self.verified_peer_leaf_len];
+    }
+
     pub fn selectedAlpn(self: *const Tls13Backend) ?[]const u8 {
         return if (self.selected_alpn_present) self.selected_alpn[0..self.selected_alpn_len] else null;
     }
@@ -2044,6 +2060,8 @@ pub const Tls13Backend = struct {
         crypto_pkg.secrets.secureZero(&self.peer_chain);
         self.peer_chain_count = 0;
         self.peer_chain_len = 0;
+        crypto_pkg.secrets.secureZero(&self.verified_peer_leaf);
+        self.verified_peer_leaf_len = 0;
         crypto_pkg.secrets.secureZero(std.mem.asBytes(&self.peer_sig_schemes));
         self.peer_sig_scheme_count = 0;
         crypto_pkg.secrets.secureZero(&self.server_name);
@@ -4152,7 +4170,14 @@ pub const Tls13Backend = struct {
     /// must not be satisfied by "no trust decision was made".
     fn applyPeerVerdict(self: *Tls13Backend, verdict: credentials.Verdict, sink: *EventSink) HandshakeError!void {
         switch (verdict) {
-            .accepted => try sink.emitCertificate(.valid),
+            .accepted => {
+                if (self.role == .server and self.peer_chain_count > 0) {
+                    const e = self.peer_chain_entries[0];
+                    @memcpy(self.verified_peer_leaf[0..e.len], self.peer_chain[e.start..][0..e.len]);
+                    self.verified_peer_leaf_len = e.len;
+                }
+                try sink.emitCertificate(.valid);
+            },
             .rejected => {
                 try sink.emitCertificate(.invalid);
                 return self.failCredential(.peer_verification_rejected);

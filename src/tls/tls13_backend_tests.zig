@@ -5834,6 +5834,10 @@ test "required client authentication completes with a valid client certificate" 
     // The last certificate verdict observed is the server's over the client's
     // presented certificate: accepted against the pin.
     try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+    // #763: the server retains the verified client leaf for identity
+    // extraction; the client (which verified a *server*) retains none.
+    try std.testing.expectEqualSlices(u8, tls_backend.testdata.certificate_der, harness.server_backend.verifiedPeerCertificate().?);
+    try std.testing.expect(harness.client_backend.verifiedPeerCertificate() == null);
 
     // Application data still flows in both directions after mutual auth.
     var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
@@ -5878,6 +5882,8 @@ test "optional client authentication completes when the client declines" {
 
     try std.testing.expect(harness.client_driver.isComplete());
     try std.testing.expect(harness.server_driver.isComplete());
+    // #763: a declined optional client auth must not surface any identity.
+    try std.testing.expect(harness.server_backend.verifiedPeerCertificate() == null);
 }
 
 test "required client authentication fails closed when the client declines" {
@@ -5908,6 +5914,8 @@ test "client authentication fails when the server rejects the client certificate
         tls_backend.CredentialFailure.peer_verification_rejected,
         harness.server_backend.credentialFailure().?,
     );
+    // #763: a rejected client certificate never becomes a verified identity.
+    try std.testing.expect(harness.server_backend.verifiedPeerCertificate() == null);
 }
 
 // ===========================================================================

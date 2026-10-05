@@ -1064,8 +1064,15 @@ during `ClientHello`.
 - a plaintext HTTP request sent to a TLS listener (or vice versa) — the
   symptom looks like a "hang" or protocol error, not a clean TLS alert
 - client certificate verification enabled
-  (`TARDIGRADE_TLS_CLIENT_VERIFY=true`) but the client didn't present one,
-  or its chain doesn't validate against `TARDIGRADE_TLS_CLIENT_CA_PATH`
+  (`TARDIGRADE_TLS_CLIENT_VERIFY=true`) but the client didn't present one
+  (`certificate_required` alert; use `TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL`
+  to allow it), or its chain doesn't validate against
+  `TARDIGRADE_TLS_CLIENT_CA_PATH` — wrong issuing CA, expired or not-yet-valid
+  certificate, a `serverAuth`-only Extended Key Usage, a path longer than
+  `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH`, or a missing intermediate the client
+  did not send. Check the gateway log for `native tls handshake failed`; the
+  client certificate itself is never logged. If a reload logs
+  `client trust reload failed`, the previous CA bundle is still serving.
 
 #### Concrete fixes
 

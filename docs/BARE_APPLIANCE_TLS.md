@@ -21,7 +21,7 @@ The appliance profile is deliberately narrow:
 
 Explicit non-goals (rejected, not silently degraded): RSA, ECDSA/P-256
 signing, encrypted private keys, OpenSSH keys, multiple SNI identities,
-wildcard host names, client certificates/mTLS, full public-PKI *trust*
+wildcard host names, full public-PKI *trust*
 policy (root/CA-bundle pinning, revocation, path-length/name-constraint
 enforcement), hardware/remote signers, filesystem watchers, and heuristic
 PEM/DER format detection. See [Certificate-chain coherence](#certificate-chain-coherence)
@@ -49,8 +49,7 @@ The appliance profile also rejects, deterministically, active configuration
 its engine cannot honor: `tls_min_version`/`tls_max_version` must both be
 `"1.3"` (defaults to `"1.3"` automatically in appliance builds — only an
 explicit override to something else is rejected); `tls_cipher_list`/
-`tls_cipher_suites` must be empty (the cipher is fixed); `tls_client_verify`,
-`tls_ocsp_stapling`, `tls_crl_check`, and `tls_acme_enabled` must be off;
+`tls_cipher_suites` must be empty (the cipher is fixed); `tls_ocsp_stapling`, `tls_crl_check`, and `tls_acme_enabled` must be off;
 `tls_session_cache`/`tls_session_tickets` must be off (default off in
 appliance builds; these were OpenSSL-terminator-only features, and #649
 retired that terminator from every profile, so this owner never constructs

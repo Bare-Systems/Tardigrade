@@ -92,6 +92,16 @@ pub const WebPkiVerifier = struct {
     allocator: std.mem.Allocator,
     trust_anchors: []const pki.x509.Certificate,
     crypto_provider: crypto.provider.CryptoProvider,
+    /// Which TLS certificate purpose the peer chain is validated for. A
+    /// `.client` verifier (downstream mTLS, #763) requires `id-kp-clientAuth`
+    /// rather than `id-kp-serverAuth` and applies no hostname policy.
+    purpose: Purpose = .server,
+    /// Longest certification path accepted, counting the leaf and
+    /// intermediates but not the trust anchor.
+    maximum_path_length: usize = default_maximum_path_length,
+
+    pub const Purpose = enum { server, client };
+    pub const default_maximum_path_length: usize = 8;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -99,6 +109,19 @@ pub const WebPkiVerifier = struct {
         crypto_provider: crypto.provider.CryptoProvider,
     ) WebPkiVerifier {
         return .{ .allocator = allocator, .trust_anchors = trust_anchors, .crypto_provider = crypto_provider };
+    }
+
+    /// A verifier for downstream client certificates (#763).
+    pub fn initClientAuth(
+        allocator: std.mem.Allocator,
+        trust_anchors: []const pki.x509.Certificate,
+        crypto_provider: crypto.provider.CryptoProvider,
+        maximum_path_length: usize,
+    ) WebPkiVerifier {
+        var self = init(allocator, trust_anchors, crypto_provider);
+        self.purpose = .client;
+        self.maximum_path_length = maximum_path_length;
+        return self;
     }
 
     pub fn verifier(self: *WebPkiVerifier) credentials.PeerVerifier {
@@ -147,7 +170,12 @@ pub const WebPkiVerifier = struct {
         const now_unix_s = zig_compat.unixTimestamp();
         const result = pki.path_validator.validateCandidates(arena, candidates, .{
             .validation_time = now_unix_s,
-            .expected_dns_name = context.server_name,
+            // The SNI a client sent names *our* server, not the client
+            // certificate's identity: never a hostname policy for `.client`.
+            .expected_dns_name = if (self.purpose == .server) context.server_name else null,
+            .require_server_auth_eku = self.purpose == .server,
+            .require_client_auth_eku = self.purpose == .client,
+            .maximum_path_length = self.maximum_path_length,
             .trust_anchors = self.trust_anchors,
         }, self.crypto_provider);
         return switch (result) {

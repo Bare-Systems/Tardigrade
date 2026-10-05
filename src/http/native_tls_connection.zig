@@ -11,6 +11,8 @@ const production_crypto = tls.production_crypto;
 const tls_backend = tls.tls13_backend;
 const sni_provider = tls.sni_provider;
 const credentials = tls.credentials;
+const webpki_verifier = tls.webpki_verifier;
+const client_identity = tls.client_identity;
 
 pub const ListenerProtocolPolicy = negotiated_dispatch.ListenerProtocolPolicy;
 pub const NegotiatedProtocol = negotiated_dispatch.NegotiatedProtocol;
@@ -19,6 +21,86 @@ pub const SniCertSpec = struct {
     server_name: []const u8,
     cert_path: []const u8,
     key_path: []const u8,
+};
+
+/// Downstream client-certificate trust anchors (#763), published as immutable
+/// refcounted generations so a reload swaps the whole set atomically: a
+/// handshake pins one generation for its whole lifetime (the verifier borrows
+/// its anchors) and never observes a half-rotated bundle. A failed
+/// `prepare` leaves the serving generation untouched.
+pub const ClientTrustStore = struct {
+    allocator: std.mem.Allocator,
+    mutex: compat.Mutex = .{},
+    current: ?*Generation = null,
+
+    pub const Generation = struct {
+        allocator: std.mem.Allocator,
+        refs: std.atomic.Value(u32),
+        anchors: webpki_verifier.TrustAnchors,
+        max_path_length: usize,
+
+        pub fn release(self: *Generation) void {
+            if (self.refs.fetchSub(1, .acq_rel) == 1) {
+                const allocator = self.allocator;
+                self.anchors.deinit(allocator);
+                allocator.destroy(self);
+            }
+        }
+    };
+
+    pub const Prepared = struct {
+        generation: ?*Generation,
+
+        pub fn deinit(self: *Prepared) void {
+            if (self.generation) |g| g.release();
+            self.* = undefined;
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator) ClientTrustStore {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *ClientTrustStore) void {
+        if (self.current) |g| g.release();
+        self.* = undefined;
+    }
+
+    /// Load and parse `ca_bundle_path` without publishing it. `ca_bundle_path`
+    /// must be non-empty: client trust never falls back to the system store.
+    pub fn prepare(self: *ClientTrustStore, ca_bundle_path: []const u8, max_path_length: usize) !Prepared {
+        if (ca_bundle_path.len == 0) return error.ClientTrustPathRequired;
+        var anchors = try webpki_verifier.loadTrustAnchors(self.allocator, ca_bundle_path);
+        errdefer anchors.deinit(self.allocator);
+        if (anchors.anchors().len == 0) return error.NoClientTrustAnchors;
+        const generation = try self.allocator.create(Generation);
+        generation.* = .{
+            .allocator = self.allocator,
+            .refs = std.atomic.Value(u32).init(1),
+            .anchors = anchors,
+            .max_path_length = max_path_length,
+        };
+        return .{ .generation = generation };
+    }
+
+    pub fn commit(self: *ClientTrustStore, prepared: *Prepared) void {
+        const generation = prepared.generation orelse return;
+        prepared.generation = null;
+        self.mutex.lock();
+        const previous = self.current;
+        self.current = generation;
+        self.mutex.unlock();
+        if (previous) |g| g.release();
+    }
+
+    /// Pin the serving generation; the caller must `release` it.
+    pub fn acquire(self: *ClientTrustStore) ?*Generation {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const g = self.current orelse return null;
+        _ = g.refs.fetchAdd(1, .monotonic);
+        return g;
+    }
 };
 
 pub const NativeCredentialStore = struct {
@@ -201,6 +283,11 @@ pub const NativeTlsConnection = struct {
         /// also installed replay protection. Default disabled keeps tickets
         /// resume-only and causes attempted early data to be rejected.
         server_early_data_policy: tls_backend.ServerEarlyDataPolicy = .{},
+        /// Downstream client-certificate authentication (#763). Anything but
+        /// `.disabled` requires `client_trust` with a published generation;
+        /// creation fails closed otherwise.
+        client_auth: tls_backend.ClientAuthMode = .disabled,
+        client_trust: ?*ClientTrustStore = null,
     };
 
     allocator: std.mem.Allocator,
@@ -217,6 +304,13 @@ pub const NativeTlsConnection = struct {
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
+    /// Client-auth state (#763). `client_verifier` is borrowed by the backend
+    /// for the handshake, so it lives here (heap-stable) beside the pinned
+    /// trust generation it reads.
+    client_trust_generation: ?*ClientTrustStore.Generation = null,
+    client_verifier: webpki_verifier.WebPkiVerifier = undefined,
+    client_identity: client_identity.ClientIdentity = .{},
+    client_identity_present: bool = false,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -238,6 +332,15 @@ pub const NativeTlsConnection = struct {
         try options.buffer_limits.validate();
         try setNonBlocking(fd);
         const handshake_entropy = try production_crypto.freshHandshakeEntropy();
+
+        // Fail closed before anything is allocated: a listener that demands
+        // client certificates must never degrade to unauthenticated.
+        var trust_generation: ?*ClientTrustStore.Generation = null;
+        if (options.client_auth != .disabled) {
+            const store = options.client_trust orelse return error.ClientTrustUnavailable;
+            trust_generation = store.acquire() orelse return error.ClientTrustUnavailable;
+        }
+        errdefer if (trust_generation) |g| g.release();
 
         const self = try allocator.create(NativeTlsConnection);
         errdefer allocator.destroy(self);
@@ -300,7 +403,17 @@ pub const NativeTlsConnection = struct {
             .crypto_provider_state = self.crypto_provider_state,
             .resumption_runtime = options.resumption_runtime,
             .server_early_data_policy = if (options.early_data_replay_gate != null and options.resumption_runtime != null) options.server_early_data_policy else .{},
+            .client_trust_generation = trust_generation,
         };
+        if (trust_generation) |g| {
+            self.client_verifier = webpki_verifier.WebPkiVerifier.initClientAuth(
+                allocator,
+                g.anchors.anchors(),
+                crypto_provider,
+                g.max_path_length,
+            );
+            backend.requestClientAuthentication(options.client_auth, self.client_verifier.verifier());
+        }
         record.* = try encrypted_stream.PureZigRecordStream.initWithCarrierBackendAndLimits(
             allocator,
             .server,
@@ -321,6 +434,8 @@ pub const NativeTlsConnection = struct {
     }
 
     pub fn deinit(self: *NativeTlsConnection) void {
+        const trust_generation = self.client_trust_generation;
+        defer if (trust_generation) |g| g.release();
         self.record.deinit();
         self.allocator.destroy(self.record);
         self.allocator.destroy(self.backend);
@@ -332,7 +447,7 @@ pub const NativeTlsConnection = struct {
     }
 
     pub fn httpConnection(self: *NativeTlsConnection) encrypted_stream_connection.EncryptedStreamHttpConnection {
-        return encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFdAndProvenance(
+        var conn = encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFdAndProvenance(
             self.stream(),
             self.fd,
             self,
@@ -340,6 +455,32 @@ pub const NativeTlsConnection = struct {
             nativeReadEarlyPrefixLen,
             nativeHandshakeComplete,
         );
+        conn.client_cert_fn = nativeClientIdentity;
+        return conn;
+    }
+
+    /// Capture the verified client identity once the handshake is complete
+    /// (#763). A no-op without client auth or when the client presented no
+    /// certificate. Returns an error only when a *verified* certificate cannot
+    /// be rendered, which the caller must treat as a failed connection rather
+    /// than serve the request unauthenticated.
+    pub fn finalizeClientIdentity(self: *NativeTlsConnection) !void {
+        if (self.client_identity_present) return;
+        const der = self.backend.verifiedPeerCertificate() orelse return;
+        self.client_identity = try client_identity.ClientIdentity.fromVerifiedDer(self.allocator, der);
+        self.client_identity_present = true;
+    }
+
+    /// The verified client identity, borrowing this connection's storage.
+    /// Null when no client certificate was verified.
+    pub fn clientIdentity(self: *const NativeTlsConnection) ?*const client_identity.ClientIdentity {
+        if (!self.client_identity_present) return null;
+        return &self.client_identity;
+    }
+
+    fn nativeClientIdentity(ptr: *anyopaque) ?*const client_identity.ClientIdentity {
+        const self: *NativeTlsConnection = @ptrCast(@alignCast(ptr));
+        return self.clientIdentity();
     }
 
     pub fn readTransportEarly(self: *const NativeTlsConnection) bool {
@@ -1266,4 +1407,142 @@ fn testSocketPair() ![2]std.posix.fd_t {
     errdefer closeFd(fds[0]);
     errdefer closeFd(fds[1]);
     return fds;
+}
+
+// ---------------------------------------------------------------------------
+// #763: downstream client-certificate authentication.
+// ---------------------------------------------------------------------------
+
+fn testClientVerdict(
+    allocator: std.mem.Allocator,
+    trust: *const webpki_verifier.TrustAnchors,
+    leaf_pem_path: []const u8,
+) !credentials.Verdict {
+    const leaf_pem = try compat.cwd().readFileAlloc(allocator, leaf_pem_path, 256 * 1024);
+    defer allocator.free(leaf_pem);
+    const chain = try tls.identity_loader.certChainFromPemOrDer(allocator, leaf_pem);
+    defer freeTestCertChain(allocator, chain);
+    const views = try allocator.alloc([]const u8, chain.len);
+    defer allocator.free(views);
+    for (chain, 0..) |entry, i| views[i] = entry;
+
+    var entropy = production_crypto.OsEntropy{};
+    var provider_state = production_crypto.Provider.init(entropy.entropy());
+    var verifier = webpki_verifier.WebPkiVerifier.initClientAuth(allocator, trust.anchors(), provider_state.cryptoProvider(), 3);
+    const context = credentials.VerificationContext{
+        .role = .server,
+        // The SNI the client asked for names *this server*; it must never
+        // become a hostname policy on the client certificate.
+        .server_name = "unrelated.example",
+        .chain = .{ .entries = views },
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{ .require_peer_authentication = true },
+    };
+    return switch (try verifier.verifier().verifyPeer(&context)) {
+        .complete => |verdict| verdict,
+        .pending => error.UnexpectedPending,
+    };
+}
+
+test "client-auth verifier accepts a CA-issued clientAuth cert and rejects wrong CA, wrong EKU, and garbage" {
+    const allocator = std.testing.allocator;
+    var anchors = try webpki_verifier.loadTrustAnchors(allocator, "tests/fixtures/tls/ca.crt");
+    defer anchors.deinit(allocator);
+
+    try std.testing.expectEqual(credentials.Verdict.accepted, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/client.crt"));
+    // Issued by a different CA than the configured trust anchor.
+    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/rogue_client.crt"));
+    // Right CA, but a serverAuth-only certificate is not a client identity.
+    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/server.crt"));
+    // Self-signed leaf that is not itself a configured anchor.
+    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/native_ed25519.crt"));
+}
+
+test "client trust store rotates atomically and a failed prepare keeps the serving generation" {
+    const allocator = std.testing.allocator;
+    var store = ClientTrustStore.init(allocator);
+    defer store.deinit();
+    try std.testing.expect(store.acquire() == null);
+    try std.testing.expectError(error.ClientTrustPathRequired, store.prepare("", 3));
+
+    var first = try store.prepare("tests/fixtures/tls/ca.crt", 3);
+    store.commit(&first);
+    // A handshake pins generation one, then a reload publishes generation two.
+    const pinned = store.acquire().?;
+    defer pinned.release();
+
+    try std.testing.expectError(error.FileNotFound, store.prepare("tests/fixtures/tls/does-not-exist.pem", 3));
+    const still_serving = store.acquire().?;
+    defer still_serving.release();
+    try std.testing.expectEqual(pinned, still_serving);
+
+    var second = try store.prepare("tests/fixtures/tls/native_ed25519_ca.crt", 5);
+    store.commit(&second);
+    const current = store.acquire().?;
+    defer current.release();
+    try std.testing.expect(current != pinned);
+    try std.testing.expectEqual(@as(usize, 5), current.max_path_length);
+    // The pinned generation keeps verifying against the *old* anchors.
+    try std.testing.expectEqual(@as(usize, 3), pinned.max_path_length);
+    try std.testing.expectEqual(credentials.Verdict.accepted, try testClientVerdict(allocator, &pinned.anchors, "tests/fixtures/tls/client.crt"));
+    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &current.anchors, "tests/fixtures/tls/client.crt"));
+    // A CA bundle must be made of real CAs: a non-CA "anchor" fails the load.
+    try std.testing.expectError(error.NonCaAnchor, store.prepare("tests/fixtures/tls/rogue_ca.crt", 3));
+}
+
+test "native TLS client auth fails closed without a published trust generation" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    try std.testing.expectError(error.ClientTrustUnavailable, NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .client_auth = .required },
+    ));
+
+    var store = ClientTrustStore.init(std.testing.allocator);
+    defer store.deinit();
+    try std.testing.expectError(error.ClientTrustUnavailable, NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .client_auth = .optional, .client_trust = &store },
+    ));
+}
+
+test "native TLS client auth pins a trust generation for the connection lifetime" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    var store = ClientTrustStore.init(std.testing.allocator);
+    defer store.deinit();
+    var prepared = try store.prepare("tests/fixtures/tls/ca.crt", 3);
+    store.commit(&prepared);
+
+    const conn = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .client_auth = .required, .client_trust = &store },
+    );
+    try std.testing.expect(conn.client_trust_generation != null);
+    try std.testing.expect(conn.backend.client_auth == .required);
+    // No handshake has run: no identity may exist.
+    try conn.finalizeClientIdentity();
+    try std.testing.expect(conn.clientIdentity() == null);
+    // Rotating trust while the connection is alive must not free its anchors.
+    var rotated = try store.prepare("tests/fixtures/tls/native_ed25519_ca.crt", 3);
+    store.commit(&rotated);
+    conn.destroy();
 }

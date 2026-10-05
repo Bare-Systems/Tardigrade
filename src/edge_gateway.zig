@@ -420,6 +420,16 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         }
     }
     defer if (native_credentials) |*store| store.deinit();
+    // #763: downstream mTLS trust anchors. Loaded eagerly so a bad bundle
+    // fails startup rather than the first handshake; never falls back to the
+    // system trust store.
+    var client_trust: ?http.native_tls_connection.ClientTrustStore = null;
+    if (cfg.tls_client_verify and native_tls_provider != null) {
+        client_trust = http.native_tls_connection.ClientTrustStore.init(state_allocator);
+        var prepared = try client_trust.?.prepare(cfg.tls_client_ca_path, cfg.tls_client_verify_depth);
+        client_trust.?.commit(&prepared);
+    }
+    defer if (client_trust) |*store| store.deinit();
     const native_early_data_replay_composition = nativeEarlyDataReplayComposition(
         cfg.tls_native_early_data_replay_mode,
         native_resumption_runtime != null,
@@ -565,6 +575,7 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         .config_store = &config_store,
         .state = &state,
         .native_credentials = if (native_credentials) |*store| store else null,
+        .client_trust = if (client_trust) |*store| store else null,
         .native_tls_provider = native_tls_provider,
         .resumption_runtime = if (native_resumption_runtime) |*rt| rt else null,
         .early_data_replay_gate = native_early_data_replay_gate,
@@ -1444,8 +1455,10 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             ctx.state.logger.warn(null, "native TLS path does not support PROXY protocol preface parsing yet", .{});
             return;
         }
-        if (cfg.tls_client_verify) {
-            ctx.state.logger.warn(null, "native TLS path does not support downstream client certificate verification yet", .{});
+        if (cfg.tls_client_verify and ctx.client_trust == null) {
+            // Fail closed: never serve a listener that is configured to
+            // demand client certificates without a trust store.
+            ctx.state.logger.warn(null, "client certificate verification is enabled but no client trust store is loaded", .{});
             return;
         }
         const tls_protocol_policy = gprotocol_policy.listenerPolicyFromConfig(cfg);
@@ -1459,6 +1472,8 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
                 .resumption_runtime = ctx.resumption_runtime,
                 .early_data_replay_gate = ctx.early_data_replay_gate,
                 .server_early_data_policy = nativeTcpServerEarlyDataPolicy(ctx.early_data_replay_gate),
+                .client_auth = if (!cfg.tls_client_verify) .disabled else if (cfg.tls_client_verify_optional) .optional else .required,
+                .client_trust = ctx.client_trust,
             },
         ) catch |err| {
             ctx.state.logger.warn(null, "native tls connection setup failed: {}", .{err});
@@ -1957,6 +1972,14 @@ fn advanceNativeHandshake(ctx: *WorkerContext, managed: *http.downstream_connect
         }
     }
 
+    native.finalizeClientIdentity() catch |err| {
+        // A certificate the validator accepted but we cannot render: refuse
+        // the connection rather than serve it without its identity.
+        ctx.state.logger.warn(null, "native tls verified client identity unavailable: {}", .{err});
+        managed.deinit();
+        return;
+    };
+
     const negotiated = native.validatedNegotiatedProtocol() catch |err| {
         ctx.state.logger.warn(null, "native tls negotiated protocol rejected: {}", .{err});
         managed.deinit();
@@ -2087,6 +2110,11 @@ const WaitingEncryptedHttpConnection = struct {
 
     pub fn downstreamHandshakeComplete(self: *const WaitingEncryptedHttpConnection) bool {
         return self.inner.downstreamHandshakeComplete();
+    }
+
+    pub fn clientCertificate(self: *const WaitingEncryptedHttpConnection) ?http.headers.ClientCertificate {
+        const identity = self.inner.clientIdentity() orelse return null;
+        return clientCertificateView(identity);
     }
 
     pub fn waitForHandshakeCompletionOrInput(self: *WaitingEncryptedHttpConnection) !void {
@@ -2452,6 +2480,31 @@ fn h1ConsumeRequestEarlyProvenance(session: *ConnectionSession, old_pending_len:
     session.pending_early_prefix_len = if (consumed >= prefix_len) 0 else prefix_len - consumed;
     if (session.pending_len < session.pending_early_prefix_len) session.pending_early_prefix_len = session.pending_len;
     return request_transport_early;
+}
+
+fn clientCertificateView(identity: *const tls_core.client_identity.ClientIdentity) http.headers.ClientCertificate {
+    return .{
+        .fingerprint_sha256 = identity.fingerprintSha256(),
+        .subject = identity.subject(),
+        .issuer = identity.issuer(),
+        .serial = identity.serialHex(),
+        .san_dns = identity.sanDns(),
+        .san_email = identity.sanEmail(),
+        .san_uri = identity.sanUri(),
+    };
+}
+
+/// The verified mTLS identity of `conn` (#763), or null for plaintext and
+/// connections without a verified client certificate.
+fn connClientCertificate(conn: anytype) ?http.headers.ClientCertificate {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "clientCertificate")) return conn.clientCertificate();
+    } else {
+        if (comptime @hasDecl(T, "clientCertificate")) return conn.clientCertificate();
+    }
+    return null;
 }
 
 fn h2BeginReadScope(conn: anytype) void {
@@ -3287,6 +3340,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     cfg.max_connection_memory_bytes,
                     &buffered_request_bytes,
                 );
+                if (pending.getPtr(frame.stream_id)) |stamped| stamped.headers.client_cert = connClientCertificate(conn);
             },
             .data => {
                 if (frame.stream_id == 0) {
@@ -3448,6 +3502,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         cfg.max_connection_memory_bytes,
                         &buffered_request_bytes,
                     );
+                    if (pending.getPtr(stream_id)) |stamped| stamped.headers.client_cert = connClientCertificate(conn);
                     continuation_block.clearRetainingCapacity();
                     continuation_stream_id = null;
                     continuation_end_stream = false;
@@ -4181,7 +4236,10 @@ fn synthesizeHttp2Request(
     try raw.appendSlice(ps.body.items);
     const owned_raw = try raw.toOwnedSlice();
     errdefer allocator.free(owned_raw);
-    const parsed = try http.Request.parse(allocator, owned_raw, MAX_REQUEST_SIZE);
+    var parsed = try http.Request.parse(allocator, owned_raw, MAX_REQUEST_SIZE);
+    // The synthetic request was re-parsed from bytes, so the connection's
+    // verified identity (#763) is carried over explicitly, never from them.
+    parsed.request.headers.client_cert = ps.headers.client_cert;
     return .{
         .request = parsed.request,
         .raw = owned_raw,
@@ -4277,6 +4335,46 @@ fn buildHttp2StaticResponse(allocator: std.mem.Allocator, cfg: *const edge_confi
     })) orelse return null;
     defer served.deinit(allocator);
     return try http2StaticResponseFromServed(allocator, &served);
+}
+
+test "H2 synthetic request carries only the connection's verified client certificate (#763)" {
+    const allocator = std.testing.allocator;
+    var ps = Http2PendingStream.init(allocator);
+    defer ps.deinit(allocator);
+    ps.method = try allocator.dupe(u8, "GET");
+    ps.path = try allocator.dupe(u8, "/");
+    ps.authority = try allocator.dupe(u8, "example.test");
+    // A client spoofing the asserted identity over HTTP/2.
+    try ps.headers.append("x-tardigrade-client-cert-verified", "1");
+    try ps.headers.append("x-tardigrade-client-cert-subject", "CN=admin");
+
+    {
+        var synthesized = try synthesizeHttp2Request(allocator, "GET", "/", &ps);
+        defer synthesized.deinit(allocator);
+        // No verified certificate on the connection: nothing is carried over,
+        // and the spoofed fields are dropped by the proxy header filter.
+        try std.testing.expect(synthesized.request.headers.client_cert == null);
+        var extra = std.array_list.Managed(std.http.Header).init(allocator);
+        defer extra.deinit();
+        try gph.appendProxyRequestHeaders(&extra, &synthesized.request.headers);
+        for (extra.items) |h| try std.testing.expect(!std.ascii.startsWithIgnoreCase(h.name, "x-tardigrade-"));
+    }
+
+    ps.headers.client_cert = .{ .fingerprint_sha256 = "cd" ** 32, .subject = "CN=alice" };
+    var synthesized = try synthesizeHttp2Request(allocator, "GET", "/", &ps);
+    defer synthesized.deinit(allocator);
+    try std.testing.expectEqualStrings("CN=alice", synthesized.request.headers.client_cert.?.subject);
+    var extra = std.array_list.Managed(std.http.Header).init(allocator);
+    defer extra.deinit();
+    try gph.appendProxyRequestHeaders(&extra, &synthesized.request.headers);
+    var subjects: usize = 0;
+    for (extra.items) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "x-tardigrade-client-cert-subject")) {
+            subjects += 1;
+            try std.testing.expectEqualStrings("CN=alice", h.value);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), subjects);
 }
 
 test "buildHttp2StaticResponse: buffered static response over 256 KiB is not truncated" {
@@ -4893,6 +4991,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         session.current_request_transport_early = request_transport_early;
     }
     const request_transport_early = session.current_request_transport_early;
+    // #763: the verified mTLS identity comes from the connection's handshake,
+    // never from request bytes (inbound `X-Tardigrade-*` is stripped at proxy).
+    request.headers.client_cert = connClientCertificate(conn);
     const writer = conn.writer();
     keep_alive = request.keepAlive();
     if (streaming_request_body != null) keep_alive = false;

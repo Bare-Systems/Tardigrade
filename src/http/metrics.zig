@@ -364,6 +364,7 @@ pub const Metrics = struct {
     response_streams_active: u64,
     response_stream_admissions_total: [response_stream_admission_outcome_count]u64,
     response_stream_duration_ms_sum: u64,
+    response_stream_duration_count: u64,
     response_stream_closes_total: [response_stream_close_reason_count]u64,
     /// #818: WebSocket reactor load, sampled on the event-loop tick.
     websocket_reactor: WebSocketReactorStats = .{},
@@ -597,6 +598,7 @@ pub const Metrics = struct {
             .response_streams_active = 0,
             .response_stream_admissions_total = .{0} ** response_stream_admission_outcome_count,
             .response_stream_duration_ms_sum = 0,
+            .response_stream_duration_count = 0,
             .response_stream_closes_total = .{0} ** response_stream_close_reason_count,
             .websocket_reactor = .{},
             .http_early_data_requests_total = .{.{0} ** early_data_source_count} ** http_protocol_count,
@@ -787,12 +789,19 @@ pub const Metrics = struct {
 
     pub fn recordResponseStreamAdmission(self: *Metrics, outcome: response_stream_lifecycle.AdmissionOutcome) void {
         self.response_stream_admissions_total[@intFromEnum(outcome)] += 1;
-        if (outcome == .admitted) self.response_streams_active += 1;
+        switch (outcome) {
+            .admitted => self.response_streams_active += 1,
+            // A capacity rejection is terminal but never owns an active slot
+            // or an admitted-stream lifetime.
+            .capacity => self.response_stream_closes_total[@intFromEnum(response_stream_lifecycle.CloseReason.capacity)] += 1,
+        }
     }
 
     pub fn recordResponseStreamClosed(self: *Metrics, reason: response_stream_lifecycle.CloseReason, duration_ms: u64) void {
+        std.debug.assert(reason != .capacity);
         self.response_streams_active -|= 1;
         self.response_stream_duration_ms_sum += duration_ms;
+        self.response_stream_duration_count += 1;
         self.response_stream_closes_total[@intFromEnum(reason)] += 1;
     }
 
@@ -1982,11 +1991,6 @@ pub const Metrics = struct {
         inline for (comptime std.enums.values(response_stream_lifecycle.AdmissionOutcome)) |outcome| {
             try out.print("tardigrade_response_stream_admissions_total{{outcome=\"{s}\"}} {d}\n", .{ @tagName(outcome), self.response_stream_admissions_total[@intFromEnum(outcome)] });
         }
-        const closed = blk: {
-            var total: u64 = 0;
-            for (self.response_stream_closes_total) |count| total += count;
-            break :blk total;
-        };
         try out.print(
             \\# HELP tardigrade_response_streams_active Long-lived streamed HTTP responses currently admitted
             \\# TYPE tardigrade_response_streams_active gauge
@@ -2002,7 +2006,7 @@ pub const Metrics = struct {
             self.response_streams_active,
             self.response_stream_duration_ms_sum / 1000,
             self.response_stream_duration_ms_sum % 1000,
-            closed,
+            self.response_stream_duration_count,
         });
         inline for (comptime std.enums.values(response_stream_lifecycle.CloseReason)) |reason| {
             try out.print("tardigrade_response_stream_closes_total{{reason=\"{s}\"}} {d}\n", .{ @tagName(reason), self.response_stream_closes_total[@intFromEnum(reason)] });
@@ -3157,7 +3161,7 @@ test "Metrics serializes bounded response-stream lifecycle series (#841)" {
         "tardigrade_response_stream_closes_total{reason=\"timeout\"} 0\n",
         "tardigrade_response_stream_closes_total{reason=\"reload\"} 0\n",
         "tardigrade_response_stream_closes_total{reason=\"shutdown\"} 0\n",
-        "tardigrade_response_stream_closes_total{reason=\"capacity\"} 0\n",
+        "tardigrade_response_stream_closes_total{reason=\"capacity\"} 1\n",
     }) |needle| try std.testing.expect(std.mem.find(u8, prom, needle) != null);
 
     const json = try m.toJson(allocator);
@@ -3165,6 +3169,17 @@ test "Metrics serializes bounded response-stream lifecycle series (#841)" {
     try std.testing.expect(std.mem.find(u8, json, "\"response_streams_active\":1") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"response_stream_capacity_total\":1") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"response_stream_closes_upstream\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"response_stream_closes_capacity\":1") != null);
+}
+
+test "capacity refusal records a terminal reason without decrementing active streams (#841)" {
+    var m = Metrics.init();
+    m.recordResponseStreamAdmission(.admitted);
+    m.recordResponseStreamAdmission(.capacity);
+
+    try std.testing.expectEqual(@as(u64, 1), m.response_streams_active);
+    try std.testing.expectEqual(@as(u64, 1), m.response_stream_closes_total[@intFromEnum(response_stream_lifecycle.CloseReason.capacity)]);
+    try std.testing.expectEqual(@as(u64, 0), m.response_stream_duration_count);
 }
 
 test "Metrics toPrometheus produces valid Prometheus text" {

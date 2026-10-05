@@ -888,6 +888,7 @@ pub const GatewayState = struct {
         reason: http.response_stream_lifecycle.CloseReason,
         now_ms: u64,
     ) void {
+        std.debug.assert(reason != .capacity);
         const duration_ms = now_ms -| admission.opened_at_ms;
         admission.release();
         self.metricsRecordResponseStreamClosed(reason, duration_ms);

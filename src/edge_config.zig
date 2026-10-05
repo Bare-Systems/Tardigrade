@@ -2222,15 +2222,10 @@ fn parseStrictU32Env(allocator: std.mem.Allocator, key: []const u8, default_valu
     const raw = (try lookupConfigValue(allocator, key)) orelse return default_value;
     defer allocator.free(raw);
     const value = std.mem.trim(u8, raw, " \t\r\n");
-    return parseStrictU32(value) orelse {
+    return http.response_stream_lifecycle.parseStrictU32(value) orelse {
         logConfigDiagnostic("config validation failed: {s} must be an unsigned integer, got '{s}'", .{ directive, value });
         return error.InvalidConfigValue;
     };
-}
-
-fn parseStrictU32(value: []const u8) ?u32 {
-    for (value) |byte| if (!std.ascii.isDigit(byte)) return null;
-    return std.fmt.parseInt(u32, value, 10) catch null;
 }
 
 fn responseStreamConfigFromEnv(allocator: std.mem.Allocator) !http.response_stream_lifecycle.Config {
@@ -2263,13 +2258,13 @@ fn responseStreamConfigFromEnv(allocator: std.mem.Allocator) !http.response_stre
 }
 
 test "strict u32 settings reject malformed values and keep zero (#812)" {
-    try std.testing.expectEqual(@as(?u32, 0), parseStrictU32("0"));
-    try std.testing.expectEqual(@as(?u32, 30000), parseStrictU32("30000"));
-    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("250ms"));
-    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("-1"));
-    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("+5"));
-    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("99999999999"));
-    try std.testing.expectEqual(@as(?u32, null), parseStrictU32(""));
+    try std.testing.expectEqual(@as(?u32, 0), http.response_stream_lifecycle.parseStrictU32("0"));
+    try std.testing.expectEqual(@as(?u32, 30000), http.response_stream_lifecycle.parseStrictU32("30000"));
+    try std.testing.expectEqual(@as(?u32, null), http.response_stream_lifecycle.parseStrictU32("250ms"));
+    try std.testing.expectEqual(@as(?u32, null), http.response_stream_lifecycle.parseStrictU32("-1"));
+    try std.testing.expectEqual(@as(?u32, null), http.response_stream_lifecycle.parseStrictU32("+5"));
+    try std.testing.expectEqual(@as(?u32, null), http.response_stream_lifecycle.parseStrictU32("99999999999"));
+    try std.testing.expectEqual(@as(?u32, null), http.response_stream_lifecycle.parseStrictU32(""));
 }
 
 test "strict u32 settings default only when absent, and reject an explicit empty value (#812)" {
@@ -2884,7 +2879,7 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
                 response_stream.reload = http.response_stream_lifecycle.ReloadPolicy.parse(option["response_stream_reload:".len..]) orelse return error.InvalidLocationBlockFormat;
                 response_stream_options_seen = true;
             } else if (std.mem.startsWith(u8, option, "response_stream_reload_timeout_ms:")) {
-                response_stream.reload_timeout_ms = std.fmt.parseInt(u32, option["response_stream_reload_timeout_ms:".len..], 10) catch return error.InvalidLocationBlockFormat;
+                response_stream.reload_timeout_ms = http.response_stream_lifecycle.parseStrictU32(option["response_stream_reload_timeout_ms:".len..]) orelse return error.InvalidLocationBlockFormat;
                 response_stream_options_seen = true;
             } else if (std.mem.startsWith(u8, option, "forward_auth:")) {
                 const url = option["forward_auth:".len..];
@@ -4577,6 +4572,9 @@ test "parse location blocks reject invalid response-stream overrides (#841)" {
         "prefix|/events/|return|200|ok|response_stream_reload:drain",
         "prefix|/events/|proxy_pass|http://127.0.0.1:9000|response_stream_reload:restart",
         "prefix|/events/|proxy_pass|http://127.0.0.1:9000|response_stream_reload_timeout_ms:soon",
+        "prefix|/events/|proxy_pass|http://127.0.0.1:9000|response_stream_reload_timeout_ms:+1",
+        "prefix|/events/|proxy_pass|http://127.0.0.1:9000|response_stream_reload_timeout_ms:-0",
+        "prefix|/events/|proxy_pass|http://127.0.0.1:9000|response_stream_reload_timeout_ms:1_000",
     };
     for (cases) |raw| try std.testing.expectError(error.InvalidLocationBlockFormat, parseLocationBlocks(std.testing.allocator, raw));
 }

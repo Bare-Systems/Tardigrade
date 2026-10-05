@@ -993,7 +993,7 @@ fn parseLocationStatement(
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "proxy_response_stream_reload_timeout_ms")) {
-        builder.proxy_response_stream_reload_timeout_ms = std.fmt.parseInt(u32, value_interp, 10) catch {
+        builder.proxy_response_stream_reload_timeout_ms = response_stream_lifecycle.parseStrictU32(value_interp) orelse {
             logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_response_stream_reload_timeout_ms must be a number of milliseconds", .{ file_path, line_no });
             return error.InvalidConfigSyntax;
         };
@@ -1931,6 +1931,9 @@ test "location block rejects invalid response-stream overrides (#841)" {
         "location /events/ {\n    return 200 ok;\n    proxy_response_stream_reload drain;\n}\n",
         "location /events/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_response_stream_reload restart;\n}\n",
         "location /events/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_response_stream_reload_timeout_ms 1s;\n}\n",
+        "location /events/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_response_stream_reload_timeout_ms +1;\n}\n",
+        "location /events/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_response_stream_reload_timeout_ms -0;\n}\n",
+        "location /events/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_response_stream_reload_timeout_ms 1_000;\n}\n",
     };
     for (cases) |data| {
         var overrides = Overrides.init(allocator);

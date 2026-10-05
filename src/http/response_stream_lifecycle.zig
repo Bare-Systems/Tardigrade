@@ -4,6 +4,15 @@ const std = @import("std");
 pub const DEFAULT_MAX_ACTIVE: u32 = 256;
 pub const DEFAULT_RELOAD_TIMEOUT_MS: u32 = 30_000;
 
+/// Parse the unsigned-decimal syntax shared by every response-stream config
+/// path. `std.fmt.parseInt` also accepts signs and digit separators, which are
+/// intentionally outside the operator-facing contract for these settings.
+pub fn parseStrictU32(value: []const u8) ?u32 {
+    if (value.len == 0) return null;
+    for (value) |byte| if (byte < '0' or byte > '9') return null;
+    return std.fmt.parseInt(u32, value, 10) catch null;
+}
+
 /// What a successful reload does to a response stream admitted by an older
 /// configuration generation. The relay reads this from the admission
 /// generation; a later generation cannot change an existing stream's policy.
@@ -78,6 +87,17 @@ pub const Lifecycle = struct {
         return self.active.load(.acquire);
     }
 };
+
+test "strict u32 parsing accepts digits only (#841)" {
+    try std.testing.expectEqual(@as(?u32, 0), parseStrictU32("0"));
+    try std.testing.expectEqual(@as(?u32, 30_000), parseStrictU32("30000"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("+1"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("-0"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("1_000"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("1s"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32("4294967296"));
+    try std.testing.expectEqual(@as(?u32, null), parseStrictU32(""));
+}
 
 test "ReloadPolicy accepts preserve and drain only (#841)" {
     try std.testing.expectEqual(ReloadPolicy.preserve, ReloadPolicy.parse("preserve").?);

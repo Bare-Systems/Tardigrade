@@ -509,6 +509,30 @@ pub const entries = [_]ConfigEntry{
         .example = "location /ws/ {\n    proxy_pass http://up;\n    proxy_websocket on;\n    proxy_websocket_origins https://app.example.com;\n}",
         .docs = &.{"docs/CONFIGURATION.md"},
     },
+    .{
+        .name = "location.proxy_response_stream_reload",
+        .aliases = &.{"proxy_response_stream_reload"},
+        .contexts = CTX_TOP_LOCATION,
+        .value_type = "enum",
+        .default_value = "preserve",
+        .valid_values = &.{ "preserve", "drain" },
+        .description = "What a successful hot reload does to long-lived streamed HTTP responses admitted under an older configuration generation. preserve leaves them open; drain schedules them from the first superseding reload. Set at top level as the default and on proxy_pass locations to override it. Failed reloads have no effect.",
+        .example = "proxy_response_stream_reload drain;\nlocation /events/ {\n    proxy_pass http://up;\n    proxy_response_stream_reload preserve;\n}",
+        .env_vars = &.{"TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD"},
+        .docs = &.{ "docs/CONFIGURATION.md", "docs/PROXY_STREAMING.md" },
+    },
+    .{
+        .name = "location.proxy_response_stream_reload_timeout_ms",
+        .aliases = &.{"proxy_response_stream_reload_timeout_ms"},
+        .contexts = CTX_TOP_LOCATION,
+        .value_type = "milliseconds",
+        .default_value = "30000",
+        .valid_values = &.{">= 0"},
+        .description = "Drain window captured when a long-lived response stream is admitted, measured from the first successful reload that supersedes its configuration. 0 drains immediately. Top-level default, overridable on proxy_pass locations.",
+        .example = "location /events/ {\n    proxy_pass http://up;\n    proxy_response_stream_reload drain;\n    proxy_response_stream_reload_timeout_ms 10000;\n}",
+        .env_vars = &.{"TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD_TIMEOUT_MS"},
+        .docs = &.{ "docs/CONFIGURATION.md", "docs/PROXY_STREAMING.md" },
+    },
 
     // ---- TLS ---------------------------------------------------------------
     .{
@@ -1198,6 +1222,17 @@ pub const entries = [_]ConfigEntry{
         .docs = &.{ "docs/CONFIGURATION.md", "docs/CONCURRENCY.md" },
     },
     .{
+        .name = "proxy_response_stream_max_active",
+        .contexts = CTX_TOP,
+        .value_type = "integer",
+        .default_value = "256",
+        .valid_values = &.{"> 0"},
+        .description = "Process-wide cap on admitted long-lived streamed HTTP responses. Capacity is global and cannot be overridden per location; lowering it below the active count blocks new admissions until enough streams close.",
+        .example = "proxy_response_stream_max_active 512;",
+        .env_vars = &.{"TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE"},
+        .docs = &.{ "docs/CONFIGURATION.md", "docs/PROXY_STREAMING.md" },
+    },
+    .{
         .name = "max_requests_per_connection",
         .contexts = CTX_TOP,
         .value_type = "integer",
@@ -1587,6 +1622,19 @@ test "proxy_streaming_mode (global) and location.proxy_streaming report distinct
     // The qualified long-form spelling still reaches the location entry,
     // not the global one.
     try std.testing.expectEqualStrings("location.proxy_streaming", lookup("location.proxy_streaming_mode").?.name);
+}
+
+test "response-stream lifecycle settings report cap and override contexts (#841)" {
+    const cap = lookup("proxy_response_stream_max_active").?;
+    try std.testing.expectEqualStrings("256", cap.default_value.?);
+    try std.testing.expectEqual(Context.top_level, cap.contexts[0]);
+    try std.testing.expectEqualStrings("TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE", cap.env_vars[0]);
+
+    const reload = lookup("proxy_response_stream_reload").?;
+    try std.testing.expectEqualStrings("location.proxy_response_stream_reload", reload.name);
+    try std.testing.expect(hasContext(reload.contexts, .top_level));
+    try std.testing.expect(hasContext(reload.contexts, .location));
+    try std.testing.expectEqualStrings("TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD", reload.env_vars[0]);
 }
 
 test "location block reports its real parser contexts (top-level and server, not nested location)" {

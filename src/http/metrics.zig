@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("zig_compat");
 const proxy_buffer_account = @import("proxy_buffer_account.zig");
+const response_stream_lifecycle = @import("response_stream_lifecycle.zig");
 const encrypted_stream = @import("tls_core").encrypted_stream;
 
 pub const TlsBufferConnectionMetrics = struct {
@@ -181,6 +182,8 @@ const http_protocol_count = 3;
 const forward_auth_outcome_count = std.meta.fields(ForwardAuthOutcome).len;
 const websocket_upgrade_outcome_count = std.meta.fields(WebSocketUpgradeOutcome).len;
 const websocket_close_reason_count = std.meta.fields(WebSocketCloseReason).len;
+const response_stream_admission_outcome_count = std.meta.fields(response_stream_lifecycle.AdmissionOutcome).len;
+const response_stream_close_reason_count = std.meta.fields(response_stream_lifecycle.CloseReason).len;
 const response_write_mode_count = 4;
 const accept_error_reason_count = 2;
 const early_data_source_count = 3;
@@ -367,6 +370,13 @@ pub const Metrics = struct {
     /// #812: closed-tunnel lifetime, summed, and closes by reason.
     websocket_tunnel_duration_ms_sum: u64,
     websocket_tunnel_closes_total: [websocket_close_reason_count]u64,
+    /// #841: generic long-lived streamed-response lifecycle metrics. Labels
+    /// are closed enums, never paths, content types, or application payloads.
+    response_streams_active: u64,
+    response_stream_admissions_total: [response_stream_admission_outcome_count]u64,
+    response_stream_duration_ms_sum: u64,
+    response_stream_duration_count: u64,
+    response_stream_closes_total: [response_stream_close_reason_count]u64,
     /// #818: WebSocket reactor load, sampled on the event-loop tick.
     websocket_reactor: WebSocketReactorStats = .{},
     /// HTTP early-data replay-exposed requests by protocol and source.
@@ -596,6 +606,11 @@ pub const Metrics = struct {
             .websocket_tunnel_bytes_upstream_to_client = 0,
             .websocket_tunnel_duration_ms_sum = 0,
             .websocket_tunnel_closes_total = .{0} ** websocket_close_reason_count,
+            .response_streams_active = 0,
+            .response_stream_admissions_total = .{0} ** response_stream_admission_outcome_count,
+            .response_stream_duration_ms_sum = 0,
+            .response_stream_duration_count = 0,
+            .response_stream_closes_total = .{0} ** response_stream_close_reason_count,
             .websocket_reactor = .{},
             .http_early_data_requests_total = .{.{0} ** early_data_source_count} ** http_protocol_count,
             .response_write_mode_total = .{0} ** response_write_mode_count,
@@ -781,6 +796,24 @@ pub const Metrics = struct {
         self.websocket_tunnel_bytes_upstream_to_client += upstream_to_client;
         self.websocket_tunnel_duration_ms_sum += duration_ms;
         self.websocket_tunnel_closes_total[@intFromEnum(reason)] += 1;
+    }
+
+    pub fn recordResponseStreamAdmission(self: *Metrics, outcome: response_stream_lifecycle.AdmissionOutcome) void {
+        self.response_stream_admissions_total[@intFromEnum(outcome)] += 1;
+        switch (outcome) {
+            .admitted => self.response_streams_active += 1,
+            // A capacity rejection is terminal but never owns an active slot
+            // or an admitted-stream lifetime.
+            .capacity => self.response_stream_closes_total[@intFromEnum(response_stream_lifecycle.CloseReason.capacity)] += 1,
+        }
+    }
+
+    pub fn recordResponseStreamClosed(self: *Metrics, reason: response_stream_lifecycle.CloseReason, duration_ms: u64) void {
+        std.debug.assert(reason != .capacity);
+        self.response_streams_active -|= 1;
+        self.response_stream_duration_ms_sum += duration_ms;
+        self.response_stream_duration_count += 1;
+        self.response_stream_closes_total[@intFromEnum(reason)] += 1;
     }
 
     pub fn recordHttpEarlyDataDecision(self: *Metrics, protocol: HttpProtocol, decision: EarlyDataDecision) void {
@@ -1428,6 +1461,7 @@ pub const Metrics = struct {
         try self.appendHttpEarlyDataPrometheus(&out);
         try self.appendForwardAuthPrometheus(&out);
         try self.appendWebSocketPrometheus(&out);
+        try self.appendResponseStreamPrometheus(&out);
         try self.appendEarlyDataReplayPrometheus(&out);
 
         try out.print(
@@ -1985,6 +2019,37 @@ pub const Metrics = struct {
         , .{ reactor.threads, reactor.tunnels, reactor.max_thread_tunnels, reactor.handoffs_total, reactor.wakeups_total });
     }
 
+    fn appendResponseStreamPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        try out.appendSlice(
+            \\# HELP tardigrade_response_stream_admissions_total Long-lived streamed HTTP response admission outcomes
+            \\# TYPE tardigrade_response_stream_admissions_total counter
+            \\
+        );
+        inline for (comptime std.enums.values(response_stream_lifecycle.AdmissionOutcome)) |outcome| {
+            try out.print("tardigrade_response_stream_admissions_total{{outcome=\"{s}\"}} {d}\n", .{ @tagName(outcome), self.response_stream_admissions_total[@intFromEnum(outcome)] });
+        }
+        try out.print(
+            \\# HELP tardigrade_response_streams_active Long-lived streamed HTTP responses currently admitted
+            \\# TYPE tardigrade_response_streams_active gauge
+            \\tardigrade_response_streams_active {d}
+            \\# HELP tardigrade_response_stream_duration_seconds Lifetime of closed long-lived streamed HTTP responses
+            \\# TYPE tardigrade_response_stream_duration_seconds summary
+            \\tardigrade_response_stream_duration_seconds_sum {d}.{d:0>3}
+            \\tardigrade_response_stream_duration_seconds_count {d}
+            \\# HELP tardigrade_response_stream_closes_total Closed long-lived streamed HTTP responses by reason
+            \\# TYPE tardigrade_response_stream_closes_total counter
+            \\
+        , .{
+            self.response_streams_active,
+            self.response_stream_duration_ms_sum / 1000,
+            self.response_stream_duration_ms_sum % 1000,
+            self.response_stream_duration_count,
+        });
+        inline for (comptime std.enums.values(response_stream_lifecycle.CloseReason)) |reason| {
+            try out.print("tardigrade_response_stream_closes_total{{reason=\"{s}\"}} {d}\n", .{ @tagName(reason), self.response_stream_closes_total[@intFromEnum(reason)] });
+        }
+    }
+
     fn appendForwardAuthPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
         try out.appendSlice(
             \\# HELP tardigrade_forward_auth_total forward_auth subrequest outcomes by protocol
@@ -2358,6 +2423,8 @@ pub const Metrics = struct {
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
         var out = std.array_list.Managed(u8).init(allocator);
         errdefer out.deinit();
+        var response_stream_closed_total: u64 = 0;
+        for (self.response_stream_closes_total) |count| response_stream_closed_total += count;
         try out.print(
             \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"proxy_streaming_requests_total":{d},"proxy_buffered_requests_total":{d},"proxy_buffered_bytes_current":{d},"proxy_buffered_bytes_total":{d},"proxy_client_aborts_total":{d},"proxy_upstream_aborts_total":{d},"proxy_ttfb_ms_count":{d},"proxy_ttfb_ms_sum":{d},"upstream_connections_new_total":{d},"upstream_connections_reused_total":{d},"upstream_connections_reused_local_total":{d},"upstream_connections_reused_cross_worker_total":{d},"upstream_connections_idle":{d},"upstream_stale_retries_total":{d}
         , .{
@@ -2389,7 +2456,7 @@ pub const Metrics = struct {
             self.upstream_stale_retries,
         });
         try out.print(
-            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"worker_queue_wait_count":{d},"worker_queue_wait_sum_us":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_forbidden":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d},"reload_attempts_total":{d},"reload_success_total":{d},"reload_failure_total":{d},"drain_total":{d},"drain_timeouts_total":{d},"drain_forced_closes_total":{d}}}
+            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"worker_queue_wait_count":{d},"worker_queue_wait_sum_us":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_forbidden":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d},"reload_attempts_total":{d},"reload_success_total":{d},"reload_failure_total":{d},"drain_total":{d},"drain_timeouts_total":{d},"drain_forced_closes_total":{d}
         , .{
             self.latency_count,
             self.latency_sum_ms,
@@ -2417,6 +2484,21 @@ pub const Metrics = struct {
             self.drain_total,
             self.drain_timeouts_total,
             self.drain_forced_closes_total,
+        });
+        try out.print(
+            \\,"response_streams_active":{d},"response_stream_admitted_total":{d},"response_stream_capacity_total":{d},"response_stream_duration_ms_sum":{d},"response_stream_closed_total":{d},"response_stream_closes_client":{d},"response_stream_closes_upstream":{d},"response_stream_closes_timeout":{d},"response_stream_closes_reload":{d},"response_stream_closes_shutdown":{d},"response_stream_closes_capacity":{d}}}
+        , .{
+            self.response_streams_active,
+            self.response_stream_admissions_total[@intFromEnum(response_stream_lifecycle.AdmissionOutcome.admitted)],
+            self.response_stream_admissions_total[@intFromEnum(response_stream_lifecycle.AdmissionOutcome.capacity)],
+            self.response_stream_duration_ms_sum,
+            response_stream_closed_total,
+            self.response_stream_closes_total[@intFromEnum(response_stream_lifecycle.CloseReason.client)],
+            self.response_stream_closes_total[@intFromEnum(response_stream_lifecycle.CloseReason.upstream)],
+            self.response_stream_closes_total[@intFromEnum(response_stream_lifecycle.CloseReason.timeout)],
+            self.response_stream_closes_total[@intFromEnum(response_stream_lifecycle.CloseReason.reload)],
+            self.response_stream_closes_total[@intFromEnum(response_stream_lifecycle.CloseReason.shutdown)],
+            self.response_stream_closes_total[@intFromEnum(response_stream_lifecycle.CloseReason.capacity)],
         });
         return out.toOwnedSlice();
     }
@@ -3093,6 +3175,48 @@ test "Metrics renders WebSocket tunnel series (#812)" {
     }) |needle| {
         try std.testing.expect(std.mem.find(u8, prom, needle) != null);
     }
+}
+
+test "Metrics serializes bounded response-stream lifecycle series (#841)" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+    m.recordResponseStreamAdmission(.admitted);
+    m.recordResponseStreamAdmission(.admitted);
+    m.recordResponseStreamAdmission(.capacity);
+    m.recordResponseStreamClosed(.upstream, 1500);
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+    inline for (.{
+        "tardigrade_response_stream_admissions_total{outcome=\"admitted\"} 2\n",
+        "tardigrade_response_stream_admissions_total{outcome=\"capacity\"} 1\n",
+        "tardigrade_response_streams_active 1\n",
+        "tardigrade_response_stream_duration_seconds_sum 1.500\n",
+        "tardigrade_response_stream_duration_seconds_count 1\n",
+        "tardigrade_response_stream_closes_total{reason=\"client\"} 0\n",
+        "tardigrade_response_stream_closes_total{reason=\"upstream\"} 1\n",
+        "tardigrade_response_stream_closes_total{reason=\"timeout\"} 0\n",
+        "tardigrade_response_stream_closes_total{reason=\"reload\"} 0\n",
+        "tardigrade_response_stream_closes_total{reason=\"shutdown\"} 0\n",
+        "tardigrade_response_stream_closes_total{reason=\"capacity\"} 1\n",
+    }) |needle| try std.testing.expect(std.mem.find(u8, prom, needle) != null);
+
+    const json = try m.toJson(allocator);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"response_streams_active\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"response_stream_capacity_total\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"response_stream_closes_upstream\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"response_stream_closes_capacity\":1") != null);
+}
+
+test "capacity refusal records a terminal reason without decrementing active streams (#841)" {
+    var m = Metrics.init();
+    m.recordResponseStreamAdmission(.admitted);
+    m.recordResponseStreamAdmission(.capacity);
+
+    try std.testing.expectEqual(@as(u64, 1), m.response_streams_active);
+    try std.testing.expectEqual(@as(u64, 1), m.response_stream_closes_total[@intFromEnum(response_stream_lifecycle.CloseReason.capacity)]);
+    try std.testing.expectEqual(@as(u64, 0), m.response_stream_duration_count);
 }
 
 test "Metrics toPrometheus produces valid Prometheus text" {

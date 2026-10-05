@@ -58,6 +58,10 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     const initial_hsts = try gp.computeHstsValue(state_allocator, cfg);
     errdefer if (initial_hsts.len > 0) state_allocator.free(initial_hsts);
 
+    // Outlives `state` (its discovery config borrows the slice); freed after
+    // state.deinit() because defers run in reverse order.
+    const srv_nameservers = http.dns_srv.parseNameserverList(state_allocator, cfg.upstream_srv_nameservers) catch try state_allocator.alloc(std.Io.net.IpAddress, 0);
+    defer state_allocator.free(srv_nameservers);
     var state = GatewayState{
         .allocator = state_allocator,
         .rate_limiter = if (cfg.rate_limit_rps > 0)
@@ -179,6 +183,7 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             .min_refresh_ms = cfg.upstream_srv_min_refresh_ms,
             .stale_max_ms = cfg.upstream_srv_stale_max_ms,
             .query_timeout_ms = cfg.upstream_srv_timeout_ms,
+            .nameservers = srv_nameservers,
         }),
     };
     defer state.deinit();

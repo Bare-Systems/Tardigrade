@@ -190,6 +190,36 @@ pub fn parseResolvConf(text: []const u8, out: []std.Io.net.IpAddress) usize {
 /// One UDP query/response with `ns`. The socket is connect()ed to the
 /// nameserver so the kernel drops datagrams from any other source address or
 /// port; the caller additionally checks the transaction id.
+/// Parse a comma-separated nameserver list: `ip`, `ip:port` (IPv4) or
+/// `[ip6]:port` / bare IPv6, default port 53. Invalid entries are skipped.
+/// Caller owns the returned slice.
+pub fn parseNameserverList(allocator: std.mem.Allocator, csv: []const u8) ![]std.Io.net.IpAddress {
+    var list: std.ArrayList(std.Io.net.IpAddress) = .empty;
+    errdefer list.deinit(allocator);
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t");
+        if (item.len == 0) continue;
+        var host = item;
+        var port: u16 = 53;
+        if (item[0] == '[') {
+            const close = std.mem.findScalar(u8, item, ']') orelse continue;
+            host = item[1..close];
+            if (close + 1 < item.len) {
+                if (item[close + 1] != ':') continue;
+                port = std.fmt.parseInt(u16, item[close + 2 ..], 10) catch continue;
+            }
+        } else if (std.mem.count(u8, item, ":") == 1) {
+            const colon = std.mem.findScalar(u8, item, ':').?;
+            host = item[0..colon];
+            port = std.fmt.parseInt(u16, item[colon + 1 ..], 10) catch continue;
+        }
+        const addr = std.Io.net.IpAddress.parse(host, port) catch continue;
+        try list.append(allocator, addr);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
 fn exchange(ns: std.Io.net.IpAddress, query: []const u8, resp: []u8, timeout_ms: u32) Error!usize {
     const fam: c_uint = switch (ns) {
         .ip4 => std.posix.AF.INET,
@@ -331,4 +361,14 @@ test "parseResolvConf" {
     var out: [3]std.Io.net.IpAddress = undefined;
     const n = parseResolvConf("# c\nsearch x\nnameserver 10.0.0.2\nnameserver bogus\nnameserver ::1\n", &out);
     try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "parseNameserverList accepts ports, brackets and skips junk" {
+    const list = try parseNameserverList(testing.allocator, "127.0.0.1:5353, ::1 ,[::1]:5300,bogus,10.0.0.1,1.2.3.4:x");
+    defer testing.allocator.free(list);
+    try testing.expectEqual(@as(usize, 4), list.len);
+    try testing.expectEqual(@as(u16, 5353), list[0].ip4.port);
+    try testing.expectEqual(@as(u16, 53), list[1].ip6.port);
+    try testing.expectEqual(@as(u16, 5300), list[2].ip6.port);
+    try testing.expectEqual(@as(u16, 53), list[3].ip4.port);
 }

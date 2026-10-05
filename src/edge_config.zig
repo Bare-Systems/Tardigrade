@@ -684,6 +684,9 @@ pub const EdgeConfig = struct {
     upstream_srv_stale_max_ms: u64,
     /// Per-nameserver SRV query timeout (TARDIGRADE_UPSTREAM_SRV_TIMEOUT_MS).
     upstream_srv_timeout_ms: u32,
+    /// Comma-separated nameservers for SRV queries; empty uses /etc/resolv.conf
+    /// (TARDIGRADE_UPSTREAM_SRV_NAMESERVERS).
+    upstream_srv_nameservers: []const u8,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -850,6 +853,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.otel_endpoint);
         allocator.free(self.upstream_dns_discovery_host);
         allocator.free(self.upstream_srv_name);
+        allocator.free(self.upstream_srv_nameservers);
         self.* = undefined;
     }
 };
@@ -1394,6 +1398,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const upstream_dns_refresh_interval_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS", 30_000);
     const upstream_srv_name = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_SRV_NAME", "") catch unreachable;
     errdefer allocator.free(upstream_srv_name);
+    const upstream_srv_nameservers = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_SRV_NAMESERVERS", "") catch unreachable;
+    errdefer allocator.free(upstream_srv_nameservers);
     const upstream_srv_tls = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_SRV_TLS", false);
     const upstream_srv_min_refresh_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_SRV_MIN_REFRESH_MS", 5_000);
     const upstream_srv_stale_max_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_SRV_STALE_MAX_MS", 300_000);
@@ -1946,6 +1952,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_srv_min_refresh_ms = upstream_srv_min_refresh_ms,
         .upstream_srv_stale_max_ms = upstream_srv_stale_max_ms,
         .upstream_srv_timeout_ms = upstream_srv_timeout_ms,
+        .upstream_srv_nameservers = upstream_srv_nameservers,
     };
 }
 

@@ -1011,6 +1011,7 @@ removed. They are still parsed but have no effect, and are being retired.
 | `TARDIGRADE_UPSTREAM_SRV_MIN_REFRESH_MS` | u64 ms | `5000` | Lower bound of the TTL-derived refresh interval. | `TARDIGRADE_UPSTREAM_SRV_MIN_REFRESH_MS=2000` |
 | `TARDIGRADE_UPSTREAM_SRV_STALE_MAX_MS` | u64 ms | `300000` | How long the last good set survives SERVFAIL/timeouts. | `TARDIGRADE_UPSTREAM_SRV_STALE_MAX_MS=120000` |
 | `TARDIGRADE_UPSTREAM_SRV_TIMEOUT_MS` | u32 ms | `2000` | Per-nameserver SRV query timeout. | `TARDIGRADE_UPSTREAM_SRV_TIMEOUT_MS=1000` |
+| `TARDIGRADE_UPSTREAM_SRV_NAMESERVERS` | csv | `""` | Nameservers for SRV queries (`ip`, `ip:port`, `[ip6]:port`); empty uses `/etc/resolv.conf`. | `TARDIGRADE_UPSTREAM_SRV_NAMESERVERS=10.0.0.2:53` |
 
 #### DNS SRV upstream discovery
 

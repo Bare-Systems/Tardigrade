@@ -1400,6 +1400,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(upstream_srv_name);
     const upstream_srv_nameservers = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_SRV_NAMESERVERS", "") catch unreachable;
     errdefer allocator.free(upstream_srv_nameservers);
+    // Reject a malformed explicit list at load/reload time (fail closed).
+    if (http.dns_srv.parseNameserverList(allocator, upstream_srv_nameservers)) |parsed| {
+        allocator.free(parsed);
+    } else |_| return error.InvalidConfigValue;
     const upstream_srv_tls = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_SRV_TLS", false);
     const upstream_srv_min_refresh_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_SRV_MIN_REFRESH_MS", 5_000);
     const upstream_srv_stale_max_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_SRV_STALE_MAX_MS", 300_000);

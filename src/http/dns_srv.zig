@@ -190,10 +190,14 @@ pub fn parseResolvConf(text: []const u8, out: []std.Io.net.IpAddress) usize {
 /// One UDP query/response with `ns`. The socket is connect()ed to the
 /// nameserver so the kernel drops datagrams from any other source address or
 /// port; the caller additionally checks the transaction id.
+pub const NameserverListError = error{ InvalidNameserver, OutOfMemory };
+
 /// Parse a comma-separated nameserver list: `ip`, `ip:port` (IPv4) or
-/// `[ip6]:port` / bare IPv6, default port 53. Invalid entries are skipped.
-/// Caller owns the returned slice.
-pub fn parseNameserverList(allocator: std.mem.Allocator, csv: []const u8) ![]std.Io.net.IpAddress {
+/// `[ip6]:port` / bare IPv6, default port 53. Strict: any non-empty malformed
+/// entry (bad address, bad or zero port) is `InvalidNameserver`, so a typo can
+/// never silently shrink the list or fall back to another resolver. Empty
+/// tokens (stray commas/spaces) are ignored. Caller owns the returned slice.
+pub fn parseNameserverList(allocator: std.mem.Allocator, csv: []const u8) NameserverListError![]std.Io.net.IpAddress {
     var list: std.ArrayList(std.Io.net.IpAddress) = .empty;
     errdefer list.deinit(allocator);
     var it = std.mem.splitScalar(u8, csv, ',');
@@ -203,18 +207,19 @@ pub fn parseNameserverList(allocator: std.mem.Allocator, csv: []const u8) ![]std
         var host = item;
         var port: u16 = 53;
         if (item[0] == '[') {
-            const close = std.mem.findScalar(u8, item, ']') orelse continue;
+            const close = std.mem.findScalar(u8, item, ']') orelse return error.InvalidNameserver;
             host = item[1..close];
             if (close + 1 < item.len) {
-                if (item[close + 1] != ':') continue;
-                port = std.fmt.parseInt(u16, item[close + 2 ..], 10) catch continue;
+                if (item[close + 1] != ':') return error.InvalidNameserver;
+                port = std.fmt.parseInt(u16, item[close + 2 ..], 10) catch return error.InvalidNameserver;
             }
         } else if (std.mem.count(u8, item, ":") == 1) {
             const colon = std.mem.findScalar(u8, item, ':').?;
             host = item[0..colon];
-            port = std.fmt.parseInt(u16, item[colon + 1 ..], 10) catch continue;
+            port = std.fmt.parseInt(u16, item[colon + 1 ..], 10) catch return error.InvalidNameserver;
         }
-        const addr = std.Io.net.IpAddress.parse(host, port) catch continue;
+        if (port == 0) return error.InvalidNameserver;
+        const addr = std.Io.net.IpAddress.parse(host, port) catch return error.InvalidNameserver;
         try list.append(allocator, addr);
     }
     return list.toOwnedSlice(allocator);
@@ -363,12 +368,15 @@ test "parseResolvConf" {
     try testing.expectEqual(@as(usize, 2), n);
 }
 
-test "parseNameserverList accepts ports, brackets and skips junk" {
-    const list = try parseNameserverList(testing.allocator, "127.0.0.1:5353, ::1 ,[::1]:5300,bogus,10.0.0.1,1.2.3.4:x");
+test "parseNameserverList accepts valid entries and rejects any malformed one" {
+    const list = try parseNameserverList(testing.allocator, "127.0.0.1:5353, ::1 ,[::1]:5300,10.0.0.1,,");
     defer testing.allocator.free(list);
     try testing.expectEqual(@as(usize, 4), list.len);
     try testing.expectEqual(@as(u16, 5353), list[0].ip4.port);
     try testing.expectEqual(@as(u16, 53), list[1].ip6.port);
     try testing.expectEqual(@as(u16, 5300), list[2].ip6.port);
     try testing.expectEqual(@as(u16, 53), list[3].ip4.port);
+    for ([_][]const u8{ "10.0.0.2:x", "bogus", "10.0.0.1:0", "[::1", "[::1]x", "10.0.0.1,1.2.3.4:99999", "10.0.0.1:53,bogus" }) |bad| {
+        try testing.expectError(error.InvalidNameserver, parseNameserverList(testing.allocator, bad));
+    }
 }

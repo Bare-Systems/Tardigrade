@@ -60,7 +60,9 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
 
     // Outlives `state` (its discovery config borrows the slice); freed after
     // state.deinit() because defers run in reverse order.
-    const srv_nameservers = http.dns_srv.parseNameserverList(state_allocator, cfg.upstream_srv_nameservers) catch try state_allocator.alloc(std.Io.net.IpAddress, 0);
+    // Explicit nameserver config fails closed: a malformed list aborts startup
+    // instead of silently falling back to /etc/resolv.conf.
+    const srv_nameservers = try http.dns_srv.parseNameserverList(state_allocator, cfg.upstream_srv_nameservers);
     defer state_allocator.free(srv_nameservers);
     var state = GatewayState{
         .allocator = state_allocator,

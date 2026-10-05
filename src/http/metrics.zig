@@ -206,7 +206,18 @@ const accept_batch_bucket_count = 6;
 ///
 /// Tracks request counts, status code distribution, and uptime.
 /// All fields are updated atomically for thread-safety readiness.
+/// Bounded DNS discovery (A/AAAA + SRV) state exported as gauges/counters (#766).
+pub const DiscoveryStats = struct {
+    primary: usize = 0,
+    backup: usize = 0,
+    stale: bool = false,
+    refresh_total: u64 = 0,
+    failures_total: u64 = 0,
+    changes_total: u64 = 0,
+};
+
 pub const Metrics = struct {
+    discovery: DiscoveryStats = .{},
     /// Total requests processed.
     total_requests: u64,
     /// Requests by status code class.
@@ -1729,6 +1740,32 @@ pub const Metrics = struct {
             self.keepalive_resumes_total,
             self.keepalive_timeouts_total,
             self.keepalive_closed_total,
+        });
+        try out.print(
+            \\# HELP tardigrade_upstream_discovery_endpoints Live DNS-discovered upstream endpoints by role
+            \\# TYPE tardigrade_upstream_discovery_endpoints gauge
+            \\tardigrade_upstream_discovery_endpoints{{role="primary"}} {d}
+            \\tardigrade_upstream_discovery_endpoints{{role="backup"}} {d}
+            \\# HELP tardigrade_upstream_discovery_stale 1 while serving the last good set after a DNS failure
+            \\# TYPE tardigrade_upstream_discovery_stale gauge
+            \\tardigrade_upstream_discovery_stale {d}
+            \\# HELP tardigrade_upstream_discovery_refresh_total Successful discovery refreshes
+            \\# TYPE tardigrade_upstream_discovery_refresh_total counter
+            \\tardigrade_upstream_discovery_refresh_total {d}
+            \\# HELP tardigrade_upstream_discovery_refresh_failures_total Failed discovery refreshes
+            \\# TYPE tardigrade_upstream_discovery_refresh_failures_total counter
+            \\tardigrade_upstream_discovery_refresh_failures_total {d}
+            \\# HELP tardigrade_upstream_discovery_changes_total Live-set changes applied
+            \\# TYPE tardigrade_upstream_discovery_changes_total counter
+            \\tardigrade_upstream_discovery_changes_total {d}
+            \\
+        , .{
+            self.discovery.primary,
+            self.discovery.backup,
+            @intFromBool(self.discovery.stale),
+            self.discovery.refresh_total,
+            self.discovery.failures_total,
+            self.discovery.changes_total,
         });
 
         return out.toOwnedSlice();

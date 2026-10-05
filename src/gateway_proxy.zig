@@ -2189,6 +2189,14 @@ fn pollFdReadable(fd: std.posix.fd_t, timeout_ms: u32) !bool {
 const ResponseReadiness = enum { upstream, client_closed, client_data, timeout };
 const downstream_peer_close_probe_budget: usize = 8;
 
+/// A record-layer failure discovered while inspecting the downstream is a
+/// client-side terminal event. It must never escape into the generic relay
+/// error path, which attributes failures to the upstream and can open the
+/// origin circuit breaker.
+fn probeDownstreamPeerClose(downstream: *DownstreamCloseProbe) http.encrypted_stream_connection.PeerCloseProbe {
+    return downstream.probeBounded(downstream_peer_close_probe_budget) catch .closed;
+}
+
 fn socketPeerClosed(fd: std.posix.fd_t, revents: i16) bool {
     if ((revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) return true;
     if ((revents & std.posix.POLL.IN) == 0) return false;
@@ -2213,7 +2221,7 @@ fn pollResponseReadiness(
     observe_client_data: bool,
 ) !ResponseReadiness {
     if (observe_client_data and downstream.retry_pending) {
-        const state = try downstream.probeBounded(downstream_peer_close_probe_budget);
+        const state = probeDownstreamPeerClose(downstream);
         downstream.retry_pending = state == .retry;
         return switch (state) {
             .closed => .client_closed,
@@ -2240,7 +2248,7 @@ fn pollResponseReadiness(
         if ((downstream_revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) return .client_closed;
         if (observe_client_data and (downstream_revents & std.posix.POLL.IN) != 0) {
             const state = if (downstream.probe_fn != null)
-                try downstream.probeBounded(downstream_peer_close_probe_budget)
+                probeDownstreamPeerClose(downstream)
             else if (socketPeerClosed(client_fd, downstream_revents))
                 http.encrypted_stream_connection.PeerCloseProbe.closed
             else
@@ -2252,6 +2260,25 @@ fn pollResponseReadiness(
     }
     if (pfds[0].revents != 0) return .upstream;
     return .timeout;
+}
+
+test "downstream TLS probe errors are classified as client close (#842 review)" {
+    const FailingProbe = struct {
+        fn probe(_: *anyopaque, _: usize) anyerror!http.encrypted_stream_connection.PeerCloseProbe {
+            return error.TruncatedStream;
+        }
+    };
+    var context: u8 = 0;
+    var downstream = DownstreamCloseProbe{
+        .context = &context,
+        .probe_fn = FailingProbe.probe,
+        .retry_pending = true,
+    };
+
+    try std.testing.expectEqual(
+        ResponseReadiness.client_closed,
+        try pollResponseReadiness(-1, &downstream, 0, false, true),
+    );
 }
 
 /// What a zero-timeout writability check found on the upstream socket.

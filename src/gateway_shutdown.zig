@@ -863,11 +863,31 @@ pub fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
 /// Refresh DNS-discovered upstreams when the refresh interval has elapsed.
 /// Discovered addresses supplement the statically configured upstream pool
 /// via GatewayState.dns_discovery; the selection functions read from both.
+/// Resolution blocks (UDP timeouts), so it runs on the discovery's joinable
+/// worker thread (`DnsDiscovery.startRefresh`); the event loop only schedules.
 pub fn runDnsDiscoveryRefresh(_: *const edge_config.EdgeConfig, state: *GatewayState) void {
+    if (!state.dns_discovery.enabled()) return;
+    publishDiscoveryMetrics(state);
     const now_ms = http.event_loop.monotonicMs();
-    if (state.dns_discovery.needsRefresh(now_ms)) {
-        state.dns_discovery.refresh(now_ms);
-    }
+    if (!state.dns_discovery.needsRefresh(now_ms)) return;
+    state.dns_discovery.startRefresh();
+}
+
+fn publishDiscoveryMetrics(state: *GatewayState) void {
+    const disc = &state.dns_discovery;
+    disc.mutex.lock();
+    const stats: http.metrics.DiscoveryStats = .{
+        .primary = disc.primaryCount(),
+        .backup = disc.urls.items.len - disc.primaryCount(),
+        .stale = disc.stale,
+        .refresh_total = disc.refresh_total,
+        .failures_total = disc.refresh_failures_total,
+        .changes_total = disc.change_count,
+    };
+    disc.mutex.unlock();
+    state.metrics_mutex.lock();
+    state.metrics.discovery = stats;
+    state.metrics_mutex.unlock();
 }
 
 test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
@@ -1001,18 +1021,16 @@ fn activeHealthProbeThread(task: *HealthProbeTask) void {
         probeSingleUpstream(cfg, state, base_url);
     }
 
-    // Also probe DNS-discovered upstreams when active health checks are enabled.
-    if (state.dns_discovery.config.host.len > 0) {
-        state.dns_discovery.mutex.lock();
-        // Snapshot URLs under the discovery lock, then probe without it to avoid
-        // blocking the discovery refresh thread.
-        var discovered_buf: [32][]u8 = undefined;
-        const n = @min(state.dns_discovery.urls.items.len, discovered_buf.len);
-        for (state.dns_discovery.urls.items[0..n], 0..) |url, i| discovered_buf[i] = url;
-        state.dns_discovery.mutex.unlock();
-        for (discovered_buf[0..n]) |url| {
-            probeSingleUpstream(cfg, state, url);
+    // Also probe DNS-discovered upstreams (every priority group) when
+    // active health checks are enabled.
+    if (state.dns_discovery.enabled()) {
+        // Copy the strings: the live set may be swapped while probing.
+        const discovered: []const []const u8 = state.dns_discovery.copyUrls(state.allocator) catch &.{};
+        defer {
+            for (discovered) |u| state.allocator.free(u);
+            if (discovered.len > 0) state.allocator.free(discovered);
         }
+        for (discovered) |url| probeSingleUpstream(cfg, state, url);
     }
 
     state.metrics_mutex.lock();

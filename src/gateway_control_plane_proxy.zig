@@ -873,6 +873,7 @@ fn initControlPlaneProxyTestState(state: *GatewayState, allocator: std.mem.Alloc
     state.upstream_active_requests = std.StringHashMap(usize).init(allocator);
     state.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
     state.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+    state.dns_discovery = http.dns_discovery.DnsDiscovery.init(allocator, .{});
 }
 
 fn deinitControlPlaneProxyTestState(state: *GatewayState) void {
@@ -884,6 +885,7 @@ fn deinitControlPlaneProxyTestState(state: *GatewayState) void {
     state.upstream_active_requests.deinit();
     state.upstream_pool.deinit();
     state.h2_pool.deinit();
+    state.dns_discovery.deinit();
 }
 
 test "control-plane downstream streaming write failure records known 200 and never retries" {

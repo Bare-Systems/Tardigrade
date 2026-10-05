@@ -24302,6 +24302,90 @@ test "quiet SSE over native TLS observes close_notify without a TCP close (#842 
     } else return error.MetricThresholdNotReached;
 }
 
+test "abrupt native TLS SSE half-close remains a client failure (#842 review)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var origin = try QuietSseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+    var probe_origin = try UpstreamServer.start(allocator, &.{.{ .body = "healthy origin" }});
+    defer probe_origin.stop();
+    try probe_origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+        \\location /probe/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.server.port(), test_host, probe_origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS", .value = "5000" },
+            .{ .name = "TARDIGRADE_CB_THRESHOLD", .value = "1" },
+            .{ .name = "TARDIGRADE_CB_TIMEOUT_MS", .value = "30000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", "tardigrade.test");
+    defer client.destroy();
+    try client.writeAllPlain("GET /events/feed HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const head = try wssReadHead(client, allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
+
+    var first_event = std.array_list.Managed(u8).init(allocator);
+    defer first_event.deinit();
+    while (std.mem.find(u8, first_event.items, "data: one") == null) {
+        if (first_event.items.len >= 4096) return error.MessageTooLarge;
+        var byte: [1]u8 = undefined;
+        try client.readExactPlain(&byte, 5_000);
+        try first_event.append(byte[0]);
+    }
+
+    // No TLS close_notify: only half-close the TCP write side so the server
+    // observes a truncated TLS stream while this client retains its read side.
+    if (std.c.shutdown(client.stream.handle, std.posix.SHUT.WR) != 0) return error.ShutdownFailed;
+
+    const deadline = compat.milliTimestamp() + 2_000;
+    while (compat.milliTimestamp() < deadline) {
+        var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+        const active = prometheusMetricValue(metrics.body, "tardigrade_response_streams_active") orelse 1;
+        const closed = prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"client\""}) orelse 0;
+        metrics.deinit();
+        if (active == 0 and closed >= 1) break;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    } else return error.MetricThresholdNotReached;
+
+    var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(?u64, 0), prometheusMetricValue(metrics.body, "tardigrade_proxy_upstream_aborts_total"));
+
+    // With a threshold of one, misclassifying the downstream truncation as an
+    // origin failure would open the global circuit and return 503 here.
+    var probe = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/probe/after-client-close", "tardigrade.test");
+    defer probe.deinit();
+    try std.testing.expectEqual(@as(u16, 200), probe.status_code);
+    try std.testing.expectEqualStrings("healthy origin", probe.body);
+}
+
 test "SSE capacity applies to HTTPS ALPN HTTP/1 fallback (#842)" {
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -25070,4 +25154,243 @@ test "tardi check rejects an invalid proxy_websocket_reload (#812)" {
         defer allocator.free(result.stderr);
         try std.testing.expect(result.term != .exited or result.term.exited != 0);
     }
+}
+
+// ── #766: SRV-discovered HTTPS/mTLS upstream identity ───────────────────────
+
+/// Minimal UDP DNS server answering every query with one SRV record
+/// (priority 10, weight 1) for `target:port`. The target is an IP literal, so
+/// the gateway dials 127.0.0.1 while the certificate only names the logical
+/// service.
+const SrvDnsFixture = struct {
+    sock: c_int,
+    dns_port: u16,
+    srv_port: u16,
+    thread: ?std.Thread = null,
+    stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn start(self: *SrvDnsFixture, srv_port: u16) !void {
+        const sock = std.c.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+        if (sock < 0) return error.SocketFailed;
+        errdefer _ = std.c.close(sock);
+        var sin = std.c.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = 0,
+            .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+            .zero = [_]u8{0} ** 8,
+        };
+        if (std.c.bind(sock, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) != 0) return error.BindFailed;
+        var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        _ = std.c.getsockname(sock, @ptrCast(&sin), &len);
+        const tv = std.c.timeval{ .sec = 0, .usec = 50_000 };
+        _ = std.c.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(std.c.timeval));
+        self.sock = sock;
+        self.dns_port = std.mem.bigToNative(u16, sin.port);
+        self.srv_port = srv_port;
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn stop(self: *SrvDnsFixture) void {
+        self.stop_flag.store(true, .release);
+        if (self.thread) |t| t.join();
+        _ = std.c.close(self.sock);
+    }
+
+    fn serve(self: *SrvDnsFixture) void {
+        var buf: [512]u8 = undefined;
+        while (!self.stop_flag.load(.acquire)) {
+            var from: std.c.sockaddr.storage = undefined;
+            var flen: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
+            const n = std.c.recvfrom(self.sock, &buf, buf.len, 0, @ptrCast(&from), &flen);
+            if (n < 12) continue;
+            const query = buf[0..@intCast(n)];
+            var out: [600]u8 = undefined;
+            var q: usize = 12;
+            while (q < query.len and query[q] != 0) q += @as(usize, query[q]) + 1;
+            q += 5;
+            if (q > query.len) continue;
+            @memcpy(out[0..q], query[0..q]);
+            std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+            std.mem.writeInt(u16, out[6..8], 1, .big);
+            var pos = q;
+            out[pos] = 0xC0;
+            out[pos + 1] = 12;
+            std.mem.writeInt(u16, out[pos + 2 ..][0..2], 33, .big);
+            std.mem.writeInt(u16, out[pos + 4 ..][0..2], 1, .big);
+            std.mem.writeInt(u32, out[pos + 6 ..][0..4], 30, .big);
+            const target = "\x03127\x010\x010\x011\x00";
+            std.mem.writeInt(u16, out[pos + 10 ..][0..2], @intCast(6 + target.len), .big);
+            const rd = pos + 12;
+            std.mem.writeInt(u16, out[rd..][0..2], 10, .big);
+            std.mem.writeInt(u16, out[rd + 2 ..][0..2], 1, .big);
+            std.mem.writeInt(u16, out[rd + 4 ..][0..2], self.srv_port, .big);
+            @memcpy(out[rd + 6 ..][0..target.len], target);
+            pos = rd + 6 + target.len;
+            _ = std.c.sendto(self.sock, &out, pos, 0, @ptrCast(&from), flen);
+        }
+    }
+};
+
+/// Runs one SRV-discovery scenario against a live gateway and an
+/// `openssl s_server` origin and returns the proxied response status. The
+/// origin certificate is valid ONLY for DNS:service.test (signed by the
+/// fixture CA), so a 200 proves verification used the logical service name,
+/// not the SRV target (127.0.0.1) or the dialed IP.
+fn runSrvTlsScenario(
+    allocator: std.mem.Allocator,
+    origin_requires_client_cert: bool,
+    explicit_server_name: ?[]const u8,
+    present_client_cert: bool,
+) !u16 {
+    try requireOpenssl(allocator);
+    const ca_cert = try applianceFixturePath(allocator, "ca.crt");
+    defer allocator.free(ca_cert);
+    const ca_key = try applianceFixturePath(allocator, "ca.key");
+    defer allocator.free(ca_key);
+    const client_cert = try applianceFixturePath(allocator, "client.crt");
+    defer allocator.free(client_cert);
+    const client_key = try applianceFixturePath(allocator, "client.key");
+    defer allocator.free(client_key);
+
+    var dir = try GenericFixtureDir.create(allocator, "srv-tls-origin");
+    defer dir.deinit();
+    try dir.writeRel("index.html", "srv-ok");
+    try dir.writeRel("san.cnf", "subjectAltName=DNS:service.test\nextendedKeyUsage=serverAuth\n");
+    const leaf_key = try dir.joinAbs("leaf.key");
+    defer allocator.free(leaf_key);
+    const leaf_csr = try dir.joinAbs("leaf.csr");
+    defer allocator.free(leaf_csr);
+    const leaf_crt = try dir.joinAbs("leaf.crt");
+    defer allocator.free(leaf_crt);
+    const san_cnf = try dir.joinAbs("san.cnf");
+    defer allocator.free(san_cnf);
+    // Signing state stays in the per-test directory so the shared fixture CA
+    // directory is never written.
+    const ca_serial = try dir.joinAbs("ca.srl");
+    defer allocator.free(ca_serial);
+
+    const steps = [_][]const []const u8{
+        &.{ "openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", leaf_key, "-out", leaf_csr, "-subj", "/CN=service.test" },
+        &.{ "openssl", "x509", "-req", "-in", leaf_csr, "-CA", ca_cert, "-CAkey", ca_key, "-CAserial", ca_serial, "-CAcreateserial", "-out", leaf_crt, "-days", "2", "-extfile", san_cnf },
+    };
+    for (steps) |argv| {
+        var result = try bounded_process.run(allocator, .{
+            .argv = argv,
+            .stdout_limit = 8192,
+            .stderr_limit = 8192,
+            .deadline_ms = 30_000,
+        });
+        defer result.deinit(allocator);
+        if (result.outcome != .normal_exit) return error.OpensslStepFailed;
+    }
+
+    const origin_port = try findFreePort();
+    const accept_arg = try std.fmt.allocPrint(allocator, "{d}", .{origin_port});
+    defer allocator.free(accept_arg);
+    var argv_buf: [16][]const u8 = undefined;
+    var n: usize = 0;
+    for ([_][]const u8{ "openssl", "s_server", "-accept", accept_arg, "-cert", leaf_crt, "-key", leaf_key, "-alpn", "http/1.1", "-WWW", "-quiet" }) |a| {
+        argv_buf[n] = a;
+        n += 1;
+    }
+    if (origin_requires_client_cert) {
+        for ([_][]const u8{ "-CAfile", ca_cert, "-Verify", "1" }) |a| {
+            argv_buf[n] = a;
+            n += 1;
+        }
+    }
+    var origin = try std.process.spawn(compat.io(), .{
+        .argv = argv_buf[0..n],
+        .cwd = .{ .path = dir.dir_abs },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer origin.kill(compat.io());
+    try waitForTcpPort(origin_port, 5_000);
+
+    var dns: SrvDnsFixture = .{ .sock = -1, .dns_port = 0, .srv_port = 0 };
+    try dns.start(origin_port);
+    defer dns.stop();
+    const nameserver = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{dns.dns_port});
+    defer allocator.free(nameserver);
+
+    var env: [10]EnvPair = undefined;
+    var ne: usize = 0;
+    const base = [_]EnvPair{
+        // Never reachable: any 200 must have come from the discovered endpoint.
+        .{ .name = "TARDIGRADE_UPSTREAM_BASE_URL", .value = "https://127.0.0.1:1" },
+        .{ .name = "TARDIGRADE_UPSTREAM_SRV_NAME", .value = "_api._tcp.service.test" },
+        .{ .name = "TARDIGRADE_UPSTREAM_SRV_TLS", .value = "true" },
+        .{ .name = "TARDIGRADE_UPSTREAM_SRV_NAMESERVERS", .value = nameserver },
+        .{ .name = "TARDIGRADE_UPSTREAM_SRV_MIN_REFRESH_MS", .value = "1000" },
+        .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = ca_cert },
+    };
+    for (base) |e| {
+        env[ne] = e;
+        ne += 1;
+    }
+    if (explicit_server_name) |name| {
+        env[ne] = .{ .name = "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", .value = name };
+        ne += 1;
+    }
+    if (present_client_cert) {
+        env[ne] = .{ .name = "TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT", .value = client_cert };
+        ne += 1;
+        env[ne] = .{ .name = "TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY", .value = client_key };
+        ne += 1;
+    }
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location /srv/ {
+        \\    proxy_pass /;
+        \\}
+        ,
+        .extra_env = env[0..ne],
+        .ready_path = "/status/metrics",
+    });
+    defer tardigrade.stop();
+
+    // Wait until discovery has installed the endpoint so a failure below is a
+    // handshake/identity failure, not "not discovered yet".
+    var discovered = false;
+    var attempt: usize = 0;
+    while (attempt < 100 and !discovered) : (attempt += 1) {
+        var metrics = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+        defer metrics.deinit();
+        discovered = std.mem.find(u8, metrics.body, "tardigrade_upstream_discovery_endpoints{role=\"primary\"} 1") != null;
+        if (!discovered) compat.sleepNs(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(discovered);
+
+    var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/srv/index.html",
+        .body = null,
+        .headers = &.{},
+    }, 15_000);
+    defer response.deinit();
+    if (response.status_code == 200) try std.testing.expectEqualStrings("srv-ok", response.body);
+    return response.status_code;
+}
+
+test "srv discovery: HTTPS verifies the logical service name, not the SRV target or IP" {
+    const status = try runSrvTlsScenario(std.testing.allocator, false, null, false);
+    try std.testing.expectEqual(@as(u16, 200), status);
+}
+
+test "srv discovery: a wrong TLS identity fails closed" {
+    const status = try runSrvTlsScenario(std.testing.allocator, false, "wrong.test", false);
+    try std.testing.expect(status >= 500);
+}
+
+test "srv discovery: mTLS presents the configured client certificate" {
+    const status = try runSrvTlsScenario(std.testing.allocator, true, null, true);
+    try std.testing.expectEqual(@as(u16, 200), status);
+}
+
+test "srv discovery: mTLS origin rejects a gateway with no client certificate" {
+    const status = try runSrvTlsScenario(std.testing.allocator, true, null, false);
+    try std.testing.expect(status >= 500);
 }

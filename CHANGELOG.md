@@ -4,6 +4,19 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Shared lifecycle controls for long-lived streamed HTTP responses (#841).**
+  Added a strict process-wide active-stream cap (default 256), generation-bound
+  reload `preserve`/`drain` policy with per-location overrides, and a 30-second
+  default reload drain window. Admissions retain their exact configuration
+  generation, use race-safe process-wide slot accounting, and are unaffected by
+  failed reloads. New fixed-cardinality metrics report active streams,
+  admission outcomes, closed-stream duration, and `client`, `upstream`,
+  `timeout`, `reload`, `shutdown`, or `capacity` close reasons. This is the
+  protocol-neutral control plane; HTTP/1 and HTTP/2 relay integration remains
+  tracked separately under #842 and #843.
+
 ### Security
 
 - **Every production secret wipe now uses the canonical zeroization helper,

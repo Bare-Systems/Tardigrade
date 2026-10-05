@@ -510,6 +510,13 @@ pub const EdgeConfig = struct {
     /// Drain window for `drain` tunnels, likewise overridable per location.
     /// Set via TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS.
     proxy_websocket_reload_timeout_ms: u32 = http.location_router.WebSocketProxy.DEFAULT_RELOAD_TIMEOUT_MS,
+    /// Process-wide cap for active long-lived streamed HTTP responses (#841).
+    /// Unlike the retired built-in SSE settings, this applies to generic
+    /// responses identified from HTTP metadata by the proxy relay.
+    proxy_response_stream_max_active: u32 = http.response_stream_lifecycle.DEFAULT_MAX_ACTIVE,
+    /// Default reload policy and drain window for admitted response streams.
+    proxy_response_stream_reload: http.response_stream_lifecycle.ReloadPolicy = .preserve,
+    proxy_response_stream_reload_timeout_ms: u32 = http.response_stream_lifecycle.DEFAULT_RELOAD_TIMEOUT_MS,
     /// Idle keep-alive timeout for client connections (ms, 0 = disabled).
     keep_alive_timeout_ms: u32,
     /// Overall request deadline from first byte received to response fully written (ms, 0 = disabled).
@@ -1396,6 +1403,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     // reload) rather than silently become the default, which would publish a
     // generation and start draining open `drain` tunnels (#812).
     const proxy_websocket_reload_timeout_ms = try parseStrictU32Env(allocator, "TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS", http.location_router.WebSocketProxy.DEFAULT_RELOAD_TIMEOUT_MS, "proxy_websocket_reload_timeout_ms");
+    const response_stream_config = try responseStreamConfigFromEnv(allocator);
 
     const keep_alive_timeout_str = envOrDefault(allocator, "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", "5000") catch unreachable;
     defer allocator.free(keep_alive_timeout_str);
@@ -1822,6 +1830,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .proxy_websocket_reactor_threads = proxy_websocket_reactor_threads,
         .proxy_websocket_reload = proxy_websocket_reload,
         .proxy_websocket_reload_timeout_ms = proxy_websocket_reload_timeout_ms,
+        .proxy_response_stream_max_active = response_stream_config.max_active,
+        .proxy_response_stream_reload = response_stream_config.reload,
+        .proxy_response_stream_reload_timeout_ms = response_stream_config.reload_timeout_ms,
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
         .request_total_timeout_ms = request_total_timeout_ms,
         .tls_handshake_timeout_ms = tls_handshake_timeout_ms,
@@ -2222,6 +2233,35 @@ fn parseStrictU32(value: []const u8) ?u32 {
     return std.fmt.parseInt(u32, value, 10) catch null;
 }
 
+fn responseStreamConfigFromEnv(allocator: std.mem.Allocator) !http.response_stream_lifecycle.Config {
+    const max_active = try parseStrictU32Env(
+        allocator,
+        "TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE",
+        http.response_stream_lifecycle.DEFAULT_MAX_ACTIVE,
+        "proxy_response_stream_max_active",
+    );
+    if (max_active == 0) {
+        logConfigDiagnostic("config validation failed: proxy_response_stream_max_active must be greater than zero", .{});
+        return error.InvalidConfigValue;
+    }
+    const reload_raw = envOrDefault(allocator, "TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD", "preserve") catch unreachable;
+    defer allocator.free(reload_raw);
+    const reload = http.response_stream_lifecycle.ReloadPolicy.parse(reload_raw) orelse {
+        logConfigDiagnostic("config validation failed: proxy_response_stream_reload must be one of preserve, drain", .{});
+        return error.InvalidConfigValue;
+    };
+    return .{
+        .max_active = max_active,
+        .reload = reload,
+        .reload_timeout_ms = try parseStrictU32Env(
+            allocator,
+            "TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD_TIMEOUT_MS",
+            http.response_stream_lifecycle.DEFAULT_RELOAD_TIMEOUT_MS,
+            "proxy_response_stream_reload_timeout_ms",
+        ),
+    };
+}
+
 test "strict u32 settings reject malformed values and keep zero (#812)" {
     try std.testing.expectEqual(@as(?u32, 0), parseStrictU32("0"));
     try std.testing.expectEqual(@as(?u32, 30000), parseStrictU32("30000"));
@@ -2248,6 +2288,46 @@ test "strict u32 settings default only when absent, and reject an explicit empty
     allocator.free(entry.value_ptr.*);
     entry.value_ptr.* = try allocator.dupe(u8, "");
     try std.testing.expectError(error.InvalidConfigValue, parseStrictU32Env(allocator, key, 30000, "test"));
+}
+
+test "response-stream config defaults and strict values (#841)" {
+    const allocator = std.testing.allocator;
+    var overrides = http.config_file.Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    const previous = active_file_overrides;
+    defer active_file_overrides = previous;
+    active_file_overrides = &overrides;
+
+    try std.testing.expectEqual(http.response_stream_lifecycle.Config{}, try responseStreamConfigFromEnv(allocator));
+    try overrides.map.put(try allocator.dupe(u8, "TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE"), try allocator.dupe(u8, "17"));
+    try overrides.map.put(try allocator.dupe(u8, "TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD"), try allocator.dupe(u8, "drain"));
+    try overrides.map.put(try allocator.dupe(u8, "TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD_TIMEOUT_MS"), try allocator.dupe(u8, "0"));
+    try std.testing.expectEqual(
+        http.response_stream_lifecycle.Config{ .max_active = 17, .reload = .drain, .reload_timeout_ms = 0 },
+        try responseStreamConfigFromEnv(allocator),
+    );
+}
+
+test "response-stream config rejects zero, malformed, and empty values (#841)" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { key: []const u8, value: []const u8 }{
+        .{ .key = "TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE", .value = "0" },
+        .{ .key = "TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE", .value = "many" },
+        .{ .key = "TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE", .value = "" },
+        .{ .key = "TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD", .value = "restart" },
+        .{ .key = "TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD", .value = "" },
+        .{ .key = "TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD_TIMEOUT_MS", .value = "30s" },
+        .{ .key = "TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD_TIMEOUT_MS", .value = "" },
+    };
+    const previous = active_file_overrides;
+    defer active_file_overrides = previous;
+    for (cases) |case| {
+        var overrides = http.config_file.Overrides.init(allocator);
+        defer overrides.deinit(allocator);
+        try overrides.map.put(try allocator.dupe(u8, case.key), try allocator.dupe(u8, case.value));
+        active_file_overrides = &overrides;
+        try std.testing.expectError(error.InvalidConfigValue, responseStreamConfigFromEnv(allocator));
+    }
 }
 
 fn logConfigDiagnostic(comptime fmt: []const u8, args: anytype) void {
@@ -2778,6 +2858,8 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         var websocket: http.location_router.WebSocketProxy = .{};
         var websocket_origins: ?[]const u8 = null;
         var websocket_options_seen = false;
+        var response_stream: http.response_stream_lifecycle.LocationOverrides = .{};
+        var response_stream_options_seen = false;
         while (fields.next()) |option_raw| {
             const option = std.mem.trim(u8, option_raw, " \t\r\n");
             if (std.mem.eql(u8, option, "websocket:on")) {
@@ -2798,6 +2880,12 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             } else if (std.mem.startsWith(u8, option, "websocket_origins:")) {
                 websocket_origins = option["websocket_origins:".len..];
                 websocket_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "response_stream_reload:")) {
+                response_stream.reload = http.response_stream_lifecycle.ReloadPolicy.parse(option["response_stream_reload:".len..]) orelse return error.InvalidLocationBlockFormat;
+                response_stream_options_seen = true;
+            } else if (std.mem.startsWith(u8, option, "response_stream_reload_timeout_ms:")) {
+                response_stream.reload_timeout_ms = std.fmt.parseInt(u32, option["response_stream_reload_timeout_ms:".len..], 10) catch return error.InvalidLocationBlockFormat;
+                response_stream_options_seen = true;
             } else if (std.mem.startsWith(u8, option, "forward_auth:")) {
                 const url = option["forward_auth:".len..];
                 validateForwardAuthUrl(url) catch return error.InvalidLocationBlockFormat;
@@ -2854,6 +2942,10 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .proxy_pass => {},
             else => return error.InvalidLocationBlockFormat,
         } else if (websocket_options_seen) return error.InvalidLocationBlockFormat;
+        if (response_stream_options_seen) switch (action) {
+            .proxy_pass => {},
+            else => return error.InvalidLocationBlockFormat,
+        };
         if (websocket_origins) |raw_origins| websocket.origins = try parseWebSocketOrigins(allocator, raw_origins);
         errdefer websocket.deinit(allocator);
 
@@ -2870,6 +2962,7 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .proxy_set_headers = &.{},
             .forward_auth = forward_auth,
             .websocket = if (websocket_on) websocket else null,
+            .response_stream = response_stream,
         });
         action_owned = false;
         forward_auth = null;
@@ -4463,6 +4556,29 @@ test "parse location blocks read proxy_websocket options (#812)" {
     try std.testing.expectEqual(http.location_router.WebSocketReloadPolicy.drain, ws.reload.?);
     try std.testing.expectEqual(@as(u32, 2500), ws.reload_timeout_ms.?);
     try std.testing.expect(blocks[1].websocket == null);
+}
+
+test "parse location blocks read response-stream reload overrides (#841)" {
+    const allocator = std.testing.allocator;
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "prefix|/events/|proxy_pass|http://127.0.0.1:9000|response_stream_reload:drain|response_stream_reload_timeout_ms:2500",
+    );
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+    try std.testing.expectEqual(http.response_stream_lifecycle.ReloadPolicy.drain, blocks[0].response_stream.reload.?);
+    try std.testing.expectEqual(@as(u32, 2500), blocks[0].response_stream.reload_timeout_ms.?);
+}
+
+test "parse location blocks reject invalid response-stream overrides (#841)" {
+    const cases = [_][]const u8{
+        "prefix|/events/|return|200|ok|response_stream_reload:drain",
+        "prefix|/events/|proxy_pass|http://127.0.0.1:9000|response_stream_reload:restart",
+        "prefix|/events/|proxy_pass|http://127.0.0.1:9000|response_stream_reload_timeout_ms:soon",
+    };
+    for (cases) |raw| try std.testing.expectError(error.InvalidLocationBlockFormat, parseLocationBlocks(std.testing.allocator, raw));
 }
 
 test "parse location blocks reject unsafe proxy_websocket configuration (#812)" {

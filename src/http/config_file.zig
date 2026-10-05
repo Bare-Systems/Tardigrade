@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("zig_compat");
 const location_router = @import("location_router.zig");
+const response_stream_lifecycle = @import("response_stream_lifecycle.zig");
 const http_headers = @import("headers.zig");
 
 pub const Overrides = struct {
@@ -111,6 +112,8 @@ const LocationBlockBuilder = struct {
     proxy_websocket_origins: ?[]u8 = null,
     proxy_websocket_reload: ?location_router.WebSocketReloadPolicy = null,
     proxy_websocket_reload_timeout_ms: ?u32 = null,
+    proxy_response_stream_reload: ?response_stream_lifecycle.ReloadPolicy = null,
+    proxy_response_stream_reload_timeout_ms: ?u32 = null,
     error_pages: std.ArrayList(ErrorPageBuilder) = .empty,
     proxy_set_headers: std.ArrayList(ProxySetHeaderBuilder) = .empty,
 
@@ -982,16 +985,32 @@ fn parseLocationStatement(
         try replaceOptionalOwned(allocator, &builder.proxy_websocket_origins, joined);
         return;
     }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_response_stream_reload")) {
+        builder.proxy_response_stream_reload = response_stream_lifecycle.ReloadPolicy.parse(value_interp) orelse {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_response_stream_reload must be 'preserve' or 'drain'", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        };
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_response_stream_reload_timeout_ms")) {
+        builder.proxy_response_stream_reload_timeout_ms = std.fmt.parseInt(u32, value_interp, 10) catch {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: proxy_response_stream_reload_timeout_ms must be a number of milliseconds", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        };
+        return;
+    }
 }
 
 /// Top-level settings that must never silently take their default: an
 /// empty value (`""`, or a variable that expands to nothing) is an error
 /// rather than "unset", because accepting it would let an invalid reload
-/// publish and start draining WebSocket tunnels (#812).
+/// publish and start draining long-lived work (#812, #841).
 const strict_numeric_env_keys = [_][]const u8{
     "TARDIGRADE_PROXY_WEBSOCKET_RELOAD_TIMEOUT_MS",
     "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS",
     "TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS",
+    "TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE",
+    "TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD_TIMEOUT_MS",
 };
 
 fn rejectEmptyStrictValue(
@@ -1234,6 +1253,20 @@ fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlock
         logConfigSyntaxDiagnostic("config syntax error: location '{s}' sets proxy_websocket_* options without proxy_websocket on", .{builder.pattern});
         allocator.free(entry);
         return error.InvalidConfigSyntax;
+    }
+    if (builder.proxy_response_stream_reload != null or builder.proxy_response_stream_reload_timeout_ms != null) {
+        if (builder.proxy_pass == null) {
+            logConfigSyntaxDiagnostic("config syntax error: location '{s}' sets proxy_response_stream_* options without proxy_pass", .{builder.pattern});
+            allocator.free(entry);
+            return error.InvalidConfigSyntax;
+        }
+        var stream_entry: std.ArrayList(u8) = .empty;
+        defer stream_entry.deinit(allocator);
+        try stream_entry.appendSlice(allocator, entry);
+        if (builder.proxy_response_stream_reload) |policy| try stream_entry.print(allocator, "|response_stream_reload:{s}", .{@tagName(policy)});
+        if (builder.proxy_response_stream_reload_timeout_ms) |timeout_ms| try stream_entry.print(allocator, "|response_stream_reload_timeout_ms:{d}", .{timeout_ms});
+        allocator.free(entry);
+        entry = try stream_entry.toOwnedSlice(allocator);
     }
     return entry;
 }
@@ -1794,6 +1827,33 @@ fn parseLocationConfigForTest(allocator: std.mem.Allocator, data: []const u8, ov
     try parseFile(allocator, absolute, overrides, &vars, &visited);
 }
 
+test "top-level response-stream lifecycle directives lower to strict env keys (#841)" {
+    const allocator = std.testing.allocator;
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    try parseLocationConfigForTest(allocator,
+        \\proxy_response_stream_max_active 64;
+        \\proxy_response_stream_reload drain;
+        \\proxy_response_stream_reload_timeout_ms 5000;
+    , &overrides);
+    try std.testing.expectEqualStrings("64", overrides.map.get("TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE").?);
+    try std.testing.expectEqualStrings("drain", overrides.map.get("TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD").?);
+    try std.testing.expectEqualStrings("5000", overrides.map.get("TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD_TIMEOUT_MS").?);
+}
+
+test "top-level response-stream numeric settings reject explicit empties (#841)" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "proxy_response_stream_max_active \"\";\n",
+        "proxy_response_stream_reload_timeout_ms \"\";\n",
+    };
+    for (cases) |data| {
+        var overrides = Overrides.init(allocator);
+        defer overrides.deinit(allocator);
+        try std.testing.expectError(error.InvalidConfigSyntax, parseLocationConfigForTest(allocator, data, &overrides));
+    }
+}
+
 test "location block serializes forward_auth directives" {
     const allocator = std.testing.allocator;
     var overrides = Overrides.init(allocator);
@@ -1845,6 +1905,38 @@ test "location block serializes proxy_websocket directives (#812)" {
             ";prefix|/api/|proxy_pass|http://127.0.0.1:9000",
         overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
     );
+}
+
+test "location block serializes response-stream reload overrides (#841)" {
+    const allocator = std.testing.allocator;
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    try parseLocationConfigForTest(allocator,
+        \\location /events/ {
+        \\    proxy_pass http://127.0.0.1:9000;
+        \\    proxy_response_stream_reload drain;
+        \\    proxy_response_stream_reload_timeout_ms 2500;
+        \\}
+    , &overrides);
+
+    try std.testing.expectEqualStrings(
+        "prefix|/events/|proxy_pass|http://127.0.0.1:9000|response_stream_reload:drain|response_stream_reload_timeout_ms:2500",
+        overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
+    );
+}
+
+test "location block rejects invalid response-stream overrides (#841)" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "location /events/ {\n    return 200 ok;\n    proxy_response_stream_reload drain;\n}\n",
+        "location /events/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_response_stream_reload restart;\n}\n",
+        "location /events/ {\n    proxy_pass http://127.0.0.1:9000;\n    proxy_response_stream_reload_timeout_ms 1s;\n}\n",
+    };
+    for (cases) |data| {
+        var overrides = Overrides.init(allocator);
+        defer overrides.deinit(allocator);
+        try std.testing.expectError(error.InvalidConfigSyntax, parseLocationConfigForTest(allocator, data, &overrides));
+    }
 }
 
 test "location block rejects unsafe proxy_websocket directives (#812)" {

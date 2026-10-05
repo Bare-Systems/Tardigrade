@@ -355,7 +355,8 @@ fn mountStripPrefixForLocation(
         }
 
         const should_consider = switch (matched.block.match_type) {
-            .exact, .regex, .regex_case_insensitive => true,
+            .exact => true,
+            .regex, .regex_case_insensitive => false,
             .prefix, .prefix_priority => blk: {
                 if (candidate.pattern.len >= matched.block.pattern.len) break :blk false;
                 break :blk proxyPassTargetsDiffer(matched.block, candidate);
@@ -3021,6 +3022,31 @@ test "proxySuffixPathForLocation yields no suffix for exact route shadowing same
     const combined = try gpt.combineProxyTarget(std.testing.allocator, "http://ekho-mcp:8000/mcp", suffix);
     defer std.testing.allocator.free(combined);
     try std.testing.expectEqualStrings("http://ekho-mcp:8000/mcp", combined);
+}
+
+test "proxySuffixPathForLocation preserves full path for regex route ignoring prefix mount (#799)" {
+    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .regex,
+            .pattern = "\\.php$",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://php:9000" },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/app/",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://app:8080" },
+        },
+    };
+
+    const matched_app = http.location_router.matchLocation(std.testing.allocator, "/app/x.php", &blocks).?;
+    const suffix_app = proxySuffixPathForLocation("/app/x.php", matched_app, &blocks).?;
+    try std.testing.expectEqualStrings("/app/x.php", suffix_app);
+
+    const matched_other = http.location_router.matchLocation(std.testing.allocator, "/other/x.php", &blocks).?;
+    const suffix_other = proxySuffixPathForLocation("/other/x.php", matched_other, &blocks).?;
+    try std.testing.expectEqualStrings("/other/x.php", suffix_other);
 }
 
 test "isHttpMethodIdempotent classifies idempotent methods" {

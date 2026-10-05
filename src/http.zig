@@ -47,6 +47,7 @@ pub const event_loop = @import("http/event_loop.zig");
 pub const worker_pool = @import("http/worker_pool.zig");
 pub const buffer_pool = @import("http/buffer_pool.zig");
 pub const proxy_buffer_account = @import("http/proxy_buffer_account.zig");
+pub const response_stream_lifecycle = @import("http/response_stream_lifecycle.zig");
 pub const chunked_upload = @import("http/chunked_upload.zig");
 pub const keepalive_park = @import("http/keepalive_park.zig");
 pub const encrypted_stream_connection = @import("http/encrypted_stream_connection.zig");

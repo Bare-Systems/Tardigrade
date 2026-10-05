@@ -400,6 +400,9 @@ pub const LocationBlock = struct {
     forward_auth: ?ForwardAuth = null,
     /// Set when the location relays WebSocket upgrades (#812).
     websocket: ?WebSocketProxy = null,
+    /// Overrides for long-lived streamed HTTP responses admitted through this
+    /// location (#841). The process-wide cap is intentionally not overridable.
+    response_stream: @import("response_stream_lifecycle.zig").LocationOverrides = .{},
 
     pub fn deinit(self: *LocationBlock, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);

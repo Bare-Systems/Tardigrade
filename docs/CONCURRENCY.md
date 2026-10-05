@@ -404,6 +404,7 @@ They are not on the request hot path for standard HTTP traffic.
 | Symbol | Location | Notes |
 |---|---|---|
 | `in_flight_requests` | `gateway_state.zig` | `fetchAdd`/`fetchSub` with `.acq_rel`; lock-free request-slot accounting. Correct and hot-path safe. |
+| `response_stream_lifecycle.active` | `http/response_stream_lifecycle.zig` | CAS admission and `fetchSub` release with `.acq_rel`; process-wide long-lived response-stream cap. A lower cap on reload blocks new admissions until the active count falls below it. |
 | `health_probe_running` | `gateway_state.zig` | `bool` flag guarding the one-at-a-time health-probe constraint. Correct. |
 | `shutdown_requested` / `reload_requested` / `upgrade_requested` / `reopen_logs_requested` | `http/shutdown.zig` | Signal-handler-safe `seq_cst` atomics. Correct; read on every event-loop tick, not per-request. |
 | `dropped_lines` | `http/access_log.zig` | Monotonic counter for dropped log lines. Correct. |

@@ -534,6 +534,9 @@ pub const GatewayState = struct {
     max_in_flight_requests: u32,
     /// Open (or opening) WebSocket tunnels (#812). Lock-free.
     websocket_tunnels: std.atomic.Value(u32) = .init(0),
+    /// Active long-lived streamed HTTP responses (#841). Admission uses the
+    /// cap from the configuration generation being admitted.
+    response_stream_lifecycle: http.response_stream_lifecycle.Lifecycle = .{},
     /// Tunnel cap used when `proxy_websocket_max_tunnels` is 0: derived from
     /// the descriptor limit (#818). Set once at startup.
     websocket_default_max_tunnels: u32 = 0,
@@ -858,6 +861,37 @@ pub const GatewayState = struct {
 
     pub fn releaseWebSocketTunnel(self: *GatewayState) void {
         _ = self.websocket_tunnels.fetchSub(1, .acq_rel);
+    }
+
+    /// Reserve a long-lived response-stream slot and retain the exact config
+    /// generation that admitted it. Capacity failures are observable and do
+    /// not retain a generation or change the active gauge.
+    pub fn tryAcquireResponseStream(
+        self: *GatewayState,
+        config_lease: *ConfigLease,
+        location: *const http.location_router.LocationBlock,
+        now_ms: u64,
+    ) ?ResponseStreamAdmission {
+        const admission = tryReserveResponseStream(&self.response_stream_lifecycle, config_lease, location.response_stream, now_ms) orelse {
+            self.metricsRecordResponseStreamAdmission(.capacity);
+            return null;
+        };
+        self.metricsRecordResponseStreamAdmission(.admitted);
+        return admission;
+    }
+
+    /// Finish one admitted stream exactly once, releasing both its process
+    /// slot and its configuration-generation lease.
+    pub fn finishResponseStream(
+        self: *GatewayState,
+        admission: *ResponseStreamAdmission,
+        reason: http.response_stream_lifecycle.CloseReason,
+        now_ms: u64,
+    ) void {
+        std.debug.assert(reason != .capacity);
+        const duration_ms = now_ms -| admission.opened_at_ms;
+        admission.release();
+        self.metricsRecordResponseStreamClosed(reason, duration_ms);
     }
 
     /// HOT PATH: taken once per request when rate limiting is enabled.
@@ -1614,6 +1648,18 @@ pub const GatewayState = struct {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
         self.metrics.recordWebSocketTunnelClosed(reason, stats.client_to_upstream_bytes, stats.upstream_to_client_bytes, stats.duration_ms);
+    }
+
+    pub fn metricsRecordResponseStreamAdmission(self: *GatewayState, outcome: http.response_stream_lifecycle.AdmissionOutcome) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordResponseStreamAdmission(outcome);
+    }
+
+    pub fn metricsRecordResponseStreamClosed(self: *GatewayState, reason: http.response_stream_lifecycle.CloseReason, duration_ms: u64) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordResponseStreamClosed(reason, duration_ms);
     }
 
     pub fn metricsRecordEarlyDataDecision(self: *GatewayState, protocol: http.metrics.HttpProtocol, decision: http.metrics.EarlyDataDecision) void {
@@ -3264,6 +3310,62 @@ pub const ConfigLease = struct {
     }
 };
 
+/// A process slot plus a lease on the exact configuration generation that
+/// admitted a long-lived response stream (#841). This is intentionally
+/// independent of HTTP/1 and HTTP/2 relay state so either path can compose it.
+pub const ResponseStreamAdmission = struct {
+    lifecycle: *http.response_stream_lifecycle.Lifecycle,
+    config_lease: ConfigLease,
+    generation: u64,
+    policy: http.response_stream_lifecycle.AdmissionPolicy,
+    opened_at_ms: u64,
+
+    /// The first successful reload that superseded this admission generation.
+    /// A failed or merely prepared reload leaves this at null.
+    pub fn supersededAtMs(self: *const ResponseStreamAdmission) ?u64 {
+        const stamp = self.config_lease.version.superseded_at_ms.load(.acquire);
+        return if (stamp == 0) null else stamp;
+    }
+
+    /// Drain deadline fixed by the admission policy and the first successful
+    /// superseding reload. Preserve streams have no reload deadline.
+    pub fn reloadDeadlineMs(self: *const ResponseStreamAdmission) ?u64 {
+        if (self.policy.reload == .preserve) return null;
+        const stamp = self.supersededAtMs() orelse return null;
+        return stamp +| self.policy.reload_timeout_ms;
+    }
+
+    pub fn release(self: *ResponseStreamAdmission) void {
+        self.lifecycle.release();
+        self.config_lease.release();
+        self.* = undefined;
+    }
+};
+
+/// Protocol-neutral admission primitive used by the gateway wrapper and unit
+/// tests. A successful result owns one lifecycle slot and one retained config
+/// lease until `ResponseStreamAdmission.release`.
+pub fn tryReserveResponseStream(
+    lifecycle: *http.response_stream_lifecycle.Lifecycle,
+    config_lease: *ConfigLease,
+    overrides: http.response_stream_lifecycle.LocationOverrides,
+    now_ms: u64,
+) ?ResponseStreamAdmission {
+    const cfg = config_lease.cfg;
+    if (!lifecycle.tryReserve(cfg.proxy_response_stream_max_active)) return null;
+    return .{
+        .lifecycle = lifecycle,
+        .config_lease = config_lease.retain(),
+        .generation = config_lease.version.generation,
+        .policy = overrides.resolve(.{
+            .max_active = cfg.proxy_response_stream_max_active,
+            .reload = cfg.proxy_response_stream_reload,
+            .reload_timeout_ms = cfg.proxy_response_stream_reload_timeout_ms,
+        }),
+        .opened_at_ms = now_ms,
+    };
+}
+
 pub const ReloadableConfigStore = struct {
     allocator: std.mem.Allocator,
     mutex: compat.Mutex = .{},
@@ -4725,6 +4827,62 @@ test "a successful reload stamps the superseded generation once; failed reloads 
     third_cfg.access_control_rules = "";
     store.installPrepared(try store.prepareOwned(third_cfg));
     try std.testing.expectEqual(first_stamp, tunnel_lease.version.superseded_at_ms.load(.acquire));
+}
+
+test "response-stream admission retains its config generation across reloads (#841)" {
+    const allocator = std.testing.allocator;
+    var first_cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    first_cfg.access_control_rules = "";
+    first_cfg.proxy_response_stream_max_active = 1;
+    first_cfg.proxy_response_stream_reload = .drain;
+    first_cfg.proxy_response_stream_reload_timeout_ms = 25;
+    var store = try ReloadableConfigStore.initBorrowed(allocator, &first_cfg);
+    defer store.deinit();
+    var lifecycle: http.response_stream_lifecycle.Lifecycle = .{};
+
+    var request_lease = store.acquire();
+    var admission = tryReserveResponseStream(&lifecycle, &request_lease, .{ .reload_timeout_ms = 7 }, 100).?;
+    defer admission.release();
+    request_lease.release();
+    try std.testing.expectEqual(@as(u64, 1), admission.generation);
+    try std.testing.expectEqual(http.response_stream_lifecycle.ReloadPolicy.drain, admission.policy.reload);
+    try std.testing.expect(admission.supersededAtMs() == null);
+    try std.testing.expectEqual(@as(u32, 1), lifecycle.activeCount());
+
+    // Preparing and rejecting a reload cannot schedule this stream to drain.
+    const rejected_cfg = try allocator.create(edge_config.EdgeConfig);
+    rejected_cfg.* = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    rejected_cfg.access_control_rules = "";
+    store.destroyVersion(try store.prepareOwned(rejected_cfg));
+    try std.testing.expect(admission.supersededAtMs() == null);
+    try std.testing.expect(admission.reloadDeadlineMs() == null);
+
+    // Only installation stamps the retained generation, and the deadline uses
+    // the location override captured at admission.
+    const next_cfg = try allocator.create(edge_config.EdgeConfig);
+    next_cfg.* = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    next_cfg.access_control_rules = "";
+    store.installPrepared(try store.prepareOwned(next_cfg));
+    const stamp = admission.supersededAtMs().?;
+    try std.testing.expectEqual(stamp + 7, admission.reloadDeadlineMs().?);
+}
+
+test "response-stream capacity failure retains neither slot nor generation (#841)" {
+    const allocator = std.testing.allocator;
+    var cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.access_control_rules = "";
+    cfg.proxy_response_stream_max_active = 1;
+    var store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer store.deinit();
+    var lifecycle: http.response_stream_lifecycle.Lifecycle = .{};
+    var request_lease = store.acquire();
+    defer request_lease.release();
+
+    var first = tryReserveResponseStream(&lifecycle, &request_lease, .{}, 0).?;
+    try std.testing.expect(tryReserveResponseStream(&lifecycle, &request_lease, .{}, 0) == null);
+    try std.testing.expectEqual(@as(u32, 1), lifecycle.activeCount());
+    first.release();
+    try std.testing.expectEqual(@as(u32, 0), lifecycle.activeCount());
 }
 
 test "a reloaded ACL is published atomically with its own generation" {

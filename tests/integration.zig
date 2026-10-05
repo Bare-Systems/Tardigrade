@@ -12939,6 +12939,24 @@ const PureZigTlsClient = struct {
         if (offset < out.len) return error.ReadTimeout;
     }
 
+    /// Send TLS `close_notify` while deliberately leaving the underlying TCP
+    /// descriptor open. This exercises server-side record-layer close
+    /// observation rather than the raw socket's FIN/HUP path.
+    fn sendCloseNotifyKeepingTcpOpen(self: *PureZigTlsClient, timeout_ms: u64) !void {
+        self.record.stream().close();
+        const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (compat.milliTimestamp() < deadline) {
+            const driven = try self.record.drive();
+            const readiness = self.record.readiness();
+            if (!readiness.wants_write and self.record.queuedCiphertextLen() == 0) return;
+            if (!driven.made_progress) self.waitForReadiness(100) catch |err| switch (err) {
+                error.WouldBlock => {},
+                else => return err,
+            };
+        }
+        return error.WriteFailed;
+    }
+
     fn writeHttp2Frame(self: *PureZigTlsClient, typ: u8, flags: u8, stream_id: u31, payload: []const u8) !void {
         var header: [9]u8 = undefined;
         header[0] = @intCast((payload.len >> 16) & 0xff);
@@ -24216,6 +24234,69 @@ test "quiet SSE releases admission promptly when the client disconnects (#842)" 
         defer metrics.deinit();
         const active = prometheusMetricValue(metrics.body, "tardigrade_response_streams_active") orelse 1;
         const closed = prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"client\""}) orelse 0;
+        if (active == 0 and closed >= 1) break;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    } else return error.MetricThresholdNotReached;
+}
+
+test "quiet SSE over native TLS observes close_notify without a TCP close (#842 review)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var origin = try QuietSseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, origin.server.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS", .value = "5000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", "tardigrade.test");
+    defer client.destroy();
+    try client.writeAllPlain("GET /events/feed HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const head = try wssReadHead(client, allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
+
+    var first_event = std.array_list.Managed(u8).init(allocator);
+    defer first_event.deinit();
+    while (std.mem.find(u8, first_event.items, "data: one") == null) {
+        if (first_event.items.len >= 4096) return error.MessageTooLarge;
+        var byte: [1]u8 = undefined;
+        try client.readExactPlain(&byte, 5_000);
+        try first_event.append(byte[0]);
+    }
+
+    try client.sendCloseNotifyKeepingTcpOpen(2_000);
+
+    const deadline = compat.milliTimestamp() + 2_000;
+    while (compat.milliTimestamp() < deadline) {
+        var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+        const active = prometheusMetricValue(metrics.body, "tardigrade_response_streams_active") orelse 1;
+        const closed = prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"client\""}) orelse 0;
+        metrics.deinit();
         if (active == 0 and closed >= 1) break;
         compat.sleepNs(25 * std.time.ns_per_ms);
     } else return error.MetricThresholdNotReached;

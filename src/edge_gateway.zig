@@ -2135,6 +2135,14 @@ const WaitingEncryptedHttpConnection = struct {
         return self.inner.pendingPlaintext();
     }
 
+    pub fn probePeerCloseBounded(
+        self: *WaitingEncryptedHttpConnection,
+        max_drives: usize,
+    ) !http.encrypted_stream_connection.PeerCloseProbe {
+        defer self.observeTlsBufferMetrics();
+        return self.inner.probePeerCloseBounded(max_drives);
+    }
+
     pub fn rawFd(self: *const WaitingEncryptedHttpConnection) std.posix.fd_t {
         return self.inner.rawFd();
     }

@@ -2133,6 +2133,44 @@ fn downstreamSocketFd(conn: anytype) ?std.posix.fd_t {
     return null;
 }
 
+const DownstreamCloseProbe = struct {
+    fd: ?std.posix.fd_t = null,
+    context: ?*anyopaque = null,
+    probe_fn: ?*const fn (*anyopaque, usize) anyerror!http.encrypted_stream_connection.PeerCloseProbe = null,
+    retry_pending: bool = false,
+
+    fn probeBounded(self: *DownstreamCloseProbe, max_drives: usize) !http.encrypted_stream_connection.PeerCloseProbe {
+        const probe_fn = self.probe_fn orelse return .open;
+        const context = self.context orelse return .open;
+        return probe_fn(context, max_drives);
+    }
+};
+
+/// Preserve a transport-aware close observer when the downstream is TLS.
+/// Polling only its raw fd cannot distinguish an encrypted `close_notify`
+/// record from ordinary application ciphertext.
+fn downstreamCloseProbe(conn: anytype) DownstreamCloseProbe {
+    const T = @TypeOf(conn);
+    const info = @typeInfo(T);
+    const Target = if (info == .pointer) info.pointer.child else T;
+    var result = DownstreamCloseProbe{ .fd = downstreamSocketFd(conn) };
+    if (@hasDecl(Target, "probePeerCloseBounded")) {
+        if (info != .pointer) @compileError("peer-close probes require a pointer downstream connection");
+        const Adapter = struct {
+            fn probe(
+                context: *anyopaque,
+                max_drives: usize,
+            ) anyerror!http.encrypted_stream_connection.PeerCloseProbe {
+                const typed: T = @ptrCast(@alignCast(context));
+                return typed.probePeerCloseBounded(max_drives);
+            }
+        };
+        result.context = @ptrCast(conn);
+        result.probe_fn = Adapter.probe;
+    }
+    return result;
+}
+
 /// Wait up to `timeout_ms` for `fd` to become readable. Returns false on
 /// timeout. EINTR is retried within the original deadline.
 fn pollFdReadable(fd: std.posix.fd_t, timeout_ms: u32) !bool {
@@ -2149,6 +2187,7 @@ fn pollFdReadable(fd: std.posix.fd_t, timeout_ms: u32) !bool {
 }
 
 const ResponseReadiness = enum { upstream, client_closed, client_data, timeout };
+const downstream_peer_close_probe_budget: usize = 8;
 
 fn socketPeerClosed(fd: std.posix.fd_t, revents: i16) bool {
     if ((revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) return true;
@@ -2168,28 +2207,48 @@ fn socketPeerClosed(fd: std.posix.fd_t, revents: i16) bool {
 /// committed, when no request-body bytes remain for the downstream to send.
 fn pollResponseReadiness(
     upstream_fd: std.posix.fd_t,
-    downstream_fd: ?std.posix.fd_t,
+    downstream: *DownstreamCloseProbe,
     timeout_ms: u32,
     upstream_write: bool,
     observe_client_data: bool,
 ) !ResponseReadiness {
+    if (observe_client_data and downstream.retry_pending) {
+        const state = try downstream.probeBounded(downstream_peer_close_probe_budget);
+        downstream.retry_pending = state == .retry;
+        return switch (state) {
+            .closed => .client_closed,
+            .open, .retry => .client_data,
+        };
+    }
+
     var upstream_events: i16 = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR;
     if (upstream_write) upstream_events |= std.posix.POLL.OUT;
     var downstream_events: i16 = std.posix.POLL.HUP | std.posix.POLL.ERR;
     if (observe_client_data) downstream_events |= std.posix.POLL.IN;
     var pfds = [_]std.posix.pollfd{
         .{ .fd = upstream_fd, .events = upstream_events, .revents = 0 },
-        .{ .fd = downstream_fd orelse -1, .events = downstream_events, .revents = 0 },
+        .{ .fd = downstream.fd orelse -1, .events = downstream_events, .revents = 0 },
     };
-    const count: usize = if (downstream_fd != null) 2 else 1;
+    const count: usize = if (downstream.fd != null) 2 else 1;
     const ready = std.posix.poll(pfds[0..count], @intCast(@min(timeout_ms, std.math.maxInt(i32)))) catch |err| switch (err) {
         error.Unexpected => return error.Timeout,
         else => return err,
     };
     if (ready == 0) return .timeout;
-    if (downstream_fd) |client_fd| {
-        if (socketPeerClosed(client_fd, pfds[1].revents)) return .client_closed;
-        if (observe_client_data and (pfds[1].revents & std.posix.POLL.IN) != 0 and pfds[0].revents == 0) return .client_data;
+    if (downstream.fd) |client_fd| {
+        const downstream_revents = pfds[1].revents;
+        if ((downstream_revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) return .client_closed;
+        if (observe_client_data and (downstream_revents & std.posix.POLL.IN) != 0) {
+            const state = if (downstream.probe_fn != null)
+                try downstream.probeBounded(downstream_peer_close_probe_budget)
+            else if (socketPeerClosed(client_fd, downstream_revents))
+                http.encrypted_stream_connection.PeerCloseProbe.closed
+            else
+                http.encrypted_stream_connection.PeerCloseProbe.open;
+            downstream.retry_pending = state == .retry;
+            if (state == .closed) return .client_closed;
+            if (pfds[0].revents == 0) return .client_data;
+        }
     }
     if (pfds[0].revents != 0) return .upstream;
     return .timeout;
@@ -2890,7 +2949,7 @@ const response_stream_lifecycle_poll_slice_ms: u32 = 50;
 const TrackedResponseStream = struct {
     state: *gs.GatewayState,
     admission: gs.ResponseStreamAdmission,
-    downstream_fd: ?std.posix.fd_t,
+    downstream: DownstreamCloseProbe,
     finished: bool = false,
 
     fn stopError(self: *const TrackedResponseStream, now_ms: u64) !void {
@@ -2963,7 +3022,7 @@ fn fillTrackedResponseBody(
         const wait_started_ms = now_ms;
         var readiness = try pollResponseReadiness(
             fd,
-            tracker.downstream_fd,
+            &tracker.downstream,
             wait_ms,
             transportHasQueuedOutput(transport),
             true,
@@ -2978,7 +3037,7 @@ fn fillTrackedResponseBody(
             if (spent_ms < wait_ms) {
                 readiness = try pollResponseReadiness(
                     fd,
-                    tracker.downstream_fd,
+                    &tracker.downstream,
                     @intCast(@as(u64, wait_ms) - spent_ms),
                     transportHasQueuedOutput(transport),
                     false,
@@ -3000,7 +3059,7 @@ fn fillTrackedResponseBody(
 }
 
 const TestResponseReadTracker = struct {
-    downstream_fd: ?std.posix.fd_t = null,
+    downstream: DownstreamCloseProbe = .{},
 
     fn stopError(_: *const TestResponseReadTracker, _: u64) !void {}
 
@@ -3023,7 +3082,7 @@ test "tracked response wait does not spin on unread downstream data (#842 review
     var storage: [16]u8 = undefined;
     var rb = StreamReadBuf{ .buf = &storage };
     const transport = compat.netStreamFromFd(upstream[0]);
-    const tracker = TestResponseReadTracker{ .downstream_fd = downstream[0] };
+    var tracker = TestResponseReadTracker{ .downstream = .{ .fd = downstream[0] } };
     const started_ms = http.event_loop.monotonicMs();
     try std.testing.expectError(error.Timeout, fillTrackedResponseBody(&rb, transport, upstream[0], 80, &tracker));
     const elapsed_ms = http.event_loop.monotonicMs() -| started_ms;
@@ -3060,7 +3119,7 @@ test "tracked response wait polls TLS write readiness for queued control output 
     var transport = FakeTlsTransport{};
     var storage: [16]u8 = undefined;
     var rb = StreamReadBuf{ .buf = &storage };
-    const tracker = TestResponseReadTracker{};
+    var tracker = TestResponseReadTracker{};
 
     try std.testing.expect(try fillTrackedResponseBody(&rb, &transport, upstream[0], 1_000, &tracker));
     try std.testing.expectEqual(@as(usize, 1), transport.reads);
@@ -3085,7 +3144,7 @@ test "tracked response immediate TLS retries still obey the read deadline (#842 
     var transport = YieldingTlsTransport{};
     var storage: [16]u8 = undefined;
     var rb = StreamReadBuf{ .buf = &storage };
-    const tracker = TestResponseReadTracker{};
+    var tracker = TestResponseReadTracker{};
     const started_ms = http.event_loop.monotonicMs();
 
     try std.testing.expectError(error.Timeout, fillTrackedResponseBody(&rb, &transport, upstream[0], 10, &tracker));
@@ -3556,7 +3615,7 @@ fn streamProxyOverTransport(
         head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method, .{ .allocator = allocator, .reservation = &response_reservation });
     }
     const ttfb_ms = http.event_loop.monotonicMs() - ttfb_start_ms;
-    return relayStreamedFinalResponse(allocator, &rb, transport, fd, &head, method, downstream_writer, downstreamSocketFd(downstream_conn), security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, read_deadline_ms, cancel_token, response_stream_control, wrote_downstream, ttfb_ms);
+    return relayStreamedFinalResponse(allocator, &rb, transport, fd, &head, method, downstream_writer, downstreamCloseProbe(downstream_conn), security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, read_deadline_ms, cancel_token, response_stream_control, wrote_downstream, ttfb_ms);
 }
 
 const StreamedExchange = struct { result: StreamingProxyResult, reusable: bool };
@@ -3572,7 +3631,7 @@ fn relayStreamedFinalResponse(
     head: *const ParsedUpstreamHead,
     method: []const u8,
     downstream_writer: anytype,
-    downstream_fd: ?std.posix.fd_t,
+    downstream: DownstreamCloseProbe,
     security: *const http.security_headers.SecurityHeaders,
     alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
@@ -3596,7 +3655,7 @@ fn relayStreamedFinalResponse(
                 control.location,
                 http.event_loop.monotonicMs(),
             ) orelse return error.ResponseStreamCapacityUnavailable;
-            tracked = .{ .state = control.state, .admission = admission, .downstream_fd = downstream_fd };
+            tracked = .{ .state = control.state, .admission = admission, .downstream = downstream };
         }
     }
     defer if (tracked) |*stream| stream.finish(close_reason);
@@ -4245,9 +4304,9 @@ pub fn openWebSocketUpstream(
         // a protocol switch, not a keep-alive exchange).
         var wrote_downstream = false;
         const exchange = (if (tls) |t|
-            relayStreamedFinalResponse(allocator, &rb, t, fd, &head, "GET", downstream_writer, null, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, null, &wrote_downstream, 0)
+            relayStreamedFinalResponse(allocator, &rb, t, fd, &head, "GET", downstream_writer, .{}, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, null, &wrote_downstream, 0)
         else
-            relayStreamedFinalResponse(allocator, &rb, compat.netStreamFromFd(fd), fd, &head, "GET", downstream_writer, null, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, null, &wrote_downstream, 0)) catch |err| {
+            relayStreamedFinalResponse(allocator, &rb, compat.netStreamFromFd(fd), fd, &head, "GET", downstream_writer, .{}, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, null, &wrote_downstream, 0)) catch |err| {
             downstream_committed.* = wrote_downstream;
             return err;
         };

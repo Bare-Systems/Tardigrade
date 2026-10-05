@@ -1,6 +1,12 @@
 const std = @import("std");
 const encrypted_stream = @import("tls_core").encrypted_stream;
 
+pub const PeerCloseProbe = enum {
+    open,
+    closed,
+    retry,
+};
+
 pub const EncryptedStreamHttpConnection = struct {
     stream: encrypted_stream.EncryptedStream,
     fd: std.posix.fd_t = -1,
@@ -84,6 +90,26 @@ pub const EncryptedStreamHttpConnection = struct {
         }
         self.drive_budget_exhausted = true;
         return error.WouldBlock;
+    }
+
+    /// Advance the record layer just far enough to recognize an orderly peer
+    /// shutdown without consuming application plaintext. This lets an idle
+    /// HTTP response relay distinguish TLS `close_notify` from ciphertext that
+    /// belongs to a later request while keeping work bounded per poll tick.
+    pub fn probePeerCloseBounded(self: *EncryptedStreamHttpConnection, max_drives: usize) encrypted_stream.Error!PeerCloseProbe {
+        var readiness_state = self.stream.readiness();
+        if (readiness_state.peer_closed) return .closed;
+        if (readiness_state.can_read_plaintext) return .open;
+
+        var drives: usize = 0;
+        while (drives < max_drives) : (drives += 1) {
+            const driven = try self.stream.drive();
+            readiness_state = driven.readiness;
+            if (readiness_state.peer_closed) return .closed;
+            if (readiness_state.can_read_plaintext) return .open;
+            if (!driven.made_progress) return .retry;
+        }
+        return .retry;
     }
 
     /// `write` for the tunnel reactor (#818), bounded like `readBounded`.
@@ -341,9 +367,35 @@ test "bounded tunnel read, write and flush stop on the drive budget for a peer t
     try std.testing.expectEqual(@as(usize, 0), fake.drive_calls);
 }
 
+test "peer-close probe recognizes TLS close without consuming plaintext (#842 review)" {
+    var already_closed = FakeStream{ .readiness_state = .{ .peer_closed = true } };
+    var closed_conn = EncryptedStreamHttpConnection.init(already_closed.stream());
+    try std.testing.expectEqual(PeerCloseProbe.closed, try closed_conn.probePeerCloseBounded(8));
+    try std.testing.expectEqual(@as(usize, 0), already_closed.drive_calls);
+
+    var plaintext = FakeStream{ .readiness_state = .{ .can_read_plaintext = true } };
+    var plaintext_conn = EncryptedStreamHttpConnection.init(plaintext.stream());
+    try std.testing.expectEqual(PeerCloseProbe.open, try plaintext_conn.probePeerCloseBounded(8));
+    try std.testing.expectEqual(@as(usize, 0), plaintext.drive_calls);
+    try std.testing.expect(plaintext.readiness_state.can_read_plaintext);
+
+    var closes_on_drive = FakeStream{ .readiness_after_drive = .{ .peer_closed = true } };
+    var driven_conn = EncryptedStreamHttpConnection.init(closes_on_drive.stream());
+    try std.testing.expectEqual(PeerCloseProbe.closed, try driven_conn.probePeerCloseBounded(8));
+    try std.testing.expectEqual(@as(usize, 1), closes_on_drive.drive_calls);
+}
+
+test "peer-close probe is bounded when TLS keeps making control progress (#842 review)" {
+    var fake = FakeStream{ .spin = true };
+    var conn = EncryptedStreamHttpConnection.init(fake.stream());
+    try std.testing.expectEqual(PeerCloseProbe.retry, try conn.probePeerCloseBounded(8));
+    try std.testing.expectEqual(@as(usize, 8), fake.drive_calls);
+}
+
 const FakeStream = struct {
     payload: []const u8 = "pong",
     readiness_state: encrypted_stream.Readiness = .{},
+    readiness_after_drive: ?encrypted_stream.Readiness = null,
     drive_calls: usize = 0,
     /// Every drive reports progress without changing readiness.
     spin: bool = false,
@@ -393,6 +445,10 @@ const FakeStream = struct {
     fn drive(ptr: *anyopaque) encrypted_stream.Error!encrypted_stream.DriveResult {
         const self: *FakeStream = @ptrCast(@alignCast(ptr));
         self.drive_calls += 1;
+        if (self.readiness_after_drive) |next| {
+            self.readiness_state = next;
+            self.readiness_after_drive = null;
+        }
         return .{ .made_progress = self.spin, .readiness = self.readiness_state };
     }
 

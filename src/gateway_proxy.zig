@@ -308,6 +308,22 @@ pub const StreamingProxyResult = struct {
     /// counting this against upstream health would let local memory pressure
     /// trip a healthy origin's circuit breaker.
     local_capacity_aborted: bool = false,
+    /// An admitted long-lived response was deliberately cut short by reload
+    /// or process shutdown after its response head had been committed. This is
+    /// neither an upstream failure nor a downstream-client abort, but the
+    /// downstream connection cannot be reused because its chunked body did not
+    /// receive a terminal chunk.
+    response_stream_drained: bool = false,
+};
+
+/// Request-generation state needed to admit an SSE response after its upstream
+/// head is known. Kept optional at the lower relay boundary so WebSocket
+/// rejection relays and focused parser tests do not need to manufacture a
+/// gateway configuration lease.
+pub const ResponseStreamControl = struct {
+    state: *gs.GatewayState,
+    config_lease: *gs.ConfigLease,
+    location: *const http.location_router.LocationBlock,
 };
 
 fn streamingResultAfterDownstreamAbort(status_code: u16, reason: []const u8, body_bytes: usize, ttfb_ms: u64) StreamingProxyResult {
@@ -1015,7 +1031,7 @@ fn runNegotiatedH1Exchange(
     downstream_committed: *bool,
 ) !StreamingProxyResult {
     var wrote_downstream = false;
-    const res = streamProxyOverTransport(allocator, transport, fd, relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity) catch |err| {
+    const res = streamProxyOverTransport(allocator, transport, fd, relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, null, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity) catch |err| {
         downstream_committed.* = wrote_downstream;
         return err;
     };
@@ -2551,7 +2567,30 @@ const ParsedUpstreamHead = struct {
     framing: ResponseFraming,
     connection_close: bool,
     http_1_1: bool,
+
+    fn isEventStream(self: *const ParsedUpstreamHead) bool {
+        for (self.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-type") and isEventStreamContentType(header.value)) return true;
+        }
+        return false;
+    }
 };
+
+/// Match the HTTP media type only. Parameters are allowed and application
+/// payload bytes are intentionally never inspected (#842).
+fn isEventStreamContentType(raw: []const u8) bool {
+    const value = std.mem.trim(u8, raw, " \t");
+    const semicolon = std.mem.findScalar(u8, value, ';') orelse value.len;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value[0..semicolon], " \t"), "text/event-stream");
+}
+
+test "SSE detection uses only the response Content-Type media type (#842)" {
+    try std.testing.expect(isEventStreamContentType("text/event-stream"));
+    try std.testing.expect(isEventStreamContentType(" Text/Event-Stream ; charset=utf-8"));
+    try std.testing.expect(!isEventStreamContentType("application/json"));
+    try std.testing.expect(!isEventStreamContentType("text/event-streaming"));
+    try std.testing.expect(!isEventStreamContentType("application/mcp+json; profile=text/event-stream"));
+}
 
 /// Largest upstream response head the streaming relay accepts (#809). A head
 /// larger than the relay window (`TARDIGRADE_PROXY_STREAM_BUFFER_SIZE`, 16 KiB
@@ -2737,9 +2776,66 @@ const RelayOutcome = struct {
     reusable: bool, // connection may be returned to the pool
 };
 
-fn readChunkSize(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32) !?usize {
+const response_stream_lifecycle_poll_slice_ms: u32 = 50;
+
+const TrackedResponseStream = struct {
+    state: *gs.GatewayState,
+    admission: gs.ResponseStreamAdmission,
+    finished: bool = false,
+
+    fn stopError(self: *const TrackedResponseStream, now_ms: u64) !void {
+        if (http.shutdown.isShutdownRequested()) return error.ResponseStreamShutdown;
+        if (self.admission.reloadDeadlineMs()) |deadline_ms| {
+            if (now_ms >= deadline_ms) return error.ResponseStreamReload;
+        }
+    }
+
+    fn pollWaitMs(self: *const TrackedResponseStream, now_ms: u64, existing_remaining_ms: ?u64) u32 {
+        var wait_ms: u64 = response_stream_lifecycle_poll_slice_ms;
+        if (existing_remaining_ms) |remaining| wait_ms = @min(wait_ms, @max(remaining, 1));
+        if (self.admission.reloadDeadlineMs()) |deadline_ms| {
+            wait_ms = @min(wait_ms, @max(deadline_ms -| now_ms, 1));
+        }
+        return @intCast(@min(wait_ms, @as(u64, std.math.maxInt(u32))));
+    }
+
+    fn finish(self: *TrackedResponseStream, reason: http.response_stream_lifecycle.CloseReason) void {
+        if (self.finished) return;
+        self.finished = true;
+        self.state.finishResponseStream(&self.admission, reason, http.event_loop.monotonicMs());
+    }
+};
+
+/// Fill a response-body window while allowing a newly-published reload drain
+/// deadline (or shutdown) to shorten an already-waiting upstream read. The
+/// existing per-read timeout remains cumulative across the short lifecycle
+/// polling slices.
+fn fillResponseBody(
+    rb: *StreamReadBuf,
+    transport: anytype,
+    fd: std.posix.fd_t,
+    deadline_ms: u32,
+    tracked: ?*TrackedResponseStream,
+) !bool {
+    const tracker = tracked orelse return rb.fill(transport, fd, deadline_ms);
+    const started_ms = http.event_loop.monotonicMs();
+    while (true) {
+        const now_ms = http.event_loop.monotonicMs();
+        try tracker.stopError(now_ms);
+        if (transportHasBufferedInput(transport)) break;
+
+        const elapsed_ms = now_ms -| started_ms;
+        if (deadline_ms > 0 and elapsed_ms >= deadline_ms) return error.Timeout;
+        const existing_remaining_ms: ?u64 = if (deadline_ms > 0) @as(u64, deadline_ms) - elapsed_ms else null;
+        if (try pollFdReadable(fd, tracker.pollWaitMs(now_ms, existing_remaining_ms))) break;
+    }
+    try tracker.stopError(http.event_loop.monotonicMs());
+    return rb.fill(transport, fd, 0);
+}
+
+fn readChunkSize(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32, tracked: ?*TrackedResponseStream) !?usize {
     while (std.mem.find(u8, rb.available(), "\r\n") == null) {
-        if (!try rb.fill(transport, fd, deadline_ms)) return null;
+        if (!try fillResponseBody(rb, transport, fd, deadline_ms, tracked)) return null;
     }
     const avail = rb.available();
     const eol = std.mem.find(u8, avail, "\r\n").?;
@@ -2750,19 +2846,19 @@ fn readChunkSize(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, dea
     return size;
 }
 
-fn consumeExactCrlf(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32) !bool {
+fn consumeExactCrlf(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32, tracked: ?*TrackedResponseStream) !bool {
     while (rb.available().len < 2) {
-        if (!try rb.fill(transport, fd, deadline_ms)) return false;
+        if (!try fillResponseBody(rb, transport, fd, deadline_ms, tracked)) return false;
     }
     if (!std.mem.eql(u8, rb.available()[0..2], "\r\n")) return error.UpstreamProtocolError;
     rb.consume(2);
     return true;
 }
 
-fn consumeChunkTrailers(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32) !bool {
+fn consumeChunkTrailers(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32, tracked: ?*TrackedResponseStream) !bool {
     while (true) {
         while (std.mem.find(u8, rb.available(), "\r\n") == null) {
-            if (!try rb.fill(transport, fd, deadline_ms)) return false;
+            if (!try fillResponseBody(rb, transport, fd, deadline_ms, tracked)) return false;
         }
         const avail = rb.available();
         const eol = std.mem.find(u8, avail, "\r\n").?;
@@ -2795,6 +2891,7 @@ fn relayUpstreamBody(
     downstream_write: *gpres.StreamingResponseWriteState,
     downstream_writer: anytype,
     cancel_token: ?*const CancellationToken,
+    tracked: ?*TrackedResponseStream,
 ) !RelayOutcome {
     var total: usize = 0;
     switch (framing) {
@@ -2810,8 +2907,9 @@ fn relayUpstreamBody(
         .length => |content_length| {
             var remaining = content_length;
             while (remaining > 0) {
+                if (tracked) |tracker| try tracker.stopError(http.event_loop.monotonicMs());
                 if (cancelStopped(cancel_token)) return error.RequestCancelled;
-                if (rb.available().len == 0 and !try rb.fill(transport, fd, deadline_ms)) {
+                if (rb.available().len == 0 and !try fillResponseBody(rb, transport, fd, deadline_ms, tracked)) {
                     return .{ .body_bytes = total, .aborted = true, .reusable = false };
                 }
                 const take = @min(rb.available().len, remaining);
@@ -2826,11 +2924,12 @@ fn relayUpstreamBody(
         },
         .chunked => {
             while (true) {
+                if (tracked) |tracker| try tracker.stopError(http.event_loop.monotonicMs());
                 if (cancelStopped(cancel_token)) return error.RequestCancelled;
-                const size = (try readChunkSize(rb, transport, fd, deadline_ms)) orelse
+                const size = (try readChunkSize(rb, transport, fd, deadline_ms, tracked)) orelse
                     return .{ .body_bytes = total, .aborted = true, .reusable = false };
                 if (size == 0) {
-                    if (!try consumeChunkTrailers(rb, transport, fd, deadline_ms)) {
+                    if (!try consumeChunkTrailers(rb, transport, fd, deadline_ms, tracked)) {
                         return .{ .body_bytes = total, .aborted = true, .reusable = false };
                     }
                     // Reusable only if nothing trailed the terminating chunk.
@@ -2838,7 +2937,8 @@ fn relayUpstreamBody(
                 }
                 var chunk_remaining = size;
                 while (chunk_remaining > 0) {
-                    if (rb.available().len == 0 and !try rb.fill(transport, fd, deadline_ms)) {
+                    if (tracked) |tracker| try tracker.stopError(http.event_loop.monotonicMs());
+                    if (rb.available().len == 0 and !try fillResponseBody(rb, transport, fd, deadline_ms, tracked)) {
                         return .{ .body_bytes = total, .aborted = true, .reusable = false };
                     }
                     const take = @min(rb.available().len, chunk_remaining);
@@ -2848,15 +2948,16 @@ fn relayUpstreamBody(
                     total += take;
                     chunk_remaining -= take;
                 }
-                if (!try consumeExactCrlf(rb, transport, fd, deadline_ms)) {
+                if (!try consumeExactCrlf(rb, transport, fd, deadline_ms, tracked)) {
                     return .{ .body_bytes = total, .aborted = true, .reusable = false };
                 }
             }
         },
         .close => {
             while (true) {
+                if (tracked) |tracker| try tracker.stopError(http.event_loop.monotonicMs());
                 if (cancelStopped(cancel_token)) return error.RequestCancelled;
-                if (rb.available().len == 0 and !try rb.fill(transport, fd, deadline_ms)) break;
+                if (rb.available().len == 0 and !try fillResponseBody(rb, transport, fd, deadline_ms, tracked)) break;
                 downstream_write.beginChunk(rb.available()) catch return error.ClientAborted;
                 gpres.drainStreamingWriteBlocking(downstream_write, downstream_writer) catch return error.ClientAborted;
                 total += rb.available().len;
@@ -3104,6 +3205,7 @@ fn streamProxyOverTransport(
     connect_timeout_ms: u32,
     read_deadline_ms: u32,
     cancel_token: ?*const CancellationToken,
+    response_stream_control: ?*const ResponseStreamControl,
     wrote_downstream: *bool,
     proxy_buffer_limits: proxy_buffer_account.Limits,
     proxy_buffer_observer: proxy_buffer_account.Observer,
@@ -3192,7 +3294,7 @@ fn streamProxyOverTransport(
         head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method, .{ .allocator = allocator, .reservation = &response_reservation });
     }
     const ttfb_ms = http.event_loop.monotonicMs() - ttfb_start_ms;
-    return relayStreamedFinalResponse(allocator, &rb, transport, fd, &head, method, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, read_deadline_ms, cancel_token, wrote_downstream, ttfb_ms);
+    return relayStreamedFinalResponse(allocator, &rb, transport, fd, &head, method, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, read_deadline_ms, cancel_token, response_stream_control, wrote_downstream, ttfb_ms);
 }
 
 const StreamedExchange = struct { result: StreamingProxyResult, reusable: bool };
@@ -3215,11 +3317,26 @@ fn relayStreamedFinalResponse(
     downstream_keep_alive: bool,
     read_deadline_ms: u32,
     cancel_token: ?*const CancellationToken,
+    response_stream_control: ?*const ResponseStreamControl,
     wrote_downstream: *bool,
     ttfb_ms: u64,
 ) !StreamedExchange {
     const reason = gpres.upstreamReasonPhrase(@enumFromInt(head.status_code));
     const body_allowed = gpres.responseBodyAllowed(method, head.status_code);
+
+    var tracked: ?TrackedResponseStream = null;
+    var close_reason: http.response_stream_lifecycle.CloseReason = .upstream;
+    if (body_allowed and head.isEventStream()) {
+        if (response_stream_control) |control| {
+            const admission = control.state.tryAcquireResponseStream(
+                control.config_lease,
+                control.location,
+                http.event_loop.monotonicMs(),
+            ) orelse return error.ResponseStreamCapacityUnavailable;
+            tracked = .{ .state = control.state, .admission = admission };
+        }
+    }
+    defer if (tracked) |*stream| stream.finish(close_reason);
 
     var downstream_write = gpres.StreamingResponseWriteState{};
     defer downstream_write.deinit();
@@ -3234,13 +3351,19 @@ fn relayStreamedFinalResponse(
         security,
         alt_svc,
         sticky_set_cookie,
-    ) catch return .{
-        .result = streamingResultAfterDownstreamAbort(head.status_code, reason, 0, ttfb_ms),
-        .reusable = false,
+    ) catch {
+        close_reason = .client;
+        return .{
+            .result = streamingResultAfterDownstreamAbort(head.status_code, reason, 0, ttfb_ms),
+            .reusable = false,
+        };
     };
-    gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch return .{
-        .result = streamingResultAfterDownstreamAbort(head.status_code, reason, 0, ttfb_ms),
-        .reusable = false,
+    gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch {
+        close_reason = .client;
+        return .{
+            .result = streamingResultAfterDownstreamAbort(head.status_code, reason, 0, ttfb_ms),
+            .reusable = false,
+        };
     };
     wrote_downstream.* = true;
 
@@ -3257,10 +3380,23 @@ fn relayStreamedFinalResponse(
     // or a full ghost response.
     var reusable = body_allowed and head.http_1_1 and !head.connection_close;
     if (body_allowed) {
-        const outcome = relayUpstreamBody(rb, transport, fd, read_deadline_ms, head.framing, &downstream_write, downstream_writer, cancel_token) catch |err| {
+        const outcome = relayUpstreamBody(rb, transport, fd, read_deadline_ms, head.framing, &downstream_write, downstream_writer, cancel_token, if (tracked) |*stream| stream else null) catch |err| {
+            close_reason = responseStreamCloseReason(err, cancel_token);
             if (err == error.ClientAborted) {
                 return .{
                     .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
+                    .reusable = false,
+                };
+            }
+            if (err == error.ResponseStreamReload or err == error.ResponseStreamShutdown) {
+                return .{
+                    .result = .{
+                        .status_code = head.status_code,
+                        .reason = reason,
+                        .response_body_bytes = body_bytes,
+                        .upstream_ttfb_ms = ttfb_ms,
+                        .response_stream_drained = true,
+                    },
                     .reusable = false,
                 };
             }
@@ -3270,13 +3406,19 @@ fn relayStreamedFinalResponse(
         aborted = outcome.aborted;
         reusable = reusable and outcome.reusable;
         if (!aborted) {
-            downstream_write.beginTerminalChunk() catch return .{
-                .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
-                .reusable = false,
+            downstream_write.beginTerminalChunk() catch {
+                close_reason = .client;
+                return .{
+                    .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
+                    .reusable = false,
+                };
             };
-            gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch return .{
-                .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
-                .reusable = false,
+            gpres.drainStreamingWriteBlocking(&downstream_write, downstream_writer) catch {
+                close_reason = .client;
+                return .{
+                    .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
+                    .reusable = false,
+                };
             };
         }
     } else {
@@ -3297,6 +3439,36 @@ fn relayStreamedFinalResponse(
         },
         .reusable = reusable,
     };
+}
+
+fn responseStreamCloseReason(err: anyerror, cancel_token: ?*const CancellationToken) http.response_stream_lifecycle.CloseReason {
+    if (err == error.ClientAborted) return .client;
+    if (err == error.ResponseStreamReload) return .reload;
+    if (err == error.ResponseStreamShutdown or http.shutdown.isShutdownRequested()) return .shutdown;
+    if (err == error.RequestCancelled) {
+        if (cancel_token) |token| {
+            if (token.reason) |cancel_reason| return switch (cancel_reason) {
+                .client_disconnect => .client,
+                .shutdown => .shutdown,
+                .timeout, .upstream_timeout => .timeout,
+            };
+        }
+        return .timeout;
+    }
+    if (err == error.Timeout or err == error.TimedOut or err == error.WouldBlock) return .timeout;
+    return .upstream;
+}
+
+test "tracked response relay errors map to one bounded close reason (#842)" {
+    try std.testing.expectEqual(http.response_stream_lifecycle.CloseReason.client, responseStreamCloseReason(error.ClientAborted, null));
+    try std.testing.expectEqual(http.response_stream_lifecycle.CloseReason.upstream, responseStreamCloseReason(error.UpstreamConnectionClosed, null));
+    try std.testing.expectEqual(http.response_stream_lifecycle.CloseReason.timeout, responseStreamCloseReason(error.Timeout, null));
+    try std.testing.expectEqual(http.response_stream_lifecycle.CloseReason.reload, responseStreamCloseReason(error.ResponseStreamReload, null));
+    try std.testing.expectEqual(http.response_stream_lifecycle.CloseReason.shutdown, responseStreamCloseReason(error.ResponseStreamShutdown, null));
+
+    var token = CancellationToken.init(0);
+    token.cancel(.client_disconnect);
+    try std.testing.expectEqual(http.response_stream_lifecycle.CloseReason.client, responseStreamCloseReason(error.RequestCancelled, &token));
 }
 
 /// Stream a reverse-proxy request/response over the manual bounded transport
@@ -3336,6 +3508,7 @@ pub fn executeStreamingHttpProxyRequest(
     alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
     cancel_token: ?*const CancellationToken,
+    response_stream_control: ?*const ResponseStreamControl,
     downstream_keep_alive: bool,
     proxy_buffer_observer: proxy_buffer_account.Observer,
     /// Process-wide proxy buffer aggregate (#140). Streams reserve against it
@@ -3520,9 +3693,9 @@ pub fn executeStreamingHttpProxyRequest(
         const exchange_start_ms = http.event_loop.monotonicMs();
         const fd = conn.stream.handle;
         const res = (if (conn.tls) |tls|
-            streamProxyOverTransport(allocator, tls, fd, requested_relay_bytes, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)
+            streamProxyOverTransport(allocator, tls, fd, requested_relay_bytes, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, response_stream_control, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)
         else
-            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, requested_relay_bytes, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)) catch |err| {
+            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, requested_relay_bytes, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, downstream_keep_alive, connect_timeout_ms, read_deadline_ms, cancel_token, response_stream_control, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)) catch |err| {
             // Tear down the connection (release handles active-- and close).
             if (active_pool) |p| {
                 p.release(key, conn, false, http.event_loop.monotonicMs());
@@ -3809,9 +3982,9 @@ pub fn openWebSocketUpstream(
         // a protocol switch, not a keep-alive exchange).
         var wrote_downstream = false;
         const exchange = (if (tls) |t|
-            relayStreamedFinalResponse(allocator, &rb, t, fd, &head, "GET", downstream_writer, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, &wrote_downstream, 0)
+            relayStreamedFinalResponse(allocator, &rb, t, fd, &head, "GET", downstream_writer, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, null, &wrote_downstream, 0)
         else
-            relayStreamedFinalResponse(allocator, &rb, compat.netStreamFromFd(fd), fd, &head, "GET", downstream_writer, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, &wrote_downstream, 0)) catch |err| {
+            relayStreamedFinalResponse(allocator, &rb, compat.netStreamFromFd(fd), fd, &head, "GET", downstream_writer, security, alt_svc, null, forwarded.correlation_id, false, read_deadline_ms, cancel_token, null, &wrote_downstream, 0)) catch |err| {
             downstream_committed.* = wrote_downstream;
             return err;
         };
@@ -4658,7 +4831,7 @@ fn runStreamingRelay(
     const writer = CaptureWriter{ .list = &captured };
     var downstream_write = gpres.StreamingResponseWriteState.init("");
     try gpres.drainStreamingWriteBlocking(&downstream_write, writer);
-    const outcome = try relayUpstreamBody(&rb, transport, client_fd, 1_000, head.framing, &downstream_write, writer, null);
+    const outcome = try relayUpstreamBody(&rb, transport, client_fd, 1_000, head.framing, &downstream_write, writer, null, null);
 
     // De-chunk the captured downstream stream (relay does not emit the
     // terminating zero chunk; append it so decodeChunkedBody can parse).

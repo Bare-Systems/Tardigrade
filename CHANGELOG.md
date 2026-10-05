@@ -6,6 +6,16 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **HTTP/1 SSE responses now enforce the shared long-lived response lifecycle
+  (#842).** The streaming relay identifies `text/event-stream` from response
+  metadata before committing the downstream head, admits it against the
+  process-wide cap, and returns a deterministic 503 when capacity is exhausted.
+  Admitted streams retain their configuration generation, honor its reload
+  `preserve`/`drain` policy and drain deadline, and record exactly one close
+  reason and duration for upstream close, client close, timeout, reload, or
+  shutdown. Existing relay-buffer reservations and slow-reader backpressure
+  remain in force for plaintext and native-TLS HTTP/1 clients.
+
 - **Shared lifecycle controls for long-lived streamed HTTP responses (#841).**
   Added a strict process-wide active-stream cap (default 256), generation-bound
   reload `preserve`/`drain` policy with per-location overrides, and a 30-second
@@ -14,8 +24,8 @@ All notable user-facing changes to Tardigrade are documented here.
   failed reloads. New fixed-cardinality metrics report active streams,
   admission outcomes, closed-stream duration, and `client`, `upstream`,
   `timeout`, `reload`, `shutdown`, or `capacity` close reasons. This is the
-  protocol-neutral control plane; HTTP/1 and HTTP/2 relay integration remains
-  tracked separately under #842 and #843.
+  protocol-neutral control plane; HTTP/2-upstream relay integration remains
+  tracked separately under #843.
 
 ### Security
 

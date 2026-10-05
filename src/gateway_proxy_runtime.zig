@@ -47,6 +47,7 @@ pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
         error.InvalidChunkedUpload,
         error.ChunkedUploadTooLarge,
         error.UpstreamAtCapacity,
+        error.ResponseStreamCapacityUnavailable,
         error.ProxyBudgetExhausted,
         error.CircuitOpen,
         // Same reasoning as ProxyBufferCapacityUnavailable/
@@ -645,6 +646,11 @@ pub fn handleLocationProxyPass(
             state.recordUpstreamAttemptStart(selection.base_url);
             const proxy_buffer_observer = state.proxyBufferObserver();
             var downstream_committed = false;
+            var response_stream_control: ?gp.ResponseStreamControl = if (ctx.response_stream_config_lease) |raw_lease| .{
+                .state = state,
+                .config_lease = @ptrCast(@alignCast(raw_lease)),
+                .location = matched_block,
+            } else null;
             const streamed = executeStreamingHttpProxyRequest(
                 allocator,
                 cfg,
@@ -669,6 +675,7 @@ pub fn handleLocationProxyPass(
                 state.http3_alt_svc,
                 sticky_set_cookie,
                 if (ctx.lifecycle) |lc| &lc.token else null,
+                if (response_stream_control) |*control| control else null,
                 keep_alive,
                 proxy_buffer_observer,
                 state.proxyBufferGlobalAccount(),
@@ -698,6 +705,17 @@ pub fn handleLocationProxyPass(
                     // it against upstream health / circuit-breaker state.
                     state.circuitReleasePermit(circuit_permit);
                     try sendApiError(allocator, writer, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id, false, state);
+                    ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
+                    return @intFromEnum(http.Status.service_unavailable);
+                }
+                if (err == error.ResponseStreamCapacityUnavailable) {
+                    // The response was identified as SSE from its upstream
+                    // metadata, but the process-wide long-lived response cap
+                    // refused it before any downstream response byte was
+                    // committed. The failed exchange has already torn down its
+                    // upstream connection and released relay-buffer accounting.
+                    state.circuitReleasePermit(circuit_permit);
+                    try sendApiError(allocator, writer, .service_unavailable, "response_stream_capacity", "Long-lived response stream capacity exhausted", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
                     return @intFromEnum(http.Status.service_unavailable);
                 }
@@ -809,6 +827,7 @@ pub fn handleLocationProxyPass(
                 correlation_id,
             );
             try propagateStreamingDownstreamAbortAfterStatus(state, &streamed);
+            if (streamed.response_stream_drained) downstream_broken.* = true;
             if (streamed.upstream_aborted) downstream_broken.* = true;
             // `tardigrade_proxy_upstream_aborts_total` means "aborted by the
             // origin". A truncation this proxy caused by running out of buffer
@@ -3103,6 +3122,7 @@ test "proxyAttemptErrorCountsAsUpstreamFailure: StreamTooLong does not poison ci
     try std.testing.expect(!proxyAttemptErrorCountsAsUpstreamFailure(error.StreamTooLong));
     try std.testing.expect(!proxyAttemptErrorCountsAsUpstreamFailure(error.ProxyBufferCapacityUnavailable));
     try std.testing.expect(!proxyAttemptErrorCountsAsUpstreamFailure(error.RequestBufferLimitExceeded));
+    try std.testing.expect(!proxyAttemptErrorCountsAsUpstreamFailure(error.ResponseStreamCapacityUnavailable));
 
     // A genuine connectivity error must still count against upstream health.
     try std.testing.expect(proxyAttemptErrorCountsAsUpstreamFailure(error.ConnectionRefused));

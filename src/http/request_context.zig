@@ -133,6 +133,11 @@ pub const RequestContext = struct {
     /// leased on (0 while current). A `drain`-mode WebSocket tunnel times its
     /// reload drain from it (#812).
     config_superseded_at: ?*const std.atomic.Value(u64) = null,
+    /// Opaque pointer to the gateway configuration lease held for this HTTP/1
+    /// request. The HTTP package cannot import gateway state without creating
+    /// a module cycle; the proxy runtime casts this back to `ConfigLease` when
+    /// an SSE response needs a retained lifecycle admission (#842).
+    response_stream_config_lease: ?*anyopaque = null,
     /// True when the connection loop serving this request can hand an
     /// established WebSocket tunnel to the tunnel reactor (#818).
     tunnel_handoff_allowed: bool = false,

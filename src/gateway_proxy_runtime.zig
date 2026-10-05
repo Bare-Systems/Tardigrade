@@ -3033,20 +3033,40 @@ test "proxySuffixPathForLocation preserves full path for regex route ignoring pr
             .action = .{ .proxy_pass = "http://php:9000" },
         },
         .{
+            .match_type = .regex_case_insensitive,
+            .pattern = "\\.aspx$",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://aspx:9000" },
+        },
+        .{
             .match_type = .prefix,
             .pattern = "/app/",
-            .priority = 1,
+            .priority = 2,
             .action = .{ .proxy_pass = "http://app:8080" },
         },
     };
 
-    const matched_app = http.location_router.matchLocation(std.testing.allocator, "/app/x.php", &blocks).?;
-    const suffix_app = proxySuffixPathForLocation("/app/x.php", matched_app, &blocks).?;
-    try std.testing.expectEqualStrings("/app/x.php", suffix_app);
+    // Test .regex
+    {
+        const matched = http.location_router.matchLocation(std.testing.allocator, "/app/x.php", &blocks).?;
+        const suffix = proxySuffixPathForLocation("/app/x.php", matched, &blocks).?;
+        try std.testing.expectEqualStrings("/app/x.php", suffix);
 
-    const matched_other = http.location_router.matchLocation(std.testing.allocator, "/other/x.php", &blocks).?;
-    const suffix_other = proxySuffixPathForLocation("/other/x.php", matched_other, &blocks).?;
-    try std.testing.expectEqualStrings("/other/x.php", suffix_other);
+        const combined = try gpt.combineProxyTarget(std.testing.allocator, matched.block.action.proxy_pass, suffix);
+        defer std.testing.allocator.free(combined);
+        try std.testing.expectEqualStrings("http://php:9000/app/x.php", combined);
+    }
+
+    // Test .regex_case_insensitive
+    {
+        const matched = http.location_router.matchLocation(std.testing.allocator, "/app/x.AsPx", &blocks).?;
+        const suffix = proxySuffixPathForLocation("/app/x.AsPx", matched, &blocks).?;
+        try std.testing.expectEqualStrings("/app/x.AsPx", suffix);
+
+        const combined = try gpt.combineProxyTarget(std.testing.allocator, matched.block.action.proxy_pass, suffix);
+        defer std.testing.allocator.free(combined);
+        try std.testing.expectEqualStrings("http://aspx:9000/app/x.AsPx", combined);
+    }
 }
 
 test "isHttpMethodIdempotent classifies idempotent methods" {

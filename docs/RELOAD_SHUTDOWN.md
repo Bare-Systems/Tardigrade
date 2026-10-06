@@ -222,8 +222,19 @@ reloads never affect open tunnels. Shutdown overrides `preserve`, and a
 tunnel already in a reload drain closes at the earlier of the two deadlines.
 The reload drain is timed from the superseded generation itself, stamped
 once when the new configuration is installed, so it adds no extra polling
-or reload-time work. Streamed responses such as server-sent events are
-ordinary handlers and follow the soft cap above.
+or reload-time work.
+
+Long-lived streamed responses such as server-sent events are the other
+exception to the soft cap. They retain the reload policy from the generation
+that admitted them: `preserve` keeps them open across successful reloads;
+`drain` closes them at the admission generation's first supersession timestamp
+plus `proxy_response_stream_reload_timeout_ms`. Rejected reloads do not affect
+them, and later reloads never extend that deadline. Shutdown overrides
+`preserve`; every admitted response stream is actively closed at the configured
+shutdown-drain deadline, so a quiet peer cannot hold the worker pool forever.
+Access logs record `response_stream_close_reason` (`reload` or `shutdown`) for
+these deliberate truncations; the matching Prometheus close-reason counter is
+incremented at the same time.
 
 Related knobs:
 

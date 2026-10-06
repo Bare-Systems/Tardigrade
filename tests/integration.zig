@@ -24599,6 +24599,162 @@ test "SSE reload drain bounds a quiet native HTTPS upstream read (#842)" {
     try std.testing.expectEqual(@as(?u64, 1), prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"reload\""}));
 }
 
+test "SSE preserve reloads and rejected reloads leave admitted streams open (#844)" {
+    const allocator = std.testing.allocator;
+    var origin = try SseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\proxy_response_stream_reload_timeout_ms 100;
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, origin.server.port() });
+    defer allocator.free(config_a);
+    const config_b =
+        \\location = /healthz {
+        \\    return 200 reloaded;
+        \\}
+    ;
+    const invalid_config =
+        \\proxy_response_stream_reload later;
+        \\location = /healthz {
+        \\    return 200 invalid;
+        \\}
+    ;
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_a, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll("GET /events/feed HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    var peer = WsPeer{ .stream = stream };
+    const head = try peer.readHead(allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
+
+    // The route itself is removed, but the admitted stream retained the
+    // default preserve policy from its original generation.
+    _ = try wsReload(allocator, &tardigrade, config_b);
+    compat.sleepNs(250 * std.time.ns_per_ms);
+    const failures = try wsLogCount(allocator, tardigrade.log_path, "config reload failed");
+    try tardigrade.rewriteConfig(invalid_config);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    try wsWaitLogCount(allocator, tardigrade.log_path, "config reload failed", failures + 1, 5_000);
+
+    var during = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+    defer during.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), prometheusMetricValue(during.body, "tardigrade_response_streams_active"));
+    try std.testing.expectEqual(@as(?u64, 0), prometheusLabeledMetricValue(during.body, "tardigrade_response_stream_closes_total", &.{"reason=\"reload\""}));
+
+    origin.release.store(true, .seq_cst);
+    const remainder = try peer.readToEnd(allocator);
+    defer allocator.free(remainder);
+    try std.testing.expect(std.mem.endsWith(u8, remainder, "0\r\n\r\n"));
+}
+
+test "SSE reload drain uses the first successful supersession deadline (#844)" {
+    const allocator = std.testing.allocator;
+    var origin = try QuietSseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\proxy_response_stream_reload drain;
+        \\proxy_response_stream_reload_timeout_ms 500;
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, origin.server.port() });
+    defer allocator.free(config_a);
+    const config_b = try std.fmt.allocPrint(allocator, "{s}\nlocation = /first {{\n    return 200 first;\n}}\n", .{config_a});
+    defer allocator.free(config_b);
+    const config_c = try std.fmt.allocPrint(allocator, "{s}\nlocation = /second {{\n    return 200 second;\n}}\n", .{config_b});
+    defer allocator.free(config_c);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_a, .ready_path = "/healthz", .extra_env = &.{ws_worker_env} });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll("GET /events/feed HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    var peer = WsPeer{ .stream = stream };
+    const head = try peer.readHead(allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
+
+    const first_reload_ms = try wsReload(allocator, &tardigrade, config_b);
+    compat.sleepNs(200 * std.time.ns_per_ms);
+    const second_reload_ms = try wsReload(allocator, &tardigrade, config_c);
+    const remainder = try peer.readToEnd(allocator);
+    defer allocator.free(remainder);
+    const closed_ms = compat.milliTimestamp();
+    try std.testing.expect(closed_ms - first_reload_ms >= 300);
+    // A second reload arrives about 200 ms after the first. If it reset the
+    // deadline this would be near 500 ms after the second reload, not 300 ms.
+    try std.testing.expect(closed_ms - second_reload_ms < 420);
+    try std.testing.expect(!std.mem.endsWith(u8, remainder, "0\r\n\r\n"));
+    try waitForLogSubstring(allocator, tardigrade.log_path, "\"response_stream_close_reason\":\"reload\"", 2_000);
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), prometheusLabeledMetricValue(metrics.body, "tardigrade_response_stream_closes_total", &.{"reason=\"reload\""}));
+}
+
+test "graceful shutdown bounds a quiet preserved SSE stream (#844)" {
+    const allocator = std.testing.allocator;
+    var origin = try QuietSseOrigin.start();
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /events/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, origin.server.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{ ws_worker_env, .{ .name = "TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS", .value = "350" } },
+    });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll("GET /events/feed HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    var peer = WsPeer{ .stream = stream };
+    const head = try peer.readHead(allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(head));
+
+    const shutdown_ms = compat.milliTimestamp();
+    tardigrade.sendSignal(std.posix.SIG.TERM);
+    const remainder = try peer.readToEnd(allocator);
+    defer allocator.free(remainder);
+    const closed_ms = compat.milliTimestamp();
+    try std.testing.expect(closed_ms - shutdown_ms >= 200);
+    try std.testing.expect(closed_ms - shutdown_ms < 2_000);
+    try std.testing.expect(!std.mem.endsWith(u8, remainder, "0\r\n\r\n"));
+    try waitForPortClosed(tardigrade.port, 5_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "\"response_stream_close_reason\":\"shutdown\"", 2_000);
+}
+
 test "SSE lifecycle admission works over native TLS HTTP/1 downstream (#842)" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;

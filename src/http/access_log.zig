@@ -19,6 +19,9 @@ pub const AccessLogEntry = struct {
     /// Cancellation or timeout reason when the request was terminated early.
     /// Empty string when the request completed normally.
     cancel_reason: []const u8 = "",
+    /// Fixed reason when an admitted long-lived response stream was drained
+    /// after its head was committed; empty for all other requests.
+    response_stream_close_reason: []const u8 = "",
     /// Bounded replay-exposure source label.
     early_data_source: []const u8 = "none",
     /// Bounded early-data policy action label.
@@ -218,6 +221,7 @@ fn appendEntry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cfg: Confi
                 .response_bytes = entry.response_bytes,
                 .error_category = entry.error_category,
                 .cancel_reason = entry.cancel_reason,
+                .response_stream_close_reason = entry.response_stream_close_reason,
                 .early_data_source = entry.early_data_source,
                 .early_data_action = entry.early_data_action,
                 .early_data_retry_result = entry.early_data_retry_result,
@@ -271,6 +275,10 @@ fn appendPlainEntry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), entry
     if (entry.cancel_reason.len > 0) {
         try out.appendSlice(allocator, " cancel=");
         try appendLogValue(allocator, out, entry.cancel_reason);
+    }
+    if (entry.response_stream_close_reason.len > 0) {
+        try out.appendSlice(allocator, " response_stream_close=");
+        try appendLogValue(allocator, out, entry.response_stream_close_reason);
     }
     try out.appendSlice(allocator, " early_source=");
     try appendLogValue(allocator, out, entry.early_data_source);
@@ -332,6 +340,8 @@ fn appendTemplate(allocator: std.mem.Allocator, out: *std.ArrayList(u8), templat
                     entry.error_category
                 else if (std.mem.eql(u8, key, "cancel_reason"))
                     entry.cancel_reason
+                else if (std.mem.eql(u8, key, "response_stream_close_reason"))
+                    entry.response_stream_close_reason
                 else if (std.mem.eql(u8, key, "early_data_source"))
                     entry.early_data_source
                 else if (std.mem.eql(u8, key, "early_data_action"))
@@ -513,6 +523,14 @@ test "formatEntry adds WebSocket tunnel fields only for tunnels (#812)" {
     const plain_json = try formatEntry(std.testing.allocator, .{}, entry);
     defer std.testing.allocator.free(plain_json);
     try std.testing.expect(std.mem.find(u8, plain_json, "tunnel") == null);
+
+    entry.response_stream_close_reason = "reload";
+    const stream_json = try formatEntry(std.testing.allocator, .{}, entry);
+    defer std.testing.allocator.free(stream_json);
+    try std.testing.expect(std.mem.find(u8, stream_json, "\"response_stream_close_reason\":\"reload\"") != null);
+    const stream_plain = try formatEntry(std.testing.allocator, .{ .format = .plain }, entry);
+    defer std.testing.allocator.free(stream_plain);
+    try std.testing.expect(std.mem.find(u8, stream_plain, "response_stream_close=reload") != null);
 
     entry.tunnel = .{ .close_reason = "idle", .duration_ms = 1499, .client_to_upstream_bytes = 42, .upstream_to_client_bytes = 7 };
     const json = try formatEntry(std.testing.allocator, .{}, entry);

@@ -828,7 +828,13 @@ pub fn handleLocationProxyPass(
                 correlation_id,
             );
             try propagateStreamingDownstreamAbortAfterStatus(state, &streamed);
-            if (streamed.response_stream_drained) downstream_broken.* = true;
+            if (streamed.response_stream_drained) {
+                downstream_broken.* = true;
+                // The proxy is the only layer that knows the committed SSE
+                // exchange ended because of a lifecycle policy. Carry the
+                // fixed reason through to the request's eventual access log.
+                ctx.response_stream_close_reason = @tagName(streamed.response_stream_close_reason orelse unreachable);
+            }
             if (streamed.upstream_aborted) downstream_broken.* = true;
             // `tardigrade_proxy_upstream_aborts_total` means "aborted by the
             // origin". A truncation this proxy caused by running out of buffer

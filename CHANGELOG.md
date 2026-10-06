@@ -45,6 +45,16 @@ All notable user-facing changes to Tardigrade are documented here.
   deadline, reset only their own HTTP/2 stream on lifecycle closure, and
   release all queue and relay-buffer accounting exactly once.
 
+- **Long-lived response streams now drain deterministically on reload and
+  shutdown (#844).** A successful reload preserves streams admitted under
+  `preserve`, while `drain` streams close at the deadline fixed by their first
+  superseding generation; rejected and subsequent reloads cannot disturb or
+  extend that deadline. Graceful shutdown actively terminates every admitted
+  stream at its configured drain deadline, including quiet SSE peers, so a
+  stream cannot leave the worker pool waiting forever. The access log now
+  records `response_stream_close_reason` (`reload` or `shutdown`) alongside
+  the corresponding fixed-label Prometheus close counter.
+
 - **HTTP/1 SSE responses now enforce the shared long-lived response lifecycle
   (#842).** The streaming relay identifies `text/event-stream` from response
   metadata before committing the downstream head, admits it against the
@@ -53,8 +63,7 @@ All notable user-facing changes to Tardigrade are documented here.
   `preserve`/`drain` policy and drain deadline, and record exactly one close
   reason and duration for upstream close, client close, timeout, or reload.
   Existing relay-buffer reservations and slow-reader backpressure remain in
-  force for plaintext and native-TLS HTTP/1 clients. Graceful-shutdown timing
-  for admitted streams remains the follow-up contract in #844.
+  force for plaintext and native-TLS HTTP/1 clients.
 
 - **DNS SRV upstream discovery (#766).** `TARDIGRADE_UPSTREAM_SRV_NAME`
   resolves `_service._proto.name` SRV records, resolves each target to

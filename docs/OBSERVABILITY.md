@@ -545,6 +545,8 @@ TCP worker pool drains:
 - Native HTTP/3 uses the same timeout as a hard H3 drain deadline; H3 deadline
   expiry is not folded into the TCP worker-pool drain timeout metric.
 - After the drain completes the worker threads are joined and the process exits.
+- Admitted long-lived response streams are actively closed at the drain deadline
+  (including quiet SSE peers), rather than keeping a worker alive indefinitely.
 
 ### Reload / shutdown observability
 
@@ -567,6 +569,12 @@ Metrics (`/status/metrics`):
 | `tardigrade_drain_total` | Graceful-shutdown drains started. |
 | `tardigrade_drain_timeouts_total` | TCP worker-pool drains that reached a positive drain deadline before worker jobs finished; does not report native H3 deadline expiry. |
 | `tardigrade_drain_forced_closes_total` | Queue-owned unstarted TCP accepted sockets closed on worker drain expiry or an immediate zero-timeout shutdown. |
+| `tardigrade_response_stream_closes_total{reason="reload"}` | Long-lived response streams closed at their admission generation's reload-drain deadline. |
+| `tardigrade_response_stream_closes_total{reason="shutdown"}` | Long-lived response streams closed at graceful shutdown's drain deadline. |
+
+The JSON access log includes `response_stream_close_reason` with `reload` or
+`shutdown` when Tardigrade deliberately truncates an already-committed
+long-lived response; it is empty for ordinary requests.
 
 A healthy reload increments `reload_attempts_total` and `reload_success_total`
 together; a rejected reload increments `reload_attempts_total` and

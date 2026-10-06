@@ -314,6 +314,9 @@ pub const StreamingProxyResult = struct {
     /// downstream connection cannot be reused because its chunked body did not
     /// receive a terminal chunk.
     response_stream_drained: bool = false,
+    /// The fixed close reason for `response_stream_drained`, retained for the
+    /// request access log as well as the lifecycle metrics.
+    response_stream_close_reason: ?http.response_stream_lifecycle.CloseReason = null,
 };
 
 /// Request-generation state needed to admit an SSE response after its upstream
@@ -1475,6 +1478,7 @@ fn streamViaH2Pool(
                                     .response_body_bytes = body_bytes,
                                     .upstream_ttfb_ms = ttfb_ms,
                                     .response_stream_drained = true,
+                                    .response_stream_close_reason = response_stream_close_reason,
                                 };
                             };
                             if (upstream_body_deadline_ms == null and read_deadline_ms > 0) {
@@ -1520,6 +1524,7 @@ fn streamViaH2Pool(
                                             .response_body_bytes = body_bytes,
                                             .upstream_ttfb_ms = ttfb_ms,
                                             .response_stream_drained = true,
+                                            .response_stream_close_reason = response_stream_close_reason,
                                         };
                                     };
                                     if (upstream_body_deadline_ms) |body_deadline_ms| {
@@ -3982,6 +3987,7 @@ fn relayStreamedFinalResponse(
                         .response_body_bytes = body_bytes,
                         .upstream_ttfb_ms = ttfb_ms,
                         .response_stream_drained = true,
+                        .response_stream_close_reason = close_reason,
                     },
                     .reusable = false,
                 };

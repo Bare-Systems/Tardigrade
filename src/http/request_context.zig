@@ -129,6 +129,10 @@ pub const RequestContext = struct {
     downstream_buffered_input: []const u8 = &.{},
     /// Set when the request became a WebSocket tunnel and it has closed (#812).
     tunnel: ?tunnel.Stats = null,
+    /// Fixed lifecycle reason for an admitted long-lived response stream that
+    /// Tardigrade deliberately drained after committing its response head.
+    /// Empty for ordinary requests and streams that ended naturally.
+    response_stream_close_reason: []const u8 = "",
     /// Supersession stamp of the configuration generation this request is
     /// leased on (0 while current). A `drain`-mode WebSocket tunnel times its
     /// reload drain from it (#812).

@@ -51,6 +51,28 @@ jobs:
         with:
           override: ${{ inputs.mode || 'auto' }}
 
+      # release.yml consumes this artifact from the completed CI run rather
+      # than attempting to reconstruct a push's before..after range later.
+      - name: Record selected CI decision
+        if: github.event_name == 'push'
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          BASE: ${{ github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-decision"
+          printf 'mode=%s\nbase=%s\nhead=%s\n' "$MODE" "$BASE" "$HEAD" \
+            > "$RUNNER_TEMP/ci-decision/decision.env"
+
+      - name: Upload selected CI decision
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-decision
+          path: ${{ runner.temp }}/ci-decision/decision.env
+          if-no-files-found: error
+          retention-days: 1
+
   # These full-only suites are also independently dispatchable workflows, but
   # are called here so their results are part of the stable required check.
   linux-release-smoke:

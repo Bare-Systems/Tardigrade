@@ -490,6 +490,14 @@ fn waitFor(counter: *std.atomic.Value(u32), want: u32, timeout_ms: u64) !void {
     }
 }
 
+fn waitForDrive(counter: *std.atomic.Value(u64), timeout_ms: u64) !void {
+    const until = event_loop.monotonicMs() + timeout_ms;
+    while (counter.load(.acquire) == 0) {
+        if (event_loop.monotonicMs() > until) return error.Timeout;
+        compat.sleepNs(2 * std.time.ns_per_ms);
+    }
+}
+
 fn neverShutdown() bool {
     return false;
 }
@@ -961,6 +969,12 @@ test "a TLS peer that keeps the record layer busy cannot starve the rest of its 
         .{ .idle_timeout_ms = 400, .shutdown_requested = neverShutdown, .poll_interval_ms = 0 },
     );
     try reactor.submit(&spinner.job);
+
+    // Do not mistake an unadopted inbox entry for a busy TLS peer. Under a
+    // contended ARM runner the submission wake and the neighbour submission
+    // can otherwise race the first reactor pass, leaving the assertion below
+    // to sample before the spinner has ever been driven.
+    try waitForDrive(&spinner.spin.drives, 2_000);
 
     // A plaintext neighbour on the same (only) shard.
     var done = std.atomic.Value(u32).init(0);

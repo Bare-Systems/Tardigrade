@@ -36,6 +36,15 @@ All notable user-facing changes to Tardigrade are documented here.
   the client-auth mode (`_CLIENT_VERIFY`/`_OPTIONAL`) requires a restart and a
   reload attempting it is rejected; CA bundle and depth still reload in place.
 
+- **Pooled HTTP/2 SSE responses now enforce the long-lived response lifecycle
+  (#843).** Decoded HTTP/2 response headers are classified before downstream
+  commitment, so a full shared stream cap returns a pre-commit 503 while a
+  healthy multiplexed sibling remains usable. Admitted streams retain their
+  configuration generation, are interruptible at reload and process-published
+  shutdown drain deadlines without weakening the normal upstream response
+  deadline, reset only their own HTTP/2 stream on lifecycle closure, and
+  release all queue and relay-buffer accounting exactly once.
+
 - **HTTP/1 SSE responses now enforce the shared long-lived response lifecycle
   (#842).** The streaming relay identifies `text/event-stream` from response
   metadata before committing the downstream head, admits it against the

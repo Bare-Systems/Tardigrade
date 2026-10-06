@@ -77,6 +77,11 @@ fn rstStreamPayload(code: u32) [4]u8 {
 
 pub const H2Error = error{
     Http2Timeout,
+    /// A caller using `readStreamingBodyInterruptible` reached its short
+    /// lifecycle polling slice without receiving a body event. This is not an
+    /// upstream failure and leaves both the stream and connection usable; the
+    /// caller decides whether a higher-level deadline now requires a reset.
+    Http2ReadWaitElapsed,
     Http2GoAway,
     Http2StreamReset,
     Http2ConnectionClosed,
@@ -1057,6 +1062,52 @@ pub fn H2Conn(comptime Transport: type) type {
                 stream.wait_deadline_ms = nowMs() + self.deadline_ms;
                 stream.cond.wait(&self.state_mutex);
                 stream.wait_deadline_ms = 0;
+            }
+        }
+
+        /// Like `readStreamingBody`, but returns `Http2ReadWaitElapsed` after
+        /// a short caller-selected interval rather than waiting indefinitely
+        /// on the stream condition. Long-lived response relays use this to
+        /// observe reload/shutdown drain deadlines while an upstream is quiet.
+        ///
+        /// This deliberately does not shorten the actor's connection read
+        /// deadline. A quiet stream is polled under its own lock while the
+        /// reader continues serving every other stream, so one lifecycle drain
+        /// never turns into a connection-wide `Http2Timeout`.
+        pub fn readStreamingBodyInterruptible(self: *Self, stream: *Stream, out: []u8, wait_ms: u32) !usize {
+            const deadline_ms = nowMs() + @as(u64, wait_ms);
+            while (true) {
+                self.state_mutex.lock();
+                const avail = stream.body.items.len - stream.body_read_off;
+                if (avail > 0) {
+                    const n = @min(avail, out.len);
+                    @memcpy(out[0..n], stream.body.items[stream.body_read_off..][0..n]);
+                    stream.body_read_off += n;
+                    self.state_mutex.unlock();
+                    return n;
+                }
+                if (stream.err) |e| {
+                    self.state_mutex.unlock();
+                    return e;
+                }
+                if (stream.done) {
+                    self.state_mutex.unlock();
+                    return 0;
+                }
+                if (self.conn_err) |e| {
+                    self.state_mutex.unlock();
+                    return e;
+                }
+                self.state_mutex.unlock();
+
+                const now_ms = nowMs();
+                if (now_ms >= deadline_ms) return error.Http2ReadWaitElapsed;
+                // Keep the granularity small enough for lifecycle drains while
+                // avoiding a busy wait for a quiet SSE stream. The reader
+                // signals the regular blocking API; this polling variant must
+                // also wake for a deadline that is external to the H2 actor.
+                const sleep_ms = @min(@as(u64, 5), deadline_ms - now_ms);
+                compat.sleepNs(@as(u64, sleep_ms) * std.time.ns_per_ms);
             }
         }
 
@@ -3331,6 +3382,62 @@ const CannedServerState = struct {
         }
     }
 };
+
+/// Sends a response head then deliberately stays quiet. The client-side test
+/// uses it to prove a lifecycle polling wake-up is stream-local: ending the
+/// abandoned stream sends one RST_STREAM but leaves the pooled connection
+/// healthy instead of converting quiet upstream time into a connection error.
+fn cannedIdleStreamingServer(peer_fd: std.posix.fd_t, state: *CannedServerState) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], canned_server_read_timeout_ms) catch return state.finish(.preface_read_failed);
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return state.finish(.settings_write_failed);
+
+    var req_stream: u31 = 0;
+    while (req_stream == 0) {
+        var fr = readFrameBounded(&srv, peer_fd, a, canned_server_read_timeout_ms) catch return state.finish(.headers_read_failed);
+        if (fr.typ == .headers) req_stream = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+    }
+    const block = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/event-stream" },
+    }) catch return state.finish(.response_write_failed);
+    defer a.free(block);
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, block) catch return state.finish(.response_write_failed);
+
+    while (true) {
+        var fr = readFrameBounded(&srv, peer_fd, a, canned_server_read_timeout_ms) catch return state.finish(.rst_read_failed);
+        const is_rst = fr.typ == .rst_stream and fr.stream_id == req_stream;
+        const id = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+        if (is_rst) return state.noteRst(@intCast(id));
+    }
+}
+
+test "interruptible streaming body waits leave a quiet H2 connection healthy" {
+    const fds = try makeSocketpair();
+    var server_state = CannedServerState{};
+    const server = try std.Thread.spawn(.{}, cannedIdleStreamingServer, .{ fds[1], &server_state });
+
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2_000, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
+    const stream = try conn.requestStreaming(.{ .method = "GET", .authority = "idle.test", .path = "/events" });
+    var buf: [16]u8 = undefined;
+    try testing.expectError(error.Http2ReadWaitElapsed, conn.readStreamingBodyInterruptible(stream, buf[0..], 10));
+    try testing.expect(conn.healthy());
+
+    const stream_id: u32 = stream.id;
+    conn.finishStreaming(stream);
+    try server_state.expectTerminal(.saw_rst);
+    try testing.expect(conn.healthy());
+
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+    try testing.expectEqual(stream_id, server_state.rst_stream_id.load(.acquire));
+}
 
 /// Read budget for the canned server helpers below.
 ///

@@ -500,7 +500,15 @@ pub fn http3ListenerConfigChanged(
         // connection at creation.
         current.http3_ecn_enabled != proposed.http3_ecn_enabled or
         !std.mem.eql(u8, current.http3_qlog_dir, proposed.http3_qlog_dir) or
-        !std.mem.eql(u8, current.http3_keylog_path, proposed.http3_keylog_path);
+        !std.mem.eql(u8, current.http3_keylog_path, proposed.http3_keylog_path) or
+        // #763: the QUIC runtime snapshots the client-auth mode at startup,
+        // whereas H1/H2 recompute it per connection. Letting the mode change
+        // in place would leave H3 enforcing a stale policy (optional->required
+        // would fail open), so while H3 is active it is restart-owned. The CA
+        // bundle and depth stay hot-reloadable via the shared trust store.
+        ((current.http3_enabled or proposed.http3_enabled) and
+            (current.tls_client_verify != proposed.tls_client_verify or
+                current.tls_client_verify_optional != proposed.tls_client_verify_optional));
 }
 
 pub fn listenerShardConfigChanged(
@@ -621,6 +629,45 @@ test "http3ListenerConfigChanged permits advertisement-only reloads" {
     // connection's marking decision was made when it was created.
     proposed.http3_ecn_enabled = !base.http3_ecn_enabled;
     try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+}
+
+test "http3ListenerConfigChanged makes client-auth mode restart-owned but CA/depth rotation reloadable (#763)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+    base.http3_enabled = true;
+    proposed.http3_enabled = true;
+
+    // optional -> required
+    base.tls_client_verify = true;
+    base.tls_client_verify_optional = true;
+    proposed.tls_client_verify = true;
+    proposed.tls_client_verify_optional = false;
+    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+    // required -> optional
+    try std.testing.expect(http3ListenerConfigChanged(&proposed, &base));
+    // enabled -> disabled, and disabled -> enabled
+    proposed.tls_client_verify = false;
+    proposed.tls_client_verify_optional = base.tls_client_verify_optional;
+    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+    try std.testing.expect(http3ListenerConfigChanged(&proposed, &base));
+
+    // CA bundle and depth rotation stay hot-reloadable.
+    proposed.tls_client_verify = true;
+    // Borrow a literal, restoring the owned slice before `deinit` frees it.
+    const owned_ca_path = proposed.tls_client_ca_path;
+    defer proposed.tls_client_ca_path = owned_ca_path;
+    proposed.tls_client_ca_path = "/etc/tardigrade/other-ca.pem";
+    proposed.tls_client_verify_depth = base.tls_client_verify_depth + 1;
+    try std.testing.expect(!http3ListenerConfigChanged(&base, &proposed));
+
+    // With H3 off on both sides the mode remains freely reloadable.
+    base.http3_enabled = false;
+    proposed.http3_enabled = false;
+    proposed.tls_client_verify_optional = !base.tls_client_verify_optional;
+    try std.testing.expect(!http3ListenerConfigChanged(&base, &proposed));
 }
 
 test "listenerShardConfigChanged requires restart for listener topology changes" {

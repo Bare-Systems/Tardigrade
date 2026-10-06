@@ -32,7 +32,9 @@ All notable user-facing changes to Tardigrade are documented here.
   by real-UDP runtime tests, fuzz targets for client-certificate chains and
   identity rendering, and an external-client (aioquic) interop run
   (`scripts/interop/run-h3-mtls-interop.sh`). The former config-validation
-  rejection of this combination is removed.
+  rejection of this combination is removed. While HTTP/3 is enabled, changing
+  the client-auth mode (`_CLIENT_VERIFY`/`_OPTIONAL`) requires a restart and a
+  reload attempting it is rejected; CA bundle and depth still reload in place.
 
 - **HTTP/1 SSE responses now enforce the shared long-lived response lifecycle
   (#842).** The streaming relay identifies `text/event-stream` from response

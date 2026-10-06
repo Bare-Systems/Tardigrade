@@ -1192,7 +1192,11 @@ one atomic generation: a bundle that fails to load rejects the whole reload
 and the serving trust set keeps verifying, and a handshake already in flight
 finishes against the generation it started with. Enabling
 `TARDIGRADE_TLS_CLIENT_VERIFY` on a process that started without it requires a
-restart. Revocation (CRL/OCSP) is not consulted: remove a revoked CA or issue
+restart. While HTTP/3 is enabled, changing `TARDIGRADE_TLS_CLIENT_VERIFY` or
+`TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL` (required, optional, off) is likewise
+restart-owned and a SIGHUP that attempts it is rejected, because the QUIC
+runtime fixes the mode at startup; CA-bundle and depth changes remain
+hot-reloadable. Revocation (CRL/OCSP) is not consulted: remove a revoked CA or issue
 short-lived client certificates; the validator's revocation seam stays
 disabled until runtime OCSP/CRL support exists.
 

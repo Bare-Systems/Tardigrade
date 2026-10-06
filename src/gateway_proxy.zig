@@ -2420,6 +2420,7 @@ test "quiet http2 SSE client close releases its lifecycle slot (#850 review)" {
     state.metrics_mutex = .{};
     state.metrics = http.metrics.Metrics.init();
     state.response_stream_lifecycle = .{};
+    state.response_stream_shutdown_deadline_ms = .init(0);
     var location = http.location_router.LocationBlock{
         .match_type = .exact,
         .pattern = "/events",
@@ -2445,6 +2446,51 @@ test "quiet http2 SSE client close releases its lifecycle slot (#850 review)" {
     try std.testing.expectEqual(
         @as(u64, 1),
         state.metrics.response_stream_closes_total[@intFromEnum(http.response_stream_lifecycle.CloseReason.client)],
+    );
+}
+
+test "tracked HTTP response stream observes a published shutdown deadline" {
+    var cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.access_control_rules = "";
+    cfg.proxy_response_stream_max_active = 1;
+    var config_store = try gs.ReloadableConfigStore.initBorrowed(std.testing.allocator, &cfg);
+    defer config_store.deinit();
+    var config_lease = config_store.acquire();
+    defer config_lease.release();
+
+    var state: gs.GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.response_stream_lifecycle = .{};
+    state.response_stream_shutdown_deadline_ms = .init(0);
+    var location = http.location_router.LocationBlock{
+        .match_type = .exact,
+        .pattern = "/events",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "" } },
+    };
+    const opened_at_ms: u64 = 100;
+    const admission = state.tryAcquireResponseStream(&config_lease, &location, opened_at_ms).?;
+    var tracked = TrackedResponseStream{
+        .state = &state,
+        .admission = admission,
+        .downstream = .{},
+    };
+
+    // Publication is process-owned and absolute; observing it must neither
+    // derive a deadline from this admission nor move it later.
+    state.publishResponseStreamShutdownDeadline(125);
+    try tracked.stopError(124);
+    try std.testing.expectEqual(@as(u32, 1), tracked.pollWaitMs(124, 10_000));
+    try std.testing.expectError(error.ResponseStreamShutdown, tracked.stopError(125));
+
+    tracked.finish(.shutdown);
+    tracked.finish(.shutdown); // lifecycle cleanup remains exactly-once
+    try std.testing.expectEqual(@as(u32, 0), state.response_stream_lifecycle.activeCount());
+    try std.testing.expectEqual(@as(u64, 0), state.metrics.response_streams_active);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        state.metrics.response_stream_closes_total[@intFromEnum(http.response_stream_lifecycle.CloseReason.shutdown)],
     );
 }
 
@@ -3171,12 +3217,18 @@ const TrackedResponseStream = struct {
         if (self.admission.reloadDeadlineMs()) |deadline_ms| {
             if (now_ms >= deadline_ms) return error.ResponseStreamReload;
         }
+        if (self.state.responseStreamShutdownDeadlineMs()) |deadline_ms| {
+            if (now_ms >= deadline_ms) return error.ResponseStreamShutdown;
+        }
     }
 
     fn pollWaitMs(self: *const TrackedResponseStream, now_ms: u64, existing_remaining_ms: ?u64) u32 {
         var wait_ms: u64 = response_stream_lifecycle_poll_slice_ms;
         if (existing_remaining_ms) |remaining| wait_ms = @min(wait_ms, @max(remaining, 1));
         if (self.admission.reloadDeadlineMs()) |deadline_ms| {
+            wait_ms = @min(wait_ms, @max(deadline_ms -| now_ms, 1));
+        }
+        if (self.state.responseStreamShutdownDeadlineMs()) |deadline_ms| {
             wait_ms = @min(wait_ms, @max(deadline_ms -| now_ms, 1));
         }
         return @intCast(@min(wait_ms, @as(u64, std.math.maxInt(u32))));

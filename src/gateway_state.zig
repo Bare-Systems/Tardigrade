@@ -537,6 +537,11 @@ pub const GatewayState = struct {
     /// Active long-lived streamed HTTP responses (#841). Admission uses the
     /// cap from the configuration generation being admitted.
     response_stream_lifecycle: http.response_stream_lifecycle.Lifecycle = .{},
+    /// Absolute graceful-shutdown deadline for admitted response streams.
+    /// Zero means shutdown orchestration has not published one yet. The
+    /// shutdown owner publishes this once from its startup-owned policy;
+    /// relays only observe it.
+    response_stream_shutdown_deadline_ms: std.atomic.Value(u64) = .init(0),
     /// Tunnel cap used when `proxy_websocket_max_tunnels` is 0: derived from
     /// the descriptor limit (#818). Set once at startup.
     websocket_default_max_tunnels: u32 = 0,
@@ -892,6 +897,22 @@ pub const GatewayState = struct {
         const duration_ms = now_ms -| admission.opened_at_ms;
         admission.release();
         self.metricsRecordResponseStreamClosed(reason, duration_ms);
+    }
+
+    /// Read the process-wide, absolute shutdown deadline for response-stream
+    /// relays. It is deliberately nullable so starting a stream never creates
+    /// a deadline from a request's configuration generation.
+    pub fn responseStreamShutdownDeadlineMs(self: *const GatewayState) ?u64 {
+        const deadline_ms = self.response_stream_shutdown_deadline_ms.load(.acquire);
+        return if (deadline_ms == 0) null else deadline_ms;
+    }
+
+    /// Publish the absolute shutdown deadline established by the process
+    /// shutdown coordinator. Callers must provide a real monotonic deadline;
+    /// the relay layer never derives or extends it itself.
+    pub fn publishResponseStreamShutdownDeadline(self: *GatewayState, deadline_ms: u64) void {
+        std.debug.assert(deadline_ms != 0);
+        self.response_stream_shutdown_deadline_ms.store(deadline_ms, .release);
     }
 
     /// HOT PATH: taken once per request when rate limiting is enabled.

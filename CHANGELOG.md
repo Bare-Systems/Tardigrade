@@ -10,10 +10,10 @@ All notable user-facing changes to Tardigrade are documented here.
   (#843).** Decoded HTTP/2 response headers are classified before downstream
   commitment, so a full shared stream cap returns a pre-commit 503 while a
   healthy multiplexed sibling remains usable. Admitted streams retain their
-  configuration generation, are interruptible at reload and shutdown drain
-  deadlines without weakening the normal upstream response deadline, reset
-  only their own HTTP/2 stream on lifecycle closure, and release all queue and
-  relay-buffer accounting exactly once.
+  configuration generation, are interruptible at reload and process-published
+  shutdown drain deadlines without weakening the normal upstream response
+  deadline, reset only their own HTTP/2 stream on lifecycle closure, and
+  release all queue and relay-buffer accounting exactly once.
 
 - **HTTP/1 SSE responses now enforce the shared long-lived response lifecycle
   (#842).** The streaming relay identifies `text/event-stream` from response

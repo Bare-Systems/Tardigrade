@@ -116,7 +116,7 @@ jobs:
             --output-dir "$RUNNER_TEMP/release-artifacts"
 
       - name: Setup PR expected version
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'workflow_dispatch' || inputs.mode == 'full'
         run: echo "EXPECTED_VERSION=0.0.0-ci-smoke" >> "$GITHUB_ENV"
 
       - name: Resolve published release identity

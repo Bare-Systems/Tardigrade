@@ -71,7 +71,8 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ github.event.workflow_run.id }}
 
-      - name: Require a release-promotion full CI run
+      - name: Validate selected CI decision
+        id: ci_decision
         if: github.event_name == 'workflow_run'
         env:
           RELEASE_SHA: ${{ steps.release_target.outputs.sha }}
@@ -90,13 +91,15 @@ jobs:
           test -n "${base:-}" && git rev-parse --verify "$base^{commit}" >/dev/null
           test "${head:-}" = "$RELEASE_SHA"
           test "$head" = "$WORKFLOW_RUN_SHA"
-          test "$mode" = full || {
-            echo "automatic release requires a changelog-promotion full CI run (got $mode)" >&2
-            exit 1
-          }
+          case "$mode" in
+            smoke | full) ;;
+            *) echo "invalid CI decision mode: ${mode:-missing}" >&2; exit 1 ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
       - name: Determine release metadata
         id: meta
+        if: github.event_name == 'workflow_dispatch' || steps.ci_decision.outputs.mode == 'full'
         shell: bash
         run: |
           set -euo pipefail
@@ -121,11 +124,13 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
+        if: github.event_name == 'workflow_dispatch' || steps.ci_decision.outputs.mode == 'full'
         run: |
           mkdir -p "$RUNNER_TEMP/release-notes"
           ./scripts/release-metadata.sh notes > "$RUNNER_TEMP/release-notes/release-notes.md"
 
       - name: Upload release notes
+        if: github.event_name == 'workflow_dispatch' || steps.ci_decision.outputs.mode == 'full'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-notes

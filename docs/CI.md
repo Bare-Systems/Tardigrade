@@ -60,9 +60,10 @@ their success is required by `CI result`. Those workflows retain their PR path
 filters and manual dispatches for focused standalone runs. Scheduled and
 manual-only workflows (`h3-benchmark`, `pki-differential`, `resumption-soak`,
 `rtt-streaming-regression`, `tls-conformance-full`, `public-homebrew-smoke`,
-`scorecard`, `release`) are unchanged. `release.yml` auto-promotes only a
-successful **push-originated** full CI release promotion on `main`; a manual
-smoke CI run cannot publish artifacts.
+`scorecard`) are unchanged. Separately, `release.yml` validates the recorded
+CI decision and auto-promotes only a successful **push-originated** full CI
+release promotion on `main`; a valid smoke decision cleanly skips publication,
+and a manual smoke CI run cannot publish artifacts.
 
 ## Required check
 

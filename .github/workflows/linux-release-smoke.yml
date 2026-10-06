@@ -1,10 +1,19 @@
 name: Linux Release Smoke
 
 on:
+  workflow_call:
+    inputs:
+      mode:
+        description: Validation mode supplied by ci.yml
+        required: true
+        type: string
   pull_request:
     paths:
       - ".github/workflows/linux-release-smoke.yml"
       - ".github/workflows/release.yml"
+      - "CHANGELOG.md"
+      - ".github/actions/ci-mode/**"
+      - "scripts/ci-mode.sh"
       - "build.zig"
       - "build.zig.zon"
       - "src/**"
@@ -45,9 +54,9 @@ jobs:
 
       - name: Detect mode
         id: mode
-        uses: ./.github/actions/ci-mode
+        uses: $/.github/actions/ci-mode
         with:
-          override: ${{ github.event_name == 'pull_request' && 'auto' || 'full' }}
+          override: ${{ inputs.mode || (github.event_name == 'pull_request' && 'auto' || 'full') }}
 
   linux-release-smoke:
     name: Linux release smoke (${{ matrix.distro }})
@@ -73,22 +82,22 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'workflow_dispatch'
         run: sh ./scripts/install-zig.sh 0.16.0
 
       - name: Print Zig version
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'workflow_dispatch'
         run: zig version
 
       - name: Build native release binary
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'workflow_dispatch'
         env:
           ZIG_TARGET: ${{ matrix.zig_target }}
         run: |
           zig build -Doptimize=ReleaseFast -Dcpu=baseline "-Dtarget=$ZIG_TARGET" -Dversion=0.0.0-ci-smoke
 
       - name: Audit native release binary linkage
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'workflow_dispatch'
         run: |
           ./scripts/audit-release-binary.sh \
             --binary zig-out/bin/tardi \
@@ -96,7 +105,7 @@ jobs:
             --output "$RUNNER_TEMP/dependency-inventory-${{ matrix.archive_name }}.json"
 
       - name: Package artifact
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'workflow_dispatch'
         env:
           ARCHIVE_NAME: ${{ matrix.archive_name }}
         run: |

@@ -1,10 +1,19 @@
 name: Darwin Release Smoke
 
 on:
+  workflow_call:
+    inputs:
+      mode:
+        description: Validation mode supplied by ci.yml
+        required: true
+        type: string
   pull_request:
     paths:
       - ".github/workflows/darwin-release-smoke.yml"
       - ".github/workflows/release.yml"
+      - "CHANGELOG.md"
+      - ".github/actions/ci-mode/**"
+      - "scripts/ci-mode.sh"
       - "build.zig"
       - "build.zig.zon"
       - "src/**"
@@ -42,9 +51,9 @@ jobs:
 
       - name: Detect mode
         id: mode
-        uses: ./.github/actions/ci-mode
+        uses: $/.github/actions/ci-mode
         with:
-          override: ${{ github.event_name == 'pull_request' && 'auto' || 'full' }}
+          override: ${{ inputs.mode || (github.event_name == 'pull_request' && 'auto' || 'full') }}
 
   darwin-release-smoke:
     name: Darwin release smoke (${{ matrix.os }})

@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # Single stable required-check logic for .github/workflows/ci.yml (#806).
 #
-#   scripts/ci-gate.sh <smoke|full> <needs.json>
+#   scripts/ci-gate.sh <smoke|full> <needs.json> [event-name]
 #
 # <needs.json> is the `toJSON(needs)` object of the gate job. Job ids listed
 # in SMOKE_JOBS must have succeeded in either mode; FULL_JOBS must have
 # succeeded in `full` mode and are ignored (they are skipped) in `smoke`.
 # OPTIONAL_JOBS may be `skipped` (event-dependent) but never failed/cancelled.
+# PR_JOBS must succeed on pull_request events.
 # Exit 0 = pass, 1 = fail.
 set -euo pipefail
 
 SMOKE_JOBS="${SMOKE_JOBS:-}"
 FULL_JOBS="${FULL_JOBS:-}"
 OPTIONAL_JOBS="${OPTIONAL_JOBS:-}"
+PR_JOBS="${PR_JOBS:-}"
 
 mode="${1:-}"
 needs_file="${2:-}"
+event_name="${3:-}"
 case "$mode" in smoke | full) ;; *)
   echo "ci-gate: mode must be smoke or full (got '$mode')" >&2
   exit 1
@@ -39,6 +42,9 @@ check() {
 
 for j in $SMOKE_JOBS; do check "$j" "success"; done
 for j in $OPTIONAL_JOBS; do check "$j" "success skipped"; done
+if [ "$event_name" = "pull_request" ]; then
+  for j in $PR_JOBS; do check "$j" "success"; done
+fi
 if [ "$mode" = "full" ]; then
   for j in $FULL_JOBS; do check "$j" "success"; done
 else

@@ -7,24 +7,27 @@ Use this checklist before tagging and distributing a Tardigrade release.
 Use the existing commands and workflows in this section; do not add duplicate
 release gates for the same evidence.
 
-### Required Per PR
+### Required For Every PR (Smoke)
 
 - `zig fmt --check build.zig src/ tests/`
 - `zig build test --summary all --error-style verbose`
 - `zig build test-security-corpus --summary all --error-style verbose` on the
   Ubuntu unit-test leg
-- `zig build test-integration -Dtls-profile=appliance --summary all
-  --error-style verbose` on the Linux appliance-profile legs
-- CI packaging smokes: `./scripts/test-install.sh`,
-  `./scripts/test-deb-package.sh`, `./scripts/test-rpm-package.sh`,
-  `./scripts/test-docker-image.sh`, and generated/local Homebrew formula
-  smoke through `./scripts/test-homebrew-formula.sh`
-- Reduced TLS conformance in `ci.yml`: `scripts/interop/run-tls-interop.sh
-  --profile ci`
 - Deterministic lifecycle/reload/resource regressions already wired through
   unit, integration, native TLS reuse, resumption/restart, and release-sweep
   harness owners. Keep longer torture or soak runs manual unless the owning
   workflow documents a scheduled cadence.
+
+### Required For Release Promotion (Full)
+
+- `zig build test-integration -Dtls-profile=appliance --summary all
+  --error-style verbose` on every configured appliance-profile OS leg.
+- CI packaging smokes: `./scripts/test-install.sh`,
+  `./scripts/test-deb-package.sh`, `./scripts/test-rpm-package.sh`,
+  `./scripts/test-docker-image.sh`, and generated/local Homebrew formula
+  smoke through `./scripts/test-homebrew-formula.sh`.
+- Reduced TLS conformance in `ci.yml`: `scripts/interop/run-tls-interop.sh
+  --profile ci`, Linux/Darwin release-smoke, and the native TLS reuse soak.
 
 ### Required On Main
 
@@ -33,9 +36,10 @@ release gates for the same evidence.
   `CI result` check in branch protection.
 - The unprofiled Linux integration job (`zig build test-integration --summary
   all`) runs in both modes.
-- `.github/workflows/release.yml` is triggered after successful `main` CI or
-  by manual dispatch, and it skips publication if the selected tag already
-  exists for another commit.
+- `.github/workflows/release.yml` auto-promotes only a successful,
+  push-originated **full** CI run for a changelog release promotion on `main`.
+  Manual dispatch is separate and explicit; it skips publication if the
+  selected tag already exists for another commit.
 
 ### Required For Release Candidate
 

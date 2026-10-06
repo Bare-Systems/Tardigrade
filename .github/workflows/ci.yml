@@ -47,9 +47,35 @@ jobs:
 
       - name: Detect mode
         id: mode
-        uses: ./.github/actions/ci-mode
+        uses: $/.github/actions/ci-mode
         with:
           override: ${{ inputs.mode || 'auto' }}
+
+  # These full-only suites are also independently dispatchable workflows, but
+  # are called here so their results are part of the stable required check.
+  linux-release-smoke:
+    name: Linux release smoke
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
+    uses: $/.github/workflows/linux-release-smoke.yml
+    with:
+      mode: full
+
+  darwin-release-smoke:
+    name: Darwin release smoke
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
+    uses: $/.github/workflows/darwin-release-smoke.yml
+    with:
+      mode: full
+
+  native-tls-reuse-soak:
+    name: Native TLS reuse soak
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
+    uses: $/.github/workflows/native-tls-reuse-soak.yml
+    with:
+      mode: full
 
   # ── Format ────────────────────────────────────────────────────────────────────
   # Fast source formatting check. Required on every PR and push.
@@ -1055,6 +1081,9 @@ jobs:
       - h3-resumption-interop
       - tls-conformance-matrix
       - integration-test
+      - linux-release-smoke
+      - darwin-release-smoke
+      - native-tls-reuse-soak
 
     steps:
       - name: Checkout
@@ -1069,12 +1098,14 @@ jobs:
           SMOKE_JOBS: >-
             mode format lint dependency-audit test test-general-native-tls
             examples security integration-test
-          # Skipped by design on workflow_dispatch (pull_request-only job).
+          # Dependency review is required on PRs and skipped by design elsewhere.
           OPTIONAL_JOBS: dependency-review
+          PR_JOBS: dependency-review
           FULL_JOBS: >-
             dependency-audit-darwin test-appliance pki-differential build
             packaging-smoke homebrew-formula-smoke perf-smoke crypto-bench
-            h3-resumption-interop tls-conformance-matrix
+            h3-resumption-interop tls-conformance-matrix linux-release-smoke
+            darwin-release-smoke native-tls-reuse-soak
         run: |
           printf '%s' "$NEEDS" >"$RUNNER_TEMP/needs.json"
-          ./scripts/ci-gate.sh "$MODE" "$RUNNER_TEMP/needs.json"
+          ./scripts/ci-gate.sh "$MODE" "$RUNNER_TEMP/needs.json" "${{ github.event_name }}"

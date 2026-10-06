@@ -51,17 +51,18 @@ suite (`Integration tests`), example-config validation, and Security
 Debug/ReleaseSafe/ReleaseFast build matrix, macOS binary audit, PKI
 differential, packaging (DEB/RPM/Docker/install), Homebrew formula smoke,
 performance smoke, crypto benchmarks, H3 resumption/0-RTT peer interop, the
-TLS interop/conformance matrix, and the independent Linux/Darwin release-smoke
-workflows.
+TLS interop/conformance matrix, Linux/Darwin release-smoke, and the native TLS
+reuse soak.
 
-`linux-release-smoke.yml`, `darwin-release-smoke.yml` and
-`native-tls-reuse-soak.yml` also trigger on PRs; each starts with the same mode
-job and only runs its suite for `full` (or manual dispatch). Scheduled and
+`ci.yml` calls the substantive jobs from `linux-release-smoke.yml`,
+`darwin-release-smoke.yml`, and `native-tls-reuse-soak.yml` in full mode, so
+their success is required by `CI result`. Those workflows retain their PR path
+filters and manual dispatches for focused standalone runs. Scheduled and
 manual-only workflows (`h3-benchmark`, `pki-differential`, `resumption-soak`,
 `rtt-streaming-regression`, `tls-conformance-full`, `public-homebrew-smoke`,
-`scorecard`, `release`) are unchanged. `release.yml` still runs after a
-successful `CI` run on `main`, so a release promotion only ships after the
-**full** gate passed on the promotion commit.
+`scorecard`, `release`) are unchanged. `release.yml` auto-promotes only a
+successful **push-originated** full CI release promotion on `main`; a manual
+smoke CI run cannot publish artifacts.
 
 ## Required check
 
@@ -86,7 +87,8 @@ gh workflow run ci.yml --ref <branch> -f mode=smoke
 gh workflow run ci.yml --ref <branch> -f mode=auto
 ```
 
-Obsolete runs of the same ref are cancelled (`cancel-in-progress`).
+The full dispatch calls every full suite listed above. Obsolete runs of the
+same ref are cancelled (`cancel-in-progress`).
 
 ## Cost comparison (PR touching `src/`)
 

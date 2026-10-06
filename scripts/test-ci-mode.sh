@@ -62,11 +62,26 @@ expect "new release, empty [Unreleased] retained" full --base "$base" --head "$h
 
 # promotion with a prerelease suffix
 write_changelog "" 0.8.0-rc.1 0.7.3 0.7.2; head=$(commit promote-rc)
-expect "new prerelease heading" full --base "$base" --head "$head"
+expect "new prerelease heading is rejected" error --base "$base" --head "$head"
+
+# A release-like heading must exactly match release-metadata.sh's stable
+# X.Y.Z contract, including the separator before its date/description.
+write_changelog "" 0.8.0 0.7.3 0.7.2
+sed -i.bak 's/^## \[0.8.0\] - /## [0.8.0] /' "$repo/CHANGELOG.md"; rm -f "$repo/CHANGELOG.md.bak"
+head=$(commit malformed-release)
+expect "malformed numbered release heading is rejected" error --base "$base" --head "$head"
+
+# Keep a >256 KiB fixture to prevent a regression where `git show | grep -q`
+# returned SIGPIPE under pipefail after an early valid heading.
+large_body=$(head -c 300000 /dev/zero | tr '\0' x)
+write_changelog "$large_body" 0.7.2 0.7.3; head=$(commit large-smoke)
+expect "large changelog with existing releases stays smoke" smoke --base "$base" --head "$head"
+write_changelog "$large_body" 0.7.4 0.7.3 0.7.2; head=$(commit large-full)
+expect "large changelog with new release selects full" full --base "$base" --head "$head"
 
 # promotion by push-style before/after (base is the immediately preceding commit)
-write_changelog "" 0.7.4 0.7.3 0.7.2; prev=$(commit promote-again 2>/dev/null || git -C "$repo" rev-parse HEAD)
-write_changelog "- later fix" 0.7.4 0.7.3 0.7.2; after=$(commit later)
+write_changelog "" 0.7.5 0.7.3 0.7.2; prev=$(commit promote-again)
+write_changelog "- later fix" 0.7.5 0.7.3 0.7.2; after=$(commit later)
 expect "push after promotion (release already in before)" smoke --base "$prev" --head "$after"
 
 # merge-base semantics: main advanced with a release, the PR branch did not
@@ -91,6 +106,8 @@ git -C "$repo" rm -q CHANGELOG.md; nochange=$(commit rm-changelog)
 expect "missing changelog at head" error --base "$base" --head "$nochange"
 printf 'not a changelog\n' >"$repo/CHANGELOG.md"; junk=$(commit junk-changelog)
 expect "changelog without headings" error --base "$base" --head "$junk"
+write_changelog "" 0.7.4 0.7.3; valid_after_junk=$(commit valid-after-junk)
+expect "heading-less changelog at base" error --base "$junk" --head "$valid_after_junk"
 expect "unknown argument" error --frobnicate
 git -C "$repo" checkout -q -b nochange-line "$nochange"
 write_changelog "" 0.7.4 0.7.3; restored=$(commit restore-changelog)
@@ -98,7 +115,7 @@ expect "missing changelog at base" error --base "$nochange" --head "$restored"
 
 # ── ci-gate.sh ──
 needs() { printf '%s' "$1" >"$work/needs.json"; }
-gate() { SMOKE_JOBS="format test" FULL_JOBS="build perf" OPTIONAL_JOBS="depreview" "$gate_sh" "$@" >"$work/gate.out" 2>&1; }
+gate() { SMOKE_JOBS="format test" FULL_JOBS="build perf" OPTIONAL_JOBS="depreview" PR_JOBS="depreview" "$gate_sh" "$@" >"$work/gate.out" 2>&1; }
 expect_gate() { # name want(0|1) mode json
   local rc=0; needs "$4"; gate "$3" "$work/needs.json" || rc=$?
   if [ "$rc" -eq "$2" ]; then ok "$1"; else bad "$1" "rc=$rc want=$2: $(cat "$work/gate.out")"; fi
@@ -113,6 +130,12 @@ expect_gate "gate fails on cancelled smoke job" 1 smoke "{\"format\":{\"result\"
 expect_gate "gate fails on a missing job" 1 smoke "{\"format\":{\"result\":\"success\"},\"depreview\":{\"result\":\"skipped\"}}"
 expect_gate "gate fails when optional job fails" 1 smoke "{\"format\":{\"result\":\"success\"},\"test\":{\"result\":\"success\"},\"depreview\":{\"result\":\"failure\"}}"
 expect_gate "gate rejects invalid mode" 1 medium "{$S}"
+needs "{$S,\"build\":{\"result\":\"skipped\"},\"perf\":{\"result\":\"skipped\"}}"
+if gate smoke "$work/needs.json" pull_request; then
+  bad "gate rejects skipped dependency review on PR" "unexpected success"
+else
+  ok "gate rejects skipped dependency review on PR"
+fi
 
 echo "ci-mode tests: $pass passed, $failed failed"
 [ "$failed" -eq 0 ]

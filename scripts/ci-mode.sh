@@ -9,8 +9,10 @@
 # (callers must treat that as a failed run, never as a silent `smoke`).
 #
 # Rule (override=auto): the mode is `full` iff the changelog at <head>
-# contains a numbered release heading (`## [X.Y.Z]`, optional -prerelease)
-# that is absent from the changelog at the merge base of <base> and <head>.
+# contains a numbered release heading (`## [X.Y.Z] - ...`) that is absent from
+# the changelog at the merge base of <base> and <head>. This deliberately
+# matches scripts/release-metadata.sh; prerelease and malformed headings are
+# rejected instead of selecting a release which that script cannot publish.
 # Edits under `## [Unreleased]`, pre-existing release sections and a retained
 # empty `[Unreleased]` heading never select `full`. `--override smoke|full`
 # returns that mode without reading git or the changelog.
@@ -65,25 +67,45 @@ head_sha=$(git rev-parse --verify --quiet "$head^{commit}") ||
 merge_base=$(git merge-base "$base_sha" "$head_sha") ||
   die "no merge base between '$base' and '$head' (shallow checkout? use fetch-depth: 0)"
 
-# Numbered release headings, one version per line, sorted and unique.
-release_versions() {
+# Read each changelog exactly once. In particular, do not use `git show | grep
+# -q`: grep may exit after a matching early heading and make git fail with
+# SIGPIPE under pipefail when CHANGELOG.md is large.
+read_changelog() {
   local rev="$1" content
   content=$(git show "$rev:$changelog" 2>/dev/null) ||
     die "cannot read $changelog at $rev"
   [ -n "$content" ] || die "$changelog at $rev is empty"
+  printf '%s\n' "$content"
+}
+
+validate_changelog() {
+  local rev="$1" content="$2" invalid
+  if ! grep -Eq '^## \[Unreleased\]$|^## \[[0-9]+\.[0-9]+\.[0-9]+\] - ' <<<"$content"; then
+    die "$changelog at $rev has no [Unreleased] or valid numbered release heading"
+  fi
+
+  # Keep this contract in lockstep with release-metadata.sh. A heading that
+  # starts like a release but is not a plain X.Y.Z heading with ` - ` is not a
+  # release candidate this repository can safely publish.
+  invalid=$(printf '%s\n' "$content" | sed -n -E \
+    '/^## \[[0-9]+\.[0-9]+\.[0-9]+/ { /^## \[[0-9]+\.[0-9]+\.[0-9]+\] - /!p; }')
+  [ -z "$invalid" ] || die "$changelog at $rev has unsupported release heading: $invalid"
+}
+
+# Numbered release headings, one version per line, sorted and unique.
+release_versions() {
+  local content="$1"
   printf '%s\n' "$content" |
-    sed -n -E 's/^## \[([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)\].*/\1/p' |
+    sed -n -E 's/^## \[([0-9]+\.[0-9]+\.[0-9]+)\] - .*/\1/p' |
     sort -u
 }
 
-base_versions=$(release_versions "$merge_base")
-head_versions=$(release_versions "$head_sha")
-
-# The changelog must at least keep its Unreleased heading or a numbered
-# release; anything else is ambiguous input.
-if ! git show "$head_sha:$changelog" | grep -Eq '^## \[(Unreleased|[0-9]+\.[0-9]+\.[0-9]+)'; then
-  die "$changelog at $head has no '## [Unreleased]' or numbered release heading"
-fi
+base_content=$(read_changelog "$merge_base")
+head_content=$(read_changelog "$head_sha")
+validate_changelog "$merge_base" "$base_content"
+validate_changelog "$head_sha" "$head_content"
+base_versions=$(release_versions "$base_content")
+head_versions=$(release_versions "$head_content")
 
 new_versions=$(comm -13 <(printf '%s\n' "$base_versions") <(printf '%s\n' "$head_versions") | sed '/^$/d')
 

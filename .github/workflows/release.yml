@@ -16,14 +16,16 @@ concurrency:
 
 jobs:
   # ── Prepare release ─────────────────────────────────────────────────────────
-  # Skipped if triggered by workflow_run and CI did not succeed, ensuring
-  # releases are never cut from a failing main.
+  # Automatic publication is limited to a successful push-originated CI run on
+  # main. A manually dispatched smoke CI run must never satisfy this gate.
+  # Manual release dispatch remains an explicit operator action.
   prepare-release:
     name: Prepare release
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
 
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -58,6 +60,19 @@ jobs:
 
       - name: Fetch tags
         run: git fetch --force --tags origin
+
+      - name: Require a release-promotion full CI run
+        if: github.event_name == 'workflow_run'
+        env:
+          RELEASE_SHA: ${{ steps.release_target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          previous_main_sha="$(git rev-parse "$RELEASE_SHA^")"
+          mode="$(./scripts/ci-mode.sh --base "$previous_main_sha" --head "$RELEASE_SHA")"
+          test "$mode" = full || {
+            echo "automatic release requires a changelog-promotion full CI run (got $mode)" >&2
+            exit 1
+          }
 
       - name: Determine release metadata
         id: meta

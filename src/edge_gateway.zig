@@ -1007,6 +1007,12 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         break :blk state.active_connections_total;
     };
     state.logger.info(null, "Shutdown requested; draining active connection work (timeout={}ms active_connections={d})", .{ cfg.shutdown_drain_timeout_ms, active_at_drain_start });
+    // Publish the one authoritative, startup-policy deadline before workers
+    // begin draining. Long-lived response relays only observe this absolute
+    // boundary; they never derive a later deadline from a request generation.
+    const shutdown_started_ms = http.event_loop.monotonicMs();
+    const response_stream_shutdown_deadline_ms = @max(shutdown_started_ms +| cfg.shutdown_drain_timeout_ms, 1);
+    state.publishResponseStreamShutdownDeadline(response_stream_shutdown_deadline_ms);
     const h3_deadline_us = http.http3_runtime.Runtime.nowUsPublic() + cfg.shutdown_drain_timeout_ms * std.time.us_per_ms;
     if (http3_runtime) |*runtime| {
         updateHttp3Advertisement(&state, cfg, runtime, .draining);

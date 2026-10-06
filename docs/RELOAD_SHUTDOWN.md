@@ -232,6 +232,12 @@ plus `proxy_response_stream_reload_timeout_ms`. Rejected reloads do not affect
 them, and later reloads never extend that deadline. Shutdown overrides
 `preserve`; every admitted response stream is actively closed at the configured
 shutdown-drain deadline, so a quiet peer cannot hold the worker pool forever.
+If a stream already has a reload-drain deadline, the earlier reload or shutdown
+deadline wins. A lifecycle close deliberately truncates the already-committed
+response (there is no synthetic terminating chunk), and the downstream
+connection is not reused. This applies to native-TLS HTTP/1.1 too: a peer's
+clean `close_notify` is recorded as a normal `client` close, while the gateway's
+own reload or shutdown close is recorded as `reload` or `shutdown`.
 Access logs record `response_stream_close_reason` (`reload` or `shutdown`) for
 these deliberate truncations; the matching Prometheus close-reason counter is
 incremented at the same time.

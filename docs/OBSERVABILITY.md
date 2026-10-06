@@ -52,8 +52,10 @@ logs are written through `src/http/logger.zig`.
   `admitted` and `capacity`, `tardigrade_response_stream_duration_seconds`,
   and `tardigrade_response_stream_closes_total{reason}` with the fixed reasons
   `client`, `upstream`, `timeout`, `reload`, `shutdown`, and `capacity`.
-  Paths, content types, request IDs, and application payload values are never
-  used as labels.
+  `capacity` is a pre-commit refusal rather than an admitted stream; the other
+  close reasons each end one admitted stream. A native-TLS `close_notify` from
+  the downstream peer is `client`. Paths, content types, request IDs, and
+  application payload values are never used as labels.
 - reverse-proxy buffered byte gauges/counters:
   `tardigrade_proxy_buffered_bytes_current` and
   `tardigrade_proxy_buffered_bytes_total`
@@ -574,7 +576,9 @@ Metrics (`/status/metrics`):
 
 The JSON access log includes `response_stream_close_reason` with `reload` or
 `shutdown` when Tardigrade deliberately truncates an already-committed
-long-lived response; it is empty for ordinary requests.
+long-lived response; it is empty for ordinary requests and client/upstream/
+timeout closures. Lifecycle-close metrics use fixed labels only, so the metric
+surface never exposes SSE event data or MCP/application semantics.
 
 A healthy reload increments `reload_attempts_total` and `reload_success_total`
 together; a rejected reload increments `reload_attempts_total` and

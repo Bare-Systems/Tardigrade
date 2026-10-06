@@ -211,8 +211,8 @@ return, rewrite, or static.
 | `proxy_websocket_reload` | enum | top-level value, else `preserve` | What a successful hot reload does to open tunnels: `preserve` keeps them under their admission configuration, `drain` closes them `proxy_websocket_reload_timeout_ms` after the reload. Also valid at top level. Requires `proxy_websocket on`. See [WebSocket proxying](#websocket-proxying-proxy_websocket). | `proxy_websocket_reload drain;` |
 | `proxy_websocket_reload_timeout_ms` | ms | top-level value, else `30000` | Drain window for `drain` tunnels, from the reload that superseded their configuration. Also valid at top level. Requires `proxy_websocket on`. | `proxy_websocket_reload_timeout_ms 10000;` |
 | `proxy_websocket_origins` | origins | any | Browser origins (`scheme://host[:port]`) allowed to open a WebSocket; others get 403 before the upstream is contacted. Handshakes without `Origin` are allowed. Requires `proxy_websocket on`. | `proxy_websocket_origins https://app.example.com;` |
-| `proxy_response_stream_reload` | enum | top-level value, else `preserve` | Per-location reload policy for admitted long-lived streamed HTTP responses: `preserve` or `drain`. Valid only with `proxy_pass`; the process-wide active-stream cap is not overridable per location. | `proxy_response_stream_reload drain;` |
-| `proxy_response_stream_reload_timeout_ms` | u32 ms | top-level value, else `30000` | Per-location drain window for `drain` response streams, measured from the first successful reload that supersedes their admission generation. Valid only with `proxy_pass`; `0` means drain immediately on reload. | `proxy_response_stream_reload_timeout_ms 10000;` |
+| `proxy_response_stream_reload` | enum | top-level value, else `preserve` | Per-location reload policy captured when an SSE response is admitted: `preserve` or `drain`. Valid only with `proxy_pass`; the process-wide active-stream cap is not overridable per location. Shutdown still closes every admitted stream at its drain deadline. | `proxy_response_stream_reload drain;` |
+| `proxy_response_stream_reload_timeout_ms` | u32 ms | top-level value, else `30000` | Per-location drain window for a `drain` response stream, measured from the first successful reload that supersedes its admission generation. Valid only with `proxy_pass`; `0` means drain immediately on reload. Later or rejected reloads do not extend or create the deadline. | `proxy_response_stream_reload_timeout_ms 10000;` |
 
 Parser-valid matcher examples:
 
@@ -979,8 +979,8 @@ inspect event or application payloads.
 
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
-| `TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE` | positive u32 | `256` | Process-wide maximum number of admitted long-lived response streams. Config directive: `proxy_response_stream_max_active`. This cap cannot be overridden per location. | `TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE=512` |
-| `TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD` | enum | `preserve` | Default policy for streams admitted by a configuration generation: `preserve` or `drain`. A location's `proxy_response_stream_reload` overrides it. Config directive: `proxy_response_stream_reload`. | `TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD=drain` |
+| `TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE` | positive u32 | `256` | Process-wide maximum number of admitted long-lived response streams. Config directive: `proxy_response_stream_max_active`. This cap cannot be overridden per location. An over-cap SSE response receives `503 response_stream_capacity`; lowering the cap below the active count blocks new admissions until streams close. | `TARDIGRADE_PROXY_RESPONSE_STREAM_MAX_ACTIVE=512` |
+| `TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD` | enum | `preserve` | Default policy captured for streams admitted by a configuration generation: `preserve` or `drain`. A location's `proxy_response_stream_reload` overrides it. Config directive: `proxy_response_stream_reload`. Shutdown has precedence over `preserve`. | `TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD=drain` |
 | `TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD_TIMEOUT_MS` | u32 ms | `30000` | Default window after the first successful superseding reload before a `drain` stream is due to close. `0` means immediately. A location's `proxy_response_stream_reload_timeout_ms` overrides it. Config directive: `proxy_response_stream_reload_timeout_ms`. | `TARDIGRADE_PROXY_RESPONSE_STREAM_RELOAD_TIMEOUT_MS=10000` |
 
 Only an absent setting takes its default. Empty strings, values containing
@@ -993,7 +993,11 @@ from the admission generation; a later reload cannot change or extend them.
 Server-sent events need no special setting: proxy them as a streamed response
 (`proxy_streaming response;` on the location, or
 `TARDIGRADE_PROXY_STREAMING_MODE=response`). See
-[PROXY_STREAMING.md](PROXY_STREAMING.md#server-sent-events).
+[PROXY_STREAMING.md](PROXY_STREAMING.md#server-sent-events). The relay classifies
+only the final `Content-Type: text/event-stream` response header before it
+commits the downstream head; it does not inspect SSE or MCP payload semantics.
+The lifecycle-controlled downstream surface is HTTP/1.1, including native TLS;
+HTTP/1 and pooled HTTP/2 origins are supported.
 
 The older `TARDIGRADE_WEBSOCKET_ENABLED`, `TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS`,
 `TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE`, `TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS`

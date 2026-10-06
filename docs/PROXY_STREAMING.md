@@ -99,9 +99,8 @@ ALPN-negotiate.
 
 ## Server-sent events
 
-Server-sent events (`text/event-stream`) are an ordinary HTTP response that
-never ends on its own, so they are proxied by the response-streaming path
-rather than a dedicated feature. Enable it for the route:
+Server-sent events (`text/event-stream`) are ordinary HTTP response streams,
+not a dedicated realtime feature. Enable response streaming for the route:
 
 ```nginx
 location /events/ {
@@ -110,6 +109,13 @@ location /events/ {
 }
 ```
 
+- **Transport boundary.** Tardigrade relays generic HTTP response bytes; it
+  does not parse SSE fields (`event`, `data`, `id`, or comments) or any
+  application protocol carried in the response. The lifecycle controls classify
+  a final response solely from the `Content-Type` media type
+  `text/event-stream` (parameters are allowed), before its downstream head is
+  committed. MCP semantics, reconnection policy, and application-level
+  acknowledgement remain owned by the application.
 - **Prompt delivery.** Each chunk the origin sends is written to the client
   as it arrives; nothing waits for the end of the response. The response is
   re-chunked downstream, and `Content-Type`, `Cache-Control` and the origin's
@@ -123,26 +129,44 @@ location /events/ {
   bytes, so an origin that goes silent longer than that ends the stream.
   Origins that are legitimately quiet should send periodic comment lines
   (`: keep-alive`) more often than the timeout.
-- **Admission.** A final HTTP/1 response whose `Content-Type` media type is
-  `text/event-stream` is admitted before its downstream response head is
-  committed. Admission uses the process-wide
-  `proxy_response_stream_max_active` cap; an excess stream receives a complete
-  `503` response, and its upstream exchange and relay-buffer reservations are
-  released.
+- **Admission and capacity.** A final SSE response is admitted before its
+  downstream response head is committed. This works with HTTP/1 origins and
+  pooled HTTP/2 origins; the lifecycle-controlled downstream contract currently
+  applies to HTTP/1.1, including native-TLS HTTP/1.1. Admission uses the
+  process-wide `proxy_response_stream_max_active` cap (default `256`), not a
+  per-route share. An excess stream receives a complete `503` with code
+  `response_stream_capacity`; its upstream exchange and relay-buffer
+  reservations are released. Lowering the cap below the active count does not
+  interrupt admitted streams, but refuses new admissions until enough close.
 - **Close and reconnect.** When the origin ends the response, the client
   receives the terminating chunk and reconnects with `Last-Event-ID` on its
   own; Tardigrade forwards that header like any other. If the origin
   connection fails mid-stream, the client connection is closed without a
   terminating chunk, which EventSource clients also treat as a reason to
   reconnect.
-- **Reload.** Each admitted stream retains the configuration generation and
-  per-location lifecycle policy that admitted it. The default `preserve`
-  policy leaves it open across reloads; `drain` closes it without a terminal
-  chunk when the captured reload drain deadline expires. Response-read waits
-  are shortened to the earlier of the ordinary upstream timeout and that
-  reload deadline. Graceful-shutdown timing for admitted streams is tracked by
-  #844 and is not yet part of this relay contract. See
-  [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md).
+- **Finite lifecycle.** An admitted stream has one fixed close reason:
+  `client` (including a native-TLS `close_notify`), `upstream`, `timeout`,
+  `reload`, or `shutdown`. A capacity refusal is also counted as
+  `capacity`, but was never admitted. The first three preserve normal relay
+  semantics: a clean upstream end includes the terminating chunk, while a
+  client or upstream failure ends the committed response without one. The
+  latter two deliberately truncate the committed response without a terminal
+  chunk and make the downstream connection non-reusable.
+- **Reload and shutdown.** Each admitted stream retains the configuration
+  generation and per-location lifecycle policy that admitted it. The default
+  `preserve` policy leaves it open across successful reloads. `drain` closes
+  the stream at the deadline derived from the *first* successful reload that
+  supersedes its admission generation; rejected and later reloads cannot set or
+  extend that deadline. `proxy_response_stream_reload_timeout_ms 0` closes at
+  that reload. Graceful shutdown overrides `preserve` and closes every admitted
+  stream at the process shutdown-drain deadline; a stream already draining for
+  reload closes at whichever deadline is earlier. Response-read waits are
+  shortened to the earliest applicable lifecycle deadline, so quiet peers do
+  not defer enforcement. See [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md).
+
+The active/admission/duration/close-reason metrics and the access-log field for
+deliberate reload or shutdown truncation are documented in
+[OBSERVABILITY.md](OBSERVABILITY.md).
 
 ## Fallback reasons
 

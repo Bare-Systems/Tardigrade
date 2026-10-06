@@ -103,6 +103,12 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Changed
 
+- **CI now runs in two changelog-driven modes, smoke and full (#806)** — PRs
+  get a fast smoke run unless they add a numbered release heading to
+  `CHANGELOG.md`, which (like a push promoting a release to `main`, or a manual
+  `mode=full` dispatch) runs the complete suite. Require the single `CI result`
+  check in branch protection; see `docs/CI.md`.
+
 - **WebSocket tunnels no longer hold a request worker each (#818).** A
   worker still runs the handshake and every admission check (auth,
   `forward_auth`, rate limits, Origin, 0-RTT, tunnel cap), then hands the

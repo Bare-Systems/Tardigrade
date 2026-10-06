@@ -667,7 +667,7 @@ for the complete disposition of each.
 | `TARDIGRADE_TLS_CLIENT_CA_PATH` | path | `""` | PEM bundle of CAs trusted to issue client certificates. Required when `TARDIGRADE_TLS_CLIENT_VERIFY=true`; never falls back to the system trust store. Re-read on config reload. | `TARDIGRADE_TLS_CLIENT_CA_PATH=/etc/tls/clients.pem` |
 | `TARDIGRADE_TLS_CLIENT_VERIFY` | bool | `false` | Request and verify downstream client certificates (mTLS) on the native TLS listener. Required by default: a handshake without a valid certificate fails. HTTP/1.1 and HTTP/2 only; rejected together with `TARDIGRADE_HTTP3_ENABLED`. See [Downstream mTLS](#downstream-mtls). | `TARDIGRADE_TLS_CLIENT_VERIFY=true` |
 | `TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL` | bool | `false` | With `TARDIGRADE_TLS_CLIENT_VERIFY`, also accept clients that present no certificate. A certificate that *is* presented must still verify. | `TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL=true` |
-| `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH` | u32 | `3` | Longest accepted client certification path (leaf plus intermediates, excluding the trust anchor); must be at least 1. | `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH=3` |
+| `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH` | u32 | `3` | Longest accepted client certification path (leaf plus intermediates, excluding the trust anchor), 1 to 8: depth 1 accepts leaf → anchor, depth 2 leaf → intermediate → anchor. | `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH=3` |
 | `TARDIGRADE_TLS_CRL_PATH` | path | `""` | Unused; retained for config-file compatibility. | (unset) |
 | `TARDIGRADE_TLS_CRL_CHECK` | bool | `false` | Retired CRL checking; must be false. | (unset) |
 | `TARDIGRADE_TLS_OCSP_STAPLING` | bool | `false` | Retired OCSP stapling; must be false. | (unset) |
@@ -1207,7 +1207,8 @@ server block.
 - `TARDIGRADE_TLS_CERT_PATH` and `TARDIGRADE_TLS_KEY_PATH` must be both set or
   both empty.
 - `TARDIGRADE_TLS_CLIENT_VERIFY=true` requires `TARDIGRADE_TLS_CLIENT_CA_PATH`,
-  a depth of at least 1, and `TARDIGRADE_HTTP3_ENABLED=false`.
+  `TARDIGRADE_TLS_CERT_PATH`/`TARDIGRADE_TLS_KEY_PATH` (otherwise the listener
+  would serve plaintext), a depth of 1 to 8, and `TARDIGRADE_HTTP3_ENABLED=false`.
 - `TARDIGRADE_COMPRESSION_BROTLI_QUALITY` must be 0-11.
 - `TARDIGRADE_OTEL_SAMPLE_RATE` must be 0-100.
 - `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` has a minimum effective value of 1; `0`

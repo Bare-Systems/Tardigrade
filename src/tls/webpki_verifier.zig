@@ -96,8 +96,8 @@ pub const WebPkiVerifier = struct {
     /// `.client` verifier (downstream mTLS, #763) requires `id-kp-clientAuth`
     /// rather than `id-kp-serverAuth` and applies no hostname policy.
     purpose: Purpose = .server,
-    /// Longest certification path accepted, counting the leaf and
-    /// intermediates but not the trust anchor.
+    /// Longest certification path accepted *including* the trust anchor: the
+    /// internal bound shared by path building and validation.
     maximum_path_length: usize = default_maximum_path_length,
 
     pub const Purpose = enum { server, client };
@@ -111,16 +111,19 @@ pub const WebPkiVerifier = struct {
         return .{ .allocator = allocator, .trust_anchors = trust_anchors, .crypto_provider = crypto_provider };
     }
 
-    /// A verifier for downstream client certificates (#763).
+    /// A verifier for downstream client certificates (#763). `verify_depth`
+    /// is the public `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH`: the number of
+    /// non-anchor certificates (leaf plus intermediates) allowed, so depth 1
+    /// accepts leaf -> anchor. The internal bound counts the anchor too.
     pub fn initClientAuth(
         allocator: std.mem.Allocator,
         trust_anchors: []const pki.x509.Certificate,
         crypto_provider: crypto.provider.CryptoProvider,
-        maximum_path_length: usize,
+        verify_depth: usize,
     ) WebPkiVerifier {
         var self = init(allocator, trust_anchors, crypto_provider);
         self.purpose = .client;
-        self.maximum_path_length = maximum_path_length;
+        self.maximum_path_length = verify_depth +| 1;
         return self;
     }
 
@@ -165,7 +168,7 @@ pub const WebPkiVerifier = struct {
         const leaf = &parsed[0];
         const intermediates = parsed[1..parsed_len];
 
-        const candidates = pki.path_builder.build(arena, leaf, intermediates, self.trust_anchors, .{}) catch return .rejected;
+        const candidates = pki.path_builder.build(arena, leaf, intermediates, self.trust_anchors, .{ .max_path_len = self.maximum_path_length }) catch return .rejected;
 
         const now_unix_s = zig_compat.unixTimestamp();
         const result = pki.path_validator.validateCandidates(arena, candidates, .{

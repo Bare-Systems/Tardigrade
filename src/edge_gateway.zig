@@ -424,7 +424,10 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     // fails startup rather than the first handshake; never falls back to the
     // system trust store.
     var client_trust: ?http.native_tls_connection.ClientTrustStore = null;
-    if (cfg.tls_client_verify and native_tls_provider != null) {
+    if (cfg.tls_client_verify) {
+        // Defensive twin of config validation: never start a listener that
+        // demands client certificates but would serve plaintext.
+        if (native_tls_provider == null) return error.ClientTrustUnavailable;
         client_trust = http.native_tls_connection.ClientTrustStore.init(state_allocator);
         var prepared = try client_trust.?.prepare(cfg.tls_client_ca_path, cfg.tls_client_verify_depth);
         client_trust.?.commit(&prepared);

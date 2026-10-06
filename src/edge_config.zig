@@ -3419,6 +3419,10 @@ fn validateTlsServerNamePolicy(cfg: *const EdgeConfig) !void {
 /// (single identity, required server name, HTTP/3 feature restrictions)
 /// lives in `validateApplianceTlsProfile`/`validateTlsServerNamePolicy`
 /// instead.
+/// Mirrors `tls.credentials.max_chain_entries`: a deeper client chain could
+/// never be presented to the verifier.
+const max_client_verify_depth = 8;
+
 fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
     // ACME is checked before the TLS-files gate below: enabling ACME is a
     // request to *obtain* credentials, so it is meaningful — and must fail
@@ -3427,6 +3431,15 @@ fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
     // identity and is inert without one.
     if (cfg.tls_acme_enabled) {
         logConfigDiagnostic("config validation failed: native-TLS builds do not support TARDIGRADE_TLS_ACME_ENABLED (ACME issuance/renewal is not implemented by native Tardigrade and #649 retired the only production build that ever supported it, #634)", .{});
+        return error.UnsupportedNativeTlsConfiguration;
+    }
+
+    // Checked before the gate for the same reason as ACME: it is precisely
+    // the no-identity case that must not fall through to plaintext.
+    if (cfg.tls_client_verify and !hasTlsFiles(cfg)) {
+        // Without a server identity the listener would serve plaintext, i.e.
+        // unauthenticated, despite client verification being demanded.
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_CLIENT_VERIFY requires TARDIGRADE_TLS_CERT_PATH and TARDIGRADE_TLS_KEY_PATH", .{});
         return error.UnsupportedNativeTlsConfiguration;
     }
 
@@ -3447,8 +3460,8 @@ fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
         logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_CLIENT_VERIFY is supported on HTTP/1.1 and HTTP/2 over native TLS only; disable TARDIGRADE_HTTP3_ENABLED", .{});
         return error.UnsupportedNativeTlsConfiguration;
     }
-    if (cfg.tls_client_verify and cfg.tls_client_verify_depth == 0) {
-        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH must be at least 1", .{});
+    if (cfg.tls_client_verify and (cfg.tls_client_verify_depth == 0 or cfg.tls_client_verify_depth > max_client_verify_depth)) {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH must be between 1 and 8 (the TLS engine's peer-chain entry bound)", .{});
         return error.UnsupportedNativeTlsConfiguration;
     }
     if (cfg.tls_session_cache_enabled) {
@@ -4995,12 +5008,25 @@ test "native-TLS builds reject legacy OpenSSL-only TLS settings one at a time" {
         // not alongside HTTP/3 (the QUIC handshake has no client-auth path).
         var cfg = base;
         cfg.tls_client_verify = true;
+        // Client verification without a server identity would serve
+        // plaintext: it must fail validation, not start.
+        const cert_keep = cfg.tls_cert_path;
+        const key_keep = cfg.tls_key_path;
+        cfg.tls_cert_path = "";
+        cfg.tls_key_path = "";
+        try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
+        cfg.tls_cert_path = cert_keep;
+        cfg.tls_key_path = key_keep;
         try validateNativeTlsBuildConfig(&cfg);
         cfg.http3_enabled = true;
         try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
         cfg.http3_enabled = false;
         cfg.tls_client_verify_depth = 0;
         try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
+        cfg.tls_client_verify_depth = 9;
+        try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
+        cfg.tls_client_verify_depth = 8;
+        try validateNativeTlsBuildConfig(&cfg);
     }
     {
         var cfg = base;

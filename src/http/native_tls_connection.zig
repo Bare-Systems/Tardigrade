@@ -1417,6 +1417,7 @@ fn testClientVerdict(
     allocator: std.mem.Allocator,
     trust: *const webpki_verifier.TrustAnchors,
     leaf_pem_path: []const u8,
+    depth: usize,
 ) !credentials.Verdict {
     const leaf_pem = try compat.cwd().readFileAlloc(allocator, leaf_pem_path, 256 * 1024);
     defer allocator.free(leaf_pem);
@@ -1428,7 +1429,7 @@ fn testClientVerdict(
 
     var entropy = production_crypto.OsEntropy{};
     var provider_state = production_crypto.Provider.init(entropy.entropy());
-    var verifier = webpki_verifier.WebPkiVerifier.initClientAuth(allocator, trust.anchors(), provider_state.cryptoProvider(), 3);
+    var verifier = webpki_verifier.WebPkiVerifier.initClientAuth(allocator, trust.anchors(), provider_state.cryptoProvider(), depth);
     const context = credentials.VerificationContext{
         .role = .server,
         // The SNI the client asked for names *this server*; it must never
@@ -1451,13 +1452,13 @@ test "client-auth verifier accepts a CA-issued clientAuth cert and rejects wrong
     var anchors = try webpki_verifier.loadTrustAnchors(allocator, "tests/fixtures/tls/ca.crt");
     defer anchors.deinit(allocator);
 
-    try std.testing.expectEqual(credentials.Verdict.accepted, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/client.crt"));
+    try std.testing.expectEqual(credentials.Verdict.accepted, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/client.crt", 3));
     // Issued by a different CA than the configured trust anchor.
-    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/rogue_client.crt"));
+    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/rogue_client.crt", 3));
     // Right CA, but a serverAuth-only certificate is not a client identity.
-    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/server.crt"));
+    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/server.crt", 3));
     // Self-signed leaf that is not itself a configured anchor.
-    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/native_ed25519.crt"));
+    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &anchors, "tests/fixtures/tls/native_ed25519.crt", 3));
 }
 
 test "client trust store rotates atomically and a failed prepare keeps the serving generation" {
@@ -1486,8 +1487,8 @@ test "client trust store rotates atomically and a failed prepare keeps the servi
     try std.testing.expectEqual(@as(usize, 5), current.max_path_length);
     // The pinned generation keeps verifying against the *old* anchors.
     try std.testing.expectEqual(@as(usize, 3), pinned.max_path_length);
-    try std.testing.expectEqual(credentials.Verdict.accepted, try testClientVerdict(allocator, &pinned.anchors, "tests/fixtures/tls/client.crt"));
-    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &current.anchors, "tests/fixtures/tls/client.crt"));
+    try std.testing.expectEqual(credentials.Verdict.accepted, try testClientVerdict(allocator, &pinned.anchors, "tests/fixtures/tls/client.crt", 3));
+    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &current.anchors, "tests/fixtures/tls/client.crt", 3));
     // A CA bundle must be made of real CAs: a non-CA "anchor" fails the load.
     try std.testing.expectError(error.NonCaAnchor, store.prepare("tests/fixtures/tls/rogue_ca.crt", 3));
 }
@@ -1545,4 +1546,21 @@ test "native TLS client auth pins a trust generation for the connection lifetime
     var rotated = try store.prepare("tests/fixtures/tls/native_ed25519_ca.crt", 3);
     store.commit(&rotated);
     conn.destroy();
+}
+
+test "client verify depth counts non-anchor certificates: N accepts exactly N, N-1 rejects (#763)" {
+    const allocator = std.testing.allocator;
+    // leaf -> anchor: one non-anchor certificate.
+    var direct = try webpki_verifier.loadTrustAnchors(allocator, "tests/fixtures/tls/ca.crt");
+    defer direct.deinit(allocator);
+    try std.testing.expectEqual(credentials.Verdict.accepted, try testClientVerdict(allocator, &direct, "tests/fixtures/tls/client.crt", 1));
+
+    // leaf -> intermediate -> anchor: two non-anchor certificates.
+    var rooted = try webpki_verifier.loadTrustAnchors(allocator, "tests/fixtures/tls/client_depth_root.crt");
+    defer rooted.deinit(allocator);
+    const chain = "tests/fixtures/tls/client_depth_chain.crt";
+    try std.testing.expectEqual(credentials.Verdict.rejected, try testClientVerdict(allocator, &rooted, chain, 1));
+    try std.testing.expectEqual(credentials.Verdict.accepted, try testClientVerdict(allocator, &rooted, chain, 2));
+    // The same bound feeds both the path builder and the validator.
+    try std.testing.expectEqual(credentials.Verdict.accepted, try testClientVerdict(allocator, &rooted, chain, 8));
 }

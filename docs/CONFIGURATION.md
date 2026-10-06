@@ -641,7 +641,7 @@ the primary `PROBE_*` names bypass file/secret lookup.
 
 Both TLS profiles (`general`, the default, and `appliance`) are pure-Zig
 native (#649) and TLS 1.3-only. The settings below that only ever applied to
-the retired OpenSSL adapter (TLS 1.2, cipher overrides, downstream mTLS,
+the retired OpenSSL adapter (TLS 1.2, cipher overrides,
 OpenSSL session cache/tickets, OCSP, CRL, the filesystem credential
 watcher) now deterministically fail config validation in every profile if
 set to anything other than their listed default — see
@@ -664,9 +664,10 @@ for the complete disposition of each.
 | `TARDIGRADE_TLS_SESSION_TICKETS` | bool | `false` | Retired OpenSSL session tickets; must be false (see `TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`). | (unset) |
 | `TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS` | u32 ms | `5000` | TLS handshake read timeout. `0` falls back to keep-alive timeout. | `TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS=3000` |
 | `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS` | u64 ms | `0` | Retired OpenSSL cert/key watcher interval; must be `0` (credential rotation is the explicit SIGHUP reload path instead). | (unset) |
-| `TARDIGRADE_TLS_CLIENT_CA_PATH` | path | `""` | Required when `TARDIGRADE_TLS_CLIENT_VERIFY=true`. | `TARDIGRADE_TLS_CLIENT_CA_PATH=/etc/tls/clients.pem` |
-| `TARDIGRADE_TLS_CLIENT_VERIFY` | bool | `false` | Retired downstream client-cert (mTLS) verification; must be false. | (unset) |
-| `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH` | u32 | `3` | Unused; retained for config-file compatibility. | (unset) |
+| `TARDIGRADE_TLS_CLIENT_CA_PATH` | path | `""` | PEM bundle of CAs trusted to issue client certificates. Required when `TARDIGRADE_TLS_CLIENT_VERIFY=true`; never falls back to the system trust store. Re-read on config reload. | `TARDIGRADE_TLS_CLIENT_CA_PATH=/etc/tls/clients.pem` |
+| `TARDIGRADE_TLS_CLIENT_VERIFY` | bool | `false` | Request and verify downstream client certificates (mTLS) on the native TLS listener. Required by default: a handshake without a valid certificate fails. HTTP/1.1 and HTTP/2 only; rejected together with `TARDIGRADE_HTTP3_ENABLED`. See [Downstream mTLS](#downstream-mtls). | `TARDIGRADE_TLS_CLIENT_VERIFY=true` |
+| `TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL` | bool | `false` | With `TARDIGRADE_TLS_CLIENT_VERIFY`, also accept clients that present no certificate. A certificate that *is* presented must still verify. | `TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL=true` |
+| `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH` | u32 | `3` | Longest accepted client certification path (leaf plus intermediates, excluding the trust anchor), 1 to 8: depth 1 accepts leaf → anchor, depth 2 leaf → intermediate → anchor. | `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH=3` |
 | `TARDIGRADE_TLS_CRL_PATH` | path | `""` | Unused; retained for config-file compatibility. | (unset) |
 | `TARDIGRADE_TLS_CRL_CHECK` | bool | `false` | Retired CRL checking; must be false. | (unset) |
 | `TARDIGRADE_TLS_OCSP_STAPLING` | bool | `false` | Retired OCSP stapling; must be false. | (unset) |
@@ -1143,11 +1144,71 @@ export TARDIGRADE_UPSTREAM_PROBE_PATH=/health
 export TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS=30000
 ```
 
+### Downstream mTLS
+
+`TARDIGRADE_TLS_CLIENT_VERIFY=true` makes the native TLS 1.3 listener send a
+`CertificateRequest` and verify the client's certificate chain with the same
+pure-Zig PKI path validation used for upstream trust, against only the CAs in
+`TARDIGRADE_TLS_CLIENT_CA_PATH`:
+
+- the chain must build to a configured anchor within
+  `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH`, with valid signatures and validity
+  periods, CA/key-usage constraints and name constraints enforced;
+- every certificate that carries an Extended Key Usage must allow
+  `clientAuth` (a `serverAuth`-only certificate is rejected); no hostname
+  policy applies to a client certificate;
+- the client must prove possession of the leaf key (CertificateVerify);
+- the chain is bounded (entry count and 8 KiB per certificate) and a
+  malformed or oversized chain fails the handshake closed.
+
+`required` (default) fails the handshake with a `certificate_required` alert
+when no certificate is offered; `TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL=true`
+lets certificate-less clients through (they simply carry no identity), while a
+certificate that is presented must still verify.
+
+**Identity propagation.** For requests on a connection with a verified client
+certificate, proxied upstream requests (HTTP/1.1 and HTTP/2 downstream) carry:
+
+| Header | Value |
+|---|---|
+| `X-Tardigrade-Client-Cert-Verified` | `1` |
+| `X-Tardigrade-Client-Cert-Fingerprint-Sha256` | lowercase hex SHA-256 of the leaf DER (the stable identity key) |
+| `X-Tardigrade-Client-Cert-Subject` / `-Issuer` | RFC 2253-style DN, printable ASCII, escaped |
+| `X-Tardigrade-Client-Cert-Serial` | hex serial |
+| `X-Tardigrade-Client-Cert-San-Dns` / `-San-Email` / `-San-Uri` | first SAN of each type |
+
+Values are derived only from the verified certificate, are bounded
+(512 bytes per DN, 255 per SAN) and escaped to printable ASCII; a field that
+does not fit is omitted rather than truncated. Every client-supplied
+`X-Tardigrade-*` request header is stripped before proxying, so a client
+cannot forge these. Upstreams should trust them only from Tardigrade (use the
+signed trust headers or network isolation). The raw certificate is never
+logged or exported. Verified identity is currently asserted on the HTTP proxy
+paths; FastCGI/SCGI/uwsgi, `forward_auth` subrequests and location-level
+"require certificate" routing are not yet certificate-aware.
+
+**Rotation.** The CA bundle is re-read on every config reload and published as
+one atomic generation: a bundle that fails to load rejects the whole reload
+and the serving trust set keeps verifying, and a handshake already in flight
+finishes against the generation it started with. Enabling
+`TARDIGRADE_TLS_CLIENT_VERIFY` on a process that started without it requires a
+restart. Revocation (CRL/OCSP) is not consulted: remove a revoked CA or issue
+short-lived client certificates; the validator's revocation seam stays
+disabled until runtime OCSP/CRL support exists.
+
+**Protocol coverage.** HTTP/1.1 and HTTP/2 over TCP TLS are supported. The
+QUIC/HTTP-3 handshake does not request client certificates, so the
+combination with `TARDIGRADE_HTTP3_ENABLED` is rejected at config validation
+rather than advertised. Client verification is per listener, not per SNI
+server block.
+
 ## Validation Notes
 
 - `TARDIGRADE_TLS_CERT_PATH` and `TARDIGRADE_TLS_KEY_PATH` must be both set or
   both empty.
-- `TARDIGRADE_TLS_CLIENT_VERIFY=true` requires `TARDIGRADE_TLS_CLIENT_CA_PATH`.
+- `TARDIGRADE_TLS_CLIENT_VERIFY=true` requires `TARDIGRADE_TLS_CLIENT_CA_PATH`,
+  `TARDIGRADE_TLS_CERT_PATH`/`TARDIGRADE_TLS_KEY_PATH` (otherwise the listener
+  would serve plaintext), a depth of 1 to 8, and `TARDIGRADE_HTTP3_ENABLED=false`.
 - `TARDIGRADE_COMPRESSION_BROTLI_QUALITY` must be 0-11.
 - `TARDIGRADE_OTEL_SAMPLE_RATE` must be 0-100.
 - `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` has a minimum effective value of 1; `0`

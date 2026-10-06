@@ -1,5 +1,6 @@
 const std = @import("std");
 const encrypted_stream = @import("tls_core").encrypted_stream;
+const client_identity = @import("tls_core").client_identity;
 
 pub const PeerCloseProbe = enum {
     open,
@@ -15,6 +16,9 @@ pub const EncryptedStreamHttpConnection = struct {
     read_transport_early_fn: ?*const fn (*anyopaque) bool = null,
     read_early_prefix_len_fn: ?*const fn (*anyopaque) usize = null,
     handshake_complete_fn: ?*const fn (*anyopaque) bool = null,
+    /// Verified downstream client certificate of this connection (#763), read
+    /// through `provenance_ctx`. Null for connections without client auth.
+    client_cert_fn: ?*const fn (*anyopaque) ?*const client_identity.ClientIdentity = null,
     /// The last bounded (`*Bounded`) call stopped on its drive budget with
     /// record-layer work possibly left (#818); retry soon rather than wait
     /// for the socket.
@@ -183,6 +187,12 @@ pub const EncryptedStreamHttpConnection = struct {
             if (self.read_early_prefix_len_fn) |cb| return cb(ctx);
         }
         return self.stream.currentReadEarlyPrefixLen();
+    }
+
+    pub fn clientIdentity(self: *const EncryptedStreamHttpConnection) ?*const client_identity.ClientIdentity {
+        const ctx = self.provenance_ctx orelse return null;
+        const cb = self.client_cert_fn orelse return null;
+        return cb(ctx);
     }
 
     pub fn downstreamHandshakeComplete(self: *const EncryptedStreamHttpConnection) bool {

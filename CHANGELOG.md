@@ -6,6 +6,23 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **Downstream mTLS client-certificate authentication on the native TLS
+  listener (#763).** `TARDIGRADE_TLS_CLIENT_VERIFY=true` now sends a TLS 1.3
+  `CertificateRequest` and verifies the client chain with the pure-Zig PKI path
+  validator against `TARDIGRADE_TLS_CLIENT_CA_PATH` (no system-store fallback),
+  requiring `clientAuth` EKU, key possession and a path within
+  `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH`. `TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL`
+  admits certificate-less clients while still verifying any certificate that is
+  presented. Verified identity is asserted to proxied upstreams as bounded,
+  escaped `X-Tardigrade-Client-Cert-*` headers (fingerprint, subject, issuer,
+  serial, first SAN of each type); every client-sent `X-Tardigrade-*` header is
+  stripped. The CA bundle is rotated atomically on config reload (a bad bundle
+  rejects the reload; in-flight handshakes keep their generation). Supported on
+  HTTP/1.1 and HTTP/2; combining it with `TARDIGRADE_HTTP3_ENABLED` is rejected
+  at config validation because the QUIC handshake has no client-auth path.
+  Revocation, per-SNI trust and certificate-aware routing are not yet
+  implemented. See `docs/CONFIGURATION.md#downstream-mtls`.
+
 - **HTTP/1 SSE responses now enforce the shared long-lived response lifecycle
   (#842).** The streaming relay identifies `text/event-stream` from response
   metadata before committing the downstream head, admits it against the

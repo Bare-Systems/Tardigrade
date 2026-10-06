@@ -153,6 +153,34 @@ pub fn appendProxyRequestHeaders(
         if (anyConnectionHeaderReferencesHeader(headers_list, header.name)) continue;
         try extra_headers.append(.{ .name = header.name, .value = header.value });
     }
+    try appendVerifiedClientCertHeaders(extra_headers, request_headers.client_cert);
+}
+
+/// Assert the *verified* downstream mTLS identity to the upstream (#763).
+/// Client-supplied `X-Tardigrade-*` headers were already dropped above, so
+/// these are the only such headers an upstream can see: they come from the
+/// connection's handshake-verified certificate, never from request bytes.
+/// Absent fields are omitted, never sent empty.
+pub fn appendVerifiedClientCertHeaders(
+    extra_headers: *std.array_list.Managed(std.http.Header),
+    client_cert: ?http.headers.ClientCertificate,
+) !void {
+    const cert = client_cert orelse return;
+    try extra_headers.append(.{ .name = "X-Tardigrade-Client-Cert-Verified", .value = "1" });
+    try extra_headers.append(.{ .name = "X-Tardigrade-Client-Cert-Fingerprint-Sha256", .value = cert.fingerprint_sha256 });
+    const optional = [_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = "X-Tardigrade-Client-Cert-Subject", .value = cert.subject },
+        .{ .name = "X-Tardigrade-Client-Cert-Issuer", .value = cert.issuer },
+        .{ .name = "X-Tardigrade-Client-Cert-Serial", .value = cert.serial },
+        .{ .name = "X-Tardigrade-Client-Cert-San-Dns", .value = cert.san_dns },
+        .{ .name = "X-Tardigrade-Client-Cert-San-Email", .value = cert.san_email },
+        .{ .name = "X-Tardigrade-Client-Cert-San-Uri", .value = cert.san_uri },
+    };
+    for (optional) |entry| {
+        if (entry.value.len == 0) continue;
+        try validateAssertedHeaderValue(entry.value);
+        try extra_headers.append(.{ .name = entry.name, .value = entry.value });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +713,34 @@ test "appendCanonicalEarlyDataHeader emits exactly one RFC 8470 marker when enab
     try std.testing.expectEqual(@as(usize, 1), headers.items.len);
     try std.testing.expectEqualStrings("Early-Data", headers.items[0].name);
     try std.testing.expectEqualStrings("1", headers.items[0].value);
+}
+
+test "appendProxyRequestHeaders asserts only the verified client cert and drops spoofed ones (#763)" {
+    var request_headers = http.Headers.init(std.testing.allocator);
+    defer request_headers.deinit();
+    try request_headers.append("X-Tardigrade-Client-Cert-Verified", "1");
+    try request_headers.append("X-Tardigrade-Client-Cert-Subject", "CN=admin");
+    try request_headers.append("Accept", "*/*");
+
+    var extra_headers = std.array_list.Managed(std.http.Header).init(std.testing.allocator);
+    defer extra_headers.deinit();
+    try appendProxyRequestHeaders(&extra_headers, &request_headers);
+    try std.testing.expectEqual(@as(usize, 1), extra_headers.items.len);
+    try std.testing.expectEqualStrings("accept", extra_headers.items[0].name);
+
+    request_headers.client_cert = .{ .fingerprint_sha256 = "ab" ** 32, .subject = "CN=alice", .san_email = "alice@example.com" };
+    extra_headers.clearRetainingCapacity();
+    try appendProxyRequestHeaders(&extra_headers, &request_headers);
+    var verified: usize = 0;
+    var subject: ?[]const u8 = null;
+    for (extra_headers.items) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "X-Tardigrade-Client-Cert-Verified")) verified += 1;
+        if (std.ascii.eqlIgnoreCase(h.name, "X-Tardigrade-Client-Cert-Subject")) subject = h.value;
+    }
+    try std.testing.expectEqual(@as(usize, 1), verified);
+    try std.testing.expectEqualStrings("CN=alice", subject.?);
+    // 1 passthrough + verified + fingerprint + subject + san-email.
+    try std.testing.expectEqual(@as(usize, 5), extra_headers.items.len);
 }
 
 test "appendProxyRequestHeaders normalizes duplicate inbound Early-Data through canonical helper" {

@@ -42,6 +42,10 @@ pub const ValidationPolicy = struct {
     validation_time: i64,
     expected_dns_name: ?[]const u8 = null,
     require_server_auth_eku: bool = true,
+    /// Validate a TLS *client* certificate (#763): every non-anchor path
+    /// certificate that carries an EKU must allow `id-kp-clientAuth`, instead
+    /// of `id-kp-serverAuth`. When set, `require_server_auth_eku` is ignored.
+    require_client_auth_eku: bool = false,
     maximum_path_length: usize = 8,
     /// Bounds the validator's duplicate-extension scan even for a malformed
     /// caller-constructed certificate view. The parser default is also 64.
@@ -240,12 +244,13 @@ pub fn validatePath(
         return .{ .rejected = validation_failure };
     }
 
-    if (policy.require_server_auth_eku) {
+    if (policy.require_client_auth_eku or policy.require_server_auth_eku) {
         // A present EKU restricts every non-anchor certificate in the path;
         // absence is unrestricted. Trust-anchor purpose is configuration.
         for (path.elements[0 .. path.elements.len - 1], 0..) |element, certificate_index| {
             if (element.certificate.extendedKeyUsage()) |eku| {
-                if (!eku.allowsServerAuth()) {
+                const allowed = if (policy.require_client_auth_eku) eku.allowsClientAuth() else eku.allowsServerAuth();
+                if (!allowed) {
                     return rejectOid(.extended_key_usage_violation, certificate_index, &wk.ext_key_usage);
                 }
             }

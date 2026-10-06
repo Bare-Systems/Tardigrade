@@ -16,11 +16,30 @@ pub const Header = struct {
     value: []const u8,
 };
 
+/// A *verified* downstream client certificate identity (#763), carried
+/// out-of-band on `Headers` rather than as a header so no client-supplied
+/// field can ever populate or shadow it. Every slice is printable ASCII and
+/// borrows the TLS connection's storage, which outlives each request on it.
+/// Only the TLS accept path assigns this, after the native handshake verified
+/// the chain and the client proved possession of the leaf key.
+pub const ClientCertificate = struct {
+    fingerprint_sha256: []const u8,
+    subject: []const u8 = "",
+    issuer: []const u8 = "",
+    serial: []const u8 = "",
+    san_dns: []const u8 = "",
+    san_email: []const u8 = "",
+    san_uri: []const u8 = "",
+};
+
 /// HTTP Headers collection
 /// Stores headers with lowercase names for case-insensitive lookup
 pub const Headers = struct {
     allocator: Allocator,
     items: std.ArrayList(Header),
+    /// Verified mTLS identity of the connection this request arrived on, or
+    /// null (plaintext, no client auth, or no certificate presented).
+    client_cert: ?ClientCertificate = null,
 
     pub fn init(allocator: Allocator) Headers {
         return .{

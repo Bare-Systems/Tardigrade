@@ -336,6 +336,41 @@ pub fn hotReloadConfig(
             return;
         };
     }
+    // #763: rotate downstream client trust anchors with the same
+    // prepare-then-publish discipline as the server identity. A bundle that
+    // fails to load rejects the whole reload and the serving generation keeps
+    // verifying; connections already mid-handshake pin their own generation.
+    var prepared_client_trust: ?http.native_tls_connection.ClientTrustStore.Prepared = null;
+    defer if (prepared_client_trust) |*prepared| prepared.deinit();
+    if (cfg_ptr.tls_client_verify and worker_ctx.client_trust == null) {
+        // The trust store is created at startup alongside the credential
+        // owner; turning mTLS on later would otherwise "apply" while every
+        // new handshake fails closed.
+        worker_ctx.config_store.destroyVersion(prepared_version);
+        const msg = std.fmt.bufPrint(&state.last_reload_error, "enabling client certificate verification requires restart", .{}) catch "enabling client certificate verification requires restart";
+        state.reload_mutex.lock();
+        state.last_reload_ok = false;
+        state.last_reload_at_ms = now_ms;
+        state.last_reload_error_len = msg.len;
+        state.reload_mutex.unlock();
+        state.metricsRecordReloadFailure();
+        state.logger.warn(null, "config reload rejected: TARDIGRADE_TLS_CLIENT_VERIFY would be enabled on a process that started without a client trust store; restart to enable mTLS", .{});
+        return;
+    }
+    if (cfg_ptr.tls_client_verify) if (worker_ctx.client_trust) |store| {
+        prepared_client_trust = store.prepare(cfg_ptr.tls_client_ca_path, cfg_ptr.tls_client_verify_depth) catch |err| {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "client trust reload failed: {}", .{err}) catch "client trust reload failed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected by client trust (mTLS CA bundle) reload: {}", .{err});
+            return;
+        };
+    };
     if (worker_ctx.resumption_runtime) |runtime| {
         if (cfg_ptr.tls_native_ticket_keys_path.len > 0) {
             runtime.loadPersistentTicketKeysFromFile(cfg_ptr.tls_native_ticket_keys_path) catch |err| {
@@ -374,6 +409,10 @@ pub fn hotReloadConfig(
             };
             prepared_native_credentials = null;
         }
+    }
+
+    if (worker_ctx.client_trust) |store| {
+        if (prepared_client_trust) |*prepared| store.commit(prepared);
     }
 
     applyReloadedRuntimeConfig(cfg_ptr, state, &prepared_security);

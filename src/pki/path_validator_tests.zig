@@ -967,6 +967,30 @@ test "leaf KU and EKU server-auth policy accept absent or compatible values" {
     try expectRejected(&bad_ku, .key_usage_violation, 0);
 }
 
+test "client-auth EKU policy accepts clientAuth/any/absent and rejects serverAuth-only (#763)" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{ .subject = "server", .issuer = "Root", .subject_key = 1, .issuer_key = 3, .ca = false, .key_usage = 0x80, .eku = .server });
+    try fx.add(.{ .subject = "client", .issuer = "Root", .subject_key = 2, .issuer_key = 3, .ca = false, .key_usage = 0x80, .eku = .client });
+    try fx.add(.{ .subject = "absent", .issuer = "Root", .subject_key = 4, .issuer_key = 3, .ca = false });
+    try fx.add(.{ .subject = "any", .issuer = "Root", .subject_key = 5, .issuer_key = 3, .ca = false, .key_usage = 0x80, .eku = .any });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var client_policy = policy(fx.certs.items[0..1]);
+    client_policy.require_client_auth_eku = true;
+    inline for (.{ @as(usize, 2), 3, 4 }) |index| {
+        var result = try validateBuilt(testing.allocator, &fx.certs.items[index], &.{}, fx.certs.items[0..1], client_policy, cp);
+        defer result.deinit(testing.allocator);
+        try expectAccepted(&result, 2);
+    }
+    var server_only = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], client_policy, cp);
+    defer server_only.deinit(testing.allocator);
+    try expectRejected(&server_only, .extended_key_usage_violation, 0);
+}
+
 test "critical and duplicate extensions fail closed while unknown noncritical passes" {
     var fx = Fixtures.init(testing.allocator);
     defer fx.deinit();

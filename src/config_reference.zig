@@ -584,18 +584,40 @@ pub const entries = [_]ConfigEntry{
         .default_value = "false",
         .valid_values = &.{ "true", "false" },
         .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
-        .description = "Requires and verifies client certificates (mTLS). Rejected by the native-TLS builds: true is not a valid value in appliance or native profile builds.",
+        .description = "Requests and verifies downstream client certificates (mTLS) on the native TLS listener (HTTP/1.1 and HTTP/2; not supported with HTTP/3). Requires tls_client_ca_path. Verified identity is asserted upstream as X-Tardigrade-Client-Cert-* headers.",
         .example = "tls_client_verify true;",
         .env_vars = &.{"TARDIGRADE_TLS_CLIENT_VERIFY"},
-        .docs = &.{"docs/PENTEST_PLAYBOOK.md"},
+        .docs = &.{ "docs/PENTEST_PLAYBOOK.md", "docs/CONFIGURATION.md" },
+    },
+    .{
+        .name = "tls_client_verify_optional",
+        .contexts = CTX_TOP,
+        .value_type = "boolean",
+        .default_value = "false",
+        .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
+        .description = "With tls_client_verify, accept connections that present no client certificate (a presented certificate must still verify). The default requires one.",
+        .example = "tls_client_verify_optional true;",
+        .env_vars = &.{"TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL"},
+        .docs = &.{"docs/CONFIGURATION.md"},
+    },
+    .{
+        .name = "tls_client_ca_path",
+        .contexts = CTX_TOP,
+        .value_type = "path",
+        .default_value = "none",
+        .description = "PEM bundle of CA certificates trusted to issue downstream client certificates. Required with tls_client_verify; never falls back to the system trust store. Re-read on config reload and swapped atomically.",
+        .example = "tls_client_ca_path /etc/tls/client-ca.pem;",
+        .env_vars = &.{"TARDIGRADE_TLS_CLIENT_CA_PATH"},
+        .docs = &.{"docs/CONFIGURATION.md"},
     },
     .{
         .name = "tls_client_verify_depth",
         .contexts = CTX_TOP,
         .value_type = "integer",
         .default_value = "3",
-        .valid_values = &.{">= 0"},
-        .description = "Maximum client certificate chain verification depth.",
+        .valid_values = &.{"1..8"},
+        .description = "Maximum client certificate chain verification depth, counting the leaf plus intermediates and excluding the trust anchor.",
         .example = "tls_client_verify_depth 5;",
         .env_vars = &.{"TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH"},
     },
@@ -1848,7 +1870,7 @@ test "profile-dependent TLS and HTTP/3 entries note their appliance-profile rest
     }
     try std.testing.expect(tls_max_notes_appliance);
 
-    try std.testing.expect(std.mem.indexOf(u8, lookup("tls_client_verify").?.description, "appliance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lookup("tls_client_verify").?.description, "HTTP/3") != null);
     try std.testing.expect(std.mem.indexOf(u8, lookup("server.tls_cert_path").?.description, "appliance") != null);
     try std.testing.expect(std.mem.indexOf(u8, lookup("server.tls_key_path").?.description, "appliance") != null);
     try std.testing.expect(std.mem.indexOf(u8, lookup("http3_enable_0rtt").?.description, "appliance") != null);

@@ -1495,7 +1495,19 @@ fn streamViaH2Pool(
                             const read_result = conn.readStreamingBodyInterruptible(stream, response_buf.?, wait_ms) catch |err| {
                                 if (err == error.Http2ReadWaitElapsed) {
                                     // The wait slice ended without changing H2
-                                    // state. Re-check lifecycle policy and the
+                                    // state. A quiet origin gives downstream
+                                    // disconnects no write boundary to surface
+                                    // through, so probe the client here without
+                                    // consuming pipelined bytes. This reset is
+                                    // stream-local: healthy multiplexed
+                                    // siblings keep using the H2 connection.
+                                    if (try downstreamClosedDuringQuietH2Wait(&response_stream.downstream)) {
+                                        response_stream_close_reason = .client;
+                                        conn.finishStreaming(stream);
+                                        h2_pool.release(conn);
+                                        return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
+                                    }
+                                    // Re-check lifecycle policy and the
                                     // original upstream response deadline;
                                     // neither is reset by these short polls.
                                     response_stream.stopError(http.event_loop.monotonicMs()) catch |stop_err| {
@@ -2361,6 +2373,16 @@ fn pollResponseReadiness(
     return .timeout;
 }
 
+/// A quiet HTTP/2 response has no downstream write boundary at which a peer
+/// close would otherwise be discovered. Keep this check separate so its
+/// zero-timeout, non-consuming contract is explicit at the H2 call site.
+fn downstreamClosedDuringQuietH2Wait(downstream: *DownstreamCloseProbe) !bool {
+    return switch (try pollResponseReadiness(-1, downstream, 0, false, true)) {
+        .client_closed => true,
+        .client_data, .timeout, .upstream => false,
+    };
+}
+
 test "downstream TLS probe errors are classified as client close (#842 review)" {
     const FailingProbe = struct {
         fn probe(_: *anyopaque, _: usize) anyerror!http.encrypted_stream_connection.PeerCloseProbe {
@@ -2377,6 +2399,52 @@ test "downstream TLS probe errors are classified as client close (#842 review)" 
     try std.testing.expectEqual(
         ResponseReadiness.client_closed,
         try pollResponseReadiness(-1, &downstream, 0, false, true),
+    );
+}
+
+test "quiet http2 SSE client close releases its lifecycle slot (#850 review)" {
+    const fds = try makeBlockingSocketpair();
+    defer _ = std.c.close(fds[0]);
+
+    var cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    cfg.access_control_rules = "";
+    cfg.proxy_response_stream_max_active = 1;
+    var config_store = try gs.ReloadableConfigStore.initBorrowed(std.testing.allocator, &cfg);
+    defer config_store.deinit();
+    var config_lease = config_store.acquire();
+    defer config_lease.release();
+
+    // The tracked stream only needs the lifecycle and metrics state, so keep
+    // this fixture intentionally narrow rather than constructing a gateway.
+    var state: gs.GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.response_stream_lifecycle = .{};
+    var location = http.location_router.LocationBlock{
+        .match_type = .exact,
+        .pattern = "/events",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "" } },
+    };
+    const admission = state.tryAcquireResponseStream(&config_lease, &location, http.event_loop.monotonicMs()).?;
+    var tracked = TrackedResponseStream{
+        .state = &state,
+        .admission = admission,
+        .downstream = .{ .fd = fds[0] },
+    };
+    try std.testing.expectEqual(@as(u32, 1), state.response_stream_lifecycle.activeCount());
+
+    // The peer closes while the origin is quiet. This is precisely the branch
+    // `streamViaH2Pool` evaluates after `Http2ReadWaitElapsed`.
+    _ = std.c.close(fds[1]);
+    try std.testing.expect(try downstreamClosedDuringQuietH2Wait(&tracked.downstream));
+    tracked.finish(.client);
+
+    try std.testing.expectEqual(@as(u32, 0), state.response_stream_lifecycle.activeCount());
+    try std.testing.expectEqual(@as(u64, 0), state.metrics.response_streams_active);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        state.metrics.response_stream_closes_total[@intFromEnum(http.response_stream_lifecycle.CloseReason.client)],
     );
 }
 
@@ -3097,36 +3165,18 @@ const TrackedResponseStream = struct {
     state: *gs.GatewayState,
     admission: gs.ResponseStreamAdmission,
     downstream: DownstreamCloseProbe,
-    shutdown_deadline_ms: ?u64 = null,
     finished: bool = false,
 
-    fn stopError(self: *TrackedResponseStream, now_ms: u64) !void {
-        // The shutdown deadline starts when this admitted stream first sees
-        // shutdown, matching the tunnel drain contract. It is captured from
-        // the admission generation rather than a newer config snapshot.
-        if (self.shutdown_deadline_ms == null and http.shutdown.isShutdownRequested()) {
-            self.shutdown_deadline_ms = now_ms +| self.admission.config_lease.cfg.shutdown_drain_timeout_ms;
-        }
-
-        const reload_deadline = self.admission.reloadDeadlineMs();
-        const shutdown_deadline = self.shutdown_deadline_ms;
-        if (reload_deadline) |deadline_ms| {
-            if (now_ms >= deadline_ms and (shutdown_deadline == null or deadline_ms <= shutdown_deadline.?)) {
-                return error.ResponseStreamReload;
-            }
-        }
-        if (shutdown_deadline) |deadline_ms| {
-            if (now_ms >= deadline_ms) return error.ResponseStreamShutdown;
+    fn stopError(self: *const TrackedResponseStream, now_ms: u64) !void {
+        if (self.admission.reloadDeadlineMs()) |deadline_ms| {
+            if (now_ms >= deadline_ms) return error.ResponseStreamReload;
         }
     }
 
-    fn pollWaitMs(self: *TrackedResponseStream, now_ms: u64, existing_remaining_ms: ?u64) u32 {
+    fn pollWaitMs(self: *const TrackedResponseStream, now_ms: u64, existing_remaining_ms: ?u64) u32 {
         var wait_ms: u64 = response_stream_lifecycle_poll_slice_ms;
         if (existing_remaining_ms) |remaining| wait_ms = @min(wait_ms, @max(remaining, 1));
         if (self.admission.reloadDeadlineMs()) |deadline_ms| {
-            wait_ms = @min(wait_ms, @max(deadline_ms -| now_ms, 1));
-        }
-        if (self.shutdown_deadline_ms) |deadline_ms| {
             wait_ms = @min(wait_ms, @max(deadline_ms -| now_ms, 1));
         }
         return @intCast(@min(wait_ms, @as(u64, std.math.maxInt(u32))));

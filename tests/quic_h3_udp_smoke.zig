@@ -1643,7 +1643,7 @@ const SniPolicyServer = struct {
         self.handler_state = .{};
         self.policies = tls_core.client_trust.PolicySet.init(allocator);
         const sp = specs(fallback_mode, mtls_ca_path);
-        var prepared = try self.policies.prepare(sp.fallback, &sp.list);
+        var prepared = try self.policies.prepare(sp.fallback, &sp.list, tls_core.client_trust.exactNameMatcher);
         self.policies.commit(&prepared);
         self.runtime = try http3_runtime.Runtime.init(allocator, &self.logger, .{
             .listen_host = "127.0.0.1",
@@ -1738,7 +1738,7 @@ test "udp h3 per-SNI mTLS: a reload swaps trust atomically for new handshakes (#
     // Rotate host A's trust to the rogue CA: the old client is now refused,
     // the rogue-CA client admitted, with no restart.
     const sp = SniPolicyServer.specs(.required, mtls_rogue_ca_path);
-    var prepared = try server.policies.prepare(sp.fallback, &sp.list);
+    var prepared = try server.policies.prepare(sp.fallback, &sp.list, tls_core.client_trust.exactNameMatcher);
     server.policies.commit(&prepared);
     try testing.expectEqual(MtlsOutcome.refused, try runMtlsClientSni(allocator, &server.runtime, mtls_valid, .none, false, host_a, host_a));
     try testing.expectEqual(MtlsOutcome.served, try runMtlsClientSni(allocator, &server.runtime, mtls_wrong_ca, .none, false, host_a, host_a));

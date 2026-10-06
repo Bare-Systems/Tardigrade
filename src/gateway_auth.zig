@@ -212,27 +212,9 @@ pub fn hostMatchesServerNames(cfg: *const edge_config.EdgeConfig, request: *cons
     return hostMatchesPatterns(cfg.server_names, request.headers.get("host"));
 }
 
-pub fn hostMatchesPatterns(patterns: []const []const u8, raw_host: ?[]const u8) bool {
-    if (patterns.len == 0) return true;
-    const host = stripHostPort(raw_host orelse return false);
-    for (patterns) |pattern| {
-        if (matchHostPattern(pattern, host)) return true;
-    }
-    return false;
-}
-
-fn stripHostPort(raw_host: []const u8) []const u8 {
-    const trimmed = std.mem.trim(u8, raw_host, " \t\r\n");
-    if (trimmed.len == 0) return trimmed;
-    if (trimmed[0] == '[') {
-        const end = std.mem.findScalar(u8, trimmed, ']') orelse return trimmed;
-        return trimmed[1..end];
-    }
-    const colon = std.mem.findScalarLast(u8, trimmed, ':') orelse return trimmed;
-    const head = trimmed[0..colon];
-    if (std.mem.findScalar(u8, head, ':') != null) return trimmed;
-    return head;
-}
+/// Server-name matching is owned by `edge_config` so virtual-host routing and
+/// the TLS client-auth policy table share one implementation (#763).
+pub const hostMatchesPatterns = edge_config.hostMatchesPatterns;
 
 fn hostPort(raw_host: []const u8) ?u16 {
     const trimmed = std.mem.trim(u8, raw_host, " \t\r\n");
@@ -246,19 +228,6 @@ fn hostPort(raw_host: []const u8) ?u16 {
     const head = trimmed[0..colon];
     if (std.mem.findScalar(u8, head, ':') != null) return null;
     return std.fmt.parseInt(u16, trimmed[colon + 1 ..], 10) catch null;
-}
-
-fn matchHostPattern(pattern_raw: []const u8, host: []const u8) bool {
-    const pattern = std.mem.trim(u8, pattern_raw, " \t");
-    if (pattern.len == 0) return false;
-    if (pattern[0] == '~') {
-        return http.rewrite.regexMatches(pattern[1..], host);
-    }
-    if (std.mem.startsWith(u8, pattern, "*.")) {
-        const suffix = pattern[1..];
-        return std.mem.endsWith(u8, host, suffix);
-    }
-    return std.ascii.eqlIgnoreCase(pattern, host);
 }
 
 const ApprovalRequestBody = struct {
@@ -1000,4 +969,97 @@ test "device registration accepts the hmac_key name and the legacy spelling" {
         error.InvalidDeviceRegistration,
         parseDeviceRegistration(allocator, "{\"device_id\":\"victim\",\"hmac_key\":\"key|forged\"}"),
     );
+}
+
+// #763: TLS client-auth policy selection and virtual-host routing must pick the
+// same server block for every name, including regex names, raw-suffix
+// wildcards and overlapping exact/wildcard blocks in either order.
+const policy_test_ca = "tests/fixtures/tls/h3mtls/ca.crt";
+
+fn policyTestBlock(names: [][]const u8, verify: ?bool) edge_config.EdgeConfig.ServerBlock {
+    return .{
+        .server_names = names,
+        .doc_root = "",
+        .try_files = "",
+        .location_blocks = &.{},
+        .tls_cert_path = "",
+        .tls_key_path = "",
+        .upstream_base_url = "",
+        .proxy_pass_chat = "",
+        .proxy_pass_commands_prefix = "",
+        .tls_client_verify = verify,
+        .tls_client_ca_path = if (verify == true) policy_test_ca else null,
+    };
+}
+
+/// The policy fingerprint routing implies for `host`: the selected block's
+/// policy, or the listener-wide one when routing would reject the host.
+fn routedPolicyFingerprint(cfg: *const edge_config.EdgeConfig, host: []const u8) u64 {
+    const block = selectServerBlock(cfg, host);
+    const matched = if (block) |b| (b.server_names.len == 0 or hostMatchesPatterns(b.server_names, host)) else false;
+    const spec = cfg.clientAuthPolicy(if (matched) block else null);
+    return tls_policy_fingerprint(spec);
+}
+
+fn tls_policy_fingerprint(spec: @import("tls_core").client_trust.PolicySpec) u64 {
+    return @import("tls_core").client_trust.policyFingerprint(spec);
+}
+
+fn expectPolicyMatchesRouting(cfg: *const edge_config.EdgeConfig, hosts: []const []const u8, expect_protected: []const bool) !void {
+    const allocator = std.testing.allocator;
+    var set = @import("tls_core").client_trust.PolicySet.init(allocator);
+    defer set.deinit();
+    var prepared = try cfg.prepareClientPolicies(&set);
+    set.commit(&prepared);
+    const snapshot = set.acquire().?;
+    defer snapshot.release();
+    for (hosts, expect_protected) |host, protected| {
+        // Same name through the TLS policy table (SNI) and through routing.
+        const tls_fp = snapshot.fingerprintForHost(host);
+        try std.testing.expectEqual(routedPolicyFingerprint(cfg, host), tls_fp);
+        try std.testing.expectEqual(protected, tls_fp != 0);
+    }
+}
+
+test "client-auth policy selection follows routing: regex names, deep wildcards, and overlap order (#763)" {
+    const allocator = std.testing.allocator;
+    var cfg = try edge_config.loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    const owned_blocks = cfg.server_blocks;
+    defer cfg.server_blocks = owned_blocks;
+
+    // Regex server name with mTLS on, listener-wide off: the SNI must land on
+    // the protected block, not on the disabled fallback.
+    {
+        var re = [_][]const u8{"~^api-[0-9]+\\.example\\.test$"};
+        var blocks = [_]edge_config.EdgeConfig.ServerBlock{policyTestBlock(&re, true)};
+        cfg.server_blocks = &blocks;
+        try expectPolicyMatchesRouting(&cfg, &.{ "api-1.example.test", "api-22.example.test:8443", "other.example.test" }, &.{ true, true, false });
+    }
+    // Routing's `*.suffix` is a raw suffix match, so deep names are protected too.
+    {
+        var wild = [_][]const u8{"*.example.test"};
+        var blocks = [_]edge_config.EdgeConfig.ServerBlock{policyTestBlock(&wild, true)};
+        cfg.server_blocks = &blocks;
+        try expectPolicyMatchesRouting(&cfg, &.{ "a.example.test", "a.b.example.test", "example.org" }, &.{ true, true, false });
+    }
+    // Overlapping exact/wildcard blocks: the FIRST matching block wins, in
+    // either order (no global exact-before-wildcard preference).
+    {
+        var wild = [_][]const u8{"*.example.test"};
+        var exact = [_][]const u8{"open.example.test"};
+        var wild_first = [_]edge_config.EdgeConfig.ServerBlock{ policyTestBlock(&wild, true), policyTestBlock(&exact, false) };
+        cfg.server_blocks = &wild_first;
+        try expectPolicyMatchesRouting(&cfg, &.{ "open.example.test", "x.example.test" }, &.{ true, true });
+        var exact_first = [_]edge_config.EdgeConfig.ServerBlock{ policyTestBlock(&exact, false), policyTestBlock(&wild, true) };
+        cfg.server_blocks = &exact_first;
+        try expectPolicyMatchesRouting(&cfg, &.{ "open.example.test", "x.example.test" }, &.{ false, true });
+    }
+    // A nameless block is a catch-all at its position.
+    {
+        var exact = [_][]const u8{"open.example.test"};
+        var blocks = [_]edge_config.EdgeConfig.ServerBlock{ policyTestBlock(&exact, false), policyTestBlock(&.{}, true) };
+        cfg.server_blocks = &blocks;
+        try expectPolicyMatchesRouting(&cfg, &.{ "open.example.test", "anything.test" }, &.{ false, true });
+    }
 }

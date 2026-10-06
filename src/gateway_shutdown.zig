@@ -408,7 +408,13 @@ pub fn hotReloadConfig(
     }
 
     if (worker_ctx.client_policies) |set| {
-        if (prepared_client_policies) |*prepared| set.commit(prepared);
+        if (prepared_client_policies) |*prepared| {
+            // The generation being installed owns one reference (TCP
+            // connections take their policy table from the config they lease);
+            // the set keeps the other for new QUIC connections.
+            if (prepared.snapshot) |snapshot| gs.ReloadableConfigStore.setPreparedClientPolicies(prepared_version, snapshot.retain());
+            set.commit(prepared);
+        }
     }
 
     applyReloadedRuntimeConfig(cfg_ptr, state, &prepared_security);

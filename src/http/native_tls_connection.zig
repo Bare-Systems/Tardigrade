@@ -26,6 +26,7 @@ pub const SniCertSpec = struct {
 /// Downstream client-certificate trust anchors (#763); shared with HTTP/3.
 pub const ClientTrustStore = tls.client_trust.ClientTrustStore;
 pub const ClientPolicySet = tls.client_trust.PolicySet;
+pub const ClientPolicySnapshot = tls.client_trust.PolicySnapshot;
 
 pub const NativeCredentialStore = struct {
     allocator: std.mem.Allocator,
@@ -212,10 +213,13 @@ pub const NativeTlsConnection = struct {
         /// creation fails closed otherwise.
         client_auth: tls_backend.ClientAuthMode = .disabled,
         client_trust: ?*ClientTrustStore = null,
-        /// SNI-keyed client-auth policies (#763). When set, the policy (mode
-        /// and trust generation) is chosen from the ClientHello server_name
-        /// and takes precedence over `client_auth`/`client_trust`.
-        client_policies: ?*ClientPolicySet = null,
+        /// SNI-keyed client-auth policies (#763) of the configuration
+        /// generation this connection is admitted under. The policy (mode and
+        /// trust generation) is chosen from the ClientHello server_name and
+        /// takes precedence over `client_auth`/`client_trust`. Retained for
+        /// the connection's lifetime, so handshake policy and Host admission
+        /// can never observe a later reload.
+        client_policies: ?*ClientPolicySnapshot = null,
     };
 
     allocator: std.mem.Allocator,
@@ -239,7 +243,7 @@ pub const NativeTlsConnection = struct {
     client_verifier: webpki_verifier.WebPkiVerifier = undefined,
     client_identity: client_identity.ClientIdentity = .{},
     client_identity_present: bool = false,
-    client_policies: ?*ClientPolicySet = null,
+    client_policies: ?*ClientPolicySnapshot = null,
     /// Fingerprint of the SNI-selected policy this connection was admitted
     /// under (0 = no client auth); see `tls.client_trust.hostAdmitted`.
     client_policy_fingerprint: u64 = 0,
@@ -336,7 +340,7 @@ pub const NativeTlsConnection = struct {
             .resumption_runtime = options.resumption_runtime,
             .server_early_data_policy = if (options.early_data_replay_gate != null and options.resumption_runtime != null) options.server_early_data_policy else .{},
             .client_trust_generation = trust_generation,
-            .client_policies = options.client_policies,
+            .client_policies = null,
         };
         if (options.client_policies != null) {
             backend.setClientAuthSelector(.{ .ctx = self, .selectFn = selectClientAuth });
@@ -360,6 +364,8 @@ pub const NativeTlsConnection = struct {
             options.buffer_limits,
         );
         backend_owned_by_record = true;
+        // Last, so no failure above can leak the reference.
+        if (options.client_policies) |snap| self.client_policies = snap.retain();
         return self;
     }
 
@@ -367,8 +373,8 @@ pub const NativeTlsConnection = struct {
     /// pin its trust generation for this handshake.
     fn selectClientAuth(ptr: *anyopaque, server_name: ?[]const u8) error{ClientAuthUnavailable}!tls_backend.ClientAuthSelection {
         const self: *NativeTlsConnection = @ptrCast(@alignCast(ptr));
-        const set = self.client_policies orelse return error.ClientAuthUnavailable;
-        const selection = set.select(server_name) catch return error.ClientAuthUnavailable;
+        const snapshot = self.client_policies orelse return error.ClientAuthUnavailable;
+        const selection = snapshot.select(server_name);
         if (self.client_trust_generation) |g| g.release();
         self.client_trust_generation = selection.generation;
         self.client_policy_fingerprint = selection.fingerprint;
@@ -386,8 +392,8 @@ pub const NativeTlsConnection = struct {
     /// client-auth policy must not differ from the SNI-selected one the
     /// handshake enforced (otherwise the caller answers 421).
     pub fn clientPolicyAdmitsHost(self: *const NativeTlsConnection, host: []const u8) bool {
-        const set = self.client_policies orelse return true;
-        return tls.client_trust.hostAdmitted(self.client_policy_fingerprint, set.fingerprintForHost(host));
+        const snapshot = self.client_policies orelse return true;
+        return tls.client_trust.hostAdmitted(self.client_policy_fingerprint, snapshot.fingerprintForHost(host));
     }
 
     fn nativeClientPolicyAdmitsHost(ptr: *anyopaque, host: []const u8) bool {
@@ -404,6 +410,8 @@ pub const NativeTlsConnection = struct {
     pub fn deinit(self: *NativeTlsConnection) void {
         const trust_generation = self.client_trust_generation;
         defer if (trust_generation) |g| g.release();
+        const policies = self.client_policies;
+        defer if (policies) |snap| snap.release();
         self.record.deinit();
         self.allocator.destroy(self.record);
         self.allocator.destroy(self.backend);
@@ -1517,6 +1525,16 @@ test "native TLS client auth pins a trust generation for the connection lifetime
     conn.destroy();
 }
 
+fn testPolicySnapshot(set: *ClientPolicySet, comptime api_mode: tls_backend.ClientAuthMode) !void {
+    const specs = [_]tls.client_trust.PolicySpec{
+        .{ .names = &.{"api.example.test"}, .mode = api_mode, .ca_path = "tests/fixtures/tls/ca.crt" },
+        .{ .names = &.{"admin.example.test"}, .mode = .required, .ca_path = "tests/fixtures/tls/native_ed25519_ca.crt" },
+        .{ .names = &.{"open.example.test"}, .mode = .disabled },
+    };
+    var prepared = try set.prepare(.{}, &specs, tls.client_trust.exactNameMatcher);
+    set.commit(&prepared);
+}
+
 test "native TLS per-SNI policy: the connection installs the selector and only admits hosts whose policy matches its SNI-selected one (#763)" {
     var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
@@ -1525,34 +1543,28 @@ test "native TLS per-SNI policy: the connection installs the selector and only a
 
     var set = ClientPolicySet.init(std.testing.allocator);
     defer set.deinit();
-    const specs = [_]tls.client_trust.PolicySpec{
-        .{ .names = &.{"api.example.test"}, .mode = .required, .ca_path = "tests/fixtures/tls/ca.crt" },
-        .{ .names = &.{"admin.example.test"}, .mode = .required, .ca_path = "tests/fixtures/tls/native_ed25519_ca.crt" },
-        .{ .names = &.{"open.example.test"}, .mode = .disabled },
-    };
-    var prepared = try set.prepare(.{}, &specs);
-    set.commit(&prepared);
+    try testPolicySnapshot(&set, .required);
+    const snapshot = set.acquire().?;
+    defer snapshot.release();
 
     const conn = try NativeTlsConnection.createWithOptions(
         std.testing.allocator,
         fds[0],
         .{ .http1_enabled = true, .http2_enabled = true },
         fixed.provider(),
-        .{ .client_policies = &set },
+        .{ .client_policies = snapshot },
     );
     defer conn.destroy();
-    // Nothing is decided until the ClientHello's SNI is seen.
     try std.testing.expect(conn.backend.client_auth_selector != null);
     try std.testing.expect(conn.client_trust_generation == null);
 
-    // Simulate the backend consulting the selector for SNI api.example.test.
     const decision = try NativeTlsConnection.selectClientAuth(conn, "api.example.test");
     try std.testing.expectEqual(tls_backend.ClientAuthMode.required, decision.mode);
     try std.testing.expect(decision.verifier != null);
     try std.testing.expect(conn.client_trust_generation != null);
 
     try std.testing.expect(conn.clientPolicyAdmitsHost("api.example.test"));
-    try std.testing.expect(conn.clientPolicyAdmitsHost("API.example.test:8443"));
+    try std.testing.expect(conn.clientPolicyAdmitsHost("api.example.test:8443"));
     try std.testing.expect(conn.clientPolicyAdmitsHost("open.example.test")); // needs no client auth
     try std.testing.expect(!conn.clientPolicyAdmitsHost("admin.example.test")); // different CA
     try std.testing.expect(conn.clientPolicyAdmitsHost("unknown.example.test")); // fallback is "no client auth"
@@ -1562,6 +1574,60 @@ test "native TLS per-SNI policy: the connection installs the selector and only a
     try std.testing.expectEqual(tls_backend.ClientAuthMode.disabled, open.mode);
     try std.testing.expect(conn.client_trust_generation == null);
     try std.testing.expect(!conn.clientPolicyAdmitsHost("api.example.test")); // anonymous connection, host demands mTLS
+}
+
+test "native TLS per-SNI policy: a delayed ClientHello and later requests stay on the generation the connection was admitted under (#763)" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+    const fds2 = try testSocketPair();
+    defer closeFd(fds2[1]);
+
+    var set = ClientPolicySet.init(std.testing.allocator);
+    defer set.deinit();
+    // Generation N: api requires a client certificate.
+    try testPolicySnapshot(&set, .required);
+    const gen_n = set.acquire().?;
+    defer gen_n.release();
+    const strict = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .client_policies = gen_n },
+    );
+    defer strict.destroy();
+
+    // Reload to N+1 (api disabled) BEFORE the ClientHello arrives.
+    try testPolicySnapshot(&set, .disabled);
+    const gen_n1 = set.acquire().?;
+    defer gen_n1.release();
+    try std.testing.expect(gen_n1 != gen_n);
+
+    // required -> disabled must NOT fail open: the late ClientHello still
+    // gets generation N's required policy, and Host admission agrees.
+    const late = try NativeTlsConnection.selectClientAuth(strict, "api.example.test");
+    try std.testing.expectEqual(tls_backend.ClientAuthMode.required, late.mode);
+    try std.testing.expect(strict.clientPolicyAdmitsHost("api.example.test"));
+    try std.testing.expect(!strict.clientPolicyAdmitsHost("admin.example.test"));
+
+    // The reverse transition (disabled -> required) also stays on its own
+    // generation: a connection admitted under N+1 is anonymous and must not
+    // reach the host N+2 now protects.
+    const loose = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds2[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .client_policies = gen_n1 },
+    );
+    defer loose.destroy();
+    try testPolicySnapshot(&set, .required);
+    const anon = try NativeTlsConnection.selectClientAuth(loose, "api.example.test");
+    try std.testing.expectEqual(tls_backend.ClientAuthMode.disabled, anon.mode);
+    try std.testing.expect(loose.clientPolicyAdmitsHost("api.example.test")); // N+1 says api is open
+    try std.testing.expect(!loose.clientPolicyAdmitsHost("admin.example.test")); // required host, anonymous connection
 }
 
 test "client verify depth counts non-anchor certificates: N accepts exactly N, N-1 rejects (#763)" {

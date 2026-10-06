@@ -206,23 +206,17 @@ pub const EdgeConfig = struct {
         };
     }
 
-    /// The policy table for the TLS layer: one spec per named server block,
-    /// plus the fallback used for an absent/unmatched SNI — the default server
-    /// block (no `server_name`) when one exists, else the listener-wide
-    /// settings. Caller frees `specs`; names borrow from this config.
+    /// The policy table for the TLS layer: one spec per server block, in
+    /// configuration order — the order routing walks — each matched with
+    /// `hostMatchesPatterns` (the routing contract), so a name selects the
+    /// same block's policy that its HTTP requests are later routed to. Names
+    /// matching no block use the listener-wide settings (`fallback`). Caller
+    /// frees `specs`; names borrow from this config.
     pub fn clientAuthPolicies(self: *const EdgeConfig, allocator: std.mem.Allocator) !ClientAuthPolicies {
         var specs = std.ArrayList(tls_core.client_trust.PolicySpec).empty;
         errdefer specs.deinit(allocator);
+        for (self.server_blocks) |*block| try specs.append(allocator, self.clientAuthPolicy(block));
         var fallback = self.clientAuthPolicy(null);
-        var default_seen = false;
-        for (self.server_blocks) |*block| {
-            if (block.server_names.len == 0) {
-                if (!default_seen) fallback = self.clientAuthPolicy(block);
-                default_seen = true;
-                continue;
-            }
-            try specs.append(allocator, self.clientAuthPolicy(block));
-        }
         fallback.names = &.{};
         return .{ .fallback = fallback, .specs = try specs.toOwnedSlice(allocator) };
     }
@@ -241,7 +235,7 @@ pub const EdgeConfig = struct {
     pub fn prepareClientPolicies(self: *const EdgeConfig, set: *tls_core.client_trust.PolicySet) !tls_core.client_trust.PolicySet.Prepared {
         const policies = try self.clientAuthPolicies(set.allocator);
         defer set.allocator.free(policies.specs);
-        return set.prepare(policies.fallback, policies.specs);
+        return set.prepare(policies.fallback, policies.specs, hostMatchesPatterns);
     }
 
     pub const ClientAuthPolicies = struct {
@@ -5437,7 +5431,7 @@ test "TLS buffer limits default from TLS core" {
     try std.testing.expectError(error.InvalidBufferLimits, cfg.tls_buffer_limits.validate());
 }
 
-test "per-server client-auth policy inherits listener settings, honours overrides, and falls back to the default server (#763)" {
+test "per-server client-auth policy inherits listener settings, honours overrides, and keeps routing order (#763)" {
     const allocator = std.testing.allocator;
     var cfg = try loadFromEnv(allocator);
     defer cfg.deinit(allocator);
@@ -5464,7 +5458,8 @@ test "per-server client-auth policy inherits listener settings, honours override
 
     const policies = try cfg.clientAuthPolicies(allocator);
     defer allocator.free(policies.specs);
-    try std.testing.expectEqual(@as(usize, 3), policies.specs.len);
+    // One spec per block, in configuration order (the order routing walks).
+    try std.testing.expectEqual(@as(usize, 4), policies.specs.len);
     // api: no directives -> listener settings.
     try std.testing.expectEqual(tls_core.client_trust.Mode.required, policies.specs[0].mode);
     try std.testing.expectEqualStrings("/ca/listener.pem", policies.specs[0].ca_path);
@@ -5475,9 +5470,12 @@ test "per-server client-auth policy inherits listener settings, honours override
     try std.testing.expectEqual(@as(usize, 2), policies.specs[1].names.len);
     // open: explicitly disabled.
     try std.testing.expectEqual(tls_core.client_trust.Mode.disabled, policies.specs[2].mode);
-    // Fallback is the default server block (no server_name), inheriting verify.
+    // The nameless block is a catch-all spec at its own position...
+    try std.testing.expectEqual(@as(usize, 0), policies.specs[3].names.len);
+    try std.testing.expectEqualStrings("/ca/default.pem", policies.specs[3].ca_path);
+    // ...and names matching no block get the listener-wide settings.
     try std.testing.expectEqual(tls_core.client_trust.Mode.required, policies.fallback.mode);
-    try std.testing.expectEqualStrings("/ca/default.pem", policies.fallback.ca_path);
+    try std.testing.expectEqualStrings("/ca/listener.pem", policies.fallback.ca_path);
     try std.testing.expect(policies.fallback.names.len == 0);
     try std.testing.expect(cfg.anyClientAuth());
 
@@ -5508,4 +5506,44 @@ test "server block client-auth records parse onto the matching block and reject 
 
     try std.testing.expectError(error.InvalidServerBlockFormat, applyServerBlockClientAuth(allocator, &blocks, empty)); // too few records
     try std.testing.expectError(error.InvalidServerBlockFormat, applyServerBlockClientAuth(allocator, &blocks, "maybe" ++ server_block_field_sep ++ server_block_field_sep ++ server_block_field_sep ++ server_block_record_sep ++ empty));
+}
+
+/// Whether `raw_host` (a Host/:authority value with optional port, or a TLS
+/// SNI name) matches any server-name pattern. This is the single server-name
+/// matching contract: virtual-host routing and the per-SNI client-auth policy
+/// table both call it, so the two can never disagree about which server block
+/// a name belongs to (#763). An empty pattern list matches everything.
+pub fn hostMatchesPatterns(patterns: []const []const u8, raw_host: ?[]const u8) bool {
+    if (patterns.len == 0) return true;
+    const host = stripHostPort(raw_host orelse return false);
+    for (patterns) |pattern| {
+        if (matchHostPattern(pattern, host)) return true;
+    }
+    return false;
+}
+
+pub fn stripHostPort(raw_host: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw_host, " \t\r\n");
+    if (trimmed.len == 0) return trimmed;
+    if (trimmed[0] == '[') {
+        const end = std.mem.findScalar(u8, trimmed, ']') orelse return trimmed;
+        return trimmed[1..end];
+    }
+    const colon = std.mem.findScalarLast(u8, trimmed, ':') orelse return trimmed;
+    const head = trimmed[0..colon];
+    if (std.mem.findScalar(u8, head, ':') != null) return trimmed;
+    return head;
+}
+
+fn matchHostPattern(pattern_raw: []const u8, host: []const u8) bool {
+    const pattern = std.mem.trim(u8, pattern_raw, " \t");
+    if (pattern.len == 0) return false;
+    if (pattern[0] == '~') {
+        return http.rewrite.regexMatches(pattern[1..], host);
+    }
+    if (std.mem.startsWith(u8, pattern, "*.")) {
+        const suffix = pattern[1..];
+        return std.mem.endsWith(u8, host, suffix);
+    }
+    return std.ascii.eqlIgnoreCase(pattern, host);
 }

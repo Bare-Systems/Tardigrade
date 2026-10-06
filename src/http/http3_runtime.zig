@@ -993,7 +993,11 @@ const ConnEntry = struct {
     client_auth_mode: tls_core.tls13_backend.ClientAuthMode = .disabled,
     client_identity: tls_core.client_identity.ClientIdentity = .{},
     client_identity_present: bool = false,
+    /// The runtime's policy set (for admission against the *current* table)
+    /// and the snapshot this connection pinned at accept, which alone decides
+    /// its handshake (#763).
     client_policies: ?*tls_core.client_trust.PolicySet = null,
+    client_snapshot: ?*tls_core.client_trust.PolicySnapshot = null,
     client_policy_fingerprint: u64 = 0,
     client_policy_crypto: ?crypto_pkg.provider.CryptoProvider = null,
     client_policy_allocator: ?std.mem.Allocator = null,
@@ -1039,6 +1043,7 @@ const ConnEntry = struct {
         self.conn.deinit();
         allocator.destroy(self.backend);
         if (self.client_trust_generation) |generation| generation.release();
+        if (self.client_snapshot) |snapshot| snapshot.release();
     }
 
     /// Pin the serving client-trust generation and ask the handshake engine
@@ -1073,7 +1078,8 @@ const ConnEntry = struct {
         set: *tls_core.client_trust.PolicySet,
         crypto_provider: crypto_pkg.provider.CryptoProvider,
         allocator: std.mem.Allocator,
-    ) void {
+    ) error{ClientTrustUnavailable}!void {
+        self.client_snapshot = set.acquire() orelse return error.ClientTrustUnavailable;
         self.client_policies = set;
         self.client_policy_crypto = crypto_provider;
         self.client_policy_allocator = allocator;
@@ -1082,8 +1088,8 @@ const ConnEntry = struct {
 
     fn selectClientAuth(ptr: *anyopaque, server_name: ?[]const u8) error{ClientAuthUnavailable}!tls_core.tls13_backend.ClientAuthSelection {
         const self: *ConnEntry = @ptrCast(@alignCast(ptr));
-        const set = self.client_policies orelse return error.ClientAuthUnavailable;
-        const selection = set.select(server_name) catch return error.ClientAuthUnavailable;
+        const snapshot = self.client_snapshot orelse return error.ClientAuthUnavailable;
+        const selection = snapshot.select(server_name);
         if (self.client_trust_generation) |g| g.release();
         self.client_trust_generation = selection.generation;
         self.client_auth_mode = selection.mode;
@@ -1804,8 +1810,11 @@ pub const Runtime = struct {
         }
         // #763: no datagram has been ingested yet, so the engine still has
         // time to learn it must send a CertificateRequest.
-        if (self.client_policies) |set| entry.armClientPolicies(set, self.cryptoProvider(), allocator);
-        if (self.client_policies == null) entry.armClientAuth(self.client_auth, self.client_trust, self.cryptoProvider(), allocator) catch {
+        const arm_result = if (self.client_policies) |set|
+            entry.armClientPolicies(set, self.cryptoProvider(), allocator)
+        else
+            entry.armClientAuth(self.client_auth, self.client_trust, self.cryptoProvider(), allocator);
+        arm_result catch {
             self.logger.warn(null, "http3: client certificate verification is enabled but no client trust store is loaded; refusing connection", .{});
             entry.deinit(allocator);
             allocator.destroy(entry);
@@ -2138,9 +2147,18 @@ pub const Runtime = struct {
         // under; a request whose :authority maps to a different policy must
         // not ride this connection (421), or SNI-vs-authority mismatch would
         // let one host's trust decide another's.
-        if (entry.client_policies) |set| {
+        if (entry.client_snapshot) |pinned| {
             const host = request.authority orelse (request.headers.get("host") orelse "");
-            if (!tls_core.client_trust.hostAdmitted(entry.client_policy_fingerprint, set.fingerprintForHost(host))) {
+            // Both the table this connection handshook under and the table
+            // that now serves routing must admit the host: a reload between
+            // handshake and request can only tighten, never loosen, access.
+            const current_fp: ?u64 = if (entry.client_policies.?.acquire()) |cur| blk: {
+                defer cur.release();
+                break :blk cur.fingerprintForHost(host);
+            } else null;
+            if (!tls_core.client_trust.hostAdmitted(entry.client_policy_fingerprint, pinned.fingerprintForHost(host)) or
+                !tls_core.client_trust.hostAdmitted(entry.client_policy_fingerprint, current_fp))
+            {
                 self.sendStatusResponse(entry, incoming.stream_id, 421, now);
                 return;
             }

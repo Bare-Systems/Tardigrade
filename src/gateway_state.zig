@@ -3365,6 +3365,12 @@ pub const ManagedConfigVersion = struct {
     /// ACL and skip a denial its own configuration still requires. Owned by the
     /// version and destroyed only when the last lease releases it.
     access_control: ?http.access_control.AccessControl = null,
+    /// SNI-keyed downstream client-auth policies for THIS generation (#763).
+    /// Like the ACL, they live with the configuration a connection leases, so
+    /// the TLS handshake policy, Host admission and routing of one connection
+    /// always come from one generation, whatever reloads happen meanwhile.
+    /// The version holds one reference; connections retain their own.
+    client_policies: ?*tls_core.client_trust.PolicySnapshot = null,
 
     /// The ACL to enforce for a request holding this version, if any.
     pub fn accessControl(self: *ManagedConfigVersion) ?*http.access_control.AccessControl {
@@ -3517,6 +3523,18 @@ pub const ReloadableConfigStore = struct {
     /// version. The version owns the ACL from here on, so it stays alive for
     /// every request that later leases this generation and is freed only when
     /// the last of those leases is released.
+    /// Attach the startup generation's client-auth policy snapshot (takes
+    /// ownership of one reference). Called once, before workers accept.
+    pub fn setInitialClientPolicies(self: *ReloadableConfigStore, snapshot: ?*tls_core.client_trust.PolicySnapshot) void {
+        self.current.client_policies = snapshot;
+    }
+
+    /// Attach a reload generation's client-auth policy snapshot to a
+    /// prepared-but-not-installed version (takes ownership of one reference).
+    pub fn setPreparedClientPolicies(version: *ManagedConfigVersion, snapshot: ?*tls_core.client_trust.PolicySnapshot) void {
+        version.client_policies = snapshot;
+    }
+
     pub fn setPreparedAccessControl(
         version: *ManagedConfigVersion,
         acl: ?http.access_control.AccessControl,
@@ -3582,6 +3600,7 @@ pub const ReloadableConfigStore = struct {
         // Safe precisely because this runs only at ref_count == 0: no request
         // can still be inside `check()` on these rules.
         if (version.access_control) |*acl| acl.deinit();
+        if (version.client_policies) |snapshot| snapshot.release();
         if (version.owned_cfg) |owned_cfg| {
             owned_cfg.deinit(self.allocator);
             self.allocator.destroy(owned_cfg);

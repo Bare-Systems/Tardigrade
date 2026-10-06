@@ -1073,8 +1073,8 @@ during `ClientHello`.
   did not send. Check the gateway log for `native tls handshake failed`; the
   client certificate itself is never logged. With per-`server {}` client
   auth the policy follows the TLS **SNI**: a certificate from CA A is refused
-  by a host that trusts CA B, and a client that connects without SNI gets the
-  default-server (or listener-wide) policy. A `421 Misdirected Request`
+  by a host that trusts CA B, and a client that connects without SNI matches only a
+  `server {}` block with no `server_name` (else the listener-wide policy). A `421 Misdirected Request`
   means the request's `Host` maps to a different client-auth policy than the
   SNI the connection was admitted under — reconnect with SNI equal to the
   host (curl: use the real hostname or `--connect-to`, not `--resolve` to a

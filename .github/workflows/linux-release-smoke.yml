@@ -82,22 +82,22 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        if: github.event_name != 'workflow_dispatch'
+        if: github.event_name != 'workflow_dispatch' || inputs.mode == 'full'
         run: sh ./scripts/install-zig.sh 0.16.0
 
       - name: Print Zig version
-        if: github.event_name != 'workflow_dispatch'
+        if: github.event_name != 'workflow_dispatch' || inputs.mode == 'full'
         run: zig version
 
       - name: Build native release binary
-        if: github.event_name != 'workflow_dispatch'
+        if: github.event_name != 'workflow_dispatch' || inputs.mode == 'full'
         env:
           ZIG_TARGET: ${{ matrix.zig_target }}
         run: |
           zig build -Doptimize=ReleaseFast -Dcpu=baseline "-Dtarget=$ZIG_TARGET" -Dversion=0.0.0-ci-smoke
 
       - name: Audit native release binary linkage
-        if: github.event_name != 'workflow_dispatch'
+        if: github.event_name != 'workflow_dispatch' || inputs.mode == 'full'
         run: |
           ./scripts/audit-release-binary.sh \
             --binary zig-out/bin/tardi \
@@ -105,7 +105,7 @@ jobs:
             --output "$RUNNER_TEMP/dependency-inventory-${{ matrix.archive_name }}.json"
 
       - name: Package artifact
-        if: github.event_name != 'workflow_dispatch'
+        if: github.event_name != 'workflow_dispatch' || inputs.mode == 'full'
         env:
           ARCHIVE_NAME: ${{ matrix.archive_name }}
         run: |
@@ -120,7 +120,7 @@ jobs:
         run: echo "EXPECTED_VERSION=0.0.0-ci-smoke" >> "$GITHUB_ENV"
 
       - name: Resolve published release identity
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.mode != 'full'
         env:
           TAG: ${{ inputs.tag }}
         run: |
@@ -134,7 +134,7 @@ jobs:
           printf 'EXPECTED_VERSION=%s\n' "$expected_version" >> "$GITHUB_ENV"
 
       - name: Download published release asset
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.mode != 'full'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}

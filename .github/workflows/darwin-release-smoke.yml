@@ -1,10 +1,19 @@
 name: Darwin Release Smoke
 
 on:
+  workflow_call:
+    inputs:
+      mode:
+        description: Validation mode supplied by ci.yml
+        required: true
+        type: string
   pull_request:
     paths:
       - ".github/workflows/darwin-release-smoke.yml"
       - ".github/workflows/release.yml"
+      - "CHANGELOG.md"
+      - ".github/actions/ci-mode/**"
+      - "scripts/ci-mode.sh"
       - "build.zig"
       - "build.zig.zon"
       - "src/**"
@@ -21,12 +30,37 @@ permissions:
   contents: read
 
 concurrency:
-  group: darwin-release-smoke-${{ github.event.pull_request.number || github.ref }}
+  # A release-promotion PR starts both this standalone wrapper and the
+  # reusable copy called by CI. Keep their cancellation domains separate.
+  group: ${{ github.workflow }}-darwin-release-smoke-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Same two-mode policy as ci.yml (#806): on pull requests this expensive
+  # suite runs only for release promotions (full); manual dispatch always runs.
+  mode:
+    name: Select CI mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect mode
+        id: mode
+        uses: $/.github/actions/ci-mode
+        with:
+          override: ${{ inputs.mode || (github.event_name == 'pull_request' && 'auto' || 'full') }}
+
   darwin-release-smoke:
     name: Darwin release smoke (${{ matrix.os }})
+    needs: mode
+    if: needs.mode.outputs.mode == 'full'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:

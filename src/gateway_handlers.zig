@@ -2586,6 +2586,7 @@ const Http3Early425ProxyContinuation = struct {
         for (executor.headers.iterator()) |header| {
             try headers.append(header.name, header.value);
         }
+        headers.client_cert = executor.headers.client_cert;
         const body = try allocator.dupe(u8, executor.body);
         errdefer allocator.free(body);
         const upstream_url = try allocator.dupe(u8, executor.upstream_url);
@@ -2832,6 +2833,9 @@ fn handleHttp3LocationProxyPass(
             if (gph.isForwardedClientHeader(ctx.cfg, header.name)) continue;
             try headers.append(header.name, header.value);
         }
+        // The verified mTLS identity is out-of-band state, not a header, so a
+        // header-by-header copy must carry it explicitly (#763).
+        headers.client_cert = source_headers.client_cert;
         filtered_headers = headers;
     }
     const proxy_headers: *const http.Headers = if (filtered_headers) |*headers| headers else source_headers;
@@ -3590,6 +3594,7 @@ const Http3RouteState = struct {
             var headers = http.Headers.init(allocator);
             errdefer headers.deinit();
             for (request.headers.iterator()) |header| try headers.append(header.name, header.value);
+            headers.client_cert = request.headers.client_cert;
             self.headers = headers;
         }
         return &self.headers.?;
@@ -4646,6 +4651,92 @@ test "H3 forward_auth allow propagates auth headers upstream and drops client fo
     try std.testing.expect(auth_server.requestContains(0, "X-Forwarded-Uri: /admin/users"));
     try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
     try std.testing.expect(origin.requestContains(0, "alice"));
+    try std.testing.expect(!origin.requestContains(0, "forged"));
+}
+
+fn runH3ClientCertProxy(
+    allocator: std.mem.Allocator,
+    with_forward_auth: bool,
+    client_cert: ?http.headers.ClientCertificate,
+    origin_out: *H3ProxyOrigin,
+) !void {
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nX-Auth-User: alice\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    if (with_forward_auth) try auth_server.run();
+    try origin_out.run();
+
+    var auth_url_buf: [64]u8 = undefined;
+    var target_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "http://127.0.0.1:{d}", .{origin_out.port()});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+        .forward_auth = if (with_forward_auth) .{
+            .url = auth_server.url(&auth_url_buf, "/verify"),
+            .upstream_headers = &.{"X-Auth-User"},
+        } else null,
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/admin/users"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+    };
+    defer request.deinit();
+    // A client can put anything it likes on the wire; none of it may pass for
+    // the handshake-verified identity.
+    try request.headers.append("X-Tardigrade-Client-Cert-Verified", "1");
+    try request.headers.append("X-Tardigrade-Client-Cert-Subject", "CN=forged-admin");
+    request.headers.client_cert = client_cert;
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+}
+
+test "H3 proxy asserts only the handshake-verified client certificate and drops forged identity headers (#763)" {
+    const allocator = std.testing.allocator;
+    inline for (.{ false, true }) |with_forward_auth| {
+        var origin = try H3ProxyOrigin.start(allocator, &.{200});
+        defer origin.stop();
+        try runH3ClientCertProxy(allocator, with_forward_auth, .{
+            .fingerprint_sha256 = "ab" ** 32,
+            .subject = "CN=alice",
+            .san_email = "alice@example.com",
+        }, &origin);
+
+        try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+        try std.testing.expect(origin.requestContains(0, "X-Tardigrade-Client-Cert-Subject: CN=alice"));
+        try std.testing.expect(origin.requestContains(0, "X-Tardigrade-Client-Cert-San-Email: alice@example.com"));
+        try std.testing.expect(origin.requestContains(0, "X-Tardigrade-Client-Cert-Fingerprint-Sha256: " ++ "ab" ** 32));
+        try std.testing.expect(!origin.requestContains(0, "forged"));
+        if (with_forward_auth) try std.testing.expect(origin.requestContains(0, "alice"));
+    }
+}
+
+test "H3 proxy asserts no client identity for an anonymous connection even when the client forges headers (#763)" {
+    const allocator = std.testing.allocator;
+    var origin = try H3ProxyOrigin.start(allocator, &.{200});
+    defer origin.stop();
+    try runH3ClientCertProxy(allocator, false, null, &origin);
+
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expect(!origin.requestContains(0, "X-Tardigrade-Client-Cert"));
     try std.testing.expect(!origin.requestContains(0, "forged"));
 }
 

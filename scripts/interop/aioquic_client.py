@@ -10,6 +10,12 @@ IPv4-only CI sandboxes cannot create.
 
 usage: aioquic_client.py HOST PORT PATH [AUTHORITY]
 
+Environment (downstream mTLS interop, #763):
+  AIOQUIC_CLIENT_CERT / AIOQUIC_CLIENT_KEY   PEM client certificate chain and
+      private key presented when the server sends a CertificateRequest.
+  AIOQUIC_REQUEST_HEADERS   comma-separated `name:value` pairs added to the
+      request (used to prove a forged identity header cannot be spoofed).
+
 AUTHORITY (SNI + `:authority`) defaults to HOST when omitted. Pass the
 server's configured `server_name` explicitly when HOST is a bare IP: the
 gateway's virtual-host resolution (like plain HTTP/1.1) matches on
@@ -18,6 +24,7 @@ request to a name-based vhost 404s exactly as it would over HTTP/1.1.
 """
 
 import asyncio
+import os
 import socket
 import ssl
 import sys
@@ -27,7 +34,7 @@ from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
-from aioquic.quic.events import QuicEvent
+from aioquic.quic.events import ConnectionTerminated, QuicEvent
 
 
 class ClientProtocol(QuicConnectionProtocol):
@@ -39,6 +46,12 @@ class ClientProtocol(QuicConnectionProtocol):
         self.done = asyncio.Event()
 
     def quic_event_received(self, event: QuicEvent) -> None:
+        if isinstance(event, ConnectionTerminated):
+            # The server refused or tore down the connection (for example a
+            # rejected client certificate): fail fast instead of waiting out
+            # the response timeout.
+            print(f"connection terminated: error_code={event.error_code} reason={event.reason_phrase!r}")
+            self.done.set()
         for http_event in self.http.handle_event(event):
             if isinstance(http_event, HeadersReceived):
                 for name, value in http_event.headers:
@@ -54,6 +67,13 @@ async def main(host: str, port: int, path: str, authority: str) -> int:
     configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
     configuration.verify_mode = ssl.CERT_NONE
     configuration.server_name = authority
+    client_cert = os.environ.get("AIOQUIC_CLIENT_CERT")
+    if client_cert:
+        configuration.load_cert_chain(client_cert, os.environ.get("AIOQUIC_CLIENT_KEY"))
+    extra_headers = []
+    for pair in filter(None, os.environ.get("AIOQUIC_REQUEST_HEADERS", "").split(",")):
+        name, _, value = pair.partition(":")
+        extra_headers.append((name.strip().lower().encode(), value.strip().encode()))
     connection = QuicConnection(configuration=configuration)
 
     loop = asyncio.get_running_loop()
@@ -74,7 +94,8 @@ async def main(host: str, port: int, path: str, authority: str) -> int:
                 (b":scheme", b"https"),
                 (b":authority", authority.encode()),
                 (b":path", path.encode()),
-            ],
+            ]
+            + extra_headers,
             end_stream=True,
         )
         protocol.transmit()

@@ -3453,13 +3453,6 @@ fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
         logConfigDiagnostic("config validation failed: native-TLS builds negotiate the built-in TLS 1.3 suite set; the OpenSSL-format TARDIGRADE_TLS_CIPHER_LIST/TARDIGRADE_TLS_CIPHER_SUITES overrides must be empty", .{});
         return error.UnsupportedNativeTlsConfiguration;
     }
-    if (cfg.tls_client_verify and cfg.http3_enabled) {
-        // The shipping QUIC/HTTP-3 handshake does not request or verify client
-        // certificates; refuse the combination instead of letting HTTP/3 serve
-        // clients that an operator believes are authenticated (#763).
-        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_CLIENT_VERIFY is supported on HTTP/1.1 and HTTP/2 over native TLS only; disable TARDIGRADE_HTTP3_ENABLED", .{});
-        return error.UnsupportedNativeTlsConfiguration;
-    }
     if (cfg.tls_client_verify and (cfg.tls_client_verify_depth == 0 or cfg.tls_client_verify_depth > max_client_verify_depth)) {
         logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH must be between 1 and 8 (the TLS engine's peer-chain entry bound)", .{});
         return error.UnsupportedNativeTlsConfiguration;
@@ -5004,8 +4997,8 @@ test "native-TLS builds reject legacy OpenSSL-only TLS settings one at a time" {
         try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
     }
     {
-        // #763: downstream client verification is supported on H1/H2, but
-        // not alongside HTTP/3 (the QUIC handshake has no client-auth path).
+        // #763: downstream client verification is supported on H1/H2 and
+        // HTTP/3 alike (one trust store, one policy).
         var cfg = base;
         cfg.tls_client_verify = true;
         // Client verification without a server identity would serve
@@ -5019,7 +5012,7 @@ test "native-TLS builds reject legacy OpenSSL-only TLS settings one at a time" {
         cfg.tls_key_path = key_keep;
         try validateNativeTlsBuildConfig(&cfg);
         cfg.http3_enabled = true;
-        try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
+        try validateNativeTlsBuildConfig(&cfg);
         cfg.http3_enabled = false;
         cfg.tls_client_verify_depth = 0;
         try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));

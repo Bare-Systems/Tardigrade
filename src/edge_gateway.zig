@@ -494,6 +494,10 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             .credential_provider = h3_credential_provider,
             .resumption_runtime = if (native_resumption_runtime) |*rt| rt else null,
             .early_data_replay_gate = native_early_data_replay_gate,
+            // #763: the same trust store the TCP listener uses, so one CA
+            // bundle and one reload govern H1, H2 and H3.
+            .client_auth = if (!cfg.tls_client_verify) .disabled else if (cfg.tls_client_verify_optional) .optional else .required,
+            .client_trust = if (client_trust) |*store| store else null,
             .tls_min_version = "1.3",
             .tls_max_version = "1.3",
             .enable_0rtt = cfg.http3_enable_0rtt,

@@ -1214,3 +1214,373 @@ test "udp smoke: appliance credential provider authenticates native QUIC/H3" {
         .pending => return error.TestUnexpectedPending,
     }
 }
+
+// ---------------------------------------------------------------------------
+// #763: downstream client-certificate authentication over real UDP + the real
+// HTTP/3 runtime. The native client answers the server's CertificateRequest
+// with fixture identities from `tests/fixtures/tls/h3mtls` (regenerate with
+// its `gen.sh`); trust is the same `ClientTrustStore` the TCP listener uses.
+// ---------------------------------------------------------------------------
+
+const mtls_ca_path = "tests/fixtures/tls/h3mtls/ca.crt";
+
+const MtlsFixture = struct {
+    cert_der: []const u8,
+    key_der: []const u8,
+};
+
+const mtls_valid = MtlsFixture{
+    .cert_der = @embedFile("fixtures/tls/h3mtls/client.der"),
+    .key_der = @embedFile("fixtures/tls/h3mtls/client.key.der"),
+};
+const mtls_expired = MtlsFixture{
+    .cert_der = @embedFile("fixtures/tls/h3mtls/client_expired.der"),
+    .key_der = @embedFile("fixtures/tls/h3mtls/client_expired.key.der"),
+};
+const mtls_not_yet_valid = MtlsFixture{
+    .cert_der = @embedFile("fixtures/tls/h3mtls/client_not_yet_valid.der"),
+    .key_der = @embedFile("fixtures/tls/h3mtls/client_not_yet_valid.key.der"),
+};
+const mtls_wrong_eku = MtlsFixture{
+    .cert_der = @embedFile("fixtures/tls/h3mtls/client_wrong_eku.der"),
+    .key_der = @embedFile("fixtures/tls/h3mtls/client_wrong_eku.key.der"),
+};
+const mtls_wrong_ca = MtlsFixture{
+    .cert_der = @embedFile("fixtures/tls/h3mtls/client_wrong_ca.der"),
+    .key_der = @embedFile("fixtures/tls/h3mtls/client_wrong_ca.key.der"),
+};
+
+const MtlsHandlerState = struct {
+    requests: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    mutex: std.atomic.Mutex = .unlocked,
+    cert_present: bool = false,
+    fingerprint: [64]u8 = undefined,
+    subject: [128]u8 = undefined,
+    subject_len: usize = 0,
+    san_email: [64]u8 = undefined,
+    san_email_len: usize = 0,
+    /// The request carried a client-supplied `x-tardigrade-client-cert-*`
+    /// header (the spoof attempt); recorded to prove it never became identity.
+    saw_spoof_header: bool = false,
+
+    fn lock(self: *MtlsHandlerState) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+};
+
+fn mtlsHandler(
+    _: std.mem.Allocator,
+    request: *const http3_runtime.StreamRequest,
+    response: *http3_runtime.Response,
+    user_data: ?*anyopaque,
+) anyerror!void {
+    const state: *MtlsHandlerState = @ptrCast(@alignCast(user_data.?));
+    state.lock();
+    defer state.mutex.unlock();
+    state.saw_spoof_header = request.headers.get("x-tardigrade-client-cert-verified") != null;
+    if (request.headers.client_cert) |cert| {
+        state.cert_present = true;
+        @memcpy(&state.fingerprint, cert.fingerprint_sha256[0..64]);
+        state.subject_len = cert.subject.len;
+        @memcpy(state.subject[0..cert.subject.len], cert.subject);
+        state.san_email_len = cert.san_email.len;
+        @memcpy(state.san_email[0..cert.san_email.len], cert.san_email);
+    } else {
+        state.cert_present = false;
+    }
+    _ = state.requests.fetchAdd(1, .monotonic);
+    _ = response.setStatus(.ok).setBody("mtls-ok").setContentType("text/plain");
+}
+
+const MtlsOutcome = enum { served, refused };
+
+/// How the client corrupts its (otherwise valid) certificate DER before
+/// sending it; the private key stays the real one so only the *verifier* can
+/// be what refuses it.
+const MtlsMutation = enum {
+    none,
+    /// Bytes after the outer SEQUENCE: legal to a lax parser, malformed DER.
+    trailing_garbage,
+    /// Flip a bit in the issuer signature: structurally fine, path invalid.
+    tampered_signature,
+    /// Not a certificate at all (declared length overruns the buffer).
+    truncated,
+};
+
+/// Drive one native H3 client against `runtime` until it either completes a
+/// request or its connection is torn down. `fixture == null` models a client
+/// that answers CertificateRequest with an empty Certificate.
+fn runMtlsClient(
+    allocator: std.mem.Allocator,
+    runtime: *http3_runtime.Runtime,
+    fixture: ?MtlsFixture,
+    mutation: MtlsMutation,
+    spoof_header: bool,
+) !MtlsOutcome {
+    var client_socket = try UdpSocket.open();
+    defer client_socket.close();
+
+    const client_cid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8 };
+    const odcid = [_]u8{ 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48 };
+    const client_path = quic.path.PathKey{
+        .local = addressFromSockaddrIn(client_socket.addr),
+        .remote = runtime.local_address,
+    };
+
+    var client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
+    var client_backend = tls_backend.Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0xe1} ** 32 },
+        client_provider_storage.init(0x442_c),
+        .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
+    );
+    var client_identity_provider: ?tls_core.credentials.FixedCredentialProvider = null;
+    defer if (client_identity_provider) |*p| p.deinit();
+    var mutated_chain: ?[]u8 = null;
+    defer if (mutated_chain) |bytes| allocator.free(bytes);
+    if (fixture) |f| {
+        client_identity_provider = tls_core.credentials.FixedCredentialProvider.init(
+            try tls_core.credentials.Identity.initPkcs8(f.cert_der, f.key_der),
+            tls_core.credentials.testdata.ignoredEntropy(),
+        );
+        if (mutation != .none) {
+            const mutated = try allocator.alloc(u8, f.cert_der.len + 4);
+            @memcpy(mutated[0..f.cert_der.len], f.cert_der);
+            var len = f.cert_der.len;
+            switch (mutation) {
+                .none => unreachable,
+                .trailing_garbage => {
+                    @memcpy(mutated[len..][0..2], "\x00\x01");
+                    len += 2;
+                },
+                .tampered_signature => mutated[len - 3] ^= 0x01,
+                .truncated => len -= 7,
+            }
+            mutated_chain = mutated;
+            client_identity_provider.?.chain_entry[0] = mutated[0..len];
+        }
+        client_backend.engine.setLocalCredentialProvider(client_identity_provider.?.provider());
+    }
+
+    const client = try Connection.init(allocator, .{
+        .role = .client,
+        .local_cid = &client_cid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
+        .tls = client_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
+        .now_us = nowUs(),
+        .initial_path = client_path,
+    });
+    defer client.deinit();
+    var client_h3 = H3.init(allocator, .client);
+    defer client_h3.deinit();
+
+    var h3_started = false;
+    var request_id: ?u64 = null;
+    const spoof = [_]http3.qpack.HeaderField{.{ .name = "x-tardigrade-client-cert-verified", .value = "1" }};
+    const deadline = nowUs() + 8_000_000;
+    var iterations: usize = 0;
+    while (nowUs() < deadline) : (iterations += 1) {
+        try testing.expect(iterations < 5_000);
+        const now = nowUs();
+
+        var out: [2048]u8 = undefined;
+        while (client.pollTransmitOnPath(&out, now)) |t| {
+            try client_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
+        }
+
+        var next: u64 = now + 50_000;
+        if (client.nextTimeoutUs()) |t| next = @min(next, t);
+        const timeout_ms: i32 = @intCast(@min((next -| now) / 1_000 + 1, 50));
+        var fds = [_]posix.pollfd{.{ .fd = client_socket.fd, .events = posix.POLL.IN, .revents = 0 }};
+        _ = try posix.poll(&fds, timeout_ms);
+
+        var in: [2048]u8 = undefined;
+        while (try client_socket.recv(&in)) |datagram| {
+            client.ingestOnPath(datagram, client_path, test_challenge_entropy, nowUs()) catch return .refused;
+        }
+        client.onTimeout(nowUs());
+
+        switch (client.state()) {
+            .closing, .draining, .closed => return .refused,
+            else => {},
+        }
+
+        if (!h3_started and client.isEstablished()) {
+            try client_h3.start(client);
+            h3_started = true;
+        }
+        if (h3_started) {
+            if (request_id == null) {
+                request_id = try client_h3.sendRequest(client, .{
+                    .authority = "tardigrade.test",
+                    .path = "/mtls",
+                    .headers = if (spoof_header) &spoof else &.{},
+                });
+            }
+            try client_h3.pump(client);
+            if (request_id) |id| {
+                if (try client_h3.pollResponse(id)) |response| {
+                    try testing.expectEqual(@as(u16, 200), response.status);
+                    try testing.expectEqualStrings("mtls-ok", response.body);
+                    client_h3.releaseResponse(id);
+                    return .served;
+                }
+            }
+        }
+    }
+    return .refused;
+}
+
+const MtlsServer = struct {
+    fixed: tls_core.credentials.FixedCredentialProvider,
+    logger: http3_runtime.Logger,
+    handler_state: MtlsHandlerState = .{},
+    trust: tls_core.client_trust.ClientTrustStore,
+    runtime: http3_runtime.Runtime,
+
+    fn start(self: *MtlsServer, allocator: std.mem.Allocator, mode: tls_core.tls13_backend.ClientAuthMode) !void {
+        self.fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+        self.logger = http3_runtime.Logger.init(.err, "udp-h3-mtls-test");
+        self.handler_state = .{};
+        self.trust = tls_core.client_trust.ClientTrustStore.init(allocator);
+        var prepared = try self.trust.prepare(mtls_ca_path, 3);
+        self.trust.commit(&prepared);
+        self.runtime = try http3_runtime.Runtime.init(allocator, &self.logger, .{
+            .listen_host = "127.0.0.1",
+            .quic_port = 0,
+            .credential_provider = self.fixed.provider(),
+            .client_auth = mode,
+            .client_trust = &self.trust,
+            .request_handler = mtlsHandler,
+            .request_handler_ctx = &self.handler_state,
+        });
+        self.runtime.start();
+    }
+
+    fn stop(self: *MtlsServer) void {
+        self.runtime.deinit();
+        self.trust.deinit();
+        self.fixed.deinit();
+    }
+};
+
+fn expectMtlsRefused(mode: tls_core.tls13_backend.ClientAuthMode, fixture: ?MtlsFixture, mutation: MtlsMutation) !void {
+    const allocator = testing.allocator;
+    var server: MtlsServer = undefined;
+    try server.start(allocator, mode);
+    defer server.stop();
+
+    const outcome = try runMtlsClient(allocator, &server.runtime, fixture, mutation, false);
+    try testing.expectEqual(MtlsOutcome.refused, outcome);
+    // The application never saw a request, and the server never reported a
+    // completed handshake for the refused peer.
+    try testing.expectEqual(@as(usize, 0), server.handler_state.requests.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), server.runtime.snapshot().handshakes_completed);
+}
+
+test "udp h3 mTLS: required mode serves a valid client certificate and captures verified identity (#763)" {
+    const allocator = testing.allocator;
+    var server: MtlsServer = undefined;
+    try server.start(allocator, .required);
+    defer server.stop();
+
+    const outcome = try runMtlsClient(allocator, &server.runtime, mtls_valid, .none, true);
+    try testing.expectEqual(MtlsOutcome.served, outcome);
+    try testing.expectEqual(@as(usize, 1), server.handler_state.requests.load(.monotonic));
+
+    server.handler_state.lock();
+    defer server.handler_state.mutex.unlock();
+    try testing.expect(server.handler_state.cert_present);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(mtls_valid.cert_der, &digest, .{});
+    var expected_fp: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&expected_fp, "{x}", .{&digest});
+    try testing.expectEqualSlices(u8, &expected_fp, &server.handler_state.fingerprint);
+    try testing.expectEqualStrings("CN=h3-client.example", server.handler_state.subject[0..server.handler_state.subject_len]);
+    try testing.expectEqualStrings("h3@example.com", server.handler_state.san_email[0..server.handler_state.san_email_len]);
+    // The spoofed header travelled as an ordinary request header; identity
+    // came only from the handshake.
+    try testing.expect(server.handler_state.saw_spoof_header);
+}
+
+test "udp h3 mTLS: required mode refuses a client that presents no certificate (#763)" {
+    try expectMtlsRefused(.required, null, .none);
+}
+
+test "udp h3 mTLS: optional mode serves an anonymous client without any identity, spoofed header notwithstanding (#763)" {
+    const allocator = testing.allocator;
+    var server: MtlsServer = undefined;
+    try server.start(allocator, .optional);
+    defer server.stop();
+
+    const outcome = try runMtlsClient(allocator, &server.runtime, null, .none, true);
+    try testing.expectEqual(MtlsOutcome.served, outcome);
+    server.handler_state.lock();
+    defer server.handler_state.mutex.unlock();
+    try testing.expect(!server.handler_state.cert_present);
+    try testing.expect(server.handler_state.saw_spoof_header);
+}
+
+test "udp h3 mTLS: optional mode serves a valid presented certificate (#763)" {
+    const allocator = testing.allocator;
+    var server: MtlsServer = undefined;
+    try server.start(allocator, .optional);
+    defer server.stop();
+
+    try testing.expectEqual(MtlsOutcome.served, try runMtlsClient(allocator, &server.runtime, mtls_valid, .none, false));
+    server.handler_state.lock();
+    defer server.handler_state.mutex.unlock();
+    try testing.expect(server.handler_state.cert_present);
+}
+
+test "udp h3 mTLS: optional mode still rejects a presented certificate that does not verify (#763)" {
+    try expectMtlsRefused(.optional, mtls_wrong_ca, .none);
+}
+
+test "udp h3 mTLS: malformed client certificates are refused (#763)" {
+    try expectMtlsRefused(.required, mtls_valid, .trailing_garbage);
+    try expectMtlsRefused(.required, mtls_valid, .truncated);
+}
+
+test "udp h3 mTLS: a client certificate with a tampered issuer signature is refused (#763)" {
+    try expectMtlsRefused(.required, mtls_valid, .tampered_signature);
+}
+
+test "udp h3 mTLS: expired client certificate is refused (#763)" {
+    try expectMtlsRefused(.required, mtls_expired, .none);
+}
+
+test "udp h3 mTLS: not-yet-valid client certificate is refused (#763)" {
+    try expectMtlsRefused(.required, mtls_not_yet_valid, .none);
+}
+
+test "udp h3 mTLS: client certificate from an untrusted CA is refused (#763)" {
+    try expectMtlsRefused(.required, mtls_wrong_ca, .none);
+}
+
+test "udp h3 mTLS: serverAuth-only client certificate (wrong EKU) is refused (#763)" {
+    try expectMtlsRefused(.required, mtls_wrong_eku, .none);
+}
+
+test "udp h3 mTLS: a runtime asked for client auth without a trust store refuses every connection (#763)" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = http3_runtime.Logger.init(.err, "udp-h3-mtls-notrust-test");
+    var handler_state = MtlsHandlerState{};
+    var runtime = try http3_runtime.Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .client_auth = .required,
+        .client_trust = null,
+        .request_handler = mtlsHandler,
+        .request_handler_ctx = &handler_state,
+    });
+    defer runtime.deinit();
+    runtime.start();
+
+    try testing.expectEqual(MtlsOutcome.refused, try runMtlsClient(allocator, &runtime, mtls_valid, .none, false));
+    try testing.expectEqual(@as(usize, 0), handler_state.requests.load(.monotonic));
+}

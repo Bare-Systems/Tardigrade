@@ -240,3 +240,36 @@ test "fromVerifiedDer renders subject, issuer, serial and fingerprint" {
 test "fromVerifiedDer rejects malformed DER" {
     try testing.expectError(error.MalformedCertificate, ClientIdentity.fromVerifiedDer(testing.allocator, "not a certificate"));
 }
+
+test "fuzz: TLS protocol: client identity rendering is total, bounded and header-safe on arbitrary DER (#763)" {
+    try testing.fuzz({}, fuzzClientIdentity, .{ .corpus = &.{
+        "",
+        "\x30\x00",
+        "\x30\x82\xff\xff",
+        @embedFile("testdata/rsa3072-cert.der"),
+    } });
+}
+
+fn fuzzClientIdentity(_: void, smith: *testing.Smith) !void {
+    var buf: [8192]u8 = undefined;
+    const len = smith.slice(&buf);
+    var input = buf[0..len];
+    // Half the time, start from a real certificate and corrupt it, so the
+    // renderer is also driven through deep, almost-valid structure.
+    if (smith.index(2) == 0) {
+        const real = @embedFile("testdata/rsa3072-cert.der");
+        @memcpy(buf[0..real.len], real);
+        input = buf[0..real.len];
+        var flips = smith.index(4);
+        while (flips > 0) : (flips -= 1) input[smith.index(input.len)] ^= @as(u8, 1) << @intCast(smith.index(8));
+    }
+    const id = ClientIdentity.fromVerifiedDer(testing.allocator, input) catch return;
+    try testing.expectEqual(@as(usize, fingerprint_hex_len), id.fingerprintSha256().len);
+    const fields = [_][]const u8{ id.subject(), id.issuer(), id.serialHex(), id.sanDns(), id.sanEmail(), id.sanUri() };
+    for (fields) |field| {
+        try testing.expect(field.len <= max_dn_len);
+        // Every byte is a legal HTTP field-value byte: no CR/LF/NUL, no 8-bit.
+        for (field) |c| try testing.expect(c >= 0x20 and c <= 0x7e);
+    }
+    try testing.expect(id.subject().len <= max_dn_len and id.sanDns().len <= max_san_len);
+}

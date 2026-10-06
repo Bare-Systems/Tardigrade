@@ -25,7 +25,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-tls-reuse-soak-${{ github.ref }}
+  # A release-promotion PR starts both this standalone wrapper and the
+  # reusable copy called by CI. Keep their cancellation domains separate.
+  group: ${{ github.workflow }}-native-tls-reuse-soak-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

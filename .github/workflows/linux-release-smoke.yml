@@ -33,7 +33,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: linux-release-smoke-${{ github.event.pull_request.number || github.ref }}
+  # A release-promotion PR starts both this standalone wrapper and the
+  # reusable copy called by CI. Keep their cancellation domains separate.
+  group: ${{ github.workflow }}-linux-release-smoke-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:

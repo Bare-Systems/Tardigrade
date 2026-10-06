@@ -92,14 +92,23 @@ same ref are cancelled (`cancel-in-progress`).
 
 ## Cost comparison (PR touching `src/`)
 
-| | Before | Smoke | Full |
+| Run | Result | Wall clock | Billed runner minutes |
 | --- | --- | --- | --- |
-| Jobs (incl. matrix legs, release-smoke workflows) | ~38 | 11 (+2 trivial mode jobs) | ~41 |
-| Cross-OS/arch legs, 9-way build matrix, packaging, interop, perf | all | none | all |
+| [Smoke PR run 37504003444](https://github.com/Bare-Systems/Tardigrade/actions/runs/37504003444) | success | 8m07s | unavailable |
+| [Manual full run 37503993443](https://github.com/Bare-Systems/Tardigrade/actions/runs/37503993443) | failed | 18m41s | unavailable |
 
-Job counts come from the workflow definitions. Runner-minute totals were not
-measured in this change (no CI run existed yet); record real before/after
-wall-clock and billed minutes from the first smoke and full runs.
+The full run launched and completed every full-only/reusable release-smoke and
+soak suite, but its aggregate failed because the existing best-effort native-H2
+integration test did not complete a request; this is not a passing full-mode
+baseline. GitHub's run-timing API returned zero billed milliseconds for both
+runs, so billed minutes were not available. Repeat the full measurement after
+that unrelated integration failure is green before treating it as release
+evidence.
+
+The workflow definitions contain approximately 11 smoke jobs (plus two trivial
+mode jobs) and approximately 41 full jobs including matrix legs and release
+smoke workflows. Smoke omits cross-OS/arch legs, the 9-way build matrix,
+packaging, interop, and performance checks; full includes them.
 
 ## Failure-behaviour checks
 

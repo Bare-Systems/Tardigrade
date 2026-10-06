@@ -176,6 +176,10 @@ const ServerBlockBuilder = struct {
     upstream_base_url: ?[]u8 = null,
     proxy_pass_chat: ?[]u8 = null,
     proxy_pass_commands_prefix: ?[]u8 = null,
+    tls_client_verify: ?[]u8 = null,
+    tls_client_verify_optional: ?[]u8 = null,
+    tls_client_ca_path: ?[]u8 = null,
+    tls_client_verify_depth: ?[]u8 = null,
     location_entries: std.ArrayList(ServerLocationEntry) = .empty,
     proxy_set_headers: std.ArrayList(ProxySetHeaderBuilder) = .empty,
 
@@ -188,6 +192,10 @@ const ServerBlockBuilder = struct {
         if (self.upstream_base_url) |value| allocator.free(value);
         if (self.proxy_pass_chat) |value| allocator.free(value);
         if (self.proxy_pass_commands_prefix) |value| allocator.free(value);
+        if (self.tls_client_verify) |value| allocator.free(value);
+        if (self.tls_client_verify_optional) |value| allocator.free(value);
+        if (self.tls_client_ca_path) |value| allocator.free(value);
+        if (self.tls_client_verify_depth) |value| allocator.free(value);
         for (self.location_entries.items) |location| allocator.free(location.entry);
         self.location_entries.deinit(allocator);
         deinitProxySetHeaders(allocator, &self.proxy_set_headers);
@@ -645,6 +653,22 @@ fn parseServerStatement(
     }
     if (std.ascii.eqlIgnoreCase(directive, "tls_key_path")) {
         try replaceOptionalOwned(allocator, &builder.tls_key_path, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "tls_client_verify")) {
+        try replaceOptionalOwned(allocator, &builder.tls_client_verify, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "tls_client_verify_optional")) {
+        try replaceOptionalOwned(allocator, &builder.tls_client_verify_optional, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "tls_client_ca_path")) {
+        try replaceOptionalOwned(allocator, &builder.tls_client_ca_path, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "tls_client_verify_depth")) {
+        try replaceOptionalOwned(allocator, &builder.tls_client_verify_depth, value_interp);
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "upstream_base_url")) {
@@ -1405,6 +1429,20 @@ fn flushServerBlock(allocator: std.mem.Allocator, overrides: *Overrides, builder
     );
     defer allocator.free(record);
     try appendOverride(allocator, &overrides.map, "TARDIGRADE_SERVER_BLOCKS", record, server_block_record_sep);
+
+    // #763: per-server mTLS policy rides a parallel record (one per block, in
+    // order) so the positional server-block record format is untouched.
+    const client_auth_record = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}{s}{s}", .{
+        builder.tls_client_verify orelse "",
+        server_block_field_sep,
+        builder.tls_client_verify_optional orelse "",
+        server_block_field_sep,
+        builder.tls_client_ca_path orelse "",
+        server_block_field_sep,
+        builder.tls_client_verify_depth orelse "",
+    });
+    defer allocator.free(client_auth_record);
+    try appendOverride(allocator, &overrides.map, "TARDIGRADE_SERVER_BLOCK_CLIENT_AUTH", client_auth_record, server_block_record_sep);
 }
 
 fn replaceOptionalOwned(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
@@ -2363,4 +2401,42 @@ test "proxy_set_header rejects framing headers, CR/LF, unknown variables and mis
         \\    proxy_set_header Host "";
         \\}
     );
+}
+
+test "server block mTLS directives serialize onto a parallel record (#763)" {
+    const allocator = std.testing.allocator;
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{
+        .sub_path = "mtls.conf",
+        .data =
+        \\server {
+        \\    server_name api.example.test;
+        \\    tls_client_verify on;
+        \\    tls_client_ca_path /ca/api.pem;
+        \\    tls_client_verify_depth 2;
+        \\}
+        \\server {
+        \\    server_name open.example.test;
+        \\    tls_client_verify off;
+        \\}
+        ,
+    });
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "mtls.conf");
+    defer allocator.free(absolute);
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+    try parseFile(allocator, absolute, &overrides, &vars, &visited);
+    const expected = "on" ++ server_block_field_sep ++ "" ++ server_block_field_sep ++ "/ca/api.pem" ++ server_block_field_sep ++ "2" ++
+        server_block_record_sep ++
+        "off" ++ server_block_field_sep ++ "" ++ server_block_field_sep ++ "" ++ server_block_field_sep ++ "";
+    try std.testing.expectEqualStrings(expected, overrides.map.get("TARDIGRADE_SERVER_BLOCK_CLIENT_AUTH").?);
 }

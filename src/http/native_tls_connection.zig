@@ -25,6 +25,7 @@ pub const SniCertSpec = struct {
 
 /// Downstream client-certificate trust anchors (#763); shared with HTTP/3.
 pub const ClientTrustStore = tls.client_trust.ClientTrustStore;
+pub const ClientPolicySet = tls.client_trust.PolicySet;
 
 pub const NativeCredentialStore = struct {
     allocator: std.mem.Allocator,
@@ -211,6 +212,10 @@ pub const NativeTlsConnection = struct {
         /// creation fails closed otherwise.
         client_auth: tls_backend.ClientAuthMode = .disabled,
         client_trust: ?*ClientTrustStore = null,
+        /// SNI-keyed client-auth policies (#763). When set, the policy (mode
+        /// and trust generation) is chosen from the ClientHello server_name
+        /// and takes precedence over `client_auth`/`client_trust`.
+        client_policies: ?*ClientPolicySet = null,
     };
 
     allocator: std.mem.Allocator,
@@ -234,6 +239,10 @@ pub const NativeTlsConnection = struct {
     client_verifier: webpki_verifier.WebPkiVerifier = undefined,
     client_identity: client_identity.ClientIdentity = .{},
     client_identity_present: bool = false,
+    client_policies: ?*ClientPolicySet = null,
+    /// Fingerprint of the SNI-selected policy this connection was admitted
+    /// under (0 = no client auth); see `tls.client_trust.hostAdmitted`.
+    client_policy_fingerprint: u64 = 0,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -327,7 +336,11 @@ pub const NativeTlsConnection = struct {
             .resumption_runtime = options.resumption_runtime,
             .server_early_data_policy = if (options.early_data_replay_gate != null and options.resumption_runtime != null) options.server_early_data_policy else .{},
             .client_trust_generation = trust_generation,
+            .client_policies = options.client_policies,
         };
+        if (options.client_policies != null) {
+            backend.setClientAuthSelector(.{ .ctx = self, .selectFn = selectClientAuth });
+        }
         if (trust_generation) |g| {
             self.client_verifier = webpki_verifier.WebPkiVerifier.initClientAuth(
                 allocator,
@@ -348,6 +361,38 @@ pub const NativeTlsConnection = struct {
         );
         backend_owned_by_record = true;
         return self;
+    }
+
+    /// Backend hook: pick the client-auth policy for the ClientHello's SNI and
+    /// pin its trust generation for this handshake.
+    fn selectClientAuth(ptr: *anyopaque, server_name: ?[]const u8) error{ClientAuthUnavailable}!tls_backend.ClientAuthSelection {
+        const self: *NativeTlsConnection = @ptrCast(@alignCast(ptr));
+        const set = self.client_policies orelse return error.ClientAuthUnavailable;
+        const selection = set.select(server_name) catch return error.ClientAuthUnavailable;
+        if (self.client_trust_generation) |g| g.release();
+        self.client_trust_generation = selection.generation;
+        self.client_policy_fingerprint = selection.fingerprint;
+        const g = selection.generation orelse return .{ .mode = .disabled };
+        self.client_verifier = webpki_verifier.WebPkiVerifier.initClientAuth(
+            self.allocator,
+            g.anchors.anchors(),
+            self.crypto_provider_state.cryptoProvider(),
+            g.max_path_length,
+        );
+        return .{ .mode = selection.mode, .verifier = self.client_verifier.verifier() };
+    }
+
+    /// Whether a request for `host` may be served on this connection: its
+    /// client-auth policy must not differ from the SNI-selected one the
+    /// handshake enforced (otherwise the caller answers 421).
+    pub fn clientPolicyAdmitsHost(self: *const NativeTlsConnection, host: []const u8) bool {
+        const set = self.client_policies orelse return true;
+        return tls.client_trust.hostAdmitted(self.client_policy_fingerprint, set.fingerprintForHost(host));
+    }
+
+    fn nativeClientPolicyAdmitsHost(ptr: *anyopaque, host: []const u8) bool {
+        const self: *NativeTlsConnection = @ptrCast(@alignCast(ptr));
+        return self.clientPolicyAdmitsHost(host);
     }
 
     pub fn destroy(self: *NativeTlsConnection) void {
@@ -379,6 +424,7 @@ pub const NativeTlsConnection = struct {
             nativeHandshakeComplete,
         );
         conn.client_cert_fn = nativeClientIdentity;
+        conn.client_policy_admits_host_fn = nativeClientPolicyAdmitsHost;
         return conn;
     }
 
@@ -1469,6 +1515,53 @@ test "native TLS client auth pins a trust generation for the connection lifetime
     var rotated = try store.prepare("tests/fixtures/tls/native_ed25519_ca.crt", 3);
     store.commit(&rotated);
     conn.destroy();
+}
+
+test "native TLS per-SNI policy: the connection installs the selector and only admits hosts whose policy matches its SNI-selected one (#763)" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    var set = ClientPolicySet.init(std.testing.allocator);
+    defer set.deinit();
+    const specs = [_]tls.client_trust.PolicySpec{
+        .{ .names = &.{"api.example.test"}, .mode = .required, .ca_path = "tests/fixtures/tls/ca.crt" },
+        .{ .names = &.{"admin.example.test"}, .mode = .required, .ca_path = "tests/fixtures/tls/native_ed25519_ca.crt" },
+        .{ .names = &.{"open.example.test"}, .mode = .disabled },
+    };
+    var prepared = try set.prepare(.{}, &specs);
+    set.commit(&prepared);
+
+    const conn = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .client_policies = &set },
+    );
+    defer conn.destroy();
+    // Nothing is decided until the ClientHello's SNI is seen.
+    try std.testing.expect(conn.backend.client_auth_selector != null);
+    try std.testing.expect(conn.client_trust_generation == null);
+
+    // Simulate the backend consulting the selector for SNI api.example.test.
+    const decision = try NativeTlsConnection.selectClientAuth(conn, "api.example.test");
+    try std.testing.expectEqual(tls_backend.ClientAuthMode.required, decision.mode);
+    try std.testing.expect(decision.verifier != null);
+    try std.testing.expect(conn.client_trust_generation != null);
+
+    try std.testing.expect(conn.clientPolicyAdmitsHost("api.example.test"));
+    try std.testing.expect(conn.clientPolicyAdmitsHost("API.example.test:8443"));
+    try std.testing.expect(conn.clientPolicyAdmitsHost("open.example.test")); // needs no client auth
+    try std.testing.expect(!conn.clientPolicyAdmitsHost("admin.example.test")); // different CA
+    try std.testing.expect(conn.clientPolicyAdmitsHost("unknown.example.test")); // fallback is "no client auth"
+
+    // A second ClientHello (after HelloRetryRequest) re-selects and releases the first pin.
+    const open = try NativeTlsConnection.selectClientAuth(conn, "open.example.test");
+    try std.testing.expectEqual(tls_backend.ClientAuthMode.disabled, open.mode);
+    try std.testing.expect(conn.client_trust_generation == null);
+    try std.testing.expect(!conn.clientPolicyAdmitsHost("api.example.test")); // anonymous connection, host demands mTLS
 }
 
 test "client verify depth counts non-anchor certificates: N accepts exactly N, N-1 rejects (#763)" {

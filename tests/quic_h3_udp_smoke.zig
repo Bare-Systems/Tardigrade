@@ -1292,7 +1292,9 @@ fn mtlsHandler(
     _ = response.setStatus(.ok).setBody("mtls-ok").setContentType("text/plain");
 }
 
-const MtlsOutcome = enum { served, refused };
+var mtls_client_runs = std.atomic.Value(usize).init(0);
+
+const MtlsOutcome = enum { served, refused, misdirected };
 
 /// How the client corrupts its (otherwise valid) certificate DER before
 /// sending it; the private key stays the real one so only the *verifier* can
@@ -1317,21 +1319,40 @@ fn runMtlsClient(
     mutation: MtlsMutation,
     spoof_header: bool,
 ) !MtlsOutcome {
+    return runMtlsClientSni(allocator, runtime, fixture, mutation, spoof_header, null, "tardigrade.test");
+}
+
+/// `sni` is the TLS server_name the ClientHello carries; `authority` is the
+/// request's `:authority`. They are deliberately independent so tests can
+/// prove policy follows the SNI, never the authority.
+fn runMtlsClientSni(
+    allocator: std.mem.Allocator,
+    runtime: *http3_runtime.Runtime,
+    fixture: ?MtlsFixture,
+    mutation: MtlsMutation,
+    spoof_header: bool,
+    sni: ?[]const u8,
+    authority: []const u8,
+) !MtlsOutcome {
     var client_socket = try UdpSocket.open();
     defer client_socket.close();
 
-    const client_cid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8 };
-    const odcid = [_]u8{ 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48 };
+    // Distinct CIDs per client so sequential connections to one runtime never
+    // collide with a lingering (e.g. refused) earlier connection.
+    const run_id: u8 = @truncate(mtls_client_runs.fetchAdd(1, .monotonic));
+    const client_cid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, run_id };
+    const odcid = [_]u8{ 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, run_id };
     const client_path = quic.path.PathKey{
         .local = addressFromSockaddrIn(client_socket.addr),
         .remote = runtime.local_address,
     };
 
     var client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
-    var client_backend = tls_backend.Tls13Backend.initClient(
+    var client_backend = tls_backend.Tls13Backend.initClientWithOptions(
         .{ .hello_random = [_]u8{0xe1} ** 32 },
         client_provider_storage.init(0x442_c),
         .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
+        .{ .server_name = sni },
     );
     var client_identity_provider: ?tls_core.credentials.FixedCredentialProvider = null;
     defer if (client_identity_provider) |*p| p.deinit();
@@ -1413,7 +1434,7 @@ fn runMtlsClient(
         if (h3_started) {
             if (request_id == null) {
                 request_id = try client_h3.sendRequest(client, .{
-                    .authority = "tardigrade.test",
+                    .authority = authority,
                     .path = "/mtls",
                     .headers = if (spoof_header) &spoof else &.{},
                 });
@@ -1421,6 +1442,10 @@ fn runMtlsClient(
             try client_h3.pump(client);
             if (request_id) |id| {
                 if (try client_h3.pollResponse(id)) |response| {
+                    if (response.status == 421) {
+                        client_h3.releaseResponse(id);
+                        return .misdirected;
+                    }
                     try testing.expectEqual(@as(u16, 200), response.status);
                     try testing.expectEqualStrings("mtls-ok", response.body);
                     client_h3.releaseResponse(id);
@@ -1583,4 +1608,138 @@ test "udp h3 mTLS: a runtime asked for client auth without a trust store refuses
 
     try testing.expectEqual(MtlsOutcome.refused, try runMtlsClient(allocator, &runtime, mtls_valid, .none, false));
     try testing.expectEqual(@as(usize, 0), handler_state.requests.load(.monotonic));
+}
+
+// ---------------------------------------------------------------------------
+// Per-SNI client-auth policy (#763): two virtual hosts, two unrelated CAs.
+// ---------------------------------------------------------------------------
+
+const mtls_rogue_ca_path = "tests/fixtures/tls/h3mtls/rogue_ca.crt";
+const host_a = "a.example.test";
+const host_b = "b.example.test";
+const host_open = "open.example.test";
+
+const SniPolicyServer = struct {
+    fixed: tls_core.credentials.FixedCredentialProvider,
+    logger: http3_runtime.Logger,
+    handler_state: MtlsHandlerState = .{},
+    policies: tls_core.client_trust.PolicySet,
+    runtime: http3_runtime.Runtime,
+
+    fn specs(fallback_mode: tls_core.tls13_backend.ClientAuthMode, a_ca: []const u8) struct { fallback: tls_core.client_trust.PolicySpec, list: [3]tls_core.client_trust.PolicySpec } {
+        return .{
+            .fallback = .{ .mode = fallback_mode, .ca_path = mtls_ca_path, .max_path_length = 3 },
+            .list = .{
+                .{ .names = &.{host_a}, .mode = .required, .ca_path = a_ca, .max_path_length = 3 },
+                .{ .names = &.{host_b}, .mode = .required, .ca_path = mtls_rogue_ca_path, .max_path_length = 3 },
+                .{ .names = &.{host_open}, .mode = .disabled },
+            },
+        };
+    }
+
+    fn start(self: *SniPolicyServer, allocator: std.mem.Allocator, fallback_mode: tls_core.tls13_backend.ClientAuthMode) !void {
+        self.fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+        self.logger = http3_runtime.Logger.init(.err, "udp-h3-sni-mtls-test");
+        self.handler_state = .{};
+        self.policies = tls_core.client_trust.PolicySet.init(allocator);
+        const sp = specs(fallback_mode, mtls_ca_path);
+        var prepared = try self.policies.prepare(sp.fallback, &sp.list);
+        self.policies.commit(&prepared);
+        self.runtime = try http3_runtime.Runtime.init(allocator, &self.logger, .{
+            .listen_host = "127.0.0.1",
+            .quic_port = 0,
+            .credential_provider = self.fixed.provider(),
+            .client_policies = &self.policies,
+            .request_handler = mtlsHandler,
+            .request_handler_ctx = &self.handler_state,
+        });
+        self.runtime.start();
+    }
+
+    fn stop(self: *SniPolicyServer) void {
+        self.runtime.deinit();
+        self.policies.deinit();
+        self.fixed.deinit();
+    }
+
+    fn requests(self: *SniPolicyServer) usize {
+        return self.handler_state.requests.load(.monotonic);
+    }
+};
+
+test "udp h3 per-SNI mTLS: a certificate trusted for host A authenticates to A and is refused by B, and vice versa (#763)" {
+    const allocator = testing.allocator;
+    var server: SniPolicyServer = undefined;
+    try server.start(allocator, .required);
+    defer server.stop();
+
+    // CA-A client: served on A, refused on B.
+    try testing.expectEqual(MtlsOutcome.served, try runMtlsClientSni(allocator, &server.runtime, mtls_valid, .none, false, host_a, host_a));
+    try testing.expectEqual(@as(usize, 1), server.requests());
+    try testing.expectEqual(MtlsOutcome.refused, try runMtlsClientSni(allocator, &server.runtime, mtls_valid, .none, false, host_b, host_b));
+    try testing.expectEqual(@as(usize, 1), server.requests());
+
+    // CA-B client: served on B, refused on A.
+    try testing.expectEqual(MtlsOutcome.served, try runMtlsClientSni(allocator, &server.runtime, mtls_wrong_ca, .none, false, host_b, host_b));
+    try testing.expectEqual(@as(usize, 2), server.requests());
+    try testing.expectEqual(MtlsOutcome.refused, try runMtlsClientSni(allocator, &server.runtime, mtls_wrong_ca, .none, false, host_a, host_a));
+    try testing.expectEqual(@as(usize, 2), server.requests());
+}
+
+test "udp h3 per-SNI mTLS: a host with mTLS disabled serves anonymous clients; required hosts refuse them (#763)" {
+    const allocator = testing.allocator;
+    var server: SniPolicyServer = undefined;
+    try server.start(allocator, .required);
+    defer server.stop();
+
+    try testing.expectEqual(MtlsOutcome.served, try runMtlsClientSni(allocator, &server.runtime, null, .none, false, host_open, host_open));
+    {
+        server.handler_state.lock();
+        defer server.handler_state.mutex.unlock();
+        try testing.expect(!server.handler_state.cert_present);
+    }
+    try testing.expectEqual(MtlsOutcome.refused, try runMtlsClientSni(allocator, &server.runtime, null, .none, false, host_a, host_a));
+    try testing.expectEqual(@as(usize, 1), server.requests());
+}
+
+test "udp h3 per-SNI mTLS: the policy follows SNI, never :authority — a mismatched authority is answered 421 (#763)" {
+    const allocator = testing.allocator;
+    var server: SniPolicyServer = undefined;
+    try server.start(allocator, .required);
+    defer server.stop();
+
+    // Handshake under the open host's (disabled) policy, then ask for host A
+    // (required): the stronger policy must not be bypassed.
+    try testing.expectEqual(MtlsOutcome.misdirected, try runMtlsClientSni(allocator, &server.runtime, null, .none, false, host_open, host_a));
+    // A CA-A cert admitted on A cannot be replayed at B's authority either.
+    try testing.expectEqual(MtlsOutcome.misdirected, try runMtlsClientSni(allocator, &server.runtime, mtls_valid, .none, false, host_a, host_b));
+    try testing.expectEqual(@as(usize, 0), server.requests());
+}
+
+test "udp h3 per-SNI mTLS: absent or unknown SNI falls back to the default policy (#763)" {
+    const allocator = testing.allocator;
+    var required: SniPolicyServer = undefined;
+    try required.start(allocator, .required);
+    defer required.stop();
+    // Fallback = required/CA-A: anonymous refused, CA-A served, CA-B refused.
+    try testing.expectEqual(MtlsOutcome.refused, try runMtlsClientSni(allocator, &required.runtime, null, .none, false, null, "tardigrade.test"));
+    try testing.expectEqual(MtlsOutcome.refused, try runMtlsClientSni(allocator, &required.runtime, null, .none, false, "unknown.example.test", "unknown.example.test"));
+    try testing.expectEqual(MtlsOutcome.served, try runMtlsClientSni(allocator, &required.runtime, mtls_valid, .none, false, null, "tardigrade.test"));
+    try testing.expectEqual(MtlsOutcome.refused, try runMtlsClientSni(allocator, &required.runtime, mtls_wrong_ca, .none, false, null, "tardigrade.test"));
+}
+
+test "udp h3 per-SNI mTLS: a reload swaps trust atomically for new handshakes (#763)" {
+    const allocator = testing.allocator;
+    var server: SniPolicyServer = undefined;
+    try server.start(allocator, .required);
+    defer server.stop();
+
+    try testing.expectEqual(MtlsOutcome.served, try runMtlsClientSni(allocator, &server.runtime, mtls_valid, .none, false, host_a, host_a));
+    // Rotate host A's trust to the rogue CA: the old client is now refused,
+    // the rogue-CA client admitted, with no restart.
+    const sp = SniPolicyServer.specs(.required, mtls_rogue_ca_path);
+    var prepared = try server.policies.prepare(sp.fallback, &sp.list);
+    server.policies.commit(&prepared);
+    try testing.expectEqual(MtlsOutcome.refused, try runMtlsClientSni(allocator, &server.runtime, mtls_valid, .none, false, host_a, host_a));
+    try testing.expectEqual(MtlsOutcome.served, try runMtlsClientSni(allocator, &server.runtime, mtls_wrong_ca, .none, false, host_a, host_a));
 }

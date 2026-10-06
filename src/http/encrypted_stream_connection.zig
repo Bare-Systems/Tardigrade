@@ -19,6 +19,9 @@ pub const EncryptedStreamHttpConnection = struct {
     /// Verified downstream client certificate of this connection (#763), read
     /// through `provenance_ctx`. Null for connections without client auth.
     client_cert_fn: ?*const fn (*anyopaque) ?*const client_identity.ClientIdentity = null,
+    /// Whether this connection's SNI-selected client-auth policy admits a
+    /// request for the given Host (#763); null admits everything.
+    client_policy_admits_host_fn: ?*const fn (*anyopaque, []const u8) bool = null,
     /// The last bounded (`*Bounded`) call stopped on its drive budget with
     /// record-layer work possibly left (#818); retry soon rather than wait
     /// for the socket.
@@ -193,6 +196,12 @@ pub const EncryptedStreamHttpConnection = struct {
         const ctx = self.provenance_ctx orelse return null;
         const cb = self.client_cert_fn orelse return null;
         return cb(ctx);
+    }
+
+    pub fn clientPolicyAdmitsHost(self: *const EncryptedStreamHttpConnection, host: []const u8) bool {
+        const ctx = self.provenance_ctx orelse return true;
+        const cb = self.client_policy_admits_host_fn orelse return true;
+        return cb(ctx, host);
     }
 
     pub fn downstreamHandshakeComplete(self: *const EncryptedStreamHttpConnection) bool {

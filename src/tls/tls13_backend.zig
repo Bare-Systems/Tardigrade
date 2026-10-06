@@ -683,6 +683,22 @@ pub const CredentialFailure = credentials.FailureClass;
 /// authentication is explicitly deferred.
 pub const ClientAuthMode = enum { disabled, optional, required };
 
+/// Per-ClientHello client-auth decision (#763). `verifier` must be non-null
+/// unless `mode` is `.disabled`, and must outlive the handshake.
+pub const ClientAuthSelection = struct {
+    mode: ClientAuthMode,
+    verifier: ?PeerVerifier = null,
+};
+
+/// Chooses the client-auth policy from the ClientHello SNI, before the server
+/// flight (and therefore CertificateRequest) is built. Invoked again for the
+/// second ClientHello after a HelloRetryRequest; a failure fails the handshake
+/// closed.
+pub const ClientAuthSelector = struct {
+    ctx: *anyopaque,
+    selectFn: *const fn (ctx: *anyopaque, server_name: ?[]const u8) error{ClientAuthUnavailable}!ClientAuthSelection,
+};
+
 /// Largest peer certificate chain (total DER bytes and entry count) the engine
 /// reassembles and surfaces to a `PeerVerifier` as immutable views. A chain
 /// exceeding either bound fails closed (peer-attributed) rather than being
@@ -752,6 +768,9 @@ pub const Tls13Backend = struct {
     external_verifier: ?PeerVerifier = null,
     /// Server: whether to request client authentication.
     client_auth: ClientAuthMode = .disabled,
+    /// Server: SNI-driven override of `client_auth`/`external_verifier`,
+    /// consulted once the ClientHello's server_name is known.
+    client_auth_selector: ?ClientAuthSelector = null,
     /// Explicit local authentication policy, passed to selection and
     /// verification. Set at construction from the caller's intent, never
     /// re-derived from a defaulted field (an external verifier must not silently
@@ -1389,6 +1408,13 @@ pub const Tls13Backend = struct {
             .required => .{ .require_peer_authentication = true },
             .optional => .{},
         };
+    }
+
+    /// Server: select the client-auth policy per ClientHello from its SNI.
+    /// Must be called before `start`.
+    pub fn setClientAuthSelector(self: *Tls13Backend, selector: ClientAuthSelector) void {
+        std.debug.assert(self.role == .server);
+        self.client_auth_selector = selector;
     }
 
     /// Client: supply the credential provider for the client's own certificate,
@@ -2302,7 +2328,7 @@ pub const Tls13Backend = struct {
             len = try checkedAdd(len, 2 + 2 + payload.len);
         }
         len = try checkedAdd(len, self.recordSizeLimitEncodedLen()); // #359
-        if (self.client_auth != .disabled) {
+        if (self.client_auth != .disabled or self.client_auth_selector != null) {
             len = try checkedAdd(len, 1 + 3 + 1 + 2); // CertificateRequest header, empty context, extensions vector
             len = try checkedAdd(len, 2 + 2 + 2 + 2 * self.policy.signature_schemes.len);
         }
@@ -4712,6 +4738,24 @@ pub const Tls13Backend = struct {
             @memcpy(self.server_name[0..name.len], name);
             self.server_name_len = name.len;
             self.server_name_present = true;
+        }
+
+        // #763: the client-auth policy follows the SNI, decided here — before
+        // PSK selection and before any CertificateRequest is built — never
+        // from anything later (e.g. the HTTP Host header).
+        if (self.client_auth_selector) |selector| {
+            const sni: ?[]const u8 = if (self.server_name_present) self.server_name[0..self.server_name_len] else null;
+            const decision = selector.selectFn(selector.ctx, sni) catch
+                return self.failCredential(.verifier_internal_failure);
+            if (decision.mode != .disabled and decision.verifier == null)
+                return self.failCredential(.verifier_internal_failure);
+            if (decision.mode == .disabled) {
+                self.client_auth = .disabled;
+                self.external_verifier = null;
+                self.auth_policy = .{};
+            } else {
+                self.requestClientAuthentication(decision.mode, decision.verifier.?);
+            }
         }
 
         // #362: the PSK-bearing ClientHello is captured only once every

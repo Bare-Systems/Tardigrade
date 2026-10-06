@@ -3309,9 +3309,9 @@ pub const WorkerContext = struct {
     config_store: *ReloadableConfigStore,
     state: *GatewayState,
     native_credentials: ?*http.native_tls_connection.NativeCredentialStore,
-    /// Downstream client-certificate trust (#763); null unless
-    /// `tls_client_verify` is configured on a native TLS listener.
-    client_trust: ?*http.native_tls_connection.ClientTrustStore = null,
+    /// SNI-keyed downstream client-certificate policies (#763); present on
+    /// every native TLS listener so mTLS can be enabled by hot reload.
+    client_policies: ?*http.native_tls_connection.ClientPolicySet = null,
     /// Borrowed credential provider used by the native TCP TLS accept path.
     /// Appliance profile: borrowed from the `ApplianceCredentials` owner.
     /// Otherwise: borrowed from the generic native credential store.

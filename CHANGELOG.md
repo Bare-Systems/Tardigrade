@@ -6,6 +6,22 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **Per-SNI / per-server downstream mTLS policy and trust (#763).**
+  `tls_client_verify`, `tls_client_verify_optional`, `tls_client_ca_path` and
+  `tls_client_verify_depth` are now accepted inside `server { }` blocks. The
+  policy is selected from the TLS ClientHello SNI before the
+  `CertificateRequest` is emitted (never from the HTTP `Host`), so
+  `api.example.com` can trust CA A and require a certificate while
+  `admin.example.com` trusts CA B and another host has mTLS disabled; a
+  certificate trusted for one host cannot authenticate to another. Each policy
+  has its own trust generation, reload swaps the whole table atomically (a bad
+  bundle rejects the reload; in-flight handshakes keep their pinned
+  generation), absent/unmatched SNI falls back to the default server block or
+  the listener-wide settings, and H1/H2/H3 behave identically. A request whose
+  `Host` maps to a different client-auth policy than the connection's
+  SNI-selected one is answered `421`. Enabling or changing client verification
+  is now hot-reloadable (previously restart-owned on H3 and when first enabled).
+
 - **Downstream mTLS client-certificate authentication on the native TLS
   listener (#763).** `TARDIGRADE_TLS_CLIENT_VERIFY=true` now sends a TLS 1.3
   `CertificateRequest` and verifies the client chain with the pure-Zig PKI path

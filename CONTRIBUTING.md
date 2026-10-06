@@ -26,6 +26,8 @@ A few things to keep in mind:
 
 Read the review checklist before making changes:
 
+- **[docs/CI.md](docs/CI.md)** — smoke vs full CI modes, changelog-driven selection, and
+  manual `gh workflow run ci.yml -f mode=full`
 - **[docs/CODE_REVIEW_CHECKLIST.md](docs/CODE_REVIEW_CHECKLIST.md)** — short checklist to complete
   before submitting a PR.
 

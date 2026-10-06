@@ -1,0 +1,9 @@
+# GitHub's documented $/ self-repository references execute the action from
+# the workflow's own immutable commit. actionlint v1.7.12 does not parse that
+# newer syntax yet, so suppress only its obsolete parser diagnostic; all other
+# actionlint rules still run for every workflow.
+paths:
+  .github/workflows/**/*.{yml,yaml}:
+    ignore:
+      - 'specifying (action|reusable workflow) "\$/\.github/(actions/ci-mode|workflows/[^\"]+)" in invalid format because ref is missing.*'
+      - 'reusable workflow call "\$/\.github/workflows/[^\"]+" at "uses" is not following the format.*'

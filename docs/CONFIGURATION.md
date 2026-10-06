@@ -665,7 +665,7 @@ for the complete disposition of each.
 | `TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS` | u32 ms | `5000` | TLS handshake read timeout. `0` falls back to keep-alive timeout. | `TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS=3000` |
 | `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS` | u64 ms | `0` | Retired OpenSSL cert/key watcher interval; must be `0` (credential rotation is the explicit SIGHUP reload path instead). | (unset) |
 | `TARDIGRADE_TLS_CLIENT_CA_PATH` | path | `""` | PEM bundle of CAs trusted to issue client certificates. Required when `TARDIGRADE_TLS_CLIENT_VERIFY=true`; never falls back to the system trust store. Re-read on config reload. | `TARDIGRADE_TLS_CLIENT_CA_PATH=/etc/tls/clients.pem` |
-| `TARDIGRADE_TLS_CLIENT_VERIFY` | bool | `false` | Request and verify downstream client certificates (mTLS) on the native TLS listener. Required by default: a handshake without a valid certificate fails. HTTP/1.1 and HTTP/2 only; rejected together with `TARDIGRADE_HTTP3_ENABLED`. See [Downstream mTLS](#downstream-mtls). | `TARDIGRADE_TLS_CLIENT_VERIFY=true` |
+| `TARDIGRADE_TLS_CLIENT_VERIFY` | bool | `false` | Request and verify downstream client certificates (mTLS) on the native TLS listener and, when enabled, the HTTP/3 (QUIC) listener. Required by default: a handshake without a valid certificate fails. See [Downstream mTLS](#downstream-mtls). | `TARDIGRADE_TLS_CLIENT_VERIFY=true` |
 | `TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL` | bool | `false` | With `TARDIGRADE_TLS_CLIENT_VERIFY`, also accept clients that present no certificate. A certificate that *is* presented must still verify. | `TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL=true` |
 | `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH` | u32 | `3` | Longest accepted client certification path (leaf plus intermediates, excluding the trust anchor), 1 to 8: depth 1 accepts leaf → anchor, depth 2 leaf → intermediate → anchor. | `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH=3` |
 | `TARDIGRADE_TLS_CRL_PATH` | path | `""` | Unused; retained for config-file compatibility. | (unset) |
@@ -1167,7 +1167,7 @@ lets certificate-less clients through (they simply carry no identity), while a
 certificate that is presented must still verify.
 
 **Identity propagation.** For requests on a connection with a verified client
-certificate, proxied upstream requests (HTTP/1.1 and HTTP/2 downstream) carry:
+certificate, proxied upstream requests (HTTP/1.1, HTTP/2 and HTTP/3 downstream) carry:
 
 | Header | Value |
 |---|---|
@@ -1192,15 +1192,31 @@ one atomic generation: a bundle that fails to load rejects the whole reload
 and the serving trust set keeps verifying, and a handshake already in flight
 finishes against the generation it started with. Enabling
 `TARDIGRADE_TLS_CLIENT_VERIFY` on a process that started without it requires a
-restart. Revocation (CRL/OCSP) is not consulted: remove a revoked CA or issue
+restart. While HTTP/3 is enabled, changing `TARDIGRADE_TLS_CLIENT_VERIFY` or
+`TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL` (required, optional, off) is likewise
+restart-owned and a SIGHUP that attempts it is rejected, because the QUIC
+runtime fixes the mode at startup; CA-bundle and depth changes remain
+hot-reloadable. Revocation (CRL/OCSP) is not consulted: remove a revoked CA or issue
 short-lived client certificates; the validator's revocation seam stays
 disabled until runtime OCSP/CRL support exists.
 
-**Protocol coverage.** HTTP/1.1 and HTTP/2 over TCP TLS are supported. The
-QUIC/HTTP-3 handshake does not request client certificates, so the
-combination with `TARDIGRADE_HTTP3_ENABLED` is rejected at config validation
-rather than advertised. Client verification is per listener, not per SNI
-server block.
+**Protocol coverage.** HTTP/1.1 and HTTP/2 over TCP TLS and HTTP/3 over QUIC
+are supported, with identical policy: the QUIC handshake sends the same TLS 1.3
+`CertificateRequest`, validates the chain with the same pure-Zig PKI code
+against the same `TARDIGRADE_TLS_CLIENT_CA_PATH` bundle, applies the same
+`TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH`, `clientAuth` EKU and required/optional
+semantics, and surfaces the same `X-Tardigrade-Client-Cert-*` identity. One
+trust store backs all three protocols, so a config reload rotates them
+together; each QUIC connection pins the generation it started its handshake
+with. A rejected certificate closes the QUIC connection with a TLS
+`bad_certificate` crypto error (`CONNECTION_CLOSE` code `0x12a`) and no request
+reaches the application; a missing certificate in required mode closes with
+`certificate_required` (`0x174`). With client verification enabled the server
+always performs a full handshake (PSK resumption and therefore 0-RTT are not
+offered), so every QUIC connection carries its own verified identity and no
+early-data request can be served without one. Client verification is per
+listener, not per SNI server block, and the QUIC listener and TCP listener
+always share one policy.
 
 ## Validation Notes
 
@@ -1208,7 +1224,8 @@ server block.
   both empty.
 - `TARDIGRADE_TLS_CLIENT_VERIFY=true` requires `TARDIGRADE_TLS_CLIENT_CA_PATH`,
   `TARDIGRADE_TLS_CERT_PATH`/`TARDIGRADE_TLS_KEY_PATH` (otherwise the listener
-  would serve plaintext), a depth of 1 to 8, and `TARDIGRADE_HTTP3_ENABLED=false`.
+  would serve plaintext) and a depth of 1 to 8. It may be combined with
+  `TARDIGRADE_HTTP3_ENABLED` (#763).
 - `TARDIGRADE_COMPRESSION_BROTLI_QUALITY` must be 0-11.
 - `TARDIGRADE_OTEL_SAMPLE_RATE` must be 0-100.
 - `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` has a minimum effective value of 1; `0`

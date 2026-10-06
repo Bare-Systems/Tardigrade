@@ -364,3 +364,29 @@ space, key discards, loss, PTO, state transitions, close) to stderr —
 usually enough to localize an interop failure. For packet-level capture:
 `tcpdump -i lo udp port 4433 -w interop.pcap` alongside a run, and decrypt
 with the peer's keylog (native keylog lands with #255).
+
+## #763: downstream HTTP/3 mTLS interop
+
+`run-h3-mtls-interop.sh` (CI job `h3-mtls-interop`, via
+`run-h3-mtls-interop-ci.sh`) runs the real `tardi` gateway with
+`TARDIGRADE_HTTP3_ENABLED` and `TARDIGRADE_TLS_CLIENT_VERIFY` against aioquic
+presenting the Ed25519 fixtures in `tests/fixtures/tls/h3mtls` (regenerate
+with that directory's `gen.sh`):
+
+| mode | client certificate | expected |
+|---|---|---|
+| required | CA-issued `clientAuth` | 200; upstream sees `X-Tardigrade-Client-Cert-*`; forged `x-tardigrade-client-cert-*` request headers never reach the upstream |
+| required | none / wrong CA / expired / not yet valid / `serverAuth`-only | connection refused (TLS alert), upstream never contacted |
+| optional | none | 200, no identity headers asserted |
+| optional | wrong CA | still refused |
+| optional | CA-issued `clientAuth` | 200 with verified identity |
+
+```sh
+zig build
+python3 -m venv /tmp/aioquic-venv && /tmp/aioquic-venv/bin/pip install aioquic
+AIOQUIC_PYTHON=/tmp/aioquic-venv/bin/python scripts/interop/run-h3-mtls-interop.sh
+```
+
+The in-process counterpart (native client over real UDP against
+`http3_runtime`) lives in `tests/quic_h3_udp_smoke.zig` (`udp h3 mTLS:` tests).
+

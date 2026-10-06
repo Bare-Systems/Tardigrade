@@ -193,3 +193,204 @@ const testing = std.testing;
 test {
     testing.refAllDecls(@This());
 }
+
+// ---------------------------------------------------------------------------
+// #763: client-certificate handshake input. The chain a downstream client
+// presents is attacker-controlled bytes that reach the verifier before any
+// trust is established, so the verifier must be *total* over it (never panic,
+// leak, or exceed its bounds) and must never grant trust to anything but the
+// exact certificates the configured CA issued for client auth.
+// ---------------------------------------------------------------------------
+
+const client_fixture_dir = "tests/fixtures/tls/h3mtls/";
+
+const ClientFixtureKind = enum { valid, expired, not_yet_valid, wrong_eku, wrong_ca };
+
+fn clientFixtureFile(kind: ClientFixtureKind) []const u8 {
+    return switch (kind) {
+        .valid => client_fixture_dir ++ "client.der",
+        .expired => client_fixture_dir ++ "client_expired.der",
+        .not_yet_valid => client_fixture_dir ++ "client_not_yet_valid.der",
+        .wrong_eku => client_fixture_dir ++ "client_wrong_eku.der",
+        .wrong_ca => client_fixture_dir ++ "client_wrong_ca.der",
+    };
+}
+
+fn verifyClientChain(
+    allocator: std.mem.Allocator,
+    anchors: *const TrustAnchors,
+    entries: []const []const u8,
+    depth: usize,
+) !credentials.Verdict {
+    var entropy = @import("production_crypto.zig").OsEntropy{};
+    var provider_state = @import("production_crypto.zig").Provider.init(entropy.entropy());
+    var verifier = WebPkiVerifier.initClientAuth(allocator, anchors.anchors(), provider_state.cryptoProvider(), depth);
+    const context = credentials.VerificationContext{
+        .role = .server,
+        .server_name = "unrelated.example",
+        .chain = .{ .entries = entries },
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{ .require_peer_authentication = true },
+    };
+    const progress = verifier.verifier().verifyPeer(&context) catch return .rejected;
+    return switch (progress) {
+        .complete => |verdict| verdict,
+        .pending => error.UnexpectedPending,
+    };
+}
+
+test "fuzz: TLS protocol: client certificate chains are verified totally and mutations never gain trust (#763)" {
+    try testing.fuzz({}, fuzzClientCertificateChain, .{
+        .corpus = &.{
+            "",
+            // valid leaf accepted
+            "\x00\x00",
+            // each wrong-profile fixture rejected: expired, not-yet-valid, wrong EKU, wrong CA
+            "\x00\x01",
+            "\x00\x02",
+            "\x00\x03",
+            "\x00\x04",
+            // single-bit flips at the head, middle and tail of the signed DER
+            "\x01\x00\x00\x00\x00",
+            "\x01\x00\x00\x40\x03",
+            "\x01\x00\x00\xff\x07",
+            // truncations, including to a bare header and to nothing
+            "\x02\x00\x00\x00\x00",
+            "\x02\x00\x00\x00\x04",
+            "\x02\x00\x00\x7f\xff",
+            // trailing garbage
+            "\x03\x00\x00\x00\x00\x01",
+            "\x03\x00\x00\x00\x00\x04\xde\xad\xbe\xef",
+            // empty chain, empty leaf entry, pure noise, valid leaf with junk extras
+            "\x04",
+            "\x05",
+            "\x06\x00\x30\x82\xff\xff",
+            "\x07\x00\x00\x00\x03\x01\x02\x03",
+            // over-long chains of the valid leaf
+            "\x08\x00\x00\x0f",
+            "\x08\x00\x00\xff",
+        },
+    });
+}
+
+fn fuzzClientCertificateChain(_: void, smith: *testing.Smith) !void {
+    const allocator = testing.allocator;
+    var anchors = loadTrustAnchors(allocator, client_fixture_dir ++ "ca.crt") catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer anchors.deinit(allocator);
+
+    const kind: ClientFixtureKind = @enumFromInt(smith.index(@typeInfo(ClientFixtureKind).@"enum".fields.len));
+    const leaf = try zig_compat.cwd().readFileAlloc(allocator, clientFixtureFile(kind), 64 * 1024);
+    defer allocator.free(leaf);
+    const depth: usize = 1 + smith.index(4);
+
+    const op = smith.index(9);
+    var scratch: [4096]u8 = undefined;
+    var mutated: []u8 = &.{};
+    defer if (mutated.len != 0) allocator.free(mutated);
+
+    var entries_storage: [20][]const u8 = undefined;
+    var entries: []const []const u8 = entries_storage[0..0];
+    // Whether this input is, by construction, exactly a certificate the CA
+    // issued for client auth (so acceptance is the only legal verdict) or a
+    // negative that must never be accepted.
+    var must_accept = false;
+    var must_reject = false;
+
+    switch (op) {
+        0 => {
+            entries_storage[0] = leaf;
+            entries = entries_storage[0..1];
+            must_accept = kind == .valid;
+            must_reject = kind != .valid;
+        },
+        1 => { // single-bit flip anywhere in the signed encoding
+            mutated = try allocator.dupe(u8, leaf);
+            const index = smith.index(mutated.len);
+            mutated[index] ^= @as(u8, 1) << @intCast(smith.index(8));
+            entries_storage[0] = mutated;
+            entries = entries_storage[0..1];
+            must_reject = true;
+        },
+        2 => { // truncation
+            const keep = smith.index(leaf.len);
+            entries_storage[0] = leaf[0..keep];
+            entries = entries_storage[0..1];
+            must_reject = true;
+        },
+        3 => { // trailing bytes after the certificate
+            const extra_len = 1 + smith.slice(scratch[0 .. scratch.len - 1]);
+            if (extra_len == 0) return;
+            mutated = try allocator.alloc(u8, leaf.len + extra_len);
+            @memcpy(mutated[0..leaf.len], leaf);
+            @memcpy(mutated[leaf.len..], scratch[0..extra_len]);
+            entries_storage[0] = mutated;
+            entries = entries_storage[0..1];
+            must_reject = true;
+        },
+        4 => {}, // empty chain
+        5 => { // empty leaf entry
+            entries_storage[0] = "";
+            entries = entries_storage[0..1];
+            must_reject = true;
+        },
+        6 => { // arbitrary bytes as the leaf
+            const len = smith.slice(&scratch);
+            entries_storage[0] = scratch[0..len];
+            entries = entries_storage[0..1];
+            must_reject = true;
+        },
+        7 => { // valid leaf followed by arbitrary junk entries: leaf decides
+            entries_storage[0] = leaf;
+            const extras = smith.index(3);
+            var i: usize = 0;
+            var cursor: usize = 0;
+            while (i < extras) : (i += 1) {
+                const len = smith.slice(scratch[cursor..@min(scratch.len, cursor + 64)]);
+                entries_storage[1 + i] = scratch[cursor..][0..len];
+                cursor += len;
+            }
+            entries = entries_storage[0 .. 1 + extras];
+            must_reject = kind != .valid;
+        },
+        else => { // over-long chain: bounded work, no panic
+            const count = 1 + smith.index(entries_storage.len);
+            for (entries_storage[0..count]) |*entry| entry.* = leaf;
+            entries = entries_storage[0..count];
+        },
+    }
+
+    const verdict = try verifyClientChain(allocator, &anchors, entries, depth);
+    if (must_accept) try testing.expectEqual(credentials.Verdict.accepted, verdict);
+    if (must_reject) try testing.expectEqual(credentials.Verdict.rejected, verdict);
+}
+
+test "client auth: every single-bit corruption and every truncation of a valid client certificate is rejected (#763)" {
+    const allocator = testing.allocator;
+    var anchors = try loadTrustAnchors(allocator, client_fixture_dir ++ "ca.crt");
+    defer anchors.deinit(allocator);
+    const leaf = try zig_compat.cwd().readFileAlloc(allocator, clientFixtureFile(.valid), 64 * 1024);
+    defer allocator.free(leaf);
+
+    var entries = [_][]const u8{leaf};
+    try testing.expectEqual(credentials.Verdict.accepted, try verifyClientChain(allocator, &anchors, &entries, 3));
+
+    const copy = try allocator.dupe(u8, leaf);
+    defer allocator.free(copy);
+    for (0..leaf.len) |byte_index| {
+        for (0..8) |bit| {
+            copy[byte_index] ^= @as(u8, 1) << @intCast(bit);
+            entries[0] = copy;
+            try testing.expectEqual(credentials.Verdict.rejected, try verifyClientChain(allocator, &anchors, &entries, 3));
+            copy[byte_index] ^= @as(u8, 1) << @intCast(bit);
+        }
+    }
+    for (0..leaf.len) |keep| {
+        entries[0] = leaf[0..keep];
+        try testing.expectEqual(credentials.Verdict.rejected, try verifyClientChain(allocator, &anchors, &entries, 3));
+    }
+}

@@ -186,7 +186,7 @@ adapter cannot silently remove behavior operators were promised:
 | QUIC/HTTP/3, 0-RTT, connection migration, session resumption (`TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE`) | **native + supported** (general profile; appliance restricts 0-RTT/migration/retry-policy as product policy, not a capability gap) |
 | TLS 1.2 / non-1.3 version negotiation | **unsupported**, deterministic config failure (`UnsupportedNativeTlsConfiguration`) |
 | OpenSSL-format cipher-suite/cipher-list overrides | **unsupported**, deterministic config failure |
-| Downstream client-certificate verification (mTLS) | **native + supported** on HTTP/1.1 and HTTP/2 (#763): pure-Zig PKI path validation against `TARDIGRADE_TLS_CLIENT_CA_PATH`; rejected together with HTTP/3 (`UnsupportedNativeTlsConfiguration`) |
+| Downstream client-certificate verification (mTLS) | **native + supported** on HTTP/1.1, HTTP/2 and HTTP/3/QUIC (#763): pure-Zig PKI path validation against `TARDIGRADE_TLS_CLIENT_CA_PATH`, one shared trust store across protocols |
 | OpenSSL session cache / session tickets | **unsupported**, deterministic config failure — superseded by native resumption |
 | OCSP stapling, OCSP auto-refresh, CRL checking | **unsupported**, deterministic config failure |
 | ACME automated issuance/renewal | **unsupported**, deterministic config failure — `src/http/acme_client.zig`'s `runOnce` always returns `error.AcmeProtocolError`; tracked for a native implementation alongside #391 |

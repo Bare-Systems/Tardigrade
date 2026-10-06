@@ -33,6 +33,27 @@ the test name and minimized input needed for deterministic reproduction. Keep
 external peers out of these loops; ngtcp2/nghttp3, quiche, and aioquic remain under
 `scripts/interop/run-interop.sh`.
 
+## Client-certificate handshake input (#763)
+
+Downstream mTLS puts attacker-controlled certificate chains in front of the
+verifier on the QUIC path too. Two `fuzz: TLS protocol:` targets (run by
+`zig build test-tls-protocol-fuzz`, seed corpus replayed by `zig build test`)
+cover that input:
+
+- `client certificate chains are verified totally and mutations never gain
+  trust` (`src/tls/webpki_verifier.zig`): bit flips, truncation, trailing
+  bytes, empty/garbage/over-long chains and junk extra entries around the
+  CA-issued fixtures; wrong-CA/expired/not-yet-valid/wrong-EKU leaves must
+  never verify. A companion exhaustive test rejects *every* single-bit
+  corruption and truncation of the valid leaf.
+- `client identity rendering is total, bounded and header-safe on arbitrary
+  DER` (`src/tls/client_identity.zig`): the verified-identity renderer never
+  panics and only emits bounded printable-ASCII fields.
+
+```bash
+zig build test-tls-protocol-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
+```
+
 ## Fuzz-process memory: a large macOS-only footprint
 
 > **Current H3 conn-state target:** FINDING F19 replaced its direct use of

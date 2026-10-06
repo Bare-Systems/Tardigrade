@@ -584,7 +584,7 @@ pub const entries = [_]ConfigEntry{
         .default_value = "false",
         .valid_values = &.{ "true", "false" },
         .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
-        .description = "Requests and verifies downstream client certificates (mTLS) on the native TLS listener (HTTP/1.1 and HTTP/2; not supported with HTTP/3). Requires tls_client_ca_path. Verified identity is asserted upstream as X-Tardigrade-Client-Cert-* headers.",
+        .description = "Requests and verifies downstream client certificates (mTLS) on the native TLS listener (HTTP/1.1, HTTP/2 and HTTP/3/QUIC share one trust store and policy). Requires tls_client_ca_path. Verified identity is asserted upstream as X-Tardigrade-Client-Cert-* headers.",
         .example = "tls_client_verify true;",
         .env_vars = &.{"TARDIGRADE_TLS_CLIENT_VERIFY"},
         .docs = &.{ "docs/PENTEST_PLAYBOOK.md", "docs/CONFIGURATION.md" },

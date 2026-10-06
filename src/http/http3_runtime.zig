@@ -88,6 +88,16 @@ pub const Config = struct {
     /// bookkeeping. `null` (the default) leaves the backend's own default
     /// gate in place, which fails closed (`.unavailable`) for 0-RTT.
     early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate = null,
+    /// Downstream client-certificate authentication (#763), the QUIC twin of
+    /// the native TCP listener's. Anything but `.disabled` requires
+    /// `client_trust` with a published generation; a connection that cannot
+    /// pin one is refused rather than served unauthenticated. The store is
+    /// borrowed, shared with the TCP path (so one reload rotates both), and
+    /// must outlive this runtime. Client auth forces full handshakes (no
+    /// PSK resumption, hence no 0-RTT) so every connection carries its own
+    /// verified identity.
+    client_auth: tls_core.tls13_backend.ClientAuthMode = .disabled,
+    client_trust: ?*tls_core.client_trust.ClientTrustStore = null,
     tls_min_version: []const u8 = "1.3",
     tls_max_version: []const u8 = "1.3",
     enable_0rtt: bool = false,
@@ -971,6 +981,14 @@ const ConnEntry = struct {
     backend: *quic.tls_backend.Tls13Backend,
     conn: *Connection,
     h3: H3,
+    /// Client-auth state (#763). The verifier is borrowed by `backend` for
+    /// the handshake, so it lives here (heap-stable, like the entry itself)
+    /// beside the pinned trust generation whose anchors it reads.
+    client_trust_generation: ?*tls_core.client_trust.ClientTrustStore.Generation = null,
+    client_verifier: tls_core.webpki_verifier.WebPkiVerifier = undefined,
+    client_auth_mode: tls_core.tls13_backend.ClientAuthMode = .disabled,
+    client_identity: tls_core.client_identity.ClientIdentity = .{},
+    client_identity_present: bool = false,
     quic_observer: QuicObserver = undefined,
     h3_observer: H3Observer = undefined,
     h3_started: bool = false,
@@ -1012,6 +1030,45 @@ const ConnEntry = struct {
         self.h3.deinit();
         self.conn.deinit();
         allocator.destroy(self.backend);
+        if (self.client_trust_generation) |generation| generation.release();
+    }
+
+    /// Pin the serving client-trust generation and ask the handshake engine
+    /// for a client certificate (#763). Must run before the first datagram is
+    /// ingested. Fails closed: with no published generation the connection is
+    /// refused instead of silently skipping authentication.
+    fn armClientAuth(
+        self: *ConnEntry,
+        mode: tls_core.tls13_backend.ClientAuthMode,
+        store: ?*tls_core.client_trust.ClientTrustStore,
+        crypto_provider: crypto_pkg.provider.CryptoProvider,
+        allocator: std.mem.Allocator,
+    ) error{ClientTrustUnavailable}!void {
+        if (mode == .disabled) return;
+        const generation = (store orelse return error.ClientTrustUnavailable).acquire() orelse return error.ClientTrustUnavailable;
+        self.client_trust_generation = generation;
+        self.client_auth_mode = mode;
+        self.client_verifier = tls_core.webpki_verifier.WebPkiVerifier.initClientAuth(
+            allocator,
+            generation.anchors.anchors(),
+            crypto_provider,
+            generation.max_path_length,
+        );
+        self.backend.engine.requestClientAuthentication(mode, self.client_verifier.verifier());
+    }
+
+    /// The verified client identity once the handshake produced one (#763).
+    /// Rendered at most once from the engine's retained leaf, which the
+    /// engine keeps only after chain validation *and* CertificateVerify.
+    /// Null without client auth or when an optional client sent no
+    /// certificate. A verified certificate that cannot be rendered is an
+    /// error: the caller must not serve the request unauthenticated.
+    fn clientIdentity(self: *ConnEntry, allocator: std.mem.Allocator) error{ClientIdentityUnavailable}!?*const tls_core.client_identity.ClientIdentity {
+        if (self.client_identity_present) return &self.client_identity;
+        const der = self.backend.engine.verifiedPeerCertificate() orelse return null;
+        self.client_identity = tls_core.client_identity.ClientIdentity.fromVerifiedDer(allocator, der) catch return error.ClientIdentityUnavailable;
+        self.client_identity_present = true;
+        return &self.client_identity;
     }
 };
 
@@ -1116,6 +1173,8 @@ pub const Runtime = struct {
     credential_provider: ?tls_core.credentials.CredentialProvider,
     resumption_runtime: ?*tls_core.resumption_runtime.Runtime,
     early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
+    client_auth: tls_core.tls13_backend.ClientAuthMode,
+    client_trust: ?*tls_core.client_trust.ClientTrustStore,
     /// #523: whether the native QUIC 0-RTT carrier is actually composed and
     /// enabled — see `zeroRttCarrierEnabled`. Drives both `quic_config`'s
     /// `zero_rtt_enabled` gate and whether `accept()` installs a server
@@ -1243,6 +1302,8 @@ pub const Runtime = struct {
             .credential_provider = cfg.credential_provider,
             .resumption_runtime = cfg.resumption_runtime,
             .early_data_replay_gate = cfg.early_data_replay_gate,
+            .client_auth = cfg.client_auth,
+            .client_trust = cfg.client_trust,
             .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
             .retry_policy = cfg.retry_policy,
             .secrets = .{},
@@ -1698,6 +1759,14 @@ pub const Runtime = struct {
         if (h3EventSinkFor(&entry.h3_observer)) |event_sink| {
             entry.h3.setEventSink(event_sink);
         }
+        // #763: no datagram has been ingested yet, so the engine still has
+        // time to learn it must send a CertificateRequest.
+        entry.armClientAuth(self.client_auth, self.client_trust, self.cryptoProvider(), allocator) catch {
+            self.logger.warn(null, "http3: client certificate verification is enabled but no client trust store is loaded; refusing connection", .{});
+            entry.deinit(allocator);
+            allocator.destroy(entry);
+            return null;
+        };
 
         const cid = quic.cid.ConnectionId.init(parsed.dcid) catch {
             entry.deinit(allocator);
@@ -2021,6 +2090,22 @@ pub const Runtime = struct {
             return;
         };
         request.stream_id = incoming.stream_id;
+        // #763: the verified identity travels out-of-band on `Headers`, never
+        // as a header, so nothing in the request bytes can populate it.
+        if (entry.client_auth_mode != .disabled) {
+            const identity = entry.clientIdentity(allocator) catch {
+                self.sendInternalErrorResponse(entry, incoming.stream_id, now);
+                return;
+            };
+            if (identity) |verified| {
+                request.headers.client_cert = clientCertificateView(verified);
+            } else if (entry.client_auth_mode == .required) {
+                // Defense in depth: the engine already fails a required
+                // handshake that presented no certificate.
+                self.sendStatusResponse(entry, incoming.stream_id, 403, now);
+                return;
+            }
+        }
         request.transport_early = incoming.transport_early;
         request.downstream_handshake_complete = entry.conn.isEstablished();
         request.downstream_handshake = .{
@@ -2999,6 +3084,20 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
         else => {},
     }
     return assembler.finish();
+}
+
+/// Borrowing view of a verified client identity for `Headers.client_cert`
+/// (#763); the slices live in the owning `ConnEntry`.
+fn clientCertificateView(identity: *const tls_core.client_identity.ClientIdentity) @import("headers.zig").ClientCertificate {
+    return .{
+        .fingerprint_sha256 = identity.fingerprintSha256(),
+        .subject = identity.subject(),
+        .issuer = identity.issuer(),
+        .serial = identity.serialHex(),
+        .san_dns = identity.sanDns(),
+        .san_email = identity.sanEmail(),
+        .san_uri = identity.sanUri(),
+    };
 }
 
 /// Render a transport peer as the `client_ip` string upper layers consume.
@@ -8491,4 +8590,52 @@ test "http3 runtime: keylog initialization tightens permissive existing files" {
     const contents = try compat.cwd().readFileAlloc(testing.allocator, keylog_path, 1024);
     defer testing.allocator.free(contents);
     try testing.expect(std.mem.endsWith(u8, contents, " cc\n"));
+}
+
+test "http3 runtime: armClientAuth pins one trust generation, derives the depth bound, and fails closed without a store (#763)" {
+    const allocator = testing.allocator;
+    var os_entropy = tls_core.production_crypto.OsEntropy{};
+    var provider_state = tls_core.production_crypto.Provider.init(os_entropy.entropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var backend = quic.tls_backend.Tls13Backend.initServerWithProvider(
+        .{ .hello_random = [_]u8{0x33} ** 32 },
+        provider_state.cryptoProvider(),
+        fixed.provider(),
+    );
+    var entry: ConnEntry = undefined;
+    entry.backend = &backend;
+    entry.client_trust_generation = null;
+    entry.client_auth_mode = .disabled;
+    entry.client_identity_present = false;
+
+    // Disabled is a no-op and never touches the store.
+    try entry.armClientAuth(.disabled, null, provider_state.cryptoProvider(), allocator);
+    try testing.expect(entry.client_trust_generation == null);
+
+    // Enabled without a store, or with an empty one, refuses the connection.
+    try testing.expectError(error.ClientTrustUnavailable, entry.armClientAuth(.required, null, provider_state.cryptoProvider(), allocator));
+    var store = tls_core.client_trust.ClientTrustStore.init(allocator);
+    defer store.deinit();
+    try testing.expectError(error.ClientTrustUnavailable, entry.armClientAuth(.required, &store, provider_state.cryptoProvider(), allocator));
+    try testing.expect(entry.client_trust_generation == null);
+
+    var prepared = try store.prepare("tests/fixtures/tls/h3mtls/ca.crt", 2);
+    store.commit(&prepared);
+    try entry.armClientAuth(.optional, &store, provider_state.cryptoProvider(), allocator);
+    const pinned = entry.client_trust_generation.?;
+    try testing.expectEqual(tls_core.tls13_backend.ClientAuthMode.optional, entry.client_auth_mode);
+    try testing.expectEqual(tls_core.tls13_backend.ClientAuthMode.optional, backend.engine.client_auth);
+    // `depth` counts non-anchor certificates; the verifier's bound adds the anchor.
+    try testing.expectEqual(@as(usize, 3), entry.client_verifier.maximum_path_length);
+
+    // A reload publishes a new generation without disturbing the pinned one.
+    var rotated = try store.prepare("tests/fixtures/tls/h3mtls/rogue_ca.crt", 4);
+    store.commit(&rotated);
+    try testing.expect(entry.client_trust_generation.? == pinned);
+    try testing.expectEqual(@as(usize, 3), pinned.max_path_length + 1);
+
+    // No certificate has been verified, so there is no identity to render.
+    try testing.expect((try entry.clientIdentity(allocator)) == null);
+    pinned.release();
 }

@@ -1073,6 +1073,11 @@ during `ClientHello`.
   did not send. Check the gateway log for `native tls handshake failed`; the
   client certificate itself is never logged. If a reload logs
   `client trust reload failed`, the previous CA bundle is still serving.
+  Over HTTP/3 the same failures surface to the client as a QUIC
+  `CONNECTION_CLOSE` carrying a TLS alert (`0x12a` bad_certificate, `0x174`
+  certificate_required) and increment
+  `tardigrade_quic_handshake_failures_total`; the application never sees a
+  request from the refused peer.
 
 #### Concrete fixes
 

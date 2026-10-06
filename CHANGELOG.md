@@ -18,10 +18,23 @@ All notable user-facing changes to Tardigrade are documented here.
   serial, first SAN of each type); every client-sent `X-Tardigrade-*` header is
   stripped. The CA bundle is rotated atomically on config reload (a bad bundle
   rejects the reload; in-flight handshakes keep their generation). Supported on
-  HTTP/1.1 and HTTP/2; combining it with `TARDIGRADE_HTTP3_ENABLED` is rejected
-  at config validation because the QUIC handshake has no client-auth path.
-  Revocation, per-SNI trust and certificate-aware routing are not yet
-  implemented. See `docs/CONFIGURATION.md#downstream-mtls`.
+  HTTP/1.1 and HTTP/2. Revocation, per-SNI trust and certificate-aware routing
+  are not yet implemented. See `docs/CONFIGURATION.md#downstream-mtls`.
+
+- **Downstream mTLS on HTTP/3/QUIC (#763).** `TARDIGRADE_TLS_CLIENT_VERIFY`
+  can now be combined with `TARDIGRADE_HTTP3_ENABLED`: the QUIC handshake sends
+  the same `CertificateRequest`, validates against the same CA bundle with the
+  same depth/EKU/required-or-optional rules, and proxied HTTP/3 requests carry
+  the same verified `X-Tardigrade-Client-Cert-*` identity (client-supplied
+  `X-Tardigrade-*` headers are stripped). The TCP and QUIC listeners share one
+  trust store, so a reload rotates both. A rejected certificate closes the QUIC
+  connection with a TLS alert and no request reaches the application. Covered
+  by real-UDP runtime tests, fuzz targets for client-certificate chains and
+  identity rendering, and an external-client (aioquic) interop run
+  (`scripts/interop/run-h3-mtls-interop.sh`). The former config-validation
+  rejection of this combination is removed. While HTTP/3 is enabled, changing
+  the client-auth mode (`_CLIENT_VERIFY`/`_OPTIONAL`) requires a restart and a
+  reload attempting it is rejected; CA bundle and depth still reload in place.
 
 - **HTTP/1 SSE responses now enforce the shared long-lived response lifecycle
   (#842).** The streaming relay identifies `text/event-stream` from response

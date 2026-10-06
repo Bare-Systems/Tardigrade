@@ -39,6 +39,11 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Fixed
 
+- **Regex proxy locations no longer borrow strip prefixes from unrelated
+  prefix locations (#799).** A request such as `/app/x.php` matched by
+  `location ~ \.php$` now preserves the full request path when proxied, even
+  if a separate `/app/` prefix location exists.
+
 - DNS A/AAAA discovery now resolves hostnames (it previously only parsed IP
   literals), and discovered URL strings are no longer freed under in-flight
   requests when the set changes. Discovered endpoints now honour health state.

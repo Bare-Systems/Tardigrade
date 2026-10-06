@@ -355,7 +355,8 @@ fn mountStripPrefixForLocation(
         }
 
         const should_consider = switch (matched.block.match_type) {
-            .exact, .regex, .regex_case_insensitive => true,
+            .exact => true,
+            .regex, .regex_case_insensitive => false,
             .prefix, .prefix_priority => blk: {
                 if (candidate.pattern.len >= matched.block.pattern.len) break :blk false;
                 break :blk proxyPassTargetsDiffer(matched.block, candidate);
@@ -3021,6 +3022,51 @@ test "proxySuffixPathForLocation yields no suffix for exact route shadowing same
     const combined = try gpt.combineProxyTarget(std.testing.allocator, "http://ekho-mcp:8000/mcp", suffix);
     defer std.testing.allocator.free(combined);
     try std.testing.expectEqualStrings("http://ekho-mcp:8000/mcp", combined);
+}
+
+test "proxySuffixPathForLocation preserves full path for regex route ignoring prefix mount (#799)" {
+    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .regex,
+            .pattern = "\\.php$",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://php:9000" },
+        },
+        .{
+            .match_type = .regex_case_insensitive,
+            .pattern = "\\.aspx$",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://aspx:9000" },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/app/",
+            .priority = 2,
+            .action = .{ .proxy_pass = "http://app:8080" },
+        },
+    };
+
+    // Test .regex
+    {
+        const matched = http.location_router.matchLocation(std.testing.allocator, "/app/x.php", &blocks).?;
+        const suffix = proxySuffixPathForLocation("/app/x.php", matched, &blocks).?;
+        try std.testing.expectEqualStrings("/app/x.php", suffix);
+
+        const combined = try gpt.combineProxyTarget(std.testing.allocator, matched.block.action.proxy_pass, suffix);
+        defer std.testing.allocator.free(combined);
+        try std.testing.expectEqualStrings("http://php:9000/app/x.php", combined);
+    }
+
+    // Test .regex_case_insensitive
+    {
+        const matched = http.location_router.matchLocation(std.testing.allocator, "/app/x.AsPx", &blocks).?;
+        const suffix = proxySuffixPathForLocation("/app/x.AsPx", matched, &blocks).?;
+        try std.testing.expectEqualStrings("/app/x.AsPx", suffix);
+
+        const combined = try gpt.combineProxyTarget(std.testing.allocator, matched.block.action.proxy_pass, suffix);
+        defer std.testing.allocator.free(combined);
+        try std.testing.expectEqualStrings("http://aspx:9000/app/x.AsPx", combined);
+    }
 }
 
 test "isHttpMethodIdempotent classifies idempotent methods" {

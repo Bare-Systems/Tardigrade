@@ -75,6 +75,134 @@ pub const AuthMode = enum {
     }
 };
 
+/// Per-location downstream client-certificate policy (#763).
+///
+/// Evaluated against the identity the TLS accept path attached out-of-band
+/// to `Headers.client_cert` after the native handshake verified the chain,
+/// never against request bytes. `required` makes a location demand a verified
+/// certificate even on an optional-mTLS listener; any matcher list narrows
+/// which verified identities may use it (and itself implies `required`).
+/// Within one list any entry matches (OR); across lists every non-empty list
+/// must match (AND). Values are compared against the bounded identity view,
+/// so subject/issuer use its RFC 2253-style rendering and a SAN list matches
+/// the first SAN of that type the identity retains.
+pub const ClientCertPolicy = struct {
+    pub const Decision = enum { allow, missing, mismatch };
+
+    required: bool = false,
+    /// Lower-case hex SHA-256 fingerprints (64 chars, no separators).
+    fingerprints: []const []const u8 = &.{},
+    subjects: []const []const u8 = &.{},
+    issuers: []const []const u8 = &.{},
+    san_dns: []const []const u8 = &.{},
+    san_emails: []const []const u8 = &.{},
+    san_uris: []const []const u8 = &.{},
+
+    pub fn hasMatchers(self: ClientCertPolicy) bool {
+        return self.fingerprints.len + self.subjects.len + self.issuers.len +
+            self.san_dns.len + self.san_emails.len + self.san_uris.len > 0;
+    }
+
+    pub fn isEmpty(self: ClientCertPolicy) bool {
+        return !self.required and !self.hasMatchers();
+    }
+
+    pub fn evaluate(self: ClientCertPolicy, cert: ?@import("headers.zig").ClientCertificate) Decision {
+        if (self.isEmpty()) return .allow;
+        const c = cert orelse return .missing;
+        if (!listMatches(self.fingerprints, c.fingerprint_sha256, true)) return .mismatch;
+        if (!listMatches(self.subjects, c.subject, false)) return .mismatch;
+        if (!listMatches(self.issuers, c.issuer, false)) return .mismatch;
+        if (!listMatches(self.san_dns, c.san_dns, true)) return .mismatch;
+        if (!listMatches(self.san_emails, c.san_email, false)) return .mismatch;
+        if (!listMatches(self.san_uris, c.san_uri, false)) return .mismatch;
+        return .allow;
+    }
+
+    fn listMatches(allowed: []const []const u8, actual: []const u8, ignore_case: bool) bool {
+        if (allowed.len == 0) return true;
+        if (actual.len == 0) return false;
+        for (allowed) |want| {
+            const eq = if (ignore_case) std.ascii.eqlIgnoreCase(want, actual) else std.mem.eql(u8, want, actual);
+            if (eq) return true;
+        }
+        return false;
+    }
+
+    pub fn deinit(self: *ClientCertPolicy, allocator: std.mem.Allocator) void {
+        inline for (.{ "fingerprints", "subjects", "issuers", "san_dns", "san_emails", "san_uris" }) |field| {
+            const list = @field(self, field);
+            for (list) |item| allocator.free(item);
+            if (list.len > 0) allocator.free(list);
+        }
+        self.* = .{};
+    }
+};
+
+pub const client_cert_matcher_kinds = [_][]const u8{ "fingerprint", "subject", "issuer", "san_dns", "san_email", "san_uri" };
+
+/// Canonical (static) name for a `client_cert_allow` kind, or null.
+pub fn clientCertMatcherKind(raw: []const u8) ?[]const u8 {
+    for (client_cert_matcher_kinds) |kind| {
+        if (std.ascii.eqlIgnoreCase(raw, kind)) return kind;
+    }
+    return null;
+}
+
+pub const ClientCertMatcherError = error{ InvalidClientCertMatcher, OutOfMemory };
+
+/// Validate and canonicalize one matcher value into owned memory. Fingerprints
+/// become 64 lower-case hex digits (colons accepted); every other value must be
+/// non-empty printable ASCII, as the identity view renders them.
+pub fn normalizeClientCertMatcherValue(allocator: std.mem.Allocator, kind: []const u8, raw: []const u8) ClientCertMatcherError![]u8 {
+    if (std.mem.eql(u8, kind, "fingerprint")) {
+        var out = try allocator.alloc(u8, 64);
+        errdefer allocator.free(out);
+        var n: usize = 0;
+        for (raw) |c| {
+            if (c == ':') continue;
+            if (n >= 64 or !std.ascii.isHex(c)) return error.InvalidClientCertMatcher;
+            out[n] = std.ascii.toLower(c);
+            n += 1;
+        }
+        if (n != 64) return error.InvalidClientCertMatcher;
+        return out;
+    }
+    if (raw.len == 0 or raw.len > 512) return error.InvalidClientCertMatcher;
+    for (raw) |c| if (c < 0x20 or c > 0x7e) return error.InvalidClientCertMatcher;
+    return allocator.dupe(u8, raw);
+}
+
+test "ClientCertPolicy evaluates presence and matchers" {
+    const cert: @import("headers.zig").ClientCertificate = .{
+        .fingerprint_sha256 = "ab" ** 32,
+        .subject = "CN=alice",
+        .issuer = "CN=ca",
+        .san_dns = "Alice.Example.com",
+    };
+    const D = ClientCertPolicy.Decision;
+    try std.testing.expectEqual(D.allow, (ClientCertPolicy{}).evaluate(null));
+    try std.testing.expectEqual(D.missing, (ClientCertPolicy{ .required = true }).evaluate(null));
+    try std.testing.expectEqual(D.allow, (ClientCertPolicy{ .required = true }).evaluate(cert));
+    const fps = [_][]const u8{ "00" ** 32, "ab" ** 32 };
+    try std.testing.expectEqual(D.allow, (ClientCertPolicy{ .fingerprints = &fps }).evaluate(cert));
+    // Matchers imply required.
+    try std.testing.expectEqual(D.missing, (ClientCertPolicy{ .fingerprints = &fps }).evaluate(null));
+    const wrong = [_][]const u8{"CN=bob"};
+    try std.testing.expectEqual(D.mismatch, (ClientCertPolicy{ .subjects = &wrong }).evaluate(cert));
+    // AND across lists.
+    const good_subject = [_][]const u8{"CN=alice"};
+    try std.testing.expectEqual(D.mismatch, (ClientCertPolicy{ .subjects = &good_subject, .issuers = &wrong }).evaluate(cert));
+    // SAN DNS is case-insensitive; subject is exact.
+    const dns = [_][]const u8{"alice.example.com"};
+    try std.testing.expectEqual(D.allow, (ClientCertPolicy{ .san_dns = &dns }).evaluate(cert));
+    const upper = [_][]const u8{"cn=alice"};
+    try std.testing.expectEqual(D.mismatch, (ClientCertPolicy{ .subjects = &upper }).evaluate(cert));
+    // A cert without the SAN type never matches a SAN rule.
+    const email = [_][]const u8{"alice@example.com"};
+    try std.testing.expectEqual(D.mismatch, (ClientCertPolicy{ .san_emails = &email }).evaluate(cert));
+}
+
 pub const ProxyStreamingPolicy = enum {
     inherit,
     off,
@@ -398,6 +526,8 @@ pub const LocationBlock = struct {
     /// the enclosing `server` block's rules (#809).
     proxy_set_headers: []ProxySetHeader = &.{},
     forward_auth: ?ForwardAuth = null,
+    /// Downstream mTLS requirement and identity matchers (#763).
+    client_cert: ClientCertPolicy = .{},
     /// Set when the location relays WebSocket upgrades (#812).
     websocket: ?WebSocketProxy = null,
     /// Overrides for long-lived streamed HTTP responses admitted through this
@@ -408,6 +538,7 @@ pub const LocationBlock = struct {
         allocator.free(self.pattern);
         self.action.deinit(allocator);
         if (self.forward_auth) |*fa| fa.deinit(allocator);
+        self.client_cert.deinit(allocator);
         if (self.websocket) |*ws| ws.deinit(allocator);
         for (self.error_pages) |*rule| rule.deinit(allocator);
         if (self.error_pages.len > 0) allocator.free(self.error_pages);

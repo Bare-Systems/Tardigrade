@@ -1094,6 +1094,21 @@ jobs:
       - name: Print Zig version
         run: zig version
 
+      - name: Run WebSocket reactor smoke (#830)
+        env:
+          TARDIGRADE_WS_REACTOR_EVIDENCE: ${{ runner.temp }}/websocket-reactor-smoke.json
+          TARDIGRADE_WS_REACTOR_SOURCE_SHA: ${{ github.sha }}
+        run: zig build test-integration-websocket-reactor-smoke --summary all
+
+      - name: Upload WebSocket reactor smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: websocket-reactor-smoke
+          path: ${{ runner.temp }}/websocket-reactor-smoke.json
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Run integration tests
         run: zig build test-integration --summary all
 

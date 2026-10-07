@@ -263,13 +263,15 @@ independently:
    shutdown, and resource settle.
 
 The pre-reactor baseline was one request worker held for every established
-tunnel. The objective exit criterion is encoded by `tests/integration.zig`'s
-“proxy_websocket runs hundreds of tunnels on reactor threads while one worker
-keeps serving requests” test: with one worker, 300 idle tunnels, and two
-reactor threads, it requires all handoffs to appear, requires load to span
-both shards, serves 40 unrelated `/healthz` requests with a worst-case latency
-below one second, proves tunnel traffic still relays, and waits for tunnel,
-reactor-owned, and connection gauges to return to baseline.
+tunnel. The objective exit criterion is encoded by the focused #830
+live-process smoke in `tests/integration.zig`: with one worker, two reactor
+threads, a capped population of idle tunnels, relay traffic, capacity
+rejection, churn, and ordinary `/healthz` probes, it requires every successful
+handshake to be handed to the reactor and all tunnel/reactor/connection gauges
+to return to baseline. It writes a CI artifact with the measured outcomes and
+has a configurable dedicated-runner profile for 1,000 live plaintext tunnels.
 `src/http/tunnel_reactor.zig` separately proves up to 1500 tunnels on two
 reactor threads, idle timer wakeups without a periodic tick, handoff rollback,
-bounded stalled-reader buffering, reload drain, and shutdown join.
+bounded stalled-reader buffering, reload drain, and shutdown join. See
+[WebSocket reactor validation](WEBSOCKET_REACTOR_VALIDATION.md) for commands,
+thresholds, artifact fields, native-TLS coverage, and the boundary with #819.

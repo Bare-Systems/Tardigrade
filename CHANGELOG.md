@@ -6,6 +6,12 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **H1/H2 downstream mTLS interop (#763).** New `scripts/interop/run-h1-h2-mtls-interop.sh`
+  (CI job `h1-h2-mtls-interop`) drives the real gateway with curl `--http1.1`,
+  curl `--http2` and `openssl s_client`: required/optional modes, bad-certificate
+  classes, verified identity and forged-header replacement, per-SNI two-CA policy
+  with `421` on SNI/Host mismatch, and CA-bundle rotation via reload.
+
 - **Certificate-aware routing and forward_auth identity (#763).** New location
   directives `client_cert required` and `client_cert_allow KIND VALUE`
   (`fingerprint`, `subject`, `issuer`, `san_dns`, `san_email`, `san_uri`) gate a

@@ -390,3 +390,23 @@ AIOQUIC_PYTHON=/tmp/aioquic-venv/bin/python scripts/interop/run-h3-mtls-interop.
 The in-process counterpart (native client over real UDP against
 `http3_runtime`) lives in `tests/quic_h3_udp_smoke.zig` (`udp h3 mTLS:` tests).
 
+## #763: downstream HTTP/1.1 and HTTP/2 mTLS interop
+
+`run-h1-h2-mtls-interop.sh` (CI job `h1-h2-mtls-interop`) runs the real `tardi`
+gateway over real TCP TLS against independent clients: `curl` (OpenSSL backend)
+forced to `--http1.1` and to `--http2` (the negotiated ALPN version is
+asserted per request), and `openssl s_client` speaking raw HTTP/1.1. It uses the
+same `h3mtls` fixtures and asserts:
+
+| area | expected |
+|---|---|
+| required | valid cert served, upstream sees verified `X-Tardigrade-Client-Cert-*`; forged `X-Tardigrade-*` request headers replaced/dropped; no cert / wrong CA / expired / not yet valid / `serverAuth`-only refused, upstream never contacted |
+| optional | anonymous served with no identity; valid cert served with identity; a presented invalid cert still refused |
+| per-SNI | `a.test` (CA A), `b.test` (unrelated CA B), `open.test` (no client auth): cross-CA refused both ways; `421` when Host/`:authority` maps to a different policy than the SNI |
+| rotation | rewriting the CA bundle + `SIGHUP` swaps trust (A → B → A); an unloadable bundle is rejected and the serving trust keeps verifying |
+
+```sh
+zig build
+CURL=/opt/homebrew/opt/curl/bin/curl scripts/interop/run-h1-h2-mtls-interop.sh   # needs curl with OpenSSL + HTTP/2
+```
+

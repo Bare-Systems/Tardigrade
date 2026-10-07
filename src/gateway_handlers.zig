@@ -14,6 +14,7 @@ const gph = @import("gateway_proxy_headers.zig");
 const gpr = @import("gateway_protocols.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
 const gs = @import("gateway_state.zig");
+const tls_core_client_trust = @import("tls_core").client_trust;
 const gstatic = @import("gateway_static_runtime.zig");
 
 const JSON_CONTENT_TYPE = "application/json";
@@ -5760,6 +5761,32 @@ pub fn handleHttp3Request(
     defer cfg_lease.release();
     const active_cfg = cfg_lease.cfg;
     const authority = request.headers.get(":authority") orelse request.headers.get("host");
+    // #763: handshake -> routing consistency. The connection was admitted under
+    // the client-auth policy its handshake fingerprinted; the config generation
+    // leased above is the one that routes this request, so its own policy table
+    // (not any separately published global) decides whether this authority may
+    // ride the connection. Closes the reload publication window where a QUIC
+    // handshake sees generation N+1 while routing still uses N.
+    if (request.client_auth_policy_fingerprint) |handshake_fp| {
+        const admitted = if (cfg_lease.version.client_policies) |policies|
+            tls_core_client_trust.hostAdmitted(handshake_fp, policies.fingerprintForHost(authority orelse ""))
+        else
+            false;
+        if (!admitted) {
+            const correlation_id = request.headers.get(http.correlation.REQUEST_HEADER_NAME) orelse request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+            const payload = try buildApiErrorJson(allocator, "misdirected_request", "Request host is governed by a different client-certificate policy than this connection's TLS server name", correlation_id);
+            _ = response
+                .setStatus(.misdirected_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                .setHeader("Cache-Control", "no-store");
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(421);
+            return;
+        }
+    }
     var effective_cfg_storage = active_cfg.*;
     const effective_cfg = resolveRequestConfig(active_cfg, authority, &effective_cfg_storage) orelse {
         const correlation_id = request.headers.get(http.correlation.REQUEST_HEADER_NAME) orelse request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
@@ -5973,4 +6000,86 @@ test {
     _ = @import("gateway_proxy.zig");
     _ = @import("gateway_proxy_runtime.zig");
     _ = @import("gateway_control_plane_proxy.zig");
+}
+
+test "H3 handler binds handshake policy to the routing config generation, closing the reload publication window (#763)" {
+    const allocator = std.testing.allocator;
+    const ct = tls_core_client_trust;
+    const host = "api.example.test";
+    const required = [_]ct.PolicySpec{.{ .names = &.{host}, .mode = .required, .ca_path = "tests/fixtures/tls/h3mtls/ca.crt" }};
+    const disabled = [_]ct.PolicySpec{.{ .names = &.{host}, .mode = .disabled }};
+
+    var set = ct.PolicySet.init(allocator);
+    defer set.deinit();
+
+    var cfg = minimalHttp3ProxyConfig(&.{});
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    // Routing generation N: api requires mTLS.
+    var prepared_n = try set.prepare(.{}, &required, ct.exactNameMatcher);
+    set.commit(&prepared_n);
+    config_store.setInitialClientPolicies(set.acquire());
+
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+
+    // Reload N+1 (api disabled) has published the policy set, but
+    // `installPrepared` has not run: routing is still generation N.
+    var prepared_n1 = try set.prepare(.{}, &disabled, ct.exactNameMatcher);
+    set.commit(&prepared_n1);
+
+    // A new QUIC connection now handshakes anonymously under N+1...
+    const window = set.acquire().?;
+    defer window.release();
+    const handshake_fp = window.select(host).fingerprint;
+    try std.testing.expectEqual(@as(u64, 0), handshake_fp);
+
+    // ...and its request must be refused by generation N's table, not routed.
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/admin/users"),
+        .authority = try allocator.dupe(u8, host),
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+        .client_auth_policy_fingerprint = handshake_fp,
+    };
+    defer request.deinit();
+    try request.headers.append("host", host);
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+    try std.testing.expectEqual(@as(u16, 421), @intFromEnum(response.status));
+
+    // A connection that handshook under N's own policy is admitted to routing.
+    const n_policy = ct.policyFingerprint(required[0]);
+    var request_ok = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/admin/users"),
+        .authority = try allocator.dupe(u8, host),
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+        .client_auth_policy_fingerprint = n_policy,
+    };
+    defer request_ok.deinit();
+    try request_ok.headers.append("host", host);
+    var response_ok = http.Response.init(allocator);
+    defer response_ok.deinit();
+    try handleHttp3Request(allocator, &request_ok, &response_ok, &dispatch_ctx);
+    try std.testing.expect(@intFromEnum(response_ok.status) != 421);
+
+    // A generation with no policy table fails closed rather than open.
+    var bare_cfg = minimalHttp3ProxyConfig(&.{});
+    var bare_store = try ReloadableConfigStore.initBorrowed(allocator, &bare_cfg);
+    defer bare_store.deinit();
+    var bare_ctx = Http3DispatchContext{ .config_store = &bare_store, .cfg = &bare_cfg, .state = &state };
+    var response_bare = http.Response.init(allocator);
+    defer response_bare.deinit();
+    try handleHttp3Request(allocator, &request, &response_bare, &bare_ctx);
+    try std.testing.expectEqual(@as(u16, 421), @intFromEnum(response_bare.status));
 }

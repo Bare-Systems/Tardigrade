@@ -423,16 +423,22 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     // #763: downstream mTLS trust anchors. Loaded eagerly so a bad bundle
     // fails startup rather than the first handshake; never falls back to the
     // system trust store.
-    var client_trust: ?http.native_tls_connection.ClientTrustStore = null;
-    if (cfg.tls_client_verify) {
+    // The set always exists on a native TLS listener so mTLS policies (and
+    // their CA bundles) can be enabled, changed or rotated by hot reload.
+    var client_policies: ?http.native_tls_connection.ClientPolicySet = null;
+    if (native_tls_provider == null and cfg.anyClientAuth()) {
         // Defensive twin of config validation: never start a listener that
         // demands client certificates but would serve plaintext.
-        if (native_tls_provider == null) return error.ClientTrustUnavailable;
-        client_trust = http.native_tls_connection.ClientTrustStore.init(state_allocator);
-        var prepared = try client_trust.?.prepare(cfg.tls_client_ca_path, cfg.tls_client_verify_depth);
-        client_trust.?.commit(&prepared);
+        return error.ClientTrustUnavailable;
     }
-    defer if (client_trust) |*store| store.deinit();
+    if (native_tls_provider != null) {
+        client_policies = http.native_tls_connection.ClientPolicySet.init(state_allocator);
+        var prepared = try cfg.prepareClientPolicies(&client_policies.?);
+        client_policies.?.commit(&prepared);
+        // The startup generation owns its snapshot like it owns its ACL.
+        config_store.setInitialClientPolicies(client_policies.?.acquire());
+    }
+    defer if (client_policies) |*set| set.deinit();
     const native_early_data_replay_composition = nativeEarlyDataReplayComposition(
         cfg.tls_native_early_data_replay_mode,
         native_resumption_runtime != null,
@@ -494,10 +500,9 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             .credential_provider = h3_credential_provider,
             .resumption_runtime = if (native_resumption_runtime) |*rt| rt else null,
             .early_data_replay_gate = native_early_data_replay_gate,
-            // #763: the same trust store the TCP listener uses, so one CA
-            // bundle and one reload govern H1, H2 and H3.
-            .client_auth = if (!cfg.tls_client_verify) .disabled else if (cfg.tls_client_verify_optional) .optional else .required,
-            .client_trust = if (client_trust) |*store| store else null,
+            // #763: the same SNI-keyed policy set the TCP listener uses, so
+            // one policy table and one reload govern H1, H2 and H3.
+            .client_policies = if (client_policies) |*set| set else null,
             .tls_min_version = "1.3",
             .tls_max_version = "1.3",
             .enable_0rtt = cfg.http3_enable_0rtt,
@@ -582,7 +587,7 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         .config_store = &config_store,
         .state = &state,
         .native_credentials = if (native_credentials) |*store| store else null,
-        .client_trust = if (client_trust) |*store| store else null,
+        .client_policies = if (client_policies) |*set| set else null,
         .native_tls_provider = native_tls_provider,
         .resumption_runtime = if (native_resumption_runtime) |*rt| rt else null,
         .early_data_replay_gate = native_early_data_replay_gate,
@@ -1468,10 +1473,13 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             ctx.state.logger.warn(null, "native TLS path does not support PROXY protocol preface parsing yet", .{});
             return;
         }
-        if (cfg.tls_client_verify and ctx.client_trust == null) {
+        // #763: the policy table comes from the very configuration
+        // generation this connection leased, never from a later reload.
+        const client_policies = cfg_lease.version.client_policies;
+        if (client_policies == null and cfg.anyClientAuth()) {
             // Fail closed: never serve a listener that is configured to
-            // demand client certificates without a trust store.
-            ctx.state.logger.warn(null, "client certificate verification is enabled but no client trust store is loaded", .{});
+            // demand client certificates without a policy table.
+            ctx.state.logger.warn(null, "client certificate verification is enabled but no client policy set is loaded", .{});
             return;
         }
         const tls_protocol_policy = gprotocol_policy.listenerPolicyFromConfig(cfg);
@@ -1485,8 +1493,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
                 .resumption_runtime = ctx.resumption_runtime,
                 .early_data_replay_gate = ctx.early_data_replay_gate,
                 .server_early_data_policy = nativeTcpServerEarlyDataPolicy(ctx.early_data_replay_gate),
-                .client_auth = if (!cfg.tls_client_verify) .disabled else if (cfg.tls_client_verify_optional) .optional else .required,
-                .client_trust = ctx.client_trust,
+                .client_policies = client_policies,
             },
         ) catch |err| {
             ctx.state.logger.warn(null, "native tls connection setup failed: {}", .{err});
@@ -2130,6 +2137,10 @@ const WaitingEncryptedHttpConnection = struct {
         return clientCertificateView(identity);
     }
 
+    pub fn clientPolicyAdmitsHost(self: *const WaitingEncryptedHttpConnection, host: []const u8) bool {
+        return self.inner.clientPolicyAdmitsHost(host);
+    }
+
     pub fn waitForHandshakeCompletionOrInput(self: *WaitingEncryptedHttpConnection) !void {
         while (true) {
             if (self.downstreamHandshakeComplete()) return;
@@ -2505,6 +2516,19 @@ fn clientCertificateView(identity: *const tls_core.client_identity.ClientIdentit
         .san_email = identity.sanEmail(),
         .san_uri = identity.sanUri(),
     };
+}
+
+/// Whether `conn`'s SNI-selected client-auth policy admits a request for
+/// `host` (#763); true for plaintext and policy-less connections.
+fn connClientPolicyAdmitsHost(conn: anytype, host: []const u8) bool {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "clientPolicyAdmitsHost")) return conn.clientPolicyAdmitsHost(host);
+    } else {
+        if (comptime @hasDecl(T, "clientPolicyAdmitsHost")) return conn.clientPolicyAdmitsHost(host);
+    }
+    return true;
 }
 
 /// The verified mTLS identity of `conn` (#763), or null for plaintext and
@@ -3626,7 +3650,18 @@ fn respondHttp2Stream(
     // accepted.
     var early_data_refused = false;
     defer if (ps.transport_early and !early_data_refused) state.metricsRecordEarlyDataDecision(.h2, .accepted);
-    if (try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle, &forward_auth_allowed, &early_data_refused)) |result| {
+    // #763: stream-scope SNI/:authority admission, before any routing, auth
+    // or proxy work. The handshake enforced the client-auth policy of the SNI
+    // it was admitted under; a stream whose authority maps to a different
+    // policy gets 421 on that stream only (the connection stays up).
+    const policy_host = ps.authority orelse (ps.headers.get("host") orelse "");
+    if (!connClientPolicyAdmitsHost(conn, policy_host)) {
+        status_code = 421;
+        body_alloc = try gp.buildApiErrorJson(allocator, "misdirected_request", "Request host is governed by a different client-certificate policy than this connection's TLS server name", correlation_id);
+        body = body_alloc.?;
+        refusal_no_store = true;
+        state.metricsRecordErrorCode("misdirected_request");
+    } else if (try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle, &forward_auth_allowed, &early_data_refused)) |result| {
         switch (result) {
             .response => |proxy_response| {
                 var response = proxy_response;
@@ -5008,6 +5043,15 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // never from request bytes (inbound `X-Tardigrade-*` is stripped at proxy).
     request.headers.client_cert = connClientCertificate(conn);
     const writer = conn.writer();
+    // #763: the handshake enforced the client-auth policy of the SNI it was
+    // admitted under. A request whose Host maps to a different policy cannot
+    // ride this connection (RFC 9110 §15.5.20): answer 421 so the client
+    // reconnects with the right SNI, rather than letting one host's trust
+    // (or lack of it) decide another's.
+    if (!connClientPolicyAdmitsHost(conn, (request.headers.get("host") orelse ""))) {
+        try gp.sendApiError(allocator, writer, .misdirected_request, "misdirected_request", "Request host is governed by a different client-certificate policy than this connection's TLS server name", null, false, state);
+        return;
+    }
     keep_alive = request.keepAlive();
     if (streaming_request_body != null) keep_alive = false;
     if (http.shutdown.isShutdownRequested()) keep_alive = false;
@@ -6799,6 +6843,9 @@ const H2DispatchTestConn = struct {
     handshake_complete: bool = true,
     handshake_completes_on_wait: bool = false,
     wait_calls: usize = 0,
+    /// Result of the SNI-selected client-auth policy's Host admission (#763).
+    policy_admits: bool = true,
+    policy_checked_hosts: usize = 0,
 
     const Writer = struct {
         conn: *H2DispatchTestConn,
@@ -6843,6 +6890,11 @@ const H2DispatchTestConn = struct {
 
     fn downstreamHandshakeComplete(self: *const H2DispatchTestConn) bool {
         return self.handshake_complete;
+    }
+
+    pub fn clientPolicyAdmitsHost(self: *H2DispatchTestConn, _: []const u8) bool {
+        self.policy_checked_hosts += 1;
+        return self.policy_admits;
     }
 
     fn waitForHandshakeCompletionOrInput(self: *H2DispatchTestConn) !void {
@@ -6933,6 +6985,69 @@ test "H2 deferred ready stream wakes on handshake completion without extra H2 fr
     try std.testing.expect(!pending.contains(1));
     try std.testing.expectEqual(@as(usize, 0), ready.items.len);
     try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+}
+
+fn runH2PolicyAdmissionStream(allocator: std.mem.Allocator, admits: bool, out_421: *bool, checked: *usize, requests: *u64) !void {
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer {
+        var it = pending.iterator();
+        while (it.next()) |entry| {
+            var ps = entry.value_ptr.*;
+            ps.deinit(allocator);
+        }
+        pending.deinit();
+    }
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var pending_responses = std.AutoHashMap(u31, PendingHttp2Response).init(allocator);
+    defer {
+        var it = pending_responses.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        pending_responses.deinit();
+    }
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+
+    var ps = Http2PendingStream.init(allocator);
+    ps.method = try allocator.dupe(u8, "GET");
+    ps.path = try allocator.dupe(u8, "/secret");
+    ps.authority = try allocator.dupe(u8, "api.example.test");
+    try pending.put(1, ps);
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try ready.append(1);
+
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+    conn.policy_admits = admits;
+    var next_server_stream_id: u31 = 2;
+    var conn_send_window: i32 = 65_535;
+    var buffered_request_bytes: usize = 0;
+    try h2DispatchReadyStreams(&conn, allocator, &state, &cfg, &pending, &streams, &pending_responses, &ready, &next_server_stream_id, &conn_send_window, &buffered_request_bytes, "127.0.0.1");
+    out_421.* = std.mem.indexOf(u8, conn.out.written(), "misdirected_request") != null;
+    checked.* = conn.policy_checked_hosts;
+    requests.* = state.metrics.total_requests;
+}
+
+test "H2 stream whose :authority maps to a different client-auth policy is answered 421 before routing (#763)" {
+    const allocator = std.testing.allocator;
+    var is_421 = false;
+    var checked: usize = 0;
+    var requests: u64 = 0;
+    // CA-A / open SNI -> another policy's :authority: refused on this stream.
+    try runH2PolicyAdmissionStream(allocator, false, &is_421, &checked, &requests);
+    try std.testing.expect(is_421);
+    try std.testing.expectEqual(@as(usize, 1), checked);
+    try std.testing.expectEqual(@as(u64, 1), requests);
+    // Same-policy authority dispatches normally (no 421).
+    try runH2PolicyAdmissionStream(allocator, true, &is_421, &checked, &requests);
+    try std.testing.expect(!is_421);
+    try std.testing.expectEqual(@as(usize, 1), checked);
 }
 
 test "H2 early stream defers dispatch until handshake completion then dispatches once" {

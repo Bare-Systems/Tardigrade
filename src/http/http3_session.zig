@@ -31,6 +31,12 @@ pub const StreamRequest = struct {
     /// Never derived from request headers.
     client_ip: ?[]u8 = null,
     transport_early: bool = false,
+    /// Fingerprint of the client-auth policy this connection's TLS handshake
+    /// was admitted under (#763), supplied out-of-band by the QUIC runtime;
+    /// null when the listener has no client-auth policy table. The handler
+    /// checks it against the policy table of the very config generation it
+    /// routes with.
+    client_auth_policy_fingerprint: ?u64 = null,
     downstream_handshake_complete: bool = true,
     downstream_handshake: ?request_context.DownstreamHandshakeBarrier = null,
     park_early_425_retry: ?ParkEarly425Retry = null,

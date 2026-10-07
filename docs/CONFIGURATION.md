@@ -1194,13 +1194,11 @@ paths; FastCGI/SCGI/uwsgi, `forward_auth` subrequests and location-level
 **Rotation.** The CA bundle is re-read on every config reload and published as
 one atomic generation: a bundle that fails to load rejects the whole reload
 and the serving trust set keeps verifying, and a handshake already in flight
-finishes against the generation it started with. Enabling
-`TARDIGRADE_TLS_CLIENT_VERIFY` on a process that started without it requires a
-restart. While HTTP/3 is enabled, changing `TARDIGRADE_TLS_CLIENT_VERIFY` or
-`TARDIGRADE_TLS_CLIENT_VERIFY_OPTIONAL` (required, optional, off) is likewise
-restart-owned and a SIGHUP that attempts it is rejected, because the QUIC
-runtime fixes the mode at startup; CA-bundle and depth changes remain
-hot-reloadable. Revocation (CRL/OCSP) is not consulted: remove a revoked CA or issue
+finishes against the generation it started with. The whole per-SNI policy
+table is replaced atomically, and every part of it, including enabling or
+disabling client verification and switching required/optional, is
+hot-reloadable on every protocol; a bundle that fails to load in *any* policy
+rejects the entire reload. Revocation (CRL/OCSP) is not consulted: remove a revoked CA or issue
 short-lived client certificates; the validator's revocation seam stays
 disabled until runtime OCSP/CRL support exists.
 
@@ -1218,9 +1216,52 @@ reaches the application; a missing certificate in required mode closes with
 `certificate_required` (`0x174`). With client verification enabled the server
 always performs a full handshake (PSK resumption and therefore 0-RTT are not
 offered), so every QUIC connection carries its own verified identity and no
-early-data request can be served without one. Client verification is per
-listener, not per SNI server block, and the QUIC listener and TCP listener
-always share one policy.
+early-data request can be served without one. The QUIC listener and TCP
+listener always share one policy table.
+
+**Per-server policy (per SNI).** `tls_client_verify`,
+`tls_client_verify_optional`, `tls_client_ca_path` and
+`tls_client_verify_depth` are also accepted inside a `server { }` block
+(`on`/`off`/`true`/`false` for the booleans). The policy is selected from the
+TLS ClientHello **SNI** *before* the `CertificateRequest` is built, never from
+the later HTTP `Host` header, so each server block has its own required/
+optional mode and its own CA trust:
+
+```
+server { server_name api.example.com;   tls_client_verify on;  tls_client_ca_path /etc/tls/ca-a.pem; }
+server { server_name admin.example.com; tls_client_verify on;  tls_client_ca_path /etc/tls/ca-b.pem; }
+server { server_name www.example.com;   tls_client_verify off; }
+```
+
+A certificate issued by CA A authenticates to `api.example.com` and is refused
+by `admin.example.com` (and vice versa). Rules:
+
+- Unset directives inherit the listener-wide `TARDIGRADE_TLS_CLIENT_*` value.
+- Selection uses the **same server-name matching and ordering as virtual-host
+  routing** (one shared implementation): the first `server {}` block, in
+  configuration order, whose `server_name` matches the SNI wins — including
+  `~regex` names, `*.suffix` (a raw suffix match, so it also covers deeper
+  names) and a block with no `server_name` (matches everything from its
+  position on). There is no "exact before wildcard" preference. An SNI that
+  matches no block uses the listener-wide `tls_client_*` settings.
+- Each distinct CA bundle is its own trust generation, and every policy table
+  is bound to the **configuration generation** that owns routing. A TCP
+  connection takes its table from the config it leased at accept, so a reload
+  that lands between accept and ClientHello (or between requests) can never
+  mix handshake policy from one generation with routing from another. QUIC
+  connections pin the table current at accept and are additionally checked
+  against the current table on every request. A reload swaps every policy
+  atomically; a handshake in flight keeps the generation it pinned.
+- A policy that requests client certificates always forces a full handshake;
+  hosts with client verification off keep normal PSK resumption.
+- **SNI/Host consistency.** If a request's `Host` (HTTP/1.1, `:authority` on
+  HTTP/2 and HTTP/3) maps to a client-auth policy that differs from the one the
+  connection was admitted under, the request is answered `421 Misdirected
+  Request` (on HTTP/2, on that stream only) and the client must reconnect with
+  the matching SNI. A host with no
+  client verification is always admissible; this prevents a connection admitted
+  under a weaker (or different-CA) policy from reaching another host's
+  protected routes through connection reuse or a forged `Host`.
 
 ## Validation Notes
 

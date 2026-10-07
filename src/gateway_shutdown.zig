@@ -340,25 +340,10 @@ pub fn hotReloadConfig(
     // prepare-then-publish discipline as the server identity. A bundle that
     // fails to load rejects the whole reload and the serving generation keeps
     // verifying; connections already mid-handshake pin their own generation.
-    var prepared_client_trust: ?http.native_tls_connection.ClientTrustStore.Prepared = null;
-    defer if (prepared_client_trust) |*prepared| prepared.deinit();
-    if (cfg_ptr.tls_client_verify and worker_ctx.client_trust == null) {
-        // The trust store is created at startup alongside the credential
-        // owner; turning mTLS on later would otherwise "apply" while every
-        // new handshake fails closed.
-        worker_ctx.config_store.destroyVersion(prepared_version);
-        const msg = std.fmt.bufPrint(&state.last_reload_error, "enabling client certificate verification requires restart", .{}) catch "enabling client certificate verification requires restart";
-        state.reload_mutex.lock();
-        state.last_reload_ok = false;
-        state.last_reload_at_ms = now_ms;
-        state.last_reload_error_len = msg.len;
-        state.reload_mutex.unlock();
-        state.metricsRecordReloadFailure();
-        state.logger.warn(null, "config reload rejected: TARDIGRADE_TLS_CLIENT_VERIFY would be enabled on a process that started without a client trust store; restart to enable mTLS", .{});
-        return;
-    }
-    if (cfg_ptr.tls_client_verify) if (worker_ctx.client_trust) |store| {
-        prepared_client_trust = store.prepare(cfg_ptr.tls_client_ca_path, cfg_ptr.tls_client_verify_depth) catch |err| {
+    var prepared_client_policies: ?tls_core.client_trust.PolicySet.Prepared = null;
+    defer if (prepared_client_policies) |*prepared| prepared.deinit();
+    if (worker_ctx.client_policies) |set| {
+        prepared_client_policies = cfg_ptr.prepareClientPolicies(set) catch |err| {
             worker_ctx.config_store.destroyVersion(prepared_version);
             const msg = std.fmt.bufPrint(&state.last_reload_error, "client trust reload failed: {}", .{err}) catch "client trust reload failed";
             state.reload_mutex.lock();
@@ -370,7 +355,18 @@ pub fn hotReloadConfig(
             state.logger.warn(null, "config reload rejected by client trust (mTLS CA bundle) reload: {}", .{err});
             return;
         };
-    };
+    } else if (cfg_ptr.anyClientAuth()) {
+        worker_ctx.config_store.destroyVersion(prepared_version);
+        const msg = std.fmt.bufPrint(&state.last_reload_error, "client certificate verification requires native TLS", .{}) catch "client certificate verification requires native TLS";
+        state.reload_mutex.lock();
+        state.last_reload_ok = false;
+        state.last_reload_at_ms = now_ms;
+        state.last_reload_error_len = msg.len;
+        state.reload_mutex.unlock();
+        state.metricsRecordReloadFailure();
+        state.logger.warn(null, "config reload rejected: client certificate verification enabled without a native TLS listener; restart", .{});
+        return;
+    }
     if (worker_ctx.resumption_runtime) |runtime| {
         if (cfg_ptr.tls_native_ticket_keys_path.len > 0) {
             runtime.loadPersistentTicketKeysFromFile(cfg_ptr.tls_native_ticket_keys_path) catch |err| {
@@ -411,8 +407,14 @@ pub fn hotReloadConfig(
         }
     }
 
-    if (worker_ctx.client_trust) |store| {
-        if (prepared_client_trust) |*prepared| store.commit(prepared);
+    if (worker_ctx.client_policies) |set| {
+        if (prepared_client_policies) |*prepared| {
+            // The generation being installed owns one reference (TCP
+            // connections take their policy table from the config they lease);
+            // the set keeps the other for new QUIC connections.
+            if (prepared.snapshot) |snapshot| gs.ReloadableConfigStore.setPreparedClientPolicies(prepared_version, snapshot.retain());
+            set.commit(prepared);
+        }
     }
 
     applyReloadedRuntimeConfig(cfg_ptr, state, &prepared_security);
@@ -500,15 +502,9 @@ pub fn http3ListenerConfigChanged(
         // connection at creation.
         current.http3_ecn_enabled != proposed.http3_ecn_enabled or
         !std.mem.eql(u8, current.http3_qlog_dir, proposed.http3_qlog_dir) or
-        !std.mem.eql(u8, current.http3_keylog_path, proposed.http3_keylog_path) or
-        // #763: the QUIC runtime snapshots the client-auth mode at startup,
-        // whereas H1/H2 recompute it per connection. Letting the mode change
-        // in place would leave H3 enforcing a stale policy (optional->required
-        // would fail open), so while H3 is active it is restart-owned. The CA
-        // bundle and depth stay hot-reloadable via the shared trust store.
-        ((current.http3_enabled or proposed.http3_enabled) and
-            (current.tls_client_verify != proposed.tls_client_verify or
-                current.tls_client_verify_optional != proposed.tls_client_verify_optional));
+        // #763: client-auth policy is chosen per handshake from the shared
+        // SNI-keyed policy set (H1, H2 and H3 alike), so it is hot-reloadable.
+        !std.mem.eql(u8, current.http3_keylog_path, proposed.http3_keylog_path);
 }
 
 pub fn listenerShardConfigChanged(
@@ -631,7 +627,7 @@ test "http3ListenerConfigChanged permits advertisement-only reloads" {
     try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
 }
 
-test "http3ListenerConfigChanged makes client-auth mode restart-owned but CA/depth rotation reloadable (#763)" {
+test "http3ListenerConfigChanged leaves client-auth policy hot-reloadable (#763)" {
     const allocator = std.testing.allocator;
     var base = try edge_config.loadFromEnv(allocator);
     defer base.deinit(allocator);
@@ -640,34 +636,15 @@ test "http3ListenerConfigChanged makes client-auth mode restart-owned but CA/dep
     base.http3_enabled = true;
     proposed.http3_enabled = true;
 
-    // optional -> required
+    // optional -> required, enabled -> disabled: the policy is chosen per
+    // handshake from the shared SNI-keyed set, so none of it needs a restart.
     base.tls_client_verify = true;
     base.tls_client_verify_optional = true;
     proposed.tls_client_verify = true;
     proposed.tls_client_verify_optional = false;
-    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
-    // required -> optional
-    try std.testing.expect(http3ListenerConfigChanged(&proposed, &base));
-    // enabled -> disabled, and disabled -> enabled
+    try std.testing.expect(!http3ListenerConfigChanged(&base, &proposed));
     proposed.tls_client_verify = false;
-    proposed.tls_client_verify_optional = base.tls_client_verify_optional;
-    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
-    try std.testing.expect(http3ListenerConfigChanged(&proposed, &base));
-
-    // CA bundle and depth rotation stay hot-reloadable.
-    proposed.tls_client_verify = true;
-    // Borrow a literal, restoring the owned slice before `deinit` frees it.
-    const owned_ca_path = proposed.tls_client_ca_path;
-    defer proposed.tls_client_ca_path = owned_ca_path;
-    proposed.tls_client_ca_path = "/etc/tardigrade/other-ca.pem";
-    proposed.tls_client_verify_depth = base.tls_client_verify_depth + 1;
-    try std.testing.expect(!http3ListenerConfigChanged(&base, &proposed));
-
-    // With H3 off on both sides the mode remains freely reloadable.
-    base.http3_enabled = false;
-    proposed.http3_enabled = false;
-    proposed.tls_client_verify_optional = !base.tls_client_verify_optional;
-    try std.testing.expect(!http3ListenerConfigChanged(&base, &proposed));
+    try std.testing.expect(!http3ListenerConfigChanged(&proposed, &base));
 }
 
 test "listenerShardConfigChanged requires restart for listener topology changes" {

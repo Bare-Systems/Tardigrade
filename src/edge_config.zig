@@ -167,8 +167,15 @@ pub const EdgeConfig = struct {
         upstream_base_url: []const u8,
         proxy_pass_chat: []const u8,
         proxy_pass_commands_prefix: []const u8,
+        /// Per-server downstream mTLS policy (#763). `null` inherits the
+        /// listener-wide `tls_client_*` value; selected by ClientHello SNI.
+        tls_client_verify: ?bool = null,
+        tls_client_verify_optional: ?bool = null,
+        tls_client_ca_path: ?[]const u8 = null,
+        tls_client_verify_depth: ?u32 = null,
 
         pub fn deinit(self: *ServerBlock, allocator: std.mem.Allocator) void {
+            if (self.tls_client_ca_path) |p| allocator.free(p);
             for (self.server_names) |name| allocator.free(name);
             allocator.free(self.server_names);
             allocator.free(self.doc_root);
@@ -182,6 +189,58 @@ pub const EdgeConfig = struct {
             allocator.free(self.proxy_pass_commands_prefix);
             self.* = undefined;
         }
+    };
+
+    /// Effective client-auth policy of one server block (or, for `null`, the
+    /// listener-wide settings), inheriting every field the block leaves unset.
+    pub fn clientAuthPolicy(self: *const EdgeConfig, block: ?*const ServerBlock) tls_core.client_trust.PolicySpec {
+        const verify = if (block) |b| b.tls_client_verify orelse self.tls_client_verify else self.tls_client_verify;
+        const optional = if (block) |b| b.tls_client_verify_optional orelse self.tls_client_verify_optional else self.tls_client_verify_optional;
+        const ca = if (block) |b| b.tls_client_ca_path orelse self.tls_client_ca_path else self.tls_client_ca_path;
+        const depth = if (block) |b| b.tls_client_verify_depth orelse self.tls_client_verify_depth else self.tls_client_verify_depth;
+        return .{
+            .names = if (block) |b| b.server_names else &.{},
+            .mode = if (!verify) .disabled else if (optional) .optional else .required,
+            .ca_path = ca,
+            .max_path_length = depth,
+        };
+    }
+
+    /// The policy table for the TLS layer: one spec per server block, in
+    /// configuration order — the order routing walks — each matched with
+    /// `hostMatchesPatterns` (the routing contract), so a name selects the
+    /// same block's policy that its HTTP requests are later routed to. Names
+    /// matching no block use the listener-wide settings (`fallback`). Caller
+    /// frees `specs`; names borrow from this config.
+    pub fn clientAuthPolicies(self: *const EdgeConfig, allocator: std.mem.Allocator) !ClientAuthPolicies {
+        var specs = std.ArrayList(tls_core.client_trust.PolicySpec).empty;
+        errdefer specs.deinit(allocator);
+        for (self.server_blocks) |*block| try specs.append(allocator, self.clientAuthPolicy(block));
+        var fallback = self.clientAuthPolicy(null);
+        fallback.names = &.{};
+        return .{ .fallback = fallback, .specs = try specs.toOwnedSlice(allocator) };
+    }
+
+    /// Whether any listener or server-block policy requests client certificates.
+    pub fn anyClientAuth(self: *const EdgeConfig) bool {
+        if (self.tls_client_verify) return true;
+        for (self.server_blocks) |*b| {
+            if (b.tls_client_verify orelse false) return true;
+        }
+        return false;
+    }
+
+    /// Load every client-auth policy's CA bundle into a prepared (unpublished)
+    /// snapshot of `set`; a bad bundle fails the whole prepare.
+    pub fn prepareClientPolicies(self: *const EdgeConfig, set: *tls_core.client_trust.PolicySet) !tls_core.client_trust.PolicySet.Prepared {
+        const policies = try self.clientAuthPolicies(set.allocator);
+        defer set.allocator.free(policies.specs);
+        return set.prepare(policies.fallback, policies.specs, hostMatchesPatterns);
+    }
+
+    pub const ClientAuthPolicies = struct {
+        fallback: tls_core.client_trust.PolicySpec,
+        specs: []tls_core.client_trust.PolicySpec,
     };
 
     listen_host: []const u8,
@@ -1286,6 +1345,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         allocator.free(server_blocks);
     }
     try applyServerBlockTlsConfig(allocator, &tls_cert_path, &tls_key_path, &tls_sni_certs, server_blocks);
+    const server_block_client_auth_raw = envOrDefault(allocator, "TARDIGRADE_SERVER_BLOCK_CLIENT_AUTH", "") catch unreachable;
+    defer allocator.free(server_block_client_auth_raw);
+    try applyServerBlockClientAuth(allocator, server_blocks, server_block_client_auth_raw);
     const doc_root = envOrDefault(allocator, "TARDIGRADE_DOC_ROOT", "") catch unreachable;
     errdefer allocator.free(doc_root);
     const try_files = envOrDefault(allocator, "TARDIGRADE_TRY_FILES", "") catch unreachable;
@@ -2015,6 +2077,36 @@ fn parseServerBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfi
         });
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// Parallel-to-`TARDIGRADE_SERVER_BLOCKS` records (one per block, in order) of
+/// `verify \x1f optional \x1f ca_path \x1f depth`; an empty field inherits the
+/// listener-wide value, `on`/`off` set the booleans (#763).
+fn applyServerBlockClientAuth(allocator: std.mem.Allocator, blocks: []EdgeConfig.ServerBlock, raw: []const u8) !void {
+    if (raw.len == 0) return;
+    var records = std.mem.splitSequence(u8, raw, server_block_record_sep);
+    var i: usize = 0;
+    while (records.next()) |record| : (i += 1) {
+        if (i >= blocks.len) return error.InvalidServerBlockFormat;
+        var fields = std.mem.splitSequence(u8, record, server_block_field_sep);
+        const verify = fields.next() orelse return error.InvalidServerBlockFormat;
+        const optional = fields.next() orelse return error.InvalidServerBlockFormat;
+        const ca = fields.next() orelse return error.InvalidServerBlockFormat;
+        const depth = fields.next() orelse return error.InvalidServerBlockFormat;
+        if (fields.next() != null) return error.InvalidServerBlockFormat;
+        blocks[i].tls_client_verify = try parseOptionalOnOff(verify);
+        blocks[i].tls_client_verify_optional = try parseOptionalOnOff(optional);
+        if (ca.len > 0) blocks[i].tls_client_ca_path = try allocator.dupe(u8, ca);
+        if (depth.len > 0) blocks[i].tls_client_verify_depth = std.fmt.parseInt(u32, depth, 10) catch return error.InvalidServerBlockFormat;
+    }
+    if (i != blocks.len) return error.InvalidServerBlockFormat;
+}
+
+fn parseOptionalOnOff(raw: []const u8) !?bool {
+    if (raw.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(raw, "on") or std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "off") or std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
+    return error.InvalidServerBlockFormat;
 }
 
 const ParsedServerBlockRouteFields = struct {
@@ -3436,7 +3528,7 @@ fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
 
     // Checked before the gate for the same reason as ACME: it is precisely
     // the no-identity case that must not fall through to plaintext.
-    if (cfg.tls_client_verify and !hasTlsFiles(cfg)) {
+    if (cfg.anyClientAuth() and !hasTlsFiles(cfg)) {
         // Without a server identity the listener would serve plaintext, i.e.
         // unauthenticated, despite client verification being demanded.
         logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_CLIENT_VERIFY requires TARDIGRADE_TLS_CERT_PATH and TARDIGRADE_TLS_KEY_PATH", .{});
@@ -3456,6 +3548,13 @@ fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
     if (cfg.tls_client_verify and (cfg.tls_client_verify_depth == 0 or cfg.tls_client_verify_depth > max_client_verify_depth)) {
         logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH must be between 1 and 8 (the TLS engine's peer-chain entry bound)", .{});
         return error.UnsupportedNativeTlsConfiguration;
+    }
+    for (cfg.server_blocks) |*block| {
+        const depth = block.tls_client_verify_depth orelse continue;
+        if (depth == 0 or depth > max_client_verify_depth) {
+            logConfigDiagnostic("config validation failed: server block tls_client_verify_depth must be between 1 and 8 (the TLS engine's peer-chain entry bound)", .{});
+            return error.UnsupportedNativeTlsConfiguration;
+        }
     }
     if (cfg.tls_session_cache_enabled) {
         logConfigDiagnostic("config validation failed: native-TLS builds do not support TARDIGRADE_TLS_SESSION_CACHE (OpenSSL-terminator session cache); use TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE instead", .{});
@@ -3597,6 +3696,14 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         try validateOptionalFile(block.tls_cert_path, "server_block.tls_cert_path");
         try validateOptionalFile(block.tls_key_path, "server_block.tls_key_path");
         try validateOptionalUpstreamBaseUrl(block.upstream_base_url, "server_block.upstream_base_url");
+        if (block.tls_client_ca_path) |ca| try validateOptionalFile(ca, "server_block.tls_client_ca_path");
+        // #763: every effective policy that requests client certificates needs
+        // its own (or the inherited) CA bundle; trust never falls back.
+        const policy = cfg.clientAuthPolicy(&block);
+        validateMtlsConsistency(policy.mode != .disabled, policy.ca_path) catch {
+            std.log.err("config validation failed: server block enabling tls_client_verify requires tls_client_ca_path (its own or the listener-wide one)", .{});
+            return error.InvalidConfigPath;
+        };
     }
     try validateOptionalFile(cfg.tls_ocsp_response_path, "tls_ocsp_response_path");
     try validateOptionalFile(cfg.tls_client_ca_path, "tls_client_ca_path");
@@ -5322,4 +5429,121 @@ test "TLS buffer limits default from TLS core" {
     try std.testing.expectEqualDeep(encrypted_stream.BufferLimits.defaults(), cfg.tls_buffer_limits);
     cfg.tls_buffer_limits.inbound_plaintext.low = cfg.tls_buffer_limits.inbound_plaintext.high;
     try std.testing.expectError(error.InvalidBufferLimits, cfg.tls_buffer_limits.validate());
+}
+
+test "per-server client-auth policy inherits listener settings, honours overrides, and keeps routing order (#763)" {
+    const allocator = std.testing.allocator;
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    // Borrow literals for the listener-wide settings; restore before deinit.
+    const owned_ca = cfg.tls_client_ca_path;
+    defer cfg.tls_client_ca_path = owned_ca;
+    cfg.tls_client_verify = true;
+    cfg.tls_client_verify_optional = false;
+    cfg.tls_client_ca_path = "/ca/listener.pem";
+    cfg.tls_client_verify_depth = 3;
+
+    var api_names = [_][]const u8{"api.example.test"};
+    var admin_names = [_][]const u8{ "admin.example.test", "*.admin.example.test" };
+    var open_names = [_][]const u8{"open.example.test"};
+    var blank = [_]EdgeConfig.ServerBlock{
+        .{ .server_names = &api_names, .doc_root = "", .try_files = "", .location_blocks = &.{}, .tls_cert_path = "", .tls_key_path = "", .upstream_base_url = "", .proxy_pass_chat = "", .proxy_pass_commands_prefix = "" },
+        .{ .server_names = &admin_names, .doc_root = "", .try_files = "", .location_blocks = &.{}, .tls_cert_path = "", .tls_key_path = "", .upstream_base_url = "", .proxy_pass_chat = "", .proxy_pass_commands_prefix = "", .tls_client_ca_path = "/ca/admin.pem", .tls_client_verify_optional = true, .tls_client_verify_depth = 2 },
+        .{ .server_names = &open_names, .doc_root = "", .try_files = "", .location_blocks = &.{}, .tls_cert_path = "", .tls_key_path = "", .upstream_base_url = "", .proxy_pass_chat = "", .proxy_pass_commands_prefix = "", .tls_client_verify = false },
+        .{ .server_names = &.{}, .doc_root = "", .try_files = "", .location_blocks = &.{}, .tls_cert_path = "", .tls_key_path = "", .upstream_base_url = "", .proxy_pass_chat = "", .proxy_pass_commands_prefix = "", .tls_client_ca_path = "/ca/default.pem" },
+    };
+    const owned_blocks = cfg.server_blocks;
+    defer cfg.server_blocks = owned_blocks;
+    cfg.server_blocks = &blank;
+
+    const policies = try cfg.clientAuthPolicies(allocator);
+    defer allocator.free(policies.specs);
+    // One spec per block, in configuration order (the order routing walks).
+    try std.testing.expectEqual(@as(usize, 4), policies.specs.len);
+    // api: no directives -> listener settings.
+    try std.testing.expectEqual(tls_core.client_trust.Mode.required, policies.specs[0].mode);
+    try std.testing.expectEqualStrings("/ca/listener.pem", policies.specs[0].ca_path);
+    // admin: own CA, optional, depth 2.
+    try std.testing.expectEqual(tls_core.client_trust.Mode.optional, policies.specs[1].mode);
+    try std.testing.expectEqualStrings("/ca/admin.pem", policies.specs[1].ca_path);
+    try std.testing.expectEqual(@as(usize, 2), policies.specs[1].max_path_length);
+    try std.testing.expectEqual(@as(usize, 2), policies.specs[1].names.len);
+    // open: explicitly disabled.
+    try std.testing.expectEqual(tls_core.client_trust.Mode.disabled, policies.specs[2].mode);
+    // The nameless block is a catch-all spec at its own position...
+    try std.testing.expectEqual(@as(usize, 0), policies.specs[3].names.len);
+    try std.testing.expectEqualStrings("/ca/default.pem", policies.specs[3].ca_path);
+    // ...and names matching no block get the listener-wide settings.
+    try std.testing.expectEqual(tls_core.client_trust.Mode.required, policies.fallback.mode);
+    try std.testing.expectEqualStrings("/ca/listener.pem", policies.fallback.ca_path);
+    try std.testing.expect(policies.fallback.names.len == 0);
+    try std.testing.expect(cfg.anyClientAuth());
+
+    // A server block alone can turn mTLS on while the listener leaves it off.
+    cfg.tls_client_verify = false;
+    cfg.server_blocks = blank[1..2];
+    blank[1].tls_client_verify = true;
+    try std.testing.expect(cfg.anyClientAuth());
+    blank[1].tls_client_verify = null;
+    try std.testing.expect(!cfg.anyClientAuth());
+}
+
+test "server block client-auth records parse onto the matching block and reject malformed input (#763)" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]EdgeConfig.ServerBlock{
+        .{ .server_names = &.{}, .doc_root = "", .try_files = "", .location_blocks = &.{}, .tls_cert_path = "", .tls_key_path = "", .upstream_base_url = "", .proxy_pass_chat = "", .proxy_pass_commands_prefix = "" },
+        .{ .server_names = &.{}, .doc_root = "", .try_files = "", .location_blocks = &.{}, .tls_cert_path = "", .tls_key_path = "", .upstream_base_url = "", .proxy_pass_chat = "", .proxy_pass_commands_prefix = "" },
+    };
+    defer if (blocks[1].tls_client_ca_path) |p| allocator.free(p);
+    const raw = "on" ++ server_block_field_sep ++ "off" ++ server_block_field_sep ++ "/ca/b.pem" ++ server_block_field_sep ++ "4";
+    const empty = "" ++ server_block_field_sep ++ "" ++ server_block_field_sep ++ "" ++ server_block_field_sep;
+    try applyServerBlockClientAuth(allocator, &blocks, empty ++ server_block_record_sep ++ raw);
+    try std.testing.expect(blocks[0].tls_client_verify == null and blocks[0].tls_client_ca_path == null);
+    try std.testing.expectEqual(@as(?bool, true), blocks[1].tls_client_verify);
+    try std.testing.expectEqual(@as(?bool, false), blocks[1].tls_client_verify_optional);
+    try std.testing.expectEqualStrings("/ca/b.pem", blocks[1].tls_client_ca_path.?);
+    try std.testing.expectEqual(@as(?u32, 4), blocks[1].tls_client_verify_depth);
+
+    try std.testing.expectError(error.InvalidServerBlockFormat, applyServerBlockClientAuth(allocator, &blocks, empty)); // too few records
+    try std.testing.expectError(error.InvalidServerBlockFormat, applyServerBlockClientAuth(allocator, &blocks, "maybe" ++ server_block_field_sep ++ server_block_field_sep ++ server_block_field_sep ++ server_block_record_sep ++ empty));
+}
+
+/// Whether `raw_host` (a Host/:authority value with optional port, or a TLS
+/// SNI name) matches any server-name pattern. This is the single server-name
+/// matching contract: virtual-host routing and the per-SNI client-auth policy
+/// table both call it, so the two can never disagree about which server block
+/// a name belongs to (#763). An empty pattern list matches everything.
+pub fn hostMatchesPatterns(patterns: []const []const u8, raw_host: ?[]const u8) bool {
+    if (patterns.len == 0) return true;
+    const host = stripHostPort(raw_host orelse return false);
+    for (patterns) |pattern| {
+        if (matchHostPattern(pattern, host)) return true;
+    }
+    return false;
+}
+
+pub fn stripHostPort(raw_host: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw_host, " \t\r\n");
+    if (trimmed.len == 0) return trimmed;
+    if (trimmed[0] == '[') {
+        const end = std.mem.findScalar(u8, trimmed, ']') orelse return trimmed;
+        return trimmed[1..end];
+    }
+    const colon = std.mem.findScalarLast(u8, trimmed, ':') orelse return trimmed;
+    const head = trimmed[0..colon];
+    if (std.mem.findScalar(u8, head, ':') != null) return trimmed;
+    return head;
+}
+
+fn matchHostPattern(pattern_raw: []const u8, host: []const u8) bool {
+    const pattern = std.mem.trim(u8, pattern_raw, " \t");
+    if (pattern.len == 0) return false;
+    if (pattern[0] == '~') {
+        return http.rewrite.regexMatches(pattern[1..], host);
+    }
+    if (std.mem.startsWith(u8, pattern, "*.")) {
+        const suffix = pattern[1..];
+        return std.mem.endsWith(u8, host, suffix);
+    }
+    return std.ascii.eqlIgnoreCase(pattern, host);
 }

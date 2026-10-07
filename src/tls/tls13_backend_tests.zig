@@ -12532,6 +12532,98 @@ test "record mode delivers a fatal alert to the client when required client auth
     try std.testing.expectEqual(tls_backend.CredentialFailure.client_certificate_required, h.server_engine.credentialFailure().?);
 }
 
+// --- #763: the client-auth policy is chosen from the ClientHello SNI. ---
+
+const SniSelectorFixture = struct {
+    required_verifier: *credentials.MockVerifier,
+    calls: usize = 0,
+    seen: [64]u8 = undefined,
+    seen_len: usize = 0,
+    seen_present: bool = false,
+    /// SNI that gets `required`; any other name gets `disabled`.
+    required_for: []const u8,
+
+    fn select(ctx: *anyopaque, name: ?[]const u8) error{ClientAuthUnavailable}!tls_backend.ClientAuthSelection {
+        const self: *SniSelectorFixture = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.seen_present = name != null;
+        if (name) |n| {
+            @memcpy(self.seen[0..n.len], n);
+            self.seen_len = n.len;
+            if (std.mem.eql(u8, n, self.required_for)) return .{ .mode = .required, .verifier = self.required_verifier.verifier() };
+        }
+        return .{ .mode = .disabled };
+    }
+};
+
+test "client-auth selector: SNI that maps to a required policy triggers CertificateRequest and verification" {
+    var client_credential = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var client_verifier = credentials.MockVerifier.init(.accepted);
+    var server_verifier = credentials.MockVerifier.init(.accepted);
+    var fixture = SniSelectorFixture{ .required_verifier = &server_verifier, .required_for = "api.example.test" };
+
+    const h = try SocketHarness.create(.{ .client_verifier = client_verifier.verifier(), .client_options = .{ .server_name = "api.example.test" } });
+    defer h.destroy();
+    h.client_engine.setLocalCredentialProvider(client_credential.provider());
+    h.server_engine.setClientAuthSelector(.{ .ctx = &fixture, .selectFn = SniSelectorFixture.select });
+
+    try h.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expectEqualStrings("api.example.test", fixture.seen[0..fixture.seen_len]);
+    try std.testing.expectEqual(@as(usize, 1), server_verifier.verify_count);
+    try std.testing.expectEqual(@as(usize, 1), client_credential.sign_count);
+    try std.testing.expectEqual(tls_backend.ClientAuthMode.required, h.server_engine.client_auth);
+}
+
+test "client-auth selector: SNI that maps to a disabled policy never requests a client certificate" {
+    var client_credential = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var client_verifier = credentials.MockVerifier.init(.accepted);
+    var server_verifier = credentials.MockVerifier.init(.accepted);
+    var fixture = SniSelectorFixture{ .required_verifier = &server_verifier, .required_for = "api.example.test" };
+
+    const h = try SocketHarness.create(.{ .client_verifier = client_verifier.verifier(), .client_options = .{ .server_name = "open.example.test" } });
+    defer h.destroy();
+    h.client_engine.setLocalCredentialProvider(client_credential.provider());
+    h.server_engine.setClientAuthSelector(.{ .ctx = &fixture, .selectFn = SniSelectorFixture.select });
+
+    try h.driveUntil(SocketHarness.bothComplete);
+    // No CertificateRequest: the client never signed, the verifier never ran.
+    try std.testing.expectEqual(@as(usize, 0), server_verifier.verify_count);
+    try std.testing.expectEqual(@as(usize, 0), client_credential.sign_count);
+    try std.testing.expectEqual(tls_backend.ClientAuthMode.disabled, h.server_engine.client_auth);
+}
+
+test "client-auth selector: a required policy still fails closed when the client sends no certificate" {
+    var client_verifier = credentials.MockVerifier.init(.accepted);
+    var server_verifier = credentials.MockVerifier.init(.accepted);
+    var fixture = SniSelectorFixture{ .required_verifier = &server_verifier, .required_for = "api.example.test" };
+
+    const h = try SocketHarness.create(.{ .client_verifier = client_verifier.verifier(), .client_options = .{ .server_name = "api.example.test" } });
+    defer h.destroy();
+    h.server_engine.setClientAuthSelector(.{ .ctx = &fixture, .selectFn = SniSelectorFixture.select });
+
+    const failures = driveUntilBothErrors(h);
+    try std.testing.expectEqual(@as(?anyerror, error.ClientCertificateRequired), failures.server);
+    try std.testing.expect(!h.server.bridge.handshake_complete);
+}
+
+test "client-auth selector: a selector failure fails the handshake closed" {
+    const Failing = struct {
+        fn select(_: *anyopaque, _: ?[]const u8) error{ClientAuthUnavailable}!tls_backend.ClientAuthSelection {
+            return error.ClientAuthUnavailable;
+        }
+    };
+    var client_verifier = credentials.MockVerifier.init(.accepted);
+    var dummy: u8 = 0;
+    const h = try SocketHarness.create(.{ .client_verifier = client_verifier.verifier(), .client_options = .{ .server_name = "api.example.test" } });
+    defer h.destroy();
+    h.server_engine.setClientAuthSelector(.{ .ctx = &dummy, .selectFn = Failing.select });
+
+    const failures = driveUntilBothErrors(h);
+    try std.testing.expect(failures.server != null);
+    try std.testing.expect(!h.server.bridge.handshake_complete);
+    try std.testing.expectEqual(tls_backend.CredentialFailure.verifier_internal_failure, h.server_engine.credentialFailure().?);
+}
+
 // ---------------------------------------------------------------------
 // #369 Slice 2: TLS / replay-store layer assurance.
 //

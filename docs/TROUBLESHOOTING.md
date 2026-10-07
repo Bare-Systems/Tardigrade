@@ -1071,7 +1071,14 @@ during `ClientHello`.
   certificate, a `serverAuth`-only Extended Key Usage, a path longer than
   `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH`, or a missing intermediate the client
   did not send. Check the gateway log for `native tls handshake failed`; the
-  client certificate itself is never logged. If a reload logs
+  client certificate itself is never logged. With per-`server {}` client
+  auth the policy follows the TLS **SNI**: a certificate from CA A is refused
+  by a host that trusts CA B, and a client that connects without SNI matches only a
+  `server {}` block with no `server_name` (else the listener-wide policy). A `421 Misdirected Request`
+  means the request's `Host` maps to a different client-auth policy than the
+  SNI the connection was admitted under — reconnect with SNI equal to the
+  host (curl: use the real hostname or `--connect-to`, not `--resolve` to a
+  different name). If a reload logs
   `client trust reload failed`, the previous CA bundle is still serving.
   Over HTTP/3 the same failures surface to the client as a QUIC
   `CONNECTION_CLOSE` carrying a TLS alert (`0x12a` bad_certificate, `0x174`

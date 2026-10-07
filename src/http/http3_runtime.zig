@@ -98,6 +98,10 @@ pub const Config = struct {
     /// verified identity.
     client_auth: tls_core.tls13_backend.ClientAuthMode = .disabled,
     client_trust: ?*tls_core.client_trust.ClientTrustStore = null,
+    /// SNI-keyed client-auth policies (#763); takes precedence over
+    /// `client_auth`/`client_trust`. The policy (mode + trust generation) is
+    /// chosen from the ClientHello server_name before CertificateRequest.
+    client_policies: ?*tls_core.client_trust.PolicySet = null,
     tls_min_version: []const u8 = "1.3",
     tls_max_version: []const u8 = "1.3",
     enable_0rtt: bool = false,
@@ -989,6 +993,14 @@ const ConnEntry = struct {
     client_auth_mode: tls_core.tls13_backend.ClientAuthMode = .disabled,
     client_identity: tls_core.client_identity.ClientIdentity = .{},
     client_identity_present: bool = false,
+    /// The runtime's policy set (for admission against the *current* table)
+    /// and the snapshot this connection pinned at accept, which alone decides
+    /// its handshake (#763).
+    client_policies: ?*tls_core.client_trust.PolicySet = null,
+    client_snapshot: ?*tls_core.client_trust.PolicySnapshot = null,
+    client_policy_fingerprint: u64 = 0,
+    client_policy_crypto: ?crypto_pkg.provider.CryptoProvider = null,
+    client_policy_allocator: ?std.mem.Allocator = null,
     quic_observer: QuicObserver = undefined,
     h3_observer: H3Observer = undefined,
     h3_started: bool = false,
@@ -1031,6 +1043,7 @@ const ConnEntry = struct {
         self.conn.deinit();
         allocator.destroy(self.backend);
         if (self.client_trust_generation) |generation| generation.release();
+        if (self.client_snapshot) |snapshot| snapshot.release();
     }
 
     /// Pin the serving client-trust generation and ask the handshake engine
@@ -1055,6 +1068,40 @@ const ConnEntry = struct {
             generation.max_path_length,
         );
         self.backend.engine.requestClientAuthentication(mode, self.client_verifier.verifier());
+    }
+
+    /// Install the SNI-driven client-auth selector (#763). Must run before the
+    /// first datagram is ingested; the policy itself is resolved (and its
+    /// trust generation pinned) when the ClientHello's SNI is known.
+    fn armClientPolicies(
+        self: *ConnEntry,
+        set: *tls_core.client_trust.PolicySet,
+        crypto_provider: crypto_pkg.provider.CryptoProvider,
+        allocator: std.mem.Allocator,
+    ) error{ClientTrustUnavailable}!void {
+        self.client_snapshot = set.acquire() orelse return error.ClientTrustUnavailable;
+        self.client_policies = set;
+        self.client_policy_crypto = crypto_provider;
+        self.client_policy_allocator = allocator;
+        self.backend.engine.setClientAuthSelector(.{ .ctx = self, .selectFn = selectClientAuth });
+    }
+
+    fn selectClientAuth(ptr: *anyopaque, server_name: ?[]const u8) error{ClientAuthUnavailable}!tls_core.tls13_backend.ClientAuthSelection {
+        const self: *ConnEntry = @ptrCast(@alignCast(ptr));
+        const snapshot = self.client_snapshot orelse return error.ClientAuthUnavailable;
+        const selection = snapshot.select(server_name);
+        if (self.client_trust_generation) |g| g.release();
+        self.client_trust_generation = selection.generation;
+        self.client_auth_mode = selection.mode;
+        self.client_policy_fingerprint = selection.fingerprint;
+        const g = selection.generation orelse return .{ .mode = .disabled };
+        self.client_verifier = tls_core.webpki_verifier.WebPkiVerifier.initClientAuth(
+            self.client_policy_allocator.?,
+            g.anchors.anchors(),
+            self.client_policy_crypto.?,
+            g.max_path_length,
+        );
+        return .{ .mode = selection.mode, .verifier = self.client_verifier.verifier() };
     }
 
     /// The verified client identity once the handshake produced one (#763).
@@ -1175,6 +1222,7 @@ pub const Runtime = struct {
     early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
     client_auth: tls_core.tls13_backend.ClientAuthMode,
     client_trust: ?*tls_core.client_trust.ClientTrustStore,
+    client_policies: ?*tls_core.client_trust.PolicySet,
     /// #523: whether the native QUIC 0-RTT carrier is actually composed and
     /// enabled — see `zeroRttCarrierEnabled`. Drives both `quic_config`'s
     /// `zero_rtt_enabled` gate and whether `accept()` installs a server
@@ -1304,6 +1352,7 @@ pub const Runtime = struct {
             .early_data_replay_gate = cfg.early_data_replay_gate,
             .client_auth = cfg.client_auth,
             .client_trust = cfg.client_trust,
+            .client_policies = cfg.client_policies,
             .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
             .retry_policy = cfg.retry_policy,
             .secrets = .{},
@@ -1761,7 +1810,11 @@ pub const Runtime = struct {
         }
         // #763: no datagram has been ingested yet, so the engine still has
         // time to learn it must send a CertificateRequest.
-        entry.armClientAuth(self.client_auth, self.client_trust, self.cryptoProvider(), allocator) catch {
+        const arm_result = if (self.client_policies) |set|
+            entry.armClientPolicies(set, self.cryptoProvider(), allocator)
+        else
+            entry.armClientAuth(self.client_auth, self.client_trust, self.cryptoProvider(), allocator);
+        arm_result catch {
             self.logger.warn(null, "http3: client certificate verification is enabled but no client trust store is loaded; refusing connection", .{});
             entry.deinit(allocator);
             allocator.destroy(entry);
@@ -2090,6 +2143,20 @@ pub const Runtime = struct {
             return;
         };
         request.stream_id = incoming.stream_id;
+        if (entry.client_snapshot != null) request.client_auth_policy_fingerprint = entry.client_policy_fingerprint;
+        // #763: the handshake enforced the policy of the SNI it was admitted
+        // under; a request whose :authority maps to a different policy must
+        // not ride this connection (421), or SNI-vs-authority mismatch would
+        // let one host's trust decide another's.
+        if (entry.client_snapshot) |pinned| {
+            const host = request.authority orelse (request.headers.get("host") orelse "");
+            // The handler repeats the check against the policy table of the
+            // config generation it routes with (handshake -> routing).
+            if (!tls_core.client_trust.hostAdmitted(entry.client_policy_fingerprint, pinned.fingerprintForHost(host))) {
+                self.sendStatusResponse(entry, incoming.stream_id, 421, now);
+                return;
+            }
+        }
         // #763: the verified identity travels out-of-band on `Headers`, never
         // as a header, so nothing in the request bytes can populate it.
         if (entry.client_auth_mode != .disabled) {

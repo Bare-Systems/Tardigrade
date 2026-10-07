@@ -364,11 +364,16 @@ echo "not a pem bundle" >"$work/rot-ca.pem"
 kill -HUP "$gw_pid"
 i=0
 while [ "$i" -lt 40 ] && ! grep -q 'config reload rejected by client trust' "$work/rot.log"; do i=$((i + 1)); sleep 0.25; done
-grep -q 'config reload rejected by client trust' "$work/rot.log" \
-  && ok "rotate: reload with an unloadable bundle is rejected (logged)" \
-  || bad "rotate: unloadable-bundle reload was not rejected"
-kill -0 "$gw_pid" 2>/dev/null && ok "rotate: gateway survives a reload with an unloadable bundle" \
-  || bad "rotate: gateway died on a bad bundle"
+if grep -q 'config reload rejected by client trust' "$work/rot.log"; then
+  ok "rotate: reload with an unloadable bundle is rejected (logged)"
+else
+  bad "rotate: unloadable-bundle reload was not rejected"
+fi
+if kill -0 "$gw_pid" 2>/dev/null; then
+  ok "rotate: gateway survives a reload with an unloadable bundle"
+else
+  bad "rotate: gateway died on a bad bundle"
+fi
 expect_served "rotate: bad-bundle reload rejected, CA B still trusted" h2 a.test client_wrong_ca
 expect_refused "rotate: bad-bundle reload rejected, CA A still refused" h2 a.test client
 

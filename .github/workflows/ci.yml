@@ -1152,6 +1152,8 @@ jobs:
       - h3-resumption-interop
       - tls-conformance-matrix
       - integration-test
+      - h3-mtls-interop
+      - h1-h2-mtls-interop
       - linux-release-smoke
       - darwin-release-smoke
       - native-tls-reuse-soak
@@ -1168,7 +1170,7 @@ jobs:
           MODE: ${{ needs.mode.outputs.mode }}
           SMOKE_JOBS: >-
             mode format lint dependency-audit test test-general-native-tls
-            examples security integration-test
+            examples security integration-test h3-mtls-interop h1-h2-mtls-interop
           # Dependency review is required on PRs and skipped by design elsewhere.
           OPTIONAL_JOBS: dependency-review
           PR_JOBS: dependency-review

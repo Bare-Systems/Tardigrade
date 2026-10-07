@@ -996,6 +996,31 @@ jobs:
       - name: Run H3 mTLS interop
         run: ./scripts/interop/run-h3-mtls-interop-ci.sh
 
+  # Downstream HTTP/1.1 + HTTP/2 mTLS interop (#763): the real gateway binary
+  # against independent clients (curl/OpenSSL forced to --http1.1 and --http2,
+  # and `openssl s_client`) covering required/optional modes, bad-certificate
+  # classes, identity propagation and header forgery, per-SNI two-CA policy with
+  # 421 on SNI/Host mismatch, and CA-bundle trust rotation via SIGHUP reload.
+  h1-h2-mtls-interop:
+    name: H1/H2 mTLS interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Build gateway
+        run: zig build -Dtls-profile=general
+
+      - name: Run H1/H2 mTLS interop
+        run: ./scripts/interop/run-h1-h2-mtls-interop.sh
+
   # Shared TLS-engine interoperability and conformance matrix
   # #338 (323-J): drives the one TLS 1.3 engine as both client and server, over
   # both the record and QUIC transports, across every supported

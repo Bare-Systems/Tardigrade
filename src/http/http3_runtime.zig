@@ -2143,22 +2143,16 @@ pub const Runtime = struct {
             return;
         };
         request.stream_id = incoming.stream_id;
+        if (entry.client_snapshot != null) request.client_auth_policy_fingerprint = entry.client_policy_fingerprint;
         // #763: the handshake enforced the policy of the SNI it was admitted
         // under; a request whose :authority maps to a different policy must
         // not ride this connection (421), or SNI-vs-authority mismatch would
         // let one host's trust decide another's.
         if (entry.client_snapshot) |pinned| {
             const host = request.authority orelse (request.headers.get("host") orelse "");
-            // Both the table this connection handshook under and the table
-            // that now serves routing must admit the host: a reload between
-            // handshake and request can only tighten, never loosen, access.
-            const current_fp: ?u64 = if (entry.client_policies.?.acquire()) |cur| blk: {
-                defer cur.release();
-                break :blk cur.fingerprintForHost(host);
-            } else null;
-            if (!tls_core.client_trust.hostAdmitted(entry.client_policy_fingerprint, pinned.fingerprintForHost(host)) or
-                !tls_core.client_trust.hostAdmitted(entry.client_policy_fingerprint, current_fp))
-            {
+            // The handler repeats the check against the policy table of the
+            // config generation it routes with (handshake -> routing).
+            if (!tls_core.client_trust.hostAdmitted(entry.client_policy_fingerprint, pinned.fingerprintForHost(host))) {
                 self.sendStatusResponse(entry, incoming.stream_id, 421, now);
                 return;
             }

@@ -407,6 +407,10 @@ file-descriptor soft limit, at most 4096, since each tunnel holds two sockets.
 Raise the descriptor limit (`TARDIGRADE_FD_SOFT_LIMIT`) together with the cap for very
 large tunnel counts.
 
+For the reactor ownership boundary, resource bounds, readiness model, and
+reload/shutdown state machine, see
+[WebSocket reactor and ownership contract](WEBSOCKET_REACTOR_CONTRACT.md).
+
 **Hot reload.** A tunnel is admitted under the configuration generation its
 handshake leased, and everything about it comes from that snapshot: its
 location's settings and its reload behavior. `proxy_websocket_reload` decides

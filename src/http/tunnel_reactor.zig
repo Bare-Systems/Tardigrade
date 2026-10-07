@@ -58,6 +58,10 @@ pub const Options = struct {
     /// a shard sleeps until a socket is ready, a tunnel's own earliest
     /// deadline, a handoff, or `wakeAll`, so idle tunnels cost nothing.
     fallback_wakeup_ms: u32 = 0,
+    /// Most tunnels (owned plus queued) one shard accepts; `submit` rejects
+    /// with `error.ReactorFull` beyond it. Zero leaves the bound to the
+    /// caller's process-wide tunnel cap, which already limits every shard.
+    max_tunnels_per_shard: u32 = 0,
 };
 
 pub const ShardSnapshot = struct {
@@ -70,6 +74,12 @@ pub const Snapshot = struct {
     tunnels: u32,
     handoffs_total: u64,
     wakeups_total: u64,
+    /// Handoffs refused at `max_tunnels_per_shard`.
+    rejected_total: u64 = 0,
+    /// Handed-off jobs not yet adopted by a shard thread, and the most that
+    /// any one shard has had queued at once.
+    queue_depth: u32 = 0,
+    queue_high_water: u32 = 0,
     /// Most tunnels on any one shard (load skew).
     max_shard_tunnels: u32,
 };
@@ -102,6 +112,10 @@ const Shard = struct {
     /// Handed-off jobs not yet adopted by the shard thread (LIFO; order does
     /// not matter). Guarded by `mutex`.
     inbox: ?*Job = null,
+    /// Length of `inbox`, its peak, and refused handoffs. Guarded by `mutex`.
+    inbox_depth: u32 = 0,
+    inbox_high_water: u32 = 0,
+    rejected_total: u64 = 0,
     stopping: bool = false,
     wake_read: std.posix.fd_t,
     wake_write: std.posix.fd_t,
@@ -137,6 +151,7 @@ const Shard = struct {
             self.mutex.lock();
             var incoming = self.inbox;
             self.inbox = null;
+            self.inbox_depth = 0;
             const stopping = self.stopping;
             self.mutex.unlock();
             while (incoming) |job| {
@@ -240,6 +255,7 @@ pub const Reactor = struct {
     pub const SubmitError = error{
         ReactorStopped,
         ReactorWakeFailed,
+        ReactorFull,
     };
 
     /// Start `opts.threads` reactor threads. `self` must not move afterwards.
@@ -299,8 +315,17 @@ pub const Reactor = struct {
             best.mutex.unlock();
             return error.ReactorStopped;
         }
+        // `best` is the least loaded shard, so every shard is at the bound.
+        const cap = self.opts.max_tunnels_per_shard;
+        if (cap != 0 and best.tunnels.load(.acquire) >= cap) {
+            best.rejected_total += 1;
+            best.mutex.unlock();
+            return error.ReactorFull;
+        }
         job.next_inbox = best.inbox;
         best.inbox = job;
+        best.inbox_depth += 1;
+        best.inbox_high_water = @max(best.inbox_high_water, best.inbox_depth);
         _ = best.tunnels.fetchAdd(1, .acq_rel);
         // Keep the mutex until the signal succeeds. The shard cannot remove
         // this head concurrently, so an unexpected wake failure can roll
@@ -308,6 +333,7 @@ pub const Reactor = struct {
         best.wake() catch |err| {
             best.inbox = job.next_inbox;
             job.next_inbox = null;
+            best.inbox_depth -= 1;
             _ = best.tunnels.fetchSub(1, .acq_rel);
             best.mutex.unlock();
             return err;
@@ -367,6 +393,11 @@ pub const Reactor = struct {
             .max_shard_tunnels = 0,
         };
         for (self.shards) |*shard| {
+            shard.mutex.lock();
+            out.rejected_total += shard.rejected_total;
+            out.queue_depth += shard.inbox_depth;
+            out.queue_high_water = @max(out.queue_high_water, shard.inbox_high_water);
+            shard.mutex.unlock();
             const n = shard.tunnels.load(.acquire);
             out.tunnels += n;
             out.max_shard_tunnels = @max(out.max_shard_tunnels, n);
@@ -623,6 +654,48 @@ test "reactor registry OOM aborts an accepted handoff as an error (#818)" {
     try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.upstream_error), reason.load(.acquire));
     _ = std.c.close(c[1]);
     _ = std.c.close(u[1]);
+}
+
+test "reactor rejects handoffs at the per-shard bound and recovers after close (#818)" {
+    var reactor: Reactor = undefined;
+    try reactor.start(std.testing.allocator, .{ .threads = 2, .shutdown_requested = neverShutdown, .max_tunnels_per_shard = 2 });
+    defer reactor.deinit();
+
+    var done = std.atomic.Value(u32).init(0);
+    var reason = std.atomic.Value(u8).init(0);
+    var freed = std.atomic.Value(u32).init(0);
+    const opts = tunnel.Options{ .idle_timeout_ms = 30_000, .shutdown_requested = neverShutdown, .poll_interval_ms = 0 };
+    var peers: [4]PeerPair = undefined;
+    for (&peers) |*p| p.* = try submitTestTunnel(&reactor, opts, &done, &reason, &freed);
+    try std.testing.expectEqual(@as(u32, 4), reactor.snapshot().tunnels);
+
+    // The rejected job stays with the caller; no shard bookkeeping changes.
+    const c = try testSocketPair();
+    const u = try testSocketPair();
+    const job = try TestJob.create(c[0], u[0], opts, &done, &reason, &freed);
+    try std.testing.expectError(error.ReactorFull, reactor.submit(&job.job));
+    var snap = reactor.snapshot();
+    try std.testing.expectEqual(@as(u32, 4), snap.tunnels);
+    try std.testing.expectEqual(@as(u64, 4), snap.handoffs_total);
+    try std.testing.expectEqual(@as(u64, 1), snap.rejected_total);
+    try std.testing.expect(snap.queue_high_water >= 1 and snap.queue_high_water <= 2);
+    job.job.vtable.finish(&job.job);
+    _ = std.c.close(c[1]);
+    _ = std.c.close(u[1]);
+
+    // Closing one tunnel frees a slot exactly once, so admission resumes.
+    _ = std.c.close(peers[0].client_peer);
+    try waitFor(&done, 2, 2_000);
+    peers[0] = try submitTestTunnel(&reactor, opts, &done, &reason, &freed);
+    snap = reactor.snapshot();
+    try std.testing.expectEqual(@as(u32, 4), snap.tunnels);
+    try std.testing.expectEqual(@as(u64, 1), snap.rejected_total);
+
+    for (peers) |p| _ = std.c.close(p.client_peer);
+    try waitFor(&done, 6, 5_000);
+    for (peers) |p| _ = std.c.close(p.upstream_peer);
+    try std.testing.expectEqual(@as(u32, 0), reactor.snapshot().tunnels);
+    try std.testing.expectEqual(@as(u32, 0), reactor.snapshot().queue_depth);
 }
 
 test "reactor relays many tunnels on a fixed number of threads (#818)" {

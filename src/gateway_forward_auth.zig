@@ -122,6 +122,10 @@ pub const Grants = struct {
     decisions: [MAX_ROUTE_HOPS]Decision = undefined,
     len: usize = 0,
     client_headers: std.ArrayList(Header) = .empty,
+    /// A non-empty `client_cert` policy admitted this request on some hop
+    /// (#763). The response then depends on the connection's certificate, so
+    /// it must never be stored by a shared cache either.
+    client_cert_gated: bool = false,
 
     pub fn add(self: *Grants, allocator: std.mem.Allocator, decision: Decision) !void {
         var owned = decision;
@@ -137,6 +141,7 @@ pub const Grants = struct {
 
     pub fn clear(self: *Grants) void {
         self.client_headers.clearRetainingCapacity();
+        self.client_cert_gated = false;
         for (self.decisions[0..self.len]) |*decision| decision.deinit();
         self.len = 0;
     }
@@ -151,7 +156,7 @@ pub const Grants = struct {
     /// allowed: `no-store` when an auth service added headers (typically a
     /// session cookie), otherwise `private`.
     pub fn cachePolicy(self: *const Grants) http.security_headers.ProtectedCachePolicy {
-        if (self.len == 0) return .none;
+        if (self.len == 0 and !self.client_cert_gated) return .none;
         return if (self.client_headers.items.len > 0) .no_store else .private;
     }
 

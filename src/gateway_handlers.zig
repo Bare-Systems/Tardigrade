@@ -784,11 +784,10 @@ pub fn routeRequest(
                     // Checked before forward_auth so an unauthorized identity
                     // never triggers the auth subrequest side effect.
                     grants.clear();
-                    try sendApiError(allocator, writer, .forbidden, denial.code, denial.message, correlation_id, keep_alive.*, state);
-                    state.metricsRecord(403);
-                    state.metricsRecordErrorCode(denial.code);
+                    try sendClientCertRefusal(allocator, writer, state, denial, correlation_id, keep_alive.*);
                     return .{ .status = 403, .mirror_allowed = false };
                 }
+                if (!matched.block.client_cert.isEmpty()) grants.client_cert_gated = true;
                 var allowed: ?gfa.Decision = null;
                 if (try enforceLocationForwardAuth(allocator, writer, cfg, state, request, matched, correlation_id, keep_alive, client_ip, streaming_request_body != null, &client_view, &allowed)) |status| {
                     grants.clear();
@@ -987,6 +986,28 @@ pub fn clientCertDenial(policy: http.location_router.ClientCertPolicy, cert: ?ht
         .missing => .{ .code = "client_certificate_required", .message = "Client certificate required" },
         .mismatch => .{ .code = "client_certificate_denied", .message = "Client certificate not authorized" },
     };
+}
+
+/// H1 certificate-policy refusal: always `no-store`, whatever global headers
+/// say. Counts the status and error code exactly once.
+fn sendClientCertRefusal(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    state: *GatewayState,
+    denial: ClientCertDenial,
+    correlation_id: []const u8,
+    keep_alive: bool,
+) !void {
+    const payload = try buildApiErrorJson(allocator, denial.code, denial.message, correlation_id);
+    defer allocator.free(payload);
+    var response = http.Response.json(allocator, payload);
+    defer response.deinit();
+    _ = response.setStatus(.forbidden).setConnection(keep_alive);
+    setRequestIdHeaders(&response, correlation_id);
+    applyRefusalResponseHeaders(state, &response);
+    try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+    state.metricsRecord(403);
+    state.metricsRecordErrorCode(denial.code);
 }
 
 /// Protocol-neutral request target (`path[?query]`) for the auth service.
@@ -3727,8 +3748,10 @@ fn routeHttp3Hop(
     if (clientCertDenial(matched.block.client_cert, request.headers.client_cert)) |denial| {
         route.grants.clear();
         try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, denial.code, denial.message, correlation_id);
+        http.security_headers.applyProtectedCachePolicy(response, .no_store);
         return .handled;
     }
+    if (!matched.block.client_cert.isEmpty()) route.grants.client_cert_gated = true;
     if (matched.block.forward_auth) |*fa| {
         var allowed: ?gfa.Decision = null;
         if (!try enforceHttp3ForwardAuth(allocator, request, response, ctx, fa, matched.block.pattern, correlation_id, route, &allowed)) {
@@ -4780,6 +4803,7 @@ fn runH3ClientCertPolicy(
     policy: http.location_router.ClientCertPolicy,
     client_cert: ?http.headers.ClientCertificate,
     origin: *H3ProxyOrigin,
+    cache_control_out: ?*[128]u8,
 ) !u16 {
     try origin.run();
     var target_buf: [64]u8 = undefined;
@@ -4795,7 +4819,7 @@ fn runH3ClientCertPolicy(
     var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
     defer config_store.deinit();
     var state: GatewayState = undefined;
-    initHttp3ProxyTestState(&state, allocator, &.{});
+    initHttp3ProxyTestState(&state, allocator, test_public_cdn_add_headers[0..]);
     defer deinitHttp3ProxyTestState(&state);
     var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
     var request = http.http3_session.StreamRequest{
@@ -4813,6 +4837,14 @@ fn runH3ClientCertPolicy(
     var response = http.Response.init(allocator);
     defer response.deinit();
     try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+    if (cache_control_out) |out| {
+        const value = response.headers.get("cache-control") orelse "";
+        @memset(out, 0);
+        @memcpy(out[0..value.len], value);
+        // No CDN/surrogate field may survive a certificate-gated response.
+        try std.testing.expect(response.headers.get("cdn-cache-control") == null);
+        try std.testing.expect(response.headers.get("surrogate-control") == null);
+    }
     return @intFromEnum(response.status);
 }
 
@@ -4820,27 +4852,33 @@ test "H3 location client_cert policy: anonymous, wrong identity, matching identi
     const allocator = std.testing.allocator;
     const fps = [_][]const u8{"ab" ** 32};
     const policy = http.location_router.ClientCertPolicy{ .required = true, .fingerprints = &fps };
+    var cc: [128]u8 = undefined;
 
     // Optional-mTLS listener, no certificate presented: refused, upstream untouched.
     {
         var origin = try H3ProxyOrigin.start(allocator, &.{200});
         defer origin.stop();
-        try std.testing.expectEqual(@as(u16, 403), try runH3ClientCertPolicy(allocator, policy, null, &origin));
+        try std.testing.expectEqual(@as(u16, 403), try runH3ClientCertPolicy(allocator, policy, null, &origin, &cc));
         try std.testing.expectEqual(@as(usize, 0), origin.requestCount());
+        try std.testing.expectEqualStrings("no-store", std.mem.sliceTo(&cc, 0));
     }
     // Verified certificate for a different principal: refused.
     {
         var origin = try H3ProxyOrigin.start(allocator, &.{200});
         defer origin.stop();
-        try std.testing.expectEqual(@as(u16, 403), try runH3ClientCertPolicy(allocator, policy, .{ .fingerprint_sha256 = "cd" ** 32, .subject = "CN=mallory" }, &origin));
+        try std.testing.expectEqual(@as(u16, 403), try runH3ClientCertPolicy(allocator, policy, .{ .fingerprint_sha256 = "cd" ** 32, .subject = "CN=mallory" }, &origin, &cc));
         try std.testing.expectEqual(@as(usize, 0), origin.requestCount());
+        try std.testing.expectEqualStrings("no-store", std.mem.sliceTo(&cc, 0));
     }
     // Matching fingerprint passes, regardless of the forged header's content.
     {
         var origin = try H3ProxyOrigin.start(allocator, &.{200});
         defer origin.stop();
-        try std.testing.expectEqual(@as(u16, 200), try runH3ClientCertPolicy(allocator, policy, .{ .fingerprint_sha256 = "ab" ** 32, .subject = "CN=alice" }, &origin));
+        try std.testing.expectEqual(@as(u16, 200), try runH3ClientCertPolicy(allocator, policy, .{ .fingerprint_sha256 = "ab" ** 32, .subject = "CN=alice" }, &origin, &cc));
         try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+        // Global `Cache-Control: public` must not make the gated response shared-cacheable.
+        try std.testing.expect(std.mem.indexOf(u8, std.mem.sliceTo(&cc, 0), "public") == null);
+        try std.testing.expect(std.mem.indexOf(u8, std.mem.sliceTo(&cc, 0), "private") != null);
     }
 }
 

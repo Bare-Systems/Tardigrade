@@ -16,7 +16,9 @@ All notable user-facing changes to Tardigrade are documented here.
   before `forward_auth` and behaves identically on H1, H2 and H3. `forward_auth`
   subrequests now receive the verified identity as `X-Tardigrade-Client-Cert-*`
   headers built from connection state; client-supplied copies are never
-  forwarded. Fixes the H1 client-auth snapshot dropping the verified identity
+  forwarded. Certificate refusals are always `no-store`, and a response that
+  passed a certificate gate is never shared-cacheable (`private` at most), even
+  with a global `Cache-Control: public`. Fixes the H1 client-auth snapshot dropping the verified identity
   once an earlier hop's auth had asserted headers.
 
 - **Per-SNI / per-server downstream mTLS policy and trust (#763).**

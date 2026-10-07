@@ -100,12 +100,15 @@ charges the two direction buffers before origin contact, so a stalled reader
 backpressures the sender instead of creating an unbounded queue.
 
 `proxy_websocket_max_tunnels` and `proxy_stream_buffer_size` are evaluated at
-admission. Lowering either on reload blocks future admissions but does not
-revoke tunnels admitted under an older generation, so the current configured
-values alone are not live-process bounds. The `C_live` and `B_j` definitions
-preserve the equations across those generations. `I` is normally zero; it is
-nonzero only when the reactor is unavailable or rejects a handoff, in which
-case the calling worker intentionally relays that tunnel inline until it ends.
+admission. Lowering `proxy_websocket_max_tunnels` below the current active
+count blocks new admissions but does not revoke older tunnels. Changing
+`proxy_stream_buffer_size` affects only newly admitted tunnels; older tunnels
+retain the buffers allocated under their admission generation. The current
+configured values alone are therefore not live-process bounds. The `C_live`
+and `B_j` definitions preserve the equations across generations. `I` is
+normally zero; it is nonzero only when the reactor is unavailable or rejects a
+handoff, in which case the calling worker intentionally relays that tunnel
+inline until it ends.
 
 An established tunnel still occupies its downstream connection slot and still
 contributes to `max_active_connections`; it no longer occupies
@@ -233,7 +236,7 @@ The worker and reactor surfaces are intentionally separate:
 | --- | --- |
 | Preparation allocation failure before 101 | Request path retains every shared object and rolls back; no handoff occurs |
 | Client write failure or cancellation after preparation | `abandon()` closes the origin and returns the slot/count once |
-| Reactor wake failure before commit | `submit()` rolls inbox bookkeeping back; caller still owns the job |
+| Reactor wake failure before commit | `Reactor.submit()` rolls inbox bookkeeping back to `TunnelJob`; `TunnelJob.submit()` then runs the job inline |
 | Reactor registry OOM after commit | Reactor calls `abort(.upstream_error)`; the job releases everything once |
 | Client frames pipelined behind the request head | `initial_to_upstream` delivers them first; they are not parsed as another HTTP request |
 | Origin bytes bundled with 101 | `early_upstream_bytes` delivers them first to the client |

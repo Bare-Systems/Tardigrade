@@ -23546,6 +23546,328 @@ fn raiseFdSoftLimit(want: u64) u64 {
     return @intCast(limits.cur);
 }
 
+/// A focused, live-process #830 gate is intentionally small enough for a PR
+/// runner, but can be raised to a dedicated-runner population without changing
+/// the scenario. It is not a throughput benchmark: the assertions are about
+/// fixed reactor ownership, worker isolation, bounded admission, and settle.
+fn websocketReactorSmokeTunnelCount(allocator: std.mem.Allocator) !usize {
+    const value = compat.getEnvVarOwned(allocator, "TARDIGRADE_WS_REACTOR_SMOKE_TUNNELS") catch return 24;
+    defer allocator.free(value);
+    const count = std.fmt.parseInt(usize, value, 10) catch return error.InvalidWebSocketReactorSmokeTunnelCount;
+    if (count < 4 or count > 2_000) return error.InvalidWebSocketReactorSmokeTunnelCount;
+    return count;
+}
+
+const WsResourceSample = struct {
+    phase: []const u8,
+    rss_kb: u64,
+    open_fds: u64,
+    sockets: u64,
+    active_connections: u64,
+    active_tunnels: u64,
+    reactor_tunnels: u64,
+    buffer_bytes: u64,
+    worker_active_jobs: u64,
+    worker_queued_jobs: u64,
+    reactor_wakeups: u64,
+    close_client: u64,
+    close_reload: u64,
+    close_shutdown: u64,
+};
+
+fn websocketResourceProbe(allocator: std.mem.Allocator, script: []const u8) !u64 {
+    var result = try bounded_process.run(allocator, .{ .argv = &.{ "sh", "-c", script }, .stdout_limit = 4096, .stderr_limit = 4096, .deadline_ms = 5_000 });
+    defer result.deinit(allocator);
+    if (result.outcome != .normal_exit) return error.ResourceProbeFailed;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, result.stdout, " \t\r\n"), 10) catch error.MalformedResourceProbe;
+}
+
+fn websocketResourcePidText(pid: std.c.pid_t, out: *[32]u8) ![]const u8 {
+    return std.fmt.bufPrint(out, "{d}", .{pid});
+}
+
+fn websocketRssKb(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
+    var pid_buf: [32]u8 = undefined;
+    const script = try std.fmt.allocPrint(allocator, "ps -o rss= -p {s}", .{try websocketResourcePidText(pid, &pid_buf)});
+    defer allocator.free(script);
+    return websocketResourceProbe(allocator, script);
+}
+
+fn websocketOpenFds(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
+    var pid_buf: [32]u8 = undefined;
+    const pid_text = try websocketResourcePidText(pid, &pid_buf);
+    const script = try std.fmt.allocPrint(allocator,
+        \\if [ -d /proc/{s}/fd ]; then
+        \\  entries=$(find /proc/{s}/fd -maxdepth 1 -type l -print 2>/dev/null) || exit 4
+        \\  if [ -n "$entries" ]; then printf '%s\n' "$entries" | wc -l | tr -d ' '; else echo 0; fi
+        \\elif command -v lsof >/dev/null 2>&1; then
+        \\  rows=$(lsof -nP -p {s} 2>/dev/null) || exit 5
+        \\  printf '%s\n' "$rows" | awk 'NR>1 {{n++}} END {{print n+0}}'
+        \\else
+        \\  exit 2
+        \\fi
+    , .{ pid_text, pid_text, pid_text });
+    defer allocator.free(script);
+    return websocketResourceProbe(allocator, script);
+}
+
+fn websocketSocketCount(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
+    var pid_buf: [32]u8 = undefined;
+    const pid_text = try websocketResourcePidText(pid, &pid_buf);
+    const script = try std.fmt.allocPrint(allocator,
+        \\if command -v lsof >/dev/null 2>&1; then
+        \\  rows=$(lsof -nP -p {s} 2>/dev/null) || exit 5
+        \\  printf '%s\n' "$rows" | awk 'NR>1 && ($5 == "IPv4" || $5 == "IPv6") {{n++}} END {{print n+0}}'
+        \\elif [ -d /proc/{s}/fd ]; then
+        \\  targets=$(for f in /proc/{s}/fd/*; do readlink "$f" 2>/dev/null || exit 4; done) || exit 4
+        \\  printf '%s\n' "$targets" | awk '/^socket:/ {{n++}} END {{print n+0}}'
+        \\else
+        \\  exit 2
+        \\fi
+    , .{ pid_text, pid_text, pid_text });
+    defer allocator.free(script);
+    return websocketResourceProbe(allocator, script);
+}
+
+fn websocketResourceSample(allocator: std.mem.Allocator, process: *const TardigradeProcess, phase: []const u8) !WsResourceSample {
+    const pid = process.child.id orelse return error.MissingChildPid;
+    var metrics = try wsMetrics(allocator, process.port);
+    defer metrics.deinit();
+    const aggregate = prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"downstream_to_upstream\"", "scope=\"global\"" }) orelse 0;
+    const aggregate_reverse = prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"upstream_to_downstream\"", "scope=\"global\"" }) orelse 0;
+    return .{
+        .phase = phase,
+        .rss_kb = try websocketRssKb(allocator, pid),
+        .open_fds = try websocketOpenFds(allocator, pid),
+        .sockets = try websocketSocketCount(allocator, pid),
+        .active_connections = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0,
+        .active_tunnels = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 0,
+        .reactor_tunnels = prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_tunnels") orelse 0,
+        .buffer_bytes = aggregate + aggregate_reverse,
+        .worker_active_jobs = prometheusMetricValue(metrics.body, "tardigrade_worker_active_jobs") orelse 0,
+        .worker_queued_jobs = prometheusMetricValue(metrics.body, "tardigrade_worker_queued_jobs") orelse 0,
+        .reactor_wakeups = prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_wakeups_total") orelse 0,
+        .close_client = wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"client\""),
+        .close_reload = wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"reload\""),
+        .close_shutdown = wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"shutdown\""),
+    };
+}
+
+fn writeWebsocketReactorSmokeEvidence(
+    allocator: std.mem.Allocator,
+    tunnels: usize,
+    baseline_rest_worst_ms: i64,
+    loaded_rest_worst_ms: i64,
+    handoffs: u64,
+    capacity_rejections: u64,
+    settled: bool,
+    samples: []const WsResourceSample,
+) !void {
+    const path = compat.getEnvVarOwned(allocator, "TARDIGRADE_WS_REACTOR_EVIDENCE") catch return;
+    defer allocator.free(path);
+    const source_sha = compat.getEnvVarOwned(allocator, "TARDIGRADE_WS_REACTOR_SOURCE_SHA") catch try allocator.dupe(u8, "unknown");
+    defer allocator.free(source_sha);
+    const runner = compat.getEnvVarOwned(allocator, "RUNNER_NAME") catch try allocator.dupe(u8, "local");
+    defer allocator.free(runner);
+    const nofile_limit = (std.posix.getrlimit(std.posix.rlimit_resource.NOFILE) catch null) orelse std.mem.zeroes(std.posix.rlimit);
+    const json = try compat.stringifyAlloc(allocator, .{
+        .schema_version = 1,
+        .issue = 830,
+        .profile = "websocket-reactor-smoke",
+        .source_sha = source_sha,
+        .platform = @tagName(builtin.os.tag),
+        .architecture = @tagName(builtin.cpu.arch),
+        .cpu_count = std.Thread.getCpuCount() catch 0,
+        .runner = runner,
+        .nofile_soft_limit = nofile_limit.cur,
+        .reactor_threads = 2,
+        .request_workers = 1,
+        .tunnels_requested = tunnels,
+        .handoffs = handoffs,
+        .capacity_rejections = capacity_rejections,
+        .rest_baseline_worst_ms = baseline_rest_worst_ms,
+        .rest_loaded_worst_ms = loaded_rest_worst_ms,
+        .settled = settled,
+        .resource_samples = samples,
+    }, .{});
+    defer allocator.free(json);
+
+    var file = try compat.cwd().createFile(path, .{ .truncate = true, .read = false });
+    defer file.close();
+    try file.writeAll(json);
+    try file.writeAll("\n");
+}
+
+test "proxy_websocket reactor smoke (#830): bounded workers, capacity, churn, relay, REST, and settle" {
+    const allocator = std.testing.allocator;
+    const tunnels = try websocketReactorSmokeTunnelCount(allocator);
+    // The client/origin harness uses two descriptors per tunnel and the edge
+    // uses another two. Do not pretend a constrained PR host proved the
+    // dedicated-runner scale profile; skip before creating any state instead.
+    if (raiseFdSoftLimit(4 * tunnels + 256) < 4 * tunnels + 128) return error.SkipZigTest;
+
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    const tunnel_cap = try std.fmt.allocPrint(allocator, "{d}", .{tunnels});
+    defer allocator.free(tunnel_cap);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "1" },
+            .{ .name = "TARDIGRADE_PROXY_WEBSOCKET_REACTOR_THREADS", .value = "2" },
+            .{ .name = "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", .value = tunnel_cap },
+        },
+    });
+    defer tardigrade.stop();
+
+    const baseline_connections = blk: {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        break :blk prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0;
+    };
+    var samples = std.array_list.Managed(WsResourceSample).init(allocator);
+    defer samples.deinit();
+    try samples.append(try websocketResourceSample(allocator, &tardigrade, "baseline"));
+
+    var baseline_rest_worst_ms: i64 = 0;
+    var loaded_rest_worst_ms: i64 = 0;
+    var r: usize = 0;
+    while (r < 12) : (r += 1) {
+        const started = compat.milliTimestamp();
+        var health = try sendRequestWithTimeout(allocator, tardigrade.port, .{ .method = "GET", .path = "/healthz", .body = null, .headers = &.{} }, 2_000);
+        defer health.deinit();
+        try std.testing.expectEqual(@as(u16, 200), health.status_code);
+        baseline_rest_worst_ms = @max(baseline_rest_worst_ms, compat.milliTimestamp() - started);
+    }
+
+    var closed = try allocator.alloc(bool, tunnels);
+    defer allocator.free(closed);
+    @memset(closed, false);
+    var open = std.array_list.Managed(WsHandshake).init(allocator);
+    defer {
+        for (open.items, 0..) |*hs, index| {
+            if (!closed[index]) hs.deinit(allocator);
+        }
+        open.deinit();
+    }
+    var i: usize = 0;
+    while (i < tunnels) : (i += 1) {
+        var hs = try wsHandshake(allocator, tardigrade.port, "/ws/idle", &.{}, "");
+        errdefer hs.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 101), hs.status);
+        try open.append(hs);
+    }
+
+    // A full cap is rejected before an origin socket is opened, while the
+    // established tunnels remain reactor-owned rather than worker-owned.
+    var over_cap = try wsHandshake(allocator, tardigrade.port, "/ws/over-cap", &.{}, "");
+    defer over_cap.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 503), over_cap.status);
+    try std.testing.expectEqual(@as(u32, @intCast(tunnels)), origin.handshakeCount());
+
+    {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        try std.testing.expectEqual(@as(?u64, tunnels), prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active"));
+        try std.testing.expectEqual(@as(?u64, tunnels), prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_tunnels"));
+        try std.testing.expectEqual(@as(?u64, 2), prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_threads"));
+        try std.testing.expectEqual(@as(?u64, tunnels), prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_handoffs_total"));
+        try std.testing.expect(prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_thread_tunnels_max").? < tunnels);
+        try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"capacity\""));
+    }
+    try samples.append(try websocketResourceSample(allocator, &tardigrade, "populated"));
+
+    // Active traffic and ordinary REST share the server with every idle
+    // socket. The bound is deliberately broad enough for loaded CI hosts but
+    // still fails a worker-retention regression.
+    var relay_index: usize = 0;
+    while (relay_index < tunnels) : (relay_index += @max(@as(usize, 1), tunnels / 6)) {
+        try wsExpectEcho(allocator, open.items[relay_index].peer, .text, "reactor-smoke");
+    }
+    r = 0;
+    while (r < 24) : (r += 1) {
+        const started = compat.milliTimestamp();
+        var health = try sendRequestWithTimeout(allocator, tardigrade.port, .{ .method = "GET", .path = "/healthz", .body = null, .headers = &.{} }, 2_000);
+        defer health.deinit();
+        try std.testing.expectEqual(@as(u16, 200), health.status_code);
+        loaded_rest_worst_ms = @max(loaded_rest_worst_ms, compat.milliTimestamp() - started);
+    }
+    try std.testing.expect(loaded_rest_worst_ms < 1_000);
+    try std.testing.expect(loaded_rest_worst_ms <= @max(@as(i64, 100), baseline_rest_worst_ms * 20));
+
+    // Abrupt client closes and replacements exercise slot reuse under churn.
+    const first_wave = tunnels / 2;
+    for (open.items[0..first_wave], 0..) |*hs, index| {
+        hs.deinit(allocator);
+        closed[index] = true;
+    }
+    const churn_deadline = compat.milliTimestamp() + 10_000;
+    while (true) {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        const active = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 0;
+        const owned = prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_tunnels") orelse 0;
+        if (active == tunnels - first_wave and owned == tunnels - first_wave) break;
+        if (compat.milliTimestamp() > churn_deadline) return error.TunnelsDidNotSettle;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+    const churned_sample = try websocketResourceSample(allocator, &tardigrade, "churned");
+    try samples.append(churned_sample);
+    const populated_sample = samples.items[1];
+    try std.testing.expect(churned_sample.open_fds < populated_sample.open_fds);
+    try std.testing.expect(churned_sample.sockets < populated_sample.sockets);
+    try std.testing.expect(churned_sample.buffer_bytes < populated_sample.buffer_bytes);
+    try std.testing.expect(churned_sample.rss_kb <= populated_sample.rss_kb + 8 * 1024);
+    i = 0;
+    while (i < first_wave) : (i += 1) {
+        var hs = try wsHandshake(allocator, tardigrade.port, "/ws/churn", &.{}, "");
+        errdefer hs.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 101), hs.status);
+        open.items[i] = hs;
+        closed[i] = false;
+    }
+
+    for (open.items, 0..) |*hs, index| {
+        hs.deinit(allocator);
+        closed[index] = true;
+    }
+    // Avoid double-close in the deferred cleanup; every item has already
+    // released its client end and the test now waits on the server accounting.
+    open.clearRetainingCapacity();
+    const settle_deadline = compat.milliTimestamp() + 10_000;
+    var settled = false;
+    var handoffs: u64 = 0;
+    var capacity_rejections: u64 = 0;
+    while (true) {
+        var metrics = try wsMetrics(allocator, tardigrade.port);
+        defer metrics.deinit();
+        const active = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 0;
+        const owned = prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_tunnels") orelse 0;
+        const connections = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0;
+        handoffs = prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_handoffs_total") orelse 0;
+        capacity_rejections = wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"capacity\"");
+        if (active == 0 and owned == 0 and connections <= baseline_connections and handoffs == tunnels + first_wave) {
+            settled = true;
+            break;
+        }
+        if (compat.milliTimestamp() > settle_deadline) return error.TunnelsDidNotSettle;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+    const settled_sample = try websocketResourceSample(allocator, &tardigrade, "settled");
+    try samples.append(settled_sample);
+    const baseline_sample = samples.items[0];
+    try std.testing.expect(settled_sample.open_fds <= baseline_sample.open_fds + 2);
+    try std.testing.expect(settled_sample.sockets <= baseline_sample.sockets + 2);
+    try std.testing.expectEqual(baseline_sample.buffer_bytes, settled_sample.buffer_bytes);
+    try std.testing.expect(settled_sample.rss_kb <= samples.items[1].rss_kb + 8 * 1024);
+    try writeWebsocketReactorSmokeEvidence(allocator, tunnels, baseline_rest_worst_ms, loaded_rest_worst_ms, handoffs, capacity_rejections, settled, samples.items);
+}
+
 test "proxy_websocket runs hundreds of tunnels on reactor threads while one worker keeps serving requests (#818)" {
     const allocator = std.testing.allocator;
     // Each tunnel costs this process two descriptors (client and origin side)

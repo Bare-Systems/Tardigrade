@@ -351,6 +351,18 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("test-integration", "Run live-process integration tests");
     integration_step.dependOn(&run_integration_tests.step);
 
+    // #830: a compact, WebSocket-only live-process gate. Keep this separate
+    // from the broader integration suite so PR CI can expose the reactor
+    // ownership, capacity, churn, and resource-settle evidence directly.
+    const websocket_reactor_smoke_tests = b.addTest(.{
+        .root_module = integration_mod,
+        .filters = &.{"proxy_websocket reactor smoke (#830)"},
+    });
+    const run_websocket_reactor_smoke_tests = b.addRunArtifact(websocket_reactor_smoke_tests);
+    run_websocket_reactor_smoke_tests.step.dependOn(b.getInstallStep());
+    const websocket_reactor_smoke_step = b.step("test-integration-websocket-reactor-smoke", "Run #830 focused WebSocket reactor smoke");
+    websocket_reactor_smoke_step.dependOn(&run_websocket_reactor_smoke_tests.step);
+
     const native_listener_integration_tests = b.addTest(.{
         .root_module = integration_mod,
         // #634: "native upstream https" covers the native upstream HTTPS/TLS

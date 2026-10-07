@@ -23597,7 +23597,15 @@ fn websocketOpenFds(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
     var pid_buf: [32]u8 = undefined;
     const pid_text = try websocketResourcePidText(pid, &pid_buf);
     const script = try std.fmt.allocPrint(allocator,
-        \\if [ -d /proc/{s}/fd ]; then find /proc/{s}/fd -maxdepth 1 -type l | wc -l; elif command -v lsof >/dev/null 2>&1; then lsof -nP -p {s} | awk 'NR>1 {{n++}} END {{print n+0}}'; else exit 2; fi
+        \\if [ -d /proc/{s}/fd ]; then
+        \\  entries=$(find /proc/{s}/fd -maxdepth 1 -type l -print 2>/dev/null) || exit 4
+        \\  if [ -n "$entries" ]; then printf '%s\n' "$entries" | wc -l | tr -d ' '; else echo 0; fi
+        \\elif command -v lsof >/dev/null 2>&1; then
+        \\  rows=$(lsof -nP -p {s} 2>/dev/null) || exit 5
+        \\  printf '%s\n' "$rows" | awk 'NR>1 {{n++}} END {{print n+0}}'
+        \\else
+        \\  exit 2
+        \\fi
     , .{ pid_text, pid_text, pid_text });
     defer allocator.free(script);
     return websocketResourceProbe(allocator, script);
@@ -23607,7 +23615,15 @@ fn websocketSocketCount(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
     var pid_buf: [32]u8 = undefined;
     const pid_text = try websocketResourcePidText(pid, &pid_buf);
     const script = try std.fmt.allocPrint(allocator,
-        \\if command -v lsof >/dev/null 2>&1; then lsof -nP -a -p {s} -iTCP -iUDP | awk 'NR>1 {{n++}} END {{print n+0}}'; elif [ -d /proc/{s}/fd ]; then for f in /proc/{s}/fd/*; do readlink "$f" 2>/dev/null; done | grep -c '^socket:' || true; else exit 2; fi
+        \\if command -v lsof >/dev/null 2>&1; then
+        \\  rows=$(lsof -nP -p {s} 2>/dev/null) || exit 5
+        \\  printf '%s\n' "$rows" | awk 'NR>1 && ($5 == "IPv4" || $5 == "IPv6") {{n++}} END {{print n+0}}'
+        \\elif [ -d /proc/{s}/fd ]; then
+        \\  targets=$(for f in /proc/{s}/fd/*; do readlink "$f" 2>/dev/null || exit 4; done) || exit 4
+        \\  printf '%s\n' "$targets" | awk '/^socket:/ {{n++}} END {{print n+0}}'
+        \\else
+        \\  exit 2
+        \\fi
     , .{ pid_text, pid_text, pid_text });
     defer allocator.free(script);
     return websocketResourceProbe(allocator, script);

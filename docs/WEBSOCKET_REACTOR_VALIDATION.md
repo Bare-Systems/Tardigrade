@@ -42,6 +42,6 @@ The Prometheus scrape remains the detailed source of truth during every phase:
 - `tardigrade_websocket_reactor_threads` stays fixed at two; `tardigrade_websocket_reactor_handoffs_total` reaches one per successful handshake; and `tardigrade_websocket_reactor_thread_tunnels_max` remains below the whole population for two or more tunnels.
 - `tardigrade_websocket_upgrades_total{outcome="capacity"}` increments for the deliberate cap rejection, before a new origin handshake occurs.
 - `tardigrade_active_connections` returns to the pre-load baseline after every churn/close phase. The smoke treats ten seconds as a failed settle.
-- Ordinary `/healthz` requests remain successful; the maximum loaded latency must remain below one second and below 20 times the measured baseline (whichever allowance is larger).
+- Ordinary `/healthz` requests remain successful. Loaded worst-case latency must stay below one second and below `max(100 ms, 20 × the measured baseline)`.
 
 RSS and FD/socket counts are sampled from the Tardigrade child, not the test process. The smoke rejects post-settle buffer growth, more than two extra FDs/sockets over baseline, or RSS more than 8 MiB above the populated sample. A monotonically rising post-settle RSS or FD/socket count is a failure to investigate, not a new published limit. #819 consumes these artifacts with its separate SSE and mixed-traffic evidence.

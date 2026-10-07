@@ -6,6 +6,19 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **Certificate-aware routing and forward_auth identity (#763).** New location
+  directives `client_cert required` and `client_cert_allow KIND VALUE`
+  (`fingerprint`, `subject`, `issuer`, `san_dns`, `san_email`, `san_uri`) gate a
+  route on the handshake-verified client certificate, so an optional-mTLS
+  listener can leave most routes open and require identity only where needed.
+  Anonymous requests get `403 client_certificate_required`; a verified but
+  non-matching identity gets `403 client_certificate_denied`; the gate runs
+  before `forward_auth` and behaves identically on H1, H2 and H3. `forward_auth`
+  subrequests now receive the verified identity as `X-Tardigrade-Client-Cert-*`
+  headers built from connection state; client-supplied copies are never
+  forwarded. Fixes the H1 client-auth snapshot dropping the verified identity
+  once an earlier hop's auth had asserted headers.
+
 - **Per-SNI / per-server downstream mTLS policy and trust (#763).**
   `tls_client_verify`, `tls_client_verify_optional`, `tls_client_ca_path` and
   `tls_client_verify_depth` are now accepted inside `server { }` blocks. The

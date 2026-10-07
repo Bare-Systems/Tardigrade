@@ -199,7 +199,11 @@ pub fn authorize(
     // even for an empty body, so the auth service sees one route per policy.
     const forwards_body = fa.max_body_bytes > 0;
     var headers = std.array_list.Managed(std.http.Header).init(arena);
-    try appendAuthRequestHeaders(&headers, input, forwards_body, fa.upstream_headers, input.asserted_names);
+    appendAuthRequestHeaders(&headers, input, forwards_body, fa.upstream_headers, input.asserted_names) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // An identity value that cannot be asserted safely fails closed.
+        else => return failWith(decision, .invalid_response, fa.failure_status),
+    };
     // The bounded transport only declares a length for a non-empty body; an
     // empty POST must still be explicitly framed (RFC 9110 §8.6).
     if (forwards_body and send_body.len == 0) try headers.append(.{ .name = "Content-Length", .value = "0" });
@@ -341,6 +345,9 @@ fn appendAuthRequestHeaders(
         try headers.append(.{ .name = header.name, .value = header.value });
     }
 
+    // The verified mTLS identity comes from trusted connection state, never
+    // from request bytes: client copies of these names were skipped above.
+    try gph.appendVerifiedClientCertHeaders(headers, input.headers.client_cert);
     try headers.append(.{ .name = "X-Forwarded-Method", .value = input.method });
     try headers.append(.{ .name = "X-Forwarded-Proto", .value = input.proto });
     if (input.host) |host| {
@@ -604,6 +611,38 @@ fn testInput(headers: *const http.Headers, body: ?[]const u8) Input {
         .headers = headers,
         .body = body,
     };
+}
+
+test "authorize sends only the verified client certificate identity, never client-supplied copies (#763)" {
+    const allocator = std.testing.allocator;
+    var server = try TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer server.stop();
+    try server.run();
+    var url_buf: [64]u8 = undefined;
+    const fa = ForwardAuth{ .url = server.url(&url_buf, "/verify") };
+    var headers = http.Headers.init(allocator);
+    defer headers.deinit();
+    try headers.append("X-Tardigrade-Client-Cert-Verified", "1");
+    try headers.append("X-Tardigrade-Client-Cert-Subject", "CN=forged-admin");
+    var cfg = testConfig();
+
+    // Anonymous connection: forged headers must not reach the auth service.
+    var anon = try authorize(allocator, &cfg, &fa, testInput(&headers, null));
+    anon.deinit();
+    try std.testing.expect(!server.requestContains(0, "X-Tardigrade-Client-Cert"));
+    try std.testing.expect(!server.requestContains(0, "forged-admin"));
+
+    // Authenticated connection: only handshake-derived values are asserted.
+    headers.client_cert = .{ .fingerprint_sha256 = "ab" ** 32, .subject = "CN=alice", .san_email = "alice@example.com" };
+    var authed = try authorize(allocator, &cfg, &fa, testInput(&headers, null));
+    authed.deinit();
+    try std.testing.expect(server.requestContains(1, "X-Tardigrade-Client-Cert-Verified: 1"));
+    try std.testing.expect(server.requestContains(1, "X-Tardigrade-Client-Cert-Subject: CN=alice"));
+    try std.testing.expect(server.requestContains(1, "X-Tardigrade-Client-Cert-San-Email: alice@example.com"));
+    try std.testing.expect(!server.requestContains(1, "forged-admin"));
 }
 
 test "authorize allows 2xx and returns only allowlisted auth headers" {

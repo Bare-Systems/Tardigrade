@@ -780,6 +780,15 @@ pub fn routeRequest(
                     if (isWebSocketAttempt(matched.block, request)) state.metricsRecordWebSocketUpgrade(.denied);
                     return .{ .status = status, .mirror_allowed = false };
                 }
+                if (clientCertDenial(matched.block.client_cert, request.headers.client_cert)) |denial| {
+                    // Checked before forward_auth so an unauthorized identity
+                    // never triggers the auth subrequest side effect.
+                    grants.clear();
+                    try sendApiError(allocator, writer, .forbidden, denial.code, denial.message, correlation_id, keep_alive.*, state);
+                    state.metricsRecord(403);
+                    state.metricsRecordErrorCode(denial.code);
+                    return .{ .status = 403, .mirror_allowed = false };
+                }
                 var allowed: ?gfa.Decision = null;
                 if (try enforceLocationForwardAuth(allocator, writer, cfg, state, request, matched, correlation_id, keep_alive, client_ip, streaming_request_body != null, &client_view, &allowed)) |status| {
                     grants.clear();
@@ -951,6 +960,9 @@ const H1ClientAuthView = struct {
         var copy = http.Headers.init(allocator);
         errdefer copy.deinit();
         for (request.headers.iterator()) |header| try copy.append(header.name, header.value);
+        // The verified mTLS identity is out-of-band state, not a header; the
+        // forward_auth subrequest must still see it after the snapshot.
+        copy.client_cert = request.headers.client_cert;
         self.snapshot = copy;
     }
 
@@ -959,6 +971,23 @@ const H1ClientAuthView = struct {
         self.asserted_names.deinit(allocator);
     }
 };
+
+pub const ClientCertDenial = struct {
+    code: []const u8,
+    message: []const u8,
+};
+
+/// Location-level mTLS gate (#763), shared by H1, H2 and H3 so all three
+/// answer identically. `cert` must be the connection's handshake-verified
+/// identity (`Headers.client_cert`), never anything parsed from the request.
+/// Returns null when the request may proceed.
+pub fn clientCertDenial(policy: http.location_router.ClientCertPolicy, cert: ?http.headers.ClientCertificate) ?ClientCertDenial {
+    return switch (policy.evaluate(cert)) {
+        .allow => null,
+        .missing => .{ .code = "client_certificate_required", .message = "Client certificate required" },
+        .mismatch => .{ .code = "client_certificate_denied", .message = "Client certificate not authorized" },
+    };
+}
 
 /// Protocol-neutral request target (`path[?query]`) for the auth service.
 fn forwardAuthRequestTarget(allocator: std.mem.Allocator, path: []const u8, query: ?[]const u8) ![]u8 {
@@ -3695,6 +3724,11 @@ fn routeHttp3Hop(
         try rejectHttp3AuthRequiredLocation(allocator, response, ctx, correlation_id);
         return .handled;
     }
+    if (clientCertDenial(matched.block.client_cert, request.headers.client_cert)) |denial| {
+        route.grants.clear();
+        try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, .forbidden, denial.code, denial.message, correlation_id);
+        return .handled;
+    }
     if (matched.block.forward_auth) |*fa| {
         var allowed: ?gfa.Decision = null;
         if (!try enforceHttp3ForwardAuth(allocator, request, response, ctx, fa, matched.block.pattern, correlation_id, route, &allowed)) {
@@ -4739,6 +4773,86 @@ test "H3 proxy asserts no client identity for an anonymous connection even when 
     try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
     try std.testing.expect(!origin.requestContains(0, "X-Tardigrade-Client-Cert"));
     try std.testing.expect(!origin.requestContains(0, "forged"));
+}
+
+fn runH3ClientCertPolicy(
+    allocator: std.mem.Allocator,
+    policy: http.location_router.ClientCertPolicy,
+    client_cert: ?http.headers.ClientCertificate,
+    origin: *H3ProxyOrigin,
+) !u16 {
+    try origin.run();
+    var target_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "http://127.0.0.1:{d}", .{origin.port()});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/admin",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+        .client_cert = policy,
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/admin/users"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+    };
+    defer request.deinit();
+    try request.headers.append("X-Tardigrade-Client-Cert-Fingerprint-Sha256", "ab" ** 32);
+    request.headers.client_cert = client_cert;
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    try handleHttp3Request(allocator, &request, &response, &dispatch_ctx);
+    return @intFromEnum(response.status);
+}
+
+test "H3 location client_cert policy: anonymous, wrong identity, matching identity and spoofed headers (#763)" {
+    const allocator = std.testing.allocator;
+    const fps = [_][]const u8{"ab" ** 32};
+    const policy = http.location_router.ClientCertPolicy{ .required = true, .fingerprints = &fps };
+
+    // Optional-mTLS listener, no certificate presented: refused, upstream untouched.
+    {
+        var origin = try H3ProxyOrigin.start(allocator, &.{200});
+        defer origin.stop();
+        try std.testing.expectEqual(@as(u16, 403), try runH3ClientCertPolicy(allocator, policy, null, &origin));
+        try std.testing.expectEqual(@as(usize, 0), origin.requestCount());
+    }
+    // Verified certificate for a different principal: refused.
+    {
+        var origin = try H3ProxyOrigin.start(allocator, &.{200});
+        defer origin.stop();
+        try std.testing.expectEqual(@as(u16, 403), try runH3ClientCertPolicy(allocator, policy, .{ .fingerprint_sha256 = "cd" ** 32, .subject = "CN=mallory" }, &origin));
+        try std.testing.expectEqual(@as(usize, 0), origin.requestCount());
+    }
+    // Matching fingerprint passes, regardless of the forged header's content.
+    {
+        var origin = try H3ProxyOrigin.start(allocator, &.{200});
+        defer origin.stop();
+        try std.testing.expectEqual(@as(u16, 200), try runH3ClientCertPolicy(allocator, policy, .{ .fingerprint_sha256 = "ab" ** 32, .subject = "CN=alice" }, &origin));
+        try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    }
+}
+
+test "H1 client-auth snapshot keeps the verified client certificate for forward_auth (#763)" {
+    const allocator = std.testing.allocator;
+    var parsed = try http.Request.parse(allocator, "GET /admin HTTP/1.1\r\nHost: example.test\r\n\r\n", MAX_REQUEST_SIZE);
+    defer parsed.request.deinit();
+    parsed.request.headers.client_cert = .{ .fingerprint_sha256 = "ab" ** 32, .subject = "CN=alice" };
+    var view = H1ClientAuthView{};
+    defer view.deinit(allocator);
+    try view.preserve(allocator, &parsed.request);
+    try std.testing.expectEqualStrings("CN=alice", view.headers(&parsed.request).client_cert.?.subject);
 }
 
 test "H3 forward_auth denial is returned before the upstream is contacted" {

@@ -3969,6 +3969,11 @@ fn executeHttp2ProxyRoute(
         .code = "unauthorized",
         .message = "Unauthorized",
     } };
+    if (ghandlers.clientCertDenial(matched.block.client_cert, request.headers.client_cert)) |denial| return .{ .local_rejection = .{
+        .status_code = @intFromEnum(http.Status.forbidden),
+        .code = denial.code,
+        .message = denial.message,
+    } };
     if (matched.block.forward_auth) |*fa| {
         // H2 dispatches deferred 0-RTT streams once the handshake completes,
         // but that does not make them any less replayable. The auth call is
@@ -7301,6 +7306,80 @@ test "H2 forward_auth refusals stay no-store despite global CDN cache headers" {
     try std.testing.expect(std.mem.find(u8, too_early, "surrogate-control") == null);
     try std.testing.expect(std.mem.find(u8, too_early, "public") == null);
     try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+}
+
+test "H2 location client_cert policy gates by verified identity and feeds forward_auth trusted state (#763)" {
+    const allocator = std.testing.allocator;
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+    const allowed_fp = [_][]const u8{"ab" ** 32};
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/admin",
+            .priority = 0,
+            .action = .{ .return_response = .{ .status = 200, .body = "admin-secret" } },
+            .client_cert = .{ .fingerprints = &allowed_fp },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify") },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/open",
+            .priority = 1,
+            .action = .{ .return_response = .{ .status = 200, .body = "open-page" } },
+        },
+    };
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+
+    var h: H2ForwardAuthHarness = undefined;
+    h.init(allocator);
+    defer h.deinit();
+    h.conn.handshake_complete = true;
+
+    // Anonymous (optional-mTLS listener, no cert) -> protected route refused.
+    try h.addStream(1, "GET", "/admin", false);
+    try h.dispatch(&cfg);
+    var written = h.conn.out.written();
+    try std.testing.expect(std.mem.find(u8, written, "403") != null);
+    try std.testing.expect(std.mem.find(u8, written, "client_certificate_required") != null);
+    try std.testing.expect(std.mem.find(u8, written, "admin-secret") == null);
+
+    // Verified but wrong identity -> refused, auth service never consulted.
+    var len = written.len;
+    try h.addStream(3, "GET", "/admin", false);
+    h.pending.getPtr(3).?.headers.client_cert = .{ .fingerprint_sha256 = "cd" ** 32, .subject = "CN=mallory" };
+    try h.dispatch(&cfg);
+    written = h.conn.out.written()[len..];
+    try std.testing.expect(std.mem.find(u8, written, "client_certificate_denied") != null);
+    try std.testing.expect(std.mem.find(u8, written, "admin-secret") == null);
+    try std.testing.expectEqual(@as(usize, 0), auth_server.requestCount());
+
+    // Anonymous request to an unprotected route is unaffected.
+    len = h.conn.out.written().len;
+    try h.addStream(5, "GET", "/open", false);
+    try h.dispatch(&cfg);
+    try std.testing.expect(std.mem.find(u8, h.conn.out.written()[len..], "open-page") != null);
+
+    // Matching identity passes; forward_auth sees the verified identity and
+    // not the forged copy the client put on the wire.
+    len = h.conn.out.written().len;
+    try h.addStream(7, "GET", "/admin", false);
+    {
+        const ps = h.pending.getPtr(7).?;
+        ps.headers.client_cert = .{ .fingerprint_sha256 = "ab" ** 32, .subject = "CN=alice" };
+        try ps.headers.append("X-Tardigrade-Client-Cert-Subject", "CN=forged-root");
+    }
+    try h.dispatch(&cfg);
+    try std.testing.expect(std.mem.find(u8, h.conn.out.written()[len..], "admin-secret") != null);
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+    try std.testing.expect(auth_server.requestContains(0, "X-Tardigrade-Client-Cert-Subject: CN=alice"));
+    try std.testing.expect(auth_server.requestContains(0, "X-Tardigrade-Client-Cert-Fingerprint-Sha256: " ++ "ab" ** 32));
+    try std.testing.expect(!auth_server.requestContains(0, "forged-root"));
 }
 
 test "H2 forward_auth allow serves a protected static location with the auth Set-Cookie" {

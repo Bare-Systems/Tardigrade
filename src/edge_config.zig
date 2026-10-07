@@ -3011,6 +3011,11 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         var fa_timeout_ms: u32 = 0;
         var fa_failure_status: u16 = http.location_router.ForwardAuth.DEFAULT_FAILURE_STATUS;
         var fa_options_seen = false;
+        var client_cert: http.location_router.ClientCertPolicy = .{};
+        errdefer client_cert.deinit(allocator);
+        var cc_lists: [http.location_router.client_cert_matcher_kinds.len]std.ArrayList([]const u8) = @splat(.empty);
+        defer for (&cc_lists) |*list| list.deinit(allocator);
+        errdefer for (&cc_lists) |*list| for (list.items) |item| allocator.free(item);
         var websocket_on = false;
         var websocket: http.location_router.WebSocketProxy = .{};
         var websocket_origins: ?[]const u8 = null;
@@ -3067,6 +3072,26 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
                     else => return error.InvalidLocationBlockFormat,
                 }
                 fa_options_seen = true;
+            } else if (std.mem.eql(u8, option, "client_cert:required")) {
+                client_cert.required = true;
+            } else if (std.mem.startsWith(u8, option, "client_cert_allow:")) {
+                const spec = option["client_cert_allow:".len..];
+                const sep = std.mem.findScalar(u8, spec, ':') orelse return error.InvalidLocationBlockFormat;
+                const kind = http.location_router.clientCertMatcherKind(spec[0..sep]) orelse return error.InvalidLocationBlockFormat;
+                const hex = spec[sep + 1 ..];
+                if (hex.len == 0 or hex.len % 2 != 0) return error.InvalidLocationBlockFormat;
+                const decoded = try allocator.alloc(u8, hex.len / 2);
+                defer allocator.free(decoded);
+                _ = std.fmt.hexToBytes(decoded, hex) catch return error.InvalidLocationBlockFormat;
+                const value = http.location_router.normalizeClientCertMatcherValue(allocator, kind, decoded) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidClientCertMatcher => return error.InvalidLocationBlockFormat,
+                };
+                errdefer allocator.free(value);
+                const idx = for (http.location_router.client_cert_matcher_kinds, 0..) |k, i| {
+                    if (std.mem.eql(u8, k, kind)) break i;
+                } else unreachable;
+                try cc_lists[idx].append(allocator, value);
             } else if (std.mem.startsWith(u8, option, "auth:")) {
                 auth = http.location_router.AuthMode.parse(option["auth:".len..]) orelse return error.InvalidLocationBlockFormat;
             } else if (std.mem.startsWith(u8, option, "stream:")) {
@@ -3086,6 +3111,13 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .proxy_pass => {},
             else => return error.InvalidLocationBlockFormat,
         };
+        {
+            // Ownership moves into `client_cert`; its errdefer frees from here.
+            const targets = .{ &client_cert.fingerprints, &client_cert.subjects, &client_cert.issuers, &client_cert.san_dns, &client_cert.san_emails, &client_cert.san_uris };
+            inline for (targets, 0..) |target, i| {
+                target.* = try cc_lists[i].toOwnedSlice(allocator);
+            }
+        }
         if (forward_auth) |*fa| {
             fa.max_body_bytes = fa_body;
             fa.timeout_ms = fa_timeout_ms;
@@ -3118,11 +3150,13 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .proxy_early_data = proxy_early_data,
             .proxy_set_headers = &.{},
             .forward_auth = forward_auth,
+            .client_cert = client_cert,
             .websocket = if (websocket_on) websocket else null,
             .response_stream = response_stream,
         });
         action_owned = false;
         forward_auth = null;
+        client_cert = .{};
         websocket = .{};
         if (set_headers.items.len > 0) {
             out.items[out.items.len - 1].proxy_set_headers = try set_headers.toOwnedSlice(allocator);
@@ -4721,6 +4755,29 @@ test "parse location blocks read forward_auth options" {
     try std.testing.expectEqual(@as(u32, 750), fa.timeout_ms);
     try std.testing.expectEqual(@as(u16, 502), fa.failure_status);
     try std.testing.expect(blocks[1].forward_auth == null);
+}
+
+test "parse location blocks read client_cert policy (#763)" {
+    const allocator = std.testing.allocator;
+    // "CN=alice" and "alice.example.com" hex-encoded; fingerprint accepts colons/upper-case.
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "prefix|/admin/|return|200|ok|client_cert:required|client_cert_allow:subject:434e3d616c696365" ++
+            "|client_cert_allow:san_dns:616c6963652e6578616d706c652e636f6d" ++
+            ";prefix|/open/|return|200|ok",
+    );
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+    try std.testing.expect(blocks[0].client_cert.required);
+    try std.testing.expectEqualStrings("CN=alice", blocks[0].client_cert.subjects[0]);
+    try std.testing.expectEqualStrings("alice.example.com", blocks[0].client_cert.san_dns[0]);
+    try std.testing.expect(blocks[1].client_cert.isEmpty());
+
+    try std.testing.expectError(error.InvalidLocationBlockFormat, parseLocationBlocks(allocator, "prefix|/a/|return|200|ok|client_cert_allow:fingerprint:6162"));
+    try std.testing.expectError(error.InvalidLocationBlockFormat, parseLocationBlocks(allocator, "prefix|/a/|return|200|ok|client_cert_allow:bogus:6162"));
+    try std.testing.expectError(error.InvalidLocationBlockFormat, parseLocationBlocks(allocator, "prefix|/a/|return|200|ok|client_cert_allow:subject:zz"));
 }
 
 test "parse location blocks read proxy_websocket options (#812)" {

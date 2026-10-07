@@ -75,6 +75,17 @@ fn deinitProxySetHeaders(allocator: std.mem.Allocator, list: *std.ArrayList(Prox
     list.deinit(allocator);
 }
 
+/// One parsed `client_cert_allow KIND VALUE;` (#763), owned by its builder.
+const ClientCertAllowBuilder = struct {
+    kind: []const u8,
+    value: []u8,
+};
+
+fn deinitClientCertAllow(allocator: std.mem.Allocator, list: *std.ArrayList(ClientCertAllowBuilder)) void {
+    for (list.items) |rule| allocator.free(rule.value);
+    list.deinit(allocator);
+}
+
 const LocationBlockBuilder = struct {
     const ErrorPageBuilder = struct {
         status_codes_csv: []u8,
@@ -106,6 +117,8 @@ const LocationBlockBuilder = struct {
     forward_auth_body: ?usize = null,
     forward_auth_timeout_ms: ?u32 = null,
     forward_auth_failure_status: ?u16 = null,
+    client_cert_required: ?bool = null,
+    client_cert_allow: std.ArrayList(ClientCertAllowBuilder) = .empty,
     proxy_websocket: ?bool = null,
     proxy_websocket_idle_timeout_ms: ?u32 = null,
     proxy_websocket_max_lifetime_ms: ?u32 = null,
@@ -156,6 +169,7 @@ const LocationBlockBuilder = struct {
         }
         self.error_pages.deinit(allocator);
         deinitProxySetHeaders(allocator, &self.proxy_set_headers);
+        deinitClientCertAllow(allocator, &self.client_cert_allow);
         self.* = undefined;
     }
 };
@@ -771,10 +785,22 @@ fn parseLocationStatement(
         try parseProxySetHeader(allocator, file_path, line_no, value_raw, vars, &builder.proxy_set_headers);
         return;
     }
+    if (std.ascii.eqlIgnoreCase(directive, "client_cert_allow")) {
+        try parseClientCertAllow(allocator, file_path, line_no, value_raw, vars, &builder.client_cert_allow);
+        return;
+    }
     const trimmed_value = std.mem.trim(u8, value_raw, " \t\"'");
     const value_interp = try interpolate(allocator, trimmed_value, vars);
     defer allocator.free(value_interp);
 
+    if (std.ascii.eqlIgnoreCase(directive, "client_cert")) {
+        if (!std.ascii.eqlIgnoreCase(value_interp, "required") and !std.ascii.eqlIgnoreCase(value_interp, "off")) {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: client_cert must be 'required' or 'off'", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        }
+        builder.client_cert_required = std.ascii.eqlIgnoreCase(value_interp, "required");
+        return;
+    }
     if (std.ascii.eqlIgnoreCase(directive, "proxy_pass")) {
         try ensureLocationActionAllowed(file_path, line_no, builder, "proxy_pass");
         try replaceOptionalOwned(allocator, &builder.proxy_pass, value_interp);
@@ -1255,6 +1281,18 @@ fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlock
         allocator.free(entry);
         return error.InvalidConfigSyntax;
     }
+    if ((builder.client_cert_required orelse false) or builder.client_cert_allow.items.len > 0) {
+        var cc_entry: std.ArrayList(u8) = .empty;
+        defer cc_entry.deinit(allocator);
+        try cc_entry.appendSlice(allocator, entry);
+        if (builder.client_cert_required orelse false) try cc_entry.appendSlice(allocator, "|client_cert:required");
+        for (builder.client_cert_allow.items) |rule| {
+            try cc_entry.print(allocator, "|client_cert_allow:{s}:", .{rule.kind});
+            try appendHexLower(allocator, &cc_entry, rule.value);
+        }
+        allocator.free(entry);
+        entry = try cc_entry.toOwnedSlice(allocator);
+    }
     if (builder.proxy_websocket orelse false) {
         if (builder.proxy_pass == null) {
             logConfigSyntaxDiagnostic("config syntax error: location '{s}' uses proxy_websocket without proxy_pass", .{builder.pattern});
@@ -1364,6 +1402,45 @@ fn parseProxySetHeader(
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
     try rules.append(allocator, .{ .name = owned_name, .value = value });
+}
+
+/// Parse `client_cert_allow KIND VALUE;` (#763). Kinds: fingerprint (SHA-256
+/// hex, colons and case ignored), subject, issuer, san_dns, san_email,
+/// san_uri. The value is stored hex-encoded in the location entry so DN text
+/// (commas, `;`, `|`) cannot disturb the entry grammar.
+fn parseClientCertAllow(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    line_no: usize,
+    args_raw: []const u8,
+    vars: *std.StringHashMap([]const u8),
+    rules: *std.ArrayList(ClientCertAllowBuilder),
+) !void {
+    const args = std.mem.trim(u8, args_raw, " \t");
+    const kind_end = std.mem.findAny(u8, args, " \t") orelse {
+        logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: client_cert_allow requires a kind and a value", .{ file_path, line_no });
+        return error.InvalidConfigSyntax;
+    };
+    const kind = location_router.clientCertMatcherKind(args[0..kind_end]) orelse {
+        logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: client_cert_allow kind must be one of fingerprint, subject, issuer, san_dns, san_email, san_uri", .{ file_path, line_no });
+        return error.InvalidConfigSyntax;
+    };
+    var value_raw = std.mem.trim(u8, args[kind_end..], " \t");
+    if (value_raw.len >= 2 and (value_raw[0] == '"' or value_raw[0] == '\'') and value_raw[value_raw.len - 1] == value_raw[0]) {
+        value_raw = value_raw[1 .. value_raw.len - 1];
+    }
+    const interpolated = try interpolate(allocator, value_raw, vars);
+    errdefer allocator.free(interpolated);
+    const value = location_router.normalizeClientCertMatcherValue(allocator, kind, interpolated) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidClientCertMatcher => {
+            logConfigSyntaxDiagnostic("config syntax error at {s}:{d}: invalid client_cert_allow {s} value", .{ file_path, line_no, kind });
+            return error.InvalidConfigSyntax;
+        },
+    };
+    allocator.free(interpolated);
+    errdefer allocator.free(value);
+    try rules.append(allocator, .{ .kind = kind, .value = value });
 }
 
 fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, builder: *LocationBlockBuilder) !void {
@@ -1914,6 +1991,28 @@ test "location block serializes forward_auth directives" {
             "|forward_auth_body:0|forward_auth_timeout_ms:750|forward_auth_failure_status:502",
         overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
     );
+}
+
+test "location block serializes client_cert directives (#763)" {
+    const allocator = std.testing.allocator;
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    try parseLocationConfigForTest(allocator,
+        \\location /admin/ {
+        \\    client_cert required;
+        \\    client_cert_allow subject "CN=alice,O=Example";
+        \\    client_cert_allow fingerprint AB:CD:EF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC;
+        \\    return 200 ok;
+        \\}
+    , &overrides);
+    const entry = overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?;
+    try std.testing.expect(std.mem.startsWith(u8, entry, "prefix|/admin/|return|200|ok|client_cert:required" ++
+        "|client_cert_allow:subject:434e3d616c6963652c4f3d4578616d706c65|client_cert_allow:fingerprint:"));
+    // The fingerprint is normalized (colons dropped, lower-cased) before it is hex-encoded.
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(allocator);
+    try appendHexLower(allocator, &expected, "abcdef00112233445566778899aabbccddeeff00112233445566778899aabbcc");
+    try std.testing.expect(std.mem.endsWith(u8, entry, expected.items));
 }
 
 test "location block serializes proxy_websocket directives (#812)" {

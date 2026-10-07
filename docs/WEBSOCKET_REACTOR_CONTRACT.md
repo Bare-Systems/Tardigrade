@@ -69,21 +69,26 @@ by the global tunnel cap: a job gets there only after reserving a tunnel slot.
 
 Let:
 
-- `C` = effective `proxy_websocket_max_tunnels` (when configured as `0`, the
-  startup default is one quarter of the FD soft limit, capped at 4096);
-- `R` = `proxy_websocket_reactor_threads` (configured range 1–64; the automatic
-  default is one thread per four CPUs, clamped to 1–4);
-- `S_i` = tunnels owned or queued for shard `i`;
-- `B` = `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE` (at least 16 KiB).
+- `C_live` = the greatest effective tunnel-admission cap among configuration
+  generations that still own a live tunnel (when configured as `0`, the cap
+  is the startup default: one quarter of the FD soft limit, capped at 4096);
+- `R` = effective reactor threads, in the range 1–64 (the configured value is
+  0–64; `0` derives one thread per four CPUs, clamped to 1–4);
+- `T` = all admitted live tunnels, including reactor-owned, inbox-queued, and
+  exceptional inline-fallback tunnels;
+- `S_i` = tunnels owned or queued for reactor shard `i`;
+- `B_j` = tunnel `j`'s fixed per-direction relay-buffer size captured at its
+  admission generation, at least 16 KiB; `B_live_max` is the largest `B_j`;
+- `I` = live exceptional inline-fallback tunnels; `W` = worker threads.
 
 The enforced bounds are:
 
 ```text
-sum(S_i) <= C                         0 <= S_i <= C
-reactor threads = R                    worker-held tunnel threads = 0
-tunnel sockets <= 2 * C               reactor wake-pipe FDs = 2 * R
-relay payload buffers <= 2 * B * C    poll entries per shard <= 1 + 2 * S_i
-queued handoffs across all shards <= C
+sum(S_i) <= T <= C_live                0 <= S_i <= T
+reactor threads = R                     0 <= I <= W (I = 0 on the healthy path)
+tunnel sockets <= 2 * C_live           reactor wake-pipe FDs = 2 * R
+relay payload = 2 * sum(B_j) <= 2 * B_live_max * C_live
+poll entries per shard <= 1 + 2 * S_i  queued handoffs <= C_live
 ```
 
 The socket equation excludes listener, worker, and unrelated connection FDs;
@@ -93,6 +98,14 @@ job metadata, and normal process overhead are additional but do not grow with
 the amount of peer data buffered by the relay. The proxy-buffer account
 charges the two direction buffers before origin contact, so a stalled reader
 backpressures the sender instead of creating an unbounded queue.
+
+`proxy_websocket_max_tunnels` and `proxy_stream_buffer_size` are evaluated at
+admission. Lowering either on reload blocks future admissions but does not
+revoke tunnels admitted under an older generation, so the current configured
+values alone are not live-process bounds. The `C_live` and `B_j` definitions
+preserve the equations across those generations. `I` is normally zero; it is
+nonzero only when the reactor is unavailable or rejects a handoff, in which
+case the calling worker intentionally relays that tunnel inline until it ends.
 
 An established tunnel still occupies its downstream connection slot and still
 contributes to `max_active_connections`; it no longer occupies
@@ -108,12 +121,15 @@ request worker
                101 committed; job prepared; client detached
                                                        v
                                                   TRANSFERRED
-                                                       │ submit succeeds
-                                                       v
-reactor shard ──> ACTIVE ── reload/shutdown deadline ─> DRAINING ─> CLOSED
-                    │  │             │                    │
-                    │  └ peer EOF/error/timer ────────────┘
-                    └ relay has ready bytes or TLS work: take a bounded turn
+                                                       │ TunnelJob.submit() consumes
+                           ┌───────────────────────────┴──────────────────────────┐
+                           v                                                      v
+          Reactor.submit() succeeds: shard ACTIVE             rejection/failure: inline ACTIVE
+                           │                                                      │
+                           └────────── reload/shutdown deadline ──────────────────┘
+                                                              │
+                                                              v
+                                                         DRAINING ──> CLOSED
 ```
 
 - **ADMITTED:** the worker has passed every gate, acquired the slot and buffer
@@ -122,10 +138,13 @@ reactor shard ──> ACTIVE ── reload/shutdown deadline ─> DRAINING ─> 
   rolls back the request path cleanly.
 - **TRANSFERRED:** after the `101` is committed, `TunnelJob` holds the origin,
   admission accounting, copied pipelined bytes, and later the config lease and
-  detached client. The connection loop calls `attach()` then `submit()`. A
-  successful `submit()` is the ownership commit: the job is on exactly one
-  shard inbox. A stopped reactor or failed wake leaves ownership with the
-  caller; `TunnelJob.submit()` runs that job inline, so it is never dropped.
+  detached client. The connection loop calls `attach()` then the consuming
+  `TunnelJob.submit()`; that wrapper never returns tunnel ownership to the
+  connection loop. Internally, `Reactor.submit(&job.job)` is the reactor
+  ownership commit: on success, the job is on exactly one shard inbox. On
+  `ReactorStopped` or `ReactorWakeFailed`, it rolls inbox bookkeeping back to
+  `TunnelJob`, which immediately runs the same job inline on the calling
+  worker.
 - **ACTIVE:** the shard adopts the job and invokes its vtable (`fds`,
   `observe`, `advance`, `finish`, `abort`). `Relay.advance()` returns either a
   readiness/deadline description or one terminal close reason.
@@ -139,7 +158,7 @@ reactor shard ──> ACTIVE ── reload/shutdown deadline ─> DRAINING ─> 
 
 ## Single-owner cleanup table
 
-| Object | Before transfer | After `submit()` succeeds | Sole close/release path |
+| Object | Before transfer | After `TunnelJob.submit()` consumes it | Sole close/release path |
 | --- | --- | --- | --- |
 | Downstream socket / native TLS session / connection slot | Connection loop | `TunnelJob` on the shard (or inline fallback) | `TunnelJob.finishWithStats()` releases the slot while it still owns the FD, then closes/deinitializes it |
 | Fresh origin socket / upstream TLS session | Request path, then `TunnelJob` once 101 is committed | `TunnelJob` | `TunnelJob.releaseShared()` calls `UpgradedUpstream.deinit()` |

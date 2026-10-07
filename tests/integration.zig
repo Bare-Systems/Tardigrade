@@ -23558,6 +23558,85 @@ fn websocketReactorSmokeTunnelCount(allocator: std.mem.Allocator) !usize {
     return count;
 }
 
+const WsResourceSample = struct {
+    phase: []const u8,
+    rss_kb: u64,
+    open_fds: u64,
+    sockets: u64,
+    active_connections: u64,
+    active_tunnels: u64,
+    reactor_tunnels: u64,
+    buffer_bytes: u64,
+    worker_active_jobs: u64,
+    worker_queued_jobs: u64,
+    reactor_wakeups: u64,
+    close_client: u64,
+    close_reload: u64,
+    close_shutdown: u64,
+};
+
+fn websocketResourceProbe(allocator: std.mem.Allocator, script: []const u8) !u64 {
+    var result = try bounded_process.run(allocator, .{ .argv = &.{ "sh", "-c", script }, .stdout_limit = 4096, .stderr_limit = 4096, .deadline_ms = 5_000 });
+    defer result.deinit(allocator);
+    if (result.outcome != .normal_exit) return error.ResourceProbeFailed;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, result.stdout, " \t\r\n"), 10) catch error.MalformedResourceProbe;
+}
+
+fn websocketResourcePidText(pid: std.c.pid_t, out: *[32]u8) ![]const u8 {
+    return std.fmt.bufPrint(out, "{d}", .{pid});
+}
+
+fn websocketRssKb(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
+    var pid_buf: [32]u8 = undefined;
+    const script = try std.fmt.allocPrint(allocator, "ps -o rss= -p {s}", .{try websocketResourcePidText(pid, &pid_buf)});
+    defer allocator.free(script);
+    return websocketResourceProbe(allocator, script);
+}
+
+fn websocketOpenFds(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
+    var pid_buf: [32]u8 = undefined;
+    const pid_text = try websocketResourcePidText(pid, &pid_buf);
+    const script = try std.fmt.allocPrint(allocator,
+        \\if [ -d /proc/{s}/fd ]; then find /proc/{s}/fd -maxdepth 1 -type l | wc -l; elif command -v lsof >/dev/null 2>&1; then lsof -nP -p {s} | awk 'NR>1 {{n++}} END {{print n+0}}'; else exit 2; fi
+    , .{ pid_text, pid_text, pid_text });
+    defer allocator.free(script);
+    return websocketResourceProbe(allocator, script);
+}
+
+fn websocketSocketCount(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
+    var pid_buf: [32]u8 = undefined;
+    const pid_text = try websocketResourcePidText(pid, &pid_buf);
+    const script = try std.fmt.allocPrint(allocator,
+        \\if command -v lsof >/dev/null 2>&1; then lsof -nP -a -p {s} -iTCP -iUDP | awk 'NR>1 {{n++}} END {{print n+0}}'; elif [ -d /proc/{s}/fd ]; then for f in /proc/{s}/fd/*; do readlink "$f" 2>/dev/null; done | grep -c '^socket:' || true; else exit 2; fi
+    , .{ pid_text, pid_text, pid_text });
+    defer allocator.free(script);
+    return websocketResourceProbe(allocator, script);
+}
+
+fn websocketResourceSample(allocator: std.mem.Allocator, process: *const TardigradeProcess, phase: []const u8) !WsResourceSample {
+    const pid = process.child.id orelse return error.MissingChildPid;
+    var metrics = try wsMetrics(allocator, process.port);
+    defer metrics.deinit();
+    const aggregate = prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"downstream_to_upstream\"", "scope=\"global\"" }) orelse 0;
+    const aggregate_reverse = prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"upstream_to_downstream\"", "scope=\"global\"" }) orelse 0;
+    return .{
+        .phase = phase,
+        .rss_kb = try websocketRssKb(allocator, pid),
+        .open_fds = try websocketOpenFds(allocator, pid),
+        .sockets = try websocketSocketCount(allocator, pid),
+        .active_connections = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0,
+        .active_tunnels = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 0,
+        .reactor_tunnels = prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_tunnels") orelse 0,
+        .buffer_bytes = aggregate + aggregate_reverse,
+        .worker_active_jobs = prometheusMetricValue(metrics.body, "tardigrade_worker_active_jobs") orelse 0,
+        .worker_queued_jobs = prometheusMetricValue(metrics.body, "tardigrade_worker_queued_jobs") orelse 0,
+        .reactor_wakeups = prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_wakeups_total") orelse 0,
+        .close_client = wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"client\""),
+        .close_reload = wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"reload\""),
+        .close_shutdown = wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"shutdown\""),
+    };
+}
+
 fn writeWebsocketReactorSmokeEvidence(
     allocator: std.mem.Allocator,
     tunnels: usize,
@@ -23566,17 +23645,25 @@ fn writeWebsocketReactorSmokeEvidence(
     handoffs: u64,
     capacity_rejections: u64,
     settled: bool,
+    samples: []const WsResourceSample,
 ) !void {
     const path = compat.getEnvVarOwned(allocator, "TARDIGRADE_WS_REACTOR_EVIDENCE") catch return;
     defer allocator.free(path);
     const source_sha = compat.getEnvVarOwned(allocator, "TARDIGRADE_WS_REACTOR_SOURCE_SHA") catch try allocator.dupe(u8, "unknown");
     defer allocator.free(source_sha);
+    const runner = compat.getEnvVarOwned(allocator, "RUNNER_NAME") catch try allocator.dupe(u8, "local");
+    defer allocator.free(runner);
+    const nofile_limit = (std.posix.getrlimit(std.posix.rlimit_resource.NOFILE) catch null) orelse std.mem.zeroes(std.posix.rlimit);
     const json = try compat.stringifyAlloc(allocator, .{
         .schema_version = 1,
         .issue = 830,
         .profile = "websocket-reactor-smoke",
         .source_sha = source_sha,
         .platform = @tagName(builtin.os.tag),
+        .architecture = @tagName(builtin.cpu.arch),
+        .cpu_count = std.Thread.getCpuCount() catch 0,
+        .runner = runner,
+        .nofile_soft_limit = nofile_limit.cur,
         .reactor_threads = 2,
         .request_workers = 1,
         .tunnels_requested = tunnels,
@@ -23585,6 +23672,7 @@ fn writeWebsocketReactorSmokeEvidence(
         .rest_baseline_worst_ms = baseline_rest_worst_ms,
         .rest_loaded_worst_ms = loaded_rest_worst_ms,
         .settled = settled,
+        .resource_samples = samples,
     }, .{});
     defer allocator.free(json);
 
@@ -23626,6 +23714,9 @@ test "proxy_websocket reactor smoke (#830): bounded workers, capacity, churn, re
         defer metrics.deinit();
         break :blk prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0;
     };
+    var samples = std.array_list.Managed(WsResourceSample).init(allocator);
+    defer samples.deinit();
+    try samples.append(try websocketResourceSample(allocator, &tardigrade, "baseline"));
 
     var baseline_rest_worst_ms: i64 = 0;
     var loaded_rest_worst_ms: i64 = 0;
@@ -23673,6 +23764,7 @@ test "proxy_websocket reactor smoke (#830): bounded workers, capacity, churn, re
         try std.testing.expect(prometheusMetricValue(metrics.body, "tardigrade_websocket_reactor_thread_tunnels_max").? < tunnels);
         try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"capacity\""));
     }
+    try samples.append(try websocketResourceSample(allocator, &tardigrade, "populated"));
 
     // Active traffic and ordinary REST share the server with every idle
     // socket. The bound is deliberately broad enough for loaded CI hosts but
@@ -23690,7 +23782,7 @@ test "proxy_websocket reactor smoke (#830): bounded workers, capacity, churn, re
         loaded_rest_worst_ms = @max(loaded_rest_worst_ms, compat.milliTimestamp() - started);
     }
     try std.testing.expect(loaded_rest_worst_ms < 1_000);
-    try std.testing.expect(loaded_rest_worst_ms <= @max(@as(i64, 1_000), baseline_rest_worst_ms * 20));
+    try std.testing.expect(loaded_rest_worst_ms <= @max(@as(i64, 100), baseline_rest_worst_ms * 20));
 
     // Abrupt client closes and replacements exercise slot reuse under churn.
     const first_wave = tunnels / 2;
@@ -23708,6 +23800,13 @@ test "proxy_websocket reactor smoke (#830): bounded workers, capacity, churn, re
         if (compat.milliTimestamp() > churn_deadline) return error.TunnelsDidNotSettle;
         compat.sleepNs(25 * std.time.ns_per_ms);
     }
+    const churned_sample = try websocketResourceSample(allocator, &tardigrade, "churned");
+    try samples.append(churned_sample);
+    const populated_sample = samples.items[1];
+    try std.testing.expect(churned_sample.open_fds < populated_sample.open_fds);
+    try std.testing.expect(churned_sample.sockets < populated_sample.sockets);
+    try std.testing.expect(churned_sample.buffer_bytes < populated_sample.buffer_bytes);
+    try std.testing.expect(churned_sample.rss_kb <= populated_sample.rss_kb + 8 * 1024);
     i = 0;
     while (i < first_wave) : (i += 1) {
         var hs = try wsHandshake(allocator, tardigrade.port, "/ws/churn", &.{}, "");
@@ -23743,7 +23842,14 @@ test "proxy_websocket reactor smoke (#830): bounded workers, capacity, churn, re
         if (compat.milliTimestamp() > settle_deadline) return error.TunnelsDidNotSettle;
         compat.sleepNs(25 * std.time.ns_per_ms);
     }
-    try writeWebsocketReactorSmokeEvidence(allocator, tunnels, baseline_rest_worst_ms, loaded_rest_worst_ms, handoffs, capacity_rejections, settled);
+    const settled_sample = try websocketResourceSample(allocator, &tardigrade, "settled");
+    try samples.append(settled_sample);
+    const baseline_sample = samples.items[0];
+    try std.testing.expect(settled_sample.open_fds <= baseline_sample.open_fds + 2);
+    try std.testing.expect(settled_sample.sockets <= baseline_sample.sockets + 2);
+    try std.testing.expectEqual(baseline_sample.buffer_bytes, settled_sample.buffer_bytes);
+    try std.testing.expect(settled_sample.rss_kb <= samples.items[1].rss_kb + 8 * 1024);
+    try writeWebsocketReactorSmokeEvidence(allocator, tunnels, baseline_rest_worst_ms, loaded_rest_worst_ms, handoffs, capacity_rejections, settled, samples.items);
 }
 
 test "proxy_websocket runs hundreds of tunnels on reactor threads while one worker keeps serving requests (#818)" {

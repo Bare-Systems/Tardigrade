@@ -534,6 +534,8 @@ pub const GatewayState = struct {
     max_in_flight_requests: u32,
     /// Open (or opening) WebSocket tunnels (#812). Lock-free.
     websocket_tunnels: std.atomic.Value(u32) = .init(0),
+    /// Most tunnel slots held at once since start (observability only).
+    websocket_tunnels_high_water: std.atomic.Value(u32) = .init(0),
     /// Active long-lived streamed HTTP responses (#841). Admission uses the
     /// cap from the configuration generation being admitted.
     response_stream_lifecycle: http.response_stream_lifecycle.Lifecycle = .{},
@@ -861,6 +863,7 @@ pub const GatewayState = struct {
             _ = self.websocket_tunnels.fetchSub(1, .acq_rel);
             return false;
         }
+        _ = self.websocket_tunnels_high_water.fetchMax(prev + 1, .monotonic);
         return true;
     }
 
@@ -1665,7 +1668,7 @@ pub const GatewayState = struct {
     }
 
     pub fn metricsRecordWebSocketTunnelClosed(self: *GatewayState, stats: http.tunnel.Stats) void {
-        const reason = std.meta.stringToEnum(http.metrics.WebSocketCloseReason, stats.close_reason.label()) orelse .@"error";
+        const reason = std.meta.stringToEnum(http.metrics.WebSocketCloseReason, @tagName(stats.close_reason)) orelse .upstream_error;
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
         self.metrics.recordWebSocketTunnelClosed(reason, stats.client_to_upstream_bytes, stats.upstream_to_client_bytes, stats.duration_ms);
@@ -2237,14 +2240,22 @@ pub const GatewayState = struct {
     /// Live WebSocket reactor load (#818), read from the reactor's own
     /// atomics at scrape time.
     fn overlayWebSocketReactorStats(self: *GatewayState, metrics_snapshot: *http.metrics.Metrics) void {
-        const reactor = self.tunnel_reactor orelse return;
+        const slots_high_water = self.websocket_tunnels_high_water.load(.monotonic);
+        const reactor = self.tunnel_reactor orelse {
+            metrics_snapshot.setWebSocketReactorStats(.{ .slots_high_water = slots_high_water });
+            return;
+        };
         const snapshot = reactor.snapshot();
         metrics_snapshot.setWebSocketReactorStats(.{
+            .slots_high_water = slots_high_water,
             .threads = snapshot.threads,
             .tunnels = snapshot.tunnels,
             .max_thread_tunnels = snapshot.max_shard_tunnels,
             .handoffs_total = snapshot.handoffs_total,
             .wakeups_total = snapshot.wakeups_total,
+            .rejected_total = snapshot.rejected_total,
+            .queue_depth = snapshot.queue_depth,
+            .queue_high_water = snapshot.queue_high_water,
         });
     }
 

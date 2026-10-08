@@ -146,6 +146,18 @@ const Shard = struct {
         defer pfds.deinit(allocator);
         var seen_shutdown = false;
 
+        if (builtin.is_test) if (self.reactor.adopt_gate) |gate| {
+            // Hold the first inbox drain until the test opens the gate, or a
+            // stop is requested (so a failed test cannot hang teardown).
+            while (!gate.load(.acquire)) {
+                self.mutex.lock();
+                const stop_now = self.stopping;
+                self.mutex.unlock();
+                if (stop_now) break;
+                compat.sleepNs(std.time.ns_per_ms);
+            }
+        };
+
         while (true) {
             // Adopt handed-off tunnels.
             self.mutex.lock();
@@ -249,6 +261,9 @@ pub const Reactor = struct {
     opts: Options,
     shards: []Shard,
     wake_writer: WakeWriter,
+    /// Test-only: shard threads do not adopt handoffs (or poll) until this
+    /// reads true, so a test can hold accepted jobs in the inbox.
+    adopt_gate: ?*const std.atomic.Value(bool) = null,
     handoffs_total: std.atomic.Value(u64) = .init(0),
     stopped: std.atomic.Value(bool) = .init(false),
     /// Serializes admission decisions with the stop transition.
@@ -266,8 +281,12 @@ pub const Reactor = struct {
     }
 
     fn startWithWakeWriter(self: *Reactor, allocator: std.mem.Allocator, opts: Options, wake_writer: WakeWriter) !void {
+        try self.startWithGate(allocator, opts, wake_writer, null);
+    }
+
+    fn startWithGate(self: *Reactor, allocator: std.mem.Allocator, opts: Options, wake_writer: WakeWriter, adopt_gate: ?*const std.atomic.Value(bool)) !void {
         std.debug.assert(opts.threads > 0);
-        self.* = .{ .allocator = allocator, .opts = opts, .shards = try allocator.alloc(Shard, opts.threads), .wake_writer = wake_writer };
+        self.* = .{ .allocator = allocator, .opts = opts, .shards = try allocator.alloc(Shard, opts.threads), .wake_writer = wake_writer, .adopt_gate = adopt_gate };
         var made: usize = 0;
         errdefer {
             for (self.shards[0..made]) |*shard| {
@@ -963,6 +982,96 @@ test "reactor drains tunnels for the shutdown window, then stopAndJoin returns (
     job.job.vtable.finish(&job.job);
     _ = std.c.close(c[1]);
     _ = std.c.close(u[1]);
+}
+
+test "reactor applies each tunnel's admission reload policy across repeated reloads (#829)" {
+    var reactor: Reactor = undefined;
+    try reactor.start(std.testing.allocator, .{ .threads = 2, .shutdown_requested = neverShutdown });
+    defer reactor.deinit();
+    var drain_done = std.atomic.Value(u32).init(0);
+    var preserve_done = std.atomic.Value(u32).init(0);
+    var drain_reason = std.atomic.Value(u8).init(0);
+    var preserve_reason = std.atomic.Value(u8).init(0);
+    var freed = std.atomic.Value(u32).init(0);
+    var superseded = std.atomic.Value(u64).init(0);
+    const drain_opts = tunnel.Options{
+        .idle_timeout_ms = 60_000,
+        .shutdown_requested = neverShutdown,
+        .reload_drain = .{ .superseded_at_ms = &superseded, .timeout_ms = 80 },
+        .poll_interval_ms = 0,
+    };
+    // A preserve tunnel carries no ReloadDrain, so no stamp can end it.
+    const preserve_opts = tunnel.Options{ .idle_timeout_ms = 60_000, .shutdown_requested = neverShutdown, .poll_interval_ms = 0 };
+    var drainers: [3]PeerPair = undefined;
+    for (&drainers) |*p| p.* = try submitTestTunnel(&reactor, drain_opts, &drain_done, &drain_reason, &freed);
+    const keeper = try submitTestTunnel(&reactor, preserve_opts, &preserve_done, &preserve_reason, &freed);
+    defer for (drainers) |p| {
+        _ = std.c.close(p.client_peer);
+        _ = std.c.close(p.upstream_peer);
+    };
+    defer _ = std.c.close(keeper.client_peer);
+    defer _ = std.c.close(keeper.upstream_peer);
+
+    const first_reload = event_loop.monotonicMs();
+    superseded.store(first_reload, .release);
+    reactor.wakeAll();
+    // Repeated reloads and wakeups must not move the fixed deadline.
+    compat.sleepNs(30 * std.time.ns_per_ms);
+    reactor.wakeAll();
+    reactor.wakeAll();
+    try waitFor(&drain_done, 3, 3_000);
+    const closed_after = event_loop.monotonicMs() - first_reload;
+    try std.testing.expect(closed_after >= 80);
+    try std.testing.expect(closed_after < 1_500);
+    try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.reload), drain_reason.load(.acquire));
+
+    // The preserve tunnel is untouched and still relays.
+    try std.testing.expectEqual(@as(u32, 0), preserve_done.load(.acquire));
+    try testWriteAll(keeper.client_peer, "alive");
+    var got: [5]u8 = undefined;
+    try testReadExact(keeper.upstream_peer, &got);
+    try std.testing.expectEqualStrings("alive", &got);
+    try std.testing.expectEqual(@as(u32, 1), reactor.snapshot().tunnels);
+}
+
+test "shutdown arriving with accepted handoffs still queued closes every one exactly once (#829)" {
+    test_shutdown_flag.store(false, .release);
+    defer test_shutdown_flag.store(false, .release);
+    var allow_adopt = std.atomic.Value(bool).init(false);
+    var reactor: Reactor = undefined;
+    // The gate stops shard threads from draining their inbox, so accepted
+    // jobs stay queued regardless of thread-start scheduling.
+    try reactor.startWithGate(std.testing.allocator, .{ .threads = 2, .shutdown_requested = testShutdown }, systemWakeWrite, &allow_adopt);
+    defer reactor.deinit();
+    // Runs before deinit: even if an assertion fails, shards are released.
+    defer allow_adopt.store(true, .release);
+    var done = std.atomic.Value(u32).init(0);
+    var reason = std.atomic.Value(u8).init(0);
+    var freed = std.atomic.Value(u32).init(0);
+    const opts = tunnel.Options{ .idle_timeout_ms = 60_000, .drain_timeout_ms = 40, .shutdown_requested = testShutdown, .poll_interval_ms = 0 };
+    var peers: [8]PeerPair = undefined;
+    for (&peers) |*p| p.* = try submitTestTunnel(&reactor, opts, &done, &reason, &freed);
+    defer for (peers) |p| {
+        _ = std.c.close(p.client_peer);
+        _ = std.c.close(p.upstream_peer);
+    };
+
+    // Barrier: every accepted handoff is queued and none adopted.
+    try std.testing.expectEqual(@as(u32, 8), reactor.snapshot().queue_depth);
+    try std.testing.expectEqual(@as(u32, 0), done.load(.acquire));
+
+    // Shutdown arrives with the handoffs still queued; then adoption resumes.
+    test_shutdown_flag.store(true, .release);
+    allow_adopt.store(true, .release);
+    reactor.wakeAll();
+    reactor.stopAndJoin();
+
+    try std.testing.expectEqual(@as(u32, 8), done.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 8), freed.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.shutdown), reason.load(.acquire));
+    const snap = reactor.snapshot();
+    try std.testing.expectEqual(@as(u32, 0), snap.tunnels);
+    try std.testing.expectEqual(@as(u32, 0), snap.queue_depth);
 }
 
 test "reactor keeps one buffer per direction for a stalled reader (#818)" {

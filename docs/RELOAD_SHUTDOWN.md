@@ -222,7 +222,12 @@ reloads never affect open tunnels. Shutdown overrides `preserve`, and a
 tunnel already in a reload drain closes at the earlier of the two deadlines.
 The reload drain is timed from the superseded generation itself, stamped
 once when the new configuration is installed, so it adds no extra polling
-or reload-time work.
+or reload-time work. Reactor shards sleep until a socket event, the earliest
+tunnel deadline, a handoff or `wakeAll()`, so an idle tunnel still closes at
+its idle, lifetime, reload or shutdown deadline with no network traffic. This
+holds for plaintext and native-TLS tunnels alike. Close reasons and drain
+outcomes appear in `tardigrade_websocket_tunnel_closes_total{reason}`;
+generation pins are released when a generation's last tunnel closes.
 
 Long-lived streamed responses such as server-sent events are the other
 exception to the soft cap. They retain the reload policy from the generation

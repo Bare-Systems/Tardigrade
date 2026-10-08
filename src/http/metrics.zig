@@ -90,9 +90,17 @@ pub const WebSocketReactorStats = struct {
     max_thread_tunnels: u64 = 0,
     handoffs_total: u64 = 0,
     wakeups_total: u64 = 0,
+    /// Handoffs refused at the per-shard bound.
+    rejected_total: u64 = 0,
+    /// Handed-off tunnels not yet adopted by a shard, and the most any one
+    /// shard has had queued at once.
+    queue_depth: u64 = 0,
+    queue_high_water: u64 = 0,
+    /// Most tunnel slots (reactor and inline) held at once since start.
+    slots_high_water: u64 = 0,
 };
 
-pub const WebSocketCloseReason = enum { client, upstream, idle, lifetime, shutdown, reload, @"error" };
+pub const WebSocketCloseReason = enum { client, upstream, idle, lifetime, shutdown, reload, client_error, upstream_error };
 pub const EarlyDataSource = enum { transport, header, both };
 pub const EarlyDataDecision = enum { accepted, too_early, deferred, forwarded };
 pub const EarlyDataUpstream425Action = enum { forwarded, retried };
@@ -2015,8 +2023,20 @@ pub const Metrics = struct {
             \\# HELP tardigrade_websocket_reactor_wakeups_total Reactor thread wakeups
             \\# TYPE tardigrade_websocket_reactor_wakeups_total counter
             \\tardigrade_websocket_reactor_wakeups_total {d}
+            \\# HELP tardigrade_websocket_reactor_rejected_total Handoffs refused at the per-thread tunnel bound
+            \\# TYPE tardigrade_websocket_reactor_rejected_total counter
+            \\tardigrade_websocket_reactor_rejected_total {d}
+            \\# HELP tardigrade_websocket_reactor_queue_depth Handed-off tunnels not yet adopted by a reactor thread
+            \\# TYPE tardigrade_websocket_reactor_queue_depth gauge
+            \\tardigrade_websocket_reactor_queue_depth {d}
+            \\# HELP tardigrade_websocket_reactor_queue_high_water Most handed-off tunnels queued on any one reactor thread at once
+            \\# TYPE tardigrade_websocket_reactor_queue_high_water gauge
+            \\tardigrade_websocket_reactor_queue_high_water {d}
+            \\# HELP tardigrade_websocket_tunnel_slots_high_water Most WebSocket tunnel slots held at once since start
+            \\# TYPE tardigrade_websocket_tunnel_slots_high_water gauge
+            \\tardigrade_websocket_tunnel_slots_high_water {d}
             \\
-        , .{ reactor.threads, reactor.tunnels, reactor.max_thread_tunnels, reactor.handoffs_total, reactor.wakeups_total });
+        , .{ reactor.threads, reactor.tunnels, reactor.max_thread_tunnels, reactor.handoffs_total, reactor.wakeups_total, reactor.rejected_total, reactor.queue_depth, reactor.queue_high_water, reactor.slots_high_water });
     }
 
     fn appendResponseStreamPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
@@ -3153,20 +3173,26 @@ test "Metrics renders WebSocket tunnel series (#812)" {
     m.recordWebSocketUpgrade(.relayed);
     m.recordWebSocketUpgrade(.capacity);
     m.recordWebSocketTunnelClosed(.idle, 10, 20, 1500);
-    m.setWebSocketReactorStats(.{ .threads = 2, .tunnels = 7, .max_thread_tunnels = 4, .handoffs_total = 9, .wakeups_total = 31 });
+    m.setWebSocketReactorStats(.{ .threads = 2, .tunnels = 7, .max_thread_tunnels = 4, .handoffs_total = 9, .wakeups_total = 31, .rejected_total = 3, .queue_depth = 1, .queue_high_water = 5, .slots_high_water = 8 });
+    m.recordWebSocketTunnelClosed(.upstream_error, 0, 0, 1);
     const prom = try m.toPrometheus(allocator);
     defer allocator.free(prom);
     inline for (.{
         "tardigrade_websocket_upgrades_total{outcome=\"relayed\"} 2\n",
         "tardigrade_websocket_upgrades_total{outcome=\"capacity\"} 1\n",
         "tardigrade_websocket_upgrades_total{outcome=\"invalid\"} 0\n",
-        "tardigrade_websocket_tunnels_active 1\n",
+        "tardigrade_websocket_tunnels_active 0\n",
         "tardigrade_websocket_tunnel_bytes_total{direction=\"client_to_upstream\"} 10\n",
         "tardigrade_websocket_tunnel_bytes_total{direction=\"upstream_to_client\"} 20\n",
-        "tardigrade_websocket_tunnel_duration_seconds_sum 1.500\n",
-        "tardigrade_websocket_tunnel_duration_seconds_count 1\n",
+        "tardigrade_websocket_tunnel_duration_seconds_sum 1.501\n",
+        "tardigrade_websocket_tunnel_duration_seconds_count 2\n",
         "tardigrade_websocket_tunnel_closes_total{reason=\"idle\"} 1\n",
-        "tardigrade_websocket_tunnel_closes_total{reason=\"error\"} 0\n",
+        "tardigrade_websocket_tunnel_closes_total{reason=\"client_error\"} 0\n",
+        "tardigrade_websocket_tunnel_closes_total{reason=\"upstream_error\"} 1\n",
+        "tardigrade_websocket_reactor_rejected_total 3\n",
+        "tardigrade_websocket_reactor_queue_depth 1\n",
+        "tardigrade_websocket_reactor_queue_high_water 5\n",
+        "tardigrade_websocket_tunnel_slots_high_water 8\n",
         "tardigrade_websocket_reactor_threads 2\n",
         "tardigrade_websocket_reactor_tunnels 7\n",
         "tardigrade_websocket_reactor_thread_tunnels_max 4\n",

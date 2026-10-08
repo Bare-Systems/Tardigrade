@@ -6,6 +6,14 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **WebSocket reactor lifecycle observability (#829, #827).** Tunnel close
+  metrics now distinguish `client_error` from `upstream_error` (previously one
+  `error` label; the access log keeps `error`). New gauges/counters:
+  `tardigrade_websocket_reactor_rejected_total`, `_queue_depth`,
+  `_queue_high_water` and `tardigrade_websocket_tunnel_slots_high_water`.
+  Adds deterministic tests for admission-time reload policy resolution,
+  repeated reloads and shutdown during handoff.
+
 - **H1/H2 downstream mTLS interop (#763).** New `scripts/interop/run-h1-h2-mtls-interop.sh`
   (CI job `h1-h2-mtls-interop`) drives the real gateway with curl `--http1.1`,
   curl `--http2` and `openssl s_client`: required/optional modes, bad-certificate

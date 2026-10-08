@@ -208,10 +208,13 @@ other tunnels and deadlines before retrying. `Relay.advance()` also caps its
 own work at four bidirectional rounds. A TLS peer therefore cannot monopolize
 a shard by producing endless internal record-layer progress.
 
-The observable close reasons are `client`, `upstream`, `idle`, `lifetime`,
-`reload`, `shutdown`, and `error` (the `client_error` and `upstream_error`
-implementation cases are intentionally exported as the bounded `error`
-label). The close path writes exactly one access-log record with duration and
+The observable close reasons are `client`, `upstream` (peer EOF), `idle`,
+`lifetime`, `reload`, `shutdown`, `client_error` and `upstream_error` in the
+`tardigrade_websocket_tunnel_closes_total{reason}` metric. The access log's
+`tunnel_close_reason` collapses the two error cases into one `error` value.
+Capacity is a pre-commit admission outcome
+(`tardigrade_websocket_upgrades_total{outcome="capacity"}`), not a close
+reason, because no tunnel exists to close. The close path writes exactly one access-log record with duration and
 directional byte counts.
 
 ## Reload, shutdown, and observability
@@ -235,10 +238,19 @@ The worker and reactor surfaces are intentionally separate:
 - `tardigrade_websocket_reactor_threads`, `_tunnels`,
   `_thread_tunnels_max`, `_handoffs_total`, and `_wakeups_total` show shard
   capacity, balance, handoffs, and idle behavior.
+- `tardigrade_websocket_reactor_rejected_total`, `_queue_depth`,
+  `_queue_high_water` and `tardigrade_websocket_tunnel_slots_high_water`
+  expose shard admission pressure and peak slot use (#829).
 - Existing `tardigrade_websocket_tunnels_active`, byte, duration, upgrade, and
   close-reason metrics show the protocol lifecycle.
 
 ## Required race and failure behavior
+
+Deterministic coverage (#829): `http.tunnel` unit tests (preserve, drain,
+earlier-of reload/shutdown, idle, lifetime), `http.tunnel_reactor` tests
+(mixed preserve/drain tunnels across repeated reloads, wake-driven idle close,
+shutdown with handoffs in flight, handoff rollback), and
+`gateway_proxy_runtime` tests for per-location override resolution.
 
 | Scenario | Required outcome |
 | --- | --- |

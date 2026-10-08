@@ -1160,12 +1160,7 @@ pub fn handleLocationWebSocketProxyPass(
             // Reload behavior is fixed here, at admission, from this request's
             // own configuration: a later reload can end the tunnel (drain) but
             // never change which policy or timeout applies to it.
-            const reload_policy = websocket.reload orelse cfg.proxy_websocket_reload;
-            const reload_timeout_ms = websocket.reload_timeout_ms orelse cfg.proxy_websocket_reload_timeout_ms;
-            const reload_drain: ?http.tunnel.ReloadDrain = switch (reload_policy) {
-                .preserve => null,
-                .drain => if (ctx.config_superseded_at) |stamp| .{ .superseded_at_ms = stamp, .timeout_ms = reload_timeout_ms } else null,
-            };
+            const reload_drain = websocketReloadDrain(websocket, cfg, ctx.config_superseded_at);
             const tunnel_opts = http.tunnel.Options{
                 .idle_timeout_ms = websocket.idle_timeout_ms,
                 .max_lifetime_ms = websocket.max_lifetime_ms,
@@ -1636,6 +1631,47 @@ const ProductionBufferedProxyAttemptExecutor = struct {
         result.deinit(self.allocator);
     }
 };
+
+/// The reload behavior a tunnel keeps for life, resolved at admission: the
+/// location's own `proxy_websocket_reload*` override, else the admission
+/// configuration's top-level value. `preserve` yields null (never ended by a
+/// reload).
+fn websocketReloadDrain(
+    websocket: http.location_router.WebSocketProxy,
+    cfg: *const edge_config.EdgeConfig,
+    superseded_at: ?*const std.atomic.Value(u64),
+) ?http.tunnel.ReloadDrain {
+    const policy = websocket.reload orelse cfg.proxy_websocket_reload;
+    const timeout_ms = websocket.reload_timeout_ms orelse cfg.proxy_websocket_reload_timeout_ms;
+    return switch (policy) {
+        .preserve => null,
+        .drain => if (superseded_at) |stamp| .{ .superseded_at_ms = stamp, .timeout_ms = timeout_ms } else null,
+    };
+}
+
+test "websocket reload policy resolves per location from the admission config (#829)" {
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.proxy_websocket_reload = .drain;
+    cfg.proxy_websocket_reload_timeout_ms = 7_000;
+    var stamp = std.atomic.Value(u64).init(0);
+
+    // Inherits the top-level drain policy and timeout.
+    const inherited = websocketReloadDrain(.{}, &cfg, &stamp).?;
+    try std.testing.expectEqual(@as(u32, 7_000), inherited.timeout_ms);
+    try std.testing.expect(inherited.superseded_at_ms == &stamp);
+
+    // Per-location preserve beats a top-level drain; per-location timeout wins.
+    try std.testing.expect(websocketReloadDrain(.{ .reload = .preserve }, &cfg, &stamp) == null);
+    try std.testing.expectEqual(@as(u32, 250), websocketReloadDrain(.{ .reload_timeout_ms = 250 }, &cfg, &stamp).?.timeout_ms);
+
+    // Per-location drain beats a top-level preserve.
+    cfg.proxy_websocket_reload = .preserve;
+    try std.testing.expect(websocketReloadDrain(.{}, &cfg, &stamp) == null);
+    try std.testing.expect(websocketReloadDrain(.{ .reload = .drain }, &cfg, &stamp) != null);
+
+    // No supersession stamp (no config lease): nothing to drain on.
+    try std.testing.expect(websocketReloadDrain(.{ .reload = .drain }, &cfg, null) == null);
+}
 
 test "ProductionBufferedProxyAttemptExecutor keeps absolute target failures out of passive health" {
     const allocator = std.testing.allocator;

@@ -24083,7 +24083,7 @@ test "proxy_websocket soak: repeated connect/close settles tunnels and connectio
         defer metrics.deinit();
         const active = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 0;
         var closed: u64 = 0;
-        inline for (.{ "client", "upstream", "idle", "lifetime", "shutdown", "error" }) |reason| {
+        inline for (.{ "client", "upstream", "idle", "lifetime", "shutdown", "reload", "client_error", "upstream_error" }) |reason| {
             closed += wsMetricValue(metrics.body, "tardigrade_websocket_tunnel_closes_total", "reason=\"" ++ reason ++ "\"");
         }
         const connections = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0;

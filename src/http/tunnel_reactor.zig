@@ -965,6 +965,83 @@ test "reactor drains tunnels for the shutdown window, then stopAndJoin returns (
     _ = std.c.close(u[1]);
 }
 
+test "reactor applies each tunnel's admission reload policy across repeated reloads (#829)" {
+    var reactor: Reactor = undefined;
+    try reactor.start(std.testing.allocator, .{ .threads = 2, .shutdown_requested = neverShutdown });
+    defer reactor.deinit();
+    var drain_done = std.atomic.Value(u32).init(0);
+    var preserve_done = std.atomic.Value(u32).init(0);
+    var drain_reason = std.atomic.Value(u8).init(0);
+    var preserve_reason = std.atomic.Value(u8).init(0);
+    var freed = std.atomic.Value(u32).init(0);
+    var superseded = std.atomic.Value(u64).init(0);
+    const drain_opts = tunnel.Options{
+        .idle_timeout_ms = 60_000,
+        .shutdown_requested = neverShutdown,
+        .reload_drain = .{ .superseded_at_ms = &superseded, .timeout_ms = 80 },
+        .poll_interval_ms = 0,
+    };
+    // A preserve tunnel carries no ReloadDrain, so no stamp can end it.
+    const preserve_opts = tunnel.Options{ .idle_timeout_ms = 60_000, .shutdown_requested = neverShutdown, .poll_interval_ms = 0 };
+    var drainers: [3]PeerPair = undefined;
+    for (&drainers) |*p| p.* = try submitTestTunnel(&reactor, drain_opts, &drain_done, &drain_reason, &freed);
+    const keeper = try submitTestTunnel(&reactor, preserve_opts, &preserve_done, &preserve_reason, &freed);
+    defer for (drainers) |p| {
+        _ = std.c.close(p.client_peer);
+        _ = std.c.close(p.upstream_peer);
+    };
+    defer _ = std.c.close(keeper.client_peer);
+    defer _ = std.c.close(keeper.upstream_peer);
+
+    const first_reload = event_loop.monotonicMs();
+    superseded.store(first_reload, .release);
+    reactor.wakeAll();
+    // Repeated reloads and wakeups must not move the fixed deadline.
+    compat.sleepNs(30 * std.time.ns_per_ms);
+    reactor.wakeAll();
+    reactor.wakeAll();
+    try waitFor(&drain_done, 3, 3_000);
+    const closed_after = event_loop.monotonicMs() - first_reload;
+    try std.testing.expect(closed_after >= 80);
+    try std.testing.expect(closed_after < 1_500);
+    try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.reload), drain_reason.load(.acquire));
+
+    // The preserve tunnel is untouched and still relays.
+    try std.testing.expectEqual(@as(u32, 0), preserve_done.load(.acquire));
+    try testWriteAll(keeper.client_peer, "alive");
+    var got: [5]u8 = undefined;
+    try testReadExact(keeper.upstream_peer, &got);
+    try std.testing.expectEqualStrings("alive", &got);
+    try std.testing.expectEqual(@as(u32, 1), reactor.snapshot().tunnels);
+}
+
+test "shutdown arriving with tunnels still queued closes every one exactly once (#829)" {
+    test_shutdown_flag.store(false, .release);
+    defer test_shutdown_flag.store(false, .release);
+    var reactor: Reactor = undefined;
+    try reactor.start(std.testing.allocator, .{ .threads = 2, .shutdown_requested = testShutdown });
+    defer reactor.deinit();
+    var done = std.atomic.Value(u32).init(0);
+    var reason = std.atomic.Value(u8).init(0);
+    var freed = std.atomic.Value(u32).init(0);
+    const opts = tunnel.Options{ .idle_timeout_ms = 60_000, .drain_timeout_ms = 40, .shutdown_requested = testShutdown, .poll_interval_ms = 0 };
+    // Shutdown is already requested while handoffs are in flight.
+    test_shutdown_flag.store(true, .release);
+    var peers: [8]PeerPair = undefined;
+    for (&peers) |*p| p.* = try submitTestTunnel(&reactor, opts, &done, &reason, &freed);
+    defer for (peers) |p| {
+        _ = std.c.close(p.client_peer);
+        _ = std.c.close(p.upstream_peer);
+    };
+    reactor.stopAndJoin();
+    try std.testing.expectEqual(@as(u32, 8), done.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 8), freed.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.shutdown), reason.load(.acquire));
+    const snap = reactor.snapshot();
+    try std.testing.expectEqual(@as(u32, 0), snap.tunnels);
+    try std.testing.expectEqual(@as(u32, 0), snap.queue_depth);
+}
+
 test "reactor keeps one buffer per direction for a stalled reader (#818)" {
     var reactor: Reactor = undefined;
     try reactor.start(std.testing.allocator, .{ .threads = 1, .shutdown_requested = neverShutdown });

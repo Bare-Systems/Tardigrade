@@ -5,6 +5,7 @@
 //! stream handler from ever acquiring the TCP/TLS writer directly.
 const std = @import("std");
 const compat = @import("zig_compat");
+const http2_frame = @import("http2_frame.zig");
 
 pub const default_max_queued_bytes: usize = 256 * 1024;
 
@@ -15,17 +16,8 @@ pub const Scheduler = struct {
     allocator: std.mem.Allocator,
     max_queued_bytes: usize,
     mutex: compat.Mutex = .{},
-    /// Serializes the header+payload pair emitted by `http2_frame.writeFrame`.
-    /// It intentionally spans the two Writer calls so independent producers
-    /// cannot splice a second frame header into the first frame's payload.
-    construction_mutex: compat.Mutex = .{},
-    construction_open: bool = false,
     entries: std.ArrayList(Entry) = .empty,
     active: ?Active = null,
-    /// The connection runtime's frame serializer feeds this a frame header
-    /// followed by its payload. No producer uses this writer directly.
-    partial_frame: std.ArrayList(u8) = .empty,
-    partial_reserved_bytes: usize = 0,
     queued_bytes: usize = 0,
     wake_read: std.posix.fd_t = -1,
     wake_write: std.posix.fd_t = -1,
@@ -51,7 +43,6 @@ pub const Scheduler = struct {
         for (self.entries.items) |entry| self.allocator.free(entry.bytes);
         if (self.active) |active| self.allocator.free(active.entry.bytes);
         self.entries.deinit(self.allocator);
-        self.partial_frame.deinit(self.allocator);
         self.mutex.unlock();
         if (self.wake_read >= 0) _ = std.c.close(self.wake_read);
         if (self.wake_write >= 0) _ = std.c.close(self.wake_write);
@@ -81,17 +72,20 @@ pub const Scheduler = struct {
         }
 
         pub fn writeAll(self: Writer, bytes: []const u8) !void {
-            const begins_frame = !self.scheduler.construction_open;
-            if (begins_frame) self.scheduler.construction_mutex.lock();
-            self.scheduler.acceptSerializedBytes(bytes) catch |err| {
-                if (!self.scheduler.construction_open) self.scheduler.construction_mutex.unlock();
-                return err;
-            };
-            if (!self.scheduler.construction_open) self.scheduler.construction_mutex.unlock();
+            _ = self;
+            _ = bytes;
+            return error.InvalidFrame;
         }
 
         pub fn writeByte(self: Writer, byte: u8) !void {
             try self.writeAll(&.{byte});
+        }
+
+        /// `http2_frame.writeFrame` detects this method and hands an entire
+        /// frame to the scheduler in one operation.  A frame can therefore
+        /// never be interleaved with another producer's header or payload.
+        pub fn enqueueFrame(self: Writer, typ: http2_frame.Type, flags: u8, stream_id: u31, payload: []const u8) Error!void {
+            return self.scheduler.enqueueFrame(typ, flags, stream_id, payload);
         }
     };
 
@@ -104,92 +98,41 @@ pub const Scheduler = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (frame.len > self.max_queued_bytes -| self.queued_bytes) return error.QueueFull;
         const owned = try self.allocator.dupe(u8, frame);
-        self.entries.append(self.allocator, .{ .bytes = owned }) catch |err| {
-            self.allocator.free(owned);
-            return err;
-        };
-        self.queued_bytes += owned.len;
-        if (!self.wake_pending.load(.acquire)) {
-            self.signalLocked() catch |err| {
-                const removed = self.entries.pop().?;
-                self.queued_bytes -= removed.bytes.len;
-                self.allocator.free(removed.bytes);
-                return err;
-            };
-            self.wake_pending.store(true, .release);
-        }
+        errdefer self.allocator.free(owned);
+        try self.enqueueOwnedLocked(owned);
     }
 
-    fn acceptSerializedBytes(self: *Scheduler, bytes: []const u8) Error!void {
+    /// Atomically copies a complete frame while holding the queue mutex. This
+    /// is intentionally the only scheduled HTTP/2 serialization path.
+    pub fn enqueueFrame(self: *Scheduler, typ: http2_frame.Type, flags: u8, stream_id: u31, payload: []const u8) Error!void {
+        if (payload.len > 0xFF_FF_FF) return error.InvalidFrame;
+        const len = payload.len + 9;
         self.mutex.lock();
         defer self.mutex.unlock();
-        // The H2 serializers call writeAll for the 9-byte header and then
-        // for its payload. Once the header arrives reserve the *whole* frame
-        // before accepting any payload, making capacity refusal transactional.
-        if (self.partial_frame.items.len == 0 and bytes.len >= 9) {
-            const declared = (@as(usize, bytes[0]) << 16) |
-                (@as(usize, bytes[1]) << 8) |
-                @as(usize, bytes[2]);
-            const frame_len = declared + 9;
-            if (frame_len > self.max_queued_bytes -| self.queued_bytes) return error.QueueFull;
-            self.partial_reserved_bytes = frame_len;
-            self.queued_bytes += frame_len;
-            self.construction_open = true;
-        } else if (self.partial_frame.items.len == 0 and bytes.len > self.max_queued_bytes -| self.queued_bytes) {
-            return error.QueueFull;
-        }
-        self.partial_frame.appendSlice(self.allocator, bytes) catch |err| {
-            if (self.partial_reserved_bytes > 0) self.queued_bytes -= self.partial_reserved_bytes;
-            self.partial_reserved_bytes = 0;
-            self.construction_open = false;
+        if (len > self.max_queued_bytes -| self.queued_bytes) return error.QueueFull;
+        const owned = try self.allocator.alloc(u8, len);
+        errdefer self.allocator.free(owned);
+        owned[0] = @intCast((payload.len >> 16) & 0xff);
+        owned[1] = @intCast((payload.len >> 8) & 0xff);
+        owned[2] = @intCast(payload.len & 0xff);
+        owned[3] = @intFromEnum(typ);
+        owned[4] = flags;
+        std.mem.writeInt(u32, owned[5..9], @as(u32, stream_id) & 0x7fff_ffff, .big);
+        @memcpy(owned[9..], payload);
+        try self.enqueueOwnedLocked(owned);
+    }
+
+    fn enqueueOwnedLocked(self: *Scheduler, owned: []u8) Error!void {
+        if (owned.len > self.max_queued_bytes -| self.queued_bytes) return error.QueueFull;
+        self.entries.append(self.allocator, .{ .bytes = owned }) catch |err| return err;
+        self.queued_bytes += owned.len;
+        if (!self.wake_pending.load(.acquire)) self.signalLocked() catch |err| {
+            const removed = self.entries.pop().?;
+            self.queued_bytes -= removed.bytes.len;
             return err;
         };
-        while (self.partial_frame.items.len >= 9) {
-            const declared = (@as(usize, self.partial_frame.items[0]) << 16) |
-                (@as(usize, self.partial_frame.items[1]) << 8) |
-                @as(usize, self.partial_frame.items[2]);
-            const frame_len = declared + 9;
-            if (self.partial_frame.items.len < frame_len) return;
-            if (self.partial_reserved_bytes == 0) {
-                if (frame_len > self.max_queued_bytes -| self.queued_bytes) {
-                    self.partial_frame.clearRetainingCapacity();
-                    return error.QueueFull;
-                }
-                self.queued_bytes += frame_len;
-            }
-            if (frame_len != self.partial_reserved_bytes and self.partial_reserved_bytes != 0) {
-                self.queued_bytes -= self.partial_reserved_bytes;
-                self.partial_reserved_bytes = 0;
-                self.construction_open = false;
-                self.partial_frame.clearRetainingCapacity();
-                return error.InvalidFrame;
-            }
-            const owned = try self.allocator.dupe(u8, self.partial_frame.items[0..frame_len]);
-            self.entries.append(self.allocator, .{ .bytes = owned }) catch |err| {
-                self.allocator.free(owned);
-                self.queued_bytes -= frame_len;
-                self.partial_reserved_bytes = 0;
-                self.construction_open = false;
-                self.partial_frame.clearRetainingCapacity();
-                return err;
-            };
-            const rest = self.partial_frame.items[frame_len..];
-            std.mem.copyForwards(u8, self.partial_frame.items[0..rest.len], rest);
-            self.partial_frame.items.len = rest.len;
-            self.partial_reserved_bytes = 0;
-            self.construction_open = false;
-            if (!self.wake_pending.load(.acquire)) {
-                self.signalLocked() catch |err| {
-                    const removed = self.entries.pop().?;
-                    self.queued_bytes -= removed.bytes.len;
-                    self.allocator.free(removed.bytes);
-                    return err;
-                };
-                self.wake_pending.store(true, .release);
-            }
-        }
+        self.wake_pending.store(true, .release);
     }
 
     /// The sole connection runtime calls this. A temporary `WouldBlock` keeps
@@ -270,13 +213,21 @@ test "scheduler bounds queued bytes" {
     try std.testing.expectError(error.QueueFull, scheduler.enqueue(&frame));
 }
 
-test "serializer capacity refusal leaves no partial frame state" {
+test "atomic frame enqueue refuses capacity without queue mutation" {
     var scheduler = try Scheduler.init(std.testing.allocator, 9);
     defer scheduler.deinit();
-    const header = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 1 };
-    try std.testing.expectError(error.QueueFull, scheduler.writer().writeAll(&header));
-    try std.testing.expectEqual(@as(usize, 0), scheduler.partial_frame.items.len);
+    try std.testing.expectError(error.QueueFull, scheduler.writer().enqueueFrame(.data, 0, 1, &.{1}));
     try std.testing.expectEqual(@as(usize, 0), scheduler.queued_bytes);
+    try std.testing.expect(!scheduler.hasPendingOutput());
+}
+
+test "atomic frame enqueue rolls back on allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var scheduler = try Scheduler.init(failing.allocator(), 64);
+    defer scheduler.deinit();
+    try std.testing.expectError(error.OutOfMemory, scheduler.enqueueFrame(.data, 0, 1, &.{ 1, 2 }));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.queued_bytes);
+    try std.testing.expect(!scheduler.hasPendingOutput());
 }
 
 test "scheduler retains and resumes a frame after temporary backpressure" {
@@ -284,7 +235,7 @@ test "scheduler retains and resumes a frame after temporary backpressure" {
         blocked: bool = true,
         out: std.Io.Writer.Allocating,
 
-        fn write(self: *@This(), bytes: []const u8) error{WouldBlock}!usize {
+        fn write(self: *@This(), bytes: []const u8) anyerror!usize {
             if (self.blocked) return error.WouldBlock;
             try self.out.writer.writeAll(bytes);
             return bytes.len;

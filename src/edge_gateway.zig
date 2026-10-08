@@ -2265,21 +2265,24 @@ const WaitingEncryptedHttpConnection = struct {
 
     fn waitFor(self: *WaitingEncryptedHttpConnection, requested: http.event_loop.Interest, timeout_ms: u32) !void {
         const readiness = self.inner.readiness();
-        const interest = switch (http.downstream_connection.encryptedWaitForInterest(readiness, requested)) {
+        var interest = switch (http.downstream_connection.encryptedWaitForInterest(readiness, requested)) {
             .ready_now => return,
             .socket => |socket_interest| socket_interest,
             .retry_at_ms => return error.WouldBlock,
             .stalled => return error.WouldBlock,
         };
+        if (self.h2_outbound) |outbound| {
+            if (outbound.hasPendingOutput()) interest.write = true;
+        }
 
         var events: i16 = std.posix.POLL.ERR | std.posix.POLL.HUP;
         if (interest.read) events |= std.posix.POLL.IN;
         if (interest.write) events |= std.posix.POLL.OUT;
-        var fds = [_]std.posix.pollfd{.{
+        var fds = [_]std.posix.pollfd{ .{
             .fd = self.inner.rawFd(),
             .events = events,
             .revents = 0,
-        }, .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 }};
+        }, .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 } };
         var fd_count: usize = 1;
         if (self.h2_outbound) |outbound| {
             fds[1].fd = outbound.wakeFd();
@@ -2291,7 +2294,7 @@ const WaitingEncryptedHttpConnection = struct {
             @intCast(@min(timeout_ms, @as(u32, @intCast(std.math.maxInt(i32)))));
         const ready = try std.posix.poll(fds[0..fd_count], bounded_ms);
         if (ready == 0) return error.WouldBlock;
-        if (fd_count == 2 and fds[1].revents != 0) {
+        if (fd_count == 2 and (fds[1].revents != 0 or (fds[0].revents & std.posix.POLL.OUT) != 0)) {
             const outbound = self.h2_outbound orelse return error.ConnectionClosed;
             // We are already in the poll owner. Use the non-waiting record
             // writer here to avoid recursively re-entering this wait path;
@@ -3019,6 +3022,8 @@ const Http2FlushResult = enum { complete, blocked };
 /// WINDOW_UPDATE handler to resume a blocked response, without ever racing
 /// with or dropping frames belonging to other streams.
 fn flushHttp2PendingResponse(
+    conn: anytype,
+    outbound: ?*http.h2_outbound_scheduler.Scheduler,
     writer: anytype,
     stream_id: u31,
     resp: *PendingHttp2Response,
@@ -3027,7 +3032,7 @@ fn flushHttp2PendingResponse(
 ) !Http2FlushResult {
     const max_data_frame: usize = HTTP2_MAX_FRAME_SIZE;
     if (resp.body.len == 0) {
-        try http.http2_frame.writeFrame(writer, .data, http.http2_frame.Flags.END_STREAM, stream_id, &.{});
+        try h2WriteDataFrame(conn, outbound, writer, http.http2_frame.Flags.END_STREAM, stream_id, &.{});
         return .complete;
     }
     while (resp.offset < resp.body.len) {
@@ -3037,7 +3042,7 @@ fn flushHttp2PendingResponse(
         const n = @min(@min(max_data_frame, remaining_window), resp.body.len - resp.offset);
         const end = resp.offset + n;
         const flags: u8 = if (end == resp.body.len) http.http2_frame.Flags.END_STREAM else 0;
-        try http.http2_frame.writeFrame(writer, .data, flags, stream_id, resp.body[resp.offset..end]);
+        try h2WriteDataFrame(conn, outbound, writer, flags, stream_id, resp.body[resp.offset..end]);
         conn_send_window.* -= @intCast(n);
         stream_send_window.* -= @intCast(n);
         resp.offset = end;
@@ -3045,10 +3050,24 @@ fn flushHttp2PendingResponse(
     return .complete;
 }
 
+fn h2WriteDataFrame(conn: anytype, outbound: ?*http.h2_outbound_scheduler.Scheduler, writer: anytype, flags: u8, stream_id: u31, payload: []const u8) !void {
+    http.http2_frame.writeFrame(writer, .data, flags, stream_id, payload) catch |err| {
+        if (outbound) |queue| {
+            if (std.mem.eql(u8, @errorName(err), "QueueFull")) {
+                try queue.flush(conn.writer());
+                return http.http2_frame.writeFrame(writer, .data, flags, stream_id, payload);
+            }
+        }
+        return err;
+    };
+}
+
 /// Resume every response parked on send-credit exhaustion after new credit
 /// arrives (connection- or stream-level WINDOW_UPDATE). Called only from the
 /// central frame loop, never from a response writer.
 fn h2FlushPendingHttp2Responses(
+    conn: anytype,
+    outbound: ?*http.h2_outbound_scheduler.Scheduler,
     writer: anytype,
     allocator: std.mem.Allocator,
     state: *GatewayState,
@@ -3069,7 +3088,7 @@ fn h2FlushPendingHttp2Responses(
             try finished.append(sid);
             continue;
         };
-        const result = try flushHttp2PendingResponse(writer, sid, resp, conn_send_window, stream_window_ptr);
+        const result = try flushHttp2PendingResponse(conn, outbound, writer, sid, resp, conn_send_window, stream_window_ptr);
         if (result == .complete) {
             state.metricsRecord(resp.status_code);
             resp.deinit(allocator);
@@ -3086,6 +3105,7 @@ fn h2FlushPendingHttp2Responses(
 fn h2DispatchReadyStreamsWithWriter(
     conn: anytype,
     writer: anytype,
+    outbound: ?*http.h2_outbound_scheduler.Scheduler,
     allocator: std.mem.Allocator,
     state: *GatewayState,
     cfg: *const edge_config.EdgeConfig,
@@ -3137,7 +3157,7 @@ fn h2DispatchReadyStreamsWithWriter(
         // The accept/reject decision for a transport-early stream is recorded
         // by `respondHttp2Stream`, once routing has had its say (#761).
 
-        try respondHttp2Stream(conn, writer, allocator, state, cfg, sid, ps, next_server_stream_id, streams, pending_responses, conn_send_window, connection_ip);
+        try respondHttp2Stream(conn, writer, outbound, allocator, state, cfg, sid, ps, next_server_stream_id, streams, pending_responses, conn_send_window, connection_ip);
         ps.dispatch_count += 1;
         if (pending.fetchRemove(sid)) |removed| {
             var tmp = removed.value;
@@ -3168,7 +3188,7 @@ fn h2DispatchReadyStreams(
     buffered_request_bytes: *usize,
     connection_ip: []const u8,
 ) !void {
-    return h2DispatchReadyStreamsWithWriter(conn, conn.writer(), allocator, state, cfg, pending, streams, pending_responses, ready_streams, next_server_stream_id, conn_send_window, buffered_request_bytes, connection_ip);
+    return h2DispatchReadyStreamsWithWriter(conn, conn.writer(), null, allocator, state, cfg, pending, streams, pending_responses, ready_streams, next_server_stream_id, conn_send_window, buffered_request_bytes, connection_ip);
 }
 
 fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, connection_ip: []const u8) !void {
@@ -3241,6 +3261,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
         try h2DispatchReadyStreamsWithWriter(
             conn,
             outbound_writer,
+            &outbound,
             allocator,
             state,
             cfg,
@@ -3259,6 +3280,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             try h2DispatchReadyStreamsWithWriter(
                 conn,
                 outbound_writer,
+                &outbound,
                 allocator,
                 state,
                 cfg,
@@ -3554,7 +3576,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // can unblock a parked response; this is the only place new
                 // send credit becomes available, and it runs on the central
                 // frame loop rather than a second reader.
-                try h2FlushPendingHttp2Responses(outbound_writer, allocator, state, &pending_responses, &streams, &conn_send_window);
+                try h2FlushPendingHttp2Responses(conn, &outbound, outbound_writer, allocator, state, &pending_responses, &streams, &conn_send_window);
             },
             .rst_stream => {
                 if (frame.stream_id == 0) {
@@ -3617,6 +3639,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
         try h2DispatchReadyStreamsWithWriter(
             conn,
             outbound_writer,
+            &outbound,
             allocator,
             state,
             cfg,
@@ -3656,6 +3679,7 @@ fn lowercaseName(allocator: std.mem.Allocator, owned: *std.array_list.Managed([]
 fn respondHttp2Stream(
     conn: anytype,
     writer: anytype,
+    outbound: ?*http.h2_outbound_scheduler.Scheduler,
     allocator: std.mem.Allocator,
     state: *GatewayState,
     cfg: *const edge_config.EdgeConfig,
@@ -3907,7 +3931,7 @@ fn respondHttp2Stream(
     errdefer resp.deinit(allocator);
 
     const stream_window_ptr = if (streams.getPtr(stream_id)) |s| &s.send_window else return error.InvalidHttp2StreamId;
-    const result = try flushHttp2PendingResponse(writer, stream_id, &resp, conn_send_window, stream_window_ptr);
+    const result = try flushHttp2PendingResponse(conn, outbound, writer, stream_id, &resp, conn_send_window, stream_window_ptr);
     if (result == .complete) {
         resp.deinit(allocator);
         state.metricsRecord(status_code);

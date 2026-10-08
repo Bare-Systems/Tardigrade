@@ -342,7 +342,7 @@ the table test `proxy_pass URI rewriting semantics table (#800)` in
 |---|---|---|---|---|
 | `/mcp` (prefix) | `http://up/mcp` | `/mcp` | `/mcp` | same |
 | `/mcp` (prefix) | `http://up/mcp` | `/mcp/x` | `/mcp/x` | same |
-| `/mcp` (prefix) | `http://up/mcp` | `/mcp//x` | `/mcp/x` | `/mcp//x` (merge_slashes) |
+| `/mcp` (prefix) | `http://up/mcp` | `/mcp//x` | `/mcp/x` | same (default `merge_slashes on`) |
 | `/mcp` (prefix) | `http://up/mcp` | `/mcpfoo` | `/mcp/foo` | `/mcpfoo` |
 | `/v/` (prefix) | `http://up/v1` | `/v/x` | `/v1/x` | `/v1x` |
 | `/api/` (prefix) | `http://up:1` (no URI) | `/api/messages` | `/messages` | `/api/messages` |
@@ -366,9 +366,11 @@ Decisions for the divergences:
    is appended to the `proxy_pass` URI (no prefix is stripped). nginx rejects
    this at config load; do not rely on it for portability.
 
-Behavior that is also intentionally friendlier than nginx: leading slashes of
-the remaining suffix are collapsed, and a `proxy_pass` URI replaces the
-matched prefix with a segment join (`/v/x` -> `/v1/x`, not `/v1x`).
+Behavior that is intentionally friendlier than nginx: a `proxy_pass` URI
+replaces the matched prefix with a segment join (`/v/x` -> `/v1/x`, not
+`/v1x`). Collapsing repeated leading slashes in the suffix (`/mcp//x` ->
+`/mcp/x`) matches nginx's default `merge_slashes on`; nginx with
+`merge_slashes off` would differ.
 
 Implementation: `proxySuffixPathForLocation()` in
 `src/gateway_proxy_runtime.zig`, `combineProxyTarget()` in

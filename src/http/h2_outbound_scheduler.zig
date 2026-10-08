@@ -15,6 +15,11 @@ pub const Scheduler = struct {
     allocator: std.mem.Allocator,
     max_queued_bytes: usize,
     mutex: compat.Mutex = .{},
+    /// Serializes the header+payload pair emitted by `http2_frame.writeFrame`.
+    /// It intentionally spans the two Writer calls so independent producers
+    /// cannot splice a second frame header into the first frame's payload.
+    construction_mutex: compat.Mutex = .{},
+    construction_open: bool = false,
     entries: std.ArrayList(Entry) = .empty,
     active: ?Active = null,
     /// The connection runtime's frame serializer feeds this a frame header
@@ -25,6 +30,7 @@ pub const Scheduler = struct {
     wake_read: std.posix.fd_t = -1,
     wake_write: std.posix.fd_t = -1,
     wake_pending: std.atomic.Value(bool) = .init(false),
+    draining: std.atomic.Value(bool) = .init(false),
 
     pub const Error = error{ QueueFull, WakeFailed, InvalidFrame } || std.mem.Allocator.Error;
 
@@ -75,7 +81,13 @@ pub const Scheduler = struct {
         }
 
         pub fn writeAll(self: Writer, bytes: []const u8) !void {
-            try self.scheduler.acceptSerializedBytes(bytes);
+            const begins_frame = !self.scheduler.construction_open;
+            if (begins_frame) self.scheduler.construction_mutex.lock();
+            self.scheduler.acceptSerializedBytes(bytes) catch |err| {
+                if (!self.scheduler.construction_open) self.scheduler.construction_mutex.unlock();
+                return err;
+            };
+            if (!self.scheduler.construction_open) self.scheduler.construction_mutex.unlock();
         }
 
         pub fn writeByte(self: Writer, byte: u8) !void {
@@ -124,10 +136,16 @@ pub const Scheduler = struct {
             if (frame_len > self.max_queued_bytes -| self.queued_bytes) return error.QueueFull;
             self.partial_reserved_bytes = frame_len;
             self.queued_bytes += frame_len;
+            self.construction_open = true;
         } else if (self.partial_frame.items.len == 0 and bytes.len > self.max_queued_bytes -| self.queued_bytes) {
             return error.QueueFull;
         }
-        try self.partial_frame.appendSlice(self.allocator, bytes);
+        self.partial_frame.appendSlice(self.allocator, bytes) catch |err| {
+            if (self.partial_reserved_bytes > 0) self.queued_bytes -= self.partial_reserved_bytes;
+            self.partial_reserved_bytes = 0;
+            self.construction_open = false;
+            return err;
+        };
         while (self.partial_frame.items.len >= 9) {
             const declared = (@as(usize, self.partial_frame.items[0]) << 16) |
                 (@as(usize, self.partial_frame.items[1]) << 8) |
@@ -144,6 +162,7 @@ pub const Scheduler = struct {
             if (frame_len != self.partial_reserved_bytes and self.partial_reserved_bytes != 0) {
                 self.queued_bytes -= self.partial_reserved_bytes;
                 self.partial_reserved_bytes = 0;
+                self.construction_open = false;
                 self.partial_frame.clearRetainingCapacity();
                 return error.InvalidFrame;
             }
@@ -152,6 +171,7 @@ pub const Scheduler = struct {
                 self.allocator.free(owned);
                 self.queued_bytes -= frame_len;
                 self.partial_reserved_bytes = 0;
+                self.construction_open = false;
                 self.partial_frame.clearRetainingCapacity();
                 return err;
             };
@@ -159,6 +179,7 @@ pub const Scheduler = struct {
             std.mem.copyForwards(u8, self.partial_frame.items[0..rest.len], rest);
             self.partial_frame.items.len = rest.len;
             self.partial_reserved_bytes = 0;
+            self.construction_open = false;
             if (!self.wake_pending.load(.acquire)) {
                 self.signalLocked() catch |err| {
                     const removed = self.entries.pop().?;
@@ -175,6 +196,8 @@ pub const Scheduler = struct {
     /// the active frame and its cursor owned by the scheduler for a later
     /// writable wake; only a complete frame is ever released.
     pub fn flush(self: *Scheduler, output: anytype) !void {
+        if (self.draining.swap(true, .acq_rel)) return;
+        defer self.draining.store(false, .release);
         while (true) {
             self.mutex.lock();
             self.drainWakeLocked();
@@ -187,9 +210,10 @@ pub const Scheduler = struct {
             const active = &self.active.?;
             const bytes = active.entry.bytes[active.offset..];
             self.mutex.unlock();
-            const n = output.write(bytes) catch |err| switch (err) {
-                error.WouldBlock => return,
-                else => return err,
+            const n = output.write(bytes) catch |err| {
+                const any_err: anyerror = err;
+                if (any_err == error.WouldBlock) return;
+                return err;
             };
             if (n == 0) return;
             self.mutex.lock();

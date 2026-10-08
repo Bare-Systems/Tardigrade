@@ -146,6 +146,18 @@ const Shard = struct {
         defer pfds.deinit(allocator);
         var seen_shutdown = false;
 
+        if (builtin.is_test) if (self.reactor.adopt_gate) |gate| {
+            // Hold the first inbox drain until the test opens the gate, or a
+            // stop is requested (so a failed test cannot hang teardown).
+            while (!gate.load(.acquire)) {
+                self.mutex.lock();
+                const stop_now = self.stopping;
+                self.mutex.unlock();
+                if (stop_now) break;
+                compat.sleepNs(std.time.ns_per_ms);
+            }
+        };
+
         while (true) {
             // Adopt handed-off tunnels.
             self.mutex.lock();
@@ -249,6 +261,9 @@ pub const Reactor = struct {
     opts: Options,
     shards: []Shard,
     wake_writer: WakeWriter,
+    /// Test-only: shard threads do not adopt handoffs (or poll) until this
+    /// reads true, so a test can hold accepted jobs in the inbox.
+    adopt_gate: ?*const std.atomic.Value(bool) = null,
     handoffs_total: std.atomic.Value(u64) = .init(0),
     stopped: std.atomic.Value(bool) = .init(false),
     /// Serializes admission decisions with the stop transition.
@@ -266,8 +281,12 @@ pub const Reactor = struct {
     }
 
     fn startWithWakeWriter(self: *Reactor, allocator: std.mem.Allocator, opts: Options, wake_writer: WakeWriter) !void {
+        try self.startWithGate(allocator, opts, wake_writer, null);
+    }
+
+    fn startWithGate(self: *Reactor, allocator: std.mem.Allocator, opts: Options, wake_writer: WakeWriter, adopt_gate: ?*const std.atomic.Value(bool)) !void {
         std.debug.assert(opts.threads > 0);
-        self.* = .{ .allocator = allocator, .opts = opts, .shards = try allocator.alloc(Shard, opts.threads), .wake_writer = wake_writer };
+        self.* = .{ .allocator = allocator, .opts = opts, .shards = try allocator.alloc(Shard, opts.threads), .wake_writer = wake_writer, .adopt_gate = adopt_gate };
         var made: usize = 0;
         errdefer {
             for (self.shards[0..made]) |*shard| {
@@ -1015,18 +1034,17 @@ test "reactor applies each tunnel's admission reload policy across repeated relo
     try std.testing.expectEqual(@as(u32, 1), reactor.snapshot().tunnels);
 }
 
-fn suppressedWakeWriter(_: std.posix.fd_t) WakeWriteResult {
-    return .already_pending;
-}
-
 test "shutdown arriving with accepted handoffs still queued closes every one exactly once (#829)" {
     test_shutdown_flag.store(false, .release);
     defer test_shutdown_flag.store(false, .release);
+    var allow_adopt = std.atomic.Value(bool).init(false);
     var reactor: Reactor = undefined;
-    // The suppressed writer keeps shards asleep, so accepted jobs stay in the
-    // inbox until we deliberately wake them.
-    try reactor.startWithWakeWriter(std.testing.allocator, .{ .threads = 2, .shutdown_requested = testShutdown }, suppressedWakeWriter);
+    // The gate stops shard threads from draining their inbox, so accepted
+    // jobs stay queued regardless of thread-start scheduling.
+    try reactor.startWithGate(std.testing.allocator, .{ .threads = 2, .shutdown_requested = testShutdown }, systemWakeWrite, &allow_adopt);
     defer reactor.deinit();
+    // Runs before deinit: even if an assertion fails, shards are released.
+    defer allow_adopt.store(true, .release);
     var done = std.atomic.Value(u32).init(0);
     var reason = std.atomic.Value(u8).init(0);
     var freed = std.atomic.Value(u32).init(0);
@@ -1039,13 +1057,12 @@ test "shutdown arriving with accepted handoffs still queued closes every one exa
     };
 
     // Barrier: every accepted handoff is queued and none adopted.
-    const queued = reactor.snapshot();
-    try std.testing.expectEqual(@as(u32, 8), queued.queue_depth);
+    try std.testing.expectEqual(@as(u32, 8), reactor.snapshot().queue_depth);
     try std.testing.expectEqual(@as(u32, 0), done.load(.acquire));
 
-    // Shutdown now arrives with the handoffs still queued.
+    // Shutdown arrives with the handoffs still queued; then adoption resumes.
     test_shutdown_flag.store(true, .release);
-    reactor.wake_writer = systemWakeWrite;
+    allow_adopt.store(true, .release);
     reactor.wakeAll();
     reactor.stopAndJoin();
 

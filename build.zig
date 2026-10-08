@@ -255,6 +255,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
 
+    // WebSocket reactor foundation (#826): the tunnel reactor and relay unit
+    // tests, tagged (#818) in their names, as a fast named gate for CI.
+    const websocket_reactor_tests = b.addTest(.{ .root_module = exe_test_mod, .filters = &.{"(#818)"} });
+    const run_websocket_reactor_tests = b.addRunArtifact(websocket_reactor_tests);
+    const websocket_reactor_step = b.step("test-websocket-reactor", "Run WebSocket tunnel reactor foundation tests (#826)");
+    websocket_reactor_step.dependOn(&run_websocket_reactor_tests.step);
+
     const tls_core_tests = b.addTest(.{ .root_module = tls_core_mod });
     const run_tls_core_tests = b.addRunArtifact(tls_core_tests);
     const tls_step = b.step("test-tls", "Run pure-Zig TLS core unit tests");

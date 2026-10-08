@@ -65,6 +65,14 @@ new allocation or a lost job. `wakeAll()` similarly uses a per-shard atomic
 broadcast bit. The inbox has no separate operator setting, but it is bounded
 by the global tunnel cap: a job gets there only after reserving a tunnel slot.
 
+`Options.max_tunnels_per_shard` (internal, default `0` = bounded only by the
+tunnel cap) adds a per-shard limit on owned plus queued tunnels. At the limit
+`Reactor.submit()` returns `ReactorFull` without touching shard state, so the
+caller keeps the job and runs it inline like any other rejection. `snapshot()`
+also reports `rejected_total`, `queue_depth` and `queue_high_water`. Run the
+foundation tests alone with `zig build test-websocket-reactor`; CI runs them on
+Linux and macOS.
+
 ## Capacity and resource equations
 
 Let:

@@ -350,6 +350,31 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: zig build test-integration-init --summary all --error-style verbose
 
+  # WebSocket reactor foundation (#826): a fast, targeted gate for the sharded
+  # readiness/handoff/capacity tests on both supported readiness platforms
+  # (Linux and macOS), independent of the full unit suite's runtime.
+  websocket-reactor:
+    name: WebSocket reactor (${{ matrix.os }})
+    needs: mode
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Run reactor foundation tests
+        run: zig build test-websocket-reactor --summary all --error-style verbose
+
   # ── Appliance profile tests ──────────────────────────────────────────────────
   # The default `test` job above only exercises the general profile: no test
   # in `tests/integration.zig` skips based on profile any more (#649 retired
@@ -1155,6 +1180,7 @@ jobs:
       - dependency-audit
       - dependency-audit-darwin
       - test
+      - websocket-reactor
       - test-appliance
       - test-general-native-tls
       - pki-differential
@@ -1186,7 +1212,7 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           MODE: ${{ needs.mode.outputs.mode }}
           SMOKE_JOBS: >-
-            mode format lint dependency-audit test test-general-native-tls
+            mode format lint dependency-audit test websocket-reactor test-general-native-tls
             examples security integration-test h3-mtls-interop h1-h2-mtls-interop
           # Dependency review is required on PRs and skipped by design elsewhere.
           OPTIONAL_JOBS: dependency-review

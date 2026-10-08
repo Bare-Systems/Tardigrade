@@ -3215,3 +3215,62 @@ test "proxyAttemptErrorCountsAsUpstreamFailure: StreamTooLong does not poison ci
     // A genuine connectivity error must still count against upstream health.
     try std.testing.expect(proxyAttemptErrorCountsAsUpstreamFailure(error.ConnectionRefused));
 }
+
+// Table-driven contract for proxy_pass URI rewriting (#800). Rows marked
+// "nginx differs" are intentional divergences documented in
+// docs/PROXY_SECURITY.md §6a; changing one is a breaking config change.
+test "proxy_pass URI rewriting semantics table (#800)" {
+    const Case = struct {
+        match_type: http.location_router.MatchType,
+        pattern: []const u8,
+        proxy_pass: []const u8,
+        request_path: []const u8,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        // Prefix + URI: matched prefix replaced by the proxy_pass URI.
+        .{ .match_type = .prefix, .pattern = "/mcp", .proxy_pass = "http://up/mcp", .request_path = "/mcp", .expected = "http://up/mcp" },
+        .{ .match_type = .prefix, .pattern = "/mcp", .proxy_pass = "http://up/mcp", .request_path = "/mcp/", .expected = "http://up/mcp/" },
+        .{ .match_type = .prefix, .pattern = "/mcp", .proxy_pass = "http://up/mcp", .request_path = "/mcp/x", .expected = "http://up/mcp/x" },
+        // nginx differs (#800 case 1): non-segment boundary gains a "/".
+        .{ .match_type = .prefix, .pattern = "/mcp", .proxy_pass = "http://up/mcp", .request_path = "/mcpfoo", .expected = "http://up/mcp/foo" },
+        // Leading slashes of the suffix are collapsed.
+        .{ .match_type = .prefix, .pattern = "/mcp", .proxy_pass = "http://up/mcp", .request_path = "/mcp//x", .expected = "http://up/mcp/x" },
+        // nginx differs: URI replaces the prefix with a segment join.
+        .{ .match_type = .prefix, .pattern = "/v/", .proxy_pass = "http://up/v1", .request_path = "/v/x", .expected = "http://up/v1/x" },
+        // nginx differs (#800 case 2): URI-less proxy_pass still strips the prefix.
+        .{ .match_type = .prefix, .pattern = "/api/", .proxy_pass = "http://up:1", .request_path = "/api/messages", .expected = "http://up:1/messages" },
+        .{ .match_type = .prefix, .pattern = "/api/", .proxy_pass = "http://up:1", .request_path = "/api/", .expected = "http://up:1/" },
+        // Exact + URI: forwarded unchanged (#798).
+        .{ .match_type = .exact, .pattern = "/mcp", .proxy_pass = "http://up/mcp", .request_path = "/mcp", .expected = "http://up/mcp" },
+        // Regex: full request path appended to the proxy_pass target.
+        .{ .match_type = .regex, .pattern = "^/assets/", .proxy_pass = "http://cdn", .request_path = "/assets/a.js", .expected = "http://cdn/assets/a.js" },
+        // nginx rejects this at load (#800 case 3); Tardigrade appends.
+        .{ .match_type = .regex, .pattern = "^/assets/", .proxy_pass = "http://cdn/base", .request_path = "/assets/a.js", .expected = "http://cdn/base/assets/a.js" },
+        .{ .match_type = .regex_case_insensitive, .pattern = "\\.php$", .proxy_pass = "http://php:9000", .request_path = "/app/x.PHP", .expected = "http://php:9000/app/x.PHP" },
+    };
+
+    for (cases) |c| {
+        const blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+            .match_type = c.match_type,
+            .pattern = c.pattern,
+            .priority = 0,
+            .action = .{ .proxy_pass = c.proxy_pass },
+        }};
+        const matched = http.location_router.matchLocation(std.testing.allocator, c.request_path, &blocks) orelse {
+            std.debug.print("no match: {s} {s}\n", .{ c.pattern, c.request_path });
+            return error.TestUnexpectedResult;
+        };
+        const resolved = try gpt.resolveProxyTarget(
+            std.testing.allocator,
+            "http://unused:1",
+            c.proxy_pass,
+            proxySuffixPathForLocation(c.request_path, matched, &blocks),
+        );
+        defer std.testing.allocator.free(resolved.url);
+        std.testing.expectEqualStrings(c.expected, resolved.url) catch |err| {
+            std.debug.print("case: {s} {s} -> {s}\n", .{ c.pattern, c.proxy_pass, c.request_path });
+            return err;
+        };
+    }
+}

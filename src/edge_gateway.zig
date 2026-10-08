@@ -2053,6 +2053,10 @@ const WaitingEncryptedHttpConnection = struct {
     tls_metrics_state: ?*http.metrics.TlsBufferConnectionMetrics = null,
     read_scope_early_prefix_len: usize = 0,
     read_scope_total_len: usize = 0,
+    /// Installed only by the downstream H2 runtime.  Its pipe is included in
+    /// the encrypted connection's blocking wait, so a future producer can
+    /// wake the one connection-owned writer without touching the TLS socket.
+    h2_outbound: ?*http.h2_outbound_scheduler.Scheduler = null,
 
     fn init(
         inner: http.encrypted_stream_connection.EncryptedStreamHttpConnection,
@@ -2223,6 +2227,10 @@ const WaitingEncryptedHttpConnection = struct {
         self.write_timeout_ms = timeout_ms;
     }
 
+    pub fn setH2OutboundScheduler(self: *WaitingEncryptedHttpConnection, outbound: ?*http.h2_outbound_scheduler.Scheduler) void {
+        self.h2_outbound = outbound;
+    }
+
     pub fn writer(self: *WaitingEncryptedHttpConnection) Writer {
         return .{ .conn = self };
     }
@@ -2271,13 +2279,26 @@ const WaitingEncryptedHttpConnection = struct {
             .fd = self.inner.rawFd(),
             .events = events,
             .revents = 0,
-        }};
+        }, .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 }};
+        var fd_count: usize = 1;
+        if (self.h2_outbound) |outbound| {
+            fds[1].fd = outbound.wakeFd();
+            fd_count = 2;
+        }
         const bounded_ms: i32 = if (timeout_ms == 0)
             30_000
         else
             @intCast(@min(timeout_ms, @as(u32, @intCast(std.math.maxInt(i32)))));
-        const ready = try std.posix.poll(&fds, bounded_ms);
+        const ready = try std.posix.poll(fds[0..fd_count], bounded_ms);
         if (ready == 0) return error.WouldBlock;
+        if (fd_count == 2 and fds[1].revents != 0) {
+            const outbound = self.h2_outbound orelse return error.ConnectionClosed;
+            // We are already in the poll owner. Use the non-waiting record
+            // writer here to avoid recursively re-entering this wait path;
+            // a temporary TLS backpressure condition simply remains a normal
+            // connection-level write failure for this finite H2 phase.
+            try outbound.flush(self.inner.writer());
+        }
         if ((fds[0].revents & std.posix.POLL.ERR) != 0) return error.ConnectionResetByPeer;
         if ((fds[0].revents & std.posix.POLL.HUP) != 0 and (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.OUT)) == 0) return error.ConnectionClosed;
     }
@@ -2557,6 +2578,16 @@ fn h2BeginReadScope(conn: anytype) void {
             conn.beginReadScope();
             return;
         }
+    }
+}
+
+fn h2InstallOutboundScheduler(conn: anytype, outbound: ?*http.h2_outbound_scheduler.Scheduler) void {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "setH2OutboundScheduler")) conn.setH2OutboundScheduler(outbound);
+    } else {
+        if (comptime @hasDecl(T, "setH2OutboundScheduler")) conn.setH2OutboundScheduler(outbound);
     }
 }
 
@@ -2988,7 +3019,7 @@ const Http2FlushResult = enum { complete, blocked };
 /// WINDOW_UPDATE handler to resume a blocked response, without ever racing
 /// with or dropping frames belonging to other streams.
 fn flushHttp2PendingResponse(
-    conn: anytype,
+    writer: anytype,
     stream_id: u31,
     resp: *PendingHttp2Response,
     conn_send_window: *i32,
@@ -2996,7 +3027,7 @@ fn flushHttp2PendingResponse(
 ) !Http2FlushResult {
     const max_data_frame: usize = HTTP2_MAX_FRAME_SIZE;
     if (resp.body.len == 0) {
-        try http.http2_frame.writeFrame(conn.writer(), .data, http.http2_frame.Flags.END_STREAM, stream_id, &.{});
+        try http.http2_frame.writeFrame(writer, .data, http.http2_frame.Flags.END_STREAM, stream_id, &.{});
         return .complete;
     }
     while (resp.offset < resp.body.len) {
@@ -3006,7 +3037,7 @@ fn flushHttp2PendingResponse(
         const n = @min(@min(max_data_frame, remaining_window), resp.body.len - resp.offset);
         const end = resp.offset + n;
         const flags: u8 = if (end == resp.body.len) http.http2_frame.Flags.END_STREAM else 0;
-        try http.http2_frame.writeFrame(conn.writer(), .data, flags, stream_id, resp.body[resp.offset..end]);
+        try http.http2_frame.writeFrame(writer, .data, flags, stream_id, resp.body[resp.offset..end]);
         conn_send_window.* -= @intCast(n);
         stream_send_window.* -= @intCast(n);
         resp.offset = end;
@@ -3018,7 +3049,7 @@ fn flushHttp2PendingResponse(
 /// arrives (connection- or stream-level WINDOW_UPDATE). Called only from the
 /// central frame loop, never from a response writer.
 fn h2FlushPendingHttp2Responses(
-    conn: anytype,
+    writer: anytype,
     allocator: std.mem.Allocator,
     state: *GatewayState,
     pending_responses: *std.AutoHashMap(u31, PendingHttp2Response),
@@ -3038,7 +3069,7 @@ fn h2FlushPendingHttp2Responses(
             try finished.append(sid);
             continue;
         };
-        const result = try flushHttp2PendingResponse(conn, sid, resp, conn_send_window, stream_window_ptr);
+        const result = try flushHttp2PendingResponse(writer, sid, resp, conn_send_window, stream_window_ptr);
         if (result == .complete) {
             state.metricsRecord(resp.status_code);
             resp.deinit(allocator);
@@ -3052,8 +3083,9 @@ fn h2FlushPendingHttp2Responses(
     }
 }
 
-fn h2DispatchReadyStreams(
+fn h2DispatchReadyStreamsWithWriter(
     conn: anytype,
+    writer: anytype,
     allocator: std.mem.Allocator,
     state: *GatewayState,
     cfg: *const edge_config.EdgeConfig,
@@ -3105,7 +3137,7 @@ fn h2DispatchReadyStreams(
         // The accept/reject decision for a transport-early stream is recorded
         // by `respondHttp2Stream`, once routing has had its say (#761).
 
-        try respondHttp2Stream(conn, allocator, state, cfg, sid, ps, next_server_stream_id, streams, pending_responses, conn_send_window, connection_ip);
+        try respondHttp2Stream(conn, writer, allocator, state, cfg, sid, ps, next_server_stream_id, streams, pending_responses, conn_send_window, connection_ip);
         ps.dispatch_count += 1;
         if (pending.fetchRemove(sid)) |removed| {
             var tmp = removed.value;
@@ -3122,6 +3154,23 @@ fn h2DispatchReadyStreams(
     }
 }
 
+fn h2DispatchReadyStreams(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    pending: *std.AutoHashMap(u31, Http2PendingStream),
+    streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
+    pending_responses: *std.AutoHashMap(u31, PendingHttp2Response),
+    ready_streams: *std.array_list.Managed(u31),
+    next_server_stream_id: *u31,
+    conn_send_window: *i32,
+    buffered_request_bytes: *usize,
+    connection_ip: []const u8,
+) !void {
+    return h2DispatchReadyStreamsWithWriter(conn, conn.writer(), allocator, state, cfg, pending, streams, pending_responses, ready_streams, next_server_stream_id, conn_send_window, buffered_request_bytes, connection_ip);
+}
+
 fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, connection_ip: []const u8) !void {
     _ = session;
     var preface: [HTTP2_PREFACE.len]u8 = undefined;
@@ -3129,11 +3178,21 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     if (!std.mem.eql(u8, preface[0..], HTTP2_PREFACE)) return error.InvalidHttp2Preface;
 
     const allocator = state.allocator;
+    var outbound = try http.h2_outbound_scheduler.Scheduler.init(
+        allocator,
+        http.h2_outbound_scheduler.default_max_queued_bytes,
+    );
+    defer outbound.deinit();
+    const outbound_writer = outbound.writer();
+    h2InstallOutboundScheduler(conn, &outbound);
+    defer h2InstallOutboundScheduler(conn, null);
+    errdefer outbound.flush(conn.writer()) catch {};
 
-    try http.http2_frame.writeSettings(allocator, conn.writer(), &[_][2]u32{
+    try http.http2_frame.writeSettings(allocator, outbound_writer, &[_][2]u32{
         .{ 0x3, HTTP2_MAX_CONCURRENT_STREAMS }, // max concurrent streams
         .{ 0x4, 1024 * 1024 }, // initial window size
     });
+    try outbound.flush(conn.writer());
 
     var decoder = http.hpack.Decoder.init();
     defer decoder.deinit(allocator);
@@ -3179,8 +3238,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     }
 
     while (!http.shutdown.isShutdownRequested() and !goaway_received) {
-        try h2DispatchReadyStreams(
+        try h2DispatchReadyStreamsWithWriter(
             conn,
+            outbound_writer,
             allocator,
             state,
             cfg,
@@ -3196,8 +3256,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
 
         if (h2HasDeferredReadyStreams(&pending, &ready_streams) and !h2DownstreamHandshakeComplete(conn)) {
             try h2WaitForHandshakeCompletionOrInput(conn);
-            try h2DispatchReadyStreams(
+            try h2DispatchReadyStreamsWithWriter(
                 conn,
+                outbound_writer,
                 allocator,
                 state,
                 cfg,
@@ -3224,22 +3285,22 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
 
         if (continuation_stream_id) |expected_stream_id| {
             if (frame.typ != .continuation or frame.stream_id != expected_stream_id) {
-                try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                 return error.InvalidHttp2FrameSequence;
             }
         } else if (frame.typ == .continuation) {
-            try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+            try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
             return error.InvalidHttp2FrameSequence;
         }
 
         switch (frame.typ) {
             .settings => {
                 if (frame.stream_id != 0) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
                 if ((frame.flags & http.http2_frame.Flags.ACK) != 0 and frame.payload.len != 0) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
                     return error.InvalidSettingsFrame;
                 }
                 if ((frame.flags & http.http2_frame.Flags.ACK) == 0) {
@@ -3249,7 +3310,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                             error.InvalidSettingsValue => http.http2_stream.ErrorCode.protocol_error,
                             else => http.http2_stream.ErrorCode.frame_size_error,
                         };
-                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, code.value());
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, code.value());
                         return err;
                     };
                     if (new_initial_window) |new_window| {
@@ -3266,7 +3327,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                                 // that must be a connection-level
                                 // FLOW_CONTROL_ERROR, not an unchecked cast.
                                 if (adjusted > std.math.maxInt(i32)) {
-                                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
                                     return error.Http2FlowControlError;
                                 }
                                 // A negative result is explicitly allowed by
@@ -3280,31 +3341,31 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                             }
                         }
                     }
-                    try http.http2_frame.writeSettingsAck(conn.writer());
+                    try http.http2_frame.writeSettingsAck(outbound_writer);
                 }
             },
             .ping => {
                 if (frame.stream_id != 0) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
                 if (frame.payload.len != 8) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
                     return error.InvalidPingPayload;
                 }
-                if ((frame.flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writePingAck(conn.writer(), frame.payload);
+                if ((frame.flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writePingAck(outbound_writer, frame.payload);
             },
             .headers => {
                 if (frame.stream_id == 0) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
                 if ((frame.stream_id & 1) == 0) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
                 if (frame.stream_id <= last_client_stream_id and !streams.contains(frame.stream_id)) {
-                    try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.stream_closed.value());
+                    try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.stream_closed.value());
                     continue;
                 }
                 last_client_stream_id = @max(last_client_stream_id, frame.stream_id);
@@ -3320,7 +3381,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // while the first response is still outstanding.
                 if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
                     try http.http2_frame.writeRstStream(
-                        conn.writer(),
+                        outbound_writer,
                         frame.stream_id,
                         http.http2_stream.ErrorCode.stream_closed.value(),
                     );
@@ -3332,13 +3393,13 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         // Close the connection on a peer that exceeds the
                         // limit so we never skip a header block and desync the
                         // connection-scoped HPACK dynamic table.
-                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.enhance_your_calm.value());
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.enhance_your_calm.value());
                         return error.Http2ConcurrentStreamLimitExceeded;
                     }
                     try streams.put(frame.stream_id, http.http2_stream.Stream.init(frame.stream_id, @intCast(peer_initial_window)));
                 }
                 const headers_payload = h2HeadersPayload(frame.payload, frame.flags) catch |err| {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return err;
                 };
                 if (headers_payload.priority) |priority_payload| {
@@ -3348,7 +3409,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 if ((frame.flags & http.http2_frame.Flags.END_HEADERS) == 0) {
                     const fragment = headers_payload.fragment;
                     if (fragment.len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
-                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
                         return error.Http2CompressionError;
                     }
                     continuation_stream_id = frame.stream_id;
@@ -3359,7 +3420,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     continue;
                 }
                 if (headers_payload.fragment.len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
                     return error.Http2CompressionError;
                 }
                 try h2ProcessHeaderBlock(
@@ -3372,7 +3433,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     headers_payload.fragment,
                     (frame.flags & http.http2_frame.Flags.END_STREAM) != 0,
                     frame_transport_early,
-                    conn.writer(),
+                    outbound_writer,
                     last_client_stream_id,
                     cfg.max_connection_memory_bytes,
                     &buffered_request_bytes,
@@ -3381,7 +3442,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             },
             .data => {
                 if (frame.stream_id == 0) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
                 // Same lifecycle rule as HEADERS: DATA after the remote's
@@ -3389,14 +3450,14 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // half_closed_remote), not new body for a dispatched request.
                 if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
                     try http.http2_frame.writeRstStream(
-                        conn.writer(),
+                        outbound_writer,
                         frame.stream_id,
                         http.http2_stream.ErrorCode.stream_closed.value(),
                     );
                     continue;
                 }
                 const data_payload = h2DataPayload(frame.payload, frame.flags) catch |err| {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return err;
                 };
                 if (pending.getPtr(frame.stream_id)) |ps| {
@@ -3426,8 +3487,8 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         // Pad Length and padding, even though only the data
                         // octets belong to the application body.
                         if (frame.payload.len > 0) {
-                            try http.http2_frame.writeWindowUpdate(conn.writer(), frame.stream_id, @intCast(frame.payload.len));
-                            try http.http2_frame.writeWindowUpdate(conn.writer(), 0, @intCast(frame.payload.len));
+                            try http.http2_frame.writeWindowUpdate(outbound_writer, frame.stream_id, @intCast(frame.payload.len));
+                            try http.http2_frame.writeWindowUpdate(outbound_writer, 0, @intCast(frame.payload.len));
                         }
                     }
                     if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
@@ -3435,17 +3496,17 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         try h2AppendReadyStream(&ready_streams, frame.stream_id);
                     }
                 } else {
-                    try http.http2_frame.writeGoaway(conn.writer(), frame.stream_id, 1);
+                    try http.http2_frame.writeGoaway(outbound_writer, frame.stream_id, 1);
                     return;
                 }
             },
             .priority => {
                 if (frame.stream_id == 0) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
                 if (frame.payload.len != 5) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
                     return error.InvalidPriorityFrame;
                 }
                 const pr = try http.http2_frame.parsePriority(frame.payload);
@@ -3454,16 +3515,16 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             },
             .window_update => {
                 if (frame.payload.len != 4) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
                     return error.InvalidWindowUpdateFrame;
                 }
                 const raw_inc = std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFF_FFFF;
                 if (raw_inc == 0) {
                     if (frame.stream_id == 0) {
-                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                         return error.InvalidWindowUpdateFrame;
                     } else {
-                        try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                        try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                         h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
                     }
                     continue;
@@ -3476,14 +3537,14 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 if (frame.stream_id == 0) {
                     const new_window: i64 = @as(i64, conn_send_window) + @as(i64, inc);
                     if (new_window > std.math.maxInt(i32)) {
-                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
                         return error.Http2FlowControlError;
                     }
                     conn_send_window = @intCast(new_window);
                 } else if (streams.getPtr(frame.stream_id)) |s| {
                     const new_window: i64 = @as(i64, s.send_window) + @as(i64, inc);
                     if (new_window > std.math.maxInt(i32)) {
-                        try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                        try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
                         h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
                     } else {
                         s.send_window = @intCast(new_window);
@@ -3493,33 +3554,33 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // can unblock a parked response; this is the only place new
                 // send credit becomes available, and it runs on the central
                 // frame loop rather than a second reader.
-                try h2FlushPendingHttp2Responses(conn, allocator, state, &pending_responses, &streams, &conn_send_window);
+                try h2FlushPendingHttp2Responses(outbound_writer, allocator, state, &pending_responses, &streams, &conn_send_window);
             },
             .rst_stream => {
                 if (frame.stream_id == 0) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
                 if (frame.payload.len != 4) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
                     return error.InvalidRstStreamFrame;
                 }
                 h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
             },
             .goaway => {
                 if (frame.stream_id != 0 or frame.payload.len < 8) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
                     return error.InvalidGoawayFrame;
                 }
                 goaway_received = true;
             },
             .continuation => {
                 if (continuation_block.items.len +| frame.payload.len > h2EncodedHeaderBlockLimit(cfg, buffered_request_bytes)) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
                     return error.Http2CompressionError;
                 }
                 continuation_block.appendSlice(frame.payload) catch {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.internal_error.value());
+                    try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.internal_error.value());
                     return error.OutOfMemory;
                 };
                 if ((frame.flags & http.http2_frame.Flags.END_HEADERS) != 0) {
@@ -3534,7 +3595,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         continuation_block.items,
                         continuation_end_stream,
                         continuation_transport_early,
-                        conn.writer(),
+                        outbound_writer,
                         last_client_stream_id,
                         cfg.max_connection_memory_bytes,
                         &buffered_request_bytes,
@@ -3547,14 +3608,15 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 }
             },
             .push_promise => {
-                try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                 return error.InvalidHttp2FrameSequence;
             },
             else => {}, // Unknown extension frame types are ignored by RFC 9113 §5.5.
         }
 
-        try h2DispatchReadyStreams(
+        try h2DispatchReadyStreamsWithWriter(
             conn,
+            outbound_writer,
             allocator,
             state,
             cfg,
@@ -3567,6 +3629,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             &buffered_request_bytes,
             connection_ip,
         );
+        try outbound.flush(conn.writer());
     }
 }
 
@@ -3592,6 +3655,7 @@ fn lowercaseName(allocator: std.mem.Allocator, owned: *std.array_list.Managed([]
 
 fn respondHttp2Stream(
     conn: anytype,
+    writer: anytype,
     allocator: std.mem.Allocator,
     state: *GatewayState,
     cfg: *const edge_config.EdgeConfig,
@@ -3822,7 +3886,7 @@ fn respondHttp2Stream(
         http.http2_frame.Flags.END_HEADERS;
 
     try http.http2_frame.writeFrame(
-        conn.writer(),
+        writer,
         .headers,
         response_header_flags,
         stream_id,
@@ -3843,7 +3907,7 @@ fn respondHttp2Stream(
     errdefer resp.deinit(allocator);
 
     const stream_window_ptr = if (streams.getPtr(stream_id)) |s| &s.send_window else return error.InvalidHttp2StreamId;
-    const result = try flushHttp2PendingResponse(conn, stream_id, &resp, conn_send_window, stream_window_ptr);
+    const result = try flushHttp2PendingResponse(writer, stream_id, &resp, conn_send_window, stream_window_ptr);
     if (result == .complete) {
         resp.deinit(allocator);
         state.metricsRecord(status_code);

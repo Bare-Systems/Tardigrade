@@ -1637,7 +1637,7 @@ const ProductionBufferedProxyAttemptExecutor = struct {
 /// configuration's top-level value. `preserve` yields null (never ended by a
 /// reload).
 fn websocketReloadDrain(
-    websocket: http.location_router.WebSocketProxy,
+    websocket: *const http.location_router.WebSocketProxy,
     cfg: *const edge_config.EdgeConfig,
     superseded_at: ?*const std.atomic.Value(u64),
 ) ?http.tunnel.ReloadDrain {
@@ -1656,21 +1656,21 @@ test "websocket reload policy resolves per location from the admission config (#
     var stamp = std.atomic.Value(u64).init(0);
 
     // Inherits the top-level drain policy and timeout.
-    const inherited = websocketReloadDrain(.{}, &cfg, &stamp).?;
+    const inherited = websocketReloadDrain(&.{}, &cfg, &stamp).?;
     try std.testing.expectEqual(@as(u32, 7_000), inherited.timeout_ms);
     try std.testing.expect(inherited.superseded_at_ms == &stamp);
 
     // Per-location preserve beats a top-level drain; per-location timeout wins.
-    try std.testing.expect(websocketReloadDrain(.{ .reload = .preserve }, &cfg, &stamp) == null);
-    try std.testing.expectEqual(@as(u32, 250), websocketReloadDrain(.{ .reload_timeout_ms = 250 }, &cfg, &stamp).?.timeout_ms);
+    try std.testing.expect(websocketReloadDrain(&.{ .reload = .preserve }, &cfg, &stamp) == null);
+    try std.testing.expectEqual(@as(u32, 250), websocketReloadDrain(&.{ .reload_timeout_ms = 250 }, &cfg, &stamp).?.timeout_ms);
 
     // Per-location drain beats a top-level preserve.
     cfg.proxy_websocket_reload = .preserve;
-    try std.testing.expect(websocketReloadDrain(.{}, &cfg, &stamp) == null);
-    try std.testing.expect(websocketReloadDrain(.{ .reload = .drain }, &cfg, &stamp) != null);
+    try std.testing.expect(websocketReloadDrain(&.{}, &cfg, &stamp) == null);
+    try std.testing.expect(websocketReloadDrain(&.{ .reload = .drain }, &cfg, &stamp) != null);
 
     // No supersession stamp (no config lease): nothing to drain on.
-    try std.testing.expect(websocketReloadDrain(.{ .reload = .drain }, &cfg, null) == null);
+    try std.testing.expect(websocketReloadDrain(&.{ .reload = .drain }, &cfg, null) == null);
 }
 
 test "ProductionBufferedProxyAttemptExecutor keeps absolute target failures out of passive health" {

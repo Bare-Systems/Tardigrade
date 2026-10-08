@@ -1015,25 +1015,40 @@ test "reactor applies each tunnel's admission reload policy across repeated relo
     try std.testing.expectEqual(@as(u32, 1), reactor.snapshot().tunnels);
 }
 
-test "shutdown arriving with tunnels still queued closes every one exactly once (#829)" {
+fn suppressedWakeWriter(_: std.posix.fd_t) WakeWriteResult {
+    return .already_pending;
+}
+
+test "shutdown arriving with accepted handoffs still queued closes every one exactly once (#829)" {
     test_shutdown_flag.store(false, .release);
     defer test_shutdown_flag.store(false, .release);
     var reactor: Reactor = undefined;
-    try reactor.start(std.testing.allocator, .{ .threads = 2, .shutdown_requested = testShutdown });
+    // The suppressed writer keeps shards asleep, so accepted jobs stay in the
+    // inbox until we deliberately wake them.
+    try reactor.startWithWakeWriter(std.testing.allocator, .{ .threads = 2, .shutdown_requested = testShutdown }, suppressedWakeWriter);
     defer reactor.deinit();
     var done = std.atomic.Value(u32).init(0);
     var reason = std.atomic.Value(u8).init(0);
     var freed = std.atomic.Value(u32).init(0);
     const opts = tunnel.Options{ .idle_timeout_ms = 60_000, .drain_timeout_ms = 40, .shutdown_requested = testShutdown, .poll_interval_ms = 0 };
-    // Shutdown is already requested while handoffs are in flight.
-    test_shutdown_flag.store(true, .release);
     var peers: [8]PeerPair = undefined;
     for (&peers) |*p| p.* = try submitTestTunnel(&reactor, opts, &done, &reason, &freed);
     defer for (peers) |p| {
         _ = std.c.close(p.client_peer);
         _ = std.c.close(p.upstream_peer);
     };
+
+    // Barrier: every accepted handoff is queued and none adopted.
+    const queued = reactor.snapshot();
+    try std.testing.expectEqual(@as(u32, 8), queued.queue_depth);
+    try std.testing.expectEqual(@as(u32, 0), done.load(.acquire));
+
+    // Shutdown now arrives with the handoffs still queued.
+    test_shutdown_flag.store(true, .release);
+    reactor.wake_writer = systemWakeWrite;
+    reactor.wakeAll();
     reactor.stopAndJoin();
+
     try std.testing.expectEqual(@as(u32, 8), done.load(.acquire));
     try std.testing.expectEqual(@as(u32, 8), freed.load(.acquire));
     try std.testing.expectEqual(@intFromEnum(tunnel.CloseReason.shutdown), reason.load(.acquire));

@@ -294,6 +294,40 @@ test "wake notification coalesces, drains, and republishes" {
     try std.testing.expectEqual(@as(isize, 1), std.c.read(scheduler.wake_read, &byte, 1));
 }
 
+test "producer wakes a waiter already blocked on the scheduler fd" {
+    const Waiter = struct {
+        scheduler: *Scheduler,
+        entered: *std.atomic.Value(bool),
+        woke: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            var fds = [_]std.posix.pollfd{.{
+                .fd = self.scheduler.wakeFd(),
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            self.entered.store(true, .release);
+            const ready = std.posix.poll(&fds, 1_000) catch @panic("poll failed");
+            self.woke.store(ready == 1 and (fds[0].revents & std.posix.POLL.IN) != 0, .release);
+        }
+    };
+    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    defer scheduler.deinit();
+    var entered = std.atomic.Value(bool).init(false);
+    var woke = std.atomic.Value(bool).init(false);
+    var waiter = Waiter{ .scheduler = &scheduler, .entered = &entered, .woke = &woke };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    while (!entered.load(.acquire)) std.Thread.yield() catch {};
+    try scheduler.enqueueFrame(.data, 0, 1, "wake");
+    thread.join();
+    try std.testing.expect(woke.load(.acquire));
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try scheduler.flush(&out.writer);
+    try std.testing.expect(!scheduler.hasPendingOutput());
+}
+
 test "wake publication failure rolls back producer ownership" {
     var scheduler = try Scheduler.init(std.testing.allocator, 64);
     defer scheduler.deinit();
@@ -319,6 +353,37 @@ test "deinit releases active and queued frames after blocked output" {
     try std.testing.expect(scheduler.active != null);
     try std.testing.expectEqual(@as(usize, 1), scheduler.entries.items.len);
     scheduler.deinit();
+}
+
+test "reentrant drain attempt preserves the active frame exactly once" {
+    const ReentrantWriter = struct {
+        scheduler: *Scheduler,
+        recurse: bool = true,
+        out: std.Io.Writer.Allocating,
+
+        fn write(self: *@This(), bytes: []const u8) anyerror!usize {
+            if (self.recurse) {
+                self.recurse = false;
+                // This models the native-TLS wait callback attempting to
+                // service the same scheduler while its outer drain owns it.
+                try self.scheduler.flush(self);
+                return error.WouldBlock;
+            }
+            try self.out.writer.writeAll(bytes);
+            return bytes.len;
+        }
+    };
+    const frame = [_]u8{ 0, 0, 1, 6, 0, 0, 0, 0, 1, 9 };
+    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    defer scheduler.deinit();
+    try scheduler.enqueue(&frame);
+    var writer = ReentrantWriter{ .scheduler = &scheduler, .out = .init(std.testing.allocator) };
+    defer writer.out.deinit();
+    try scheduler.flush(&writer);
+    try std.testing.expect(scheduler.hasPendingOutput());
+    try scheduler.flush(&writer);
+    try std.testing.expectEqualSlices(u8, &frame, writer.out.written());
+    try std.testing.expect(!scheduler.hasPendingOutput());
 }
 
 test "scheduler retains and resumes a frame after temporary backpressure" {

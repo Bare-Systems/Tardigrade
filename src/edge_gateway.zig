@@ -7046,6 +7046,57 @@ test "H2 response larger than scheduler capacity drains and completes" {
     try std.testing.expectEqual(body.len, body_offset);
 }
 
+test "H2 reset removes parked response while queued output is backpressured" {
+    const BlockingWriter = struct {
+        pub fn write(_: *@This(), _: []const u8) error{WouldBlock}!usize {
+            return error.WouldBlock;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer pending.deinit();
+    var pending_responses = std.AutoHashMap(u31, PendingHttp2Response).init(allocator);
+    defer {
+        var it = pending_responses.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        pending_responses.deinit();
+    }
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try pending_responses.put(1, .{
+        .body_alloc = try allocator.dupe(u8, "cancelled"),
+        .body = "cancelled",
+        .status_code = 200,
+    });
+    try ready.append(1);
+
+    var scheduler = try http.h2_outbound_scheduler.Scheduler.init(allocator, 64);
+    try scheduler.enqueueFrame(.data, 0, 1, "already-queued");
+    var writer = BlockingWriter{};
+    try scheduler.flush(&writer);
+    try std.testing.expect(scheduler.hasPendingOutput());
+
+    var buffered_request_bytes: usize = 0;
+    h2ResetStreamState(
+        allocator,
+        &streams,
+        &pending,
+        &pending_responses,
+        &ready,
+        &buffered_request_bytes,
+        1,
+    );
+    try std.testing.expect(!streams.contains(1));
+    try std.testing.expect(!pending_responses.contains(1));
+    try std.testing.expectEqual(@as(usize, 0), ready.items.len);
+    // The connection-level scheduler owns already-serialized bytes until the
+    // connection closes; teardown releases that retained active frame once.
+    scheduler.deinit();
+}
+
 test "H2 deferred ready stream wakes on handshake completion without extra H2 frame" {
     const allocator = std.testing.allocator;
     var state: GatewayState = undefined;

@@ -230,12 +230,110 @@ test "atomic frame enqueue rolls back on allocation failure" {
     try std.testing.expect(!scheduler.hasPendingOutput());
 }
 
+test "concurrent producers retain whole cross-stream frames" {
+    const Producer = struct {
+        scheduler: *Scheduler,
+        stream_id: u31,
+        payload: []const u8,
+
+        fn run(self: *@This()) void {
+            self.scheduler.enqueueFrame(.data, 0, self.stream_id, self.payload) catch @panic("enqueue failed");
+        }
+    };
+    var scheduler = try Scheduler.init(std.testing.allocator, 128);
+    defer scheduler.deinit();
+    var first = Producer{ .scheduler = &scheduler, .stream_id = 1, .payload = "first" };
+    var second = Producer{ .scheduler = &scheduler, .stream_id = 3, .payload = "second" };
+    const first_thread = try std.Thread.spawn(.{}, Producer.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, Producer.run, .{&second});
+    first_thread.join();
+    second_thread.join();
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try scheduler.flush(&out.writer);
+    var offset: usize = 0;
+    var seen_first = false;
+    var seen_second = false;
+    while (offset < out.written().len) {
+        const bytes = out.written()[offset..];
+        const payload_len = (@as(usize, bytes[0]) << 16) | (@as(usize, bytes[1]) << 8) | bytes[2];
+        const stream_id = std.mem.readInt(u32, bytes[5..9], .big) & 0x7fff_ffff;
+        if (stream_id == 1) {
+            try std.testing.expectEqualSlices(u8, "first", bytes[9 .. 9 + payload_len]);
+            seen_first = true;
+        } else if (stream_id == 3) {
+            try std.testing.expectEqualSlices(u8, "second", bytes[9 .. 9 + payload_len]);
+            seen_second = true;
+        } else return error.TestUnexpectedResult;
+        offset += 9 + payload_len;
+    }
+    try std.testing.expect(seen_first and seen_second);
+}
+
+test "wake notification coalesces, drains, and republishes" {
+    var scheduler = try Scheduler.init(std.testing.allocator, 128);
+    defer scheduler.deinit();
+    try scheduler.enqueueFrame(.data, 0, 1, "a");
+    try scheduler.enqueueFrame(.data, 0, 3, "b");
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = scheduler.wakeFd(),
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&poll_fds, 0));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 1), std.c.read(scheduler.wake_read, &byte, 1));
+    try std.testing.expect(std.c.read(scheduler.wake_read, &byte, 1) < 0);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try scheduler.flush(&out.writer);
+    try std.testing.expect(!scheduler.hasPendingOutput());
+    try scheduler.enqueueFrame(.data, 0, 5, "c");
+    try std.testing.expectEqual(@as(isize, 1), std.c.read(scheduler.wake_read, &byte, 1));
+}
+
+test "wake publication failure rolls back producer ownership" {
+    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    defer scheduler.deinit();
+    _ = std.c.close(scheduler.wake_write);
+    scheduler.wake_write = -1;
+    try std.testing.expectError(error.WakeFailed, scheduler.enqueueFrame(.data, 0, 1, "x"));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.queued_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.entries.items.len);
+    try std.testing.expect(!scheduler.hasPendingOutput());
+}
+
+test "deinit releases active and queued frames after blocked output" {
+    const BlockingWriter = struct {
+        fn write(_: *@This(), _: []const u8) error{WouldBlock}!usize {
+            return error.WouldBlock;
+        }
+    };
+    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    try scheduler.enqueueFrame(.data, 0, 1, "first");
+    try scheduler.enqueueFrame(.data, 0, 3, "second");
+    var writer = BlockingWriter{};
+    try scheduler.flush(&writer);
+    try std.testing.expect(scheduler.active != null);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.entries.items.len);
+    scheduler.deinit();
+}
+
 test "scheduler retains and resumes a frame after temporary backpressure" {
     const TestWriter = struct {
         blocked: bool = true,
+        return_partial: bool = true,
         out: std.Io.Writer.Allocating,
 
         fn write(self: *@This(), bytes: []const u8) anyerror!usize {
+            if (self.blocked and self.return_partial) {
+                self.return_partial = false;
+                const n = @min(@as(usize, 4), bytes.len);
+                try self.out.writer.writeAll(bytes[0..n]);
+                return n;
+            }
             if (self.blocked) return error.WouldBlock;
             try self.out.writer.writeAll(bytes);
             return bytes.len;

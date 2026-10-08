@@ -7004,6 +7004,48 @@ const H2DispatchTestConn = struct {
     }
 };
 
+test "H2 response larger than scheduler capacity drains and completes" {
+    const allocator = std.testing.allocator;
+    var body: [300 * 1024]u8 = undefined;
+    @memset(&body, 'x');
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+    var scheduler = try http.h2_outbound_scheduler.Scheduler.init(allocator, http.h2_outbound_scheduler.default_max_queued_bytes);
+    defer scheduler.deinit();
+    var response = PendingHttp2Response{
+        .body_alloc = null,
+        .body = body[0..],
+        .status_code = 200,
+    };
+    var connection_window: i32 = @intCast(body.len);
+    var stream_window: i32 = @intCast(body.len);
+    try std.testing.expectEqual(
+        Http2FlushResult.complete,
+        try flushHttp2PendingResponse(
+            &conn,
+            &scheduler,
+            scheduler.writer(),
+            1,
+            &response,
+            &connection_window,
+            &stream_window,
+        ),
+    );
+    try scheduler.flush(conn.writer());
+
+    var offset: usize = 0;
+    var body_offset: usize = 0;
+    while (offset < conn.out.written().len) {
+        const frame = conn.out.written()[offset..];
+        const payload_len = (@as(usize, frame[0]) << 16) | (@as(usize, frame[1]) << 8) | frame[2];
+        try std.testing.expectEqual(@as(u8, @intFromEnum(http.http2_frame.Type.data)), frame[3]);
+        try std.testing.expectEqualSlices(u8, body[body_offset .. body_offset + payload_len], frame[9 .. 9 + payload_len]);
+        body_offset += payload_len;
+        offset += 9 + payload_len;
+    }
+    try std.testing.expectEqual(body.len, body_offset);
+}
+
 test "H2 deferred ready stream wakes on handshake completion without extra H2 frame" {
     const allocator = std.testing.allocator;
     var state: GatewayState = undefined;

@@ -4,6 +4,14 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Documentation
+
+- **`proxy_pass` URI rewriting semantics (#800).** `docs/PROXY_SECURITY.md` §6a
+  now documents how request paths map onto `proxy_pass` targets, including the
+  intentional nginx divergences (non-segment prefix joins, prefix stripping for
+  URI-less `proxy_pass`, regex locations with a URI). A table-driven test pins
+  the behavior. No runtime change.
+
 ### Added
 
 - **WebSocket reactor lifecycle observability (#829, #827).** Tunnel close

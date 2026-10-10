@@ -331,6 +331,51 @@ with no trailing slash) are rejected with `400 Bad Request` (`error.InvalidUri`)
 
 Implementation: `parseUri()` in `src/http/request.zig`.
 
+## 6a. `proxy_pass` URI Rewriting (#800)
+
+Tardigrade's mapping from request path to upstream URL is intentionally
+**not** identical to nginx. The behavior below is the contract; it is pinned by
+the table test `proxy_pass URI rewriting semantics table (#800)` in
+`src/gateway_proxy_runtime.zig`. Changing a row is a breaking config change.
+
+| Location | `proxy_pass` | Request | Upstream path | nginx |
+|---|---|---|---|---|
+| `/mcp` (prefix) | `http://up/mcp` | `/mcp` | `/mcp` | same |
+| `/mcp` (prefix) | `http://up/mcp` | `/mcp/x` | `/mcp/x` | same |
+| `/mcp` (prefix) | `http://up/mcp` | `/mcp//x` | `/mcp/x` | same (default `merge_slashes on`) |
+| `/mcp` (prefix) | `http://up/mcp` | `/mcpfoo` | `/mcp/foo` | `/mcpfoo` |
+| `/v/` (prefix) | `http://up/v1` | `/v/x` | `/v1/x` | `/v1x` |
+| `/api/` (prefix) | `http://up:1` (no URI) | `/api/messages` | `/messages` | `/api/messages` |
+| `= /mcp` (exact) | `http://up/mcp` | `/mcp` | `/mcp` | same |
+| `~ ^/assets/` (regex) | `http://cdn` | `/assets/a.js` | `/assets/a.js` | same |
+| `~ ^/assets/` (regex) | `http://cdn/base` | `/assets/a.js` | `/base/assets/a.js` | config load error |
+
+Decisions for the divergences:
+
+1. **Non-segment prefix matches** (`/mcpfoo` under `location /mcp`): the
+   remainder is joined to the `proxy_pass` URI with a single `/`. Tardigrade
+   cannot express a non-slash boundary. Use a trailing-slash location
+   (`/mcp/`) or an exact location if the upstream must see `/mcpfoo`.
+2. **URI-less `proxy_pass`** (`location /api/ { proxy_pass http://up:1; }`):
+   the matched prefix is stripped, so `/api/messages` reaches the upstream as
+   `/messages`. nginx would forward `/api/messages`. To forward the full path
+   unchanged, repeat the prefix in the URI (`proxy_pass http://up:1/api/;`).
+   This is the largest divergence and is kept because existing configs rely
+   on the stripping behavior.
+3. **Regex location with a `proxy_pass` URI**: accepted. The full request path
+   is appended to the `proxy_pass` URI (no prefix is stripped). nginx rejects
+   this at config load; do not rely on it for portability.
+
+Behavior that is intentionally friendlier than nginx: a `proxy_pass` URI
+replaces the matched prefix with a segment join (`/v/x` -> `/v1/x`, not
+`/v1x`). Collapsing repeated leading slashes in the suffix (`/mcp//x` ->
+`/mcp/x`) matches nginx's default `merge_slashes on`; nginx with
+`merge_slashes off` would differ.
+
+Implementation: `proxySuffixPathForLocation()` in
+`src/gateway_proxy_runtime.zig`, `combineProxyTarget()` in
+`src/gateway_proxy_target.zig`.
+
 ## 7. Forwarded / X-Forwarded-* Trust Boundary
 
 Tardigrade unconditionally strips all client-supplied `X-Forwarded-For`,

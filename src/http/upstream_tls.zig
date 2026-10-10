@@ -64,6 +64,12 @@ pub const UpstreamTlsOptions = struct {
     client_cert_path: []const u8 = "",
     client_key_path: []const u8 = "",
     alpn_policy: UpstreamAlpnPolicy = .require_http1,
+    /// Borrowed, preloaded trust anchors (#832). When set, `connect()` verifies
+    /// against this snapshot and performs no filesystem access, so a caller
+    /// that loaded anchors before a privilege drop/chroot (ACME) keeps working
+    /// afterwards. `ca_bundle_path` is ignored when this is set. The snapshot
+    /// must outlive the `connect()` call only: verification completes inside it.
+    trust_anchors: ?*const tls_core.webpki_verifier.TrustAnchors = null,
 };
 
 pub const UpstreamAlpnPolicy = enum {
@@ -272,8 +278,13 @@ pub const UpstreamTlsConn = struct {
                 client_options,
             );
         } else {
-            trust_anchors = tls_core.webpki_verifier.loadTrustAnchors(allocator, opts.ca_bundle_path) catch return error.VerifyConfigFailed;
-            verifier_storage = tls_core.webpki_verifier.WebPkiVerifier.init(allocator, trust_anchors.?.anchors(), crypto_provider);
+            const anchors = if (opts.trust_anchors) |preloaded|
+                preloaded.anchors()
+            else blk: {
+                trust_anchors = tls_core.webpki_verifier.loadTrustAnchors(allocator, opts.ca_bundle_path) catch return error.VerifyConfigFailed;
+                break :blk trust_anchors.?.anchors();
+            };
+            verifier_storage = tls_core.webpki_verifier.WebPkiVerifier.init(allocator, anchors, crypto_provider);
             state.backend = tls_core.tls13_backend.Tls13Backend.initClientWithVerifierConfigured(
                 handshake_entropy,
                 crypto_provider,

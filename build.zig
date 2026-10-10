@@ -1005,6 +1005,24 @@ pub fn build(b: *std.Build) void {
     pki_step.dependOn(&run_pki_tests.step);
     test_step.dependOn(&run_pki_tests.step);
 
+    // Native ACME accounts, JWS transport and durable state (#832). The same
+    // sources are already part of the exe test graph (`test`); this is the
+    // fast, named gate for them (and the `fuzz: ACME:` corpus targets), built
+    // as its own compilation so it is not also wired into `test`.
+    const acme_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/acme_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    acme_test_mod.addImport("crypto", crypto_mod);
+    acme_test_mod.addImport("zig_compat", compat_mod);
+    acme_test_mod.addImport("tls_core", tls_core_mod);
+    const acme_tests = b.addTest(.{ .root_module = acme_test_mod });
+    const run_acme_tests = b.addRunArtifact(acme_tests);
+    const acme_step = b.step("test-acme", "Run native ACME account/JWS/state unit and corpus tests (#832)");
+    acme_step.dependOn(&run_acme_tests.step);
+
     // DER/PEM/X.509/path-validation fuzz targets (#492, epic #324-K). The
     // targets are inline `test "fuzz: PKI: ..."` blocks in der_tests.zig and
     // x509_tests.zig, reached via the same `src/pki/root.zig` root as

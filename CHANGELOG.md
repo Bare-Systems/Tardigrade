@@ -19,6 +19,15 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **Native ACME accounts, JWS transport and durable state (#832).** New
+  `src/acme/` layer for epic #759 phase A2: P-256 account keys, ES256 JWS
+  signing, a bounded HTTPS transport with a preloaded CA trust-anchor
+  snapshot (`UpstreamTlsOptions.trust_anchors`), directory/nonce/newAccount
+  handling with a finite `badNonce` retry budget, and a permission-checked,
+  atomically-written, lock-protected state directory. No certificate is
+  requested or activated; `TARDIGRADE_TLS_ACME_ENABLED` is still rejected.
+  Tests: `zig build test-acme` (fake CA that verifies every signed request,
+  plus `fuzz: ACME:` corpus targets).
 - **WebSocket reactor lifecycle observability (#829, #827).** Tunnel close
   metrics now distinguish `client_error` from `upstream_error` (previously one
   `error` label; the access log keeps `error`). New gauges/counters:

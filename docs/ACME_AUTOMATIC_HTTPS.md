@@ -800,6 +800,43 @@ scope source of truth. Dependencies are those in the graph in §3. A3 depends
 on A2's `Jws`, `AccountKey` and transport interfaces, which A2 must publish
 first; A4's unit-tested persistence can proceed alongside A3.
 
+### 10.1 A2 as implemented (#832)
+
+Landed behind the closed gate; `TARDIGRADE_TLS_ACME_ENABLED=true` is still
+rejected and no certificate is requested, issued or activated.
+
+| File | What it provides |
+| --- | --- |
+| `src/acme/account.zig` | `AccountKey` (OS-entropy P-256 generation, strict PKCS#8 PEM load/save, wiped on `deinit`), `Jwk` + RFC 7638 thumbprint, `signJws` (ES256, `jwk` xor `kid`, POST-as-GET). |
+| `src/acme/state.zig` | `StateDir`: `0700` dir, symlink/perm checks, `flock` single owner, atomic `0600` replace (temp, fsync, rename, fsync dir), stale-temp cleanup, versioned `account.json`, never-regenerate key policy. |
+| `src/acme/json_limits.zig` | Bounded JSON admission (bytes, depth 8, strings 2 KiB, arrays 128, keys 64) before any typed parse. |
+| `src/acme/url.zig` | CA URL grammar and same-origin pin (§6.3). |
+| `src/acme/transport.zig` | Bounded HTTP/1.1 over an abstract `Connection`: header/body caps, chunked decoding, redirects rejected, one request deadline; refcounted `TrustAnchorSnapshot` (G10). |
+| `src/http/acme_tls_dialer.zig` | Production `Dialer` over `UpstreamTlsConn` using `UpstreamTlsOptions.trust_anchors` (no filesystem access per dial). |
+| `src/acme/client.zig` | Directory fetch, single-slot nonce cache (taken before signing, never restored), `signedPost` with a finite `badNonce` budget (default 2 retries), `Session.open` (create/reuse account), `Diagnostics` with `FailureClass` (transport / protocol / persistence / resource). |
+| `src/acme/fake_ca.zig`, `client_tests.zig` | In-process fake CA that verifies every JWS (nonce single-use, `url`, `jwk`/`kid`, ES256 signature) and can script hostile behavior. |
+
+Behavior worth knowing:
+
+- Opening with a persisted `account.json` performs **no network I/O**; the CA
+  is only contacted when a request is made (restart during a CA outage keeps
+  the account identity).
+- If registration succeeds at the CA but writing `account.json` fails, the key
+  is already durable, and the next open converges: `newAccount` is idempotent
+  per key (200 with the existing account URL).
+- `account.json` stores the directory URL, account URL, creation time and a
+  SHA-256 of the contact; the email itself is never written.
+- Not in A2: owner-uid check on the state directory (portable stat lacks it
+  in the Zig std surface used here), `Link`-header parsing and certificate-size
+  response caps (A3), and the config grammar/env wiring of §4, which remain
+  unimplemented with the gate closed.
+- The TLS leg of the real dialer is covered by the existing `UpstreamTlsConn`
+  and `webpki_verifier` suites; A2's fake CA replaces only the byte stream
+  beneath HTTP. A loopback TLS CA is A7 interop work.
+
+Run the focused gate with `zig build test-acme` (includes the
+`fuzz: ACME: ...` corpus targets); the same tests also run under `zig build test`.
+
 ## 11. Test plan
 
 - **Deterministic local CA.** An in-process, test-only ACME server written in

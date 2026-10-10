@@ -2669,6 +2669,33 @@ fn h2ResetStreamState(
     h2RemoveReadyStream(ready_streams, stream_id);
 }
 
+fn h2WriteStreamClosedReset(
+    writer: anytype,
+    outbound: *http.h2_outbound_scheduler.Scheduler,
+    allocator: std.mem.Allocator,
+    streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
+    pending: *std.AutoHashMap(u31, Http2PendingStream),
+    pending_responses: *std.AutoHashMap(u31, PendingHttp2Response),
+    ready_streams: *std.array_list.Managed(u31),
+    buffered_request_bytes: *usize,
+    stream_id: u31,
+) !void {
+    // Drop old response output before queuing our RST, otherwise a
+    // backpressured connection could send DATA after stream closure.
+    outbound.cancelStream(stream_id);
+    try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.stream_closed.value());
+    h2ResetStreamState(
+        allocator,
+        streams,
+        pending,
+        pending_responses,
+        ready_streams,
+        buffered_request_bytes,
+        stream_id,
+        null,
+    );
+}
+
 fn h2EncodedHeaderBlockLimit(cfg: *const edge_config.EdgeConfig, buffered_request_bytes: usize) usize {
     var limit = cfg.request_limits.effectiveMaxHeadersTotalSize();
     if (cfg.max_connection_memory_bytes > 0) {
@@ -3389,7 +3416,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     return error.InvalidHttp2StreamId;
                 }
                 if (frame.stream_id <= last_client_stream_id and !streams.contains(frame.stream_id)) {
-                    try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.stream_closed.value());
+                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
                     continue;
                 }
                 last_client_stream_id = @max(last_client_stream_id, frame.stream_id);
@@ -3404,11 +3431,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // SECOND request, duplicating route/auth/handler execution
                 // while the first response is still outstanding.
                 if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
-                    try http.http2_frame.writeRstStream(
-                        outbound_writer,
-                        frame.stream_id,
-                        http.http2_stream.ErrorCode.stream_closed.value(),
-                    );
+                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
                     continue;
                 }
                 if (!streams.contains(frame.stream_id)) {
@@ -3473,11 +3496,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // END_STREAM is a stream error (RFC 7540 §5.1,
                 // half_closed_remote), not new body for a dispatched request.
                 if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
-                    try http.http2_frame.writeRstStream(
-                        outbound_writer,
-                        frame.stream_id,
-                        http.http2_stream.ErrorCode.stream_closed.value(),
-                    );
+                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
                     continue;
                 }
                 const data_payload = h2DataPayload(frame.payload, frame.flags) catch |err| {
@@ -7099,6 +7118,81 @@ test "H2 reset removes parked response while queued output is backpressured" {
     try std.testing.expectEqual(@as(usize, 0), ready.items.len);
     try std.testing.expect(!scheduler.hasPendingOutput());
     scheduler.deinit();
+}
+
+test "local STREAM_CLOSED reset drops queued response before its RST" {
+    const BlockingWriter = struct {
+        blocked: bool = true,
+        out: std.Io.Writer.Allocating,
+
+        pub fn write(self: *@This(), bytes: []const u8) anyerror!usize {
+            if (self.blocked) return error.WouldBlock;
+            try self.out.writer.writeAll(bytes);
+            return bytes.len;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer pending.deinit();
+    var pending_responses = std.AutoHashMap(u31, PendingHttp2Response).init(allocator);
+    defer {
+        var it = pending_responses.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        pending_responses.deinit();
+    }
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    const parked = try allocator.dupe(u8, "parked");
+    try pending_responses.put(1, .{ .body_alloc = parked, .body = parked, .status_code = 200 });
+    try ready.append(1);
+
+    var scheduler = try http.h2_outbound_scheduler.Scheduler.init(allocator, 128);
+    defer scheduler.deinit();
+    try scheduler.enqueueFrame(.data, 0, 1, "stale");
+    try scheduler.enqueueFrame(.data, 0, 3, "sibling");
+    var output = BlockingWriter{ .out = .init(allocator) };
+    defer output.out.deinit();
+    try scheduler.flush(&output);
+
+    var buffered_request_bytes: usize = 0;
+    try h2WriteStreamClosedReset(
+        scheduler.writer(),
+        &scheduler,
+        allocator,
+        &streams,
+        &pending,
+        &pending_responses,
+        &ready,
+        &buffered_request_bytes,
+        1,
+    );
+    try std.testing.expect(!streams.contains(1));
+    try std.testing.expect(!pending_responses.contains(1));
+    output.blocked = false;
+    try scheduler.flush(&output);
+
+    var offset: usize = 0;
+    var saw_sibling = false;
+    var saw_reset = false;
+    while (offset < output.out.written().len) {
+        const frame = output.out.written()[offset..];
+        const payload_len = (@as(usize, frame[0]) << 16) | (@as(usize, frame[1]) << 8) | frame[2];
+        const stream_id = std.mem.readInt(u32, frame[5..9], .big) & 0x7fff_ffff;
+        if (frame[3] == @intFromEnum(http.http2_frame.Type.data)) {
+            try std.testing.expectEqual(@as(u32, 3), stream_id);
+            try std.testing.expectEqualSlices(u8, "sibling", frame[9 .. 9 + payload_len]);
+            saw_sibling = true;
+        } else {
+            try std.testing.expectEqual(@as(u8, @intFromEnum(http.http2_frame.Type.rst_stream)), frame[3]);
+            try std.testing.expectEqual(@as(u32, 1), stream_id);
+            saw_reset = true;
+        }
+        offset += 9 + payload_len;
+    }
+    try std.testing.expect(saw_sibling and saw_reset);
 }
 
 test "H2 deferred ready stream wakes on handshake completion without extra H2 frame" {

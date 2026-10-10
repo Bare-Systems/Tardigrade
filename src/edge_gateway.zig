@@ -2653,7 +2653,9 @@ fn h2ResetStreamState(
     ready_streams: *std.array_list.Managed(u31),
     buffered_request_bytes: *usize,
     stream_id: u31,
+    outbound: ?*http.h2_outbound_scheduler.Scheduler,
 ) void {
+    if (outbound) |scheduler| scheduler.cancelStream(stream_id);
     _ = streams.remove(stream_id);
     if (pending.fetchRemove(stream_id)) |removed| {
         var tmp = removed.value;
@@ -3546,8 +3548,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                         return error.InvalidWindowUpdateFrame;
                     } else {
+                        outbound.cancelStream(frame.stream_id);
                         try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.protocol_error.value());
-                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
+                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, null);
                     }
                     continue;
                 }
@@ -3566,8 +3569,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 } else if (streams.getPtr(frame.stream_id)) |s| {
                     const new_window: i64 = @as(i64, s.send_window) + @as(i64, inc);
                     if (new_window > std.math.maxInt(i32)) {
+                        outbound.cancelStream(frame.stream_id);
                         try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
-                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
+                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, null);
                     } else {
                         s.send_window = @intCast(new_window);
                     }
@@ -3587,7 +3591,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
                     return error.InvalidRstStreamFrame;
                 }
-                h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
+                h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, &outbound);
             },
             .goaway => {
                 if (frame.stream_id != 0 or frame.payload.len < 8) {
@@ -7088,12 +7092,12 @@ test "H2 reset removes parked response while queued output is backpressured" {
         &ready,
         &buffered_request_bytes,
         1,
+        &scheduler,
     );
     try std.testing.expect(!streams.contains(1));
     try std.testing.expect(!pending_responses.contains(1));
     try std.testing.expectEqual(@as(usize, 0), ready.items.len);
-    // The connection-level scheduler owns already-serialized bytes until the
-    // connection closes; teardown releases that retained active frame once.
+    try std.testing.expect(!scheduler.hasPendingOutput());
     scheduler.deinit();
 }
 

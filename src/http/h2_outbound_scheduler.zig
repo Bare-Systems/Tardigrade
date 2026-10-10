@@ -9,7 +9,10 @@ const http2_frame = @import("http2_frame.zig");
 
 pub const default_max_queued_bytes: usize = 256 * 1024;
 
-const Entry = struct { bytes: []u8 };
+const Entry = struct {
+    bytes: []u8,
+    stream_id: u31,
+};
 const Active = struct { entry: Entry, offset: usize = 0 };
 
 pub const Scheduler = struct {
@@ -95,12 +98,13 @@ pub const Scheduler = struct {
         if (frame.len < 9) return error.InvalidFrame;
         const declared = (@as(usize, frame[0]) << 16) | (@as(usize, frame[1]) << 8) | @as(usize, frame[2]);
         if (declared + 9 != frame.len) return error.InvalidFrame;
+        const stream_id: u31 = @intCast(std.mem.readInt(u32, frame[5..9], .big) & 0x7fff_ffff);
 
         self.mutex.lock();
         defer self.mutex.unlock();
         const owned = try self.allocator.dupe(u8, frame);
         errdefer self.allocator.free(owned);
-        try self.enqueueOwnedLocked(owned);
+        try self.enqueueOwnedLocked(.{ .bytes = owned, .stream_id = stream_id });
     }
 
     /// Atomically copies a complete frame while holding the queue mutex. This
@@ -120,19 +124,47 @@ pub const Scheduler = struct {
         owned[4] = flags;
         std.mem.writeInt(u32, owned[5..9], @as(u32, stream_id) & 0x7fff_ffff, .big);
         @memcpy(owned[9..], payload);
-        try self.enqueueOwnedLocked(owned);
+        try self.enqueueOwnedLocked(.{ .bytes = owned, .stream_id = stream_id });
     }
 
-    fn enqueueOwnedLocked(self: *Scheduler, owned: []u8) Error!void {
-        if (owned.len > self.max_queued_bytes -| self.queued_bytes) return error.QueueFull;
-        self.entries.append(self.allocator, .{ .bytes = owned }) catch |err| return err;
-        self.queued_bytes += owned.len;
+    fn enqueueOwnedLocked(self: *Scheduler, owned: Entry) Error!void {
+        if (owned.bytes.len > self.max_queued_bytes -| self.queued_bytes) return error.QueueFull;
+        self.entries.append(self.allocator, owned) catch |err| return err;
+        self.queued_bytes += owned.bytes.len;
         if (!self.wake_pending.load(.acquire)) self.signalLocked() catch |err| {
             const removed = self.entries.pop().?;
             self.queued_bytes -= removed.bytes.len;
             return err;
         };
         self.wake_pending.store(true, .release);
+    }
+
+    /// Remove unsent frames for a stream after an inbound RST_STREAM.  A frame
+    /// already partially written must finish so its wire framing remains valid.
+    pub fn cancelStream(self: *Scheduler, stream_id: u31) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            if (self.entries.items[i].stream_id == stream_id) {
+                const removed = self.entries.orderedRemove(i);
+                self.queued_bytes -= removed.bytes.len;
+                self.allocator.free(removed.bytes);
+                continue;
+            }
+            i += 1;
+        }
+        if (self.active) |active| {
+            if (active.entry.stream_id == stream_id and active.offset == 0) {
+                self.active = null;
+                self.queued_bytes -= active.entry.bytes.len;
+                self.allocator.free(active.entry.bytes);
+            }
+        }
+        if (self.active == null and self.entries.items.len == 0) {
+            self.drainWakeLocked();
+            self.wake_pending.store(false, .release);
+        }
     }
 
     /// The sole connection runtime calls this. A temporary `WouldBlock` keeps
@@ -353,6 +385,70 @@ test "deinit releases active and queued frames after blocked output" {
     try std.testing.expect(scheduler.active != null);
     try std.testing.expectEqual(@as(usize, 1), scheduler.entries.items.len);
     scheduler.deinit();
+}
+
+test "cancel stream drops unsent active and queued frames but keeps siblings" {
+    const BlockingWriter = struct {
+        out: std.Io.Writer.Allocating,
+        blocked: bool = true,
+
+        fn write(self: *@This(), bytes: []const u8) anyerror!usize {
+            if (self.blocked) return error.WouldBlock;
+            try self.out.writer.writeAll(bytes);
+            return bytes.len;
+        }
+    };
+    const first = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 1, 'a' };
+    const follower = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 1, 'b' };
+    const sibling = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 3, 'c' };
+    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    defer scheduler.deinit();
+    try scheduler.enqueue(&first);
+    try scheduler.enqueue(&follower);
+    try scheduler.enqueue(&sibling);
+    var writer = BlockingWriter{ .out = .init(std.testing.allocator) };
+    defer writer.out.deinit();
+    try scheduler.flush(&writer);
+    scheduler.cancelStream(1);
+    writer.blocked = false;
+    try scheduler.flush(&writer);
+    try std.testing.expectEqualSlices(u8, &sibling, writer.out.written());
+}
+
+test "cancel stream finishes a partial frame but drops later frames" {
+    const PartialWriter = struct {
+        out: std.Io.Writer.Allocating,
+        phase: u2 = 0,
+
+        fn write(self: *@This(), bytes: []const u8) anyerror!usize {
+            if (self.phase == 0) {
+                self.phase = 1;
+                try self.out.writer.writeAll(bytes[0..4]);
+                return 4;
+            }
+            if (self.phase == 1) {
+                self.phase = 2;
+                return error.WouldBlock;
+            }
+            try self.out.writer.writeAll(bytes);
+            return bytes.len;
+        }
+    };
+    const first = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 1, 'a' };
+    const follower = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 1, 'b' };
+    const sibling = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 3, 'c' };
+    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    defer scheduler.deinit();
+    try scheduler.enqueue(&first);
+    try scheduler.enqueue(&follower);
+    try scheduler.enqueue(&sibling);
+    var writer = PartialWriter{ .out = .init(std.testing.allocator) };
+    defer writer.out.deinit();
+    try scheduler.flush(&writer);
+    scheduler.cancelStream(1);
+    try scheduler.flush(&writer);
+    try std.testing.expectEqualSlices(u8, &first, writer.out.written()[0..first.len]);
+    try std.testing.expectEqualSlices(u8, &sibling, writer.out.written()[first.len..]);
 }
 
 test "reentrant drain attempt preserves the active frame exactly once" {

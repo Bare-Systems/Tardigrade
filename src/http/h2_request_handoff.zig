@@ -349,11 +349,53 @@ pub const Handoff = struct {
     }
 
     fn clearWakeLocked(self: *Handoff) void {
-        var bytes: [64]u8 = undefined;
-        while (std.c.read(self.wake_read, &bytes, bytes.len) > 0) {}
-        self.wake_pending = false;
+        if (drainWake(.{ .ctx = self, .read_fn = readWakeC }, self.wake_read)) {
+            self.wake_pending = false;
+        }
     }
 };
+
+const WakeReadResult = union(enum) {
+    bytes: usize,
+    eof,
+    interrupted,
+    would_block,
+    failed,
+};
+
+const WakeReader = struct {
+    ctx: *anyopaque,
+    read_fn: *const fn (ctx: *anyopaque, fd: std.posix.fd_t, bytes: []u8) WakeReadResult,
+
+    fn read(self: WakeReader, fd: std.posix.fd_t, bytes: []u8) WakeReadResult {
+        return self.read_fn(self.ctx, fd, bytes);
+    }
+};
+
+/// Drain a coalesced wake notification. An interrupted read did not consume a
+/// byte, so only EOF or a non-blocking empty read proves the wake fd is clear.
+fn drainWake(reader: WakeReader, fd: std.posix.fd_t) bool {
+    var bytes: [64]u8 = undefined;
+    while (true) {
+        switch (reader.read(fd, &bytes)) {
+            .bytes => continue,
+            .interrupted => continue,
+            .eof, .would_block => return true,
+            .failed => return false,
+        }
+    }
+}
+
+fn readWakeC(_: *anyopaque, fd: std.posix.fd_t, bytes: []u8) WakeReadResult {
+    const n = std.c.read(fd, bytes.ptr, bytes.len);
+    if (n > 0) return .{ .bytes = @intCast(n) };
+    if (n == 0) return .eof;
+    return switch (std.posix.errno(n)) {
+        .INTR => .interrupted,
+        .AGAIN => .would_block,
+        else => .failed,
+    };
+}
 
 fn setNonBlocking(fd: std.posix.fd_t) Error!void {
     const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
@@ -494,7 +536,26 @@ test "H2 request handoff moves accepted work without allocator activity" {
     try std.testing.expectEqual(@as(usize, 1), counter.jobs);
 }
 
-test "H2 request handoff completion wake is pollable and rearms" {
+test "H2 request handoff wake drain retries interrupted reads" {
+    const Script = struct {
+        step: usize = 0,
+
+        fn read(raw: *anyopaque, _: std.posix.fd_t, _: []u8) WakeReadResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            defer self.step += 1;
+            return switch (self.step) {
+                0 => .interrupted,
+                1 => .{ .bytes = 1 },
+                else => .would_block,
+            };
+        }
+    };
+    var script = Script{};
+    try std.testing.expect(drainWake(.{ .ctx = &script, .read_fn = Script.read }, -1));
+    try std.testing.expectEqual(@as(usize, 3), script.step);
+}
+
+test "H2 request handoff wakes blocked connection owner and rearms" {
     const Counter = struct {
         jobs: usize = 0,
         completions: usize = 0,
@@ -520,25 +581,69 @@ test "H2 request handoff completion wake is pollable and rearms" {
             }) catch @panic("completion handoff failed");
         }
     };
+    const Waiter = struct {
+        handoff: *Handoff,
+        mutex: compat.Mutex = .{},
+        cond: compat.Condition = .{},
+        entered_poll: bool = false,
+        woke: bool = false,
+
+        fn run(self: *@This()) void {
+            self.mutex.lock();
+            // This is deliberately the instruction immediately before the
+            // blocking poll, so the test releases a worker only after the
+            // connection owner is poised to block.
+            self.entered_poll = true;
+            self.cond.broadcast();
+            self.mutex.unlock();
+
+            var fds = [_]std.posix.pollfd{.{ .fd = self.handoff.wakeFd(), .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, 1_000) catch @panic("wake poll failed");
+            self.mutex.lock();
+            self.woke = ready == 1 and (fds[0].revents & std.posix.POLL.IN) != 0;
+            self.cond.broadcast();
+            self.mutex.unlock();
+        }
+
+        fn waitUntilEntered(self: *@This()) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (!self.entered_poll) self.cond.wait(&self.mutex);
+        }
+    };
 
     var counter = Counter{};
     var handoff = try Handoff.init(std.testing.allocator, 1);
     defer handoff.deinit();
     try handoff.submit(.{ .stream_id = 7, .payload = &counter, .deinit_fn = Counter.dropJob });
-    var lease = handoff.takeJob().?;
+    var first_lease = handoff.takeJob().?;
+    var first_waiter = Waiter{ .handoff = &handoff };
+    const first_wait_thread = try std.Thread.spawn(.{}, Waiter.run, .{&first_waiter});
+    first_waiter.waitUntilEntered();
+    var first_worker = Worker{ .handoff = &handoff, .lease = &first_lease, .counter = &counter };
+    const first_worker_thread = try std.Thread.spawn(.{}, Worker.run, .{&first_worker});
+    first_worker_thread.join();
+    first_wait_thread.join();
+    try std.testing.expect(first_waiter.woke);
+    const first = handoff.takeCompletion().?;
+    try std.testing.expectEqual(@as(u31, 7), first.stream_id);
+    first.deinit();
 
-    var fds = [_]std.posix.pollfd{.{ .fd = handoff.wakeFd(), .events = std.posix.POLL.IN, .revents = 0 }};
-    try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&fds, 0));
-    var worker = Worker{ .handoff = &handoff, .lease = &lease, .counter = &counter };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&fds, 1_000));
-    thread.join();
-
-    const delivered = handoff.takeCompletion().?;
-    try std.testing.expectEqual(@as(u31, 7), delivered.stream_id);
-    delivered.deinit();
-    fds[0].revents = 0;
-    try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&fds, 0));
-    try std.testing.expectEqual(@as(usize, 1), counter.jobs);
-    try std.testing.expectEqual(@as(usize, 1), counter.completions);
+    // Draining clears `wake_pending`. A second completion must write a fresh
+    // wake byte and unblock another connection-owner poll.
+    try handoff.submit(.{ .stream_id = 9, .payload = &counter, .deinit_fn = Counter.dropJob });
+    var second_lease = handoff.takeJob().?;
+    var second_waiter = Waiter{ .handoff = &handoff };
+    const second_wait_thread = try std.Thread.spawn(.{}, Waiter.run, .{&second_waiter});
+    second_waiter.waitUntilEntered();
+    var second_worker = Worker{ .handoff = &handoff, .lease = &second_lease, .counter = &counter };
+    const second_worker_thread = try std.Thread.spawn(.{}, Worker.run, .{&second_worker});
+    second_worker_thread.join();
+    second_wait_thread.join();
+    try std.testing.expect(second_waiter.woke);
+    const second = handoff.takeCompletion().?;
+    try std.testing.expectEqual(@as(u31, 9), second.stream_id);
+    second.deinit();
+    try std.testing.expectEqual(@as(usize, 2), counter.jobs);
+    try std.testing.expectEqual(@as(usize, 2), counter.completions);
 }

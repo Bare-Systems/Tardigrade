@@ -35,6 +35,17 @@ pub const Frame = struct {
 
 pub const HEADER_LEN: usize = 9;
 
+fn hasFrameEnqueuer(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| switch (@typeInfo(pointer.child)) {
+            .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(pointer.child, "enqueueFrame"),
+            else => false,
+        },
+        .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, "enqueueFrame"),
+        else => false,
+    };
+}
+
 pub fn readFrame(conn: anytype, allocator: std.mem.Allocator, max_frame_size: usize) !Frame {
     var header: [HEADER_LEN]u8 = undefined;
     try readExact(conn, header[0..]);
@@ -60,6 +71,11 @@ pub fn deinitFrame(allocator: std.mem.Allocator, frame: *Frame) void {
 }
 
 pub fn writeFrame(writer: anytype, typ: Type, flags: u8, stream_id: u31, payload: []const u8) !void {
+    // A connection-owned outbound scheduler accepts the complete frame in one
+    // transaction.  Keep ordinary writers on the conventional two-write path.
+    if (comptime hasFrameEnqueuer(@TypeOf(writer))) {
+        return writer.enqueueFrame(typ, flags, stream_id, payload);
+    }
     var header: [HEADER_LEN]u8 = undefined;
     header[0] = @as(u8, @intCast((payload.len >> 16) & 0xFF));
     header[1] = @as(u8, @intCast((payload.len >> 8) & 0xFF));

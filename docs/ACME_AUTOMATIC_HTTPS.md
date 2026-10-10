@@ -92,6 +92,7 @@ does not), **Missing** (nothing in tree).
 | G8 | Optional HTTP→HTTPS redirect (served by the G9 listener) | A4 |
 | G9 | Dedicated bounded challenge-only HTTP-01 listener: config, bind-before-drop, lifecycle, limits (§8.0) | A3 |
 | G10 | Preloaded refcounted CA trust-anchor snapshot and a `UpstreamTlsOptions` field to use it, so CA connections touch no filesystem post-drop (§9.3) | A2 |
+| G11 | Automatic-HTTPS TLS topology: `automatic_https` itself makes the main listener TLS from process start (§7.4.1) | A4 |
 
 ## 3. Requirement map (#759)
 
@@ -262,7 +263,7 @@ Manual and managed identities coexist deterministically:
   operator-owned. ACME never replaces or modifies it. Managed hostnames
   are added as named bundles beside it; an unmapped SNI keeps today's
   `use_default_when_identity_matches` behavior.
-- ACME-only mode (no cert/key configured) is allowed: the listener starts,
+- ACME-only mode (no cert/key configured) is allowed: the main listener starts as TLS (§7.4.1, G11),
   the provider has no usable bundle for managed names until first issuance,
   and handshakes for them fail closed with a TLS alert, not plaintext (§7.4).
 - Manual files are never read from or written to the state directory.
@@ -515,6 +516,43 @@ anti-replay is unaffected.
 
 ### 7.4 Bootstrap and fallback
 
+#### 7.4.1 Startup TLS topology (G11, A4)
+
+Today the main listener is TLS only when `edge_config.hasTlsFiles(cfg)`
+(cert **and** key set); `src/edge_gateway.zig` constructs
+`NativeCredentialStore` and sets `native_tls_provider` /
+`h3_credential_provider` only inside that branch. An ACME-only config would
+therefore start as **plaintext** on the HTTPS port. A4's automatic-HTTPS
+wiring must change this: `automatic_https` itself makes the main listener
+TLS from process start, conceptually:
+
+```zig
+const tls_listener_enabled = edge_config.hasTlsFiles(cfg) or cfg.automatic_https;
+if (tls_listener_enabled and is_general_profile) {
+    native_credentials = NativeCredentialStore.init(allocator);
+    if (edge_config.hasTlsFiles(cfg))
+        try native_credentials.reloadFromFiles(...);
+    // otherwise intentionally empty until persisted/issued credentials load
+    native_tls_provider = native_credentials.provider();
+    h3_credential_provider = native_credentials.provider();
+}
+```
+
+The exact API may differ; the invariants may not: an empty provider fails
+handshakes with `NoCredentialAvailable`; plaintext is never accepted on
+the TLS port; `native_tls_provider` is non-null whenever `automatic_https`
+is on (the existing `ClientTrustUnavailable` defensive check in startup
+stays). Because TLS topology is startup-fixed, toggling `automatic_https`
+on reload is rejected as restart-required, alongside the existing "enable or
+disable native TLS" rejection.
+
+Required tests (A4): ACME-only first boot accepts no plaintext on the
+listener (a plaintext request gets a handshake failure, not an HTTP
+response); a TLS handshake for a managed name fails closed before first
+issuance and succeeds after a publish, without restart; reload that toggles
+`automatic_https` is rejected; H3 uses the same provider handle.
+
+
 - **ACME-only start (no cert yet).** The TLS listener binds with a provider
   that has no bundle for managed names. Handshakes for them fail with the
   existing `NoCredentialAvailable` path (a fatal alert), never plaintext and
@@ -692,9 +730,10 @@ named by `current` are removed at startup.
 ### 9.3 Privilege
 
 The worker runs in the same process and uid as the gateway. It needs read/write
-on `state_dir` and outbound HTTPS to the CA. It needs **no** extra
-privileges: HTTP-01 is served by the existing listener (binding port 80 is an
-existing deployment concern, not an ACME one). If the process drops
+on `state_dir` and outbound HTTPS to the CA, and **no** extra privileges. The
+dedicated HTTP-01 listener is bound by startup code **before** privilege
+drop/chroot (§8.0), and a bind failure fails startup; after the drop the
+worker only reads and writes challenge state in memory. If the process drops
 privileges or chroots after startup (`src/main.zig` runtime identity), the
 state dir must be inside the chroot and writable by the dropped uid;
 validation checks this at startup, before the drop.
@@ -749,7 +788,7 @@ changes no operator-visible support claim until A7.
 | --- | --- | --- | --- |
 | **A2 Accounts and transport** (#832) | `src/acme/account.zig`: `AccountKey` (generate/load/save, G3, G6), `Jwk`, `Jwk.thumbprint()` (final base64url string, §5.1), `Jws.sign()` (ES256, `jwk`/`kid`), `StateDir` open/validate/atomic-write/lock helpers. `src/acme/transport.zig`: bounded native HTTPS client over `UpstreamTlsConn` (G1), `AcmeTrustAnchors` + `UpstreamTlsOptions.trust_anchors` (G10), directory fetch, nonce handling (§5.3), CA-URL rules (§6.3). Config grammar and validation (§4) with the gate still closed. | account key, state dir, CA transport, trust anchors | `0600` exclusive-create; wipe on deinit; no key in logs; directory-mismatch fatal; caps §9.1; no redirects; no post-drop file access. |
 | **A3 Orders / HTTP-01** (#833) | `src/acme/orders.zig`: `Order`, `Authorization`, challenge, finalize, download using A2's transport; CSR writer (G4); `ChallengeStore` hardening (G5); dedicated challenge listener `acme_http01_listen` (G9, §8.0). Produces `IssuedChain{ key, chain_pem }`. Replaces the `acme_client.zig` stub surface. | protocol, CSR, challenge listener | token charset, host-bound store, listener limits §8.0, bind-before-drop, serialized CA traffic. |
-| **A4 Activation** (#834) | `src/acme/activate.zig`: `verifyIssued()` (§6.4), `persist()` generation model (§9.2), bytes-based `prepareReloadFromBundles` (G2) on `NativeCredentialStore`; automatic-HTTPS wiring and HTTP→HTTPS redirect (G8, §8.3). Publishes through the existing provider. | verification, persistence, publish, redirect | persist-before-publish; `current` is the only commit point; no independent store; constant-time key binding. |
+| **A4 Activation** (#834) | startup TLS-topology change so `automatic_https` yields an initially-empty TLS provider (G11, §7.4.1); `src/acme/activate.zig`: `verifyIssued()` (§6.4), `persist()` generation model (§9.2), bytes-based `prepareReloadFromBundles` (G2) on `NativeCredentialStore`; automatic-HTTPS wiring and HTTP→HTTPS redirect (G8, §8.3). Publishes through the existing provider. | verification, persistence, publish, redirect | persist-before-publish; `current` is the only commit point; no independent store; constant-time key binding. |
 | **A5 Renewal** (#835) | `src/acme/worker.zig`: scheduler, backoff, due logic, cancel/restart/reload (§5.4–5.5, G7); metrics (§9.4). | worker lifecycle | failure floor across restarts; interruptible waits; no CA hammering. |
 | **A6 TLS-ALPN-01 / multi-SNI** | Validation-cert bundle selectable only under ALPN `acme-tls/1` (§8.4); per-group order wiring for multiple SNI names. | selector extension | validation cert never selectable for normal ALPN. |
 | **A7 Interop / release gating** | Local-CA interop in CI, TLS client matrix, fuzz targets, docs/support-matrix/CHANGELOG, flip the gate and update `TLS_DEPENDENCY_POLICY.md` and `SUPPORT_MATRIX.md`. | release | no support claim before all of §11 passes; production CA never contacted by CI. |

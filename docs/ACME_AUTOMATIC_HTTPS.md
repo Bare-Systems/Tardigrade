@@ -67,28 +67,31 @@ does not), **Missing** (nothing in tree).
 | H1/H2/H3 sharing | `src/edge_gateway.zig` | **Reusable** | One `NativeCredentialStore` provider is handed to both `native_tls_provider` (TCP; H1 and H2 via ALPN) and `h3_credential_provider` (QUIC). One publish serves all three. |
 | Hot reload | `src/gateway_shutdown.zig` (`prepareReloadFromFiles` → commit) | **Reusable pattern** | Prepare-then-publish; a failed prepare rejects the reload and leaves the serving generation. TLS topology (enable/disable) is startup-fixed and rejected on reload. |
 | Appliance credentials | `src/tls/appliance_credentials.zig` | **Reusable pattern, not extended** | Strict single Ed25519 identity published through the same `ReloadableProvider`. Appliance ACME stays fail-closed (§4.6). |
-| Outbound TLS client | `src/http/upstream_tls.zig` (`UpstreamTlsConn`) | **Reusable transport, missing HTTP layer** | Full verification via `webpki_verifier`; `ca_bundle_path` empty → system bundle candidates → `NoSystemTrustAnchors`. It is a raw connection owned by the proxy path. No bounded HTTP/1.1 request/response client with JSON bodies (G1). |
+| Outbound TLS client | `src/http/upstream_tls.zig` (`UpstreamTlsConn`) | **Reusable transport, missing HTTP layer** | Full verification via `webpki_verifier`; `ca_bundle_path` empty → system bundle candidates → `NoSystemTrustAnchors`. It is a raw connection owned by the proxy path. No bounded HTTP/1.1 request/response client with JSON bodies (G1; trust anchors loaded per connection, G10). |
 | X.509 parsing, validity, SAN, SPKI | `src/pki/x509.zig`, `time.zig`, `identity.zig` | **Reusable** | Gives expiry (`Validity`), SAN match (`verifyHost`), SPKI for key/cert binding. |
-| P-256 ECDSA signing, SHA-256, OS entropy | `src/crypto/pure_zig.zig`, `std.crypto` | **Reusable** | `SoftwareEcdsaP256SigningKey.fromSeed/fromScalarBytes`, SHA-256 for JWK thumbprint and key authorization. |
+| P-256 ECDSA signing, SHA-256, OS entropy | `src/crypto/pure_zig.zig`, `std.crypto` | **Reusable** | `SoftwareEcdsaP256SigningKey.fromSeed/fromScalarBytes`, SHA-256 for the JWK thumbprint (key authorization is plain concatenation, no further hash). |
 | Key generation for a persistent P-256 key | — | **Missing** | Only ephemeral key-share generation exists (G3). |
 | DER encoder / CSR writer | `src/pki/der.zig` is a parser | **Missing** | G4. |
 | PKCS#8/SEC1 PEM writer, atomic secret-file writer | — | **Missing** | G6. |
 | JSON, base64url, JWS framing | `std.json`, `std.base64.url_safe_no_pad` | **Reusable** | Must be bounded (§9). |
 | Renewal scheduling, background worker | — | **Missing** | G7. |
 | HTTP→HTTPS redirect | — | **Missing** | Only generic `internal_redirect_rules` exist. G8. |
+| Second (plaintext) listener | — | **Missing** | Single top-level `listen_host/listen_port`; TLS startup-fixed. G9. |
 
 ### Gaps
 
 | ID | Gap | Owner |
 | --- | --- | --- |
-| G1 | Bounded HTTPS request/response client for CA traffic (HEAD, POST, GET; status, `Replay-Nonce`, `Location`, `Retry-After`, `Link`; capped bodies; deadlines) built on `UpstreamTlsConn` | A3 |
+| G1 | Bounded HTTPS request/response client for CA traffic (HEAD, POST, GET; status, `Replay-Nonce`, `Location`, `Retry-After`, `Link`; capped bodies; deadlines) built on `UpstreamTlsConn` (#832) | A2 |
 | G2 | Publish a bundle set from in-memory DER chains and signer owners (not paths) into the live provider, preserving unrelated bundles | A4 |
 | G3 | Persistent P-256 key generation (account and leaf) from OS entropy with scalar validation, wiped buffers, `crypto.secrets` ownership | A2 |
 | G4 | DER writer sufficient for a PKCS#10 CSR (subject, SAN extension request, ECDSA-SHA256 signature) | A3 |
 | G5 | Challenge store bounds: entry cap, value cap, TTL, host binding | A3 |
 | G6 | PKCS#8 PEM writer and atomic `0600` file writer (temp → fsync → rename → fsync dir) | A2 |
 | G7 | Renewal worker: scheduler, jitter, backoff, cancellation | A5 |
-| G8 | Optional HTTP→HTTPS redirect with challenge exemption | A5 |
+| G8 | Optional HTTP→HTTPS redirect (served by the G9 listener) | A4 |
+| G9 | Dedicated bounded challenge-only HTTP-01 listener: config, bind-before-drop, lifecycle, limits (§8.0) | A3 |
+| G10 | Preloaded refcounted CA trust-anchor snapshot and a `UpstreamTlsOptions` field to use it, so CA connections touch no filesystem post-drop (§9.3) | A2 |
 
 ## 3. Requirement map (#759)
 
@@ -112,11 +115,11 @@ does not), **Missing** (nothing in tree).
 
 ```mermaid
 flowchart TD
-  A1[A1 design contract - this doc] --> A2[A2 accounts and key custody]
-  A1 --> A3[A3 orders and HTTP-01]
+  A1[A1 design contract - this doc] --> A2[A2 accounts, JWS, HTTPS transport, state]
+  A1 --> A3[A3 orders, CSR, HTTP-01 listener]
   A2 --> A3
-  A3 --> A4[A4 validate and atomic activate]
-  A4 --> A5[A5 renewal, redirect, restart recovery]
+  A3 --> A4[A4 verify, persist, activate, redirect]
+  A4 --> A5[A5 renewal scheduler and restart recovery]
   A4 --> A6[A6 TLS-ALPN-01 and multi-SNI]
   A5 --> A7[A7 interop and release gating]
   A6 --> A7
@@ -128,7 +131,7 @@ flowchart TD
     P5[ChallengeStore + gateway route]
   end
   A2 -.-> P3
-  A3 -.-> P4
+  A2 -.-> P4
   A3 -.-> P5
   A4 -.-> P1
   A4 -.-> P2
@@ -151,10 +154,11 @@ muscle memory keep working.
 | `TARDIGRADE_TLS_ACME_EMAIL` | `acme_email` | email | `""` | Account contact. Optional; sent as `mailto:`. |
 | `TARDIGRADE_TLS_ACME_STATE_DIR` | `acme_state_dir` | path | required | Durable state root (§4.4). Replaces `..._CERT_DIR`, which remains an alias. |
 | `TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH` | `acme_account_key_path` | path | `<state_dir>/account.key` | Override only for operators who pre-provision a key. |
-| `TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH` | `acme_ca_bundle_path` | path | `""` | Trust anchors used to verify the **ACME directory server**. Empty uses the system bundle. Required for private/test CAs. Never affects downstream client verification. |
+| `TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH` | `acme_ca_bundle_path` | path | `""` | Trust anchors used to verify the **ACME directory server**. Empty uses the system bundle. Required for private/test CAs. Loaded before privilege drop (§9.3). Never affects downstream client verification. |
 | `TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY` | `acme_renew_days_before_expiry` | u32 | `30` | Renewal window; `1..=60`, and must be less than the certificate lifetime (§5.5). |
 | `TARDIGRADE_TLS_ACME_CHALLENGES` | `acme_challenges` | enum CSV | `http-01` | `http-01`; `tls-alpn-01` is accepted only after A6. |
 | `TARDIGRADE_TLS_ACME_EAB_KID` / `_EAB_HMAC_KEY_PATH` | `acme_eab_*` | | unset | External account binding. **Out of scope for A2–A7**; reserved so the grammar does not change later. Set → config error until implemented. |
+| `TARDIGRADE_TLS_ACME_HTTP01_LISTEN` | `acme_http01_listen` | `host:port` | `0.0.0.0:80` | Dedicated challenge listener (§8.0). Required when `http-01` is configured; cannot equal the main listener. Startup-fixed. |
 | `TARDIGRADE_TLS_HTTP_REDIRECT` | `https_redirect` | bool | `false` | Optional HTTP→HTTPS redirect (§8.3). Only valid with `automatic_https`. |
 
 The default directory URL is production on purpose: it matches the existing
@@ -195,14 +199,23 @@ Must be `https://`, a host, no userinfo, no fragment, ≤ 2048 bytes. Plain
 
 ```
 <state_dir>/                 mode 0700, owned by the runtime user
+  .lock                      advisory flock, one process per state dir
   account.key                0600, PKCS#8 PEM, P-256
   account.json               0600, {directory, kid, created_at, contact_hash}
   groups/<group-id>/
-    leaf.key                 0600, PKCS#8 PEM, P-256 (current)
-    chain.pem                0644-or-stricter, leaf-first, validated
-    meta.json                0600, {not_before, not_after, generation_hint, names}
+    current                  0600, atomically replaced; one line: <gen-id>\n
+    generations/<gen-id>/    immutable once `current` names it
+      leaf.key               0600, PKCS#8 PEM, P-256
+      chain.pem              0644-or-stricter, leaf-first
+      meta.json              0600, {not_before, not_after, names, issued_at, last_attempt_at}
     pending/                 in-flight order only; removed on completion
 ```
+
+`gen-id` is `<unix-seconds>-<8 random hex bytes>`: unique, sortable, and
+unrelated to `Snapshot.generation` (the in-memory provider counter, which
+restarts at 1 and is not persisted). `current` is the **only** commit
+point: a generation directory is invisible to readers until `current`
+names it, so key and chain can never be mixed across issuances.
 
 `group-id` is a lowercase hex SHA-256 of the sorted name list truncated to 16
 bytes, so renaming the config does not collide with other groups.
@@ -297,7 +310,9 @@ stateDiagram-v2
    identifier. Persist the order URL in `pending/` so restart resumes
    rather than burning rate limit.
 3. **Authorize.** For each authorization, pick the configured challenge
-   type, compute `token || "." || base64url(SHA-256(JWK thumbprint))`,
+   type, compute `key_authorization = token || "." || thumbprint`, where
+   `thumbprint = base64url(SHA-256(canonical_jwk))` (RFC 7638; hashed
+   **once**),
    publish it to the challenge store (host-bound, TTL), then POST `{}` to the
    challenge URL.
 4. **Validating.** POST-as-GET the authorization until `valid`, `invalid`, or
@@ -503,17 +518,19 @@ anti-replay is unaffected.
 - **ACME-only start (no cert yet).** The TLS listener binds with a provider
   that has no bundle for managed names. Handshakes for them fail with the
   existing `NoCredentialAvailable` path (a fatal alert), never plaintext and
-  never a self-signed stand-in. Challenges are served over the plaintext
-  listener (§8), which is what lets the first issuance happen. Config
-  validation requires a plaintext HTTP listener on a port reachable as 80 by
-  the CA when `http-01` is configured (A3 verifies, §12 Q3).
+  never a self-signed stand-in. Challenges are served by the dedicated
+  `acme_http01_listen` listener (§8.0), which is what lets the first
+  issuance happen. Config validation requires it whenever `http-01` is
+  configured; whether the CA can actually reach it is an operator
+  deployment concern surfaced by the failed-authorization metrics.
 - **Renewal failure.** The serving generation is never touched. An expiring
   certificate keeps being served until it actually expires; there is no
   downgrade, no automatic fallback to another cert, no disabling TLS. The
   operator signal is `tardigrade_acme_not_after_seconds` plus alerts (§9).
-- **Corrupt state on disk.** An unreadable `chain.pem`/`leaf.key` pair is
-  treated as "no certificate", renamed to `*.corrupt-<ts>` (never deleted),
-  and re-issued, subject to the failure floor.
+- **Corrupt state on disk.** A generation that fails startup validation
+  (§9.2) is renamed `*.corrupt-<ts>` (never deleted); the previous
+  generation is used if it validates, otherwise the group has no
+  certificate and is re-issued, subject to the failure floor.
 - **Persist succeeds, publish fails** (OOM, `StaleSnapshotGeneration`):
   the on-disk state is already valid; the next wake-up republishes. The
   persisted pair is the truth the provider is rebuilt from at startup, so
@@ -523,7 +540,53 @@ anti-replay is unaffected.
 
 ## 8. Challenge routing and redirects
 
-### 8.1 Precedence (HTTP request path)
+### 8.0 Listener topology (decision)
+
+Tardigrade has one top-level TCP listener (`listen_host`/`listen_port`),
+and TLS is selected process-wide for it by whether a native credential
+provider exists; TLS topology is startup-fixed. With `automatic_https` on,
+that listener is the **TLS** listener (e.g. `:443`), so a CA validating
+HTTP-01 on port 80 can never reach the existing challenge route, and the
+config cannot currently express a second listener. This is gap **G9** and is
+decided here:
+
+**Automatic HTTPS owns a dedicated, bounded, challenge-only plaintext
+listener** (`acme_http01_listen`, default `0.0.0.0:80`):
+
+- **Routing.** It serves exactly `GET`/`HEAD
+  /.well-known/acme-challenge/<token>` for managed hosts (host-bound store
+  lookup, §8.2) and, when `https_redirect` is on, the §8.3 redirect for
+  managed hosts. Everything else gets `404` (or `421` for an unmanaged
+  Host). It never reaches location routing, proxying, auth, rewrite, static
+  files or the application. This removes the §8.1 ordering questions for
+  this listener entirely; there is no application route to precede.
+- **Ownership and lifecycle.** Created by the same startup code that creates
+  the TLS listener; **bound before the privilege drop/chroot** (port 80 is
+  privileged); closed in the shutdown drain with the main listener. The
+  address is startup-fixed: a reload that changes it, or toggles
+  `automatic_https`, is rejected as restart-required, like TLS topology.
+- **Limits.** ≤ 64 concurrent connections (excess accepted-and-closed), 8
+  KiB request head, 5 s head-read deadline, 10 s total per connection, one
+  request per connection (`Connection: close`), no request bodies, no
+  upgrades, no proxy protocol, no keep-alive parking, per-IP accept cap
+  shared with existing accept limits. A flood here cannot consume the main
+  listener's worker budget: it has its own small bounded pool.
+- **Bootstrap.** This listener plus an empty-provider TLS listener (§7.4) is
+  the first-run topology; neither needs the other to exist first.
+- **Port 80 unreachable.** If `acme_http01_listen` cannot be bound,
+  startup fails (deterministic, names the address). It is never a silent
+  downgrade.
+- **External front proxy / load balancer.** Operators whose edge owns port
+  80 set `acme_http01_listen` to an internal address (e.g. `127.0.0.1:8080`)
+  and forward `/.well-known/acme-challenge/` to it, preserving `Host`. This
+  is the supported alternative; running with no challenge listener at all is
+  **not** supported in v1.
+- **Main-listener route.** The existing in-gateway route
+  (`src/edge_gateway.zig`, `acme_prefix`) is retired for the managed-host
+  case once A3 lands; the challenge store becomes owned by the dedicated
+  listener, not `GatewayState`.
+
+### 8.1 Precedence (shared gateway request path; reference)
 
 1. Request-line, Host and TRACE checks as today.
 2. **ACME challenge** for `/.well-known/acme-challenge/<token>` when
@@ -541,8 +604,11 @@ per-IP rate limiting (A3 verifies and tests each). A challenge for a hostname ou
 through to normal routing so an operator-owned `/.well-known/acme-challenge/`
 location keeps working for non-managed hosts.
 
-Requests that arrive as TLS early data keep the current `425 Too Early`
-behavior; CA validation uses fresh HTTP, so this never affects issuance.
+This section describes the pre-existing in-gateway route that A3 retires for
+managed hosts (§8.0); it is kept as the audit record and for the miss-fall-through
+rule if the route is retained for non-managed hosts. Requests that arrive as
+TLS early data keep the current `425 Too Early` behavior; CA validation uses
+fresh HTTP, so this never affects issuance.
 
 ### 8.2 Store hardening (G5)
 
@@ -557,15 +623,17 @@ is on and `http-01` is configured, not only when domains are non-empty.
 
 ### 8.3 HTTP→HTTPS redirect (optional)
 
-Off by default. When on: for hosts in `acme_domains` only, a plaintext
+Off by default. Served by the dedicated listener (§8.0) — there is no other
+plaintext listener to attach it to. When on: for hosts in `acme_domains` only, a plaintext
 request outside the challenge path gets `308 Permanent Redirect` to
 `https://<same host><same path+query>`. Rules: the target host comes from
 the **validated** Host header already matched against the managed set (never
 raw header echo); non-managed hosts are not redirected; `Host` ports are
 rewritten to the configured HTTPS port; the redirect is skipped until the
 host has a published certificate, so a first-run deployment never redirects
-users to a closed door. Health endpoints (`/health`) are exempt. This is
-A5's scope and ships behind the same experimental gate.
+users to a closed door. This is A4's scope (#834) and ships behind the same
+experimental gate. Health endpoints are not served on the challenge listener,
+so no exemption is needed.
 
 ### 8.4 Multi-SNI and TLS-ALPN-01 (A6)
 
@@ -596,13 +664,30 @@ selection. Detailed contract in A6; A1 fixes only the invariant.
 
 ### 9.2 Persistence and atomicity
 
-All state files are written with: create temp in the **same directory**
-(`O_CREAT|O_EXCL`, `0600`), write, `fsync`, `rename` over the target,
-`fsync` the directory. A key and its chain are published together by
-writing both into a new `groups/<id>/.next-<ts>/` directory and renaming the
-directory pointer file last, so a crash never leaves a chain whose key is
-from a different issuance. Readers (startup) validate pair consistency
-(§6.4 step 2) and treat any inconsistency as corrupt state (§7.4).
+Single files (`account.key`, `account.json`) are written by: create temp in
+the **same directory** (`O_CREAT|O_EXCL`, `0600`), write, `fsync`, `rename`
+over the target, `fsync` the directory.
+
+Key and chain are never replaced as two live files. Persisting a new
+generation (A4):
+
+1. Create `groups/<id>/generations/<gen-id>/` (`0700`), write `leaf.key`,
+   `chain.pem`, `meta.json` with the single-file procedure; `fsync` each.
+2. `fsync` the generation directory, then `generations/`.
+3. Write `current.tmp` (`0600`, `<gen-id>\n`), `fsync`, `rename` to
+   `current`, `fsync` the group directory. This rename is the commit.
+4. Publish to the provider (§7.1). Only now may older generations be
+   pruned (keep the newest 2, so a bad new generation has a fallback).
+
+Startup strictly validates: `current` is a regular `0600` file of at most
+64 bytes matching `^[0-9]+-[0-9a-f]{16}\n$`; the named directory exists and
+is not a symlink; `leaf.key` and `chain.pem` pass §6.4 including the
+key/cert binding. Any failure marks that generation corrupt (renamed
+`*.corrupt-<ts>`, never deleted), falls back to the previous generation if it
+validates, else treats the group as having no certificate. A crash at any
+step leaves either the old `current` (steps 1–3 incomplete) or the new
+one (step 3 complete) — never a mixture. Orphan generation directories not
+named by `current` are removed at startup.
 
 ### 9.3 Privilege
 
@@ -612,8 +697,29 @@ privileges: HTTP-01 is served by the existing listener (binding port 80 is an
 existing deployment concern, not an ACME one). If the process drops
 privileges or chroots after startup (`src/main.zig` runtime identity), the
 state dir must be inside the chroot and writable by the dropped uid;
-validation checks this at startup, before the drop. The CA trust file is read
-at startup and on reload, before the drop.
+validation checks this at startup, before the drop.
+
+**CA trust anchors (model a: preloaded owner).** Today
+`UpstreamTlsConn.connect()` calls `webpki_verifier.loadTrustAnchors(...,
+ca_bundle_path)` on every connection, which would read the file after
+`applyRuntimeIdentity()` has dropped privileges or chrooted. The design
+therefore does **not** rely on the path staying readable. The ACME
+transport owns an `AcmeTrustAnchors` snapshot (a refcounted
+`webpki_verifier.TrustAnchors`):
+
+- Loaded once at startup, **before** the privilege drop/chroot, from
+  `acme_ca_bundle_path` or, when empty, the first readable
+  `system_ca_bundle_candidates` entry. Failure is a startup error
+  (`NoSystemTrustAnchors`/`VerifyConfigFailed`), not a first-use failure.
+- Reloaded transactionally on config reload only when it is still readable
+  (pre-drop processes); after a drop the snapshot is startup-fixed, and a
+  changed `acme_ca_bundle_path` is rejected as restart-required, matching
+  the TLS-topology rule.
+- `UpstreamTlsOptions` gains a borrowed `trust_anchors` field (G10) used
+  instead of `ca_bundle_path` when set, so `connect()` performs no
+  filesystem access for ACME. Existing proxy callers are unchanged.
+- The snapshot is refcounted so a reload cannot free anchors under an
+  in-flight CA request.
 
 ### 9.4 Observability
 
@@ -641,16 +747,19 @@ changes no operator-visible support claim until A7.
 
 | Phase | Scope and API | Owns | Key security limits |
 | --- | --- | --- | --- |
-| **A2 Accounts** | `src/acme/account.zig`: `AccountKey` (generate/load/save, G3, G6), `Jwk`, `thumbprint()`, `Jws.sign()` (ES256, `jwk`/`kid`), `StateDir` open/validate/atomic-write helpers. Config grammar and validation (§4) with the gate still closed. | account key, state dir | `0600` exclusive-create; wipe on deinit; no key in logs; directory-mismatch fatal. |
-| **A3 Orders / HTTP-01** | `src/acme/client.zig`: bounded HTTPS transport (G1) over `UpstreamTlsConn`; `Directory`, `Nonce`, `Order`, `Authorization`; CSR writer (G4); `ChallengeStore` hardening (G5); gateway route adjustments (§8.1–8.2). Produces `IssuedChain{ key, chain_pem }`. Replaces `acme_client.zig` stub surface. | transport, protocol, CSR | CA-URL rules §6.3, caps §9.1, no redirects, token charset, serialized. |
-| **A4 Activation** | `src/acme/activate.zig`: `verifyIssued()` (§6.4), `persist()` (§9.2), bytes-based `prepareReloadFromBundles` (G2) on `NativeCredentialStore`. Publishes through the existing provider. | verification, persistence, publish | persist-before-publish; no independent store; constant-time key binding. |
-| **A5 Renewal** | `src/acme/worker.zig`: scheduler, backoff, due logic, cancel/restart/reload (§5.4–5.5, G7); HTTP→HTTPS redirect (G8); metrics (§9.4). | worker lifecycle | failure floor across restarts; interruptible waits; no CA hammering. |
+| **A2 Accounts and transport** (#832) | `src/acme/account.zig`: `AccountKey` (generate/load/save, G3, G6), `Jwk`, `Jwk.thumbprint()` (final base64url string, §5.1), `Jws.sign()` (ES256, `jwk`/`kid`), `StateDir` open/validate/atomic-write/lock helpers. `src/acme/transport.zig`: bounded native HTTPS client over `UpstreamTlsConn` (G1), `AcmeTrustAnchors` + `UpstreamTlsOptions.trust_anchors` (G10), directory fetch, nonce handling (§5.3), CA-URL rules (§6.3). Config grammar and validation (§4) with the gate still closed. | account key, state dir, CA transport, trust anchors | `0600` exclusive-create; wipe on deinit; no key in logs; directory-mismatch fatal; caps §9.1; no redirects; no post-drop file access. |
+| **A3 Orders / HTTP-01** (#833) | `src/acme/orders.zig`: `Order`, `Authorization`, challenge, finalize, download using A2's transport; CSR writer (G4); `ChallengeStore` hardening (G5); dedicated challenge listener `acme_http01_listen` (G9, §8.0). Produces `IssuedChain{ key, chain_pem }`. Replaces the `acme_client.zig` stub surface. | protocol, CSR, challenge listener | token charset, host-bound store, listener limits §8.0, bind-before-drop, serialized CA traffic. |
+| **A4 Activation** (#834) | `src/acme/activate.zig`: `verifyIssued()` (§6.4), `persist()` generation model (§9.2), bytes-based `prepareReloadFromBundles` (G2) on `NativeCredentialStore`; automatic-HTTPS wiring and HTTP→HTTPS redirect (G8, §8.3). Publishes through the existing provider. | verification, persistence, publish, redirect | persist-before-publish; `current` is the only commit point; no independent store; constant-time key binding. |
+| **A5 Renewal** (#835) | `src/acme/worker.zig`: scheduler, backoff, due logic, cancel/restart/reload (§5.4–5.5, G7); metrics (§9.4). | worker lifecycle | failure floor across restarts; interruptible waits; no CA hammering. |
 | **A6 TLS-ALPN-01 / multi-SNI** | Validation-cert bundle selectable only under ALPN `acme-tls/1` (§8.4); per-group order wiring for multiple SNI names. | selector extension | validation cert never selectable for normal ALPN. |
 | **A7 Interop / release gating** | Local-CA interop in CI, TLS client matrix, fuzz targets, docs/support-matrix/CHANGELOG, flip the gate and update `TLS_DEPENDENCY_POLICY.md` and `SUPPORT_MATRIX.md`. | release | no support claim before all of §11 passes; production CA never contacted by CI. |
 
-Dependencies are those in the graph in §3. A2 and A3 can proceed in
-parallel only on disjoint files (`account.zig` vs `client.zig`); A3 depends
-on A2's `Jws`/`AccountKey` interface, which A2 must publish first.
+This split matches the existing child issues (#832 accounts/JWS/transport,
+#833 orders and HTTP-01 routing, #834 persistence/activation and redirect
+wiring, #835 renewal, #836 multi-SNI/TLS-ALPN-01, #837 gating); there is one
+scope source of truth. Dependencies are those in the graph in §3. A3 depends
+on A2's `Jws`, `AccountKey` and transport interfaces, which A2 must publish
+first; A4's unit-tested persistence can proceed alongside A3.
 
 ## 11. Test plan
 
@@ -696,7 +805,7 @@ on A2's `Jws`/`AccountKey` interface, which A2 must publish first.
 
 ## 12. Open questions
 
-These do not block A2–A3 but need an owner decision before A7.
+Q3 is resolved (§8.0). The rest do not block A2–A3 but need an owner decision before A7.
 
 1. **Terms of service.** Silent `termsOfServiceAgreed: true` is
    acceptance on the operator's behalf. Recommend a required
@@ -704,9 +813,9 @@ These do not block A2–A3 but need an owner decision before A7.
 2. **Staging vs production default.** §4.1 keeps production for continuity.
    Alternative: require the directory URL explicitly. Recommend keeping the
    default but logging the chosen directory at startup.
-3. **Port 80 requirement.** HTTP-01 needs the CA to reach port 80. Confirm
-   how the plaintext listener coexists with a TLS-only deployment and
-   whether validation should fail or warn when none is configured (A3).
+3. ~~Port 80 requirement~~ — **resolved in §8.0** (dedicated challenge
+   listener). Remaining sub-question: whether a future release should allow
+   a challenge-less deployment using only DNS-01 (out of scope here).
 4. **OCSP stapling / must-staple.** Out of scope; ACME-issued certs do
    not request must-staple.
 5. **ARI (RFC 9773) renewal hints.** Out of scope for A5; fixed-window

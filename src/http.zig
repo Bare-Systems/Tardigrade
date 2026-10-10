@@ -66,6 +66,7 @@ pub const hpack = @import("http/hpack.zig");
 pub const http2_frame = @import("http/http2_frame.zig");
 pub const http2_stream = @import("http/http2_stream.zig");
 pub const h2_outbound_scheduler = @import("http/h2_outbound_scheduler.zig");
+pub const h2_request_handoff = @import("http/h2_request_handoff.zig");
 pub const upstream_h2 = @import("http/upstream_h2.zig");
 pub const stream_transport = @import("stream_transport");
 pub const quic = @import("quic");

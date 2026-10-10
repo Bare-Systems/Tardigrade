@@ -9,7 +9,7 @@
 const std = @import("std");
 const compat = @import("zig_compat");
 
-pub const Error = error{ QueueFull, Closed } || std.mem.Allocator.Error;
+pub const Error = error{ QueueFull, Closed, WakeFailed } || std.mem.Allocator.Error;
 
 /// Opaque, owned request state. `deinit` is called exactly once, either when
 /// the job is cancelled before it starts or when its worker finishes.
@@ -26,7 +26,6 @@ pub const Job = struct {
 /// Opaque, owned response intent. The connection runtime takes this value and
 /// is responsible for serializing it through its outbound scheduler.
 pub const Completion = struct {
-    stream_id: u31,
     payload: *anyopaque,
     deinit_fn: *const fn (payload: *anyopaque) void,
 
@@ -35,9 +34,25 @@ pub const Completion = struct {
     }
 };
 
+/// A completion whose stream routing identity was derived from its source
+/// lease. Workers cannot choose this value.
+pub const DeliveredCompletion = struct {
+    stream_id: u31,
+    completion: Completion,
+
+    pub fn deinit(self: DeliveredCompletion) void {
+        self.completion.deinit();
+    }
+};
+
 const Entry = struct {
     job: Job,
     cancelled: bool = false,
+};
+
+const QueuedCompletion = struct {
+    stream_id: u31,
+    completion: Completion,
 };
 
 /// An in-flight job, owned by exactly one application worker.  The worker
@@ -49,6 +64,12 @@ pub const Lease = struct {
 
     pub fn streamId(self: *const Lease) u31 {
         return self.entry.?.job.stream_id;
+    }
+
+    /// The worker-owned request data. Cancellation only marks the lease, so
+    /// this payload remains valid until the worker calls `finish`.
+    pub fn jobPayload(self: *const Lease) *anyopaque {
+        return self.entry.?.job.payload;
     }
 
     pub fn isCancelled(self: *const Lease) bool {
@@ -82,12 +103,36 @@ pub const Handoff = struct {
     mutex: compat.Mutex = .{},
     pending: std.ArrayList(*Entry) = .empty,
     active: std.ArrayList(*Entry) = .empty,
-    completions: std.ArrayList(Completion) = .empty,
+    completions: std.ArrayList(QueuedCompletion) = .empty,
     outstanding: usize = 0,
     closed: bool = false,
+    wake_read: std.posix.fd_t = -1,
+    wake_write: std.posix.fd_t = -1,
+    wake_pending: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, capacity: usize) Handoff {
-        return .{ .allocator = allocator, .capacity = capacity };
+    /// Pre-reserve each bounded state queue. Every ownership transition after
+    /// this succeeds without allocation, so allocator pressure can reject a
+    /// new job but cannot lose a job already accepted by the handoff.
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) Error!Handoff {
+        var handoff = Handoff{ .allocator = allocator, .capacity = capacity };
+        errdefer handoff.pending.deinit(allocator);
+        try handoff.pending.ensureTotalCapacity(allocator, capacity);
+        errdefer handoff.active.deinit(allocator);
+        try handoff.active.ensureTotalCapacity(allocator, capacity);
+        errdefer handoff.completions.deinit(allocator);
+        try handoff.completions.ensureTotalCapacity(allocator, capacity);
+
+        var fds: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&fds) != 0) return error.WakeFailed;
+        errdefer {
+            _ = std.c.close(fds[0]);
+            _ = std.c.close(fds[1]);
+        }
+        try setNonBlocking(fds[0]);
+        try setNonBlocking(fds[1]);
+        handoff.wake_read = fds[0];
+        handoff.wake_write = fds[1];
+        return handoff;
     }
 
     /// Stop accepting work, cancel queued work and response intents, and mark
@@ -102,6 +147,7 @@ pub const Handoff = struct {
         self.completions = .empty;
         self.outstanding -= pending.items.len + completions.items.len;
         for (self.active.items) |entry| entry.cancelled = true;
+        self.clearWakeLocked();
         self.mutex.unlock();
 
         for (pending.items) |entry| {
@@ -109,7 +155,7 @@ pub const Handoff = struct {
             self.allocator.destroy(entry);
         }
         pending.deinit(self.allocator);
-        for (completions.items) |completion| completion.deinit();
+        for (completions.items) |completion| completion.completion.deinit();
         completions.deinit(self.allocator);
     }
 
@@ -120,6 +166,8 @@ pub const Handoff = struct {
         self.pending.deinit(self.allocator);
         self.active.deinit(self.allocator);
         self.completions.deinit(self.allocator);
+        if (self.wake_read >= 0) _ = std.c.close(self.wake_read);
+        if (self.wake_write >= 0) _ = std.c.close(self.wake_write);
         self.mutex.unlock();
         self.* = undefined;
     }
@@ -134,7 +182,7 @@ pub const Handoff = struct {
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
         entry.* = .{ .job = job };
-        try self.pending.append(self.allocator, entry);
+        self.pending.appendAssumeCapacity(entry);
         self.outstanding += 1;
     }
 
@@ -146,13 +194,13 @@ pub const Handoff = struct {
         defer self.mutex.unlock();
         if (self.closed or self.pending.items.len == 0) return null;
         const entry = self.pending.orderedRemove(0);
-        self.active.append(self.allocator, entry) catch unreachable;
+        self.active.appendAssumeCapacity(entry);
         return .{ .handoff = self, .entry = entry };
     }
 
     /// Finish an active request. A cancellation racing completion wins: the
     /// completion is released and cannot reach the downstream H2 writer.
-    pub fn finish(self: *Handoff, lease: *Lease, completion: ?Completion) FinishResult {
+    pub fn finish(self: *Handoff, lease: *Lease, completion: ?Completion) Error!FinishResult {
         const entry = lease.entry orelse {
             if (completion) |value| value.deinit();
             return .already_finished;
@@ -169,7 +217,19 @@ pub const Handoff = struct {
         _ = self.active.orderedRemove(active_index);
         const cancelled = self.closed or entry.cancelled;
         if (!cancelled and completion != null) {
-            self.completions.append(self.allocator, completion.?) catch unreachable;
+            self.signalWakeLocked() catch |err| {
+                self.outstanding -= 1;
+                self.mutex.unlock();
+                entry.job.deinit();
+                self.allocator.destroy(entry);
+                lease.entry = null;
+                completion.?.deinit();
+                return err;
+            };
+            self.completions.appendAssumeCapacity(.{
+                .stream_id = entry.job.stream_id,
+                .completion = completion.?,
+            });
         } else {
             self.outstanding -= 1;
         }
@@ -189,9 +249,13 @@ pub const Handoff = struct {
     /// shutdown. Queued jobs and response intents are released immediately;
     /// active jobs are only marked so their worker keeps ownership until it
     /// reaches `finish`.
-    pub fn cancelStream(self: *Handoff, stream_id: u31) CancelResult {
-        var removed_jobs = std.ArrayList(*Entry).empty;
-        var removed_completions = std.ArrayList(Completion).empty;
+    pub fn cancelStream(self: *Handoff, stream_id: u31) Error!CancelResult {
+        // Reserve before mutating live ownership. A cancellation that cannot
+        // acquire bounded cleanup storage reports OOM without dropping a job.
+        var removed_jobs = try std.ArrayList(*Entry).initCapacity(self.allocator, self.capacity);
+        defer removed_jobs.deinit(self.allocator);
+        var removed_completions = try std.ArrayList(QueuedCompletion).initCapacity(self.allocator, self.capacity);
+        defer removed_completions.deinit(self.allocator);
         var result = CancelResult{};
 
         self.mutex.lock();
@@ -199,7 +263,7 @@ pub const Handoff = struct {
         while (index < self.pending.items.len) {
             const entry = self.pending.items[index];
             if (entry.job.stream_id == stream_id) {
-                removed_jobs.append(self.allocator, self.pending.orderedRemove(index)) catch unreachable;
+                removed_jobs.appendAssumeCapacity(self.pending.orderedRemove(index));
                 self.outstanding -= 1;
                 result.pending_jobs += 1;
                 continue;
@@ -215,33 +279,40 @@ pub const Handoff = struct {
         index = 0;
         while (index < self.completions.items.len) {
             if (self.completions.items[index].stream_id == stream_id) {
-                removed_completions.append(self.allocator, self.completions.orderedRemove(index)) catch unreachable;
+                removed_completions.appendAssumeCapacity(self.completions.orderedRemove(index));
                 self.outstanding -= 1;
                 result.completions += 1;
                 continue;
             }
             index += 1;
         }
+        if (self.completions.items.len == 0) self.clearWakeLocked();
         self.mutex.unlock();
 
         for (removed_jobs.items) |entry| {
             entry.job.deinit();
             self.allocator.destroy(entry);
         }
-        removed_jobs.deinit(self.allocator);
-        for (removed_completions.items) |completion| completion.deinit();
-        removed_completions.deinit(self.allocator);
+        for (removed_completions.items) |completion| completion.completion.deinit();
         return result;
     }
 
     /// Transfer one response intent to the connection runtime. The caller now
     /// owns it and must call `Completion.deinit` after serialization or drop.
-    pub fn takeCompletion(self: *Handoff) ?Completion {
+    pub fn takeCompletion(self: *Handoff) ?DeliveredCompletion {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.completions.items.len == 0) return null;
         self.outstanding -= 1;
-        return self.completions.orderedRemove(0);
+        const queued = self.completions.orderedRemove(0);
+        if (self.completions.items.len == 0) self.clearWakeLocked();
+        return .{ .stream_id = queued.stream_id, .completion = queued.completion };
+    }
+
+    /// Pollable completion readiness. A worker only writes this notification;
+    /// the connection owner still drains and serializes every response intent.
+    pub fn wakeFd(self: *const Handoff) std.posix.fd_t {
+        return self.wake_read;
     }
 
     pub fn outstandingCount(self: *Handoff) usize {
@@ -256,7 +327,39 @@ pub const Handoff = struct {
         }
         return null;
     }
+
+    fn signalWakeLocked(self: *Handoff) Error!void {
+        if (self.wake_pending) return;
+        const byte = [_]u8{1};
+        while (true) {
+            const n = std.c.write(self.wake_write, &byte, 1);
+            if (n == 1) {
+                self.wake_pending = true;
+                return;
+            }
+            if (n < 0 and std.posix.errno(n) == .INTR) continue;
+            // A full non-blocking pipe already has a readable notification;
+            // treat it as a coalesced wake rather than failing the response.
+            if (n < 0 and std.posix.errno(n) == .AGAIN) {
+                self.wake_pending = true;
+                return;
+            }
+            return error.WakeFailed;
+        }
+    }
+
+    fn clearWakeLocked(self: *Handoff) void {
+        var bytes: [64]u8 = undefined;
+        while (std.c.read(self.wake_read, &bytes, bytes.len) > 0) {}
+        self.wake_pending = false;
+    }
 };
+
+fn setNonBlocking(fd: std.posix.fd_t) Error!void {
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    if (flags < 0 or std.c.fcntl(fd, std.c.F.SETFL, flags | @as(c_int, @bitCast(std.posix.O{ .NONBLOCK = true }))) < 0)
+        return error.WakeFailed;
+}
 
 test "H2 request handoff bounds jobs and preserves FIFO completion ownership" {
     const Counter = struct {
@@ -273,7 +376,7 @@ test "H2 request handoff bounds jobs and preserves FIFO completion ownership" {
         }
     };
     var counter = Counter{};
-    var handoff = Handoff.init(std.testing.allocator, 2);
+    var handoff = try Handoff.init(std.testing.allocator, 2);
     defer handoff.deinit();
 
     try handoff.submit(.{ .stream_id = 1, .payload = &counter, .deinit_fn = Counter.dropJob });
@@ -284,8 +387,9 @@ test "H2 request handoff bounds jobs and preserves FIFO completion ownership" {
     var second = handoff.takeJob().?;
     try std.testing.expectEqual(@as(u31, 1), first.streamId());
     try std.testing.expectEqual(@as(u31, 3), second.streamId());
-    try std.testing.expectEqual(FinishResult.delivered, handoff.finish(&first, .{ .stream_id = 1, .payload = &counter, .deinit_fn = Counter.dropCompletion }));
-    try std.testing.expectEqual(FinishResult.delivered, handoff.finish(&second, .{ .stream_id = 3, .payload = &counter, .deinit_fn = Counter.dropCompletion }));
+    try std.testing.expect(first.jobPayload() == @as(*anyopaque, @ptrCast(&counter)));
+    try std.testing.expectEqual(FinishResult.delivered, try handoff.finish(&first, .{ .payload = &counter, .deinit_fn = Counter.dropCompletion }));
+    try std.testing.expectEqual(FinishResult.delivered, try handoff.finish(&second, .{ .payload = &counter, .deinit_fn = Counter.dropCompletion }));
     try std.testing.expectEqual(@as(usize, 2), counter.jobs);
 
     const first_completion = handoff.takeCompletion().?;
@@ -313,20 +417,20 @@ test "H2 request handoff releases cancellation before and during execution exact
         }
     };
     var counter = Counter{};
-    var handoff = Handoff.init(std.testing.allocator, 2);
+    var handoff = try Handoff.init(std.testing.allocator, 2);
     defer handoff.deinit();
 
     try handoff.submit(.{ .stream_id = 1, .payload = &counter, .deinit_fn = Counter.dropJob });
-    const queued_cancel = handoff.cancelStream(1);
+    const queued_cancel = try handoff.cancelStream(1);
     try std.testing.expectEqual(@as(usize, 1), queued_cancel.pending_jobs);
     try std.testing.expect(handoff.takeJob() == null);
 
     try handoff.submit(.{ .stream_id = 3, .payload = &counter, .deinit_fn = Counter.dropJob });
     var running = handoff.takeJob().?;
-    const running_cancel = handoff.cancelStream(3);
+    const running_cancel = try handoff.cancelStream(3);
     try std.testing.expectEqual(@as(usize, 1), running_cancel.running_jobs);
     try std.testing.expect(running.isCancelled());
-    try std.testing.expectEqual(FinishResult.cancelled, handoff.finish(&running, .{ .stream_id = 3, .payload = &counter, .deinit_fn = Counter.dropCompletion }));
+    try std.testing.expectEqual(FinishResult.cancelled, try handoff.finish(&running, .{ .payload = &counter, .deinit_fn = Counter.dropCompletion }));
     try std.testing.expect(handoff.takeCompletion() == null);
     try std.testing.expectEqual(@as(usize, 2), counter.jobs);
     try std.testing.expectEqual(@as(usize, 1), counter.completions);
@@ -348,21 +452,93 @@ test "H2 request handoff drops queued completion on reset and marks active work 
         }
     };
     var counter = Counter{};
-    var handoff = Handoff.init(std.testing.allocator, 2);
+    var handoff = try Handoff.init(std.testing.allocator, 2);
     defer handoff.deinit();
 
     try handoff.submit(.{ .stream_id = 1, .payload = &counter, .deinit_fn = Counter.dropJob });
     var complete = handoff.takeJob().?;
-    _ = handoff.finish(&complete, .{ .stream_id = 1, .payload = &counter, .deinit_fn = Counter.dropCompletion });
-    const completion_cancel = handoff.cancelStream(1);
+    _ = try handoff.finish(&complete, .{ .payload = &counter, .deinit_fn = Counter.dropCompletion });
+    const completion_cancel = try handoff.cancelStream(1);
     try std.testing.expectEqual(@as(usize, 1), completion_cancel.completions);
 
     try handoff.submit(.{ .stream_id = 3, .payload = &counter, .deinit_fn = Counter.dropJob });
     var running = handoff.takeJob().?;
     handoff.shutdown();
     try std.testing.expect(running.isCancelled());
-    try std.testing.expectEqual(FinishResult.cancelled, handoff.finish(&running, .{ .stream_id = 3, .payload = &counter, .deinit_fn = Counter.dropCompletion }));
+    try std.testing.expectEqual(FinishResult.cancelled, try handoff.finish(&running, .{ .payload = &counter, .deinit_fn = Counter.dropCompletion }));
     try std.testing.expectError(error.Closed, handoff.submit(.{ .stream_id = 5, .payload = &counter, .deinit_fn = Counter.dropJob }));
     try std.testing.expectEqual(@as(usize, 2), counter.jobs);
     try std.testing.expectEqual(@as(usize, 2), counter.completions);
+}
+
+test "H2 request handoff moves accepted work without allocator activity" {
+    const Counter = struct {
+        jobs: usize = 0,
+        fn dropJob(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.jobs += 1;
+        }
+    };
+    var counter = Counter{};
+    // Handoff initialization reserves three arrays; submitting one job owns
+    // the fourth allocation. The fifth allocation is deliberately withheld,
+    // so `takeJob` would panic under the old post-transfer append shape.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 4 });
+    var handoff = try Handoff.init(failing.allocator(), 1);
+    defer handoff.deinit();
+    try handoff.submit(.{ .stream_id = 1, .payload = &counter, .deinit_fn = Counter.dropJob });
+    var lease = handoff.takeJob().?;
+    try std.testing.expectError(error.OutOfMemory, handoff.cancelStream(9));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(FinishResult.delivered, try handoff.finish(&lease, null));
+    try std.testing.expectEqual(@as(usize, 1), counter.jobs);
+}
+
+test "H2 request handoff completion wake is pollable and rearms" {
+    const Counter = struct {
+        jobs: usize = 0,
+        completions: usize = 0,
+
+        fn dropJob(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.jobs += 1;
+        }
+        fn dropCompletion(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.completions += 1;
+        }
+    };
+    const Worker = struct {
+        handoff: *Handoff,
+        lease: *Lease,
+        counter: *Counter,
+
+        fn run(self: *@This()) void {
+            _ = self.handoff.finish(self.lease, .{
+                .payload = self.counter,
+                .deinit_fn = Counter.dropCompletion,
+            }) catch @panic("completion handoff failed");
+        }
+    };
+
+    var counter = Counter{};
+    var handoff = try Handoff.init(std.testing.allocator, 1);
+    defer handoff.deinit();
+    try handoff.submit(.{ .stream_id = 7, .payload = &counter, .deinit_fn = Counter.dropJob });
+    var lease = handoff.takeJob().?;
+
+    var fds = [_]std.posix.pollfd{.{ .fd = handoff.wakeFd(), .events = std.posix.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&fds, 0));
+    var worker = Worker{ .handoff = &handoff, .lease = &lease, .counter = &counter };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&fds, 1_000));
+    thread.join();
+
+    const delivered = handoff.takeCompletion().?;
+    try std.testing.expectEqual(@as(u31, 7), delivered.stream_id);
+    delivered.deinit();
+    fds[0].revents = 0;
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&fds, 0));
+    try std.testing.expectEqual(@as(usize, 1), counter.jobs);
+    try std.testing.expectEqual(@as(usize, 1), counter.completions);
 }

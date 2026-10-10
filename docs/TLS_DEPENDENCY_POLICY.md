@@ -189,7 +189,7 @@ adapter cannot silently remove behavior operators were promised:
 | Downstream client-certificate verification (mTLS) | **native + supported** on HTTP/1.1, HTTP/2 and HTTP/3/QUIC (#763): pure-Zig PKI path validation against `TARDIGRADE_TLS_CLIENT_CA_PATH`, one shared trust store across protocols |
 | OpenSSL session cache / session tickets | **unsupported**, deterministic config failure — superseded by native resumption |
 | OCSP stapling, OCSP auto-refresh, CRL checking | **unsupported**, deterministic config failure |
-| ACME automated issuance/renewal | **unsupported**, deterministic config failure — `src/http/acme_client.zig`'s `runOnce` always returns `error.AcmeProtocolError`; tracked for a native implementation alongside #391 |
+| ACME automated issuance/renewal | **unsupported**, deterministic config failure — `src/http/acme_client.zig`'s `runOnce` always returns `error.AcmeProtocolError`; tracked for a native implementation alongside #391; design contract in `docs/ACME_AUTOMATIC_HTTPS.md` (#831) |
 | Filesystem credential watcher (`TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS`) | **unsupported**, deterministic config failure — superseded by the explicit SIGHUP reload path |
 | PROXY protocol combined with TLS | **unsupported**, deterministic config failure |
 | OpenSSL itself, as a differential/interop test peer (`evp_oracle`, `tests/crypto_openssl_diff.zig`, `tests/pki_openssl_diff.zig`, `scripts/interop/`) | **non-production test/interop only** — never reachable from any shipping `tardi` target |

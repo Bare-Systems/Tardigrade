@@ -6,6 +6,11 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Documentation
 
+- **Native automatic HTTPS design (#831).** New `docs/ACME_AUTOMATIC_HTTPS.md`
+  specifies the ACME architecture for #759: code audit, operator config
+  grammar, issuance/renewal state machine, secret/trust boundary, credential
+  generation integration, and the A2–A7 work split. Design only: ACME remains
+  unsupported and `TARDIGRADE_TLS_ACME_ENABLED` is still rejected.
 - **`proxy_pass` URI rewriting semantics (#800).** `docs/PROXY_SECURITY.md` §6a
   now documents how request paths map onto `proxy_pass` targets, including the
   intentional nginx divergences (non-segment prefix joins, prefix stripping for

@@ -169,8 +169,8 @@ test "ACME client: persistent badNonce fails after exactly the retry budget" {
     defer env.deinit();
     env.ca.script.bad_nonce_remaining = 100;
     try expectOpenFails(&env, env.config(), error.BadNonceExhausted);
-    // 1 attempt + 2 retries.
-    try testing.expectEqual(@as(usize, 3), env.ca.countPosts());
+    // 1 attempt + 1 retry (A1 contract §5.3).
+    try testing.expectEqual(@as(usize, 2), env.ca.countPosts());
     try testing.expect(!(try env.recordExists()));
     try testing.expectEqual(client_mod.FailureClass.protocol, client_mod.classify(error.BadNonceExhausted));
 }
@@ -183,6 +183,8 @@ test "ACME client: a zero retry budget makes one attempt" {
     cfg.max_bad_nonce_retries = 0;
     try expectOpenFails(&env, cfg, error.BadNonceExhausted);
     try testing.expectEqual(@as(usize, 1), env.ca.countPosts());
+    // The default is one retry.
+    try testing.expectEqual(@as(u8, 1), (client_mod.Config{ .directory_url = directory_url }).max_bad_nonce_retries);
 }
 
 test "ACME client: a nonce is never reused across sequential and failing requests" {
@@ -279,6 +281,10 @@ test "ACME client: hostile account responses fail closed without persisting" {
         .{ .mode = .status_202, .err = error.UnexpectedStatus },
         .{ .mode = .rate_limited, .err = error.RateLimited },
         .{ .mode = .invalid_status_body, .err = error.BadAccountResponse },
+        .{ .mode = .text_plain_content_type, .err = error.BadAccountResponse },
+        .{ .mode = .garbage_body, .err = error.BadAccountResponse },
+        .{ .mode = .empty_body, .err = error.BadAccountResponse },
+        .{ .mode = .huge_body, .err = error.ResponseTooLarge },
         .{ .mode = .server_error_problem, .err = error.CaRejected },
     };
     for (cases) |case| {
@@ -417,9 +423,9 @@ test "ACME client: a missing key beside an existing account is inconsistent, not
     {
         var state = try StateDir.open(env.path);
         defer state.close();
-        var path_z: [std.fs.max_path_bytes]u8 = undefined;
-        const joined = try std.fmt.bufPrintZ(&path_z, "{s}/{s}", .{ env.path, state_mod.account_key_name });
-        _ = std.c.unlink(joined);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const joined = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ env.path, state_mod.account_key_name });
+        zig_compat.unlinkPath(joined);
     }
     try expectOpenFails(&env, env.config(), error.InconsistentState);
 }
@@ -431,9 +437,9 @@ test "ACME client: loosened key permissions refuse to start" {
         const first = try openSession(&env, env.config());
         first.close();
     }
-    var path_z: [std.fs.max_path_bytes]u8 = undefined;
-    const joined = try std.fmt.bufPrintZ(&path_z, "{s}/{s}", .{ env.path, state_mod.account_key_name });
-    try testing.expectEqual(@as(c_int, 0), std.c.chmod(joined, 0o644));
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const joined = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ env.path, state_mod.account_key_name });
+    try zig_compat.chmodPath(joined, 0o644);
     try expectOpenFails(&env, env.config(), error.InsecurePermissions);
 }
 

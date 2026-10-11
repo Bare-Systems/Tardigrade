@@ -25,7 +25,9 @@ All notable user-facing changes to Tardigrade are documented here.
   snapshot (`UpstreamTlsOptions.trust_anchors`), directory/nonce/newAccount
   handling with a finite `badNonce` retry budget, and a permission-checked,
   atomically-written, lock-protected state directory. No certificate is
-  requested or activated; `TARDIGRADE_TLS_ACME_ENABLED` is still rejected.
+  requested or activated. The §4 config grammar (`TARDIGRADE_TLS_AUTOMATIC_HTTPS`,
+  `_ACME_AGREE_TOS`, `_ACME_STATE_DIR`, `_ACME_CA_BUNDLE_PATH`, ...) is now
+  parsed and validated, but enabling it is still rejected.
   Tests: `zig build test-acme` (fake CA that verifies every signed request,
   plus `fuzz: ACME:` corpus targets).
 - **WebSocket reactor lifecycle observability (#829, #827).** Tunnel close

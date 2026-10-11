@@ -28,6 +28,8 @@ pub const Error = error{
     /// The directory is group/other-writable, or a secret file has any
     /// group/other permission bit.
     InsecurePermissions,
+    /// The state directory or a private file is not owned by the effective uid.
+    WrongOwner,
     /// Another process (or another `StateDir` in this process) holds the lock.
     Locked,
     NotFound,
@@ -61,11 +63,9 @@ pub const Fault = enum {
     fsync_dir,
 };
 
-const O = std.posix.O;
-
 pub const StateDir = struct {
-    dir_fd: std.posix.fd_t,
-    lock_fd: std.posix.fd_t,
+    dir_fd: zig_compat.Fd,
+    lock_fd: zig_compat.Fd,
     /// Test-only one-shot fault; ignored (and compiled out) outside tests.
     fault: Fault = .none,
 
@@ -74,33 +74,35 @@ pub const StateDir = struct {
     /// must already exist.
     pub fn open(path: []const u8) Error!StateDir {
         if (path.len == 0 or path.len > std.fs.max_path_bytes - 1 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        @memcpy(path_buf[0..path.len], path);
-        path_buf[path.len] = 0;
-        const path_z: [:0]const u8 = path_buf[0..path.len :0];
-
         const io = zig_compat.io();
         const cwd = std.Io.Dir.cwd();
-        var existing = cwd.statFile(io, path, .{ .follow_symlinks = false });
-        if (existing) |_| {} else |err| switch (err) {
-            error.FileNotFound => {
-                const rc = std.c.mkdirat(std.posix.AT.FDCWD, path_z, 0o700);
-                if (rc != 0 and std.posix.errno(rc) != .EXIST) return error.IoFailure;
-                existing = cwd.statFile(io, path, .{ .follow_symlinks = false });
+        if (cwd.statFile(io, path, .{ .follow_symlinks = false })) |_| {} else |err| switch (err) {
+            error.FileNotFound => zig_compat.mkdirPath(path, 0o700) catch |mk| switch (mk) {
+                error.Exists => {}, // lost a creation race; validated below
+                else => return error.IoFailure,
             },
             else => return error.IoFailure,
         }
-        const st = existing catch return error.IoFailure;
-        if (st.kind != .directory) return error.UnsafeFileType;
-        if (modeBits(st) & 0o022 != 0) return error.InsecurePermissions;
 
-        const dir_fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0) catch return error.IoFailure;
-        errdefer _ = std.c.close(dir_fd);
+        // Open without following a final symlink, then validate the *descriptor*
+        // (type, owner, mode) so the checks cannot race a swap of the path.
+        const dir_fd = zig_compat.openDirNoFollow(path) catch {
+            // Say why when we can: a symlink or file is a different problem
+            // from an I/O failure.
+            if (cwd.statFile(io, path, .{ .follow_symlinks = false })) |st| {
+                if (st.kind != .directory) return error.UnsafeFileType;
+            } else |_| {}
+            return error.IoFailure;
+        };
+        errdefer zig_compat.closeFd(dir_fd);
+        const identity = zig_compat.statFdIdentity(dir_fd) catch return error.IoFailure;
+        if (!identity.is_directory) return error.UnsafeFileType;
+        if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
+        if (identity.mode & 0o022 != 0) return error.InsecurePermissions;
 
-        const lock_fd = std.posix.openat(dir_fd, lock_name, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600) catch return error.IoFailure;
-        errdefer _ = std.c.close(lock_fd);
-        const lock_rc = std.c.flock(lock_fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
-        if (lock_rc != 0) return if (std.posix.errno(lock_rc) == .AGAIN) error.Locked else error.IoFailure;
+        const lock_fd = zig_compat.openAtNoFollow(dir_fd, lock_name, .{ .write = true, .create = true }, 0o600) catch return error.IoFailure;
+        errdefer zig_compat.closeFd(lock_fd);
+        zig_compat.lockExclusiveNonBlocking(lock_fd) catch |err| return if (err == error.WouldBlock) error.Locked else error.IoFailure;
 
         var self = StateDir{ .dir_fd = dir_fd, .lock_fd = lock_fd };
         self.removeStaleTemps();
@@ -109,8 +111,8 @@ pub const StateDir = struct {
 
     /// Releases the lock and the directory handle.
     pub fn close(self: *StateDir) void {
-        _ = std.c.close(self.lock_fd);
-        _ = std.c.close(self.dir_fd);
+        zig_compat.closeFd(self.lock_fd);
+        zig_compat.closeFd(self.dir_fd);
         self.* = undefined;
     }
 
@@ -128,49 +130,44 @@ pub const StateDir = struct {
 
     /// Replace `name` atomically with `data` at `mode`. On any failure the
     /// previous `name` is untouched and the temp file is removed.
-    pub fn writeFileAtomic(self: *StateDir, name: []const u8, data: []const u8, mode: std.posix.mode_t) Error!void {
+    pub fn writeFileAtomic(self: *StateDir, name: []const u8, data: []const u8, mode: u32) Error!void {
         if (!validName(name)) return error.InvalidPath;
         if (data.len > max_state_file_len) return error.TooLarge;
 
         var random: [8]u8 = undefined;
         zig_compat.randomBytes(&random);
         var temp_buf: [128]u8 = undefined;
-        const temp_name = std.fmt.bufPrintZ(&temp_buf, ".{s}.tmp-{x}", .{ name, random }) catch return error.InvalidPath;
-        var name_buf: [96]u8 = undefined;
-        const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch return error.InvalidPath;
+        const temp_name = std.fmt.bufPrint(&temp_buf, ".{s}.tmp-{x}", .{ name, random }) catch return error.InvalidPath;
 
         try self.hit(.create_temp);
-        const fd = std.posix.openat(self.dir_fd, temp_name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, mode) catch return error.IoFailure;
+        const fd = zig_compat.openAtNoFollow(self.dir_fd, temp_name, .{ .write = true, .create = true, .exclusive = true }, mode) catch return error.IoFailure;
         var fd_open = true;
         var renamed = false;
         defer {
-            if (fd_open) _ = std.c.close(fd);
-            if (!renamed) _ = std.c.unlinkat(self.dir_fd, temp_name, 0);
+            if (fd_open) zig_compat.closeFd(fd);
+            if (!renamed) zig_compat.unlinkAt(self.dir_fd, temp_name);
         }
         // umask may have narrowed the mode, never widened it; make it exact.
-        if (std.c.fchmod(fd, mode) != 0) return error.IoFailure;
+        zig_compat.fchmodFd(fd, mode) catch return error.IoFailure;
 
         try self.hit(.write);
         const limit = if (self.fault == .short_write) data.len / 2 else data.len;
-        try writeAll(fd, data[0..limit]);
+        zig_compat.writeAllFd(fd, data[0..limit]) catch return error.IoFailure;
         try self.hit(.short_write);
 
         try self.hit(.fsync_file);
-        if (std.c.fsync(fd) != 0) return error.IoFailure;
-        if (std.c.close(fd) != 0) {
-            fd_open = false;
-            return error.IoFailure;
-        }
+        zig_compat.fsyncFd(fd) catch return error.IoFailure;
         fd_open = false;
+        zig_compat.closeFd(fd);
 
         try self.hit(.rename);
-        if (std.c.renameat(self.dir_fd, temp_name, self.dir_fd, name_z) != 0) return error.IoFailure;
+        zig_compat.renameAt(self.dir_fd, temp_name, name) catch return error.IoFailure;
         renamed = true;
 
         // The rename is already visible; a failed directory fsync means we
         // cannot promise it survives a crash, which the caller must know.
         try self.hit(.fsync_dir);
-        if (std.c.fsync(self.dir_fd) != 0) return error.IoFailure;
+        zig_compat.fsyncFd(self.dir_fd) catch return error.IoFailure;
     }
 
     /// Read `name` (bounded). With `private`, any group/other permission bit
@@ -186,23 +183,30 @@ pub const StateDir = struct {
         if (private and modeBits(st) & 0o077 != 0) return error.InsecurePermissions;
         if (st.size > max_len) return error.TooLarge;
 
-        const fd = std.posix.openat(self.dir_fd, name, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0) catch |err| switch (err) {
-            error.FileNotFound => return error.NotFound,
+        const fd = zig_compat.openAtNoFollow(self.dir_fd, name, .{}, 0) catch |err| switch (err) {
+            error.NotFound => return error.NotFound,
             else => return error.IoFailure,
         };
-        defer _ = std.c.close(fd);
+        defer zig_compat.closeFd(fd);
+        // Re-check on the descriptor we will actually read.
+        const identity = zig_compat.statFdIdentity(fd) catch return error.IoFailure;
+        if (!identity.is_regular) return error.UnsafeFileType;
+        if (private) {
+            if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
+            if (identity.mode & 0o077 != 0) return error.InsecurePermissions;
+        }
 
         var buf = try allocator.alloc(u8, @intCast(st.size));
         errdefer if (private) secrets.secureZeroAndFree(allocator, buf) else allocator.free(buf);
         var filled: usize = 0;
         while (filled < buf.len) {
-            const n = std.posix.read(fd, buf[filled..]) catch return error.IoFailure;
+            const n = zig_compat.readFd(fd, buf[filled..]) catch return error.IoFailure;
             if (n == 0) return error.CorruptState; // shrank under us
             filled += n;
         }
         // Grew under us: the bound we checked is no longer the truth.
         var probe: [1]u8 = undefined;
-        const extra = std.posix.read(fd, &probe) catch return error.IoFailure;
+        const extra = zig_compat.readFd(fd, &probe) catch return error.IoFailure;
         if (extra != 0) return error.CorruptState;
         return buf;
     }
@@ -222,32 +226,15 @@ pub const StateDir = struct {
             if (std.mem.indexOf(u8, entry.name, ".tmp-") == null) continue;
             if (count == doomed.len) break;
             @memcpy(doomed[count][0..entry.name.len], entry.name);
-            doomed[count][entry.name.len] = 0;
             doomed_len[count] = entry.name.len;
             count += 1;
         }
-        for (0..count) |i| {
-            const z: [:0]const u8 = doomed[i][0..doomed_len[i] :0];
-            _ = std.c.unlinkat(self.dir_fd, z, 0);
-        }
+        for (0..count) |i| zig_compat.unlinkAt(self.dir_fd, doomed[i][0..doomed_len[i]]);
     }
 };
 
 fn modeBits(st: std.Io.File.Stat) u32 {
     return @as(u32, @intCast(@intFromEnum(st.permissions))) & 0o777;
-}
-
-fn writeAll(fd: std.posix.fd_t, data: []const u8) Error!void {
-    var offset: usize = 0;
-    while (offset < data.len) {
-        const rc = std.c.write(fd, data[offset..].ptr, data.len - offset);
-        if (rc < 0) {
-            if (std.posix.errno(rc) == .INTR) continue;
-            return error.IoFailure;
-        }
-        if (rc == 0) return error.IoFailure;
-        offset += @intCast(rc);
-    }
 }
 
 /// File names are a single path component from a small closed alphabet; no
@@ -445,11 +432,12 @@ test "ACME state: refuses symlink, file, and group-writable directories" {
         var s = try StateDir.open(loose);
         s.close();
     }
-    var loose_z: [std.fs.max_path_bytes]u8 = undefined;
-    @memcpy(loose_z[0..loose.len], loose);
-    loose_z[loose.len] = 0;
-    try testing.expectEqual(@as(c_int, 0), std.c.chmod(@ptrCast(&loose_z), 0o770));
+    try zig_compat.chmodPath(loose, 0o770);
     try testing.expectError(error.InsecurePermissions, StateDir.open(loose));
+
+    // A directory owned by someone else is refused (skipped when running as
+    // root, where /usr is our own).
+    if (zig_compat.effectiveUid() != 0) try testing.expectError(error.WrongOwner, StateDir.open("/usr"));
 
     try testing.expectError(error.InvalidPath, StateDir.open(""));
     try testing.expectError(error.InvalidPath, StateDir.open("a\x00b"));
@@ -509,8 +497,8 @@ test "ACME state: stale temp files from a crashed writer are removed at open" {
     {
         var first = try StateDir.open(tmp.path);
         defer first.close();
-        const fd = try std.posix.openat(first.dir_fd, ".account.key.tmp-deadbeef", .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
-        _ = std.c.close(fd);
+        const fd = try zig_compat.openAtNoFollow(first.dir_fd, ".account.key.tmp-deadbeef", .{ .write = true, .create = true, .exclusive = true }, 0o600);
+        zig_compat.closeFd(fd);
     }
     var second = try StateDir.open(tmp.path);
     defer second.close();

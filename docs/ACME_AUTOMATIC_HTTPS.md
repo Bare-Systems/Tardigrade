@@ -826,10 +826,21 @@ Behavior worth knowing:
   per key (200 with the existing account URL).
 - `account.json` stores the directory URL, account URL, creation time and a
   SHA-256 of the contact; the email itself is never written.
-- Not in A2: owner-uid check on the state directory (portable stat lacks it
-  in the Zig std surface used here), `Link`-header parsing and certificate-size
-  response caps (A3), and the config grammar/env wiring of §4, which remain
-  unimplemented with the gate closed.
+- Config (§4) is parsed and validated in `edge_config.zig` before the final
+  unsupported gate: `automatic_https` alias, directory URL grammar, ToS, state
+  dir (`STATE_DIR`, alias `CERT_DIR`), email, `http-01`-only challenges, EAB
+  reserved, account-key override rejected, and "set without the opt-in" is an
+  error. Still open for later phases because they depend on the listener and
+  redirect work: per-hostname rules (§4.2), `acme_http01_listen`, and
+  `https_redirect` (A3/A4); `acme_renew_days_before_expiry` range (A5).
+- State-directory ownership (effective uid) and mode are validated on the
+  opened descriptor; all OS calls live in `zig_compat.zig`, and a test in
+  `src/acme_test_root.zig` fails if ACME production code references `std.c`,
+  `std.posix`, or any C/OpenSSL interop.
+- One absolute request deadline covers TCP connect, the TLS handshake and
+  every later read/write (`UpstreamTlsOptions.deadline_ms` clamps each
+  `poll()`), so a peer that dribbles bytes cannot stack per-wait timeouts.
+- `badNonce` is retried once by default (§5.3), configurable per client.
 - The TLS leg of the real dialer is covered by the existing `UpstreamTlsConn`
   and `webpki_verifier` suites; A2's fake CA replaces only the byte stream
   beneath HTTP. A loopback TLS CA is A7 interop work.

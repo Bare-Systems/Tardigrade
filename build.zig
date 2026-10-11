@@ -1013,7 +1013,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/acme_test_root.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     acme_test_mod.addImport("crypto", crypto_mod);
     acme_test_mod.addImport("zig_compat", compat_mod);

@@ -36,7 +36,7 @@ pub const thumbprint_len = 43; // base64url(SHA-256), unpadded
 
 /// The fixed bytes preceding the 32-byte scalar in the PKCS#8 encoding of a
 /// P-256 key that carries its public point (RFC 5958 wrapping RFC 5915), as
-/// written by `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256`.
+/// written by common command-line key generators.
 const pkcs8_prefix = [_]u8{
     0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86,
     0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d,
@@ -109,7 +109,7 @@ pub const AccountKey = struct {
     }
 
     /// Strict loader: exactly the 138-byte PKCS#8 shape this type writes (and
-    /// openssl produces), a valid scalar, and an embedded public point that
+    /// common generators produce), a valid scalar, and an embedded public point that
     /// matches the one derived from it. Anything else is `InvalidKey`.
     pub fn fromPkcs8Der(der: []const u8) Error!AccountKey {
         if (der.len != pkcs8_len) return error.InvalidKey;

@@ -83,7 +83,9 @@ pub const DialError = error{ OutOfMemory, DialFailed, Timeout };
 
 pub const Dialer = struct {
     ptr: *anyopaque,
-    dialFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, host: []const u8, port: u16, timeout_ms: u32) DialError!Connection,
+    /// `remaining_ms` is what is left of the request deadline; connect, TLS
+    /// and all later I/O on the connection must complete within it.
+    dialFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, host: []const u8, port: u16, remaining_ms: u32) DialError!Connection,
 };
 
 /// Monotonic millisecond clock; injectable so deadline tests are deterministic.
@@ -161,7 +163,9 @@ pub const Transport = struct {
         var host_buf: [url_mod.max_host_len + 8]u8 = undefined;
         const host_header = target.writeHostHeader(&host_buf) orelse return error.InvalidUrl;
 
-        const conn = self.dialer.dialFn(self.dialer.ptr, self.allocator, target.host, target.port, self.limits.request_deadline_ms) catch |err| return switch (err) {
+        // The dialer gets the *remaining* budget, not a fresh one: connect and
+        // TLS must fit in what is left of the single request deadline.
+        const conn = self.dialer.dialFn(self.dialer.ptr, self.allocator, target.host, target.port, try self.remainingMs(deadline)) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.Timeout => error.Timeout,
             error.DialFailed => error.DialFailed,
@@ -189,6 +193,12 @@ pub const Transport = struct {
 
         var reader = Reader{ .conn = conn, .clock = self.clock, .deadline = deadline };
         return self.readResponse(&reader, method, max_body_bytes);
+    }
+
+    fn remainingMs(self: *const Transport, deadline: i64) Error!u32 {
+        const remaining = deadline - self.clock.now();
+        if (remaining <= 0) return error.Timeout;
+        return @intCast(@min(remaining, @as(i64, std.math.maxInt(u32))));
     }
 
     fn readResponse(self: *const Transport, reader: *Reader, method: Method, max_body_bytes: usize) Error!Response {
@@ -427,7 +437,8 @@ pub const TrustAnchorSnapshot = struct {
 
     /// `ca_bundle_path` empty selects the first readable system bundle.
     pub fn load(allocator: std.mem.Allocator, ca_bundle_path: []const u8) !*TrustAnchorSnapshot {
-        const anchors = try tls_core.webpki_verifier.loadTrustAnchors(allocator, ca_bundle_path);
+        var anchors = try tls_core.webpki_verifier.loadTrustAnchors(allocator, ca_bundle_path);
+        errdefer anchors.deinit(allocator);
         const snapshot = try allocator.create(TrustAnchorSnapshot);
         snapshot.* = .{ .allocator = allocator, .anchors = anchors, .refs = .init(1) };
         return snapshot;

@@ -21986,6 +21986,11 @@ test "native TLS listener check rejects ACME on native builds even without crede
     var env_map = try inheritedEnvMap(allocator);
     defer env_map.deinit();
     try env_map.put("TARDIGRADE_TLS_ACME_ENABLED", "true");
+    // #832: the §4 grammar is validated first, so give the gate a fully valid
+    // configuration to reach.
+    try env_map.put("TARDIGRADE_TLS_ACME_AGREE_TOS", "true");
+    try env_map.put("TARDIGRADE_TLS_ACME_STATE_DIR", ".zig-cache");
+    try env_map.put("TARDIGRADE_TLS_ACME_DOMAINS", "example.com");
     _ = env_map.swapRemove("TARDIGRADE_TLS_CERT_PATH");
     _ = env_map.swapRemove("TARDIGRADE_TLS_KEY_PATH");
 

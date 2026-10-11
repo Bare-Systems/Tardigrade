@@ -5,6 +5,7 @@ pub const account = @import("account.zig");
 pub const json_limits = @import("json_limits.zig");
 pub const state = @import("state.zig");
 pub const url = @import("url.zig");
+pub const contact = @import("contact.zig");
 pub const transport = @import("transport.zig");
 pub const client = @import("client.zig");
 

@@ -726,12 +726,17 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
-| `TARDIGRADE_TLS_ACME_ENABLED` | bool | `false` | Retired OpenSSL-adapter ACME automation; must be false in every profile. A native ACME client is tracked separately (#391, #634). | (unset) |
-| `TARDIGRADE_TLS_ACME_CERT_DIR` | path | `""` | Certificate storage directory. | `TARDIGRADE_TLS_ACME_CERT_DIR=/var/lib/tardigrade/acme` |
+| `TARDIGRADE_TLS_AUTOMATIC_HTTPS` / `TARDIGRADE_TLS_ACME_ENABLED` (alias) | bool | `false` | Opt-in for native automatic HTTPS. The grammar below is parsed and validated (#832), but the feature is **not supported yet**: `true` is still rejected after validation in every profile until the release-gating phase (docs/ACME_AUTOMATIC_HTTPS.md §4.5). | (unset) |
+| `TARDIGRADE_TLS_ACME_AGREE_TOS` | bool | `false` | Operator accepts the CA's terms of service. Required `true` when enabled; rejected if set without the opt-in. | (unset) |
+| `TARDIGRADE_TLS_ACME_STATE_DIR` | path | `""` | Durable ACME state root (alias: `TARDIGRADE_TLS_ACME_CERT_DIR`). Required when enabled. | (unset) |
+| `TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH` | path | `""` | Trust anchors for the ACME directory server only (empty = system bundle). Rejected if set without the opt-in. | (unset) |
+| `TARDIGRADE_TLS_ACME_CHALLENGES` | CSV | `http-01` | Only `http-01` is accepted. | (unset) |
+| `TARDIGRADE_TLS_ACME_EAB_KID`, `TARDIGRADE_TLS_ACME_EAB_HMAC_KEY_PATH` | | unset | Reserved for external account binding; setting either is a config error. | (unset) |
+| `TARDIGRADE_TLS_ACME_CERT_DIR` | path | `""` | Alias of `TARDIGRADE_TLS_ACME_STATE_DIR` (state directory). | `TARDIGRADE_TLS_ACME_CERT_DIR=/var/lib/tardigrade/acme` |
 | `TARDIGRADE_TLS_ACME_DIRECTORY_URL` | URL | `https://acme-v02.api.letsencrypt.org/directory` | ACME directory URL. | `TARDIGRADE_TLS_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/directory` |
-| `TARDIGRADE_TLS_ACME_DOMAINS` | CSV DNS names | `[]` | Domains to obtain/renew. Empty logs a warning when ACME is enabled. | `TARDIGRADE_TLS_ACME_DOMAINS=example.com,www.example.com` |
+| `TARDIGRADE_TLS_ACME_DOMAINS` | CSV DNS names | `[]` | Domains to obtain/renew. Required non-empty when enabled. | `TARDIGRADE_TLS_ACME_DOMAINS=example.com,www.example.com` |
 | `TARDIGRADE_TLS_ACME_EMAIL` | email | `""` | ACME account email. | `TARDIGRADE_TLS_ACME_EMAIL=ops@example.com` |
-| `TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH` | path | `""` | PEM ECDSA P-256 account key path; created on first run. | `TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH=/var/lib/tardigrade/acme/account.key` |
+| `TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH` | path | `""` | Override not supported yet (rejected if set); the account key lives in the state directory as `account.key`. | `TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH=/var/lib/tardigrade/acme/account.key` |
 | `TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY` | u32 days | `30` | Renewal trigger window. | `TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY=21` |
 
 ### HTTP/3 And QUIC

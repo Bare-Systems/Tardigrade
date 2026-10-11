@@ -28,20 +28,28 @@ pub const TlsDialer = struct {
         conn: upstream_tls.UpstreamTlsConn,
     };
 
-    fn dial(ptr: *anyopaque, allocator: std.mem.Allocator, host: []const u8, port: u16, timeout_ms: u32) DialError!Connection {
+    fn dial(ptr: *anyopaque, allocator: std.mem.Allocator, host: []const u8, port: u16, remaining_ms: u32) DialError!Connection {
         const self: *TlsDialer = @ptrCast(@alignCast(ptr));
-        const fd = zig_compat.connectBoundedTcp(host, port, timeout_ms) catch |err| return switch (err) {
+        // One absolute deadline for the whole connection: TCP connect, the TLS
+        // handshake and every later read/write are clamped to what is left.
+        const started = upstream_tls.monotonicMs();
+        const deadline_ms = started + @as(i64, remaining_ms);
+        const fd = zig_compat.connectBoundedTcp(host, port, remaining_ms) catch |err| return switch (err) {
             error.Timeout => error.Timeout,
             else => error.DialFailed,
         };
-        errdefer _ = std.c.close(fd);
-        zig_compat.setSocketTimeoutsMs(fd, timeout_ms, timeout_ms);
+        errdefer zig_compat.closeFd(fd);
+        const after_connect = deadline_ms - upstream_tls.monotonicMs();
+        if (after_connect <= 0) return error.Timeout;
+        const socket_ms: u32 = @intCast(@min(after_connect, @as(i64, std.math.maxInt(u32))));
+        zig_compat.setSocketTimeoutsMs(fd, socket_ms, socket_ms);
         const wrapper = try allocator.create(TlsConnection);
         errdefer allocator.destroy(wrapper);
         wrapper.allocator = allocator;
         wrapper.conn = upstream_tls.UpstreamTlsConn.connect(fd, host, .{
             .trust_anchors = &self.snapshot.anchors,
             .alpn_policy = .require_http1,
+            .deadline_ms = deadline_ms,
         }) catch return error.DialFailed;
         return .{ .ptr = wrapper, .vtable = &tls_vtable };
     }
@@ -73,4 +81,56 @@ test "ACME TLS dialer: fails closed when nothing is listening" {
     // Port 1 on loopback: connection refused, never a silent success.
     const result = tls.dialer().dialFn(tls.dialer().ptr, std.testing.allocator, "127.0.0.1", 1, 500);
     try std.testing.expectError(error.DialFailed, result);
+}
+
+const DribbleCtx = struct {
+    server: *zig_compat.NetServer,
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+/// Accepts one connection and sends the start of a plausible TLS record, then
+/// one more byte every 150 ms for 600 ms, then goes silent (without closing,
+/// so the client never sees an EOF or RST).
+fn dribbleServer(ctx: *DribbleCtx) void {
+    const conn = ctx.server.accept() catch return;
+    const header = [_]u8{ 0x16, 0x03, 0x03, 0x00, 0xff };
+    conn.stream.writeAll(&header) catch return;
+    for (0..4) |_| {
+        zig_compat.sleepNs(150 * std.time.ns_per_ms);
+        conn.stream.writeAll(&[_]u8{0}) catch return;
+    }
+    while (!ctx.done.load(.acquire)) zig_compat.sleepNs(20 * std.time.ns_per_ms);
+    conn.stream.close();
+}
+
+test "ACME TLS dialer: one absolute deadline bounds TCP, TLS and a dribbling peer" {
+    const snapshot = try transport.TrustAnchorSnapshot.load(std.testing.allocator, "src/pki/testdata/ecdsa_p256_ca.crt");
+    defer snapshot.release();
+    var server = try zig_compat.listenTcp("127.0.0.1", 0);
+    defer server.deinit();
+    var ctx = DribbleCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, dribbleServer, .{&ctx});
+    defer {
+        ctx.done.store(true, .release);
+        thread.join();
+    }
+
+    var tls = TlsDialer{ .snapshot = snapshot };
+    const t = transport.Transport{
+        .allocator = std.testing.allocator,
+        .dialer = tls.dialer(),
+        .limits = .{ .request_deadline_ms = 800 },
+    };
+    var url_buf: [64]u8 = undefined;
+    const url_text = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/directory", .{server.port()});
+    const target = try @import("../acme/url.zig").parse(url_text);
+
+    const started = upstream_tls.monotonicMs();
+    try std.testing.expectError(error.DialFailed, t.request(.GET, target, null, null));
+    const elapsed = upstream_tls.monotonicMs() - started;
+    // Every byte the peer sent would have reset a per-wait timeout (800 ms
+    // after the last byte at ~600 ms = ~1400 ms); the shared deadline cuts it
+    // at ~800 ms regardless.
+    try std.testing.expect(elapsed >= 700);
+    try std.testing.expect(elapsed < 1200);
 }

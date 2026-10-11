@@ -45,6 +45,10 @@ pub const AccountMode = enum {
     status_202,
     rate_limited,
     invalid_status_body,
+    text_plain_content_type,
+    garbage_body,
+    empty_body,
+    huge_body,
     server_error_problem,
 };
 
@@ -527,6 +531,18 @@ pub const FakeCa = struct {
         resp.status = if (created) 201 else 200;
         if (self.script.account == .status_202) resp.status = 202;
         resp.body = if (self.script.account_body) |override| override else if (self.script.account == .invalid_status_body) "{\"status\":\"deactivated\"}" else "{\"status\":\"valid\"}";
+        switch (self.script.account) {
+            .text_plain_content_type => resp.content_type = "text/plain",
+            .garbage_body => resp.body = "not json at all",
+            .empty_body => resp.body = "",
+            .huge_body => {
+                const big = try allocator.alloc(u8, 200 * 1024);
+                @memset(big, ' ');
+                resp.body_owned = big;
+                resp.body = big;
+            },
+            else => {},
+        }
         if (!self.script.omit_nonce_on_post) resp.nonce = try self.freshNonce(allocator);
         const loc = try std.fmt.allocPrint(allocator, "{s}/acct/{d}", .{ self.base, index + 1 });
         switch (self.script.account) {

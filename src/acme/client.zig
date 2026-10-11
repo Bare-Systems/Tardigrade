@@ -23,6 +23,7 @@ const std = @import("std");
 const crypto = @import("crypto");
 const zig_compat = @import("zig_compat");
 const account_mod = @import("account.zig");
+const contact = @import("contact.zig");
 const json_limits = @import("json_limits.zig");
 const state_mod = @import("state.zig");
 const transport_mod = @import("transport.zig");
@@ -154,8 +155,9 @@ pub const Config = struct {
     terms_of_service_agreed: bool = false,
     /// Off by default (design §6.3): CA URLs must share the directory origin.
     allow_cross_host_urls: bool = false,
-    /// Extra attempts after a `badNonce`; total POSTs is this plus one.
-    max_bad_nonce_retries: u8 = 2,
+    /// Extra attempts after a `badNonce`; total POSTs is this plus one. The
+    /// A1 contract (§5.3) is a single retry.
+    max_bad_nonce_retries: u8 = 1,
 };
 
 const DirectoryJson = struct {
@@ -450,19 +452,17 @@ pub const Client = struct {
             else => return self.failLocked(error.UnexpectedStatus),
         };
         const location = resp.location() orelse return self.failLocked(error.BadAccountResponse);
-        if (resp.content_type_json) {
-            // The account object is optional to us, but if present it must
-            // be a bounded JSON object whose status is not a terminal one.
-            if (json_limits.parseBounded(AccountJson, self.allocator, resp.body, .{})) |parsed| {
-                var p = parsed;
-                defer p.deinit();
-                if (p.value.status) |s| {
-                    if (!std.mem.eql(u8, s, "valid")) return self.failLocked(error.BadAccountResponse);
-                }
-            } else |err| switch (err) {
-                error.OutOfMemory => return self.failLocked(error.OutOfMemory),
-                else => return self.failLocked(error.BadAccountResponse),
-            }
+        // The account object is required to be bounded JSON: a 2xx with a
+        // missing/odd content type or a garbage body fails closed instead of
+        // being persisted.
+        if (!resp.content_type_json) return self.failLocked(error.BadAccountResponse);
+        var parsed = json_limits.parseBounded(AccountJson, self.allocator, resp.body, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return self.failLocked(error.OutOfMemory),
+            else => return self.failLocked(error.BadAccountResponse),
+        };
+        defer parsed.deinit();
+        if (parsed.value.status) |s| {
+            if (!std.mem.eql(u8, s, "valid")) return self.failLocked(error.BadAccountResponse);
         }
         self.setKid(location) catch |err| return self.failLocked(err);
         return created;
@@ -482,20 +482,7 @@ pub const Client = struct {
     }
 };
 
-/// Conservative address check: it only has to be safe to embed in JSON and a
-/// `mailto:` URI without escaping, and plausibly an address. The CA is the
-/// authority on whether it is deliverable.
-pub fn isPlausibleEmail(email: []const u8) bool {
-    if (email.len < 3 or email.len > 254) return false;
-    const at = std.mem.indexOfScalar(u8, email, '@') orelse return false;
-    if (at == 0 or at == email.len - 1) return false;
-    if (std.mem.indexOfScalarPos(u8, email, at + 1, '@') != null) return false;
-    for (email) |c| {
-        if (c <= 0x20 or c >= 0x7f) return false;
-        if (std.mem.indexOfScalar(u8, "\"\\<>,;?#%&=/", c) != null) return false;
-    }
-    return true;
-}
+pub const isPlausibleEmail = contact.isPlausibleEmail;
 
 /// A ready account: key, protocol client, and the persisted account URL.
 pub const Session = struct {

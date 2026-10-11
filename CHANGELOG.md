@@ -27,7 +27,8 @@ All notable user-facing changes to Tardigrade are documented here.
   atomically-written, lock-protected state directory. No certificate is
   requested or activated. The §4 config grammar (`TARDIGRADE_TLS_AUTOMATIC_HTTPS`,
   `_ACME_AGREE_TOS`, `_ACME_STATE_DIR`, `_ACME_CA_BUNDLE_PATH`, ...) is now
-  parsed and validated, but enabling it is still rejected.
+  parsed and validated, but enabling it is still rejected in release builds;
+  `-Dacme-experimental` builds add `tardi acme-account` (account bootstrap only).
   Tests: `zig build test-acme` (fake CA that verifies every signed request,
   plus `fuzz: ACME:` corpus targets).
 - **WebSocket reactor lifecycle observability (#829, #827).** Tunnel close

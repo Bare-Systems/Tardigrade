@@ -629,3 +629,39 @@ test "fuzz: ACME: arbitrary account response bodies never crash or leak" {
         &([_]u8{'{'} ** 40),
     } });
 }
+
+test "ACME client: a pre-provisioned account key is used and never created" {
+    var env = try Env.init();
+    defer env.deinit();
+    var key = try account_mod.AccountKey.generate();
+    defer key.deinit();
+    const pem = try key.toPkcs8Pem(testing.allocator);
+    defer crypto.secrets.secureZeroAndFree(testing.allocator, pem);
+    const key_path = try std.fmt.allocPrint(testing.allocator, "{s}-provisioned.pem", .{env.path});
+    defer testing.allocator.free(key_path);
+    defer zig_compat.unlinkPath(key_path);
+    {
+        var state = try StateDir.open(env.path);
+        defer state.close();
+        // Written next to (not inside) the state dir, as an operator would.
+        var parent = try std.Io.Dir.cwd().openDir(zig_compat.io(), std.fs.path.dirname(env.path).?, .{});
+        defer parent.close(zig_compat.io());
+        var file = try parent.createFile(zig_compat.io(), std.fs.path.basename(key_path), .{ .permissions = .fromMode(0o600) });
+        defer file.close(zig_compat.io());
+        try file.writePositionalAll(zig_compat.io(), pem, 0);
+    }
+
+    var cfg = env.config();
+    cfg.account_key_path = key_path;
+    const session = try openSession(&env, cfg);
+    defer session.close();
+    try testing.expectEqualSlices(u8, &key.jwk().x, &session.key.jwk().x);
+    try testing.expect(env.ca.allPostsVerified());
+    // The state directory did not mint its own key.
+    var state = try StateDir.open(env.path);
+    defer state.close();
+    try testing.expectError(error.NotFound, state.readFileAlloc(testing.allocator, state_mod.account_key_name, 512, true));
+
+    cfg.account_key_path = "/nonexistent/key.pem";
+    try testing.expectError(error.NotFound, Session.open(testing.allocator, env.transport(), &state, cfg, 1));
+}

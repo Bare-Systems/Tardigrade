@@ -59,6 +59,7 @@ pub const Fault = enum {
     write,
     short_write,
     fsync_file,
+    close_file,
     rename,
     fsync_dir,
 };
@@ -157,8 +158,12 @@ pub const StateDir = struct {
 
         try self.hit(.fsync_file);
         zig_compat.fsyncFd(fd) catch return error.IoFailure;
+        // close() can report deferred write errors; a reported failure must
+        // not be committed. The descriptor is consumed either way.
+        const close_result = zig_compat.closeFdChecked(fd);
         fd_open = false;
-        zig_compat.closeFd(fd);
+        try self.hit(.close_file);
+        close_result catch return error.IoFailure;
 
         try self.hit(.rename);
         zig_compat.renameAt(self.dir_fd, temp_name, name) catch return error.IoFailure;
@@ -330,6 +335,35 @@ pub fn loadAccountRecord(state: *const StateDir, allocator: std.mem.Allocator, e
     return .{ .parsed = parsed };
 }
 
+/// Load a pre-provisioned account key from an operator-chosen path. Same
+/// strictness as the state directory's own key (no symlink, regular file,
+/// owned by the effective uid, no group/other bits, bounded, strict PKCS#8),
+/// but it is only ever read: a missing or invalid file is an error, never a
+/// reason to create a key somewhere the operator did not expect.
+pub fn loadPreprovisionedKey(path: []const u8) Error!account_mod.AccountKey {
+    if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+    const fd = zig_compat.openAtNoFollow(zig_compat.cwd_fd, path, .{}, 0) catch |err| switch (err) {
+        error.NotFound => return error.NotFound,
+        else => return error.UnsafeFileType, // includes a symlink (ELOOP)
+    };
+    defer zig_compat.closeFd(fd);
+    const identity = zig_compat.statFdIdentity(fd) catch return error.IoFailure;
+    if (!identity.is_regular) return error.UnsafeFileType;
+    if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
+    if (identity.mode & 0o077 != 0) return error.InsecurePermissions;
+
+    var buf: [account_mod.max_pem_len + 1]u8 = undefined;
+    defer secrets.secureZero(&buf);
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = zig_compat.readFd(fd, buf[len..]) catch return error.IoFailure;
+        if (n == 0) break;
+        len += n;
+    }
+    if (len > account_mod.max_pem_len) return error.TooLarge;
+    return account_mod.AccountKey.fromPkcs8Pem(buf[0..len]) catch error.CorruptState;
+}
+
 /// Load `account.key`, or create it (exclusive: only when it does not
 /// exist). An existing but unreadable/invalid key is an error — it is never
 /// regenerated, because that would silently orphan the registered account.
@@ -469,7 +503,7 @@ test "ACME state: a failure at every step keeps the previous file and removes th
     defer state.close();
     try state.writeFileAtomic("a.json", "original", 0o600);
 
-    const points = [_]Fault{ .create_temp, .write, .short_write, .fsync_file, .rename };
+    const points = [_]Fault{ .create_temp, .write, .short_write, .fsync_file, .close_file, .rename };
     for (points) |point| {
         state.fault = point;
         try testing.expectError(error.InjectedFault, state.writeFileAtomic("a.json", "replacement-content", 0o600));
@@ -694,4 +728,40 @@ test "ACME state: racing openers are serialized and never corrupt the shared fil
     defer testing.allocator.free(got);
     try testing.expectEqual(@as(usize, 256), got.len);
     for (got) |c| try testing.expectEqual(got[0], c);
+}
+
+test "ACME state: pre-provisioned key loads strictly and is never created" {
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try StateDir.open(tmp.path);
+    defer state.close();
+
+    var original = try account_mod.AccountKey.generate();
+    defer original.deinit();
+    const pem = try original.toPkcs8Pem(testing.allocator);
+    defer secrets.secureZeroAndFree(testing.allocator, pem);
+
+    const key_path = try std.fmt.allocPrint(testing.allocator, "{s}/provisioned.pem", .{tmp.path});
+    defer testing.allocator.free(key_path);
+
+    try testing.expectError(error.NotFound, loadPreprovisionedKey(key_path));
+    try testing.expectError(error.NotFound, state.readFileAlloc(testing.allocator, "provisioned.pem", 8, true));
+
+    try state.writeFileAtomic("provisioned.pem", pem, 0o600);
+    var loaded = try loadPreprovisionedKey(key_path);
+    defer loaded.deinit();
+    try testing.expectEqualSlices(u8, &original.jwk().x, &loaded.jwk().x);
+
+    try state.writeFileAtomic("provisioned.pem", pem, 0o640);
+    try testing.expectError(error.InsecurePermissions, loadPreprovisionedKey(key_path));
+    try state.writeFileAtomic("provisioned.pem", "garbage", 0o600);
+    try testing.expectError(error.CorruptState, loadPreprovisionedKey(key_path));
+    try state.writeFileAtomic("provisioned.pem", &([_]u8{'a'} ** 600), 0o600);
+    try testing.expectError(error.TooLarge, loadPreprovisionedKey(key_path));
+
+    const link_path = try std.fmt.allocPrint(testing.allocator, "{s}/link.pem", .{tmp.path});
+    defer testing.allocator.free(link_path);
+    try tmp.tmp.dir.symLink(zig_compat.io(), "provisioned.pem", "state/link.pem", .{});
+    try testing.expectError(error.UnsafeFileType, loadPreprovisionedKey(link_path));
+    try testing.expectError(error.InvalidPath, loadPreprovisionedKey(""));
 }

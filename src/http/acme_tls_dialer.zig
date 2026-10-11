@@ -16,8 +16,22 @@ const IoError = transport.IoError;
 const DialError = transport.DialError;
 const Dialer = transport.Dialer;
 
+/// Owns one reference to the trust-anchor snapshot for its whole lifetime, so
+/// a reload that retires the configured snapshot cannot free anchors under a
+/// handshake in flight (design §9.3). Reload swaps whole dialer owners and
+/// calls `deinit` on the old one only after nothing can start a new request
+/// through it.
 pub const TlsDialer = struct {
     snapshot: *transport.TrustAnchorSnapshot,
+
+    pub fn init(snapshot: *transport.TrustAnchorSnapshot) TlsDialer {
+        return .{ .snapshot = snapshot.retain() };
+    }
+
+    pub fn deinit(self: *TlsDialer) void {
+        self.snapshot.release();
+        self.* = undefined;
+    }
 
     pub fn dialer(self: *TlsDialer) Dialer {
         return .{ .ptr = self, .dialFn = dial };
@@ -77,7 +91,8 @@ pub const TlsDialer = struct {
 test "ACME TLS dialer: fails closed when nothing is listening" {
     const snapshot = try transport.TrustAnchorSnapshot.load(std.testing.allocator, "src/pki/testdata/ecdsa_p256_ca.crt");
     defer snapshot.release();
-    var tls = TlsDialer{ .snapshot = snapshot };
+    var tls = TlsDialer.init(snapshot);
+    defer tls.deinit();
     // Port 1 on loopback: connection refused, never a silent success.
     const result = tls.dialer().dialFn(tls.dialer().ptr, std.testing.allocator, "127.0.0.1", 1, 500);
     try std.testing.expectError(error.DialFailed, result);
@@ -115,7 +130,8 @@ test "ACME TLS dialer: one absolute deadline bounds TCP, TLS and a dribbling pee
         thread.join();
     }
 
-    var tls = TlsDialer{ .snapshot = snapshot };
+    var tls = TlsDialer.init(snapshot);
+    defer tls.deinit();
     const t = transport.Transport{
         .allocator = std.testing.allocator,
         .dialer = tls.dialer(),
@@ -133,4 +149,16 @@ test "ACME TLS dialer: one absolute deadline bounds TCP, TLS and a dribbling pee
     // at ~800 ms regardless.
     try std.testing.expect(elapsed >= 700);
     try std.testing.expect(elapsed < 1200);
+}
+
+test "ACME TLS dialer: retiring the configured snapshot does not free anchors under a dialer" {
+    const configured = try transport.TrustAnchorSnapshot.load(std.testing.allocator, "src/pki/testdata/ecdsa_p256_ca.crt");
+    var dialer_owner = TlsDialer.init(configured);
+    // Reload retires the configured reference; the dialer's own reference
+    // keeps the anchors alive (the testing allocator would flag a
+    // use-after-free or a leak).
+    configured.release();
+    try std.testing.expect(dialer_owner.snapshot.anchors.anchors().len > 0);
+    try std.testing.expectEqual(@as(u32, 1), dialer_owner.snapshot.refs.load(.acquire));
+    dialer_owner.deinit();
 }

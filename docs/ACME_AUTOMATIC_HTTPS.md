@@ -813,7 +813,7 @@ rejected and no certificate is requested, issued or activated.
 | `src/acme/url.zig` | CA URL grammar and same-origin pin (§6.3). |
 | `src/acme/transport.zig` | Bounded HTTP/1.1 over an abstract `Connection`: header/body caps, chunked decoding, redirects rejected, one request deadline; refcounted `TrustAnchorSnapshot` (G10). |
 | `src/http/acme_tls_dialer.zig` | Production `Dialer` over `UpstreamTlsConn` using `UpstreamTlsOptions.trust_anchors` (no filesystem access per dial). |
-| `src/acme/client.zig` | Directory fetch, single-slot nonce cache (taken before signing, never restored), `signedPost` with a finite `badNonce` budget (default 2 retries), `Session.open` (create/reuse account), `Diagnostics` with `FailureClass` (transport / protocol / persistence / resource). |
+| `src/acme/client.zig` | Directory fetch, single-slot nonce cache (taken before signing, never restored), `signedPost` with a finite `badNonce` budget (default 1 retry, §5.3), `Session.open` (create/reuse account), `Diagnostics` with `FailureClass` (transport / protocol / persistence / resource). |
 | `src/acme/fake_ca.zig`, `client_tests.zig` | In-process fake CA that verifies every JWS (nonce single-use, `url`, `jwk`/`kid`, ES256 signature) and can script hostile behavior. |
 
 Behavior worth knowing:
@@ -827,12 +827,25 @@ Behavior worth knowing:
 - `account.json` stores the directory URL, account URL, creation time and a
   SHA-256 of the contact; the email itself is never written.
 - Config (§4) is parsed and validated in `edge_config.zig` before the final
-  unsupported gate: `automatic_https` alias, directory URL grammar, ToS, state
-  dir (`STATE_DIR`, alias `CERT_DIR`), email, `http-01`-only challenges, EAB
-  reserved, account-key override rejected, and "set without the opt-in" is an
-  error. Still open for later phases because they depend on the listener and
-  redirect work: per-hostname rules (§4.2), `acme_http01_listen`, and
-  `https_redirect` (A3/A4); `acme_renew_days_before_expiry` range (A5).
+  gate: `automatic_https` (primary name beats the `ACME_ENABLED` alias and the
+  directive-normalized name), directory URL grammar, ToS, state dir
+  (`STATE_DIR`, alias `CERT_DIR`), email, `acme_domains` (§4.2 via
+  `src/acme/names.zig`: DNS syntax from `tls/dns_name.zig`, no wildcards/IPs,
+  duplicates, 100-name/64-group/16-per-group caps, `;` order groups, private
+  names only with a non-default directory plus CA bundle), renew window
+  `1..=60`, `http-01` only, reserved EAB, pre-provisioned account key path,
+  and with the opt-in off **every** non-default `acme_*` setting is an error.
+  Still open for later phases because they need the listener/redirect:
+  `acme_http01_listen` and `https_redirect` (A3/A4), and the §4.7 overlap rule
+  with manual SNI certificates (A4).
+- `acme_experimental` (`zig build -Dacme-experimental`, off by default and for
+  release artifacts) is the §4.5 build gate. Only general-profile builds with
+  it accept the validated opt-in, and `tardi acme-account` is the sole
+  consumer: it opens the state dir, loads trust anchors, and creates or loads
+  the account, then stops. `tardi run` refuses ACME-enabled configs in every
+  build; nothing issues or activates a certificate.
+- `TlsDialer` owns a retained trust-anchor reference for its lifetime.
+- The atomic write path checks `close()` and has a `close_file` fault point.
 - State-directory ownership (effective uid) and mode are validated on the
   opened descriptor; all OS calls live in `zig_compat.zig`, and a test in
   `src/acme_test_root.zig` fails if ACME production code references `std.c`,

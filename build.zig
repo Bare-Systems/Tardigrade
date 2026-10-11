@@ -95,6 +95,15 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", app_version);
     build_options.addOption([]const u8, "commit", commit_sha);
     build_options.addOption([]const u8, "tls_profile", @tagName(tls_profile));
+    // Native ACME implementation slices land behind this option before the
+    // release-gating phase (docs/ACME_AUTOMATIC_HTTPS.md §4.5). Off by default
+    // and never set for release artifacts.
+    const acme_experimental = b.option(
+        bool,
+        "acme-experimental",
+        "Enable native ACME implementation slices (account bootstrap, #832) before they are supported; never for release builds",
+    ) orelse false;
+    build_options.addOption(bool, "acme_experimental", acme_experimental);
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("src/zig_compat.zig"),
         .target = target,
@@ -335,6 +344,8 @@ pub fn build(b: *std.Build) void {
         "tardigrade_bin_path",
         b.option([]const u8, "tardigrade-bin-path", "Path to the tardi executable used by integration tests") orelse b.getInstallPath(.bin, "tardi"),
     );
+
+    integration_options.addOption(bool, "acme_experimental", acme_experimental);
 
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration.zig"),

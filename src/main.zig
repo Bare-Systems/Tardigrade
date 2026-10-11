@@ -4,6 +4,7 @@ const compat = @import("zig_compat");
 const config_profiles = @import("config_profiles.zig");
 const config_reference = @import("config_reference.zig");
 const edge_config = @import("edge_config.zig");
+const acme_account_cmd = @import("acme_account_cmd.zig");
 const edge_gateway = @import("edge_gateway.zig");
 const http = @import("http.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
@@ -29,6 +30,7 @@ const CliCommand = union(enum) {
     config_init: ConfigInitOptions,
     init: InitOptions,
     explain: ExplainOptions,
+    acme_account: CommonOptions,
 };
 
 const CommonOptions = struct {
@@ -158,6 +160,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .reload => |options| try executeSignalCommand(control_allocator, "reload", std.posix.SIG.HUP, options),
         .stop => |options| try executeSignalCommand(control_allocator, "stop", std.posix.SIG.TERM, options),
         .check => |options| try executeValidationCommandOrExit(control_allocator, options, .check),
+        .acme_account => |options| try executeAcmeAccountCommandOrExit(control_allocator, options),
         .validate => |options| try executeValidationCommandOrExit(control_allocator, options, .legacy),
         .run => |options| {
             if (environmentRequestsValidate()) {
@@ -179,6 +182,12 @@ fn parseCliCommand(args: []const []const u8) !CliCommand {
     if (std.mem.eql(u8, first, "version")) return .version;
     if (std.mem.eql(u8, first, "run")) return try parseRunCommand(args[1..]);
     if (std.mem.eql(u8, first, "check")) return try parseCheckCommand(args[1..]);
+    if (std.mem.eql(u8, first, "acme-account")) {
+        return switch (try parseCheckCommand(args[1..])) {
+            .check => |options| .{ .acme_account = options },
+            else => |other| other,
+        };
+    }
     if (std.mem.eql(u8, first, "validate")) return try parseValidateCommand(args[1..]);
     if (std.mem.eql(u8, first, "status")) return try parseSignalCommand(.status, args[1..]);
     if (std.mem.eql(u8, first, "print-config")) return try parsePrintConfigCommand(args[1..]);
@@ -496,6 +505,50 @@ fn environmentRequestsValidate() bool {
     const env = compat.getEnvVarOwned(std.heap.page_allocator, "TARDIGRADE_VALIDATE_CONFIG_ONLY") catch return false;
     defer std.heap.page_allocator.free(env);
     return std.mem.eql(u8, env, "1") or std.ascii.eqlIgnoreCase(env, "true");
+}
+
+/// `tardi acme-account` (#832): bootstrap the ACME account only. Experimental
+/// builds (`-Dacme-experimental`) on the general profile; everything else
+/// reports why it is unavailable.
+fn executeAcmeAccountCommandOrExit(allocator: std.mem.Allocator, options: CommonOptions) !void {
+    var stderr_buf: [2048]u8 = undefined;
+    var stderr = compat.stderrWriter(&stderr_buf);
+    if (!build_options.acme_experimental or edge_config.is_appliance_tls_profile) {
+        try stderr.print("error: acme-account requires a general-profile build compiled with -Dacme-experimental; automatic HTTPS is not supported yet\n", .{});
+        try stderr.flush();
+        std.process.exit(EXIT_CONFIG_INVALID);
+    }
+    const resolved_config_path = resolveValidationConfigPath(allocator, options.config_path, .legacy) catch |err| {
+        try printConfigCommandError(&stderr, err, options, .legacy);
+        try stderr.flush();
+        std.process.exit(configCommandExitCode(err));
+    };
+    defer if (resolved_config_path) |path| allocator.free(path);
+    if (resolved_config_path) |path| try setProcessEnv(allocator, ENV_CONFIG_PATH, path);
+
+    var cfg = edge_config.loadFromEnv(allocator) catch |err| {
+        try printConfigCommandError(&stderr, err, options, .legacy);
+        try stderr.flush();
+        std.process.exit(configCommandExitCode(err));
+    };
+    defer cfg.deinit(allocator);
+    edge_config.validate(&cfg) catch |err| {
+        try printConfigCommandError(&stderr, err, options, .legacy);
+        try stderr.flush();
+        std.process.exit(configCommandExitCode(err));
+    };
+    if (!cfg.tls_acme_enabled) {
+        try stderr.print("error: acme-account requires TARDIGRADE_TLS_AUTOMATIC_HTTPS=true\n", .{});
+        try stderr.flush();
+        std.process.exit(EXIT_CONFIG_INVALID);
+    }
+    var stdout_buf: [512]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    acme_account_cmd.execute(allocator, &cfg, &stdout) catch {
+        try stdout.flush();
+        std.process.exit(EXIT_INTERNAL_ERROR);
+    };
+    try stdout.flush();
 }
 
 fn executeValidationCommandOrExit(allocator: std.mem.Allocator, options: CommonOptions, mode: ValidationMode) !void {
@@ -957,6 +1010,7 @@ fn prepareRunPlan(allocator: std.mem.Allocator, args: []const []const u8, option
     var cfg = try edge_config.loadFromEnv(allocator);
     errdefer cfg.deinit(allocator);
     try edge_config.validate(&cfg);
+    try edge_config.rejectAcmeRuntime(&cfg);
     try preflightApplianceCredentials(allocator, &cfg);
     edge_config.warnRiskyConfig(&cfg);
 
@@ -1540,6 +1594,7 @@ test {
     _ = @import("edge_gateway.zig");
     _ = @import("gateway_protocol_policy.zig");
     _ = @import("config_reference.zig");
+    _ = @import("acme_account_cmd.zig");
 }
 
 test "rotateLogFiles shifts generations" {

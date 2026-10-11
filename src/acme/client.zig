@@ -153,6 +153,10 @@ pub const Config = struct {
     contact_email: []const u8 = "",
     /// Operator accepts the CA's terms of service (design §4.1, `acme_agree_tos`).
     terms_of_service_agreed: bool = false,
+    /// Pre-provisioned account key (design §4.1). Empty uses `account.key` in
+    /// the state directory, created on first use. When set the file is only
+    /// read, never created.
+    account_key_path: []const u8 = "",
     /// Off by default (design §6.3): CA URLs must share the directory origin.
     allow_cross_host_urls: bool = false,
     /// Extra attempts after a `badNonce`; total POSTs is this plus one. The
@@ -512,8 +516,12 @@ pub const Session = struct {
         errdefer allocator.destroy(session);
         session.allocator = allocator;
 
-        const loaded = try state_mod.loadOrCreateAccountKey(state, allocator);
-        session.key = loaded.key;
+        if (config.account_key_path.len > 0) {
+            session.key = try state_mod.loadPreprovisionedKey(config.account_key_path);
+        } else {
+            const loaded = try state_mod.loadOrCreateAccountKey(state, allocator);
+            session.key = loaded.key;
+        }
         errdefer session.key.deinit();
 
         session.client = try Client.init(allocator, transport, &session.key, config);

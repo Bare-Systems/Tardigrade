@@ -1235,12 +1235,21 @@ test "DirCompat createFile and stat" {
 /// Raw descriptor type, so callers need not name `std.posix`.
 pub const Fd = std.posix.fd_t;
 
+/// `AT_FDCWD`: resolve relative to the working directory.
+pub const cwd_fd: Fd = std.posix.AT.FDCWD;
+
 pub const StateFileError = error{ IoFailure, WouldBlock, NotFound, Exists };
 
 /// Close a raw descriptor, ignoring errors (use `fsyncFd` first when
 /// durability matters).
 pub fn closeFd(fd: std.posix.fd_t) void {
     _ = std.c.close(fd);
+}
+
+/// Close and report a failure (deferred write errors can surface here). The
+/// descriptor is consumed either way: never retry or close it again.
+pub fn closeFdChecked(fd: std.posix.fd_t) StateFileError!void {
+    if (std.c.close(fd) != 0) return error.IoFailure;
 }
 
 pub fn effectiveUid() u32 {

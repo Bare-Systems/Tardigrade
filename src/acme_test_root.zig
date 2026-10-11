@@ -31,7 +31,7 @@ test "ACME implementation stays behind the native compat boundary (#832)" {
     };
     // Direct libc/POSIX calls belong in zig_compat.zig; no foreign crypto or
     // C interop anywhere in the ACME implementation.
-    const forbidden = [_][]const u8{ "std.c.", "std.posix.", "@cImport", "@cInclude", "openssl", "OPENSSL", "libcrypto", "extern \"c\"" };
+    const forbidden = [_][]const u8{ "std.c.", "std.posix.", "@c" ++ "Import", "@c" ++ "Include", "open" ++ "ssl", "OPEN" ++ "SSL", "lib" ++ "crypto", "extern \"" ++ "c\"" };
     inline for (files) |entry| {
         const text = productionText(entry[1]);
         try std.testing.expect(text.len > 200);

@@ -168,7 +168,7 @@ from a surprising default.
 
 ### 4.2 Hostname rules
 
-A managed hostname must be a DNS name, lowercased, no trailing dot, 1–253
+A managed hostname must be a DNS name, already lowercase (uppercase is rejected, not normalized), no trailing dot, 1–253
 bytes, labels 1–63 bytes, validated by `tls/dns_name.zig` (the validator the
 SNI provider already uses). Additionally:
 
@@ -202,7 +202,7 @@ Must be `https://`, a host, no userinfo, no fragment, ≤ 2048 bytes. Plain
 <state_dir>/                 mode 0700, owned by the runtime user
   .lock                      advisory flock, one process per state dir
   account.key                0600, PKCS#8 PEM, P-256
-  account.json               0600, {directory, kid, created_at, contact_hash}
+  account.json               0600, {version: 2, directory, kid, key_thumbprint, created_at, contact_hash}
   groups/<group-id>/
     current                  0600, atomically replaced; one line: <gen-id>\n
     generations/<gen-id>/    immutable once `current` names it
@@ -799,6 +799,68 @@ wiring, #835 renewal, #836 multi-SNI/TLS-ALPN-01, #837 gating); there is one
 scope source of truth. Dependencies are those in the graph in §3. A3 depends
 on A2's `Jws`, `AccountKey` and transport interfaces, which A2 must publish
 first; A4's unit-tested persistence can proceed alongside A3.
+
+### 10.1 A2 as implemented (#832)
+
+Landed behind the closed gate; `TARDIGRADE_TLS_ACME_ENABLED=true` is still
+rejected and no certificate is requested, issued or activated.
+
+| File | What it provides |
+| --- | --- |
+| `src/acme/account.zig` | `AccountKey` (OS-entropy P-256 generation, strict PKCS#8 PEM load/save, wiped on `deinit`), `Jwk` + RFC 7638 thumbprint, `signJws` (ES256, `jwk` xor `kid`, POST-as-GET). |
+| `src/acme/state.zig` | `StateDir`: `0700` dir, symlink/perm checks, `flock` single owner, atomic `0600` replace (temp, fsync, rename, fsync dir), stale-temp cleanup, versioned `account.json`, never-regenerate key policy. |
+| `src/acme/json_limits.zig` | Bounded JSON admission (bytes, depth 8, strings 2 KiB, arrays 128, keys 64) before any typed parse. |
+| `src/acme/url.zig` | CA URL grammar and same-origin pin (§6.3). |
+| `src/acme/transport.zig` | Bounded HTTP/1.1 over an abstract `Connection`: header/body caps, chunked decoding, redirects rejected, one request deadline; refcounted `TrustAnchorSnapshot` (G10). |
+| `src/http/acme_tls_dialer.zig` | Production `Dialer` over `UpstreamTlsConn` using `UpstreamTlsOptions.trust_anchors` (no filesystem access per dial). |
+| `src/acme/client.zig` | Directory fetch, single-slot nonce cache (taken before signing, never restored), `signedPost` with a finite `badNonce` budget (default 1 retry, §5.3), `Session.open` (create/reuse account), `Diagnostics` with `FailureClass` (transport / protocol / persistence / resource). |
+| `src/acme/fake_ca.zig`, `client_tests.zig` | In-process fake CA that verifies every JWS (nonce single-use, `url`, `jwk`/`kid`, ES256 signature) and can script hostile behavior. |
+
+Behavior worth knowing:
+
+- Opening with a persisted `account.json` performs **no network I/O**; the CA
+  is only contacted when a request is made (restart during a CA outage keeps
+  the account identity).
+- If registration succeeds at the CA but writing `account.json` fails, the key
+  is already durable, and the next open converges: `newAccount` is idempotent
+  per key (200 with the existing account URL).
+- `account.json` (version 2) stores the directory URL, account URL, the RFC 7638
+  thumbprint of the key that registered it (a record for a different key fails
+  `InconsistentState`), creation time and a SHA-256 of the contact; the email itself is never written.
+- Config (§4) is parsed and validated in `edge_config.zig` before the final
+  gate: `automatic_https` (primary name beats the `ACME_ENABLED` alias and the
+  directive-normalized name), directory URL grammar, ToS, state dir
+  (`STATE_DIR`, alias `CERT_DIR`), email, `acme_domains` (§4.2 via
+  `src/acme/names.zig`: DNS syntax from `tls/dns_name.zig`, no wildcards/IPs,
+  duplicates, 100-name/64-group/16-per-group caps, `;` order groups, private
+  names only with a non-default directory plus CA bundle), renew window
+  `1..=60`, `http-01` only, reserved EAB, pre-provisioned account key path,
+  and with the opt-in off **every** non-default `acme_*` setting is an error.
+  Still open for later phases because they need the listener/redirect:
+  `acme_http01_listen` and `https_redirect` (A3/A4), and the §4.7 overlap rule
+  with manual SNI certificates (A4).
+- `acme_experimental` (`zig build -Dacme-experimental`, off by default and for
+  release artifacts) is the §4.5 build gate. Only general-profile builds with
+  it accept the validated opt-in, and `tardi acme-account` is the sole
+  consumer: it opens the state dir, loads trust anchors, and creates or loads
+  the account, then stops. `tardi run` refuses ACME-enabled configs in every
+  build; nothing issues or activates a certificate.
+- `TlsDialer` owns a retained trust-anchor reference for its lifetime.
+- The atomic write path checks `close()` and has a `close_file` fault point.
+- State-directory ownership (effective uid) and mode are validated on the
+  opened descriptor; all OS calls live in `zig_compat.zig`, and a test in
+  `src/acme_test_root.zig` fails if ACME production code references `std.c`,
+  `std.posix`, or any C/OpenSSL interop.
+- One absolute request deadline covers TCP connect, the TLS handshake and
+  every later read/write (`UpstreamTlsOptions.deadline_ms` clamps each
+  `poll()`), so a peer that dribbles bytes cannot stack per-wait timeouts.
+- `badNonce` is retried once by default (§5.3), configurable per client.
+- The TLS leg of the real dialer is covered by the existing `UpstreamTlsConn`
+  and `webpki_verifier` suites; A2's fake CA replaces only the byte stream
+  beneath HTTP. A loopback TLS CA is A7 interop work.
+
+Run the focused gate with `zig build test-acme` (includes the
+`fuzz: ACME: ...` corpus targets); the same tests also run under `zig build test`.
 
 ## 11. Test plan
 

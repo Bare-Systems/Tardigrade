@@ -314,6 +314,20 @@ pub const EdgeConfig = struct {
     tls_acme_account_key_path: []const u8,
     /// Days before certificate expiry at which renewal is triggered.
     tls_acme_renew_days_before_expiry: u32,
+    /// Raw `TARDIGRADE_TLS_ACME_DOMAINS`, including `;` order-group
+    /// boundaries (`tls_acme_domains` is the flat name list).
+    tls_acme_domains_spec: []const u8,
+    /// `TARDIGRADE_TLS_ACME_AGREE_TOS`: operator accepts the CA's terms
+    /// (docs/ACME_AUTOMATIC_HTTPS.md §4.1, #832).
+    tls_acme_agree_tos: bool,
+    /// `TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH`: trust anchors for the ACME
+    /// directory server only; empty selects the system bundle.
+    tls_acme_ca_bundle_path: []const u8,
+    /// `TARDIGRADE_TLS_ACME_CHALLENGES` (CSV); only `http-01` is accepted.
+    tls_acme_challenges: []const u8,
+    /// `TARDIGRADE_TLS_ACME_EAB_KID` or `_EAB_HMAC_KEY_PATH` was set. External
+    /// account binding is reserved and rejected until implemented.
+    tls_acme_eab_requested: bool,
     http1_enabled: bool,
     http2_enabled: bool,
     tls_http1_no_alpn_fallback: bool,
@@ -791,6 +805,9 @@ pub const EdgeConfig = struct {
         allocator.free(self.tls_client_ca_path);
         allocator.free(self.tls_crl_path);
         allocator.free(self.tls_acme_cert_dir);
+        allocator.free(self.tls_acme_ca_bundle_path);
+        allocator.free(self.tls_acme_domains_spec);
+        allocator.free(self.tls_acme_challenges);
         allocator.free(self.trust_gateway_id);
         allocator.free(self.trust_shared_secret);
         for (self.trusted_upstream_identities) |id| allocator.free(id);
@@ -1029,23 +1046,53 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     // touches this gets an accurate config, and an explicit nonzero
     // override is caught by validateNativeTlsBuildConfig.
     const tls_dynamic_reload_interval_ms = parseIntEnv(u64, allocator, "TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS", 0);
-    const tls_acme_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_ACME_ENABLED", false);
-    const tls_acme_cert_dir = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_CERT_DIR", "") catch unreachable;
+    // Automatic-HTTPS grammar (docs/ACME_AUTOMATIC_HTTPS.md §4.1, #832). For
+    // each setting the first *present* name wins: the documented
+    // `TARDIGRADE_TLS_*` name, then the native config-file directive's
+    // normalized name (`acme_state_dir` -> `TARDIGRADE_ACME_STATE_DIR`), then
+    // the legacy alias. A stale legacy value therefore cannot override an
+    // explicit primary one.
+    const tls_acme_enabled = acmeEnvBool(allocator, "TARDIGRADE_TLS_AUTOMATIC_HTTPS", "TARDIGRADE_TLS_ACME_ENABLED", false);
+    const tls_acme_cert_dir = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_STATE_DIR", "TARDIGRADE_TLS_ACME_CERT_DIR", "") catch unreachable;
     errdefer allocator.free(tls_acme_cert_dir);
-    const tls_acme_directory_url = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_DIRECTORY_URL", "https://acme-v02.api.letsencrypt.org/directory") catch unreachable;
+    const tls_acme_directory_url = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_DIRECTORY_URL", "", default_acme_directory_url) catch unreachable;
     errdefer allocator.free(tls_acme_directory_url);
-    const tls_acme_domains_raw = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_DOMAINS", "") catch unreachable;
-    defer allocator.free(tls_acme_domains_raw);
-    const tls_acme_domains = try parseCsvValues(allocator, tls_acme_domains_raw);
+    const tls_acme_domains_spec = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_DOMAINS", "", "") catch unreachable;
+    errdefer allocator.free(tls_acme_domains_spec);
+    // The flat list is every name; `;` order-group boundaries live only in
+    // `tls_acme_domains_spec` and are validated there.
+    const tls_acme_domains_flat = try allocator.dupe(u8, tls_acme_domains_spec);
+    defer allocator.free(tls_acme_domains_flat);
+    std.mem.replaceScalar(u8, tls_acme_domains_flat, ';', ',');
+    const tls_acme_domains = try parseCsvValues(allocator, tls_acme_domains_flat);
     errdefer {
         for (tls_acme_domains) |d| allocator.free(d);
         allocator.free(tls_acme_domains);
     }
-    const tls_acme_email = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_EMAIL", "") catch unreachable;
+    const tls_acme_email = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_EMAIL", "", "") catch unreachable;
     errdefer allocator.free(tls_acme_email);
-    const tls_acme_account_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH", "") catch unreachable;
+    const tls_acme_account_key_path = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH", "", "") catch unreachable;
     errdefer allocator.free(tls_acme_account_key_path);
-    const tls_acme_renew_days_before_expiry = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY", 30);
+    const tls_acme_renew_days_before_expiry = blk: {
+        const raw = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY", "", "") catch unreachable;
+        defer allocator.free(raw);
+        if (raw.len == 0) break :blk @as(u32, 30);
+        // An unparsable value must not silently become the default.
+        break :blk std.fmt.parseInt(u32, raw, 10) catch std.math.maxInt(u32);
+    };
+    const tls_acme_agree_tos = acmeEnvBool(allocator, "TARDIGRADE_TLS_ACME_AGREE_TOS", "", false);
+    const tls_acme_ca_bundle_path = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", "", "") catch unreachable;
+    errdefer allocator.free(tls_acme_ca_bundle_path);
+    const tls_acme_challenges = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_CHALLENGES", "", "http-01") catch unreachable;
+    errdefer allocator.free(tls_acme_challenges);
+    const tls_acme_eab_requested = blk: {
+        for ([_][]const u8{ "TARDIGRADE_TLS_ACME_EAB_KID", "TARDIGRADE_TLS_ACME_EAB_HMAC_KEY_PATH" }) |key| {
+            const value = acmeEnvOwned(allocator, key, "", "") catch unreachable;
+            defer allocator.free(value);
+            if (value.len > 0) break :blk true;
+        }
+        break :blk false;
+    };
     const upstream_protocol_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_PROTOCOL", "http1") catch unreachable;
     defer allocator.free(upstream_protocol_str);
     const upstream_protocol = try parseUpstreamProtocolConfig(upstream_protocol_str);
@@ -1819,6 +1866,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_acme_email = tls_acme_email,
         .tls_acme_account_key_path = tls_acme_account_key_path,
         .tls_acme_renew_days_before_expiry = tls_acme_renew_days_before_expiry,
+        .tls_acme_domains_spec = tls_acme_domains_spec,
+        .tls_acme_agree_tos = tls_acme_agree_tos,
+        .tls_acme_ca_bundle_path = tls_acme_ca_bundle_path,
+        .tls_acme_challenges = tls_acme_challenges,
+        .tls_acme_eab_requested = tls_acme_eab_requested,
         .http1_enabled = http1_enabled,
         .http2_enabled = http2_enabled,
         .tls_http1_no_alpn_fallback = tls_http1_no_alpn_fallback,
@@ -2545,6 +2597,55 @@ fn conflictingFileOverrideValue(key: []const u8, env_value: []const u8) ?[]const
     const file_value = overrides.map.get(key) orelse return null;
     if (std.mem.eql(u8, file_value, env_value)) return null;
     return file_value;
+}
+
+const default_acme_directory_url = "https://acme-v02.api.letsencrypt.org/directory";
+
+/// `TARDIGRADE_TLS_X` -> `TARDIGRADE_X`: the name a native config-file
+/// directive (`acme_state_dir`) normalizes to.
+fn acmeDirectiveAlias(buf: []u8, primary: []const u8) ?[]const u8 {
+    const prefix = "TARDIGRADE_TLS_";
+    if (!std.mem.startsWith(u8, primary, prefix)) return null;
+    return std.fmt.bufPrint(buf, "TARDIGRADE_{s}", .{primary[prefix.len..]}) catch null;
+}
+
+/// Resolve an ACME setting with the normal precedence of every other setting
+/// (environment, then config-file directive, then secret override, then
+/// default) and, *within each source*, name precedence: the documented
+/// `TARDIGRADE_TLS_*` name, then the name a config-file directive normalizes
+/// to (`acme_state_dir` -> `TARDIGRADE_ACME_STATE_DIR`), then `legacy` (when
+/// non-empty). Presence, not truthiness, decides, so an explicit primary
+/// `false`/empty beats a stale legacy value.
+fn acmeEnvOwned(allocator: std.mem.Allocator, primary: []const u8, legacy: []const u8, default_value: []const u8) ![]u8 {
+    var alias_buf: [128]u8 = undefined;
+    const names = [_]?[]const u8{
+        primary,
+        acmeDirectiveAlias(&alias_buf, primary),
+        if (legacy.len > 0) legacy else null,
+    };
+    for (names) |maybe| {
+        const key = maybe orelse continue;
+        if (compat.getEnvVarOwned(allocator, key)) |owned| return owned else |_| {}
+    }
+    if (active_file_overrides) |ov| {
+        for (names) |maybe| {
+            const key = maybe orelse continue;
+            if (ov.map.get(key)) |value| return allocator.dupe(u8, value);
+        }
+    }
+    if (active_secret_overrides) |ov| {
+        for (names) |maybe| {
+            const key = maybe orelse continue;
+            if (ov.map.get(key)) |value| return allocator.dupe(u8, value);
+        }
+    }
+    return allocator.dupe(u8, default_value);
+}
+
+fn acmeEnvBool(allocator: std.mem.Allocator, primary: []const u8, legacy: []const u8, default_value: bool) bool {
+    const raw = acmeEnvOwned(allocator, primary, legacy, if (default_value) "true" else "false") catch return default_value;
+    defer allocator.free(raw);
+    return std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "1");
 }
 
 fn envOrDefaultAlias(allocator: std.mem.Allocator, primary_key: []const u8, fallback_key: []const u8, default_value: []const u8) ![]u8 {
@@ -3561,13 +3662,100 @@ fn validateTlsServerNamePolicy(cfg: *const EdgeConfig) !void {
 /// never be presented to the verifier.
 const max_client_verify_depth = 8;
 
+/// Parse and validate the automatic-HTTPS grammar of
+/// docs/ACME_AUTOMATIC_HTTPS.md §4 (#832, phase A2). Runs *before* the final
+/// "not supported yet" gate so later phases consume a stable, validated
+/// contract and invalid combinations fail deterministically; passing it never
+/// enables ACME. Deterministic messages carry no secrets.
+fn validateAcmeConfig(cfg: *const EdgeConfig) !void {
+    const acme_url = @import("acme/url.zig");
+    const acme_contact = @import("acme/contact.zig");
+    const acme_names = @import("acme/names.zig");
+    if (cfg.tls_acme_eab_requested) {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_EAB_KID/_EAB_HMAC_KEY_PATH (external account binding) is reserved and not implemented", .{});
+        return error.InvalidConfigValue;
+    }
+    if (!cfg.tls_acme_enabled) {
+        // §4.5 step 1: with the opt-in off, every non-default ACME setting is
+        // an error so none can be silently inert.
+        if (acmeSettingsNonDefault(cfg)) {
+            logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_* settings require TARDIGRADE_TLS_AUTOMATIC_HTTPS=true", .{});
+            return error.InvalidConfigValue;
+        }
+        return;
+    }
+    _ = acme_url.parse(cfg.tls_acme_directory_url) catch {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_DIRECTORY_URL must be an https:// URL with a host, no userinfo or fragment, at most 2048 bytes", .{});
+        return error.InvalidConfigValue;
+    };
+    if (!cfg.tls_acme_agree_tos) {
+        logConfigDiagnostic("config validation failed: automatic HTTPS requires TARDIGRADE_TLS_ACME_AGREE_TOS=true (accept the CA's terms of service)", .{});
+        return error.InvalidConfigValue;
+    }
+    if (cfg.tls_acme_cert_dir.len == 0) {
+        logConfigDiagnostic("config validation failed: automatic HTTPS requires TARDIGRADE_TLS_ACME_STATE_DIR (or its alias TARDIGRADE_TLS_ACME_CERT_DIR)", .{});
+        return error.InvalidConfigValue;
+    }
+    // Test names are meaningful only against a non-default directory with an
+    // explicit trust bundle (§4.2).
+    const private_ca = !std.mem.eql(u8, cfg.tls_acme_directory_url, default_acme_directory_url) and cfg.tls_acme_ca_bundle_path.len > 0;
+    _ = acme_names.validate(cfg.tls_acme_domains_spec, private_ca) catch |err| {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_DOMAINS is invalid ({s}); see docs/ACME_AUTOMATIC_HTTPS.md §4.2", .{@errorName(err)});
+        return error.InvalidConfigValue;
+    };
+    if (cfg.tls_acme_email.len > 0 and !acme_contact.isPlausibleEmail(cfg.tls_acme_email)) {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_EMAIL is not a plausible address", .{});
+        return error.InvalidConfigValue;
+    }
+    if (cfg.tls_acme_renew_days_before_expiry < 1 or cfg.tls_acme_renew_days_before_expiry > 60) {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY must be in 1..=60", .{});
+        return error.InvalidConfigValue;
+    }
+    if (!std.mem.eql(u8, cfg.tls_acme_challenges, "http-01")) {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_CHALLENGES only supports \"http-01\" (tls-alpn-01 arrives with a later phase)", .{});
+        return error.InvalidConfigValue;
+    }
+    // A pre-provisioned account key must exist; it is read, never created.
+    try validateOptionalFile(cfg.tls_acme_account_key_path, "tls_acme_account_key_path");
+    try validateOptionalFile(cfg.tls_acme_ca_bundle_path, "tls_acme_ca_bundle_path");
+}
+
+/// Any ACME setting that differs from its default.
+fn acmeSettingsNonDefault(cfg: *const EdgeConfig) bool {
+    return !std.mem.eql(u8, cfg.tls_acme_directory_url, default_acme_directory_url) or
+        cfg.tls_acme_cert_dir.len != 0 or
+        cfg.tls_acme_domains.len != 0 or
+        cfg.tls_acme_domains_spec.len != 0 or
+        cfg.tls_acme_email.len != 0 or
+        cfg.tls_acme_account_key_path.len != 0 or
+        cfg.tls_acme_renew_days_before_expiry != 30 or
+        cfg.tls_acme_agree_tos or
+        cfg.tls_acme_ca_bundle_path.len != 0 or
+        !std.mem.eql(u8, cfg.tls_acme_challenges, "http-01");
+}
+
+/// `tardi run` has nothing that can serve or activate an ACME-managed
+/// certificate until the activation phase, so even an experimental build must
+/// not start a listener with ACME enabled. `tardi acme-account` is the only
+/// consumer of the validated configuration in this phase.
+pub fn rejectAcmeRuntime(cfg: *const EdgeConfig) !void {
+    if (!cfg.tls_acme_enabled) return;
+    logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_AUTOMATIC_HTTPS cannot run a server yet; use `tardi acme-account` to bootstrap the ACME account (certificate issuance and activation are not implemented)", .{});
+    return error.UnsupportedNativeTlsConfiguration;
+}
+
 fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
     // ACME is checked before the TLS-files gate below: enabling ACME is a
     // request to *obtain* credentials, so it is meaningful — and must fail
     // deterministically — precisely when no cert/key pair is configured
     // yet. Every check after the gate concerns behavior of an active local
     // identity and is inert without one.
-    if (cfg.tls_acme_enabled) {
+    try validateAcmeConfig(cfg);
+    // The profile gate (§4.6) and the experimental gate (§4.5): until the
+    // release-gating phase, enabling ACME is only accepted by general-profile
+    // builds compiled with -Dacme-experimental, and even then `run` refuses it
+    // (see `rejectAcmeRuntime`).
+    if (cfg.tls_acme_enabled and (!build_options.acme_experimental or is_appliance_tls_profile)) {
         logConfigDiagnostic("config validation failed: native-TLS builds do not support TARDIGRADE_TLS_ACME_ENABLED (ACME issuance/renewal is not implemented by native Tardigrade and #649 retired the only production build that ever supported it, #634)", .{});
         return error.UnsupportedNativeTlsConfiguration;
     }
@@ -5218,9 +5406,12 @@ test "native-TLS builds reject legacy OpenSSL-only TLS settings one at a time" {
         try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
     }
     {
+        // A fully valid automatic-HTTPS grammar still hits the final
+        // "not supported yet" gate (#832 validates, it does not enable).
         var cfg = base;
-        cfg.tls_acme_enabled = true;
-        try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
+        var domains = [_][]const u8{"example.com"};
+        setValidAcmeForTest(&cfg, &domains);
+        try expectAcmeGateForTest(&cfg);
     }
     {
         // #641 review: ACME is a request to *obtain* credentials, so it
@@ -5230,8 +5421,258 @@ test "native-TLS builds reject legacy OpenSSL-only TLS settings one at a time" {
         var cfg = base;
         cfg.tls_cert_path = "";
         cfg.tls_key_path = "";
-        cfg.tls_acme_enabled = true;
-        try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
+        var domains = [_][]const u8{"example.com"};
+        setValidAcmeForTest(&cfg, &domains);
+        try expectAcmeGateForTest(&cfg);
+    }
+}
+
+/// A valid automatic-HTTPS configuration is rejected by the support gate in
+/// ordinary builds, and accepted only by general-profile `-Dacme-experimental`
+/// builds (where `run` still refuses it).
+fn expectAcmeGateForTest(cfg: *const EdgeConfig) !void {
+    if (build_options.acme_experimental and !is_appliance_tls_profile) {
+        try validateNativeTlsBuildConfig(cfg);
+        try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, rejectAcmeRuntime(cfg));
+    } else {
+        try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(cfg));
+    }
+}
+
+fn setValidAcmeForTest(cfg: *EdgeConfig, domains: [][]const u8) void {
+    cfg.tls_acme_enabled = true;
+    cfg.tls_acme_directory_url = "https://localhost:14000/dir";
+    cfg.tls_acme_agree_tos = true;
+    cfg.tls_acme_cert_dir = "/tmp";
+    cfg.tls_acme_domains = domains;
+    cfg.tls_acme_domains_spec = "example.com";
+    cfg.tls_acme_renew_days_before_expiry = 30;
+    cfg.tls_acme_email = "";
+    cfg.tls_acme_account_key_path = "";
+    cfg.tls_acme_ca_bundle_path = "";
+    cfg.tls_acme_challenges = "http-01";
+    cfg.tls_acme_eab_requested = false;
+}
+
+test "automatic HTTPS grammar is validated before the support gate (#832)" {
+    const allocator = std.testing.allocator;
+    var base = try loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var domains = [_][]const u8{"example.com"};
+
+    // Defaults are inert and valid.
+    try validateAcmeConfig(&base);
+
+    const Case = struct { mutate: *const fn (*EdgeConfig) void };
+    const cases = [_]Case{
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_directory_url = "http://localhost:14000/dir";
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_directory_url = "https://user@ca.test/dir";
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_directory_url = "https://ca.test/dir#x";
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_agree_tos = false;
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_cert_dir = "";
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_email = "not-an-address";
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_challenges = "tls-alpn-01";
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_challenges = "http-01,dns-01";
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_eab_requested = true;
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_domains_spec = "*.example.com";
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_domains_spec = "a.example.com,A.example.com";
+            }
+        }.f },
+        .{
+            .mutate = struct {
+                fn f(c: *EdgeConfig) void {
+                    c.tls_acme_domains_spec = "localhost"; // public CA by default
+                }
+            }.f,
+        },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_domains_spec = "10.0.0.1";
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_domains_spec = "";
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_renew_days_before_expiry = 0;
+            }
+        }.f },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
+                c.tls_acme_renew_days_before_expiry = 61;
+            }
+        }.f },
+    };
+    for (cases) |case| {
+        var cfg = base;
+        setValidAcmeForTest(&cfg, &domains);
+        try validateAcmeConfig(&cfg);
+        case.mutate(&cfg);
+        try std.testing.expectError(error.InvalidConfigValue, validateNativeTlsBuildConfig(&cfg));
+    }
+    // Test names are accepted against a private CA (non-default directory
+    // plus an explicit bundle), and groups parse.
+    {
+        var cfg = base;
+        setValidAcmeForTest(&cfg, &domains);
+        cfg.tls_acme_domains_spec = "a.example.com,www.a.example.com;b.example.com";
+        try validateAcmeConfig(&cfg);
+        cfg.tls_acme_domains_spec = "localhost,host.test";
+        cfg.tls_acme_ca_bundle_path = "/etc/ssl/cert.pem";
+        if (validateOptionalFileChecked("/etc/ssl/cert.pem")) |_| {
+            try validateAcmeConfig(&cfg);
+        } else |_| {}
+    }
+    // §4.5 step 1: with the opt-in off, every non-default ACME field is an
+    // error, one field at a time; reserved EAB too.
+    for (0..11) |which| {
+        var cfg = base;
+        switch (which) {
+            0 => cfg.tls_acme_directory_url = "https://ca.example/dir",
+            1 => cfg.tls_acme_cert_dir = "/tmp",
+            2 => cfg.tls_acme_domains = &domains,
+            3 => cfg.tls_acme_domains_spec = "example.com",
+            4 => cfg.tls_acme_email = "ops@example.com",
+            5 => cfg.tls_acme_account_key_path = "/tmp/k",
+            6 => cfg.tls_acme_renew_days_before_expiry = 21,
+            7 => cfg.tls_acme_agree_tos = true,
+            8 => cfg.tls_acme_ca_bundle_path = "/etc/ssl/cert.pem",
+            9 => cfg.tls_acme_challenges = "tls-alpn-01",
+            else => cfg.tls_acme_eab_requested = true,
+        }
+        try std.testing.expectError(error.InvalidConfigValue, validateNativeTlsBuildConfig(&cfg));
+    }
+}
+
+test "config-file ACME directives reach EdgeConfig and validate (#832)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(compat.io(), &dir_buf);
+    const state_dir = try std.fmt.allocPrint(allocator, "{s}", .{dir_buf[0..dir_len]});
+    defer allocator.free(state_dir);
+    const conf = try std.fmt.allocPrint(allocator,
+        \\automatic_https true;
+        \\acme_agree_tos true;
+        \\acme_state_dir {s};
+        \\acme_directory_url https://localhost:14000/dir;
+        \\acme_domains a.example.com,www.a.example.com;b.example.com;
+        \\acme_email ops@example.com;
+        \\acme_renew_days_before_expiry 21;
+        \\
+    , .{state_dir});
+    defer allocator.free(conf);
+    const conf_path = try std.fmt.allocPrint(allocator, "{s}/tardigrade.conf", .{state_dir});
+    defer allocator.free(conf_path);
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tardigrade.conf", .data = conf });
+
+    const env_c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const conf_path_z = try allocator.dupeZ(u8, conf_path);
+    defer allocator.free(conf_path_z);
+    _ = env_c.setenv("TARDIGRADE_CONFIG_PATH", conf_path_z, 1);
+    defer _ = env_c.unsetenv("TARDIGRADE_CONFIG_PATH");
+
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    try std.testing.expect(cfg.tls_acme_enabled);
+    try std.testing.expect(cfg.tls_acme_agree_tos);
+    try std.testing.expectEqualStrings(state_dir, cfg.tls_acme_cert_dir);
+    try std.testing.expectEqualStrings("https://localhost:14000/dir", cfg.tls_acme_directory_url);
+    try std.testing.expectEqualStrings("a.example.com,www.a.example.com;b.example.com", cfg.tls_acme_domains_spec);
+    try std.testing.expectEqual(@as(usize, 3), cfg.tls_acme_domains.len);
+    try std.testing.expectEqualStrings("ops@example.com", cfg.tls_acme_email);
+    try std.testing.expectEqual(@as(u32, 21), cfg.tls_acme_renew_days_before_expiry);
+    try validateAcmeConfig(&cfg);
+
+    // Environment still beats the file, name precedence inside each source.
+    _ = env_c.setenv("TARDIGRADE_TLS_AUTOMATIC_HTTPS", "false", 1);
+    defer _ = env_c.unsetenv("TARDIGRADE_TLS_AUTOMATIC_HTTPS");
+    var overridden = try loadFromEnv(allocator);
+    defer overridden.deinit(allocator);
+    try std.testing.expect(!overridden.tls_acme_enabled);
+}
+
+test "automatic HTTPS opt-in: primary name beats legacy alias and directive name (#832)" {
+    const allocator = std.testing.allocator;
+    const env_c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const primary = "TARDIGRADE_TLS_AUTOMATIC_HTTPS";
+    const directive = "TARDIGRADE_AUTOMATIC_HTTPS";
+    const legacy = "TARDIGRADE_TLS_ACME_ENABLED";
+    const names = [_][*:0]const u8{ primary, directive, legacy };
+    for (names) |n| _ = env_c.unsetenv(n);
+    defer for (names) |n| {
+        _ = env_c.unsetenv(n);
+    };
+
+    const Case = struct { primary: ?[*:0]const u8, directive: ?[*:0]const u8, legacy: ?[*:0]const u8, expect: bool };
+    const cases = [_]Case{
+        .{ .primary = null, .directive = null, .legacy = null, .expect = false },
+        .{ .primary = null, .directive = null, .legacy = "true", .expect = true },
+        .{ .primary = "true", .directive = null, .legacy = null, .expect = true },
+        .{ .primary = "false", .directive = null, .legacy = "true", .expect = false },
+        .{ .primary = "true", .directive = null, .legacy = "false", .expect = true },
+        .{ .primary = null, .directive = "true", .legacy = null, .expect = true },
+        .{ .primary = null, .directive = "false", .legacy = "true", .expect = false },
+        .{ .primary = "false", .directive = "true", .legacy = "true", .expect = false },
+    };
+    for (cases) |case| {
+        for (names) |n| _ = env_c.unsetenv(n);
+        if (case.primary) |v| _ = env_c.setenv(primary, v, 1);
+        if (case.directive) |v| _ = env_c.setenv(directive, v, 1);
+        if (case.legacy) |v| _ = env_c.setenv(legacy, v, 1);
+        try std.testing.expectEqual(case.expect, acmeEnvBool(allocator, primary, legacy, false));
     }
 }
 

@@ -1223,3 +1223,172 @@ test "DirCompat createFile and stat" {
     const stat = try dir.statFile("out.txt");
     try std.testing.expect(stat.size > 0);
 }
+
+// ---------------------------------------------------------------------------
+// Secure state files (#832): the OS-ABI surface the ACME state directory needs
+// (descriptor-relative open/rename/unlink, fsync, advisory locking, fd
+// identity). It lives here so `src/acme/` stays free of direct `std.c` /
+// `std.posix` calls (docs/CONCURRENCY.md); the policy (what is allowed, in
+// what order) stays in `acme/state.zig`.
+// ---------------------------------------------------------------------------
+
+/// Raw descriptor type, so callers need not name `std.posix`.
+pub const Fd = std.posix.fd_t;
+
+/// `AT_FDCWD`: resolve relative to the working directory.
+pub const cwd_fd: Fd = std.posix.AT.FDCWD;
+
+pub const StateFileError = error{ IoFailure, WouldBlock, NotFound, Exists };
+
+/// Close a raw descriptor, ignoring errors (use `fsyncFd` first when
+/// durability matters).
+pub fn closeFd(fd: std.posix.fd_t) void {
+    _ = std.c.close(fd);
+}
+
+/// Close and report a failure (deferred write errors can surface here). The
+/// descriptor is consumed either way: never retry or close it again.
+pub fn closeFdChecked(fd: std.posix.fd_t) StateFileError!void {
+    if (std.c.close(fd) != 0) return error.IoFailure;
+}
+
+pub fn effectiveUid() u32 {
+    return @intCast(std.c.geteuid());
+}
+
+/// What a descriptor *is*, read from the descriptor itself (not a pathname),
+/// so a check cannot race a rename of the path it was opened through.
+pub const FdIdentity = struct {
+    is_directory: bool,
+    is_regular: bool,
+    uid: u32,
+    /// Permission bits only (`& 0o7777`).
+    mode: u32,
+};
+
+pub fn statFdIdentity(fd: std.posix.fd_t) StateFileError!FdIdentity {
+    if (builtin.os.tag == .linux) {
+        var buf: std.os.linux.Statx = undefined;
+        const rc = std.c.statx(fd, "", 0x1000, .{ .TYPE = true, .MODE = true, .UID = true }, &buf);
+        if (rc != 0) return error.IoFailure;
+        const fmt: u32 = @as(u32, buf.mode) & std.os.linux.S.IFMT;
+        return .{
+            .is_directory = fmt == std.os.linux.S.IFDIR,
+            .is_regular = fmt == std.os.linux.S.IFREG,
+            .uid = @intCast(buf.uid),
+            .mode = @as(u32, buf.mode) & 0o7777,
+        };
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return error.IoFailure;
+    const mode: u32 = @intCast(st.mode);
+    return .{
+        .is_directory = std.c.S.ISDIR(mode),
+        .is_regular = std.c.S.ISREG(mode),
+        .uid = @intCast(st.uid),
+        .mode = mode & 0o7777,
+    };
+}
+
+fn cString(buf: []u8, text: []const u8) StateFileError![:0]const u8 {
+    if (text.len >= buf.len or std.mem.indexOfScalar(u8, text, 0) != null) return error.IoFailure;
+    @memcpy(buf[0..text.len], text);
+    buf[text.len] = 0;
+    return buf[0..text.len :0];
+}
+
+/// `mkdir(path, mode)`; an already-existing path is `error.Exists`.
+pub fn mkdirPath(path: []const u8, mode: u32) StateFileError!void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = try cString(&buf, path);
+    const rc = std.c.mkdirat(std.posix.AT.FDCWD, z, @intCast(mode));
+    if (rc == 0) return;
+    return if (std.posix.errno(rc) == .EXIST) error.Exists else error.IoFailure;
+}
+
+/// Open a directory without following a final symlink. Caller closes.
+pub fn openDirNoFollow(path: []const u8) StateFileError!std.posix.fd_t {
+    return std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0) catch error.IoFailure;
+}
+
+pub const OpenAtFlags = struct {
+    write: bool = false,
+    create: bool = false,
+    exclusive: bool = false,
+};
+
+/// Descriptor-relative open that never follows a final symlink and is
+/// close-on-exec. `mode` applies only when creating.
+pub fn openAtNoFollow(dir_fd: std.posix.fd_t, name: []const u8, flags: OpenAtFlags, mode: u32) StateFileError!std.posix.fd_t {
+    return std.posix.openat(dir_fd, name, .{
+        .ACCMODE = if (flags.write) .RDWR else .RDONLY,
+        .CREAT = flags.create,
+        .EXCL = flags.exclusive,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, @intCast(mode)) catch |err| switch (err) {
+        error.FileNotFound => error.NotFound,
+        error.PathAlreadyExists => error.Exists,
+        else => error.IoFailure,
+    };
+}
+
+/// Non-blocking exclusive advisory lock; held until the descriptor closes.
+pub fn lockExclusiveNonBlocking(fd: std.posix.fd_t) StateFileError!void {
+    const rc = std.c.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+    if (rc == 0) return;
+    return if (std.posix.errno(rc) == .AGAIN) error.WouldBlock else error.IoFailure;
+}
+
+pub fn fchmodFd(fd: std.posix.fd_t, mode: u32) StateFileError!void {
+    if (std.c.fchmod(fd, @intCast(mode)) != 0) return error.IoFailure;
+}
+
+pub fn fsyncFd(fd: std.posix.fd_t) StateFileError!void {
+    if (std.c.fsync(fd) != 0) return error.IoFailure;
+}
+
+pub fn writeAllFd(fd: std.posix.fd_t, data: []const u8) StateFileError!void {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const rc = std.c.write(fd, data[offset..].ptr, data.len - offset);
+        if (rc < 0) {
+            if (std.posix.errno(rc) == .INTR) continue;
+            return error.IoFailure;
+        }
+        if (rc == 0) return error.IoFailure;
+        offset += @intCast(rc);
+    }
+}
+
+pub fn readFd(fd: std.posix.fd_t, buf: []u8) StateFileError!usize {
+    return std.posix.read(fd, buf) catch error.IoFailure;
+}
+
+pub fn renameAt(dir_fd: std.posix.fd_t, old: []const u8, new: []const u8) StateFileError!void {
+    var a: [256]u8 = undefined;
+    var b: [256]u8 = undefined;
+    const old_z = try cString(&a, old);
+    const new_z = try cString(&b, new);
+    if (std.c.renameat(dir_fd, old_z, dir_fd, new_z) != 0) return error.IoFailure;
+}
+
+/// Best-effort unlink relative to a directory descriptor.
+pub fn unlinkAt(dir_fd: std.posix.fd_t, name: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const z = cString(&buf, name) catch return;
+    _ = std.c.unlinkat(dir_fd, z, 0);
+}
+
+/// Path-based helpers for tests that need to tamper with state on disk.
+pub fn chmodPath(path: []const u8, mode: u32) StateFileError!void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = try cString(&buf, path);
+    if (std.c.chmod(z, @intCast(mode)) != 0) return error.IoFailure;
+}
+
+pub fn unlinkPath(path: []const u8) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = cString(&buf, path) catch return;
+    _ = std.c.unlink(z);
+}

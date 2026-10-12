@@ -21968,8 +21968,71 @@ test "native TLS listener appliance check command validates credentials without 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, unnamed.term);
 }
 
+test "acme-account bootstraps only in experimental builds and fails closed against an unreachable CA (#832)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    const state_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-acme-account-{d}", .{compat.nanoTimestamp()});
+    defer allocator.free(state_rel);
+    const config_rel = try std.fmt.allocPrint(allocator, "{s}.conf", .{state_rel});
+    defer allocator.free(config_rel);
+    try compat.cwd().makePath(state_rel);
+    defer compat.cwd().deleteTree(state_rel) catch {};
+    try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = "" });
+    defer compat.cwd().deleteFile(config_rel) catch {};
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("TARDIGRADE_TLS_AUTOMATIC_HTTPS", "true");
+    try env_map.put("TARDIGRADE_TLS_ACME_AGREE_TOS", "true");
+    try env_map.put("TARDIGRADE_TLS_ACME_STATE_DIR", state_rel);
+    try env_map.put("TARDIGRADE_TLS_ACME_DOMAINS", "example.com");
+    // Nothing listens on port 1: the account bootstrap must fail as a
+    // transport failure, never fall through to anything else.
+    try env_map.put("TARDIGRADE_TLS_ACME_DIRECTORY_URL", "https://127.0.0.1:1/directory");
+    try env_map.put("TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", "src/pki/testdata/ecdsa_p256_ca.crt");
+    _ = env_map.swapRemove("TARDIGRADE_TLS_CERT_PATH");
+    _ = env_map.swapRemove("TARDIGRADE_TLS_KEY_PATH");
+
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "acme-account", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (integration_options.acme_experimental and !std.mem.eql(u8, build_options.tls_profile, "appliance")) {
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+        try assertContains(result.stdout, "class=transport");
+        // The account key was created before the CA was contacted, but no
+        // account record exists, and nothing sensitive was printed.
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "PRIVATE KEY") == null);
+    } else {
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, result.term);
+        try assertContains(result.stderr, "-Dacme-experimental");
+    }
+
+    // `check` validates the grammar: experimental general builds accept it,
+    // every other build rejects the opt-in at the support gate.
+    const run_result = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+    const expected_exit: u8 = if (integration_options.acme_experimental and !std.mem.eql(u8, build_options.tls_profile, "appliance")) 0 else 2;
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = expected_exit }, run_result.term);
+}
+
 test "native TLS listener check rejects ACME on native builds even without credentials" {
     try requireNativeTlsProfile();
+    // -Dacme-experimental builds accept the validated grammar (and refuse to
+    // run it); this test pins the default/release behavior.
+    if (integration_options.acme_experimental) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     // #634 (#641 review): enabling ACME is a request to *obtain*
@@ -21986,6 +22049,11 @@ test "native TLS listener check rejects ACME on native builds even without crede
     var env_map = try inheritedEnvMap(allocator);
     defer env_map.deinit();
     try env_map.put("TARDIGRADE_TLS_ACME_ENABLED", "true");
+    // #832: the §4 grammar is validated first, so give the gate a fully valid
+    // configuration to reach.
+    try env_map.put("TARDIGRADE_TLS_ACME_AGREE_TOS", "true");
+    try env_map.put("TARDIGRADE_TLS_ACME_STATE_DIR", ".zig-cache");
+    try env_map.put("TARDIGRADE_TLS_ACME_DOMAINS", "example.com");
     _ = env_map.swapRemove("TARDIGRADE_TLS_CERT_PATH");
     _ = env_map.swapRemove("TARDIGRADE_TLS_KEY_PATH");
 

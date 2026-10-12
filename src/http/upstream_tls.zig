@@ -37,6 +37,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const tls_core = @import("tls_core");
+const zig_compat = @import("zig_compat");
 const encrypted_stream = tls_core.encrypted_stream;
 const negotiated_dispatch = @import("negotiated_dispatch.zig");
 
@@ -64,7 +65,25 @@ pub const UpstreamTlsOptions = struct {
     client_cert_path: []const u8 = "",
     client_key_path: []const u8 = "",
     alpn_policy: UpstreamAlpnPolicy = .require_http1,
+    /// Borrowed, preloaded trust anchors (#832). When set, `connect()` verifies
+    /// against this snapshot and performs no filesystem access, so a caller
+    /// that loaded anchors before a privilege drop/chroot (ACME) keeps working
+    /// afterwards. `ca_bundle_path` is ignored when this is set. The snapshot
+    /// must outlive the `connect()` call only: verification completes inside it.
+    trust_anchors: ?*const tls_core.webpki_verifier.TrustAnchors = null,
+    /// Absolute `zig_compat.monotonicNanoTimestamp()`-based millisecond
+    /// deadline (#832) bounding the handshake and every later blocking wait
+    /// on this connection, in addition to the socket timeout. Each `poll()` is
+    /// clamped to the time remaining, so a peer cannot stack several full
+    /// per-wait timeouts. `null` keeps the per-wait socket timeout only.
+    deadline_ms: ?i64 = null,
 };
+
+/// Monotonic milliseconds on the same clock `UpstreamTlsOptions.deadline_ms`
+/// uses.
+pub fn monotonicMs() i64 {
+    return @intCast(@divTrunc(zig_compat.monotonicNanoTimestamp(), std.time.ns_per_ms));
+}
 
 pub const UpstreamAlpnPolicy = enum {
     require_http1,
@@ -179,6 +198,7 @@ const UpstreamTlsState = struct {
     crypto_provider_state: tls_core.production_crypto.Provider = undefined,
     backend: tls_core.tls13_backend.Tls13Backend = undefined,
     record: encrypted_stream.PureZigRecordStream = undefined,
+    deadline_ms: ?i64 = null,
 };
 
 pub const TestHooks = if (builtin.is_test) struct {
@@ -229,7 +249,7 @@ pub const UpstreamTlsConn = struct {
 
         const state = allocator.create(UpstreamTlsState) catch return error.ContextInitFailed;
         errdefer allocator.destroy(state);
-        state.* = .{ .allocator = allocator, .fd = fd };
+        state.* = .{ .allocator = allocator, .fd = fd, .deadline_ms = opts.deadline_ms };
         state.entropy_source = .{};
         state.crypto_provider_state = tls_core.production_crypto.Provider.init(state.entropy_source.entropy());
         const crypto_provider = state.crypto_provider_state.cryptoProvider();
@@ -272,8 +292,13 @@ pub const UpstreamTlsConn = struct {
                 client_options,
             );
         } else {
-            trust_anchors = tls_core.webpki_verifier.loadTrustAnchors(allocator, opts.ca_bundle_path) catch return error.VerifyConfigFailed;
-            verifier_storage = tls_core.webpki_verifier.WebPkiVerifier.init(allocator, trust_anchors.?.anchors(), crypto_provider);
+            const anchors = if (opts.trust_anchors) |preloaded|
+                preloaded.anchors()
+            else blk: {
+                trust_anchors = tls_core.webpki_verifier.loadTrustAnchors(allocator, opts.ca_bundle_path) catch return error.VerifyConfigFailed;
+                break :blk trust_anchors.?.anchors();
+            };
+            verifier_storage = tls_core.webpki_verifier.WebPkiVerifier.init(allocator, anchors, crypto_provider);
             state.backend = tls_core.tls13_backend.Tls13Backend.initClientWithVerifierConfigured(
                 handshake_entropy,
                 crypto_provider,
@@ -338,7 +363,7 @@ pub const UpstreamTlsConn = struct {
         // to actually deliver the "verification disabled" contract.
         state.record.allow_unverified_certificate = opts.skip_verify;
 
-        try driveUntilHandshakeComplete(&state.record, fd);
+        try driveUntilHandshakeComplete(&state.record, fd, state.deadline_ms);
 
         const protocol = try opts.alpn_policy.select(state.record.negotiatedAlpn());
         return .{ .state = state, .fd = fd, .protocol = protocol };
@@ -388,7 +413,7 @@ pub const UpstreamTlsConn = struct {
             const result = record.drive() catch return error.TlsReadFailed;
             if (record.inbound_plaintext.len > 0 or record.peer_closed) continue;
             if (result.made_progress) continue;
-            try waitForFd(fd, record.readiness(), error.TlsReadFailed);
+            try waitForFd(fd, record.readiness(), error.TlsReadFailed, self.state.deadline_ms);
         }
     }
 
@@ -411,11 +436,11 @@ pub const UpstreamTlsConn = struct {
                 const result = record.drive() catch return error.TlsWriteFailed;
                 if (record.queuedCiphertextLen() == 0) break;
                 if (result.made_progress) continue;
-                try waitForFd(fd, record.readiness(), error.TlsWriteFailed);
+                try waitForFd(fd, record.readiness(), error.TlsWriteFailed, self.state.deadline_ms);
             }
             if (written == 0 and offset < data.len) {
                 const result = record.drive() catch return error.TlsWriteFailed;
-                if (!result.made_progress) try waitForFd(fd, record.readiness(), error.TlsWriteFailed);
+                if (!result.made_progress) try waitForFd(fd, record.readiness(), error.TlsWriteFailed, self.state.deadline_ms);
             }
         }
     }
@@ -621,7 +646,7 @@ fn boundedFlush(record: anytype, max_drives: usize, exhausted: *bool) TlsError!v
     }
 }
 
-fn driveUntilHandshakeComplete(record: *encrypted_stream.PureZigRecordStream, fd: std.posix.fd_t) TlsError!void {
+fn driveUntilHandshakeComplete(record: *encrypted_stream.PureZigRecordStream, fd: std.posix.fd_t, deadline_ms: ?i64) TlsError!void {
     var iterations: usize = 0;
     while (!record.applicationDataOpen()) {
         iterations += 1;
@@ -629,7 +654,7 @@ fn driveUntilHandshakeComplete(record: *encrypted_stream.PureZigRecordStream, fd
         const result = record.drive() catch return error.HandshakeFailed;
         if (record.applicationDataOpen()) return;
         if (result.made_progress) continue;
-        try waitForFd(fd, record.readiness(), error.HandshakeFailed);
+        try waitForFd(fd, record.readiness(), error.HandshakeFailed, deadline_ms);
     }
 }
 
@@ -639,14 +664,20 @@ fn driveUntilHandshakeComplete(record: *encrypted_stream.PureZigRecordStream, fd
 /// Returns `timeout_err` if `readiness` wants nothing (nothing to wait for —
 /// a stuck record-layer state, not a socket condition), the poll itself
 /// fails, or it times out.
-fn waitForFd(fd: std.posix.fd_t, readiness: encrypted_stream.Readiness, timeout_err: TlsError) TlsError!void {
+fn waitForFd(fd: std.posix.fd_t, readiness: encrypted_stream.Readiness, timeout_err: TlsError, deadline_ms: ?i64) TlsError!void {
     if (!readiness.wants_read and !readiness.wants_write) return timeout_err;
     var events: i16 = 0;
     if (readiness.wants_read) events |= std.posix.POLL.IN;
     if (readiness.wants_write) events |= std.posix.POLL.OUT;
     var pfd = [1]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
     const timeout_ms = currentSocketTimeoutMs(fd);
-    const timeout: i32 = if (timeout_ms == 0) -1 else @intCast(@min(timeout_ms, @as(u32, @intCast(std.math.maxInt(i32)))));
+    var timeout: i32 = if (timeout_ms == 0) -1 else @intCast(@min(timeout_ms, @as(u32, @intCast(std.math.maxInt(i32)))));
+    if (deadline_ms) |deadline| {
+        const remaining = deadline - monotonicMs();
+        if (remaining <= 0) return timeout_err;
+        const clamped: i32 = @intCast(@min(remaining, @as(i64, std.math.maxInt(i32))));
+        timeout = if (timeout < 0) clamped else @min(timeout, clamped);
+    }
     const ready = std.posix.poll(&pfd, timeout) catch return timeout_err;
     if (ready == 0) return timeout_err;
 }

@@ -101,6 +101,7 @@ pub const Handoff = struct {
     allocator: std.mem.Allocator,
     capacity: usize,
     mutex: compat.Mutex = .{},
+    drain_cond: compat.Condition = .{},
     pending: std.ArrayList(*Entry) = .empty,
     active: std.ArrayList(*Entry) = .empty,
     completions: std.ArrayList(QueuedCompletion) = .empty,
@@ -215,6 +216,7 @@ pub const Handoff = struct {
             return .already_finished;
         };
         _ = self.active.orderedRemove(active_index);
+        if (self.active.items.len == 0) self.drain_cond.broadcast();
         const cancelled = self.closed or entry.cancelled;
         if (!cancelled and completion != null) {
             self.signalWakeLocked() catch |err| {
@@ -313,6 +315,17 @@ pub const Handoff = struct {
     /// the connection owner still drains and serializes every response intent.
     pub fn wakeFd(self: *const Handoff) std.posix.fd_t {
         return self.wake_read;
+    }
+
+    /// Block until every active (in-flight) job has called `finish`. Callers
+    /// must `shutdown` first so no new job can become active; this only
+    /// drains work already handed to a worker. Required before `deinit`,
+    /// whose active-queue assertion would otherwise fire on connection
+    /// teardown with outstanding jobs.
+    pub fn waitForActiveDrain(self: *Handoff) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.active.items.len != 0) self.drain_cond.wait(&self.mutex);
     }
 
     pub fn outstandingCount(self: *Handoff) usize {
@@ -646,4 +659,54 @@ test "H2 request handoff wakes blocked connection owner and rearms" {
     second.deinit();
     try std.testing.expectEqual(@as(usize, 2), counter.jobs);
     try std.testing.expectEqual(@as(usize, 2), counter.completions);
+}
+
+test "H2 request handoff waitForActiveDrain blocks until the last active job finishes" {
+    const NoOp = struct {
+        fn drop(_: *anyopaque) void {}
+    };
+    const Waiter = struct {
+        handoff: *Handoff,
+        mutex: compat.Mutex = .{},
+        cond: compat.Condition = .{},
+        entered: bool = false,
+        drained: bool = false,
+
+        fn run(self: *@This()) void {
+            self.mutex.lock();
+            // Signal immediately before the blocking call, mirroring the
+            // wake test above: the test only releases the active job once
+            // this thread is poised to block inside `waitForActiveDrain`.
+            self.entered = true;
+            self.cond.broadcast();
+            self.mutex.unlock();
+
+            self.handoff.waitForActiveDrain();
+
+            self.mutex.lock();
+            self.drained = true;
+            self.cond.broadcast();
+            self.mutex.unlock();
+        }
+
+        fn waitUntilEntered(self: *@This()) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (!self.entered) self.cond.wait(&self.mutex);
+        }
+    };
+
+    var handoff = try Handoff.init(std.testing.allocator, 1);
+    defer handoff.deinit();
+    try handoff.submit(.{ .stream_id = 1, .payload = @ptrFromInt(@alignOf(u8)), .deinit_fn = NoOp.drop });
+    var lease = handoff.takeJob().?;
+    handoff.shutdown();
+
+    var waiter = Waiter{ .handoff = &handoff };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    waiter.waitUntilEntered();
+
+    try std.testing.expectEqual(FinishResult.cancelled, try handoff.finish(&lease, null));
+    waiter_thread.join();
+    try std.testing.expect(waiter.drained);
 }

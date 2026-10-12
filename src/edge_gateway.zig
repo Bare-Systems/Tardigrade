@@ -583,6 +583,34 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     try tunnel_reactor.start(state_allocator, .{ .threads = reactor_threads, .shutdown_requested = http.shutdown.isShutdownRequested });
     defer tunnel_reactor.deinit();
     state.tunnel_reactor = &tunnel_reactor;
+
+    // Process-wide executor for finite HTTP/2 request jobs (#866), shared by
+    // every downstream H2 connection so one connection's slow route/proxy
+    // work can never consume unbounded worker/queue capacity. Separate from
+    // `worker_pool` below, which dispatches whole accepted connections, not
+    // the requests multiplexed within an already-accepted H2 connection.
+    // Declared (and its shutdown deferred) before `worker_pool` for the same
+    // reason as `tunnel_reactor` above: every connection thread's own
+    // teardown can block draining its in-flight H2 jobs, so this executor
+    // must still be running when `worker_pool.deinit()` joins those threads.
+    const h2_request_worker_count: usize = blk: {
+        const configured = if (cfg.h2_request_worker_threads == 0)
+            @max(worker_count / 2, 1)
+        else
+            cfg.h2_request_worker_threads;
+        break :blk @intCast(@max(configured, @as(u32, 1)));
+    };
+    var h2_request_executor: http.h2_request_executor.Executor = undefined;
+    try h2_request_executor.init(
+        state_allocator,
+        h2_request_worker_count,
+        cfg.h2_request_queue_capacity,
+        executeH2RequestJobSignal,
+        &state,
+    );
+    defer h2_request_executor.shutdownAndJoin();
+    state.h2_request_executor = &h2_request_executor;
+
     var worker_ctx = WorkerContext{
         .config_store = &config_store,
         .state = &state,
@@ -2057,6 +2085,13 @@ const WaitingEncryptedHttpConnection = struct {
     /// the encrypted connection's blocking wait, so a future producer can
     /// wake the one connection-owned writer without touching the TLS socket.
     h2_outbound: ?*http.h2_outbound_scheduler.Scheduler = null,
+    /// Installed only by the downstream H2 runtime (#866). Its wake fd is
+    /// included in the same blocking wait as `h2_outbound`'s, so a worker
+    /// thread's response completion can unblock this connection without it
+    /// ever polling or owning the H2 socket.
+    h2_request_handoff: ?*http.h2_request_handoff.Handoff = null,
+    h2_completion_drain_fn: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    h2_completion_drain_ctx: ?*anyopaque = null,
 
     fn init(
         inner: http.encrypted_stream_connection.EncryptedStreamHttpConnection,
@@ -2231,6 +2266,17 @@ const WaitingEncryptedHttpConnection = struct {
         self.h2_outbound = outbound;
     }
 
+    pub fn setH2RequestHandoff(
+        self: *WaitingEncryptedHttpConnection,
+        handoff: ?*http.h2_request_handoff.Handoff,
+        drain_fn: ?*const fn (ctx: *anyopaque) anyerror!void,
+        drain_ctx: ?*anyopaque,
+    ) void {
+        self.h2_request_handoff = handoff;
+        self.h2_completion_drain_fn = drain_fn;
+        self.h2_completion_drain_ctx = drain_ctx;
+    }
+
     pub fn writer(self: *WaitingEncryptedHttpConnection) Writer {
         return .{ .conn = self };
     }
@@ -2278,29 +2324,35 @@ const WaitingEncryptedHttpConnection = struct {
         var events: i16 = std.posix.POLL.ERR | std.posix.POLL.HUP;
         if (interest.read) events |= std.posix.POLL.IN;
         if (interest.write) events |= std.posix.POLL.OUT;
-        var fds = [_]std.posix.pollfd{ .{
-            .fd = self.inner.rawFd(),
-            .events = events,
-            .revents = 0,
-        }, .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 } };
-        var fd_count: usize = 1;
-        if (self.h2_outbound) |outbound| {
-            fds[1].fd = outbound.wakeFd();
-            fd_count = 2;
-        }
+        // Slot 1 wakes this wait when the outbound scheduler has bytes to
+        // flush (#865); slot 2 wakes it when a worker's request-job
+        // completion is ready to apply (#866). Both stay `-1` (ignored by
+        // `poll`) when their producer is not installed on this connection.
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = self.inner.rawFd(), .events = events, .revents = 0 },
+            .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        if (self.h2_outbound) |outbound| fds[1].fd = outbound.wakeFd();
+        if (self.h2_request_handoff) |handoff| fds[2].fd = handoff.wakeFd();
         const bounded_ms: i32 = if (timeout_ms == 0)
             30_000
         else
             @intCast(@min(timeout_ms, @as(u32, @intCast(std.math.maxInt(i32)))));
-        const ready = try std.posix.poll(fds[0..fd_count], bounded_ms);
+        const ready = try std.posix.poll(&fds, bounded_ms);
         if (ready == 0) return error.WouldBlock;
-        if (fd_count == 2 and (fds[1].revents != 0 or (fds[0].revents & std.posix.POLL.OUT) != 0)) {
+        if (fds[1].fd >= 0 and (fds[1].revents != 0 or (fds[0].revents & std.posix.POLL.OUT) != 0)) {
             const outbound = self.h2_outbound orelse return error.ConnectionClosed;
             // We are already in the poll owner. Use the non-waiting record
             // writer here to avoid recursively re-entering this wait path;
             // a temporary TLS backpressure condition simply remains a normal
             // connection-level write failure for this finite H2 phase.
             try outbound.flush(self.inner.writer());
+        }
+        if (fds[2].fd >= 0 and fds[2].revents != 0) {
+            const drain_fn = self.h2_completion_drain_fn orelse return error.ConnectionClosed;
+            const drain_ctx = self.h2_completion_drain_ctx orelse return error.ConnectionClosed;
+            try drain_fn(drain_ctx);
         }
         if ((fds[0].revents & std.posix.POLL.ERR) != 0) return error.ConnectionResetByPeer;
         if ((fds[0].revents & std.posix.POLL.HUP) != 0 and (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.OUT)) == 0) return error.ConnectionClosed;
@@ -2594,6 +2646,26 @@ fn h2InstallOutboundScheduler(conn: anytype, outbound: ?*http.h2_outbound_schedu
     }
 }
 
+/// Install (or clear) the connection's request-job completion handoff and
+/// the drain callback that applies an arriving completion (#866). Only a
+/// `conn` that declares `setH2RequestHandoff` -- today just
+/// `WaitingEncryptedHttpConnection` -- includes the handoff's wake fd in its
+/// blocking wait; other `conn` types (test fakes) simply never wake for one.
+fn h2InstallRequestHandoff(
+    conn: anytype,
+    handoff: ?*http.h2_request_handoff.Handoff,
+    drain_fn: ?*const fn (ctx: *anyopaque) anyerror!void,
+    drain_ctx: ?*anyopaque,
+) void {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "setH2RequestHandoff")) conn.setH2RequestHandoff(handoff, drain_fn, drain_ctx);
+    } else {
+        if (comptime @hasDecl(T, "setH2RequestHandoff")) conn.setH2RequestHandoff(handoff, drain_fn, drain_ctx);
+    }
+}
+
 fn h2DownstreamHandshakeComplete(conn: anytype) bool {
     const T = @TypeOf(conn);
     if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
@@ -2654,8 +2726,12 @@ fn h2ResetStreamState(
     buffered_request_bytes: *usize,
     stream_id: u31,
     outbound: ?*http.h2_outbound_scheduler.Scheduler,
+    handoff: ?*http.h2_request_handoff.Handoff,
+    in_flight: *std.AutoHashMap(u31, void),
 ) void {
     if (outbound) |scheduler| scheduler.cancelStream(stream_id);
+    if (handoff) |ho| _ = ho.cancelStream(stream_id) catch {};
+    _ = in_flight.remove(stream_id);
     _ = streams.remove(stream_id);
     if (pending.fetchRemove(stream_id)) |removed| {
         var tmp = removed.value;
@@ -2679,6 +2755,8 @@ fn h2WriteStreamClosedReset(
     ready_streams: *std.array_list.Managed(u31),
     buffered_request_bytes: *usize,
     stream_id: u31,
+    handoff: ?*http.h2_request_handoff.Handoff,
+    in_flight: *std.AutoHashMap(u31, void),
 ) !void {
     // Drop old response output before queuing our RST, otherwise a
     // backpressured connection could send DATA after stream closure.
@@ -2693,6 +2771,8 @@ fn h2WriteStreamClosedReset(
         buffered_request_bytes,
         stream_id,
         null,
+        handoff,
+        in_flight,
     );
 }
 
@@ -3146,7 +3226,11 @@ fn h2DispatchReadyStreamsWithWriter(
     conn_send_window: *i32,
     buffered_request_bytes: *usize,
     connection_ip: []const u8,
+    handoff: ?*http.h2_request_handoff.Handoff,
+    executor: ?*http.h2_request_executor.Executor,
+    in_flight: *std.AutoHashMap(u31, void),
 ) !void {
+    _ = next_server_stream_id;
     if (ready_streams.items.len == 0) return;
 
     const initial_ready = ready_streams.items.len;
@@ -3186,7 +3270,7 @@ fn h2DispatchReadyStreamsWithWriter(
         // The accept/reject decision for a transport-early stream is recorded
         // by `respondHttp2Stream`, once routing has had its say (#761).
 
-        try respondHttp2Stream(conn, writer, outbound, allocator, state, cfg, sid, ps, next_server_stream_id, streams, pending_responses, conn_send_window, connection_ip);
+        try respondHttp2Stream(conn, writer, outbound, allocator, state, cfg, sid, ps, handoff, executor, in_flight, streams, pending_responses, conn_send_window, connection_ip);
         ps.dispatch_count += 1;
         if (pending.fetchRemove(sid)) |removed| {
             var tmp = removed.value;
@@ -3196,8 +3280,10 @@ fn h2DispatchReadyStreamsWithWriter(
         // If the response is still parked on send-credit exhaustion, its
         // `streams` entry (needed for send-window bookkeeping and to detect
         // RST_STREAM/removal) must survive until `h2FlushPendingHttp2Responses`
-        // finishes it.
-        if (!pending_responses.contains(sid)) {
+        // finishes it. The same is true while a worker owns the request
+        // (#866): its eventual completion still needs the stream's send
+        // window and RST/removal detection.
+        if (!pending_responses.contains(sid) and !in_flight.contains(sid)) {
             _ = streams.remove(sid);
         }
     }
@@ -3217,7 +3303,9 @@ fn h2DispatchReadyStreams(
     buffered_request_bytes: *usize,
     connection_ip: []const u8,
 ) !void {
-    return h2DispatchReadyStreamsWithWriter(conn, conn.writer(), null, allocator, state, cfg, pending, streams, pending_responses, ready_streams, next_server_stream_id, conn_send_window, buffered_request_bytes, connection_ip);
+    var in_flight = std.AutoHashMap(u31, void).init(allocator);
+    defer in_flight.deinit();
+    return h2DispatchReadyStreamsWithWriter(conn, conn.writer(), null, allocator, state, cfg, pending, streams, pending_responses, ready_streams, next_server_stream_id, conn_send_window, buffered_request_bytes, connection_ip, null, null, &in_flight);
 }
 
 fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, connection_ip: []const u8) !void {
@@ -3286,7 +3374,84 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
         pending.deinit();
     }
 
+    // #866: finite request execution is handed off to a shared, bounded
+    // executor so a slow route/auth/proxy/static call never stops this
+    // connection from parsing sibling-stream frames or control frames.
+    // `in_flight_jobs` keeps a dispatched stream's `streams`/HPACK-adjacent
+    // bookkeeping alive while its worker runs, mirroring what
+    // `pending_responses` already does for a response parked on
+    // flow-control exhaustion.
+    var in_flight_jobs = std.AutoHashMap(u31, void).init(allocator);
+    defer in_flight_jobs.deinit();
+    var handoff = try http.h2_request_handoff.Handoff.init(allocator, HTTP2_MAX_CONCURRENT_STREAMS);
+    defer {
+        handoff.shutdown();
+        handoff.waitForActiveDrain();
+        handoff.deinit();
+    }
+    const executor: ?*http.h2_request_executor.Executor = state.h2_request_executor;
+
+    const DrainCtx = struct {
+        conn: @TypeOf(conn),
+        writer: @TypeOf(outbound_writer),
+        outbound: *http.h2_outbound_scheduler.Scheduler,
+        allocator: std.mem.Allocator,
+        state: *GatewayState,
+        handoff: *http.h2_request_handoff.Handoff,
+        streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
+        pending_responses: *std.AutoHashMap(u31, PendingHttp2Response),
+        conn_send_window: *i32,
+        in_flight: *std.AutoHashMap(u31, void),
+
+        /// Woken whenever a worker's completion arrives while this connection
+        /// is blocked waiting for downstream input (#866's half of #865's
+        /// wakeable wait).
+        fn drain(raw: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            while (self.handoff.takeCompletion()) |delivered| {
+                _ = self.in_flight.remove(delivered.stream_id);
+                try applyH2RequestCompletion(
+                    self.conn,
+                    self.writer,
+                    self.outbound,
+                    self.allocator,
+                    self.state,
+                    delivered.stream_id,
+                    delivered.completion,
+                    self.streams,
+                    self.pending_responses,
+                    self.conn_send_window,
+                );
+                if (!self.pending_responses.contains(delivered.stream_id) and !self.in_flight.contains(delivered.stream_id)) {
+                    _ = self.streams.remove(delivered.stream_id);
+                }
+            }
+        }
+    };
+    var drain_ctx = DrainCtx{
+        .conn = conn,
+        .writer = outbound_writer,
+        .outbound = &outbound,
+        .allocator = allocator,
+        .state = state,
+        .handoff = &handoff,
+        .streams = &streams,
+        .pending_responses = &pending_responses,
+        .conn_send_window = &conn_send_window,
+        .in_flight = &in_flight_jobs,
+    };
+    h2InstallRequestHandoff(conn, &handoff, DrainCtx.drain, &drain_ctx);
+    defer h2InstallRequestHandoff(conn, null, null, null);
+
     while (!http.shutdown.isShutdownRequested() and !goaway_received) {
+        // Apply any worker completions that already arrived. A busy
+        // connection that keeps `readFrame` returning real data every
+        // iteration never falls into `waitFor`'s blocking poll, so draining
+        // here -- not only from that poll's wake path -- is what keeps a
+        // slow job's sibling streams from starving behind a steady stream of
+        // fast ones (#866).
+        try DrainCtx.drain(&drain_ctx);
+
         try h2DispatchReadyStreamsWithWriter(
             conn,
             outbound_writer,
@@ -3302,6 +3467,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             &conn_send_window,
             &buffered_request_bytes,
             connection_ip,
+            &handoff,
+            executor,
+            &in_flight_jobs,
         );
 
         if (h2HasDeferredReadyStreams(&pending, &ready_streams) and !h2DownstreamHandshakeComplete(conn)) {
@@ -3321,6 +3489,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 &conn_send_window,
                 &buffered_request_bytes,
                 connection_ip,
+                &handoff,
+                executor,
+                &in_flight_jobs,
             );
             if (ready_streams.items.len == 0) continue;
         }
@@ -3416,7 +3587,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     return error.InvalidHttp2StreamId;
                 }
                 if (frame.stream_id <= last_client_stream_id and !streams.contains(frame.stream_id)) {
-                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
+                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, &handoff, &in_flight_jobs);
                     continue;
                 }
                 last_client_stream_id = @max(last_client_stream_id, frame.stream_id);
@@ -3431,7 +3602,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // SECOND request, duplicating route/auth/handler execution
                 // while the first response is still outstanding.
                 if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
-                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
+                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, &handoff, &in_flight_jobs);
                     continue;
                 }
                 if (!streams.contains(frame.stream_id)) {
@@ -3496,7 +3667,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // END_STREAM is a stream error (RFC 7540 §5.1,
                 // half_closed_remote), not new body for a dispatched request.
                 if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
-                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id);
+                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, &handoff, &in_flight_jobs);
                     continue;
                 }
                 const data_payload = h2DataPayload(frame.payload, frame.flags) catch |err| {
@@ -3569,7 +3740,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     } else {
                         outbound.cancelStream(frame.stream_id);
                         try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.protocol_error.value());
-                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, null);
+                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, null, &handoff, &in_flight_jobs);
                     }
                     continue;
                 }
@@ -3590,7 +3761,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     if (new_window > std.math.maxInt(i32)) {
                         outbound.cancelStream(frame.stream_id);
                         try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
-                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, null);
+                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, null, &handoff, &in_flight_jobs);
                     } else {
                         s.send_window = @intCast(new_window);
                     }
@@ -3610,7 +3781,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
                     return error.InvalidRstStreamFrame;
                 }
-                h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, &outbound);
+                h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, &outbound, &handoff, &in_flight_jobs);
             },
             .goaway => {
                 if (frame.stream_id != 0 or frame.payload.len < 8) {
@@ -3674,6 +3845,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             &conn_send_window,
             &buffered_request_bytes,
             connection_ip,
+            &handoff,
+            executor,
+            &in_flight_jobs,
         );
         try outbound.flush(conn.writer());
     }
@@ -3699,6 +3873,25 @@ fn lowercaseName(allocator: std.mem.Allocator, owned: *std.array_list.Managed([]
     return dup;
 }
 
+/// Either the stream-scope SNI/`:authority` policy refusal (#763, decided
+/// before any routing work and never worth a job) or the routing result
+/// `executeHttp2ProxyRoute` produced -- synchronously, or via a completion
+/// relayed from a worker thread (#866).
+const Http2FinalizeOutcome = union(enum) {
+    misdirected,
+    routed: ?Http2ProxyRouteResult,
+};
+
+fn h2OverloadedRejection() Http2LocalRejection {
+    return .{
+        .status_code = 503,
+        .code = "overloaded",
+        .message = "Request execution capacity exhausted",
+        .retry_after = "1",
+        .no_store = true,
+    };
+}
+
 fn respondHttp2Stream(
     conn: anytype,
     writer: anytype,
@@ -3708,13 +3901,14 @@ fn respondHttp2Stream(
     cfg: *const edge_config.EdgeConfig,
     stream_id: u31,
     ps: *const Http2PendingStream,
-    next_server_stream_id: *u31,
+    handoff: ?*http.h2_request_handoff.Handoff,
+    executor: ?*http.h2_request_executor.Executor,
+    in_flight: *std.AutoHashMap(u31, void),
     streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
     pending_responses: *std.AutoHashMap(u31, PendingHttp2Response),
     conn_send_window: *i32,
     connection_ip: []const u8,
 ) !void {
-    _ = next_server_stream_id;
     const method = ps.method orelse return error.InvalidHttp2Request;
     const path = ps.path orelse return error.InvalidHttp2Request;
     if (!http.headers.isValidHeaderValue(method) or !http.headers.isValidHeaderValue(path)) return error.InvalidHttp2Request;
@@ -3730,6 +3924,82 @@ fn respondHttp2Stream(
         cfg.request_total_timeout_ms,
     );
     if (lifecycle.checkDeadline(.headers_read)) return error.RequestTimeout;
+
+    // #763: stream-scope SNI/:authority admission, before any routing, auth
+    // or proxy work. The handshake enforced the client-auth policy of the SNI
+    // it was admitted under; a stream whose authority maps to a different
+    // policy gets 421 on that stream only (the connection stays up).
+    const policy_host = ps.authority orelse (ps.headers.get("host") orelse "");
+    if (!connClientPolicyAdmitsHost(conn, policy_host)) {
+        return finalizeHttp2Response(conn, writer, outbound, allocator, state, stream_id, method, correlation_id, .misdirected, null, false, false, ps.transport_early, streams, pending_responses, conn_send_window);
+    }
+
+    // Move execution off the connection frame-reader loop whenever an
+    // executor is configured (#866): a slow route/auth/proxy/static call must
+    // never stop this connection from parsing sibling-stream frames or
+    // control frames. A saturated handoff/executor is a clean rejection, not
+    // a reason to fall back to inline execution -- that would reintroduce
+    // the exact blocking this phase removes.
+    if (handoff) |ho| if (executor) |ex| {
+        if (buildH2RequestJob(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, lifecycle)) |job| {
+            const submitted = submitted: {
+                ho.submit(.{ .stream_id = stream_id, .payload = job, .deinit_fn = H2RequestJob.destroyOpaque }) catch {
+                    H2RequestJob.destroyOpaque(job);
+                    break :submitted false;
+                };
+                ex.submitSignal(ho) catch {
+                    _ = ho.cancelStream(stream_id) catch {};
+                    break :submitted false;
+                };
+                break :submitted true;
+            };
+            if (submitted) {
+                try in_flight.put(stream_id, {});
+                return;
+            }
+        } else |_| {}
+        return finalizeHttp2Response(conn, writer, outbound, allocator, state, stream_id, method, correlation_id, .{ .routed = .{ .local_rejection = h2OverloadedRejection() } }, null, false, false, ps.transport_early, streams, pending_responses, conn_send_window);
+    };
+
+    // No executor configured (disabled, or a unit test exercising this
+    // function directly): preserve the pre-#866 synchronous behavior exactly.
+    var forward_auth_allowed: ?gfa.Decision = null;
+    var client_cert_gated = false;
+    var early_data_refused = false;
+    const result = try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle, &forward_auth_allowed, &client_cert_gated, &early_data_refused);
+    return finalizeHttp2Response(conn, writer, outbound, allocator, state, stream_id, method, correlation_id, .{ .routed = result }, forward_auth_allowed, client_cert_gated, early_data_refused, ps.transport_early, streams, pending_responses, conn_send_window);
+}
+
+/// Build the actual H2 response frames for a routing outcome, whether it was
+/// computed synchronously on this connection thread or relayed from a worker
+/// job's completion (#866). Owns `forward_auth_allowed` and every payload
+/// inside `outcome`.
+fn finalizeHttp2Response(
+    conn: anytype,
+    writer: anytype,
+    outbound: ?*http.h2_outbound_scheduler.Scheduler,
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    stream_id: u31,
+    method: []const u8,
+    correlation_id: []const u8,
+    outcome: Http2FinalizeOutcome,
+    forward_auth_allowed: ?gfa.Decision,
+    client_cert_gated: bool,
+    early_data_refused: bool,
+    transport_early: bool,
+    streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
+    pending_responses: *std.AutoHashMap(u31, PendingHttp2Response),
+    conn_send_window: *i32,
+) !void {
+    // An allow decision from a `forward_auth` location; its client headers
+    // decorate whatever response the location produces (#761).
+    var owned_forward_auth = forward_auth_allowed;
+    defer if (owned_forward_auth) |*allowed| allowed.deinit();
+    // Exactly one early-data decision per transport-early stream: routing
+    // records `too_early` itself when it refuses one; otherwise it was
+    // accepted.
+    if (transport_early and !early_data_refused) state.metricsRecordEarlyDataDecision(.h2, .accepted);
 
     var status_code: u16 = 404;
     var body: []const u8 = "{\"error\":\"not_found\"}";
@@ -3749,34 +4019,19 @@ fn respondHttp2Stream(
         owned_header_values.deinit();
     }
 
-    // An allow decision from a `forward_auth` location; its client headers
-    // decorate whatever response the location produces (#761).
-    var forward_auth_allowed: ?gfa.Decision = null;
-    defer if (forward_auth_allowed) |*allowed| allowed.deinit();
     // Set for gateway-generated security refusals (forward_auth denial or
     // failure, protected 425) that must end up `no-store` (#761).
     var refusal_no_store = false;
-    // Set once a non-empty `client_cert` policy admitted the request: the
-    // response then depended on a certificate no shared cache can see (#763).
-    var client_cert_gated = false;
-    // Exactly one early-data decision per transport-early stream: routing
-    // records `too_early` itself when it refuses one; otherwise it was
-    // accepted.
-    var early_data_refused = false;
-    defer if (ps.transport_early and !early_data_refused) state.metricsRecordEarlyDataDecision(.h2, .accepted);
-    // #763: stream-scope SNI/:authority admission, before any routing, auth
-    // or proxy work. The handshake enforced the client-auth policy of the SNI
-    // it was admitted under; a stream whose authority maps to a different
-    // policy gets 421 on that stream only (the connection stays up).
-    const policy_host = ps.authority orelse (ps.headers.get("host") orelse "");
-    if (!connClientPolicyAdmitsHost(conn, policy_host)) {
-        status_code = 421;
-        body_alloc = try gp.buildApiErrorJson(allocator, "misdirected_request", "Request host is governed by a different client-certificate policy than this connection's TLS server name", correlation_id);
-        body = body_alloc.?;
-        refusal_no_store = true;
-        state.metricsRecordErrorCode("misdirected_request");
-    } else if (try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle, &forward_auth_allowed, &client_cert_gated, &early_data_refused)) |result| {
-        switch (result) {
+
+    switch (outcome) {
+        .misdirected => {
+            status_code = 421;
+            body_alloc = try gp.buildApiErrorJson(allocator, "misdirected_request", "Request host is governed by a different client-certificate policy than this connection's TLS server name", correlation_id);
+            body = body_alloc.?;
+            refusal_no_store = true;
+            state.metricsRecordErrorCode("misdirected_request");
+        },
+        .routed => |maybe_result| if (maybe_result) |result| switch (result) {
             .response => |proxy_response| {
                 var response = proxy_response;
                 defer response.deinit(allocator);
@@ -3867,10 +4122,10 @@ fn respondHttp2Stream(
                 }
                 if (static.accept_ranges) try response_headers.append(.{ .name = "accept-ranges", .value = "bytes" });
             },
-        }
+        },
     }
 
-    if (forward_auth_allowed) |*allowed| {
+    if (owned_forward_auth) |*allowed| {
         for (allowed.client_headers) |header| {
             try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, header.name), .value = header.value });
         }
@@ -3899,7 +4154,7 @@ fn respondHttp2Stream(
     // by the one protected policy.
     const final_cache_policy: http.security_headers.ProtectedCachePolicy = if (refusal_no_store)
         .no_store
-    else if (forward_auth_allowed) |*allowed|
+    else if (owned_forward_auth) |*allowed|
         (if (allowed.client_headers.len > 0) .no_store else .private)
     else if (client_cert_gated)
         .private
@@ -3961,6 +4216,63 @@ fn respondHttp2Stream(
     } else {
         try pending_responses.put(stream_id, resp);
     }
+}
+
+/// Apply one worker-produced response intent to its stream (#866). Called
+/// from the connection thread only, once per `Handoff.takeCompletion()`
+/// result. A route execution error closes the connection with the same
+/// error the synchronous path would have returned, so a worker failure is
+/// externally indistinguishable from today's inline failure.
+fn applyH2RequestCompletion(
+    conn: anytype,
+    writer: anytype,
+    outbound: ?*http.h2_outbound_scheduler.Scheduler,
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    stream_id: u31,
+    completion: http.h2_request_handoff.Completion,
+    streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
+    pending_responses: *std.AutoHashMap(u31, PendingHttp2Response),
+    conn_send_window: *i32,
+) anyerror!void {
+    const payload: *H2JobCompletion = @ptrCast(@alignCast(completion.payload));
+    defer completion.deinit();
+
+    switch (payload.outcome) {
+        .route_error => |err| return err,
+        .routed => {},
+    }
+    // The stream was reset/closed between the worker finishing and this
+    // completion being drained; `Handoff.cancelStream` already prevents this
+    // in the ordinary case; this is a defensive, never-expected fallback.
+    if (!streams.contains(stream_id)) return;
+
+    // Ownership of the route result and forward_auth decision moves into
+    // `finalizeHttp2Response`; null both out first so `completion.deinit()`
+    // (deferred above) does not also try to free what finalize just consumed.
+    const forward_auth = payload.forward_auth_allowed;
+    payload.forward_auth_allowed = null;
+    const route_result = payload.outcome.routed;
+    payload.outcome = .{ .routed = null };
+
+    try finalizeHttp2Response(
+        conn,
+        writer,
+        outbound,
+        allocator,
+        state,
+        stream_id,
+        payload.method,
+        payload.correlation_id,
+        .{ .routed = route_result },
+        forward_auth,
+        payload.client_cert_gated,
+        payload.early_data_refused,
+        payload.transport_early,
+        streams,
+        pending_responses,
+        conn_send_window,
+    );
 }
 
 const Http2ProxyRouteResult = union(enum) {
@@ -4205,6 +4517,241 @@ fn executeHttp2ProxyRoute(
             &.{},
     );
     return .{ .response = proxy_response.bounded_buffered };
+}
+
+/// Release whatever `Http2ProxyRouteResult` owns without ever finalizing it
+/// into a response -- used only when a result is discarded unapplied (a
+/// cancelled stream's completion, or a job destroyed before it ran).
+fn deinitHttp2ProxyRouteResult(result: *Http2ProxyRouteResult, allocator: std.mem.Allocator) void {
+    switch (result.*) {
+        .response => |*r| r.deinit(allocator),
+        .local_rejection => {},
+        .forward_auth_denied => |*d| d.deinit(),
+        .return_response => {},
+        .static_response => |*s| s.deinit(allocator),
+    }
+}
+
+/// Independent, owned snapshot of everything `executeHttp2ProxyRoute` needs
+/// to run safely off the connection frame-reader loop (#866). Nothing here
+/// borrows from `conn`, the connection's `pending` map, or any other
+/// connection-thread-only storage, so a worker thread can use it after the
+/// connection has moved on to parsing the next frame.
+const H2RequestJob = struct {
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    method: []u8,
+    path: []u8,
+    ps: Http2PendingStream,
+    correlation_id: []u8,
+    connection_ip: []u8,
+    lifecycle: http.request_lifecycle.RequestLifecycle,
+
+    fn destroy(self: *H2RequestJob) void {
+        self.allocator.free(self.method);
+        self.allocator.free(self.path);
+        self.ps.deinit(self.allocator);
+        self.allocator.free(self.correlation_id);
+        self.allocator.free(self.connection_ip);
+        self.allocator.destroy(self);
+    }
+
+    fn destroyOpaque(raw: *anyopaque) void {
+        const self: *H2RequestJob = @ptrCast(@alignCast(raw));
+        self.destroy();
+    }
+};
+
+/// Build an owned job snapshot from a connection-owned pending stream. The
+/// connection keeps its own ownership of `ps`/`correlation_id` either way; on
+/// success the caller owns the returned job and must either submit it to a
+/// `Handoff` or call `H2RequestJob.destroyOpaque` on it.
+fn buildH2RequestJob(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    method: []const u8,
+    path: []const u8,
+    ps: *const Http2PendingStream,
+    correlation_id: []const u8,
+    connection_ip: []const u8,
+    lifecycle: http.request_lifecycle.RequestLifecycle,
+) !*H2RequestJob {
+    const job = try allocator.create(H2RequestJob);
+    errdefer allocator.destroy(job);
+    job.allocator = allocator;
+    job.state = state;
+    job.cfg = cfg;
+
+    job.method = try allocator.dupe(u8, method);
+    errdefer allocator.free(job.method);
+    job.path = try allocator.dupe(u8, path);
+    errdefer allocator.free(job.path);
+
+    job.ps = .{
+        .headers = try ps.headers.clone(allocator),
+        .body = std.array_list.Managed(u8).init(allocator),
+        .transport_early = ps.transport_early,
+        .body_limit_exceeded = ps.body_limit_exceeded,
+    };
+    errdefer job.ps.deinit(allocator);
+    job.ps.method = try allocator.dupe(u8, ps.method.?);
+    job.ps.path = try allocator.dupe(u8, ps.path.?);
+    if (ps.authority) |a| job.ps.authority = try allocator.dupe(u8, a);
+    try job.ps.body.appendSlice(ps.body.items);
+
+    job.correlation_id = try allocator.dupe(u8, correlation_id);
+    errdefer allocator.free(job.correlation_id);
+    job.connection_ip = try allocator.dupe(u8, connection_ip);
+    errdefer allocator.free(job.connection_ip);
+
+    job.lifecycle = lifecycle;
+    job.lifecycle.request_id = job.correlation_id;
+    return job;
+}
+
+/// Either the routing result `executeHttp2ProxyRoute` produced, or the error
+/// it returned instead. Carried from the worker thread back to the
+/// connection thread so a route execution failure still closes the
+/// connection exactly as it does on the synchronous path (#866).
+const H2RouteOutcome = union(enum) {
+    routed: ?Http2ProxyRouteResult,
+    route_error: anyerror,
+};
+
+/// Owned response intent handed back to the connection runtime (#866).
+/// Produced on a worker thread, consumed exactly once by
+/// `applyH2RequestCompletion` on the connection thread.
+const H2JobCompletion = struct {
+    allocator: std.mem.Allocator,
+    method: []u8,
+    correlation_id: []u8,
+    transport_early: bool,
+    forward_auth_allowed: ?gfa.Decision,
+    client_cert_gated: bool,
+    early_data_refused: bool,
+    outcome: H2RouteOutcome,
+
+    fn destroy(self: *H2JobCompletion) void {
+        switch (self.outcome) {
+            .routed => |*maybe_result| if (maybe_result.*) |*result| deinitHttp2ProxyRouteResult(result, self.allocator),
+            .route_error => {},
+        }
+        if (self.forward_auth_allowed) |*decision| decision.deinit();
+        self.allocator.free(self.method);
+        self.allocator.free(self.correlation_id);
+        self.allocator.destroy(self);
+    }
+
+    fn destroyOpaque(raw: *anyopaque) void {
+        const self: *H2JobCompletion = @ptrCast(@alignCast(raw));
+        self.destroy();
+    }
+};
+
+/// Build the owned completion for one job's already-computed route outcome.
+/// Returns null only on allocation failure, in which case everything passed
+/// in has already been released -- the stream's client simply sees no
+/// response and eventually times out, the same degraded fallback this
+/// codebase already accepts for other rare OOM paths.
+fn buildH2JobCompletion(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    correlation_id: []const u8,
+    transport_early: bool,
+    forward_auth_allowed: ?gfa.Decision,
+    client_cert_gated: bool,
+    early_data_refused: bool,
+    outcome: H2RouteOutcome,
+) ?*H2JobCompletion {
+    var owned_forward_auth = forward_auth_allowed;
+    var owned_outcome = outcome;
+    const completion = allocator.create(H2JobCompletion) catch {
+        if (owned_forward_auth) |*decision| decision.deinit();
+        switch (owned_outcome) {
+            .routed => |*maybe_result| if (maybe_result.*) |*result| deinitHttp2ProxyRouteResult(result, allocator),
+            .route_error => {},
+        }
+        return null;
+    };
+    const method_copy = allocator.dupe(u8, method) catch {
+        allocator.destroy(completion);
+        if (owned_forward_auth) |*decision| decision.deinit();
+        switch (owned_outcome) {
+            .routed => |*maybe_result| if (maybe_result.*) |*result| deinitHttp2ProxyRouteResult(result, allocator),
+            .route_error => {},
+        }
+        return null;
+    };
+    const correlation_copy = allocator.dupe(u8, correlation_id) catch {
+        allocator.free(method_copy);
+        allocator.destroy(completion);
+        if (owned_forward_auth) |*decision| decision.deinit();
+        switch (owned_outcome) {
+            .routed => |*maybe_result| if (maybe_result.*) |*result| deinitHttp2ProxyRouteResult(result, allocator),
+            .route_error => {},
+        }
+        return null;
+    };
+    completion.* = .{
+        .allocator = allocator,
+        .method = method_copy,
+        .correlation_id = correlation_copy,
+        .transport_early = transport_early,
+        .forward_auth_allowed = owned_forward_auth,
+        .client_cert_gated = client_cert_gated,
+        .early_data_refused = early_data_refused,
+        .outcome = owned_outcome,
+    };
+    return completion;
+}
+
+/// Run one leased job's route/auth/proxy/static execution on a worker thread
+/// and hand the result back to the connection through `handoff.finish`.
+/// Called from `http.h2_request_executor.Executor`'s worker loop (#866).
+fn executeH2RequestJobSignal(ctx: *anyopaque, handoff: *http.h2_request_handoff.Handoff) void {
+    _ = ctx;
+    var lease = handoff.takeJob() orelse return;
+    if (lease.isCancelled()) {
+        _ = handoff.finish(&lease, null) catch {};
+        return;
+    }
+    const job: *H2RequestJob = @ptrCast(@alignCast(lease.jobPayload()));
+
+    var forward_auth_allowed: ?gfa.Decision = null;
+    var client_cert_gated = false;
+    var early_data_refused = false;
+    const outcome: H2RouteOutcome = if (executeHttp2ProxyRoute(
+        job.allocator,
+        job.state,
+        job.cfg,
+        job.method,
+        job.path,
+        &job.ps,
+        job.correlation_id,
+        job.connection_ip,
+        &job.lifecycle,
+        &forward_auth_allowed,
+        &client_cert_gated,
+        &early_data_refused,
+    )) |result| .{ .routed = result } else |err| .{ .route_error = err };
+
+    const maybe_completion = buildH2JobCompletion(
+        job.allocator,
+        job.method,
+        job.correlation_id,
+        job.ps.transport_early,
+        forward_auth_allowed,
+        client_cert_gated,
+        early_data_refused,
+        outcome,
+    );
+    const completion: ?http.h2_request_handoff.Completion = if (maybe_completion) |c|
+        .{ .payload = c, .deinit_fn = H2JobCompletion.destroyOpaque }
+    else
+        null;
+    _ = handoff.finish(&lease, completion) catch {};
 }
 
 fn h2EvaluateRequestPolicy(
@@ -7103,6 +7650,10 @@ test "H2 reset removes parked response while queued output is backpressured" {
     try std.testing.expect(scheduler.hasPendingOutput());
 
     var buffered_request_bytes: usize = 0;
+    var in_flight_jobs = std.AutoHashMap(u31, void).init(allocator);
+    defer in_flight_jobs.deinit();
+    var handoff = try http.h2_request_handoff.Handoff.init(allocator, 4);
+    defer handoff.deinit();
     h2ResetStreamState(
         allocator,
         &streams,
@@ -7112,6 +7663,8 @@ test "H2 reset removes parked response while queued output is backpressured" {
         &buffered_request_bytes,
         1,
         &scheduler,
+        &handoff,
+        &in_flight_jobs,
     );
     try std.testing.expect(!streams.contains(1));
     try std.testing.expect(!pending_responses.contains(1));
@@ -7158,6 +7711,10 @@ test "local STREAM_CLOSED reset drops queued response before its RST" {
     try scheduler.flush(&output);
 
     var buffered_request_bytes: usize = 0;
+    var in_flight_jobs = std.AutoHashMap(u31, void).init(allocator);
+    defer in_flight_jobs.deinit();
+    var handoff = try http.h2_request_handoff.Handoff.init(allocator, 4);
+    defer handoff.deinit();
     try h2WriteStreamClosedReset(
         scheduler.writer(),
         &scheduler,
@@ -7168,6 +7725,8 @@ test "local STREAM_CLOSED reset drops queued response before its RST" {
         &ready,
         &buffered_request_bytes,
         1,
+        &handoff,
+        &in_flight_jobs,
     );
     try std.testing.expect(!streams.contains(1));
     try std.testing.expect(!pending_responses.contains(1));
@@ -7340,6 +7899,200 @@ test "H2 stream whose :authority maps to a different client-auth policy is answe
     try runH2PolicyAdmissionStream(allocator, true, &is_421, &checked, &requests);
     try std.testing.expect(!is_421);
     try std.testing.expectEqual(@as(usize, 1), checked);
+}
+
+test "H2 request dispatched to the executor runs off the dispatch call and completes via the handoff (#866)" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer {
+        var it = pending.iterator();
+        while (it.next()) |entry| {
+            var ps = entry.value_ptr.*;
+            ps.deinit(allocator);
+        }
+        pending.deinit();
+    }
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var pending_responses = std.AutoHashMap(u31, PendingHttp2Response).init(allocator);
+    defer {
+        var it = pending_responses.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        pending_responses.deinit();
+    }
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+    var in_flight = std.AutoHashMap(u31, void).init(allocator);
+    defer in_flight.deinit();
+
+    var ps = Http2PendingStream.init(allocator);
+    ps.method = try allocator.dupe(u8, "GET");
+    ps.path = try allocator.dupe(u8, "/missing");
+    ps.authority = try allocator.dupe(u8, "api.example.test");
+    try pending.put(1, ps);
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try ready.append(1);
+
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+    var next_server_stream_id: u31 = 2;
+    var conn_send_window: i32 = 65_535;
+    var buffered_request_bytes: usize = 0;
+
+    var handoff = try http.h2_request_handoff.Handoff.init(allocator, 4);
+    var executor: http.h2_request_executor.Executor = undefined;
+    try executor.init(allocator, 1, 4, executeH2RequestJobSignal, &state);
+
+    try h2DispatchReadyStreamsWithWriter(
+        &conn,
+        conn.writer(),
+        null,
+        allocator,
+        &state,
+        &cfg,
+        &pending,
+        &streams,
+        &pending_responses,
+        &ready,
+        &next_server_stream_id,
+        &conn_send_window,
+        &buffered_request_bytes,
+        "127.0.0.1",
+        &handoff,
+        &executor,
+        &in_flight,
+    );
+
+    // Dispatch handed the request to the executor and returned immediately:
+    // nothing is written yet, and the stream is tracked as awaiting a
+    // worker's completion rather than a parked flow-control response.
+    try std.testing.expectEqual(@as(usize, 0), conn.out.written().len);
+    try std.testing.expect(in_flight.contains(1));
+    try std.testing.expect(!pending.contains(1));
+
+    // Poll for the completion exactly as the connection's drain callback
+    // would from `waitFor`; bounded so a real regression fails the test
+    // instead of hanging.
+    var delivered: ?http.h2_request_handoff.DeliveredCompletion = null;
+    var attempts: usize = 0;
+    while (delivered == null and attempts < 10_000) : (attempts += 1) {
+        delivered = handoff.takeCompletion();
+        if (delivered == null) std.Thread.yield() catch {};
+    }
+    const completion = delivered orelse return error.TestUnexpectedResult;
+    _ = in_flight.remove(completion.stream_id);
+    try applyH2RequestCompletion(
+        &conn,
+        conn.writer(),
+        null,
+        allocator,
+        &state,
+        completion.stream_id,
+        completion.completion,
+        &streams,
+        &pending_responses,
+        &conn_send_window,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, conn.out.written(), "not_found") != null);
+    try std.testing.expect(!in_flight.contains(1));
+
+    handoff.shutdown();
+    handoff.waitForActiveDrain();
+    handoff.deinit();
+    executor.shutdownAndJoin();
+}
+
+test "H2 request dispatch rejects with 503 instead of executing inline when the handoff is saturated (#866)" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer {
+        var it = pending.iterator();
+        while (it.next()) |entry| {
+            var ps = entry.value_ptr.*;
+            ps.deinit(allocator);
+        }
+        pending.deinit();
+    }
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var pending_responses = std.AutoHashMap(u31, PendingHttp2Response).init(allocator);
+    defer {
+        var it = pending_responses.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        pending_responses.deinit();
+    }
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+    var in_flight = std.AutoHashMap(u31, void).init(allocator);
+    defer in_flight.deinit();
+
+    var ps = Http2PendingStream.init(allocator);
+    ps.method = try allocator.dupe(u8, "GET");
+    ps.path = try allocator.dupe(u8, "/missing");
+    ps.authority = try allocator.dupe(u8, "api.example.test");
+    try pending.put(1, ps);
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try ready.append(1);
+
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+    var next_server_stream_id: u31 = 2;
+    var conn_send_window: i32 = 65_535;
+    var buffered_request_bytes: usize = 0;
+
+    // Zero capacity: `Handoff.submit` rejects every job immediately, so
+    // dispatch must answer the stream itself rather than fall back to inline
+    // execution (which would reintroduce the frame-loop blocking #866
+    // removes) or silently drop the request.
+    var handoff = try http.h2_request_handoff.Handoff.init(allocator, 0);
+    defer handoff.deinit();
+    const NoOpExecute = struct {
+        fn run(_: *anyopaque, _: *http.h2_request_handoff.Handoff) void {
+            @panic("a saturated handoff must never reach the executor");
+        }
+    };
+    var executor: http.h2_request_executor.Executor = undefined;
+    try executor.init(allocator, 1, 4, NoOpExecute.run, undefined);
+    defer executor.shutdownAndJoin();
+
+    try h2DispatchReadyStreamsWithWriter(
+        &conn,
+        conn.writer(),
+        null,
+        allocator,
+        &state,
+        &cfg,
+        &pending,
+        &streams,
+        &pending_responses,
+        &ready,
+        &next_server_stream_id,
+        &conn_send_window,
+        &buffered_request_bytes,
+        "127.0.0.1",
+        &handoff,
+        &executor,
+        &in_flight,
+    );
+
+    try std.testing.expect(!in_flight.contains(1));
+    try std.testing.expectEqual(@as(usize, 0), handoff.outstandingCount());
+    const written = conn.out.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "overloaded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "503") != null);
 }
 
 test "H2 early stream defers dispatch until handshake completion then dispatches once" {

@@ -110,6 +110,10 @@ pub const Handoff = struct {
     wake_read: std.posix.fd_t = -1,
     wake_write: std.posix.fd_t = -1,
     wake_pending: bool = false,
+    /// Protected by the request executor's mutex.  Once teardown has detached
+    /// this handoff, that executor must neither queue nor begin another
+    /// callback that can dereference this connection-owned object.
+    executor_detached: bool = false,
 
     /// Pre-reserve each bounded state queue. Every ownership transition after
     /// this succeeds without allocation, so allocator pressure can reject a

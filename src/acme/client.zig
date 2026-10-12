@@ -535,7 +535,13 @@ pub const Session = struct {
             defer r.deinit();
             // A record we wrote must name an account on the directory's
             // origin; anything else is corruption or tampering.
+            // A record we wrote must name an account on the directory's
+            // origin; anything else is corruption or tampering.
             session.client.setKid(r.record().kid) catch return session.client.fail(error.CorruptState);
+            // ...and it must belong to the key just loaded; otherwise every
+            // request would sign with one key while claiming another's `kid`.
+            const current = session.key.jwk().thumbprint();
+            if (!std.mem.eql(u8, r.record().key_thumbprint, &current)) return session.client.fail(error.InconsistentState);
             session.client.diagnostics.accounts_reused +|= 1;
             session.created = false;
             return session;
@@ -546,6 +552,7 @@ pub const Session = struct {
         state_mod.saveAccountRecord(state, allocator, .{
             .directory = config.directory_url,
             .kid = session.client.kid.?,
+            .key_thumbprint = &session.key.jwk().thumbprint(),
             .created_at = now_unix,
             .contact_hash = &hash,
         }) catch |err| return session.client.failLocked(err);

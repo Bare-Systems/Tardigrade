@@ -408,7 +408,7 @@ test "ACME client: corrupt or missing state is reported, never papered over" {
         var state = try StateDir.open(env.path);
         defer state.close();
         const hash = state_mod.contactHash("");
-        try state_mod.saveAccountRecord(&state, testing.allocator, .{ .directory = directory_url, .kid = "https://evil.test/acct/1", .created_at = 1, .contact_hash = &hash });
+        try state_mod.saveAccountRecord(&state, testing.allocator, .{ .directory = directory_url, .kid = "https://evil.test/acct/1", .key_thumbprint = &(account_mod.AccountKey.generate() catch unreachable).jwk().thumbprint(), .created_at = 1, .contact_hash = &hash });
     }
     try expectOpenFails(&env, env.config(), error.CorruptState);
 }
@@ -664,4 +664,53 @@ test "ACME client: a pre-provisioned account key is used and never created" {
 
     cfg.account_key_path = "/nonexistent/key.pem";
     try testing.expectError(error.NotFound, Session.open(testing.allocator, env.transport(), &state, cfg, 1));
+}
+
+test "ACME client: replacing the pre-provisioned key invalidates the stored account (#832)" {
+    var env = try Env.init();
+    defer env.deinit();
+    const key_path = try std.fmt.allocPrint(testing.allocator, "{s}-provisioned.pem", .{env.path});
+    defer testing.allocator.free(key_path);
+    defer zig_compat.unlinkPath(key_path);
+
+    const writeKey = struct {
+        fn run(path: []const u8, key: *const account_mod.AccountKey) !void {
+            const pem = try key.toPkcs8Pem(testing.allocator);
+            defer crypto.secrets.secureZeroAndFree(testing.allocator, pem);
+            var parent = try std.Io.Dir.cwd().openDir(zig_compat.io(), std.fs.path.dirname(path).?, .{});
+            defer parent.close(zig_compat.io());
+            var file = try parent.createFile(zig_compat.io(), std.fs.path.basename(path), .{ .permissions = .fromMode(0o600), .truncate = true });
+            defer file.close(zig_compat.io());
+            try file.writePositionalAll(zig_compat.io(), pem, 0);
+        }
+    }.run;
+
+    var key_a = try account_mod.AccountKey.generate();
+    defer key_a.deinit();
+    var key_b = try account_mod.AccountKey.generate();
+    defer key_b.deinit();
+    {
+        var state = try StateDir.open(env.path);
+        state.close();
+    }
+    try writeKey(key_path, &key_a);
+    var cfg = env.config();
+    cfg.account_key_path = key_path;
+
+    {
+        const first = try openSession(&env, cfg);
+        first.close();
+    }
+    // Same key: loads from the record with no network traffic.
+    env.ca.script.refuse_dial = true;
+    {
+        const again = try openSession(&env, cfg);
+        try testing.expect(!again.created);
+        again.close();
+    }
+    // A different key behind the same path must not inherit account A.
+    try writeKey(key_path, &key_b);
+    const before = env.ca.log.items.len;
+    try expectOpenFails(&env, cfg, error.InconsistentState);
+    try testing.expectEqual(before, env.ca.log.items.len);
 }

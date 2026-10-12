@@ -50,7 +50,8 @@ pub const account_key_name = "account.key";
 pub const account_record_name = "account.json";
 pub const lock_name = ".lock";
 pub const max_state_file_len = 16 * 1024;
-pub const state_version = 1;
+/// Version 2 binds the record to the account key (`key_thumbprint`).
+pub const state_version = 2;
 
 /// Steps of the atomic write procedure at which tests inject a failure.
 pub const Fault = enum {
@@ -262,6 +263,9 @@ pub fn validName(name: []const u8) bool {
 pub const AccountRecord = struct {
     directory: []const u8,
     kid: []const u8,
+    /// RFC 7638 thumbprint (43-char base64url SHA-256) of the account key
+    /// that registered `kid`; a different key must never reuse the record.
+    key_thumbprint: []const u8,
     created_at: i64,
     /// Lowercase hex SHA-256 of the contact string; the address itself is
     /// never written to disk.
@@ -272,6 +276,7 @@ const AccountRecordJson = struct {
     version: u32,
     directory: []const u8,
     kid: []const u8,
+    key_thumbprint: []const u8,
     created_at: i64,
     contact_hash: []const u8,
 };
@@ -281,7 +286,7 @@ pub const LoadedRecord = struct {
 
     pub fn record(self: *const LoadedRecord) AccountRecord {
         const v = self.parsed.value;
-        return .{ .directory = v.directory, .kid = v.kid, .created_at = v.created_at, .contact_hash = v.contact_hash };
+        return .{ .directory = v.directory, .kid = v.kid, .key_thumbprint = v.key_thumbprint, .created_at = v.created_at, .contact_hash = v.contact_hash };
     }
 
     pub fn deinit(self: *LoadedRecord) void {
@@ -301,11 +306,12 @@ const record_limits = json_limits.Limits{ .max_bytes = max_state_file_len, .max_
 pub fn saveAccountRecord(state: *StateDir, allocator: std.mem.Allocator, record: AccountRecord) Error!void {
     const json = std.fmt.allocPrint(
         allocator,
-        "{{\"version\":{d},\"directory\":{f},\"kid\":{f},\"created_at\":{d},\"contact_hash\":{f}}}\n",
+        "{{\"version\":{d},\"directory\":{f},\"kid\":{f},\"key_thumbprint\":{f},\"created_at\":{d},\"contact_hash\":{f}}}\n",
         .{
             state_version,
             std.json.fmt(record.directory, .{}),
             std.json.fmt(record.kid, .{}),
+            std.json.fmt(record.key_thumbprint, .{}),
             record.created_at,
             std.json.fmt(record.contact_hash, .{}),
         },
@@ -327,7 +333,11 @@ pub fn loadAccountRecord(state: *const StateDir, allocator: std.mem.Allocator, e
     errdefer parsed.deinit();
     const v = parsed.value;
     if (v.version != state_version) return error.CorruptState;
-    if (v.kid.len == 0 or v.contact_hash.len != 64 or v.created_at < 0) return error.CorruptState;
+    if (v.kid.len == 0 or v.key_thumbprint.len != account_mod.thumbprint_len or v.contact_hash.len != 64 or v.created_at < 0) return error.CorruptState;
+    for (v.key_thumbprint) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-' or c == '_';
+        if (!ok) return error.CorruptState;
+    }
     for (v.contact_hash) |c| {
         if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return error.CorruptState;
     }
@@ -397,6 +407,8 @@ pub fn loadOrCreateAccountKey(state: *StateDir, allocator: std.mem.Allocator) Er
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+const test_thumbprint = "A" ** account_mod.thumbprint_len;
 
 const TempState = struct {
     tmp: testing.TmpDir,
@@ -614,6 +626,7 @@ test "ACME state: record without a key is inconsistent, not a reason to mint a k
     try saveAccountRecord(&state, testing.allocator, .{
         .directory = "https://ca.test/dir",
         .kid = "https://ca.test/acct/1",
+        .key_thumbprint = test_thumbprint,
         .created_at = 1,
         .contact_hash = &contactHash("mailto:a@example.com"),
     });
@@ -630,6 +643,7 @@ test "ACME state: account record round trips and detects directory mismatch" {
     try saveAccountRecord(&state, testing.allocator, .{
         .directory = "https://ca.test/dir",
         .kid = "https://ca.test/acct/42",
+        .key_thumbprint = test_thumbprint,
         .created_at = 1_700_000_000,
         .contact_hash = &hash,
     });
@@ -641,6 +655,7 @@ test "ACME state: account record round trips and detects directory mismatch" {
     try testing.expectEqualStrings("https://ca.test/acct/42", record.kid);
     try testing.expectEqual(@as(i64, 1_700_000_000), record.created_at);
     try testing.expectEqualStrings(&hash, record.contact_hash);
+    try testing.expectEqualStrings(test_thumbprint, record.key_thumbprint);
     // The address itself is never persisted.
     const raw = try state.readFileAlloc(testing.allocator, account_record_name, max_state_file_len, true);
     defer testing.allocator.free(raw);
@@ -655,18 +670,24 @@ test "ACME state: malformed account records fail closed as corrupt" {
     var state = try StateDir.open(tmp.path);
     defer state.close();
     const hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const tp = test_thumbprint;
+    const head = "{\"version\":2,\"directory\":\"https://ca.test/dir\",";
     const cases = [_][]const u8{
         "",
         "{",
         "[]",
-        "{\"version\":1}",
-        "{\"version\":2,\"directory\":\"https://ca.test/dir\",\"kid\":\"k\",\"created_at\":1,\"contact_hash\":\"" ++ hash ++ "\"}",
-        "{\"version\":1,\"directory\":\"https://ca.test/dir\",\"kid\":\"\",\"created_at\":1,\"contact_hash\":\"" ++ hash ++ "\"}",
-        "{\"version\":1,\"directory\":\"https://ca.test/dir\",\"kid\":\"k\",\"created_at\":-1,\"contact_hash\":\"" ++ hash ++ "\"}",
-        "{\"version\":1,\"directory\":\"https://ca.test/dir\",\"kid\":\"k\",\"created_at\":1,\"contact_hash\":\"zz\"}",
-        "{\"version\":1,\"directory\":\"https://ca.test/dir\",\"kid\":\"k\",\"created_at\":1,\"contact_hash\":\"" ++ ("G" ** 64) ++ "\"}",
-        "{\"version\":1,\"version\":1,\"directory\":\"https://ca.test/dir\",\"kid\":\"k\",\"created_at\":1,\"contact_hash\":\"" ++ hash ++ "\"}",
-        "{\"version\":1,\"directory\":" ++ "[" ** 20 ++ "}",
+        "{\"version\":2}",
+        // Old (unbound) format and unknown versions.
+        "{\"version\":1,\"directory\":\"https://ca.test/dir\",\"kid\":\"k\",\"created_at\":1,\"contact_hash\":\"" ++ hash ++ "\"}",
+        "{\"version\":3,\"directory\":\"https://ca.test/dir\",\"kid\":\"k\",\"key_thumbprint\":\"" ++ tp ++ "\",\"created_at\":1,\"contact_hash\":\"" ++ hash ++ "\"}",
+        head ++ "\"kid\":\"\",\"key_thumbprint\":\"" ++ tp ++ "\",\"created_at\":1,\"contact_hash\":\"" ++ hash ++ "\"}",
+        head ++ "\"kid\":\"k\",\"key_thumbprint\":\"" ++ tp ++ "\",\"created_at\":-1,\"contact_hash\":\"" ++ hash ++ "\"}",
+        head ++ "\"kid\":\"k\",\"key_thumbprint\":\"" ++ tp ++ "\",\"created_at\":1,\"contact_hash\":\"zz\"}",
+        head ++ "\"kid\":\"k\",\"key_thumbprint\":\"" ++ tp ++ "\",\"created_at\":1,\"contact_hash\":\"" ++ ("G" ** 64) ++ "\"}",
+        head ++ "\"kid\":\"k\",\"key_thumbprint\":\"short\",\"created_at\":1,\"contact_hash\":\"" ++ hash ++ "\"}",
+        head ++ "\"kid\":\"k\",\"key_thumbprint\":\"" ++ ("+" ** account_mod.thumbprint_len) ++ "\",\"created_at\":1,\"contact_hash\":\"" ++ hash ++ "\"}",
+        "{\"version\":2,\"version\":2,\"directory\":\"https://ca.test/dir\",\"kid\":\"k\",\"key_thumbprint\":\"" ++ tp ++ "\",\"created_at\":1,\"contact_hash\":\"" ++ hash ++ "\"}",
+        "{\"version\":2,\"directory\":" ++ "[" ** 20 ++ "}",
     };
     for (cases) |content| {
         try state.writeFileAtomic(account_record_name, content, 0o600);

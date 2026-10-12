@@ -21,6 +21,9 @@ pub const Error = error{
     WildcardUnsupported,
     IpLiteral,
     Duplicate,
+    /// Names must already be canonical lowercase so order-group identity
+    /// never depends on spelling case.
+    NotLowercase,
     TooManyNames,
     TooManyGroups,
     GroupTooLarge,
@@ -67,14 +70,12 @@ pub fn validate(raw: []const u8, private_ca: bool) Error!Summary {
             in_group += 1;
             if (in_group > max_names_per_group) return error.GroupTooLarge;
 
-            // Duplicates after lowercasing, across all groups.
-            var lowered: [dns_name.max_name_len]u8 = undefined;
-            const canon = std.ascii.lowerString(&lowered, name);
+            // Names are canonical lowercase here, so equality is identity.
             for (0..names - 1) |i| {
-                if (std.mem.eql(u8, seen[i][0..seen_len[i]], canon)) return error.Duplicate;
+                if (std.mem.eql(u8, seen[i][0..seen_len[i]], name)) return error.Duplicate;
             }
-            @memcpy(seen[names - 1][0..canon.len], canon);
-            seen_len[names - 1] = @intCast(canon.len);
+            @memcpy(seen[names - 1][0..name.len], name);
+            seen_len[names - 1] = @intCast(name.len);
         }
         if (in_group == 0) return error.EmptyGroup;
     }
@@ -85,6 +86,7 @@ pub fn validate(raw: []const u8, private_ca: bool) Error!Summary {
 fn validateName(name: []const u8, private_ca: bool) Error!void {
     if (std.mem.indexOfScalar(u8, name, '*') != null) return error.WildcardUnsupported;
     dns_name.validateHostName(name) catch return error.InvalidName;
+    for (name) |c| if (c >= 'A' and c <= 'Z') return error.NotLowercase;
     if (isIpv4Literal(name)) return error.IpLiteral;
     if (!private_ca and isPrivateName(name)) return error.PrivateNameForPublicCa;
 }
@@ -118,7 +120,7 @@ test "ACME names: accepts names and order groups" {
     const two = try validate("a.example.com, www.a.example.com ; b.example.com;", false);
     try testing.expectEqual(@as(usize, 3), two.names);
     try testing.expectEqual(@as(usize, 2), two.groups);
-    _ = try validate("Example.COM", false);
+    try testing.expectError(error.NotLowercase, validate("Example.COM", false));
 }
 
 test "ACME names: rejects each invalid shape deterministically" {
@@ -144,7 +146,8 @@ test "ACME names: rejects each invalid shape deterministically" {
         .{ .raw = "host.internal", .err = error.PrivateNameForPublicCa },
         .{ .raw = "host.test", .err = error.PrivateNameForPublicCa },
         .{ .raw = "host.invalid", .err = error.PrivateNameForPublicCa },
-        .{ .raw = "a.example.com,A.EXAMPLE.COM", .err = error.Duplicate },
+        .{ .raw = "a.example.com,A.EXAMPLE.COM", .err = error.NotLowercase },
+        .{ .raw = "a.example.com,a.example.com", .err = error.Duplicate },
         .{ .raw = "a.example.com;b.example.com;a.example.com", .err = error.Duplicate },
     };
     for (cases) |case| try testing.expectError(case.err, validate(case.raw, false));

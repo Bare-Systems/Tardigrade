@@ -168,7 +168,7 @@ from a surprising default.
 
 ### 4.2 Hostname rules
 
-A managed hostname must be a DNS name, lowercased, no trailing dot, 1–253
+A managed hostname must be a DNS name, already lowercase (uppercase is rejected, not normalized), no trailing dot, 1–253
 bytes, labels 1–63 bytes, validated by `tls/dns_name.zig` (the validator the
 SNI provider already uses). Additionally:
 
@@ -202,7 +202,7 @@ Must be `https://`, a host, no userinfo, no fragment, ≤ 2048 bytes. Plain
 <state_dir>/                 mode 0700, owned by the runtime user
   .lock                      advisory flock, one process per state dir
   account.key                0600, PKCS#8 PEM, P-256
-  account.json               0600, {directory, kid, created_at, contact_hash}
+  account.json               0600, {version: 2, directory, kid, key_thumbprint, created_at, contact_hash}
   groups/<group-id>/
     current                  0600, atomically replaced; one line: <gen-id>\n
     generations/<gen-id>/    immutable once `current` names it
@@ -824,8 +824,9 @@ Behavior worth knowing:
 - If registration succeeds at the CA but writing `account.json` fails, the key
   is already durable, and the next open converges: `newAccount` is idempotent
   per key (200 with the existing account URL).
-- `account.json` stores the directory URL, account URL, creation time and a
-  SHA-256 of the contact; the email itself is never written.
+- `account.json` (version 2) stores the directory URL, account URL, the RFC 7638
+  thumbprint of the key that registered it (a record for a different key fails
+  `InconsistentState`), creation time and a SHA-256 of the contact; the email itself is never written.
 - Config (§4) is parsed and validated in `edge_config.zig` before the final
   gate: `automatic_https` (primary name beats the `ACME_ENABLED` alias and the
   directive-normalized name), directory URL grammar, ToS, state dir

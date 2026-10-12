@@ -2597,17 +2597,37 @@ fn acmeDirectiveAlias(buf: []u8, primary: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "TARDIGRADE_{s}", .{primary[prefix.len..]}) catch null;
 }
 
-/// First present of: primary, its directive-normalized name, then `legacy`
-/// (when non-empty); otherwise `default_value`. Presence, not truthiness,
-/// decides, so an explicit primary `false`/empty beats a stale legacy value.
+/// Resolve an ACME setting with the normal precedence of every other setting
+/// (environment, then config-file directive, then secret override, then
+/// default) and, *within each source*, name precedence: the documented
+/// `TARDIGRADE_TLS_*` name, then the name a config-file directive normalizes
+/// to (`acme_state_dir` -> `TARDIGRADE_ACME_STATE_DIR`), then `legacy` (when
+/// non-empty). Presence, not truthiness, decides, so an explicit primary
+/// `false`/empty beats a stale legacy value.
 fn acmeEnvOwned(allocator: std.mem.Allocator, primary: []const u8, legacy: []const u8, default_value: []const u8) ![]u8 {
-    if (compat.getEnvVarOwned(allocator, primary)) |owned| return owned else |_| {}
-    var buf: [128]u8 = undefined;
-    if (acmeDirectiveAlias(&buf, primary)) |alias| {
-        if (compat.getEnvVarOwned(allocator, alias)) |owned| return owned else |_| {}
+    var alias_buf: [128]u8 = undefined;
+    const names = [_]?[]const u8{
+        primary,
+        acmeDirectiveAlias(&alias_buf, primary),
+        if (legacy.len > 0) legacy else null,
+    };
+    for (names) |maybe| {
+        const key = maybe orelse continue;
+        if (compat.getEnvVarOwned(allocator, key)) |owned| return owned else |_| {}
     }
-    if (legacy.len > 0) return envOrDefault(allocator, legacy, default_value);
-    return envOrDefault(allocator, primary, default_value);
+    if (active_file_overrides) |ov| {
+        for (names) |maybe| {
+            const key = maybe orelse continue;
+            if (ov.map.get(key)) |value| return allocator.dupe(u8, value);
+        }
+    }
+    if (active_secret_overrides) |ov| {
+        for (names) |maybe| {
+            const key = maybe orelse continue;
+            if (ov.map.get(key)) |value| return allocator.dupe(u8, value);
+        }
+    }
+    return allocator.dupe(u8, default_value);
 }
 
 fn acmeEnvBool(allocator: std.mem.Allocator, primary: []const u8, legacy: []const u8, default_value: bool) bool {
@@ -5555,6 +5575,58 @@ test "automatic HTTPS grammar is validated before the support gate (#832)" {
         }
         try std.testing.expectError(error.InvalidConfigValue, validateNativeTlsBuildConfig(&cfg));
     }
+}
+
+test "config-file ACME directives reach EdgeConfig and validate (#832)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(compat.io(), &dir_buf);
+    const state_dir = try std.fmt.allocPrint(allocator, "{s}", .{dir_buf[0..dir_len]});
+    defer allocator.free(state_dir);
+    const conf = try std.fmt.allocPrint(allocator,
+        \\automatic_https true;
+        \\acme_agree_tos true;
+        \\acme_state_dir {s};
+        \\acme_directory_url https://localhost:14000/dir;
+        \\acme_domains a.example.com,www.a.example.com;b.example.com;
+        \\acme_email ops@example.com;
+        \\acme_renew_days_before_expiry 21;
+        \\
+    , .{state_dir});
+    defer allocator.free(conf);
+    const conf_path = try std.fmt.allocPrint(allocator, "{s}/tardigrade.conf", .{state_dir});
+    defer allocator.free(conf_path);
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tardigrade.conf", .data = conf });
+
+    const env_c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const conf_path_z = try allocator.dupeZ(u8, conf_path);
+    defer allocator.free(conf_path_z);
+    _ = env_c.setenv("TARDIGRADE_CONFIG_PATH", conf_path_z, 1);
+    defer _ = env_c.unsetenv("TARDIGRADE_CONFIG_PATH");
+
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    try std.testing.expect(cfg.tls_acme_enabled);
+    try std.testing.expect(cfg.tls_acme_agree_tos);
+    try std.testing.expectEqualStrings(state_dir, cfg.tls_acme_cert_dir);
+    try std.testing.expectEqualStrings("https://localhost:14000/dir", cfg.tls_acme_directory_url);
+    try std.testing.expectEqualStrings("a.example.com,www.a.example.com;b.example.com", cfg.tls_acme_domains_spec);
+    try std.testing.expectEqual(@as(usize, 3), cfg.tls_acme_domains.len);
+    try std.testing.expectEqualStrings("ops@example.com", cfg.tls_acme_email);
+    try std.testing.expectEqual(@as(u32, 21), cfg.tls_acme_renew_days_before_expiry);
+    try validateAcmeConfig(&cfg);
+
+    // Environment still beats the file, name precedence inside each source.
+    _ = env_c.setenv("TARDIGRADE_TLS_AUTOMATIC_HTTPS", "false", 1);
+    defer _ = env_c.unsetenv("TARDIGRADE_TLS_AUTOMATIC_HTTPS");
+    var overridden = try loadFromEnv(allocator);
+    defer overridden.deinit(allocator);
+    try std.testing.expect(!overridden.tls_acme_enabled);
 }
 
 test "automatic HTTPS opt-in: primary name beats legacy alias and directive name (#832)" {

@@ -3131,6 +3131,102 @@ fn h2FlushPendingHttp2Responses(
     }
 }
 
+/// Route one inbound DATA frame payload to an attached persistent stream
+/// session (#867) instead of the ordinary finite-request buffer. Receive
+/// credit is deliberately not returned here: `h2ReturnSessionReceiveCredit`
+/// only grants it once the consumer actually drains queued bytes, so a
+/// stalled consumer caps retained memory instead of growing the window.
+fn h2DeliverSessionInboundData(session: *http.h2_stream_session.Session, payload: []const u8, end_stream: bool) !void {
+    if (payload.len > 0) try session.deliverInbound(payload);
+    if (end_stream) session.deliverRemoteEndStream();
+}
+
+/// Drain an attached session's outbound queue onto the wire exactly like
+/// `flushHttp2PendingResponse` drains a finite response: the same per-frame
+/// cap and stream/connection send-credit accounting, segmented so a stalled
+/// peer blocks this stream's bytes without blocking siblings. Emits the
+/// final END_STREAM-flagged frame once the consumer calls `finishLocal` and
+/// the queue has fully drained.
+fn flushHttp2SessionOutbound(
+    conn: anytype,
+    outbound: ?*http.h2_outbound_scheduler.Scheduler,
+    writer: anytype,
+    stream_id: u31,
+    session: *http.h2_stream_session.Session,
+    conn_send_window: *i32,
+    stream_send_window: *i32,
+) !void {
+    const max_data_frame: usize = HTTP2_MAX_FRAME_SIZE;
+    while (true) {
+        const credit = @min(conn_send_window.*, stream_send_window.*);
+        if (credit <= 0) break;
+        const chunk = session.peekOutbound(@min(max_data_frame, @as(usize, @intCast(credit)))) orelse break;
+        if (chunk.len == 0) break;
+        const n = chunk.len;
+        try h2WriteDataFrame(conn, outbound, writer, 0, stream_id, chunk);
+        session.commitOutboundSent(n);
+        conn_send_window.* -= @intCast(n);
+        stream_send_window.* -= @intCast(n);
+    }
+    if (session.outboundLocalEndPending()) {
+        try h2WriteDataFrame(conn, outbound, writer, http.http2_frame.Flags.END_STREAM, stream_id, &.{});
+        session.markLocalEndStreamSent();
+    }
+}
+
+/// Return receive-window credit the consumer has earned by draining inbound
+/// bytes since the last call. Mirrors ordinary-stream WINDOW_UPDATE: both
+/// the stream and connection windows grow by the same amount (#867).
+fn h2ReturnSessionReceiveCredit(writer: anytype, session: *http.h2_stream_session.Session, stream_id: u31) !void {
+    const credit = session.takeReceiveCreditToReturn();
+    if (credit == 0) return;
+    try http.http2_frame.writeWindowUpdate(writer, stream_id, @intCast(credit));
+    try http.http2_frame.writeWindowUpdate(writer, 0, @intCast(credit));
+}
+
+const Http2SessionCloseReason = enum { goaway, connection_closed, shutdown };
+
+/// Settle every attached session for a connection-wide terminal event
+/// (GOAWAY, abrupt close, or graceful shutdown) and detach the runtime
+/// side of each. A session whose consumer already detached is freed here;
+/// otherwise the consumer's later `consumerDetach` frees it.
+fn h2SettleAllSessions(
+    allocator: std.mem.Allocator,
+    sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
+    reason: Http2SessionCloseReason,
+) void {
+    var it = sessions.valueIterator();
+    while (it.next()) |session_ptr| {
+        const session = session_ptr.*;
+        switch (reason) {
+            .goaway => session.deliverGoaway(),
+            .connection_closed => session.deliverConnectionClosed(),
+            .shutdown => session.deliverShutdown(),
+        }
+        if (session.runtimeDetach()) {
+            session.deinit();
+            allocator.destroy(session);
+        }
+    }
+    sessions.clearAndFree();
+}
+
+/// Detach the runtime side of one stream's session after RST_STREAM or
+/// ordinary bidirectional close, freeing it if the consumer already
+/// detached.
+fn h2DetachSession(
+    allocator: std.mem.Allocator,
+    sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
+    stream_id: u31,
+) void {
+    const session = sessions.get(stream_id) orelse return;
+    _ = sessions.remove(stream_id);
+    if (session.runtimeDetach()) {
+        session.deinit();
+        allocator.destroy(session);
+    }
+}
+
 fn h2DispatchReadyStreamsWithWriter(
     conn: anytype,
     writer: anytype,
@@ -7785,6 +7881,257 @@ test "H2 ordinary stream dispatch remains unchanged" {
     try std.testing.expect(!pending.contains(3));
     try std.testing.expectEqual(@as(usize, 0), ready.items.len);
     try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+}
+
+const H2SessionDecodedFrame = struct { typ: http.http2_frame.Type, flags: u8, stream_id: u31, payload: []const u8 };
+
+/// Minimal wire decoder shared by the session integration tests below, so
+/// assertions read real `writeFrame` output rather than internal state.
+fn h2DecodeFrames(allocator: std.mem.Allocator, wire: []const u8) !std.array_list.Managed(H2SessionDecodedFrame) {
+    var frames = std.array_list.Managed(H2SessionDecodedFrame).init(allocator);
+    var offset: usize = 0;
+    while (offset < wire.len) {
+        const header = wire[offset..];
+        const len = (@as(usize, header[0]) << 16) | (@as(usize, header[1]) << 8) | header[2];
+        const stream_id: u31 = @intCast(std.mem.readInt(u32, header[5..9], .big) & 0x7fff_ffff);
+        try frames.append(.{
+            .typ = @enumFromInt(header[3]),
+            .flags = header[4],
+            .stream_id = stream_id,
+            .payload = header[9 .. 9 + len],
+        });
+        offset += 9 + len;
+    }
+    return frames;
+}
+
+test "H2 persistent stream session exchanges bidirectional DATA alongside a sibling finite request (#867)" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer {
+        var it = pending.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        pending.deinit();
+    }
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var pending_responses = std.AutoHashMap(u31, PendingHttp2Response).init(allocator);
+    defer {
+        var it = pending_responses.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        pending_responses.deinit();
+    }
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer sessions.deinit();
+
+    // Sibling ordinary request on stream 3, dispatched through the same
+    // #866 path used today.
+    var ps = Http2PendingStream.init(allocator);
+    ps.method = try allocator.dupe(u8, "GET");
+    ps.path = try allocator.dupe(u8, "/ordinary");
+    try pending.put(3, ps);
+    try streams.put(3, http.http2_stream.Stream.init(3, 65_535));
+    try ready.append(3);
+
+    // Persistent stream session on stream 5.
+    try streams.put(5, http.http2_stream.Stream.init(5, 65_535));
+    const session = try allocator.create(http.h2_stream_session.Session);
+    session.* = try http.h2_stream_session.Session.init(allocator, 5, 4096, 4096);
+    try sessions.put(5, session);
+
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+    conn.handshake_complete = false;
+
+    // The integration consumer: a real worker thread using only the
+    // production `Session` API (never the connection/socket), echoing
+    // inbound bytes back out and finishing local production once the
+    // remote half closes.
+    const Consumer = struct {
+        session: *http.h2_stream_session.Session,
+        bytes_echoed: usize = 0,
+        fn run(ctx: *@This()) void {
+            var buf: [256]u8 = undefined;
+            while (true) {
+                switch (ctx.session.read(&buf)) {
+                    .data => |n| {
+                        ctx.bytes_echoed += n;
+                        _ = ctx.session.write(buf[0..n]);
+                    },
+                    else => break,
+                }
+            }
+            ctx.session.finishLocal();
+        }
+    };
+    var consumer_ctx = Consumer{ .session = session };
+    const consumer_thread = try std.Thread.spawn(.{}, Consumer.run, .{&consumer_ctx});
+
+    // Inbound DATA is delivered incrementally through the same
+    // `h2DataPayload` parsing the real frame loop uses, not buffered to a
+    // full request first.
+    try h2DeliverSessionInboundData(session, try h2DataPayload("first-chunk-", 0), false);
+    try h2DeliverSessionInboundData(session, try h2DataPayload("second-chunk", 0), true);
+
+    // Sibling ordinary dispatch keeps completing while the persistent
+    // stream's consumer thread is still active.
+    var next_server_stream_id: u31 = 2;
+    var conn_send_window: i32 = 65_535;
+    var buffered_request_bytes: usize = 0;
+    try h2DispatchReadyStreams(
+        &conn,
+        allocator,
+        &state,
+        &cfg,
+        &pending,
+        &streams,
+        &pending_responses,
+        &ready,
+        &next_server_stream_id,
+        &conn_send_window,
+        &buffered_request_bytes,
+        "127.0.0.1",
+    );
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+
+    consumer_thread.join();
+    try std.testing.expectEqual(@as(usize, "first-chunk-".len + "second-chunk".len), consumer_ctx.bytes_echoed);
+
+    // Exhaust the stream's send credit mid-drain, proving outbound
+    // production is segmented by available credit and resumes once more
+    // credit (a WINDOW_UPDATE) arrives.
+    var scheduler = try http.h2_outbound_scheduler.Scheduler.init(allocator, http.h2_outbound_scheduler.default_max_queued_bytes);
+    defer scheduler.deinit();
+    var stream_send_window: i32 = 4;
+    try flushHttp2SessionOutbound(&conn, &scheduler, scheduler.writer(), 5, session, &conn_send_window, &stream_send_window);
+    try std.testing.expect(session.hasPendingOutbound());
+    try std.testing.expect(!session.outboundLocalEndPending());
+
+    stream_send_window = 65_535;
+    try flushHttp2SessionOutbound(&conn, &scheduler, scheduler.writer(), 5, session, &conn_send_window, &stream_send_window);
+    try std.testing.expect(!session.hasPendingOutbound());
+    try scheduler.flush(conn.writer());
+
+    // `conn.out` also carries the sibling stream-3 response written
+    // directly by `h2DispatchReadyStreams` above; only the scheduler-routed
+    // stream-5 DATA frames belong to the persistent session.
+    var frames = try h2DecodeFrames(allocator, conn.out.written());
+    defer frames.deinit();
+    var echoed = std.array_list.Managed(u8).init(allocator);
+    defer echoed.deinit();
+    var saw_end_stream = false;
+    for (frames.items) |frame| {
+        if (frame.stream_id != 5) continue;
+        try std.testing.expectEqual(http.http2_frame.Type.data, frame.typ);
+        try echoed.appendSlice(frame.payload);
+        if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) saw_end_stream = true;
+    }
+    try std.testing.expectEqualSlices(u8, "first-chunk-second-chunk", echoed.items);
+    try std.testing.expect(saw_end_stream);
+
+    // Receive-window credit is only earned as the consumer actually drains
+    // inbound bytes; it was all consumed above, so exactly that many bytes
+    // come back as WINDOW_UPDATE, and a second call returns nothing.
+    var credit_out = std.Io.Writer.Allocating.init(allocator);
+    defer credit_out.deinit();
+    try h2ReturnSessionReceiveCredit(&credit_out.writer, session, 5);
+    var credit_frames = try h2DecodeFrames(allocator, credit_out.written());
+    defer credit_frames.deinit();
+    try std.testing.expectEqual(@as(usize, 2), credit_frames.items.len);
+    for (credit_frames.items) |frame| {
+        try std.testing.expectEqual(http.http2_frame.Type.window_update, frame.typ);
+        try std.testing.expectEqual(@as(u32, "first-chunk-".len + "second-chunk".len), std.mem.readInt(u32, frame.payload[0..4], .big));
+    }
+    const before_len = credit_out.written().len;
+    try h2ReturnSessionReceiveCredit(&credit_out.writer, session, 5);
+    try std.testing.expectEqual(before_len, credit_out.written().len);
+
+    // The consumer detaches first; the runtime, still attached, must not
+    // free the session out from under it. `h2DetachSession` (the runtime
+    // side) frees it only once both have let go.
+    try std.testing.expect(!session.consumerDetach());
+    h2DetachSession(allocator, &sessions, 5);
+    try std.testing.expect(!sessions.contains(5));
+}
+
+test "H2 session RST_STREAM settles the consumer and detaches without leaking" {
+    const allocator = std.testing.allocator;
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer sessions.deinit();
+    const session = try allocator.create(http.h2_stream_session.Session);
+    session.* = try http.h2_stream_session.Session.init(allocator, 7, 64, 64);
+    try sessions.put(7, session);
+
+    try std.testing.expect(!session.consumerDetach());
+    session.deliverReset(.cancel);
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqual(http.h2_stream_session.ReadResult{ .reset = .cancel }, session.read(&buf));
+
+    h2DetachSession(allocator, &sessions, 7);
+    try std.testing.expect(!sessions.contains(7));
+}
+
+test "H2 GOAWAY, connection close, and shutdown settle every attached session exactly once" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { reason: Http2SessionCloseReason, closed: http.h2_stream_session.TerminalReason }{
+        .{ .reason = .goaway, .closed = .goaway },
+        .{ .reason = .connection_closed, .closed = .connection_closed },
+        .{ .reason = .shutdown, .closed = .shutdown },
+    };
+    for (cases) |case| {
+        var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+        defer sessions.deinit();
+        const ids = [_]u31{ 9, 11, 13 };
+        var created: [ids.len]*http.h2_stream_session.Session = undefined;
+        for (ids, 0..) |id, idx| {
+            const session = try allocator.create(http.h2_stream_session.Session);
+            session.* = try http.h2_stream_session.Session.init(allocator, id, 64, 64);
+            try sessions.put(id, session);
+            created[idx] = session;
+        }
+
+        // `h2SettleAllSessions` detaches the runtime side of every attached
+        // session and clears the map; none here is freed yet because each
+        // consumer (simulated below) is still attached.
+        h2SettleAllSessions(allocator, &sessions, case.reason);
+        try std.testing.expectEqual(@as(usize, 0), sessions.count());
+
+        for (created) |session| {
+            var buf: [4]u8 = undefined;
+            try std.testing.expectEqual(http.h2_stream_session.ReadResult{ .closed = case.closed }, session.read(&buf));
+            // The consumer detaches last and frees the session, mirroring
+            // what its worker thread would do after observing settlement.
+            try std.testing.expect(session.consumerDetach());
+            session.deinit();
+            allocator.destroy(session);
+        }
+    }
+}
+
+test "H2 session attach/detach churn settles resources with no leak" {
+    const allocator = std.testing.allocator;
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer sessions.deinit();
+
+    var i: u31 = 0;
+    while (i < 50) : (i += 1) {
+        const stream_id = i * 2 + 1;
+        const session = try allocator.create(http.h2_stream_session.Session);
+        session.* = try http.h2_stream_session.Session.init(allocator, stream_id, 64, 64);
+        try sessions.put(stream_id, session);
+        try h2DeliverSessionInboundData(session, "ping", true);
+        try std.testing.expect(!session.consumerDetach());
+        h2DetachSession(allocator, &sessions, stream_id);
+    }
+    try std.testing.expectEqual(@as(usize, 0), sessions.count());
 }
 
 const H2FrameReadProvenanceHarness = struct {

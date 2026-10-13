@@ -13,14 +13,20 @@ const JSON_CONTENT_TYPE = "application/json";
 const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_MAX_FRAME_SIZE: usize = 16 * 1024;
 const HTTP2_MAX_CONCURRENT_STREAMS: usize = 100;
+/// Per-stream SETTINGS_INITIAL_WINDOW_SIZE this connection advertises to the
+/// peer for every HTTP/2 stream, including #867 persistent sessions.
+const HTTP2_INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
 /// Per-stream bound on a #867 persistent session's queued inbound/outbound
-/// bytes. Deliberately independent of (and tighter than) the generic HTTP/2
-/// flow-control window advertised in SETTINGS: a session's own bounded
-/// queue -- not a shrinking receive window -- is what caps retained memory,
-/// so a peer that outruns its consumer gets RST_STREAM(FLOW_CONTROL_ERROR)
-/// rather than unbounded buffering.
-const HTTP2_SESSION_MAX_INBOUND_BYTES: usize = 256 * 1024;
+/// bytes. The inbound bound must be at least `HTTP2_INITIAL_WINDOW_SIZE`: a
+/// smaller session queue would let a well-behaved peer legally fill the
+/// receive window this connection already advertised and still get
+/// RST_STREAM(FLOW_CONTROL_ERROR) before exceeding what it was actually
+/// granted. Both bounds are charged against `cfg.max_connection_memory_bytes`
+/// on attach (`HTTP2_SESSION_RESERVED_BYTES`) so many concurrent sessions on
+/// one connection cannot bypass the connection-wide memory ceiling.
+const HTTP2_SESSION_MAX_INBOUND_BYTES: usize = HTTP2_INITIAL_WINDOW_SIZE;
 const HTTP2_SESSION_MAX_OUTBOUND_BYTES: usize = 256 * 1024;
+const HTTP2_SESSION_RESERVED_BYTES: usize = HTTP2_SESSION_MAX_INBOUND_BYTES + HTTP2_SESSION_MAX_OUTBOUND_BYTES;
 const WS_MUX_MAX_CHANNELS: usize = 32;
 const ACTIVE_DRIVE_POLL_INTERVAL_MS: u64 = 250;
 /// Fallback approval TTL when no config value is provided (5 minutes).
@@ -2816,6 +2822,7 @@ fn h2ResetStreamState(
     _ = in_flight.remove(stream_id);
     if (sessions.fetchRemove(stream_id)) |removed| {
         const session = removed.value;
+        buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
         session.deliverReset(.cancel);
         if (session.runtimeDetach()) {
             session.deinit();
@@ -3139,6 +3146,15 @@ fn h2ProcessHeaderBlock(
 
     if (state.h2_session_test_hook) |hook| {
         if (hook.shouldAttach(hook.ctx, &ps)) {
+            // A session's bounded queues are charged against the same
+            // connection-wide memory ceiling as ordinary buffered request
+            // bytes: otherwise many concurrent sessions (each individually
+            // bounded) could together retain far more than
+            // `cfg.max_connection_memory_bytes` permits.
+            if (max_connection_memory_bytes > 0 and HTTP2_SESSION_RESERVED_BYTES > max_connection_memory_bytes -| buffered_request_bytes.*) {
+                try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.enhance_your_calm.value());
+                return error.Http2ConnectionMemoryLimitExceeded;
+            }
             // Headers that request a persistent #867 session never enter
             // `pending`/ordinary finite dispatch; `ps`'s parsed fields are
             // only used by `shouldAttach` above.
@@ -3156,6 +3172,7 @@ fn h2ProcessHeaderBlock(
             // runtime sends a minimal 200 on its behalf.
             try h2WriteSessionResponseHeaders(writer, allocator, stream_id);
             try sessions.put(stream_id, session);
+            buffered_request_bytes.* += HTTP2_SESSION_RESERVED_BYTES;
             if (end_stream) session.deliverRemoteEndStream();
             hook.attach(hook.ctx, session);
             ps.deinit(allocator);
@@ -3472,14 +3489,17 @@ fn h2SettleAllSessions(
 
 /// Detach the runtime side of one stream's session after RST_STREAM or
 /// ordinary bidirectional close, freeing it if the consumer already
-/// detached.
+/// detached and releasing its reserved share of the connection memory
+/// budget (see `HTTP2_SESSION_RESERVED_BYTES`).
 fn h2DetachSession(
     allocator: std.mem.Allocator,
     sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
+    buffered_request_bytes: *usize,
     stream_id: u31,
 ) void {
     const session = sessions.get(stream_id) orelse return;
     _ = sessions.remove(stream_id);
+    buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
     if (session.runtimeDetach()) {
         session.deinit();
         allocator.destroy(session);
@@ -3602,7 +3622,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
 
     try http.http2_frame.writeSettings(allocator, outbound_writer, &[_][2]u32{
         .{ 0x3, HTTP2_MAX_CONCURRENT_STREAMS }, // max concurrent streams
-        .{ 0x4, 1024 * 1024 }, // initial window size
+        .{ 0x4, HTTP2_INITIAL_WINDOW_SIZE }, // initial window size
     });
     try outbound.flush(conn.writer());
 
@@ -3746,6 +3766,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
         sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
         streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
         conn_send_window: *i32,
+        buffered_request_bytes: *usize,
 
         fn pollFds(raw: *anyopaque, buf: []std.posix.fd_t) []const std.posix.fd_t {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -3777,17 +3798,29 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 const stream_id = entry.key_ptr.*;
                 const sess = entry.value_ptr.*;
                 sess.clearWake();
-                if (sess.hasWakeFailure()) {
+                if (sess.hasWakeFailure() or sess.hasWriteFailure()) {
                     // A lost wake notification means this session can no
                     // longer learn about new inbound credit or outbound
-                    // bytes; treat it like a protocol-level reset rather
-                    // than let it stall forever.
+                    // bytes; a failed producer write may have already
+                    // queued a prefix the consumer cannot safely retry.
+                    // Treat both like a protocol-level reset rather than
+                    // let the stream stall forever. Cancel any output this
+                    // stream already queued with the scheduler first, same
+                    // as the consumer-cancel path below, so a reset stream
+                    // never has stale DATA retained or transmitted after it.
+                    self.outbound.cancelStream(stream_id);
                     try http.http2_frame.writeRstStream(self.writer, stream_id, http.http2_stream.ErrorCode.internal_error.value());
                     sess.deliverReset(.internal_error);
                     try detach_list.append(stream_id);
                     continue;
                 }
                 const stream_ptr = self.streams.getPtr(stream_id) orelse {
+                    // This stream's bookkeeping disappeared without this
+                    // session ever being detached (e.g. an ordinary
+                    // RST/close path removed it). Settle it explicitly so a
+                    // blocked consumer is woken instead of left owning a
+                    // live but unreachable handle.
+                    sess.deliverReset(.internal_error);
                     try detach_list.append(stream_id);
                     continue;
                 };
@@ -3803,7 +3836,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 if (stream_ptr.state == .closed) try detach_list.append(stream_id);
             }
             for (detach_list.items) |stream_id| {
-                h2DetachSession(self.allocator, self.sessions, stream_id);
+                h2DetachSession(self.allocator, self.sessions, self.buffered_request_bytes, stream_id);
                 _ = self.streams.remove(stream_id);
             }
         }
@@ -3816,6 +3849,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
         .sessions = &sessions,
         .streams = &streams,
         .conn_send_window = &conn_send_window,
+        .buffered_request_bytes = &buffered_request_bytes,
     };
     h2InstallSessionRegistry(conn, SessionDrainCtx.pollFds, SessionDrainCtx.drain, &session_drain_ctx);
     defer h2InstallSessionRegistry(conn, null, null, null);
@@ -4063,16 +4097,17 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         data_payload,
                         (frame.flags & http.http2_frame.Flags.END_STREAM) != 0,
                     ) catch |err| switch (err) {
-                        // The session's own bounded queue is deliberately
-                        // tighter than the generic flow-control window (see
-                        // `HTTP2_SESSION_MAX_INBOUND_BYTES`): a peer that
-                        // outruns its consumer gets RST_STREAM here instead
-                        // of unbounded buffering.
+                        // The session's own bounded queue matches the
+                        // receive window this connection advertised (see
+                        // `HTTP2_SESSION_MAX_INBOUND_BYTES`), so this can
+                        // only fire on an actual protocol violation (a peer
+                        // sending more than its granted window), never on a
+                        // merely stalled consumer.
                         error.QueueFull => {
                             outbound.cancelStream(frame.stream_id);
                             try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
                             active_session.deliverReset(.flow_control_error);
-                            h2DetachSession(allocator, &sessions, frame.stream_id);
+                            h2DetachSession(allocator, &sessions, &buffered_request_bytes, frame.stream_id);
                             _ = streams.remove(frame.stream_id);
                         },
                         error.Closed => {},
@@ -9464,7 +9499,8 @@ test "H2 session RST_STREAM settles the consumer and detaches without leaking" {
     var buf: [4]u8 = undefined;
     try std.testing.expectEqual(http.h2_stream_session.ReadResult{ .reset = .cancel }, session.read(&buf));
 
-    h2DetachSession(allocator, &sessions, 7);
+    var buffered_request_bytes: usize = 0;
+    h2DetachSession(allocator, &sessions, &buffered_request_bytes, 7);
     try std.testing.expect(!sessions.contains(7));
 }
 
@@ -9509,6 +9545,7 @@ test "H2 session attach/detach churn settles resources with no leak" {
     const allocator = std.testing.allocator;
     var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
     defer sessions.deinit();
+    var buffered_request_bytes: usize = 0;
 
     var i: u31 = 0;
     while (i < 50) : (i += 1) {
@@ -9520,7 +9557,7 @@ test "H2 session attach/detach churn settles resources with no leak" {
         defer discard_out.deinit();
         try h2DeliverSessionInboundData(&discard_out.writer, session, stream_id, "ping".len, "ping", true);
         try std.testing.expect(!session.consumerDetach());
-        h2DetachSession(allocator, &sessions, stream_id);
+        h2DetachSession(allocator, &sessions, &buffered_request_bytes, stream_id);
     }
     try std.testing.expectEqual(@as(usize, 0), sessions.count());
 }

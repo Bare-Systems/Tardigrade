@@ -108,6 +108,13 @@ pub const Session = struct {
     /// for the stream -- it can no longer learn about inbound credit or
     /// outbound bytes becoming available -- rather than silently stalling.
     wake_failed: bool = false,
+    /// A producer `write` failed (allocator error), possibly after already
+    /// queuing part of its input. A caller that retried the same bytes
+    /// would duplicate whatever prefix already reached the queue, so
+    /// further writes are rejected immediately and the runtime must treat
+    /// this as fatal for the stream (RST_STREAM and detach), exactly like
+    /// `wake_failed`.
+    write_failed: bool = false,
 
     runtime_attached: bool = true,
     consumer_attached: bool = true,
@@ -359,9 +366,18 @@ pub const Session = struct {
     /// is a slow reader). Allocator failures propagate to the caller instead
     /// of blocking forever: there is no guarantee free capacity will ever
     /// appear to unblock a retry, and nothing else would signal this waiter.
+    ///
+    /// An allocator failure here can happen after one or more earlier
+    /// chunks of this same `bytes` were already queued successfully, so the
+    /// caller cannot tell from the error alone how much was accepted.
+    /// Rather than leave that ambiguous, a failure sets `write_failed`
+    /// sticky: this and every later `write` fail fast with `.reset` instead
+    /// of risking a retry that duplicates an already-queued prefix on the
+    /// wire, and the runtime detects the flag and tears the stream down.
     pub fn write(self: *Session, bytes: []const u8) Error!WriteResult {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.write_failed) return .{ .reset = .internal_error };
         var remaining = bytes;
         while (remaining.len > 0) {
             if (self.terminal) |terminal| return terminalWriteResult(terminal);
@@ -372,9 +388,21 @@ pub const Session = struct {
                 continue;
             }
             const n = @min(capacity, remaining.len);
-            const owned = try self.allocator.dupe(u8, remaining[0..n]);
-            errdefer self.allocator.free(owned);
-            try self.outbound.append(self.allocator, .{ .bytes = owned });
+            const owned = self.allocator.dupe(u8, remaining[0..n]) catch |err| {
+                self.write_failed = true;
+                self.signalWakeLocked() catch {
+                    self.wake_failed = true;
+                };
+                return err;
+            };
+            self.outbound.append(self.allocator, .{ .bytes = owned }) catch |err| {
+                self.allocator.free(owned);
+                self.write_failed = true;
+                self.signalWakeLocked() catch {
+                    self.wake_failed = true;
+                };
+                return err;
+            };
             self.outbound_bytes += n;
             remaining = remaining[n..];
             self.signalWakeLocked() catch {
@@ -415,6 +443,15 @@ pub const Session = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.wake_failed;
+    }
+
+    /// True once a producer `write` failed irrecoverably (see `write`'s
+    /// doc comment). The runtime must treat this as connection-fatal for
+    /// the stream exactly like `hasWakeFailure`.
+    pub fn hasWriteFailure(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.write_failed;
     }
 
     /// The consumer calls this exactly once when it stops using the handle.

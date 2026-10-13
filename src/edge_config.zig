@@ -557,6 +557,14 @@ pub const EdgeConfig = struct {
     /// When all worker queues are at this depth, new connections are rejected with 503.
     /// Set via TARDIGRADE_WORKER_MAX_QUEUE_DEPTH.
     worker_max_queue_depth: usize,
+    /// Dedicated worker threads that execute finite HTTP/2 requests off the
+    /// connection frame-reader loop (#866, 0 = auto: half of worker_threads,
+    /// minimum 1). Set via TARDIGRADE_H2_REQUEST_WORKER_THREADS.
+    h2_request_worker_threads: u32,
+    /// Process-wide bound on HTTP/2 request jobs dispatched to the executor
+    /// across every connection (#866). Set via
+    /// TARDIGRADE_H2_REQUEST_QUEUE_CAPACITY.
+    h2_request_queue_capacity: usize,
     /// Graceful shutdown drain timeout in milliseconds (TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS).
     /// On shutdown signal, tardigrade waits up to this long for in-flight requests to complete
     /// before force-closing any remaining queued connections. 0 force-closes immediately.
@@ -1482,6 +1490,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(worker_queue_str);
     const worker_queue_size = std.fmt.parseInt(usize, worker_queue_str, 10) catch 1024;
     const worker_max_queue_depth = parseIntEnv(usize, allocator, "TARDIGRADE_WORKER_MAX_QUEUE_DEPTH", 0);
+    const h2_request_worker_threads = parseIntEnv(u32, allocator, "TARDIGRADE_H2_REQUEST_WORKER_THREADS", 0);
+    const h2_request_queue_capacity = @max(parseIntEnv(usize, allocator, "TARDIGRADE_H2_REQUEST_QUEUE_CAPACITY", 256), 1);
     const shutdown_drain_timeout_ms = parseIntEnv(u64, allocator, "TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS", 30_000);
     const websocket_enabled = parseBoolEnv(allocator, "TARDIGRADE_WEBSOCKET_ENABLED", false);
     const websocket_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS", 30_000);
@@ -1980,6 +1990,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .worker_cpu_affinity = worker_cpu_affinity,
         .worker_queue_size = worker_queue_size,
         .worker_max_queue_depth = worker_max_queue_depth,
+        .h2_request_worker_threads = h2_request_worker_threads,
+        .h2_request_queue_capacity = h2_request_queue_capacity,
         .shutdown_drain_timeout_ms = shutdown_drain_timeout_ms,
         .fd_soft_limit = fd_soft_limit,
         .max_connections_per_ip = max_connections_per_ip,

@@ -551,6 +551,12 @@ pub const GatewayState = struct {
     /// hold a worker thread each. Null in unit tests and when a tunnel must
     /// run inline. Set once at startup; outlives every worker.
     tunnel_reactor: ?*http.tunnel_reactor.Reactor = null,
+    /// Process-wide, bounded worker pool that executes finite HTTP/2 request
+    /// jobs off each connection's frame-reader loop (#866). Null in unit
+    /// tests and when disabled; `respondHttp2Stream` falls back to inline
+    /// synchronous execution in that case. Set once at startup; outlives
+    /// every connection.
+    h2_request_executor: ?*http.h2_request_executor.Executor = null,
     active_ws_streams: usize, // runtime accounting [connection_mutex]
     active_sse_streams: usize, // runtime accounting [connection_mutex]
     active_mux_connections: usize, // runtime accounting [connection_mutex]
@@ -4013,6 +4019,7 @@ test "reloadable config store retires old config after last lease" {
 fn initSlotTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.allocator = allocator;
     gs.tunnel_reactor = null;
+    gs.h2_request_executor = null;
     gs.connection_mutex = .{};
     gs.metrics_mutex = .{};
     gs.runtime_mutex = .{};
@@ -4170,6 +4177,7 @@ test "in-flight request slot is unlimited and release is a no-op when disabled" 
 fn initUpstreamTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.allocator = allocator;
     gs.tunnel_reactor = null;
+    gs.h2_request_executor = null;
     gs.upstream_mutex = .{};
     gs.circuit_mutex = .{};
     gs.metrics_mutex = .{};
@@ -4323,6 +4331,7 @@ test "gateway proxy outcome accounting drives live circuit breaker" {
 fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.allocator = allocator;
     gs.tunnel_reactor = null;
+    gs.h2_request_executor = null;
     gs.connection_mutex = .{};
     gs.metrics_mutex = .{};
     gs.runtime_mutex = .{};
@@ -4577,6 +4586,7 @@ test "command lifecycle creation releases every partial allocation on OOM" {
             var gs: GatewayState = undefined;
             gs.allocator = allocator;
             gs.tunnel_reactor = null;
+            gs.h2_request_executor = null;
             gs.command_mutex = .{};
             gs.command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(allocator);
             defer deinitCommandLifecycleTestMap(&gs);
@@ -4591,6 +4601,7 @@ test "approval creation releases every partial allocation on OOM" {
             var gs: GatewayState = undefined;
             gs.allocator = allocator;
             gs.tunnel_reactor = null;
+            gs.h2_request_executor = null;
             gs.approval_mutex = .{};
             gs.approval_persist_mutex = .{};
             gs.approvals = std.StringHashMap(ApprovalEntry).init(allocator);
@@ -4709,6 +4720,7 @@ test "served Prometheus metrics reflect updated proxy buffer limit snapshot" {
 fn initApprovalTestState(gs: *GatewayState, allocator: std.mem.Allocator, store_path: []const u8) void {
     gs.allocator = allocator;
     gs.tunnel_reactor = null;
+    gs.h2_request_executor = null;
     gs.approval_mutex = .{};
     gs.approval_persist_mutex = .{};
     gs.approvals = std.StringHashMap(ApprovalEntry).init(allocator);

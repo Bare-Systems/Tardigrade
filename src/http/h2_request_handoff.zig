@@ -101,6 +101,7 @@ pub const Handoff = struct {
     allocator: std.mem.Allocator,
     capacity: usize,
     mutex: compat.Mutex = .{},
+    drain_cond: compat.Condition = .{},
     pending: std.ArrayList(*Entry) = .empty,
     active: std.ArrayList(*Entry) = .empty,
     completions: std.ArrayList(QueuedCompletion) = .empty,
@@ -109,6 +110,14 @@ pub const Handoff = struct {
     wake_read: std.posix.fd_t = -1,
     wake_write: std.posix.fd_t = -1,
     wake_pending: bool = false,
+    /// A completion was retained but its notification write failed.  The
+    /// connection owner must drain the retained terminal event and close the
+    /// connection rather than leave its stream bookkeeping in flight.
+    wake_failed: bool = false,
+    /// Protected by the request executor's mutex.  Once teardown has detached
+    /// this handoff, that executor must neither queue nor begin another
+    /// callback that can dereference this connection-owned object.
+    executor_detached: bool = false,
 
     /// Pre-reserve each bounded state queue. Every ownership transition after
     /// this succeeds without allocation, so allocator pressure can reject a
@@ -215,21 +224,25 @@ pub const Handoff = struct {
             return .already_finished;
         };
         _ = self.active.orderedRemove(active_index);
+        if (self.active.items.len == 0) self.drain_cond.broadcast();
         const cancelled = self.closed or entry.cancelled;
         if (!cancelled and completion != null) {
-            self.signalWakeLocked() catch |err| {
-                self.outstanding -= 1;
-                self.mutex.unlock();
-                entry.job.deinit();
-                self.allocator.destroy(entry);
-                lease.entry = null;
-                completion.?.deinit();
-                return err;
-            };
+            // Capacity was reserved at init, so retain the terminal event
+            // before attempting its best-effort notification.  A failed
+            // wake must never turn an accepted stream into an unretired
+            // connection-side ownership entry.
             self.completions.appendAssumeCapacity(.{
                 .stream_id = entry.job.stream_id,
                 .completion = completion.?,
             });
+            self.signalWakeLocked() catch |err| {
+                self.wake_failed = true;
+                self.mutex.unlock();
+                entry.job.deinit();
+                self.allocator.destroy(entry);
+                lease.entry = null;
+                return err;
+            };
         } else {
             self.outstanding -= 1;
         }
@@ -313,6 +326,26 @@ pub const Handoff = struct {
     /// the connection owner still drains and serializes every response intent.
     pub fn wakeFd(self: *const Handoff) std.posix.fd_t {
         return self.wake_read;
+    }
+
+    /// A failed completion wake is connection-fatal, but the completion stays
+    /// available for the connection owner to retire its in-flight stream
+    /// before it closes the connection.
+    pub fn hasWakeFailure(self: *Handoff) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.wake_failed;
+    }
+
+    /// Block until every active (in-flight) job has called `finish`. Callers
+    /// must `shutdown` first so no new job can become active; this only
+    /// drains work already handed to a worker. Required before `deinit`,
+    /// whose active-queue assertion would otherwise fire on connection
+    /// teardown with outstanding jobs.
+    pub fn waitForActiveDrain(self: *Handoff) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.active.items.len != 0) self.drain_cond.wait(&self.mutex);
     }
 
     pub fn outstandingCount(self: *Handoff) usize {
@@ -441,6 +474,47 @@ test "H2 request handoff bounds jobs and preserves FIFO completion ownership" {
     first_completion.deinit();
     second_completion.deinit();
     try std.testing.expectEqual(@as(usize, 2), counter.completions);
+    try std.testing.expectEqual(@as(usize, 0), handoff.outstandingCount());
+}
+
+test "H2 request handoff retains a terminal completion when its wake fails" {
+    const Counter = struct {
+        jobs: usize = 0,
+        completions: usize = 0,
+
+        fn dropJob(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.jobs += 1;
+        }
+
+        fn dropCompletion(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.completions += 1;
+        }
+    };
+
+    var counter = Counter{};
+    var handoff = try Handoff.init(std.testing.allocator, 1);
+    defer handoff.deinit();
+    try handoff.submit(.{ .stream_id = 7, .payload = &counter, .deinit_fn = Counter.dropJob });
+    var lease = handoff.takeJob().?;
+
+    // Closing only the write end is a deterministic fault injection: finish
+    // must report the failed notification but leave the terminal event for
+    // the connection owner to retire before it closes the connection.
+    _ = std.c.close(handoff.wake_write);
+    handoff.wake_write = -1;
+    try std.testing.expectError(error.WakeFailed, handoff.finish(&lease, .{
+        .payload = &counter,
+        .deinit_fn = Counter.dropCompletion,
+    }));
+    try std.testing.expect(handoff.hasWakeFailure());
+
+    const completion = handoff.takeCompletion().?;
+    try std.testing.expectEqual(@as(u31, 7), completion.stream_id);
+    completion.deinit();
+    try std.testing.expectEqual(@as(usize, 1), counter.jobs);
+    try std.testing.expectEqual(@as(usize, 1), counter.completions);
     try std.testing.expectEqual(@as(usize, 0), handoff.outstandingCount());
 }
 
@@ -646,4 +720,54 @@ test "H2 request handoff wakes blocked connection owner and rearms" {
     second.deinit();
     try std.testing.expectEqual(@as(usize, 2), counter.jobs);
     try std.testing.expectEqual(@as(usize, 2), counter.completions);
+}
+
+test "H2 request handoff waitForActiveDrain blocks until the last active job finishes" {
+    const NoOp = struct {
+        fn drop(_: *anyopaque) void {}
+    };
+    const Waiter = struct {
+        handoff: *Handoff,
+        mutex: compat.Mutex = .{},
+        cond: compat.Condition = .{},
+        entered: bool = false,
+        drained: bool = false,
+
+        fn run(self: *@This()) void {
+            self.mutex.lock();
+            // Signal immediately before the blocking call, mirroring the
+            // wake test above: the test only releases the active job once
+            // this thread is poised to block inside `waitForActiveDrain`.
+            self.entered = true;
+            self.cond.broadcast();
+            self.mutex.unlock();
+
+            self.handoff.waitForActiveDrain();
+
+            self.mutex.lock();
+            self.drained = true;
+            self.cond.broadcast();
+            self.mutex.unlock();
+        }
+
+        fn waitUntilEntered(self: *@This()) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (!self.entered) self.cond.wait(&self.mutex);
+        }
+    };
+
+    var handoff = try Handoff.init(std.testing.allocator, 1);
+    defer handoff.deinit();
+    try handoff.submit(.{ .stream_id = 1, .payload = @ptrFromInt(@alignOf(u8)), .deinit_fn = NoOp.drop });
+    var lease = handoff.takeJob().?;
+    handoff.shutdown();
+
+    var waiter = Waiter{ .handoff = &handoff };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    waiter.waitUntilEntered();
+
+    try std.testing.expectEqual(FinishResult.cancelled, try handoff.finish(&lease, null));
+    waiter_thread.join();
+    try std.testing.expect(waiter.drained);
 }

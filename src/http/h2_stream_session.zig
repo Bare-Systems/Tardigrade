@@ -30,7 +30,7 @@ const std = @import("std");
 const compat = @import("zig_compat");
 const http2_stream = @import("http2_stream.zig");
 
-pub const Error = error{ QueueFull, Closed, WakeFailed } || std.mem.Allocator.Error;
+pub const Error = error{ QueueFull, Closed, WakeFailed, InvalidCapacity } || std.mem.Allocator.Error;
 
 pub const TerminalReason = enum {
     reset,
@@ -57,6 +57,9 @@ pub const WriteResult = union(enum) {
     ok,
     reset: http2_stream.ErrorCode,
     closed: TerminalReason,
+    /// `write` was called after `finishLocal`. Local production is already
+    /// over; this is a caller bug, not a protocol-level terminal event.
+    finished,
 };
 
 const Chunk = struct {
@@ -100,11 +103,17 @@ pub const Session = struct {
     wake_read: std.posix.fd_t = -1,
     wake_write: std.posix.fd_t = -1,
     wake_pending: bool = false,
+    /// A wake notification was lost (the pipe write failed with something
+    /// other than a coalesced EAGAIN). The runtime must treat this as fatal
+    /// for the stream -- it can no longer learn about inbound credit or
+    /// outbound bytes becoming available -- rather than silently stalling.
+    wake_failed: bool = false,
 
     runtime_attached: bool = true,
     consumer_attached: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, stream_id: u31, max_inbound_bytes: usize, max_outbound_bytes: usize) Error!Session {
+        if (max_inbound_bytes == 0 or max_outbound_bytes == 0) return error.InvalidCapacity;
         var fds: [2]std.posix.fd_t = undefined;
         if (std.c.pipe(&fds) != 0) return error.WakeFailed;
         errdefer {
@@ -202,7 +211,9 @@ pub const Session = struct {
         self.outbound.clearAndFree(self.allocator);
         self.outbound_bytes = 0;
         self.cond.broadcast();
-        self.signalWakeLocked() catch {};
+        self.signalWakeLocked() catch {
+            self.wake_failed = true;
+        };
     }
 
     /// Borrow up to `max_len` contiguous outbound bytes from the front of
@@ -270,6 +281,26 @@ pub const Session = struct {
         return credit;
     }
 
+    /// Read the receive-window credit earned so far, without clearing it.
+    /// Pairs with `consumeReceiveCredit` so a runtime that must emit two
+    /// WINDOW_UPDATE frames (stream + connection) for the same credit can
+    /// retry on partial failure instead of losing it, by only clearing the
+    /// amount it actually finished emitting.
+    pub fn peekReceiveCreditToReturn(self: *Session) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.inbound_credit_to_return;
+    }
+
+    /// Clear `amount` of previously peeked credit that the runtime confirmed
+    /// it emitted. Any credit that accrued after the matching `peek` (a
+    /// consumer read racing the runtime's drain) remains pending.
+    pub fn consumeReceiveCredit(self: *Session, amount: usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.inbound_credit_to_return -= @min(amount, self.inbound_credit_to_return);
+    }
+
     /// True if the consumer requested cancellation (`requestCancel`). The
     /// runtime should answer with RST_STREAM and call `deliverReset`.
     pub fn takeCancelRequest(self: *Session) bool {
@@ -311,7 +342,9 @@ pub const Session = struct {
                     self.allocator.free(chunk.bytes);
                     _ = self.inbound.orderedRemove(0);
                 }
-                self.signalWakeLocked() catch {};
+                self.signalWakeLocked() catch {
+                    self.wake_failed = true;
+                };
                 return .{ .data = n };
             }
             if (self.terminal) |terminal| return terminalReadResult(terminal);
@@ -320,35 +353,33 @@ pub const Session = struct {
         }
     }
 
-    /// Block until `bytes` is fully queued or a terminal event is observed.
-    /// Queue capacity bounds outbound memory even if the runtime is slow to
-    /// drain (e.g. the client is a slow reader).
-    pub fn write(self: *Session, bytes: []const u8) WriteResult {
+    /// Block until `bytes` is fully queued, local production is already
+    /// finished, or a terminal event is observed. Queue capacity bounds
+    /// outbound memory even if the runtime is slow to drain (e.g. the client
+    /// is a slow reader). Allocator failures propagate to the caller instead
+    /// of blocking forever: there is no guarantee free capacity will ever
+    /// appear to unblock a retry, and nothing else would signal this waiter.
+    pub fn write(self: *Session, bytes: []const u8) Error!WriteResult {
         self.mutex.lock();
         defer self.mutex.unlock();
         var remaining = bytes;
         while (remaining.len > 0) {
             if (self.terminal) |terminal| return terminalWriteResult(terminal);
+            if (self.local_end_requested) return .finished;
             const capacity = self.max_outbound_bytes -| self.outbound_bytes;
             if (capacity == 0) {
                 self.cond.wait(&self.mutex);
                 continue;
             }
             const n = @min(capacity, remaining.len);
-            const owned = self.allocator.dupe(u8, remaining[0..n]) catch {
-                // Allocation failure leaves `remaining` untouched so a retry
-                // can resume from the same offset.
-                self.cond.wait(&self.mutex);
-                continue;
-            };
-            self.outbound.append(self.allocator, .{ .bytes = owned }) catch {
-                self.allocator.free(owned);
-                self.cond.wait(&self.mutex);
-                continue;
-            };
+            const owned = try self.allocator.dupe(u8, remaining[0..n]);
+            errdefer self.allocator.free(owned);
+            try self.outbound.append(self.allocator, .{ .bytes = owned });
             self.outbound_bytes += n;
             remaining = remaining[n..];
-            self.signalWakeLocked() catch {};
+            self.signalWakeLocked() catch {
+                self.wake_failed = true;
+            };
         }
         return .ok;
     }
@@ -359,7 +390,9 @@ pub const Session = struct {
         defer self.mutex.unlock();
         if (self.local_end_requested) return;
         self.local_end_requested = true;
-        self.signalWakeLocked() catch {};
+        self.signalWakeLocked() catch {
+            self.wake_failed = true;
+        };
     }
 
     /// Ask the runtime to RST_STREAM this session (consumer-originated
@@ -369,7 +402,19 @@ pub const Session = struct {
         defer self.mutex.unlock();
         if (self.terminal != null) return;
         self.cancel_requested = true;
-        self.signalWakeLocked() catch {};
+        self.signalWakeLocked() catch {
+            self.wake_failed = true;
+        };
+    }
+
+    /// True once a wake notification was lost. The runtime must treat this
+    /// as connection-fatal for the stream (RST_STREAM and detach) rather
+    /// than risk a consumer or producer stalling forever on a signal that
+    /// will never arrive.
+    pub fn hasWakeFailure(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.wake_failed;
     }
 
     /// The consumer calls this exactly once when it stops using the handle.
@@ -501,7 +546,7 @@ test "outbound production is segmented by caller-provided max length" {
     var session = try Session.init(allocator, 1, 1024, 1024);
     defer session.deinit();
 
-    try std.testing.expectEqual(WriteResult.ok, session.write("0123456789"));
+    try std.testing.expectEqual(WriteResult.ok, try session.write("0123456789"));
     const first = session.peekOutbound(4).?;
     try std.testing.expectEqualSlices(u8, "0123", first);
     session.commitOutboundSent(4);
@@ -518,7 +563,7 @@ test "local END_STREAM is pending only after producer finishes and queue drains"
     var session = try Session.init(allocator, 1, 1024, 1024);
     defer session.deinit();
 
-    try std.testing.expectEqual(WriteResult.ok, session.write("bytes"));
+    try std.testing.expectEqual(WriteResult.ok, try session.write("bytes"));
     session.finishLocal();
     try std.testing.expect(!session.outboundLocalEndPending());
 
@@ -528,20 +573,46 @@ test "local END_STREAM is pending only after producer finishes and queue drains"
     try std.testing.expect(!session.outboundLocalEndPending());
 }
 
+test "write after finishLocal is rejected before and after markLocalEndStreamSent" {
+    const allocator = std.testing.allocator;
+    var session = try Session.init(allocator, 1, 1024, 1024);
+    defer session.deinit();
+
+    session.finishLocal();
+    try std.testing.expectEqual(WriteResult.finished, try session.write("too-late"));
+
+    session.markLocalEndStreamSent();
+    try std.testing.expectEqual(WriteResult.finished, try session.write("still-too-late"));
+}
+
+test "zero-capacity session configuration is rejected" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidCapacity, Session.init(allocator, 1, 0, 64));
+    try std.testing.expectError(error.InvalidCapacity, Session.init(allocator, 1, 64, 0));
+}
+
+test "an allocator failure during write propagates instead of blocking forever" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var session = try Session.init(failing.allocator(), 1, 1024, 1024);
+    defer session.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, session.write("bytes"));
+}
+
 test "RST_STREAM settles exactly once, releases queued bytes, and wakes both sides" {
     const allocator = std.testing.allocator;
     var session = try Session.init(allocator, 1, 1024, 1024);
     defer session.deinit();
 
     try session.deliverInbound("queued");
-    try std.testing.expectEqual(WriteResult.ok, session.write("queued-out"));
+    try std.testing.expectEqual(WriteResult.ok, try session.write("queued-out"));
 
     session.deliverReset(.cancel);
     session.deliverReset(.flow_control_error); // second settle is a no-op
 
     var buf: [16]u8 = undefined;
     try std.testing.expectEqual(ReadResult{ .reset = .cancel }, session.read(&buf));
-    try std.testing.expectEqual(WriteResult{ .reset = .cancel }, session.write("more"));
+    try std.testing.expectEqual(WriteResult{ .reset = .cancel }, try session.write("more"));
     try std.testing.expectError(error.Closed, session.deliverInbound("late"));
 }
 
@@ -558,7 +629,7 @@ test "GOAWAY, connection close, and shutdown settle as closed with their own rea
         case.trigger(&session);
         var buf: [4]u8 = undefined;
         try std.testing.expectEqual(ReadResult{ .closed = case.reason }, session.read(&buf));
-        try std.testing.expectEqual(WriteResult{ .closed = case.reason }, session.write("x"));
+        try std.testing.expectEqual(WriteResult{ .closed = case.reason }, try session.write("x"));
     }
 }
 
@@ -573,13 +644,28 @@ test "consumer-requested cancellation is observed exactly once by the runtime" {
     try std.testing.expect(!session.takeCancelRequest());
 }
 
+test "a lost wake notification is surfaced as a sticky failure instead of dropped" {
+    const allocator = std.testing.allocator;
+    var session = try Session.init(allocator, 1, 1024, 1024);
+    defer session.deinit();
+
+    // Closing only the write end is a deterministic fault injection,
+    // mirroring how `h2_request_handoff` tests the same failure mode.
+    _ = std.c.close(session.wake_write);
+    session.wake_write = -1;
+
+    try std.testing.expect(!session.hasWakeFailure());
+    session.requestCancel();
+    try std.testing.expect(session.hasWakeFailure());
+}
+
 test "wake notification coalesces across multiple producer signals" {
     const allocator = std.testing.allocator;
     var session = try Session.init(allocator, 1, 1024, 1024);
     defer session.deinit();
 
-    try std.testing.expectEqual(WriteResult.ok, session.write("a"));
-    try std.testing.expectEqual(WriteResult.ok, session.write("b"));
+    try std.testing.expectEqual(WriteResult.ok, try session.write("a"));
+    try std.testing.expectEqual(WriteResult.ok, try session.write("b"));
     session.finishLocal();
 
     var pfd = [_]std.posix.pollfd{.{ .fd = session.wakeFd(), .events = std.posix.POLL.IN, .revents = 0 }};
@@ -657,7 +743,7 @@ test "blocked write wakes deterministically when the runtime commits queued byte
 
     const Ctx = struct {
         session: *Session,
-        result: WriteResult = undefined,
+        result: Error!WriteResult = undefined,
         fn run(ctx: *@This()) void {
             ctx.result = ctx.session.write("abcdefgh");
         }
@@ -670,7 +756,7 @@ test "blocked write wakes deterministically when the runtime commits queued byte
     while (!session.hasPendingOutbound()) {}
     session.commitOutboundSent(4);
     writer_thread.join();
-    try std.testing.expectEqual(WriteResult.ok, ctx.result);
+    try std.testing.expectEqual(WriteResult.ok, try ctx.result);
     try std.testing.expectEqual(@as(usize, 4), session.outbound_bytes);
     session.commitOutboundSent(4);
 }

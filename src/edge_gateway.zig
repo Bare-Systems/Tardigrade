@@ -2340,7 +2340,18 @@ const WaitingEncryptedHttpConnection = struct {
         else
             @intCast(@min(timeout_ms, @as(u32, @intCast(std.math.maxInt(i32)))));
         const ready = try std.posix.poll(&fds, bounded_ms);
-        if (ready == 0) return error.WouldBlock;
+        if (ready == 0) {
+            // An exotic write failure can leave the notification fd without a
+            // poll event. The handoff's fatal status is still checked at this
+            // bounded read deadline, and its drain callback retires the
+            // retained completion before terminating the connection.
+            if (self.h2_request_handoff) |handoff| if (handoff.hasWakeFailure()) {
+                const drain_fn = self.h2_completion_drain_fn orelse return error.ConnectionClosed;
+                const drain_ctx = self.h2_completion_drain_ctx orelse return error.ConnectionClosed;
+                try drain_fn(drain_ctx);
+            };
+            return error.WouldBlock;
+        }
         if (fds[1].fd >= 0 and (fds[1].revents != 0 or (fds[0].revents & std.posix.POLL.OUT) != 0)) {
             const outbound = self.h2_outbound orelse return error.ConnectionClosed;
             // We are already in the poll owner. Use the non-waiting record
@@ -3431,6 +3442,10 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     _ = self.streams.remove(delivered.stream_id);
                 }
             }
+            // `finish` retains its terminal event when its wake write fails.
+            // Draining above retires the affected stream before this forces
+            // the connection through its normal shutdown path.
+            if (self.handoff.hasWakeFailure()) return error.H2RequestWakeFailed;
         }
     };
     var drain_ctx = DrainCtx{

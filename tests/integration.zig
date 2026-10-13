@@ -7042,6 +7042,164 @@ test "interop.h2.proxy_multiplexed_streams_complete_after_window_update" {
     try std.testing.expectEqual(@as(u32, 1), small_upstream.requestCount());
 }
 
+test "interop.h2.finite request handoff keeps siblings and control frames live (#866)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var slow_upstream = try GatedUpstream.start(allocator);
+    defer slow_upstream.stop();
+    try slow_upstream.run();
+
+    var fast_upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "fast-sibling-one", .connection_header = "close" },
+        .{ .body = "fast-sibling-two", .connection_header = "close" },
+        .{ .body = "fast-after-reset", .connection_header = "close" },
+    });
+    defer fast_upstream.stop();
+    try fast_upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-slow {{
+        \\    proxy_pass http://{s}:{d}/h2-slow;
+        \\}}
+        \\
+        \\location = /h2-fast {{
+        \\    proxy_pass http://{s}:{d}/h2-fast;
+        \\}}
+    , .{ test_host, slow_upstream.port(), test_host, fast_upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            // One executor worker stays at the controlled upstream while the
+            // other must service siblings on this same downstream connection.
+            .{ .name = "TARDIGRADE_H2_REQUEST_WORKER_THREADS", .value = "2" },
+        },
+    });
+    defer tardigrade.stop();
+    try fast_upstream.resetCapture();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{});
+    try completeH2SettingsHandshake(client, allocator);
+
+    const slow_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-slow" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const slow_block = try hpack.encodeLiteralHeaderBlock(allocator, slow_headers[0..]);
+    defer allocator.free(slow_block);
+    try client.writeHttp2Frame(0x1, 0x1 | 0x4, 1, slow_block);
+    try slow_upstream.waitEntered(5_000);
+
+    const fast_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-fast" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const fast_block = try hpack.encodeLiteralHeaderBlock(allocator, fast_headers[0..]);
+    defer allocator.free(fast_block);
+    try client.writeHttp2Frame(0x1, 0x1 | 0x4, 3, fast_block);
+    try client.writeHttp2Frame(0x1, 0x1 | 0x4, 5, fast_block);
+
+    const ping_payload = [_]u8{ 'h', '2', 'a', 'c', 't', 'i', 'v', 'e' };
+    try client.writeHttp2Frame(0x6, 0, 0, &ping_payload);
+    var window_increment: [4]u8 = undefined;
+    std.mem.writeInt(u32, window_increment[0..4], 1, .big);
+    try client.writeHttp2Frame(0x8, 0, 0, window_increment[0..4]);
+    // Cancellation while the finite route is blocked must not poison the
+    // connection or permit a late response once that route is released.
+    try client.writeHttp2Frame(0x3, 0, 1, &[_]u8{ 0, 0, 0, 8 });
+
+    var fast_three = std.array_list.Managed(u8).init(allocator);
+    defer fast_three.deinit();
+    var fast_five = std.array_list.Managed(u8).init(allocator);
+    defer fast_five.deinit();
+    var fast_three_done = false;
+    var fast_five_done = false;
+    var saw_ping_ack = false;
+    var saw_slow_response = false;
+    var frame_count: usize = 0;
+    while (frame_count < 48 and !(fast_three_done and fast_five_done and saw_ping_ack)) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        switch (frame.typ) {
+            0x4 => if ((frame.flags & 0x1) == 0) try client.writeHttp2Frame(0x4, 0x1, 0, &.{}),
+            0x6 => {
+                if ((frame.flags & 0x1) != 0 and std.mem.eql(u8, frame.payload, &ping_payload)) saw_ping_ack = true;
+            },
+            0x0 => {
+                if (frame.stream_id == 1) saw_slow_response = true;
+                if (frame.stream_id == 3) {
+                    try fast_three.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) fast_three_done = true;
+                }
+                if (frame.stream_id == 5) {
+                    try fast_five.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) fast_five_done = true;
+                }
+            },
+            0x1 => {
+                if (frame.stream_id == 1) saw_slow_response = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(fast_three_done and fast_five_done and saw_ping_ack);
+    try std.testing.expectEqualStrings("fast-sibling-one", fast_three.items);
+    try std.testing.expectEqualStrings("fast-sibling-two", fast_five.items);
+    try std.testing.expect(!saw_slow_response);
+    try std.testing.expectEqual(@as(u32, 2), fast_upstream.requestCount());
+
+    slow_upstream.release();
+    try client.writeHttp2Frame(0x1, 0x1 | 0x4, 7, fast_block);
+    var fast_seven = std.array_list.Managed(u8).init(allocator);
+    defer fast_seven.deinit();
+    var fast_seven_done = false;
+    frame_count = 0;
+    while (frame_count < 48 and !fast_seven_done) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        switch (frame.typ) {
+            0x4 => if ((frame.flags & 0x1) == 0) try client.writeHttp2Frame(0x4, 0x1, 0, &.{}),
+            0x0 => {
+                if (frame.stream_id == 1) saw_slow_response = true;
+                if (frame.stream_id == 7) {
+                    try fast_seven.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) fast_seven_done = true;
+                }
+            },
+            0x1 => {
+                if (frame.stream_id == 1) saw_slow_response = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(fast_seven_done);
+    try std.testing.expectEqualStrings("fast-after-reset", fast_seven.items);
+    try std.testing.expect(!saw_slow_response);
+    try std.testing.expectEqual(@as(u32, 3), fast_upstream.requestCount());
+}
+
 test "interop.h2.proxy_response_respects_peer_initial_window_size" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;

@@ -57,6 +57,22 @@ pub const Headers = struct {
         self.items.deinit(self.allocator);
     }
 
+    /// An independent deep copy, safe to outlive `self` on another thread.
+    /// `client_cert` is copied by value: its slices borrow the owning TLS
+    /// connection's storage, which already outlives every request on it.
+    pub fn clone(self: *const Headers, allocator: Allocator) !Headers {
+        var cloned = Headers{ .allocator = allocator, .items = .empty, .client_cert = self.client_cert };
+        errdefer cloned.deinit();
+        try cloned.items.ensureTotalCapacity(allocator, self.items.items.len);
+        for (self.items.items) |header| {
+            const name = try allocator.dupe(u8, header.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, header.value);
+            cloned.items.appendAssumeCapacity(.{ .name = name, .value = value });
+        }
+        return cloned;
+    }
+
     /// Add a header (name will be lowercased).
     /// Returns `error.InvalidHeader` if the name or value contains control
     /// characters, CRLF sequences, or other bytes prohibited by RFC 7230 §3.2.6.

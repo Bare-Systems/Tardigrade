@@ -19,6 +19,18 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **Finite HTTP/2 request execution off the connection frame loop (#866).**
+  Downstream H2 route/auth/proxy/static handling now runs on a bounded,
+  shared worker pool (`TARDIGRADE_H2_REQUEST_WORKER_THREADS`,
+  `TARDIGRADE_H2_REQUEST_QUEUE_CAPACITY`) instead of the connection's own
+  frame-reader loop, so one slow request no longer stops that connection
+  from parsing sibling-stream frames, WINDOW_UPDATE, PING or RST_STREAM.
+  Completions are relayed back through the #865 outbound scheduler's
+  connection-owned wakeable wait; RST_STREAM/GOAWAY/shutdown cancel or drain
+  outstanding jobs exactly once. A saturated per-connection or process-wide
+  bound is a clean request-scoped rejection, never a fallback to inline
+  execution. No persistent-stream, CONNECT, or WebSocket behavior is added.
+
 - **Native ACME accounts, JWS transport and durable state (#832).** New
   `src/acme/` layer for epic #759 phase A2: P-256 account keys, ES256 JWS
   signing, a bounded HTTPS transport with a preloaded CA trust-anchor

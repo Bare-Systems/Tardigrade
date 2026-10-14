@@ -208,9 +208,18 @@ pub const Session = struct {
     /// Settle exactly once: first terminal event wins, queued bytes are
     /// released immediately, and both a blocked consumer (`cond`) and a
     /// blocked runtime poll (`wake`) are notified.
+    ///
+    /// Unread inbound bytes already charged the peer's connection-level
+    /// receive window (the runtime only credits application bytes once a
+    /// consumer actually drains them). Discarding them here without folding
+    /// them into `inbound_credit_to_return` would leak that connection
+    /// credit forever once the stream is gone; the caller is expected to
+    /// `takeReceiveCreditToReturn` after settling and return it with a
+    /// stream-0-only WINDOW_UPDATE, since the stream itself is closing.
     fn settleLocked(self: *Session, terminal: Terminal) void {
         if (self.terminal != null) return;
         self.terminal = terminal;
+        self.inbound_credit_to_return += self.inbound_bytes;
         for (self.inbound.items) |chunk| self.allocator.free(chunk.bytes);
         self.inbound.clearAndFree(self.allocator);
         self.inbound_bytes = 0;

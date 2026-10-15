@@ -78,6 +78,27 @@ pub const Http2PendingStream = struct {
     }
 };
 
+/// Internal/test-only hook for attaching an HTTP/2 stream to a persistent,
+/// bidirectional stream session (#867) instead of ordinary finite dispatch.
+/// Production traffic never sets this -- `run()`'s `GatewayState` literal
+/// never does, and this ticket deliberately does not negotiate RFC 8441
+/// CONNECT/WebSocket semantics that would let a real client request one.
+/// It exists so the connection-owned session registry, DATA routing,
+/// wake-fd polling, and RST/GOAWAY/shutdown teardown in
+/// `handleHttp2Connection` run through the exact production code path a
+/// future protocol upgrade will reuse, proven end to end by a real H2
+/// client/server test rather than by calling session helpers directly.
+pub const H2SessionTestHook = struct {
+    ctx: ?*anyopaque = null,
+    /// Decide whether this stream's parsed headers request a persistent
+    /// session rather than ordinary finite dispatch.
+    shouldAttach: *const fn (ctx: ?*anyopaque, ps: *const Http2PendingStream) bool,
+    /// Ownership of the session's *consumer* side transfers to this call; it
+    /// must eventually call `session.consumerDetach()` from its own thread,
+    /// never touching the connection socket.
+    attach: *const fn (ctx: ?*anyopaque, session: *http.h2_stream_session.Session) void,
+};
+
 pub const UpstreamScope = enum {
     global,
     chat,
@@ -557,6 +578,10 @@ pub const GatewayState = struct {
     /// synchronous execution in that case. Set once at startup; outlives
     /// every connection.
     h2_request_executor: ?*http.h2_request_executor.Executor = null,
+    /// Internal/test-only hook (#867); see `H2SessionTestHook`. Null in
+    /// production and in every other unit test; only the live H2 session
+    /// integration test sets it.
+    h2_session_test_hook: ?H2SessionTestHook = null,
     active_ws_streams: usize, // runtime accounting [connection_mutex]
     active_sse_streams: usize, // runtime accounting [connection_mutex]
     active_mux_connections: usize, // runtime accounting [connection_mutex]

@@ -13,6 +13,20 @@ const JSON_CONTENT_TYPE = "application/json";
 const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_MAX_FRAME_SIZE: usize = 16 * 1024;
 const HTTP2_MAX_CONCURRENT_STREAMS: usize = 100;
+/// Per-stream SETTINGS_INITIAL_WINDOW_SIZE this connection advertises to the
+/// peer for every HTTP/2 stream, including #867 persistent sessions.
+const HTTP2_INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
+/// Per-stream bound on a #867 persistent session's queued inbound/outbound
+/// bytes. The inbound bound must be at least `HTTP2_INITIAL_WINDOW_SIZE`: a
+/// smaller session queue would let a well-behaved peer legally fill the
+/// receive window this connection already advertised and still get
+/// RST_STREAM(FLOW_CONTROL_ERROR) before exceeding what it was actually
+/// granted. Both bounds are charged against `cfg.max_connection_memory_bytes`
+/// on attach (`HTTP2_SESSION_RESERVED_BYTES`) so many concurrent sessions on
+/// one connection cannot bypass the connection-wide memory ceiling.
+const HTTP2_SESSION_MAX_INBOUND_BYTES: usize = HTTP2_INITIAL_WINDOW_SIZE;
+const HTTP2_SESSION_MAX_OUTBOUND_BYTES: usize = 256 * 1024;
+const HTTP2_SESSION_RESERVED_BYTES: usize = HTTP2_SESSION_MAX_INBOUND_BYTES + HTTP2_SESSION_MAX_OUTBOUND_BYTES;
 const WS_MUX_MAX_CHANNELS: usize = 32;
 const ACTIVE_DRIVE_POLL_INTERVAL_MS: u64 = 250;
 /// Fallback approval TTL when no config value is provided (5 minutes).
@@ -2092,6 +2106,14 @@ const WaitingEncryptedHttpConnection = struct {
     h2_request_handoff: ?*http.h2_request_handoff.Handoff = null,
     h2_completion_drain_fn: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     h2_completion_drain_ctx: ?*anyopaque = null,
+    /// Installed only by the downstream H2 runtime (#867). `h2_session_poll_fds_fn`
+    /// fills a caller-provided buffer with every attached session's wake fd
+    /// so this connection's one blocking wait can observe all of them
+    /// without a session ever touching the TLS socket; `h2_session_drain_fn`
+    /// services whichever sessions have pending work once any of them fire.
+    h2_session_poll_fds_fn: ?*const fn (ctx: *anyopaque, buf: []std.posix.fd_t) []const std.posix.fd_t = null,
+    h2_session_drain_fn: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    h2_session_ctx: ?*anyopaque = null,
 
     fn init(
         inner: http.encrypted_stream_connection.EncryptedStreamHttpConnection,
@@ -2277,6 +2299,17 @@ const WaitingEncryptedHttpConnection = struct {
         self.h2_completion_drain_ctx = drain_ctx;
     }
 
+    pub fn setH2SessionRegistry(
+        self: *WaitingEncryptedHttpConnection,
+        poll_fds_fn: ?*const fn (ctx: *anyopaque, buf: []std.posix.fd_t) []const std.posix.fd_t,
+        drain_fn: ?*const fn (ctx: *anyopaque) anyerror!void,
+        ctx: ?*anyopaque,
+    ) void {
+        self.h2_session_poll_fds_fn = poll_fds_fn;
+        self.h2_session_drain_fn = drain_fn;
+        self.h2_session_ctx = ctx;
+    }
+
     pub fn writer(self: *WaitingEncryptedHttpConnection) Writer {
         return .{ .conn = self };
     }
@@ -2328,13 +2361,26 @@ const WaitingEncryptedHttpConnection = struct {
         // flush (#865); slot 2 wakes it when a worker's request-job
         // completion is ready to apply (#866). Both stay `-1` (ignored by
         // `poll`) when their producer is not installed on this connection.
-        var fds = [_]std.posix.pollfd{
-            .{ .fd = self.inner.rawFd(), .events = events, .revents = 0 },
-            .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 },
-            .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 },
-        };
+        // Slots 3.. are one per attached #867 session, so any of them --
+        // not just the one TLS socket -- can wake this one blocking wait;
+        // unused slots also stay `-1`.
+        var fds: [3 + HTTP2_MAX_CONCURRENT_STREAMS]std.posix.pollfd = undefined;
+        fds[0] = .{ .fd = self.inner.rawFd(), .events = events, .revents = 0 };
+        fds[1] = .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 };
+        fds[2] = .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 };
         if (self.h2_outbound) |outbound| fds[1].fd = outbound.wakeFd();
         if (self.h2_request_handoff) |handoff| fds[2].fd = handoff.wakeFd();
+
+        var session_fd_buf: [HTTP2_MAX_CONCURRENT_STREAMS]std.posix.fd_t = undefined;
+        var session_fd_count: usize = 0;
+        if (self.h2_session_poll_fds_fn) |get_fds| {
+            const ctx = self.h2_session_ctx orelse return error.ConnectionClosed;
+            const session_fds = get_fds(ctx, &session_fd_buf);
+            session_fd_count = session_fds.len;
+            for (session_fds, 0..) |fd, i| fds[3 + i] = .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
+        }
+        for (session_fd_count..HTTP2_MAX_CONCURRENT_STREAMS) |i| fds[3 + i] = .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 };
+
         const bounded_ms: i32 = if (timeout_ms == 0)
             30_000
         else
@@ -2364,6 +2410,14 @@ const WaitingEncryptedHttpConnection = struct {
             const drain_fn = self.h2_completion_drain_fn orelse return error.ConnectionClosed;
             const drain_ctx = self.h2_completion_drain_ctx orelse return error.ConnectionClosed;
             try drain_fn(drain_ctx);
+        }
+        for (fds[3 .. 3 + session_fd_count]) |pfd| {
+            if (pfd.revents != 0) {
+                const drain_fn = self.h2_session_drain_fn orelse return error.ConnectionClosed;
+                const ctx = self.h2_session_ctx orelse return error.ConnectionClosed;
+                try drain_fn(ctx);
+                break;
+            }
         }
         if ((fds[0].revents & std.posix.POLL.ERR) != 0) return error.ConnectionResetByPeer;
         if ((fds[0].revents & std.posix.POLL.HUP) != 0 and (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.OUT)) == 0) return error.ConnectionClosed;
@@ -2677,6 +2731,26 @@ fn h2InstallRequestHandoff(
     }
 }
 
+/// Install (or clear) the connection's #867 session registry poll/drain
+/// callbacks. Only a `conn` that declares `setH2SessionRegistry` -- today
+/// just `WaitingEncryptedHttpConnection` -- includes attached sessions' wake
+/// fds in its blocking wait; other `conn` types (test fakes) simply never
+/// wake for one.
+fn h2InstallSessionRegistry(
+    conn: anytype,
+    poll_fds_fn: ?*const fn (ctx: *anyopaque, buf: []std.posix.fd_t) []const std.posix.fd_t,
+    drain_fn: ?*const fn (ctx: *anyopaque) anyerror!void,
+    ctx: ?*anyopaque,
+) void {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "setH2SessionRegistry")) conn.setH2SessionRegistry(poll_fds_fn, drain_fn, ctx);
+    } else {
+        if (comptime @hasDecl(T, "setH2SessionRegistry")) conn.setH2SessionRegistry(poll_fds_fn, drain_fn, ctx);
+    }
+}
+
 fn h2DownstreamHandshakeComplete(conn: anytype) bool {
     const T = @TypeOf(conn);
     if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
@@ -2729,22 +2803,65 @@ fn h2RemoveReadyStream(ready_streams: *std.array_list.Managed(u31), sid: u31) vo
 }
 
 fn h2ResetStreamState(
+    writer: anytype,
     allocator: std.mem.Allocator,
     streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
     pending: *std.AutoHashMap(u31, Http2PendingStream),
     pending_responses: *std.AutoHashMap(u31, PendingHttp2Response),
     ready_streams: *std.array_list.Managed(u31),
+    sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
     buffered_request_bytes: *usize,
     stream_id: u31,
     outbound: ?*http.h2_outbound_scheduler.Scheduler,
     handoff: ?*http.h2_request_handoff.Handoff,
     executor: ?*http.h2_request_executor.Executor,
     in_flight: *std.AutoHashMap(u31, void),
-) void {
-    if (outbound) |scheduler| scheduler.cancelStream(stream_id);
+    conn_recv_window: ?*i64,
+    conn_send_window: ?*i32,
+) !void {
+    if (outbound) |scheduler| {
+        // Any still-queued (never transmitted) DATA this stream had reserved
+        // already debited the connection's send-window when it was queued
+        // (see `flushHttp2PendingResponse`/`flushHttp2SessionOutbound`); it
+        // must come back now that the stream is gone, or those bytes are
+        // lost forever and can starve an unrelated sibling stream.
+        const refunded = scheduler.cancelStream(stream_id);
+        if (refunded > 0) {
+            if (conn_send_window) |w| w.* +|= @intCast(@min(refunded, std.math.maxInt(i32)));
+        }
+    }
     if (handoff) |ho| _ = ho.cancelStream(stream_id) catch {};
     if (handoff) |ho| if (executor) |ex| ex.cancelStreamSignals(ho, stream_id);
     _ = in_flight.remove(stream_id);
+    if (sessions.fetchRemove(stream_id)) |removed| {
+        const session = removed.value;
+        buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
+        session.deliverReset(.cancel);
+        // Unread inbound bytes already charged the peer's connection-level
+        // receive window (see `Session.settleLocked`). The stream itself is
+        // gone, so return that credit with a stream-0-only WINDOW_UPDATE
+        // rather than ever crediting the now-closed stream.
+        const abandoned_credit = session.takeReceiveCreditToReturn();
+        // Detach/free unconditionally once the session is removed from the
+        // registry: a failed WINDOW_UPDATE write below must not skip this,
+        // or the removed registry entry becomes the session's only
+        // reference and it leaks with a consumer possibly still blocked on
+        // it (the registry can no longer find it to settle later).
+        defer if (session.runtimeDetach()) {
+            session.deinit();
+            allocator.destroy(session);
+        };
+        if (abandoned_credit > 0) {
+            try http.http2_frame.writeWindowUpdate(writer, 0, @intCast(abandoned_credit));
+            // Only reflect the refund in our own local receive-window
+            // bookkeeping once the peer has actually been credited: the
+            // connection's receive-credit counter must stay in lockstep
+            // with what we told the peer, or later DATA on an unrelated
+            // sibling stream will be rejected as a flow-control violation
+            // even though the peer legitimately still has that credit.
+            if (conn_recv_window) |w| w.* += @intCast(abandoned_credit);
+        }
+    }
     _ = streams.remove(stream_id);
     if (pending.fetchRemove(stream_id)) |removed| {
         var tmp = removed.value;
@@ -2766,28 +2883,40 @@ fn h2WriteStreamClosedReset(
     pending: *std.AutoHashMap(u31, Http2PendingStream),
     pending_responses: *std.AutoHashMap(u31, PendingHttp2Response),
     ready_streams: *std.array_list.Managed(u31),
+    sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
     buffered_request_bytes: *usize,
     stream_id: u31,
     handoff: ?*http.h2_request_handoff.Handoff,
     executor: ?*http.h2_request_executor.Executor,
     in_flight: *std.AutoHashMap(u31, void),
+    conn_recv_window: ?*i64,
+    conn_send_window: ?*i32,
 ) !void {
     // Drop old response output before queuing our RST, otherwise a
-    // backpressured connection could send DATA after stream closure.
-    outbound.cancelStream(stream_id);
+    // backpressured connection could send DATA after stream closure. Any
+    // never-transmitted DATA this dropped already debited the connection
+    // send-window when queued; refund it now (see `h2ResetStreamState`).
+    const refunded = outbound.cancelStream(stream_id);
+    if (refunded > 0) {
+        if (conn_send_window) |w| w.* +|= @intCast(@min(refunded, std.math.maxInt(i32)));
+    }
     try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.stream_closed.value());
-    h2ResetStreamState(
+    try h2ResetStreamState(
+        writer,
         allocator,
         streams,
         pending,
         pending_responses,
         ready_streams,
+        sessions,
         buffered_request_bytes,
         stream_id,
         null,
         handoff,
         executor,
         in_flight,
+        conn_recv_window,
+        conn_send_window,
     );
 }
 
@@ -2951,12 +3080,26 @@ fn h2StreamAcceptsInboundFrame(streams: *std.AutoHashMap(u31, http.http2_stream.
     return existing.canReceive();
 }
 
+/// Minimal "200 OK" response HEADERS for a stream attached as a #867
+/// session: the session's consumer only ever produces/consumes DATA, never
+/// framing, so the runtime sends this on its behalf immediately on attach.
+fn h2WriteSessionResponseHeaders(writer: anytype, allocator: std.mem.Allocator, stream_id: u31) !void {
+    const status_headers = [_]http.hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+    };
+    const block = try http.hpack.encodeLiteralHeaderBlock(allocator, status_headers[0..]);
+    defer allocator.free(block);
+    try http.http2_frame.writeFrame(writer, .headers, http.http2_frame.Flags.END_HEADERS, stream_id, block);
+}
+
 fn h2ProcessHeaderBlock(
     allocator: std.mem.Allocator,
     decoder: *http.hpack.Decoder,
     pending: *std.AutoHashMap(u31, Http2PendingStream),
     streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
     ready_streams: *std.array_list.Managed(u31),
+    sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
+    state: *GatewayState,
     stream_id: u31,
     header_block: []const u8,
     end_stream: bool,
@@ -2971,6 +3114,20 @@ fn h2ProcessHeaderBlock(
         return error.Http2CompressionError;
     };
     defer http.hpack.deinitDecoded(allocator, &decoded);
+
+    if (sessions.get(stream_id)) |active_session| {
+        // A second HEADERS frame on an attached #867 session stream can
+        // only be a trailing field section that ends the stream (RFC 9113
+        // §8.1); the HPACK decode above still ran so the shared dynamic
+        // table stays in sync with the peer's encoder regardless.
+        if (!h2RequestHeaderBlockIsValid(decoded.headers, false) or !end_stream) {
+            try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+            return error.InvalidHttp2Request;
+        }
+        if (streams.getPtr(stream_id)) |s| s.remoteEndStream() catch {};
+        active_session.deliverRemoteEndStream();
+        return;
+    }
 
     const initial_headers = !pending.contains(stream_id);
     if (!h2RequestHeaderBlockIsValid(decoded.headers, initial_headers)) {
@@ -3029,6 +3186,54 @@ fn h2ProcessHeaderBlock(
             try ps.headers.append(h.name, h.value);
         }
     }
+
+    if (state.h2_session_test_hook) |hook| {
+        if (hook.shouldAttach(hook.ctx, &ps)) {
+            // A session's bounded queues are charged against the same
+            // connection-wide memory ceiling as ordinary buffered request
+            // bytes: otherwise many concurrent sessions (each individually
+            // bounded) could together retain far more than
+            // `cfg.max_connection_memory_bytes` permits.
+            if (max_connection_memory_bytes > 0 and HTTP2_SESSION_RESERVED_BYTES > max_connection_memory_bytes -| buffered_request_bytes.*) {
+                // Refuse only this stream: a GOAWAY here would tear down the
+                // whole connection -- including already-admitted sessions and
+                // ordinary sibling requests -- merely because one more
+                // session cannot be admitted under the connection budget.
+                try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.refused_stream.value());
+                // Retire the bookkeeping, not just the state: admission for
+                // new streams is bounded by `streams.count()`, so leaving a
+                // `.closed` entry behind here would let repeated refusals
+                // on this connection exhaust that limit and force a GOAWAY
+                // on the next healthy sibling request.
+                _ = streams.remove(stream_id);
+                ps.deinit(allocator);
+                return;
+            }
+            // Headers that request a persistent #867 session never enter
+            // `pending`/ordinary finite dispatch; `ps`'s parsed fields are
+            // only used by `shouldAttach` above.
+            const session = try allocator.create(http.h2_stream_session.Session);
+            errdefer allocator.destroy(session);
+            session.* = try http.h2_stream_session.Session.init(
+                allocator,
+                stream_id,
+                HTTP2_SESSION_MAX_INBOUND_BYTES,
+                HTTP2_SESSION_MAX_OUTBOUND_BYTES,
+            );
+            errdefer session.deinit();
+            // RFC 9113 requires a response HEADERS before DATA; the
+            // session's consumer only ever sees DATA, never framing, so the
+            // runtime sends a minimal 200 on its behalf.
+            try h2WriteSessionResponseHeaders(writer, allocator, stream_id);
+            try sessions.put(stream_id, session);
+            buffered_request_bytes.* += HTTP2_SESSION_RESERVED_BYTES;
+            if (end_stream) session.deliverRemoteEndStream();
+            hook.attach(hook.ctx, session);
+            ps.deinit(allocator);
+            return;
+        }
+    }
+
     const retained = ps.retainedBytes();
     if (max_connection_memory_bytes > 0 and retained > max_connection_memory_bytes -| buffered_request_bytes.*) {
         try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.enhance_your_calm.value());
@@ -3226,6 +3431,158 @@ fn h2FlushPendingHttp2Responses(
     }
 }
 
+/// Route one inbound DATA frame payload to an attached persistent stream
+/// session (#867) instead of the ordinary finite-request buffer. `app_payload`
+/// is the application bytes only (padding and the Pad Length octet already
+/// stripped by `h2DataPayload`); `frame_payload_len` is the full DATA frame
+/// payload length flow control actually charges the peer for.
+///
+/// Application-byte receive credit is deliberately not returned here:
+/// `h2ReturnSessionReceiveCredit` only grants it once the consumer actually
+/// drains queued bytes, so a stalled consumer caps retained memory instead
+/// of growing the window. Padding is never buffered by the session at all
+/// (only `app_payload` is), so its share of the frame's flow-control charge
+/// is credited back immediately rather than held hostage to a slow consumer.
+fn h2DeliverSessionInboundData(
+    writer: anytype,
+    session: *http.h2_stream_session.Session,
+    stream_id: u31,
+    frame_payload_len: usize,
+    app_payload: []const u8,
+    end_stream: bool,
+) !void {
+    if (app_payload.len > 0) try session.deliverInbound(app_payload);
+    if (end_stream) session.deliverRemoteEndStream();
+    const padding_len = frame_payload_len - app_payload.len;
+    if (padding_len > 0) {
+        try http.http2_frame.writeWindowUpdate(writer, stream_id, @intCast(padding_len));
+        try http.http2_frame.writeWindowUpdate(writer, 0, @intCast(padding_len));
+    }
+}
+
+/// Drain an attached session's outbound queue onto the wire exactly like
+/// `flushHttp2PendingResponse` drains a finite response: the same per-frame
+/// cap and stream/connection send-credit accounting, segmented so a stalled
+/// peer blocks this stream's bytes without blocking siblings. Emits the
+/// final END_STREAM-flagged frame once the consumer calls `finishLocal` and
+/// the queue has fully drained, and advances the stream state machine to
+/// match so connection-wide bookkeeping (e.g. `countOpenStreams`) and
+/// RST/GOAWAY detection stay correct for an attached session exactly as
+/// they already are for an ordinary response.
+fn flushHttp2SessionOutbound(
+    conn: anytype,
+    outbound: ?*http.h2_outbound_scheduler.Scheduler,
+    writer: anytype,
+    stream_id: u31,
+    session: *http.h2_stream_session.Session,
+    conn_send_window: *i32,
+    stream: *http.http2_stream.Stream,
+) !void {
+    const max_data_frame: usize = HTTP2_MAX_FRAME_SIZE;
+    while (true) {
+        const credit = @min(conn_send_window.*, stream.send_window);
+        if (credit <= 0) break;
+        const chunk = session.peekOutbound(@min(max_data_frame, @as(usize, @intCast(credit)))) orelse break;
+        if (chunk.len == 0) break;
+        const n = chunk.len;
+        try h2WriteDataFrame(conn, outbound, writer, 0, stream_id, chunk);
+        session.commitOutboundSent(n);
+        conn_send_window.* -= @intCast(n);
+        stream.send_window -= @intCast(n);
+    }
+    if (session.outboundLocalEndPending()) {
+        try h2WriteDataFrame(conn, outbound, writer, http.http2_frame.Flags.END_STREAM, stream_id, &.{});
+        session.markLocalEndStreamSent();
+        stream.localEndStream() catch {};
+    }
+}
+
+/// Return receive-window credit the consumer has earned by draining inbound
+/// bytes since the last call. Mirrors ordinary-stream WINDOW_UPDATE: both
+/// the stream and connection windows grow by the same amount (#867).
+///
+/// Credit is only cleared once both WINDOW_UPDATE frames are confirmed
+/// written: if the first write succeeds but the second fails, the pending
+/// credit is left intact for a retry rather than taken-and-lost, and the
+/// propagated error tears down the connection (so a retry cannot ever
+/// double-credit a live peer).
+fn h2ReturnSessionReceiveCredit(writer: anytype, session: *http.h2_stream_session.Session, stream: *http.http2_stream.Stream, conn_recv_window: *i64) !void {
+    const credit = session.peekReceiveCreditToReturn();
+    if (credit == 0) return;
+    try http.http2_frame.writeWindowUpdate(writer, stream.id, @intCast(credit));
+    try http.http2_frame.writeWindowUpdate(writer, 0, @intCast(credit));
+    session.consumeReceiveCredit(credit);
+    // Mirror the credit we just granted back to the peer in our own
+    // receive-window bookkeeping (see `conn_recv_window`/`Stream.recv_window`
+    // in `handleHttp2Connection`), the same way the ordinary finite-request
+    // path does inline when it emits its own WINDOW_UPDATE pair.
+    stream.recv_window += @intCast(credit);
+    conn_recv_window.* += @intCast(credit);
+}
+
+const Http2SessionCloseReason = enum { goaway, connection_closed, shutdown };
+
+/// Settle every attached session for a connection-wide terminal event
+/// (GOAWAY, abrupt close, or graceful shutdown) and detach the runtime
+/// side of each. A session whose consumer already detached is freed here;
+/// otherwise the consumer's later `consumerDetach` frees it.
+fn h2SettleAllSessions(
+    allocator: std.mem.Allocator,
+    sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
+    reason: Http2SessionCloseReason,
+) void {
+    var it = sessions.valueIterator();
+    while (it.next()) |session_ptr| {
+        const session = session_ptr.*;
+        switch (reason) {
+            .goaway => session.deliverGoaway(),
+            .connection_closed => session.deliverConnectionClosed(),
+            .shutdown => session.deliverShutdown(),
+        }
+        if (session.runtimeDetach()) {
+            session.deinit();
+            allocator.destroy(session);
+        }
+    }
+    sessions.clearAndFree();
+}
+
+/// Detach the runtime side of one stream's session after RST_STREAM or
+/// ordinary bidirectional close, freeing it if the consumer already
+/// detached and releasing its reserved share of the connection memory
+/// budget (see `HTTP2_SESSION_RESERVED_BYTES`).
+fn h2DetachSession(
+    writer: anytype,
+    allocator: std.mem.Allocator,
+    sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
+    buffered_request_bytes: *usize,
+    stream_id: u31,
+    conn_recv_window: ?*i64,
+) !void {
+    const removed = sessions.fetchRemove(stream_id) orelse return;
+    const session = removed.value;
+    buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
+    // Any inbound bytes that already charged the peer's connection-level
+    // receive window but were never credited back -- because the session
+    // settled (reset, wake failure, cancellation) before a consumer drained
+    // them -- must be returned now via a stream-0-only WINDOW_UPDATE: the
+    // stream's own credit is about to become unreachable.
+    const abandoned_credit = session.takeReceiveCreditToReturn();
+    // As in `h2ResetStreamState`: detach/free unconditionally once removed
+    // from the registry, so a failed WINDOW_UPDATE write can never orphan
+    // the session (the registry has already lost its only reference).
+    defer if (session.runtimeDetach()) {
+        session.deinit();
+        allocator.destroy(session);
+    };
+    if (abandoned_credit > 0) {
+        try http.http2_frame.writeWindowUpdate(writer, 0, @intCast(abandoned_credit));
+        // Keep our local receive-window counter in lockstep with the peer:
+        // see the matching comment in `h2ResetStreamState`.
+        if (conn_recv_window) |w| w.* += @intCast(abandoned_credit);
+    }
+}
+
 fn h2DispatchReadyStreamsWithWriter(
     conn: anytype,
     writer: anytype,
@@ -3342,7 +3699,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
 
     try http.http2_frame.writeSettings(allocator, outbound_writer, &[_][2]u32{
         .{ 0x3, HTTP2_MAX_CONCURRENT_STREAMS }, // max concurrent streams
-        .{ 0x4, 1024 * 1024 }, // initial window size
+        .{ 0x4, HTTP2_INITIAL_WINDOW_SIZE }, // initial window size
     });
     try outbound.flush(conn.writer());
 
@@ -3366,6 +3723,15 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     // advertised SETTINGS_INITIAL_WINDOW_SIZE for streams opened after the
     // setting and apply any change's delta to already-open streams.
     var peer_initial_window: u32 = 65_535;
+    // Receive-side counters (the mirror image of `conn_send_window`/
+    // `Stream.send_window`): how many more DATA bytes the peer may send us
+    // on this connection, and per-stream, before we must reject it as a
+    // real flow-control violation. RFC 9113 §6.9.2 fixes the connection
+    // window's initial value at 65,535 regardless of SETTINGS; only our own
+    // `HTTP2_INITIAL_WINDOW_SIZE` SETTINGS value raises the per-stream
+    // starting point. Both grow only when a WINDOW_UPDATE we actually wrote
+    // to the peer grants more credit back.
+    var conn_recv_window: i64 = 65_535;
     // Aggregate bytes currently buffered in `pending[*].body` across every
     // stream on this connection, bounded by `cfg.max_connection_memory_bytes`
     // in addition to each stream's own `request_limits` body cap -- a client
@@ -3463,6 +3829,121 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     h2InstallRequestHandoff(conn, &handoff, DrainCtx.drain, &drain_ctx);
     defer h2InstallRequestHandoff(conn, null, null, null);
 
+    // #867: streams attached as persistent bidirectional sessions. Settled
+    // for whatever terminal reason this connection actually ends with --
+    // GOAWAY, graceful shutdown, or an abrupt close/error -- regardless of
+    // which `return` below unwinds through this defer.
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer {
+        const reason: Http2SessionCloseReason = if (goaway_received)
+            .goaway
+        else if (http.shutdown.isShutdownRequested())
+            .shutdown
+        else
+            .connection_closed;
+        h2SettleAllSessions(allocator, &sessions, reason);
+    }
+
+    const SessionDrainCtx = struct {
+        allocator: std.mem.Allocator,
+        conn: @TypeOf(conn),
+        writer: @TypeOf(outbound_writer),
+        outbound: *http.h2_outbound_scheduler.Scheduler,
+        sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
+        streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
+        conn_send_window: *i32,
+        conn_recv_window: *i64,
+        buffered_request_bytes: *usize,
+
+        fn pollFds(raw: *anyopaque, buf: []std.posix.fd_t) []const std.posix.fd_t {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var n: usize = 0;
+            var it = self.sessions.valueIterator();
+            while (it.next()) |session_ptr| {
+                if (n >= buf.len) break;
+                buf[n] = session_ptr.*.wakeFd();
+                n += 1;
+            }
+            return buf[0..n];
+        }
+
+        /// Service every attached session's pending outbound/credit/cancel
+        /// work (#867's half of #865's wakeable wait), detaching any session
+        /// that just reached a terminal state. Woken by any session's wake
+        /// fd firing in `waitFor`, and also run unconditionally once per
+        /// loop iteration so a busy connection -- one that keeps `readFrame`
+        /// returning real data and never falls into that blocking poll --
+        /// cannot starve a session behind a steady stream of frames on
+        /// other streams.
+        fn drain(raw: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var detach_list = std.array_list.Managed(u31).init(self.allocator);
+            defer detach_list.deinit();
+
+            var it = self.sessions.iterator();
+            while (it.next()) |entry| {
+                const stream_id = entry.key_ptr.*;
+                const sess = entry.value_ptr.*;
+                sess.clearWake();
+                if (sess.hasWakeFailure() or sess.hasWriteFailure()) {
+                    // A lost wake notification means this session can no
+                    // longer learn about new inbound credit or outbound
+                    // bytes; a failed producer write may have already
+                    // queued a prefix the consumer cannot safely retry.
+                    // Treat both like a protocol-level reset rather than
+                    // let the stream stall forever. Cancel any output this
+                    // stream already queued with the scheduler first, same
+                    // as the consumer-cancel path below, so a reset stream
+                    // never has stale DATA retained or transmitted after it.
+                    const refunded = self.outbound.cancelStream(stream_id);
+                    if (refunded > 0) self.conn_send_window.* +|= @intCast(@min(refunded, std.math.maxInt(i32)));
+                    try http.http2_frame.writeRstStream(self.writer, stream_id, http.http2_stream.ErrorCode.internal_error.value());
+                    sess.deliverReset(.internal_error);
+                    try detach_list.append(stream_id);
+                    continue;
+                }
+                const stream_ptr = self.streams.getPtr(stream_id) orelse {
+                    // This stream's bookkeeping disappeared without this
+                    // session ever being detached (e.g. an ordinary
+                    // RST/close path removed it). Settle it explicitly so a
+                    // blocked consumer is woken instead of left owning a
+                    // live but unreachable handle.
+                    sess.deliverReset(.internal_error);
+                    try detach_list.append(stream_id);
+                    continue;
+                };
+                try flushHttp2SessionOutbound(self.conn, self.outbound, self.writer, stream_id, sess, self.conn_send_window, stream_ptr);
+                try h2ReturnSessionReceiveCredit(self.writer, sess, stream_ptr, self.conn_recv_window);
+                if (sess.takeCancelRequest()) {
+                    const refunded = self.outbound.cancelStream(stream_id);
+                    if (refunded > 0) self.conn_send_window.* +|= @intCast(@min(refunded, std.math.maxInt(i32)));
+                    try http.http2_frame.writeRstStream(self.writer, stream_id, http.http2_stream.ErrorCode.cancel.value());
+                    sess.deliverReset(.cancel);
+                    try detach_list.append(stream_id);
+                    continue;
+                }
+                if (stream_ptr.state == .closed) try detach_list.append(stream_id);
+            }
+            for (detach_list.items) |stream_id| {
+                try h2DetachSession(self.writer, self.allocator, self.sessions, self.buffered_request_bytes, stream_id, self.conn_recv_window);
+                _ = self.streams.remove(stream_id);
+            }
+        }
+    };
+    var session_drain_ctx = SessionDrainCtx{
+        .allocator = allocator,
+        .conn = conn,
+        .writer = outbound_writer,
+        .outbound = &outbound,
+        .sessions = &sessions,
+        .streams = &streams,
+        .conn_send_window = &conn_send_window,
+        .conn_recv_window = &conn_recv_window,
+        .buffered_request_bytes = &buffered_request_bytes,
+    };
+    h2InstallSessionRegistry(conn, SessionDrainCtx.pollFds, SessionDrainCtx.drain, &session_drain_ctx);
+    defer h2InstallSessionRegistry(conn, null, null, null);
+
     while (!http.shutdown.isShutdownRequested() and !goaway_received) {
         // Apply any worker completions that already arrived. A busy
         // connection that keeps `readFrame` returning real data every
@@ -3471,6 +3952,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
         // slow job's sibling streams from starving behind a steady stream of
         // fast ones (#866).
         try DrainCtx.drain(&drain_ctx);
+        try SessionDrainCtx.drain(&session_drain_ctx);
 
         try h2DispatchReadyStreamsWithWriter(
             conn,
@@ -3607,7 +4089,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     return error.InvalidHttp2StreamId;
                 }
                 if (frame.stream_id <= last_client_stream_id and !streams.contains(frame.stream_id)) {
-                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, &handoff, executor, &in_flight_jobs);
+                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
                     continue;
                 }
                 last_client_stream_id = @max(last_client_stream_id, frame.stream_id);
@@ -3622,7 +4104,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // SECOND request, duplicating route/auth/handler execution
                 // while the first response is still outstanding.
                 if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
-                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, &handoff, executor, &in_flight_jobs);
+                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
                     continue;
                 }
                 if (!streams.contains(frame.stream_id)) {
@@ -3635,6 +4117,12 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         return error.Http2ConcurrentStreamLimitExceeded;
                     }
                     try streams.put(frame.stream_id, http.http2_stream.Stream.init(frame.stream_id, @intCast(peer_initial_window)));
+                    // `Stream.init` defaults `recv_window` to the RFC 9113
+                    // default of 65,535; override it to what this
+                    // connection actually advertised via SETTINGS
+                    // INITIAL_WINDOW_SIZE above, since that is the real
+                    // per-stream credit the client was granted to send us.
+                    if (streams.getPtr(frame.stream_id)) |s| s.recv_window = @intCast(HTTP2_INITIAL_WINDOW_SIZE);
                 }
                 const headers_payload = h2HeadersPayload(frame.payload, frame.flags) catch |err| {
                     try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
@@ -3667,6 +4155,8 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     &pending,
                     &streams,
                     &ready_streams,
+                    &sessions,
+                    state,
                     frame.stream_id,
                     headers_payload.fragment,
                     (frame.flags & http.http2_frame.Flags.END_STREAM) != 0,
@@ -3687,14 +4177,141 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // END_STREAM is a stream error (RFC 7540 §5.1,
                 // half_closed_remote), not new body for a dispatched request.
                 if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
-                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, &handoff, executor, &in_flight_jobs);
+                    // RFC 9113 §6.9/§5.1: DATA on a stream we already
+                    // closed for receiving still counts against the
+                    // connection-wide receive window the instant it
+                    // arrives -- a peer that keeps sending to a closed
+                    // stream after we reset it must not get to bypass the
+                    // connection cap that way. Charge it, fail the
+                    // connection on a genuine violation, and otherwise
+                    // discard the payload and return the credit at once
+                    // via a stream-0 WINDOW_UPDATE, since there is no
+                    // longer a stream to carry it forward.
+                    const charge: i64 = @intCast(frame.payload.len);
+                    if (conn_recv_window - charge < 0) {
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                        return error.Http2FlowControlError;
+                    }
+                    if (charge > 0) try http.http2_frame.writeWindowUpdate(outbound_writer, 0, @intCast(charge));
+                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
+                    continue;
+                }
+                if (!streams.contains(frame.stream_id) and !sessions.contains(frame.stream_id) and !pending.contains(frame.stream_id)) {
+                    if (frame.stream_id > last_client_stream_id) {
+                        // Genuinely idle: the client never opened this
+                        // stream with HEADERS. RFC 9113 §5.1 makes sending
+                        // DATA on an idle stream a connection error.
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                        return error.InvalidHttp2StreamId;
+                    }
+                    // Previously observed but already fully torn down (e.g.
+                    // a refused #867 session admission or an earlier
+                    // h2ResetStreamState): `h2StreamAcceptsInboundFrame`
+                    // returns true for a stream id absent from `streams`,
+                    // so this is the only place left to catch DATA that was
+                    // already in flight from the peer when we reset it.
+                    // RFC 9113 §5.1 requires tolerating it rather than
+                    // treating it as a connection-wide protocol error, but
+                    // RFC 9113 §6.9 still requires the bytes to count
+                    // against the connection-wide receive window the
+                    // instant they arrive; since there is no stream left to
+                    // carry that credit forward, return it immediately via
+                    // a stream-0-only WINDOW_UPDATE.
+                    const stale_charge: i64 = @intCast(frame.payload.len);
+                    if (conn_recv_window - stale_charge < 0) {
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                        return error.Http2FlowControlError;
+                    }
+                    if (stale_charge > 0) try http.http2_frame.writeWindowUpdate(outbound_writer, 0, @intCast(stale_charge));
                     continue;
                 }
                 const data_payload = h2DataPayload(frame.payload, frame.flags) catch |err| {
                     try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return err;
                 };
-                if (pending.getPtr(frame.stream_id)) |ps| {
+                // RFC 9113 §6.9: every DATA byte -- including Pad Length and
+                // padding -- counts against both the connection-wide and
+                // per-stream receive windows the instant it arrives,
+                // regardless of whether this stream maps to a #867 session
+                // or an ordinary finite request. A merely stalled consumer
+                // or an over-`max_body_size` request must never look like a
+                // flow-control violation (neither shrinks these windows by
+                // itself), but a peer that sends beyond what it was
+                // actually granted must.
+                if (streams.getPtr(frame.stream_id)) |recv_stream| {
+                    const charge: i64 = @intCast(frame.payload.len);
+                    const new_conn_recv = conn_recv_window - charge;
+                    if (new_conn_recv < 0) {
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                        return error.Http2FlowControlError;
+                    }
+                    const new_stream_recv: i64 = @as(i64, recv_stream.recv_window) - charge;
+                    if (new_stream_recv < 0) {
+                        const refunded = outbound.cancelStream(frame.stream_id);
+                        if (refunded > 0) conn_send_window +|= @intCast(@min(refunded, std.math.maxInt(i32)));
+                        try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                        // These bytes already counted against the
+                        // connection window the instant they arrived
+                        // (checked just above); since this stream is
+                        // being torn down and can no longer carry its own
+                        // window forward, return that credit immediately
+                        // via a stream-0 WINDOW_UPDATE instead of leaving
+                        // the connection permanently short.
+                        if (charge > 0) try http.http2_frame.writeWindowUpdate(outbound_writer, 0, @intCast(charge));
+                        try h2ResetStreamState(outbound_writer, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, null, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
+                        continue;
+                    }
+                    conn_recv_window = new_conn_recv;
+                    recv_stream.recv_window = @intCast(new_stream_recv);
+                }
+                if (sessions.get(frame.stream_id)) |active_session| {
+                    var delivered_ok = true;
+                    h2DeliverSessionInboundData(
+                        outbound_writer,
+                        active_session,
+                        frame.stream_id,
+                        frame.payload.len,
+                        data_payload,
+                        (frame.flags & http.http2_frame.Flags.END_STREAM) != 0,
+                    ) catch |err| switch (err) {
+                        // The session's own bounded queue matches the
+                        // receive window this connection advertised (see
+                        // `HTTP2_SESSION_MAX_INBOUND_BYTES`), so this can
+                        // only fire on an actual protocol violation (a peer
+                        // sending more than its granted window), never on a
+                        // merely stalled consumer.
+                        error.QueueFull => {
+                            delivered_ok = false;
+                            const refunded = outbound.cancelStream(frame.stream_id);
+                            if (refunded > 0) conn_send_window +|= @intCast(@min(refunded, std.math.maxInt(i32)));
+                            try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                            active_session.deliverReset(.flow_control_error);
+                            try h2DetachSession(outbound_writer, allocator, &sessions, &buffered_request_bytes, frame.stream_id, &conn_recv_window);
+                            _ = streams.remove(frame.stream_id);
+                        },
+                        error.Closed => {
+                            delivered_ok = false;
+                        },
+                        else => return err,
+                    };
+                    if (delivered_ok) {
+                        // Padding's share of this frame's flow-control charge
+                        // was just credited straight back to the peer inside
+                        // `h2DeliverSessionInboundData` (it is never buffered
+                        // by the session); mirror that in our own window
+                        // bookkeeping. The application bytes' credit is
+                        // deliberately deferred to `h2ReturnSessionReceiveCredit`,
+                        // matching when it is actually earned.
+                        const padding_len = frame.payload.len - data_payload.len;
+                        if (padding_len > 0) {
+                            conn_recv_window += @intCast(padding_len);
+                            if (streams.getPtr(frame.stream_id)) |s| s.recv_window += @intCast(padding_len);
+                        }
+                    }
+                    if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
+                        if (streams.getPtr(frame.stream_id)) |s| s.remoteEndStream() catch {};
+                    }
+                } else if (pending.getPtr(frame.stream_id)) |ps| {
                     ps.transport_early = ps.transport_early or frame_transport_early;
                     const max_body = cfg.request_limits.effectiveMaxBodySize();
                     const max_conn_mem = cfg.max_connection_memory_bytes;
@@ -3723,6 +4340,8 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         if (frame.payload.len > 0) {
                             try http.http2_frame.writeWindowUpdate(outbound_writer, frame.stream_id, @intCast(frame.payload.len));
                             try http.http2_frame.writeWindowUpdate(outbound_writer, 0, @intCast(frame.payload.len));
+                            conn_recv_window += @intCast(frame.payload.len);
+                            if (streams.getPtr(frame.stream_id)) |s| s.recv_window += @intCast(frame.payload.len);
                         }
                     }
                     if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
@@ -3758,9 +4377,10 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                         return error.InvalidWindowUpdateFrame;
                     } else {
-                        outbound.cancelStream(frame.stream_id);
+                        const refunded = outbound.cancelStream(frame.stream_id);
+                        if (refunded > 0) conn_send_window +|= @intCast(@min(refunded, std.math.maxInt(i32)));
                         try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.protocol_error.value());
-                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, null, &handoff, executor, &in_flight_jobs);
+                        try h2ResetStreamState(outbound_writer, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, null, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
                     }
                     continue;
                 }
@@ -3779,9 +4399,10 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 } else if (streams.getPtr(frame.stream_id)) |s| {
                     const new_window: i64 = @as(i64, s.send_window) + @as(i64, inc);
                     if (new_window > std.math.maxInt(i32)) {
-                        outbound.cancelStream(frame.stream_id);
+                        const refunded = outbound.cancelStream(frame.stream_id);
+                        if (refunded > 0) conn_send_window +|= @intCast(@min(refunded, std.math.maxInt(i32)));
                         try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
-                        h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, null, &handoff, executor, &in_flight_jobs);
+                        try h2ResetStreamState(outbound_writer, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, null, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
                     } else {
                         s.send_window = @intCast(new_window);
                     }
@@ -3801,7 +4422,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
                     return error.InvalidRstStreamFrame;
                 }
-                h2ResetStreamState(allocator, &streams, &pending, &pending_responses, &ready_streams, &buffered_request_bytes, frame.stream_id, &outbound, &handoff, executor, &in_flight_jobs);
+                try h2ResetStreamState(outbound_writer, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, &outbound, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
             },
             .goaway => {
                 if (frame.stream_id != 0 or frame.payload.len < 8) {
@@ -3827,6 +4448,8 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         &pending,
                         &streams,
                         &ready_streams,
+                        &sessions,
+                        state,
                         stream_id,
                         continuation_block.items,
                         continuation_end_stream,
@@ -7604,6 +8227,9 @@ test "H2 reset removes parked response while queued output is backpressured" {
         pub fn write(_: *@This(), _: []const u8) error{WouldBlock}!usize {
             return error.WouldBlock;
         }
+        pub fn writeAll(_: *@This(), _: []const u8) error{WouldBlock}!void {
+            return error.WouldBlock;
+        }
     };
     const allocator = std.testing.allocator;
     var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
@@ -7618,6 +8244,8 @@ test "H2 reset removes parked response while queued output is backpressured" {
     }
     var ready = std.array_list.Managed(u31).init(allocator);
     defer ready.deinit();
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer sessions.deinit();
     try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
     try pending_responses.put(1, .{
         .body_alloc = try allocator.dupe(u8, "cancelled"),
@@ -7637,23 +8265,33 @@ test "H2 reset removes parked response while queued output is backpressured" {
     defer in_flight_jobs.deinit();
     var handoff = try http.h2_request_handoff.Handoff.init(allocator, 4);
     defer handoff.deinit();
-    h2ResetStreamState(
+    // The queued-but-never-transmitted "already-queued" DATA frame already
+    // debited this much from the connection send-window when it was first
+    // written; the reset must refund it or an unrelated sibling stream would
+    // be starved of credit that was never actually spent on the wire.
+    var conn_send_window: i32 = 0;
+    try h2ResetStreamState(
+        &writer,
         allocator,
         &streams,
         &pending,
         &pending_responses,
         &ready,
+        &sessions,
         &buffered_request_bytes,
         1,
         &scheduler,
         &handoff,
         null,
         &in_flight_jobs,
+        null,
+        &conn_send_window,
     );
     try std.testing.expect(!streams.contains(1));
     try std.testing.expect(!pending_responses.contains(1));
     try std.testing.expectEqual(@as(usize, 0), ready.items.len);
     try std.testing.expect(!scheduler.hasPendingOutput());
+    try std.testing.expectEqual(@as(i32, "already-queued".len), conn_send_window);
     scheduler.deinit();
 }
 
@@ -7681,6 +8319,8 @@ test "local STREAM_CLOSED reset drops queued response before its RST" {
     }
     var ready = std.array_list.Managed(u31).init(allocator);
     defer ready.deinit();
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer sessions.deinit();
     try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
     const parked = try allocator.dupe(u8, "parked");
     try pending_responses.put(1, .{ .body_alloc = parked, .body = parked, .status_code = 200 });
@@ -7699,6 +8339,10 @@ test "local STREAM_CLOSED reset drops queued response before its RST" {
     defer in_flight_jobs.deinit();
     var handoff = try http.h2_request_handoff.Handoff.init(allocator, 4);
     defer handoff.deinit();
+    // The never-transmitted "stale" DATA frame already debited the
+    // connection send-window when queued; dropping it on reset must refund
+    // that credit rather than lose it.
+    var conn_send_window: i32 = 0;
     try h2WriteStreamClosedReset(
         scheduler.writer(),
         &scheduler,
@@ -7707,14 +8351,18 @@ test "local STREAM_CLOSED reset drops queued response before its RST" {
         &pending,
         &pending_responses,
         &ready,
+        &sessions,
         &buffered_request_bytes,
         1,
         &handoff,
         null,
         &in_flight_jobs,
+        null,
+        &conn_send_window,
     );
     try std.testing.expect(!streams.contains(1));
     try std.testing.expect(!pending_responses.contains(1));
+    try std.testing.expectEqual(@as(i32, "stale".len), conn_send_window);
     output.blocked = false;
     try scheduler.flush(&output);
 
@@ -8524,6 +9172,2357 @@ test "H2 ordinary stream dispatch remains unchanged" {
     try std.testing.expect(!pending.contains(3));
     try std.testing.expectEqual(@as(usize, 0), ready.items.len);
     try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+}
+
+const H2SessionDecodedFrame = struct { typ: http.http2_frame.Type, flags: u8, stream_id: u31, payload: []const u8 };
+
+/// Minimal wire decoder shared by the session integration tests below, so
+/// assertions read real `writeFrame` output rather than internal state.
+fn h2DecodeFrames(allocator: std.mem.Allocator, wire: []const u8) !std.array_list.Managed(H2SessionDecodedFrame) {
+    var frames = std.array_list.Managed(H2SessionDecodedFrame).init(allocator);
+    var offset: usize = 0;
+    while (offset < wire.len) {
+        const header = wire[offset..];
+        const len = (@as(usize, header[0]) << 16) | (@as(usize, header[1]) << 8) | header[2];
+        const stream_id: u31 = @intCast(std.mem.readInt(u32, header[5..9], .big) & 0x7fff_ffff);
+        try frames.append(.{
+            .typ = @enumFromInt(header[3]),
+            .flags = header[4],
+            .stream_id = stream_id,
+            .payload = header[9 .. 9 + len],
+        });
+        offset += 9 + len;
+    }
+    return frames;
+}
+
+test "H2 session inbound DATA credits padding immediately but app bytes only on consumption (#867)" {
+    const allocator = std.testing.allocator;
+    var session = try http.h2_stream_session.Session.init(allocator, 1, 4096, 4096);
+    defer session.deinit();
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+
+    // A PADDED DATA frame: payload = [pad_len_byte] ++ app_bytes ++ padding.
+    // `h2DataPayload` (production parsing) strips padding; only the 4
+    // application bytes reach the session, but flow control is charged for
+    // the whole frame payload.
+    const frame_payload = [_]u8{ 3, 'a', 'b', 'c', 'd', 0, 0, 0 };
+    const app_payload = try h2DataPayload(&frame_payload, http.http2_frame.Flags.PADDED);
+
+    try h2DeliverSessionInboundData(&out.writer, &session, 1, frame_payload.len, app_payload, false);
+
+    // Padding (the Pad Length octet plus 3 padding bytes) is credited back
+    // immediately -- it was never buffered by the session at all.
+    var frames = try h2DecodeFrames(allocator, out.written());
+    defer frames.deinit();
+    try std.testing.expectEqual(@as(usize, 2), frames.items.len);
+    for (frames.items) |frame| {
+        try std.testing.expectEqual(http.http2_frame.Type.window_update, frame.typ);
+        try std.testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, frame.payload[0..4], .big));
+    }
+
+    // The 4 application bytes are only credited once the consumer reads
+    // them.
+    try std.testing.expectEqual(@as(usize, 0), session.peekReceiveCreditToReturn());
+    var buf: [8]u8 = undefined;
+    _ = session.read(&buf);
+    try std.testing.expectEqual(@as(usize, 4), session.peekReceiveCreditToReturn());
+}
+
+/// A real, pollable, two-way byte pipe (an AF_UNIX `socketpair`) wrapped as
+/// an `EncryptedStream` that passes bytes straight through unencrypted. This
+/// stands in for a completed TLS handshake so the live H2 session tests
+/// below exercise the *real* `handleHttp2Connection` frame loop, the real
+/// `WaitingEncryptedHttpConnection` adapter (including its session wake-fd
+/// polling), and a real client thread over a real kernel socket. The only
+/// thing it does not exercise is TLS itself, which this codebase already
+/// covers elsewhere (`native_tls_connection.zig`) and which is orthogonal to
+/// #867's session plumbing.
+const PlaintextSocketStream = struct {
+    fd: std.posix.fd_t,
+
+    fn stream(self: *PlaintextSocketStream) tls_core.encrypted_stream.EncryptedStream {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn backend(_: *anyopaque) tls_core.encrypted_stream.BackendKind {
+        return .pure_zig_record;
+    }
+
+    fn read(ptr: *anyopaque, out: []u8) tls_core.encrypted_stream.Error!usize {
+        const self: *PlaintextSocketStream = @ptrCast(@alignCast(ptr));
+        const n = std.c.read(self.fd, out.ptr, out.len);
+        if (n >= 0) return @intCast(n);
+        return switch (std.posix.errno(n)) {
+            .AGAIN, .INTR => error.WouldBlock,
+            else => error.SocketReadFailed,
+        };
+    }
+
+    fn write(ptr: *anyopaque, bytes: []const u8) tls_core.encrypted_stream.Error!usize {
+        const self: *PlaintextSocketStream = @ptrCast(@alignCast(ptr));
+        const n = std.c.write(self.fd, bytes.ptr, bytes.len);
+        if (n >= 0) return @intCast(n);
+        return switch (std.posix.errno(n)) {
+            .AGAIN, .INTR => error.WouldBlock,
+            else => error.SocketWriteFailed,
+        };
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    /// Mirrors a real record layer's readiness: plaintext is readable only
+    /// while the kernel actually has bytes queued. Reporting it as always
+    /// readable would make `WaitingEncryptedHttpConnection.waitFor` return
+    /// `ready_now` without ever polling, so the runtime would spin and never
+    /// observe a session wake fd or flush its outbound scheduler.
+    fn readiness(ptr: *anyopaque) tls_core.encrypted_stream.Readiness {
+        const self: *PlaintextSocketStream = @ptrCast(@alignCast(ptr));
+        var pfd = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&pfd, 0) catch 0;
+        return .{
+            .wants_read = true,
+            .can_read_plaintext = ready > 0 and (pfd[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0,
+            .can_write_plaintext = true,
+        };
+    }
+
+    fn drive(ptr: *anyopaque) tls_core.encrypted_stream.Error!tls_core.encrypted_stream.DriveResult {
+        return .{ .made_progress = false, .readiness = readiness(ptr) };
+    }
+
+    fn bufferSnapshot(_: *anyopaque) tls_core.encrypted_stream.BufferSnapshot {
+        return .{};
+    }
+
+    const vtable = tls_core.encrypted_stream.EncryptedStream.VTable{
+        .backendFn = backend,
+        .readFn = read,
+        .writeFn = write,
+        .closeFn = close,
+        .readinessFn = readiness,
+        .driveFn = drive,
+        .bufferSnapshotFn = bufferSnapshot,
+    };
+};
+
+fn testH2SocketPair() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+        if (linux.errno(rc) != .SUCCESS) return error.SocketPairFailed;
+    } else {
+        if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    }
+    return fds;
+}
+
+fn testSetFdNonBlocking(fd: std.posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    if (flags < 0 or std.c.fcntl(fd, std.c.F.SETFL, flags | @as(c_int, @bitCast(std.posix.O{ .NONBLOCK = true }))) < 0)
+        return error.FcntlFailed;
+}
+
+/// Negative-control assertion for the live flow-control tests below: polls
+/// `fd` for readability without consuming anything, failing if a frame
+/// arrived within `timeout_ms`. Used to prove a WINDOW_UPDATE that grants
+/// credit on the *wrong* dimension (stream-only vs. connection-only) does
+/// not unstall a producer still blocked on the other one.
+fn testExpectNoFrameArrives(fd: std.posix.fd_t, timeout_ms: i32) !void {
+    var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = try std.posix.poll(&pfd, timeout_ms);
+    if (ready != 0) return error.UnexpectedFrameArrived;
+}
+
+/// Negative-control assertion for the independent-credit-exhaustion tests:
+/// drains whatever arrives on `client` within `timeout_ms`, appending
+/// `target_stream` DATA payloads to `out` and discarding everything else.
+/// A session consumer earns inbound receive credit purely by reading
+/// (independent of the outbound stall under test), so a benign WINDOW_UPDATE
+/// for that unrelated direction can legitimately arrive during the window;
+/// only new DATA for `target_stream` would mean the credit grant under test
+/// actually unstalled the producer.
+fn testDrainStreamDataFor(client: *TestH2Client, allocator: std.mem.Allocator, target_stream: u31, out: *std.array_list.Managed(u8), timeout_ms: i64, send_credit: ?*TestConnSendCredit) !void {
+    const deadline_ms = compat.milliTimestamp() + timeout_ms;
+    while (true) {
+        const remaining_ms = deadline_ms - compat.milliTimestamp();
+        if (remaining_ms <= 0) return;
+        var pfd = [_]std.posix.pollfd{.{ .fd = client.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = try std.posix.poll(&pfd, @intCast(remaining_ms));
+        if (ready == 0) return;
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.stream_id == target_stream and frame.typ == .data) try out.appendSlice(frame.payload);
+        if (send_credit) |credit| testGrantIfConnSendCredit(&frame, credit);
+    }
+}
+
+/// Tracks HTTP/2 connection-level send credit a live test's fake client has
+/// actually been granted by the real server via a stream-0 WINDOW_UPDATE, so
+/// a background sender thread can pace its own DATA to the server instead of
+/// blasting past the connection-level receive window RFC 9113 §6.9.2 fixes
+/// at 65,535 bytes until the peer actually grows it. Every per-stream window
+/// in these live tests is always the fixed 1 MiB the server itself
+/// advertises (`HTTP2_INITIAL_WINDOW_SIZE`), far above anything sent here,
+/// so only the connection-level counter can ever be the real bottleneck for
+/// a test's own outbound (client-to-server) DATA.
+const TestConnSendCredit = struct {
+    mutex: compat.Mutex = .{},
+    cond: compat.Condition = .{},
+    available: i64 = 65_535,
+    /// Set by `cancelAndBroadcast` so a sender thread blocked in `take`
+    /// wakes up and exits instead of waiting forever once a failed test is
+    /// unwinding and will never grant more credit.
+    canceled: bool = false,
+
+    fn grant(self: *@This(), amount: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.available += amount;
+        self.cond.signal();
+    }
+
+    /// Blocks until at least one byte of credit exists, then reserves and
+    /// returns up to `want` bytes of it. Returns `null` once canceled,
+    /// whether or not a wait was actually needed.
+    fn take(self: *@This(), want: usize) ?usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.available <= 0 and !self.canceled) self.cond.wait(&self.mutex);
+        if (self.canceled) return null;
+        const n = @min(self.available, @as(i64, @intCast(want)));
+        self.available -= n;
+        return @intCast(n);
+    }
+
+    /// Wakes a sender thread blocked in `take` so it can exit instead of
+    /// outliving the stack it closes over when a live test fails early.
+    fn cancelAndBroadcast(self: *@This()) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.canceled = true;
+        self.cond.broadcast();
+    }
+};
+
+fn testGrantIfConnSendCredit(frame: *const http.http2_frame.Frame, credit: *TestConnSendCredit) void {
+    if (frame.typ == .window_update and frame.stream_id == 0 and frame.payload.len == 4) {
+        const inc = std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFF_FFFF;
+        credit.grant(inc);
+    }
+}
+
+/// Joins a thread at most once: a slot already nulled out by an earlier
+/// join (success path or a prior cleanup call) is left alone. `std.Thread`
+/// has no built-in way to ask "was this already joined?", and calling
+/// `join()` twice on the same handle is undefined behavior, so every
+/// caller that might run both a normal join and a failure-path cleanup
+/// join must go through this instead of calling `.join()` directly.
+fn testJoinOnce(thread_slot: *?std.Thread) void {
+    if (thread_slot.*) |t| {
+        t.join();
+        thread_slot.* = null;
+    }
+}
+
+/// `errdefer`-only safety net for the live H2 session tests: if a test
+/// returns early via an assertion/read failure before reaching its normal
+/// trailing `server_thread.join(); ...; consumer_thread.?.join();` lines,
+/// the server and consumer worker threads would otherwise keep running and
+/// touch the test's about-to-be-destroyed stack (`state`, `hook_ctx`, ...)
+/// after the test frame returns -- this is the exact mechanism behind a
+/// real observed CI segfault. Shutting down the server-side fd forces
+/// `handleHttp2Connection` to unwind (settling every attached session, the
+/// same as an ordinary GOAWAY/EOF teardown), which lets a blocked consumer
+/// observe termination and exit on its own; joining both threads here then
+/// guarantees neither outlives the stack frame they close over. Takes both
+/// threads as slots and joins through `testJoinOnce` because a failure can
+/// land after the normal-path join of either thread already succeeded --
+/// without the slot, this `errdefer` would join an already-joined handle.
+fn testShutdownAndJoinOnFailure(server_fd: std.posix.fd_t, server_thread_slot: *?std.Thread, consumer_thread_slot: *?std.Thread) void {
+    _ = std.c.shutdown(server_fd, std.c.SHUT.RDWR);
+    testJoinOnce(server_thread_slot);
+    testJoinOnce(consumer_thread_slot);
+}
+
+/// Same as `testShutdownAndJoinOnFailure`, for the one live test whose hook
+/// never spawns a consumer worker at all (`StallingSessionHookCtx`).
+fn testShutdownAndJoinServerOnFailure(server_fd: std.posix.fd_t, server_thread_slot: *?std.Thread) void {
+    _ = std.c.shutdown(server_fd, std.c.SHUT.RDWR);
+    testJoinOnce(server_thread_slot);
+}
+
+/// Same as `testShutdownAndJoinOnFailure`, for the live tests that also
+/// pace a DATA sender against this process's own connection-send-credit
+/// model from a second thread (see `TestConnSendCredit`). Closing the
+/// server socket does nothing to wake a sender blocked in
+/// `send_credit.take()` -- it is a userspace condvar, not I/O -- and
+/// `send_credit.cancelAndBroadcast()` does nothing to wake a sender blocked
+/// in a real blocking `write()` on `client_fd` once the kernel socket
+/// buffer is full. Both must happen, and the socket shutdown must happen
+/// before any join is attempted, or a failed assertion deadlocks tearing
+/// down the test instead of unwinding it.
+fn testShutdownAndJoinSenderOnFailure(
+    server_fd: std.posix.fd_t,
+    client_fd: std.posix.fd_t,
+    send_credit: *TestConnSendCredit,
+    send_thread_slot: *?std.Thread,
+    server_thread_slot: *?std.Thread,
+    consumer_thread_slot: *?std.Thread,
+) void {
+    send_credit.cancelAndBroadcast();
+    _ = std.c.shutdown(client_fd, std.c.SHUT.RDWR);
+    _ = std.c.shutdown(server_fd, std.c.SHUT.RDWR);
+    testJoinOnce(send_thread_slot);
+    testJoinOnce(server_thread_slot);
+    testJoinOnce(consumer_thread_slot);
+}
+
+/// Blocking client-side wrapper over a raw socket fd, used only by the live
+/// H2 session tests below to speak real wire bytes to the real server loop.
+const TestH2Client = struct {
+    fd: std.posix.fd_t,
+    /// Serializes whole frames: the live tests keep one thread streaming DATA
+    /// while another sends WINDOW_UPDATE/GOAWAY/RST_STREAM, and a frame's
+    /// header and payload must never interleave with another frame's bytes.
+    write_mutex: compat.Mutex = .{},
+
+    pub fn read(self: *TestH2Client, buf: []u8) !usize {
+        while (true) {
+            const n = std.c.read(self.fd, buf.ptr, buf.len);
+            if (n >= 0) return @intCast(n);
+            if (std.posix.errno(n) == .INTR) continue;
+            return error.SocketReadFailed;
+        }
+    }
+
+    fn writer(self: *TestH2Client) Writer {
+        return .{ .conn = self };
+    }
+
+    const Writer = struct {
+        conn: *TestH2Client,
+
+        pub fn enqueueFrame(self: Writer, typ: http.http2_frame.Type, flags: u8, stream_id: u31, payload: []const u8) !void {
+            var buf: [http.http2_frame.HEADER_LEN + HTTP2_MAX_FRAME_SIZE]u8 = undefined;
+            if (payload.len > HTTP2_MAX_FRAME_SIZE) return error.Http2FrameTooLarge;
+            buf[0] = @intCast((payload.len >> 16) & 0xFF);
+            buf[1] = @intCast((payload.len >> 8) & 0xFF);
+            buf[2] = @intCast(payload.len & 0xFF);
+            buf[3] = @intFromEnum(typ);
+            buf[4] = flags;
+            std.mem.writeInt(u32, buf[5..9], @as(u32, stream_id) & 0x7FFF_FFFF, .big);
+            @memcpy(buf[http.http2_frame.HEADER_LEN..][0..payload.len], payload);
+            self.conn.write_mutex.lock();
+            defer self.conn.write_mutex.unlock();
+            try self.writeAll(buf[0 .. http.http2_frame.HEADER_LEN + payload.len]);
+        }
+
+        pub fn writeAll(self: Writer, bytes: []const u8) !void {
+            var off: usize = 0;
+            while (off < bytes.len) {
+                const n = std.c.write(self.conn.fd, bytes[off..].ptr, bytes.len - off);
+                if (n >= 0) {
+                    off += @intCast(n);
+                    continue;
+                }
+                if (std.posix.errno(n) == .INTR) continue;
+                return error.SocketWriteFailed;
+            }
+        }
+    };
+
+    fn readFrame(self: *TestH2Client, allocator: std.mem.Allocator) !http.http2_frame.Frame {
+        return http.http2_frame.readFrame(self, allocator, HTTP2_MAX_FRAME_SIZE);
+    }
+
+    fn sendHeaders(self: *TestH2Client, allocator: std.mem.Allocator, stream_id: u31, end_stream: bool, headers: []const http.hpack.HeaderField) !void {
+        const block = try http.hpack.encodeLiteralHeaderBlock(allocator, headers);
+        defer allocator.free(block);
+        const flags: u8 = http.http2_frame.Flags.END_HEADERS | (if (end_stream) http.http2_frame.Flags.END_STREAM else 0);
+        try http.http2_frame.writeFrame(self.writer(), .headers, flags, stream_id, block);
+    }
+
+    fn sendData(self: *TestH2Client, stream_id: u31, end_stream: bool, payload: []const u8) !void {
+        const flags: u8 = if (end_stream) http.http2_frame.Flags.END_STREAM else 0;
+        try http.http2_frame.writeFrame(self.writer(), .data, flags, stream_id, payload);
+    }
+};
+
+/// Internal/test-only `H2SessionTestHook` consumer for the live tests below:
+/// a real worker thread that drives only the production `Session` API
+/// (never the connection/socket), echoing inbound bytes back out and
+/// finishing/detaching once the remote half closes or the session settles.
+const LiveSessionHookCtx = struct {
+    allocator: std.mem.Allocator,
+    attach_path: []const u8,
+    consumer_thread: ?std.Thread = null,
+
+    fn shouldAttach(raw: ?*anyopaque, ps: *const Http2PendingStream) bool {
+        const self: *LiveSessionHookCtx = @ptrCast(@alignCast(raw.?));
+        const path = ps.path orelse return false;
+        return std.mem.eql(u8, path, self.attach_path);
+    }
+
+    fn attach(raw: ?*anyopaque, session: *http.h2_stream_session.Session) void {
+        const self: *LiveSessionHookCtx = @ptrCast(@alignCast(raw.?));
+        self.consumer_thread = std.Thread.spawn(.{}, runEchoConsumer, .{ self, session }) catch @panic("consumer spawn failed");
+    }
+
+    fn runEchoConsumer(self: *LiveSessionHookCtx, session: *http.h2_stream_session.Session) void {
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            switch (session.read(&buf)) {
+                .data => |n| _ = session.write(buf[0..n]) catch break,
+                else => break,
+            }
+        }
+        session.finishLocal();
+        if (session.consumerDetach()) {
+            session.deinit();
+            self.allocator.destroy(session);
+        }
+    }
+};
+
+/// Internal/test-only `H2SessionTestHook` consumer that never reads: it
+/// captures the attached session but leaves its consumer side permanently
+/// stalled, so a live test can send inbound DATA that is charged against the
+/// connection receive window yet never drained before the stream resets.
+const StallingSessionHookCtx = struct {
+    attach_path: []const u8,
+    session: ?*http.h2_stream_session.Session = null,
+
+    fn shouldAttach(raw: ?*anyopaque, ps: *const Http2PendingStream) bool {
+        const self: *StallingSessionHookCtx = @ptrCast(@alignCast(raw.?));
+        const path = ps.path orelse return false;
+        return std.mem.eql(u8, path, self.attach_path);
+    }
+
+    fn attach(raw: ?*anyopaque, session: *http.h2_stream_session.Session) void {
+        const self: *StallingSessionHookCtx = @ptrCast(@alignCast(raw.?));
+        self.session = session;
+    }
+};
+
+/// Internal/test-only `H2SessionTestHook` consumer whose worker thread spins
+/// without reading until the test flips `released`, then falls back to the
+/// same echo loop as `LiveSessionHookCtx`. Lets a live test fill a session's
+/// inbound queue up to its advertised window with a genuinely idle consumer
+/// before proving consumption (and WINDOW_UPDATE emission) resumes cleanly.
+const DelayedLiveSessionHookCtx = struct {
+    allocator: std.mem.Allocator,
+    attach_path: []const u8,
+    released: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    consumer_thread: ?std.Thread = null,
+
+    fn shouldAttach(raw: ?*anyopaque, ps: *const Http2PendingStream) bool {
+        const self: *DelayedLiveSessionHookCtx = @ptrCast(@alignCast(raw.?));
+        const path = ps.path orelse return false;
+        return std.mem.eql(u8, path, self.attach_path);
+    }
+
+    fn attach(raw: ?*anyopaque, session: *http.h2_stream_session.Session) void {
+        const self: *DelayedLiveSessionHookCtx = @ptrCast(@alignCast(raw.?));
+        self.consumer_thread = std.Thread.spawn(.{}, runDelayedEchoConsumer, .{ self, session }) catch @panic("consumer spawn failed");
+    }
+
+    fn runDelayedEchoConsumer(self: *DelayedLiveSessionHookCtx, session: *http.h2_stream_session.Session) void {
+        while (!self.released.load(.acquire)) std.Io.sleep(compat.io(), .fromMilliseconds(1), .awake) catch {};
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            switch (session.read(&buf)) {
+                .data => |n| _ = session.write(buf[0..n]) catch break,
+                else => break,
+            }
+        }
+        session.finishLocal();
+        if (session.consumerDetach()) {
+            session.deinit();
+            self.allocator.destroy(session);
+        }
+    }
+};
+
+/// Internal/test-only `H2SessionTestHook` consumer for the live churn test:
+/// unlike `LiveSessionHookCtx`, `attach` can fire many times on one
+/// connection (one #867 session per churn iteration), so every spawned
+/// worker thread is collected for the test to join instead of overwriting a
+/// single `consumer_thread` field and leaking earlier threads' handles.
+const ChurnSessionHookCtx = struct {
+    allocator: std.mem.Allocator,
+    attach_path: []const u8,
+    mutex: compat.Mutex = .{},
+    consumer_threads: std.array_list.Managed(std.Thread),
+
+    fn init(allocator: std.mem.Allocator, attach_path: []const u8) ChurnSessionHookCtx {
+        return .{ .allocator = allocator, .attach_path = attach_path, .consumer_threads = std.array_list.Managed(std.Thread).init(allocator) };
+    }
+
+    fn deinit(self: *ChurnSessionHookCtx) void {
+        self.consumer_threads.deinit();
+    }
+
+    /// Idempotent: clears the list after joining so a failure-path
+    /// `errdefer` call and the normal trailing call never join the same
+    /// handle twice, which is undefined behavior.
+    fn joinAll(self: *ChurnSessionHookCtx) void {
+        for (self.consumer_threads.items) |t| t.join();
+        self.consumer_threads.clearRetainingCapacity();
+    }
+
+    fn shouldAttach(raw: ?*anyopaque, ps: *const Http2PendingStream) bool {
+        const self: *ChurnSessionHookCtx = @ptrCast(@alignCast(raw.?));
+        const path = ps.path orelse return false;
+        return std.mem.eql(u8, path, self.attach_path);
+    }
+
+    fn attach(raw: ?*anyopaque, session: *http.h2_stream_session.Session) void {
+        const self: *ChurnSessionHookCtx = @ptrCast(@alignCast(raw.?));
+        const t = std.Thread.spawn(.{}, runEchoConsumer, .{ self, session }) catch @panic("consumer spawn failed");
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.consumer_threads.append(t) catch @panic("consumer thread list append failed");
+    }
+
+    fn runEchoConsumer(self: *ChurnSessionHookCtx, session: *http.h2_stream_session.Session) void {
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            switch (session.read(&buf)) {
+                .data => |n| _ = session.write(buf[0..n]) catch break,
+                else => break,
+            }
+        }
+        session.finishLocal();
+        if (session.consumerDetach()) {
+            session.deinit();
+            self.allocator.destroy(session);
+        }
+    }
+};
+
+const LiveH2ServerCtx = struct {
+    adapter: *WaitingEncryptedHttpConnection,
+    session: *ConnectionSession,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    result: anyerror!void = undefined,
+
+    fn run(self: *LiveH2ServerCtx) void {
+        self.result = handleHttp2Connection(self.adapter, self.session, self.cfg, self.state, "127.0.0.1");
+        // A server-side error must surface as client EOF rather than leave a
+        // blocking client read hanging forever on a half-dead socket.
+        _ = std.c.shutdown(self.adapter.inner.rawFd(), std.c.SHUT.RDWR);
+    }
+};
+
+test "H2 live session: bidirectional DATA, sibling dispatch, window exhaustion/recovery, and GOAWAY teardown (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    // Client preface + an (empty) SETTINGS frame, matching RFC 9113 §3.4.
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+
+    // The server's initial SETTINGS includes SETTINGS_INITIAL_WINDOW_SIZE =
+    // 1MiB (see `handleHttp2Connection`), so stream 1's ~100KB inbound echo
+    // below never needs a client-side WINDOW_UPDATE of its own.
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    // The server also ACKs the client's own initial SETTINGS frame sent
+    // above -- a second, distinct settings-direction frame that must be
+    // read and discarded before anything else.
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    // Attach a persistent session on stream 1 and confirm the immediate
+    // 200 response HEADERS the runtime sends on the session's behalf.
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
+    try std.testing.expectEqual(@as(u31, 1), session_headers.stream_id);
+
+    // A sibling ordinary request keeps completing while the session is
+    // active -- #867's central acceptance criterion.
+    try client.sendHeaders(allocator, 3, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+
+    // ~100,000 bytes of session DATA: comfortably under the session's own
+    // bounded queues and the 1MiB *per-stream* inbound window the server
+    // just advertised, but well over the *connection*-level receive window,
+    // which RFC 9113 §6.9.2 fixes at 65,535 bytes regardless of any SETTINGS
+    // value, so our own send thread below must pace itself on that credit
+    // exactly as a real compliant client would.
+    const total_bytes: usize = 100_000;
+    var expected = try std.array_list.Managed(u8).initCapacity(allocator, total_bytes);
+    defer expected.deinit();
+    for (0..total_bytes) |i| try expected.append(@intCast((i % 26) + 'a'));
+
+    // Sent from its own thread: the client's kernel socket buffer for this
+    // direction is far smaller than 100,000 bytes, and the server's own
+    // echo is deliberately left undrained below until the window-exhaustion
+    // assertion runs. Blasting all of this from the main thread while also
+    // leaving the server's reply unread would deadlock both sides on a full
+    // write buffer; a real H2 client's read and write paths are similarly
+    // independent. `send_credit` is fed by the main thread's read loops
+    // below as stream-0 WINDOW_UPDATE frames actually arrive from the
+    // server, so this never sends more than the connection-level window the
+    // server has actually granted. Sending straight out of `expected` (the
+    // full precomputed payload) rather than repeatedly re-slicing a small
+    // fixed template from offset 0 keeps every byte correct regardless of
+    // how credit-limited chunk sizes happen to land relative to any
+    // template period.
+    var send_credit = TestConnSendCredit{};
+    const SendCtx = struct {
+        client: *TestH2Client,
+        send_buf: []const u8,
+        credit: *TestConnSendCredit,
+        result: anyerror!void = {},
+
+        fn run(self: *@This()) void {
+            var sent: usize = 0;
+            while (sent < self.send_buf.len) {
+                const want = @min(HTTP2_MAX_FRAME_SIZE, self.send_buf.len - sent);
+                const n = self.credit.take(want) orelse return;
+                self.result = self.client.sendData(1, false, self.send_buf[sent .. sent + n]);
+                self.result catch return;
+                sent += n;
+            }
+        }
+    };
+    var send_ctx = SendCtx{ .client = &client, .send_buf = expected.items, .credit = &send_credit };
+    var send_thread: ?std.Thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
+    // `send_thread` can be parked indefinitely inside `send_credit.take`, or
+    // blocked in a real blocking `write()` on `client_fd` once the kernel
+    // socket buffer fills; unlike the server/consumer threads, neither
+    // closing the server socket nor `cancelAndBroadcast` alone wakes the
+    // latter case, so a failed assertion below must shut down both sockets
+    // before joining, or this join can hang forever on the about-to-be-
+    // destroyed stack (`send_ctx`/`send_credit`/`client`/`expected`).
+    errdefer testShutdownAndJoinSenderOnFailure(server_fd, client_fd, &send_credit, &send_thread, &server_thread, &hook_ctx.consumer_thread);
+
+    // Read every frame the server has sent so far without granting any
+    // more send credit yet: the sibling response (stream 3) must already
+    // be there, and the session's echo (stream 1) must have stalled at
+    // exactly the 65,535-byte default send window.
+    var echoed = std.array_list.Managed(u8).init(allocator);
+    defer echoed.deinit();
+    var saw_ordinary_response = false;
+    var frames_read: usize = 0;
+    // The 65,535-byte default connection send window is shared by every
+    // stream, so the sibling's own response body counts against it too:
+    // stall detection is on total DATA payload, not stream 1's alone.
+    var conn_data_bytes: usize = 0;
+    while (conn_data_bytes < 65_535) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.typ == .data) conn_data_bytes += frame.payload.len;
+        testGrantIfConnSendCredit(&frame, &send_credit);
+        if (frame.stream_id == 3) {
+            // The ordinary response is a HEADERS frame followed by a DATA
+            // frame (empty-bodied responses still send one, carrying
+            // END_STREAM); either is expected here.
+            try std.testing.expect(frame.typ == .headers or frame.typ == .data);
+            saw_ordinary_response = true;
+        } else if (frame.stream_id == 1 and frame.typ == .data) {
+            try echoed.appendSlice(frame.payload);
+        }
+        frames_read += 1;
+        if (frames_read > 10_000) return error.TestFrameBudgetExceeded;
+    }
+    try std.testing.expect(saw_ordinary_response);
+    try std.testing.expectEqual(@as(usize, 65_535), conn_data_bytes);
+    try std.testing.expect(echoed.items.len > 0 and echoed.items.len <= 65_535);
+    const stalled_at = echoed.items.len;
+
+    // Grant the rest of the send credit; the remaining echoed bytes arrive
+    // once the server's wake-fd-driven session drain resumes.
+    try http.http2_frame.writeWindowUpdate(client.writer(), 1, @intCast(total_bytes - 65_535));
+    try http.http2_frame.writeWindowUpdate(client.writer(), 0, @intCast(total_bytes - stalled_at));
+    while (echoed.items.len < total_bytes) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.stream_id == 1 and frame.typ == .data) try echoed.appendSlice(frame.payload);
+        testGrantIfConnSendCredit(&frame, &send_credit);
+        frames_read += 1;
+        if (frames_read > 20_000) return error.TestFrameBudgetExceeded;
+    }
+    try std.testing.expectEqualSlices(u8, expected.items, echoed.items);
+    testJoinOnce(&send_thread);
+    try send_ctx.result;
+
+    // GOAWAY (without ever ending stream 1 locally) proves connection-wide
+    // teardown settles a still-active session and wakes its blocked
+    // consumer, instead of leaking it.
+    try http.http2_frame.writeGoaway(client.writer(), 3, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live session: client RST_STREAM settles the consumer without leaking or dropping the connection (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
+
+    try http.http2_frame.writeRstStream(client.writer(), 1, http.http2_stream.ErrorCode.cancel.value());
+
+    // A fresh ordinary request on a new stream proves the connection (and
+    // its frame loop) survives the reset instead of tearing the whole
+    // connection down.
+    try client.sendHeaders(allocator, 3, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var ordinary_response = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &ordinary_response);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, ordinary_response.typ);
+    try std.testing.expectEqual(@as(u31, 3), ordinary_response.stream_id);
+
+    try http.http2_frame.writeGoaway(client.writer(), 3, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live RST_STREAM on a stalled session returns the abandoned connection receive credit (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = StallingSessionHookCtx{ .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = StallingSessionHookCtx.shouldAttach,
+        .attach = StallingSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinServerOnFailure(server_fd, &server_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
+
+    // The stalling consumer never reads, so this payload sits unread in the
+    // session's inbound queue -- already charged against the connection's
+    // receive window -- when the client resets the stream. Its size is
+    // deliberately large relative to the connection's default 65,535-byte
+    // receive window: if the refund below ever stops updating this
+    // connection's local `conn_recv_window` counter (while still crediting
+    // the peer via WINDOW_UPDATE), the sibling request after it would be
+    // spuriously rejected as a flow-control violation even though the peer
+    // legitimately still has that credit.
+    const unread_payload = try allocator.alloc(u8, 50_000);
+    defer allocator.free(unread_payload);
+    @memset(unread_payload, 'a');
+    {
+        var sent: usize = 0;
+        while (sent < unread_payload.len) {
+            const n = @min(HTTP2_MAX_FRAME_SIZE, unread_payload.len - sent);
+            try client.sendData(1, false, unread_payload[sent .. sent + n]);
+            sent += n;
+        }
+    }
+
+    try http.http2_frame.writeRstStream(client.writer(), 1, http.http2_stream.ErrorCode.cancel.value());
+
+    // The connection must get that credit back via a stream-0-only
+    // WINDOW_UPDATE once the stream is gone, rather than lose it forever.
+    var window_update = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &window_update);
+    try std.testing.expectEqual(http.http2_frame.Type.window_update, window_update.typ);
+    try std.testing.expectEqual(@as(u31, 0), window_update.stream_id);
+    const increment = std.mem.readInt(u32, window_update.payload[0..4], .big) & 0x7FFF_FFFF;
+    try std.testing.expectEqual(@as(u32, @intCast(unread_payload.len)), increment);
+
+    // A fresh ordinary request on a new stream, carrying a real DATA body
+    // too large to fit in what the connection receive window would be if
+    // the refund above had not actually been applied to `conn_recv_window`
+    // (65,535 - 50,000 = 15,535 remaining), but well within the window the
+    // peer was actually just credited back up to (65,535). This proves the
+    // connection (and its frame loop) survives the reset, and that an
+    // unrelated sibling keeps making progress after the credit refund,
+    // rather than being wrongly reset/GOAWAY'd for a flow-control
+    // violation that never really happened.
+    const sibling_body = try allocator.alloc(u8, 30_000);
+    defer allocator.free(sibling_body);
+    @memset(sibling_body, 'b');
+    try client.sendHeaders(allocator, 3, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    {
+        var sent: usize = 0;
+        while (sent < sibling_body.len) {
+            const n = @min(HTTP2_MAX_FRAME_SIZE, sibling_body.len - sent);
+            sent += n;
+            try client.sendData(3, sent == sibling_body.len, sibling_body[sent - n .. sent]);
+        }
+    }
+    // Each inbound DATA chunk above earns its own stream/connection
+    // WINDOW_UPDATE pair for the ordinary (non-session) body path, so skip
+    // over those before the actual response HEADERS.
+    var ordinary_response: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.stream_id == 3 and frame.typ == .headers) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
+    defer http.http2_frame.deinitFrame(allocator, &ordinary_response);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, ordinary_response.typ);
+    try std.testing.expectEqual(@as(u31, 3), ordinary_response.stream_id);
+
+    try http.http2_frame.writeGoaway(client.writer(), 3, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+
+    // The stalling hook never attached a consumer worker, so the runtime
+    // side's detach inside `h2ResetStreamState` is the only side that ever
+    // detaches; simulate the consumer's final detach here so the test frees
+    // the session without leaking.
+    const session = hook_ctx.session orelse return error.SessionNeverAttached;
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqual(http.h2_stream_session.ReadResult{ .reset = .cancel }, session.read(&buf));
+    if (session.consumerDetach()) {
+        session.deinit();
+        allocator.destroy(session);
+    }
+}
+
+test "H2 live: an over-budget second session is refused at stream scope while the first session and a sibling GET stay alive (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    // One session reserves `HTTP2_SESSION_RESERVED_BYTES` (~1.25 MiB); size
+    // the budget to admit exactly one and refuse a second.
+    cfg.max_connection_memory_bytes = 1_400_000;
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var first_session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &first_session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, first_session_headers.typ);
+    try std.testing.expectEqual(@as(u31, 1), first_session_headers.stream_id);
+
+    // A second session on a fresh stream cannot be admitted under the
+    // connection budget. It must be refused at stream scope (RST_STREAM),
+    // never torn down with a connection-wide GOAWAY that would also kill
+    // the first, already-healthy session.
+    try client.sendHeaders(allocator, 3, true, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var refusal = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &refusal);
+    try std.testing.expectEqual(http.http2_frame.Type.rst_stream, refusal.typ);
+    try std.testing.expectEqual(@as(u31, 3), refusal.stream_id);
+    const refusal_code = std.mem.readInt(u32, refusal.payload[0..4], .big);
+    try std.testing.expectEqual(http.http2_stream.ErrorCode.refused_stream.value(), refusal_code);
+
+    // An ordinary sibling request on yet another stream proves the
+    // connection (and its dispatcher) is still alive and multiplexing.
+    try client.sendHeaders(allocator, 5, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var ordinary_response = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &ordinary_response);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, ordinary_response.typ);
+    try std.testing.expectEqual(@as(u31, 5), ordinary_response.stream_id);
+
+    // The first session is still live: DATA sent on it is still echoed
+    // back, proving the refused second session never tore down the first.
+    // The ordinary GET response above may still have a trailing DATA frame
+    // (even empty-bodied END_STREAM responses send one) in flight on
+    // stream 5, so skip over it rather than assuming the very next frame
+    // is the echo.
+    try client.sendData(1, false, "still-alive");
+    var echoed: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.stream_id == 1 and frame.typ == .data) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
+    defer http.http2_frame.deinitFrame(allocator, &echoed);
+    try std.testing.expectEqualStrings("still-alive", echoed.payload);
+
+    try http.http2_frame.writeGoaway(client.writer(), 5, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live: DATA already in flight on a just-refused stream is tolerated with a live sibling, but DATA on a truly idle stream still ends the connection (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    // One session reserves `HTTP2_SESSION_RESERVED_BYTES` (~1.25 MiB); size
+    // the budget to admit exactly one and refuse a second, so stream 3 is
+    // refused at stream scope below rather than ever being admitted.
+    cfg.max_connection_memory_bytes = 1_400_000;
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var first_session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &first_session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, first_session_headers.typ);
+    try std.testing.expectEqual(@as(u31, 1), first_session_headers.stream_id);
+
+    // A second session on a fresh stream cannot be admitted under the
+    // connection budget and is refused at stream scope.
+    try client.sendHeaders(allocator, 3, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var refusal = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &refusal);
+    try std.testing.expectEqual(http.http2_frame.Type.rst_stream, refusal.typ);
+    try std.testing.expectEqual(@as(u31, 3), refusal.stream_id);
+
+    // DATA for stream 3 that was already in flight from the client when our
+    // RST_STREAM(REFUSED_STREAM) arrived: `h2ResetStreamState` has already
+    // removed stream 3 from every map (RFC 9113 §5.1 still requires
+    // tolerating frames already in flight for it), so this must be
+    // discriminated from a brand-new idle-stream violation rather than
+    // tearing down the whole connection with GOAWAY.
+    try client.sendData(3, true, "already in flight");
+
+    // The connection (and dispatcher) must still be alive: an ordinary
+    // sibling request on yet another stream completes normally. Skip any
+    // incidental connection-level WINDOW_UPDATE the discarded DATA above
+    // earns back before the response headers arrive.
+    try client.sendHeaders(allocator, 5, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var ordinary_response: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.stream_id == 5 and frame.typ == .headers) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
+    defer http.http2_frame.deinitFrame(allocator, &ordinary_response);
+
+    // The first session is still live too: DATA sent on it is still echoed
+    // back, proving the tolerated post-refusal DATA never tore it down.
+    try client.sendData(1, false, "still-alive");
+    var echoed: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.stream_id == 1 and frame.typ == .data) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
+    defer http.http2_frame.deinitFrame(allocator, &echoed);
+    try std.testing.expectEqualStrings("still-alive", echoed.payload);
+
+    // By contrast, DATA on a stream the client never opened with HEADERS at
+    // all is a genuine idle-stream violation (RFC 9113 §5.1) and must still
+    // tear down the whole connection with a connection-level GOAWAY.
+    try client.sendData(99, true, "never opened");
+    var goaway: http.http2_frame.Frame = undefined;
+    var frames_read: usize = 0;
+    while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.typ == .goaway) {
+            goaway = frame;
+            break;
+        }
+        http.http2_frame.deinitFrame(allocator, &frame);
+        frames_read += 1;
+        if (frames_read > 100) return error.TestFrameBudgetExceeded;
+    }
+    defer http.http2_frame.deinitFrame(allocator, &goaway);
+    try std.testing.expectEqual(@as(u32, http.http2_stream.ErrorCode.protocol_error.value()), std.mem.readInt(u32, goaway.payload[4..8], .big));
+
+    testJoinOnce(&server_thread);
+    try std.testing.expectError(error.InvalidHttp2StreamId, server_ctx.result);
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live: repeated over-budget session refusals retire their stream bookkeeping instead of exhausting the concurrent-stream limit (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    // One session reserves `HTTP2_SESSION_RESERVED_BYTES` (~1.25 MiB); size
+    // the budget to admit exactly one and refuse every one after it.
+    cfg.max_connection_memory_bytes = 1_400_000;
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var first_session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &first_session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, first_session_headers.typ);
+
+    // Refuse well past `HTTP2_MAX_CONCURRENT_STREAMS` (100): if a refused
+    // attach left its `.closed` entry behind in `streams`, this alone would
+    // exhaust the connection-wide admission guard and force a GOAWAY on the
+    // healthy sibling request below.
+    var stream_id: u31 = 3;
+    var refusals: usize = 0;
+    while (refusals < 150) : (refusals += 1) {
+        try client.sendHeaders(allocator, stream_id, true, &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = "/session" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "test.local" },
+        });
+        var refusal = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &refusal);
+        try std.testing.expectEqual(http.http2_frame.Type.rst_stream, refusal.typ);
+        try std.testing.expectEqual(stream_id, refusal.stream_id);
+        const refusal_code = std.mem.readInt(u32, refusal.payload[0..4], .big);
+        try std.testing.expectEqual(http.http2_stream.ErrorCode.refused_stream.value(), refusal_code);
+        stream_id += 2;
+    }
+
+    // A fresh, ordinary sibling request proves admission still works: it
+    // must get an answer, not a connection-wide GOAWAY from a saturated
+    // `streams` map full of stale refusals.
+    try client.sendHeaders(allocator, stream_id, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var ordinary_response = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &ordinary_response);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, ordinary_response.typ);
+    try std.testing.expectEqual(stream_id, ordinary_response.stream_id);
+
+    try http.http2_frame.writeGoaway(client.writer(), stream_id, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live: stream-only send-window exhaustion stalls independently of connection credit, resumed by a stream-only WINDOW_UPDATE (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    // A tiny SETTINGS_INITIAL_WINDOW_SIZE applies to every stream opened
+    // after this, independent of the connection-level send window (which
+    // RFC 9113 fixes at 65,535 until grown by a stream-0 WINDOW_UPDATE).
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{.{ 4, 4096 }});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
+
+    const total_bytes: usize = 6_000;
+    var send_buf: [6_000]u8 = undefined;
+    for (&send_buf, 0..) |*b, i| b.* = @intCast((i % 26) + 'a');
+    try client.sendData(1, false, &send_buf);
+
+    // Stream 1's send window is 4,096 bytes (from the SETTINGS above); the
+    // connection-level window is still the full 65,535-byte default, so
+    // nothing here should ever block on connection credit.
+    var echoed = std.array_list.Managed(u8).init(allocator);
+    defer echoed.deinit();
+    var frames_read: usize = 0;
+    while (echoed.items.len < 4_096) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.stream_id == 1 and frame.typ == .data) try echoed.appendSlice(frame.payload);
+        frames_read += 1;
+        if (frames_read > 1_000) return error.TestFrameBudgetExceeded;
+    }
+    try std.testing.expectEqual(@as(usize, 4_096), echoed.items.len);
+
+    // Negative control: granting more *connection* credit does nothing,
+    // because connection credit was never the bottleneck here. (A benign
+    // receive-direction WINDOW_UPDATE may still arrive as the consumer
+    // drains inbound bytes -- that's unrelated to this outbound stall.)
+    try http.http2_frame.writeWindowUpdate(client.writer(), 0, 50_000);
+    try testDrainStreamDataFor(&client, allocator, 1, &echoed, 200, null);
+    try std.testing.expectEqual(@as(usize, 4_096), echoed.items.len);
+
+    // Positive control: granting the missing *stream* credit resumes it.
+    try http.http2_frame.writeWindowUpdate(client.writer(), 1, @intCast(total_bytes - 4_096));
+    while (echoed.items.len < total_bytes) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.stream_id == 1 and frame.typ == .data) try echoed.appendSlice(frame.payload);
+        frames_read += 1;
+        if (frames_read > 2_000) return error.TestFrameBudgetExceeded;
+    }
+    try std.testing.expectEqualSlices(u8, &send_buf, echoed.items);
+
+    try http.http2_frame.writeGoaway(client.writer(), 1, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live: connection-only send-window exhaustion stalls independently of stream credit, resumed by a connection-only WINDOW_UPDATE (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    // A large per-stream initial window keeps stream credit far above what
+    // this test ever sends; only the fixed 65,535-byte connection window
+    // (unaffected by SETTINGS_INITIAL_WINDOW_SIZE) can be the bottleneck.
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{.{ 4, 200_000 }});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
+
+    const total_bytes: usize = 100_000;
+    var expected = try std.array_list.Managed(u8).initCapacity(allocator, total_bytes);
+    defer expected.deinit();
+    for (0..total_bytes) |i| try expected.append(@intCast((i % 26) + 'a'));
+
+    // The connection-level receive window the server advertises to us is
+    // fixed at the RFC 9113 §6.9.2 default of 65,535 bytes (SETTINGS
+    // INITIAL_WINDOW_SIZE only raises the *per-stream* window); pace our own
+    // send thread on that credit, exactly as a real compliant client must,
+    // rather than relying on the kernel socket buffer to mask the
+    // difference. Sending straight out of `expected` (the full precomputed
+    // payload) rather than repeatedly re-slicing a small fixed template from
+    // offset 0 keeps every byte correct regardless of how credit-limited
+    // chunk sizes happen to land relative to any template period.
+    var send_credit = TestConnSendCredit{};
+    const SendCtx = struct {
+        client: *TestH2Client,
+        send_buf: []const u8,
+        credit: *TestConnSendCredit,
+        result: anyerror!void = {},
+
+        fn run(self: *@This()) void {
+            var sent: usize = 0;
+            while (sent < self.send_buf.len) {
+                const want = @min(HTTP2_MAX_FRAME_SIZE, self.send_buf.len - sent);
+                const n = self.credit.take(want) orelse return;
+                self.result = self.client.sendData(1, false, self.send_buf[sent .. sent + n]);
+                self.result catch return;
+                sent += n;
+            }
+        }
+    };
+    var send_ctx = SendCtx{ .client = &client, .send_buf = expected.items, .credit = &send_credit };
+    var send_thread: ?std.Thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
+    // `send_thread` can be parked indefinitely inside `send_credit.take`, or
+    // blocked in a real blocking `write()` on `client_fd` once the kernel
+    // socket buffer fills; unlike the server/consumer threads, neither
+    // closing the server socket nor `cancelAndBroadcast` alone wakes the
+    // latter case, so a failed assertion below must shut down both sockets
+    // before joining, or this join can hang forever on the about-to-be-
+    // destroyed stack (`send_ctx`/`send_credit`/`client`/`expected`).
+    errdefer testShutdownAndJoinSenderOnFailure(server_fd, client_fd, &send_credit, &send_thread, &server_thread, &hook_ctx.consumer_thread);
+
+    var echoed = std.array_list.Managed(u8).init(allocator);
+    defer echoed.deinit();
+    var frames_read: usize = 0;
+    while (echoed.items.len < 65_535) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.stream_id == 1 and frame.typ == .data) try echoed.appendSlice(frame.payload);
+        testGrantIfConnSendCredit(&frame, &send_credit);
+        frames_read += 1;
+        if (frames_read > 10_000) return error.TestFrameBudgetExceeded;
+    }
+    try std.testing.expectEqual(@as(usize, 65_535), echoed.items.len);
+
+    // Negative control: granting more *stream* credit does nothing, because
+    // the connection-level window (not stream credit) is the bottleneck. (A
+    // benign receive-direction WINDOW_UPDATE may still arrive as the
+    // consumer drains inbound bytes -- that's unrelated to this outbound
+    // stall, and the background SendCtx thread keeps feeding it more.)
+    try http.http2_frame.writeWindowUpdate(client.writer(), 1, 50_000);
+    try testDrainStreamDataFor(&client, allocator, 1, &echoed, 200, &send_credit);
+    try std.testing.expectEqual(@as(usize, 65_535), echoed.items.len);
+
+    // Positive control: a connection-only WINDOW_UPDATE resumes it.
+    try http.http2_frame.writeWindowUpdate(client.writer(), 0, @intCast(total_bytes - 65_535));
+    while (echoed.items.len < total_bytes) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.stream_id == 1 and frame.typ == .data) try echoed.appendSlice(frame.payload);
+        testGrantIfConnSendCredit(&frame, &send_credit);
+        frames_read += 1;
+        if (frames_read > 20_000) return error.TestFrameBudgetExceeded;
+    }
+    try std.testing.expectEqualSlices(u8, expected.items, echoed.items);
+    testJoinOnce(&send_thread);
+    try send_ctx.result;
+
+    try http.http2_frame.writeGoaway(client.writer(), 1, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live: a stalled consumer can receive DATA up to the full advertised window without a premature reset, then resumes (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = DelayedLiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = DelayedLiveSessionHookCtx.shouldAttach,
+        .attach = DelayedLiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    // The server's advertised per-stream window must match the session's
+    // own inbound capacity exactly: a mismatch is the defect this test
+    // guards against (a well-behaved peer getting reset inside its own
+    // granted window).
+    const advertised_window = try http.http2_frame.parseSettingsInitialWindowSize(server_settings.payload);
+    try std.testing.expectEqual(@as(?u32, @intCast(HTTP2_SESSION_MAX_INBOUND_BYTES)), advertised_window);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
+
+    // Send exactly the connection-level receive window (RFC 9113 §6.9.2
+    // fixes this at 65,535 regardless of any SETTINGS value) while the
+    // consumer is still idle. `HTTP2_SESSION_MAX_INBOUND_BYTES` only raises
+    // the *per-stream* window the server advertised via SETTINGS
+    // INITIAL_WINDOW_SIZE; a compliant client may not send more than this
+    // on the connection as a whole until it is credited back, so sending
+    // the larger per-stream figure here would itself be a protocol
+    // violation rather than the "well-behaved peer" this test means to
+    // exercise.
+    const window_bytes: usize = 65_535;
+    var chunk: [16 * 1024]u8 = undefined;
+    for (&chunk, 0..) |*b, i| b.* = @intCast((i % 26) + 'a');
+    var sent: usize = 0;
+    while (sent < window_bytes) {
+        const n = @min(chunk.len, window_bytes - sent);
+        try client.sendData(1, false, chunk[0..n]);
+        sent += n;
+    }
+
+    // No RST_STREAM (or anything else) should have arrived: this is all
+    // legal, in-window traffic against a merely slow consumer.
+    try testExpectNoFrameArrives(client_fd, 200);
+
+    // Let the consumer start draining; it echoes back exactly what it
+    // reads, so the first bytes to arrive must match what was sent first.
+    hook_ctx.released.store(true, .release);
+
+    var expected = try std.array_list.Managed(u8).initCapacity(allocator, 65_535);
+    defer expected.deinit();
+    {
+        var built: usize = 0;
+        while (built < 65_535) {
+            const n = @min(chunk.len, 65_535 - built);
+            try expected.appendSlice(chunk[0..n]);
+            built += n;
+        }
+    }
+
+    var echoed = std.array_list.Managed(u8).init(allocator);
+    defer echoed.deinit();
+    var frames_read: usize = 0;
+    // The default 65,535-byte send window bounds this without needing any
+    // further WINDOW_UPDATE from the client.
+    while (echoed.items.len < 65_535) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.stream_id == 1 and frame.typ == .data) try echoed.appendSlice(frame.payload);
+        frames_read += 1;
+        if (frames_read > 10_000) return error.TestFrameBudgetExceeded;
+    }
+    try std.testing.expectEqualSlices(u8, expected.items, echoed.items);
+
+    try http.http2_frame.writeGoaway(client.writer(), 1, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live: DATA beyond the advertised connection-level receive window is a flow-control GOAWAY (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = DelayedLiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = DelayedLiveSessionHookCtx.shouldAttach,
+        .attach = DelayedLiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
+
+    // One byte past the connection-level receive window -- fixed at 65,535
+    // by RFC 9113 §6.9.2 regardless of any SETTINGS value -- while the
+    // consumer never reads. `HTTP2_SESSION_MAX_INBOUND_BYTES` only bounds
+    // this session's *per-stream* queue and cannot by itself detect this;
+    // this is the real protocol violation the connection-level counter must
+    // catch instead.
+    var chunk: [16 * 1024]u8 = undefined;
+    for (&chunk, 0..) |*b, i| b.* = @intCast((i % 26) + 'a');
+    const over_budget: usize = 65_536;
+    var sent: usize = 0;
+    while (sent < over_budget) {
+        const n = @min(chunk.len, over_budget - sent);
+        try client.sendData(1, false, chunk[0..n]);
+        sent += n;
+    }
+
+    var goaway: http.http2_frame.Frame = undefined;
+    var frames_read: usize = 0;
+    while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.typ == .goaway) {
+            goaway = frame;
+            break;
+        }
+        http.http2_frame.deinitFrame(allocator, &frame);
+        frames_read += 1;
+        if (frames_read > 100) return error.TestFrameBudgetExceeded;
+    }
+    defer http.http2_frame.deinitFrame(allocator, &goaway);
+    try std.testing.expectEqual(@as(u32, http.http2_stream.ErrorCode.flow_control_error.value()), std.mem.readInt(u32, goaway.payload[4..8], .big));
+
+    hook_ctx.released.store(true, .release);
+    testJoinOnce(&server_thread);
+    try std.testing.expectError(error.Http2FlowControlError, server_ctx.result);
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live: a stalled client reader does not unbound the session's outbound memory, and recovers once it reads (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
+
+    // Grant generous send credit up front on the *outbound* (server-to-us
+    // echo) direction so protocol-level flow control is never the
+    // bottleneck there: the only thing that can bound the session's
+    // retained memory while the client reads nothing is its own
+    // `max_outbound_bytes` queue cap (well under this payload). This is a
+    // separate direction from our own *inbound* (us-to-server) sends below,
+    // which remain bound by the server's fixed 65,535-byte connection
+    // receive window and must be paced on `send_credit` like every other
+    // live test here.
+    const total_bytes: usize = 600_000;
+    try http.http2_frame.writeWindowUpdate(client.writer(), 0, @intCast(total_bytes));
+    try http.http2_frame.writeWindowUpdate(client.writer(), 1, @intCast(total_bytes));
+
+    var expected = try std.array_list.Managed(u8).initCapacity(allocator, total_bytes);
+    defer expected.deinit();
+    for (0..total_bytes) |i| try expected.append(@intCast((i % 26) + 'a'));
+
+    // Sending straight out of `expected` (the full precomputed payload)
+    // rather than repeatedly re-slicing a small fixed template from offset 0
+    // keeps every byte correct regardless of how credit-limited chunk sizes
+    // happen to land relative to any template period.
+    var send_credit = TestConnSendCredit{};
+    const SendCtx = struct {
+        client: *TestH2Client,
+        send_buf: []const u8,
+        credit: *TestConnSendCredit,
+        result: anyerror!void = {},
+
+        fn run(self: *@This()) void {
+            var sent: usize = 0;
+            while (sent < self.send_buf.len) {
+                const want = @min(HTTP2_MAX_FRAME_SIZE, self.send_buf.len - sent);
+                const n = self.credit.take(want) orelse return;
+                self.result = self.client.sendData(1, false, self.send_buf[sent .. sent + n]);
+                self.result catch return;
+                sent += n;
+            }
+        }
+    };
+    var send_ctx = SendCtx{ .client = &client, .send_buf = expected.items, .credit = &send_credit };
+    var send_thread: ?std.Thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
+    // `send_thread` can be parked indefinitely inside `send_credit.take`, or
+    // blocked in a real blocking `write()` on `client_fd` once the kernel
+    // socket buffer fills; unlike the server/consumer threads, neither
+    // closing the server socket nor `cancelAndBroadcast` alone wakes the
+    // latter case, so a failed assertion below must shut down both sockets
+    // before joining, or this join can hang forever on the about-to-be-
+    // destroyed stack (`send_ctx`/`send_credit`/`client`/`expected`).
+    errdefer testShutdownAndJoinSenderOnFailure(server_fd, client_fd, &send_credit, &send_thread, &server_thread, &hook_ctx.consumer_thread);
+
+    // Deliberately read nothing for a while: the echo consumer should run
+    // ahead of what the wire can absorb and then block inside
+    // `Session.write` once its outbound queue fills, rather than growing
+    // without bound.
+    std.Io.sleep(compat.io(), .fromMilliseconds(200), .awake) catch {};
+
+    var echoed = std.array_list.Managed(u8).init(allocator);
+    defer echoed.deinit();
+    var frames_read: usize = 0;
+    while (echoed.items.len < total_bytes) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.stream_id == 1 and frame.typ == .data) try echoed.appendSlice(frame.payload);
+        testGrantIfConnSendCredit(&frame, &send_credit);
+        frames_read += 1;
+        if (frames_read > 100_000) return error.TestFrameBudgetExceeded;
+    }
+    try std.testing.expectEqualSlices(u8, expected.items, echoed.items);
+    testJoinOnce(&send_thread);
+    try send_ctx.result;
+
+    try http.http2_frame.writeGoaway(client.writer(), 1, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live: an abrupt client disconnect (no GOAWAY) settles the active session as connection_closed without leaking (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
+
+    // Prove the session is genuinely live before tearing the socket down.
+    try client.sendData(1, false, "alive");
+    var echo = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &echo);
+    try std.testing.expectEqual(http.http2_frame.Type.data, echo.typ);
+    try std.testing.expectEqualStrings("alive", echo.payload);
+
+    // No GOAWAY, no FIN: just slam the socket shut, as a crashed or
+    // force-killed client would.
+    _ = std.c.close(client_fd);
+
+    testJoinOnce(&server_thread);
+    // An abrupt close can surface either as a clean return (the next read
+    // sees EOF first) or as a benign write-side error (a queued
+    // receive-credit WINDOW_UPDATE loses its race against the close) --
+    // both are `isBenignDisconnect` outcomes the production caller already
+    // treats as ordinary teardown, never as a crash or a hang.
+    server_ctx.result catch |err| {
+        // `error.SocketWriteFailed` is this file's `PlaintextSocketStream`
+        // test shim's name for exactly the same underlying EPIPE condition
+        // `isBenignDisconnect` already recognizes as `error.BrokenPipe` in
+        // production's real socket/TLS stack: a queued receive-credit
+        // WINDOW_UPDATE write losing its race against the close.
+        try std.testing.expect(isBenignDisconnect(err) or err == error.SocketWriteFailed);
+    };
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live: graceful shutdown settles the active session as shutdown without leaking (#867)" {
+    const allocator = std.testing.allocator;
+    http.shutdown.reset();
+    defer http.shutdown.reset();
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
+
+    try client.sendData(1, false, "alive");
+    var echo = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &echo);
+    try std.testing.expectEqual(http.http2_frame.Type.data, echo.typ);
+    try std.testing.expectEqualStrings("alive", echo.payload);
+
+    http.shutdown.requestShutdown();
+    // The connection loop only rechecks the shutdown flag between frame
+    // reads; nudge it with a harmless PING so it wakes up and observes it.
+    try client.writer().enqueueFrame(.ping, 0, 0, &[_]u8{0} ** 8);
+    // The "alive" echo above earned the consumer receive credit, which may
+    // surface as its own WINDOW_UPDATE(s) interleaved before the PING ACK;
+    // skip those rather than assume the very next frame is the ack.
+    var ping_ack: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.typ != .window_update) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
+    defer http.http2_frame.deinitFrame(allocator, &ping_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.ping, ping_ack.typ);
+    try std.testing.expect((ping_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live: repeated session attach/close churn over one connection settles every session with no leak (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = ChurnSessionHookCtx.init(allocator, "/session");
+    defer hook_ctx.deinit();
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = ChurnSessionHookCtx.shouldAttach,
+        .attach = ChurnSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer {
+        _ = std.c.shutdown(server_fd, std.c.SHUT.RDWR);
+        testJoinOnce(&server_thread);
+        hook_ctx.joinAll();
+    }
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    var churn: u31 = 0;
+    while (churn < 20) : (churn += 1) {
+        const stream_id: u31 = churn * 2 + 1;
+        try client.sendHeaders(allocator, stream_id, false, &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = "/session" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "test.local" },
+        });
+        // A prior iteration's receive-credit WINDOW_UPDATE(s) may still be
+        // interleaved here; skip those rather than assume the very next
+        // frame is this iteration's session-attach response.
+        var headers: http.http2_frame.Frame = while (true) {
+            var frame = try client.readFrame(allocator);
+            if (frame.typ != .window_update) break frame;
+            http.http2_frame.deinitFrame(allocator, &frame);
+        };
+        defer http.http2_frame.deinitFrame(allocator, &headers);
+        try std.testing.expectEqual(http.http2_frame.Type.headers, headers.typ);
+        try std.testing.expectEqual(stream_id, headers.stream_id);
+
+        var payload_buf: [16]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&payload_buf, "churn-{d}", .{churn});
+        try client.sendData(stream_id, true, payload);
+
+        var echoed = std.array_list.Managed(u8).init(allocator);
+        defer echoed.deinit();
+        var saw_end_stream = false;
+        var frames_read: usize = 0;
+        while (!saw_end_stream) {
+            var frame = try client.readFrame(allocator);
+            defer http.http2_frame.deinitFrame(allocator, &frame);
+            if (frame.stream_id == stream_id and frame.typ == .data) {
+                try echoed.appendSlice(frame.payload);
+                if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) saw_end_stream = true;
+            }
+            frames_read += 1;
+            if (frames_read > 1_000) return error.TestFrameBudgetExceeded;
+        }
+        try std.testing.expectEqualSlices(u8, payload, echoed.items);
+    }
+
+    try http.http2_frame.writeGoaway(client.writer(), churn * 2 - 1, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    hook_ctx.joinAll();
+}
+
+test "H2 session RST_STREAM settles the consumer and detaches without leaking" {
+    const allocator = std.testing.allocator;
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer sessions.deinit();
+    const session = try allocator.create(http.h2_stream_session.Session);
+    session.* = try http.h2_stream_session.Session.init(allocator, 7, 64, 64);
+    try sessions.put(7, session);
+
+    try std.testing.expect(!session.consumerDetach());
+    session.deliverReset(.cancel);
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqual(http.h2_stream_session.ReadResult{ .reset = .cancel }, session.read(&buf));
+
+    var buffered_request_bytes: usize = 0;
+    var discard_out = std.Io.Writer.Allocating.init(allocator);
+    defer discard_out.deinit();
+    try h2DetachSession(&discard_out.writer, allocator, &sessions, &buffered_request_bytes, 7, null);
+    try std.testing.expect(!sessions.contains(7));
+}
+
+test "H2 GOAWAY, connection close, and shutdown settle every attached session exactly once" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { reason: Http2SessionCloseReason, closed: http.h2_stream_session.TerminalReason }{
+        .{ .reason = .goaway, .closed = .goaway },
+        .{ .reason = .connection_closed, .closed = .connection_closed },
+        .{ .reason = .shutdown, .closed = .shutdown },
+    };
+    for (cases) |case| {
+        var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+        defer sessions.deinit();
+        const ids = [_]u31{ 9, 11, 13 };
+        var created: [ids.len]*http.h2_stream_session.Session = undefined;
+        for (ids, 0..) |id, idx| {
+            const session = try allocator.create(http.h2_stream_session.Session);
+            session.* = try http.h2_stream_session.Session.init(allocator, id, 64, 64);
+            try sessions.put(id, session);
+            created[idx] = session;
+        }
+
+        // `h2SettleAllSessions` detaches the runtime side of every attached
+        // session and clears the map; none here is freed yet because each
+        // consumer (simulated below) is still attached.
+        h2SettleAllSessions(allocator, &sessions, case.reason);
+        try std.testing.expectEqual(@as(usize, 0), sessions.count());
+
+        for (created) |session| {
+            var buf: [4]u8 = undefined;
+            try std.testing.expectEqual(http.h2_stream_session.ReadResult{ .closed = case.closed }, session.read(&buf));
+            // The consumer detaches last and frees the session, mirroring
+            // what its worker thread would do after observing settlement.
+            try std.testing.expect(session.consumerDetach());
+            session.deinit();
+            allocator.destroy(session);
+        }
+    }
+}
+
+test "H2 session attach/detach churn settles resources with no leak" {
+    const allocator = std.testing.allocator;
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer sessions.deinit();
+    var buffered_request_bytes: usize = 0;
+
+    var i: u31 = 0;
+    while (i < 50) : (i += 1) {
+        const stream_id = i * 2 + 1;
+        const session = try allocator.create(http.h2_stream_session.Session);
+        session.* = try http.h2_stream_session.Session.init(allocator, stream_id, 64, 64);
+        try sessions.put(stream_id, session);
+        var discard_out = std.Io.Writer.Allocating.init(allocator);
+        defer discard_out.deinit();
+        try h2DeliverSessionInboundData(&discard_out.writer, session, stream_id, "ping".len, "ping", true);
+        try std.testing.expect(!session.consumerDetach());
+        try h2DetachSession(&discard_out.writer, allocator, &sessions, &buffered_request_bytes, stream_id, null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), sessions.count());
+}
+
+const TestAlwaysFailingWriter = struct {
+    pub fn writeAll(_: *TestAlwaysFailingWriter, _: []const u8) error{BrokenPipe}!void {
+        return error.BrokenPipe;
+    }
+};
+
+test "h2ResetStreamState never orphans a session when its connection-credit WINDOW_UPDATE write fails" {
+    const allocator = std.testing.allocator;
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer pending.deinit();
+    var pending_responses = std.AutoHashMap(u31, PendingHttp2Response).init(allocator);
+    defer pending_responses.deinit();
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer sessions.deinit();
+    var buffered_request_bytes: usize = 0;
+    var in_flight_jobs = std.AutoHashMap(u31, void).init(allocator);
+    defer in_flight_jobs.deinit();
+
+    const session = try allocator.create(http.h2_stream_session.Session);
+    session.* = try http.h2_stream_session.Session.init(allocator, 7, 64, 64);
+    // Earn real receive credit (consumption, not mere queuing -- see
+    // "receive credit accrues only on consumption, not on queuing" in
+    // h2_stream_session.zig) so `h2ResetStreamState` actually attempts the
+    // fallible connection-credit WINDOW_UPDATE below instead of skipping it.
+    try session.deliverInbound("abcd");
+    var buf: [4]u8 = undefined;
+    _ = session.read(&buf);
+    try sessions.put(7, session);
+
+    var failing_writer = TestAlwaysFailingWriter{};
+    var conn_recv_window: i64 = 15_535;
+    try std.testing.expectError(error.BrokenPipe, h2ResetStreamState(
+        &failing_writer,
+        allocator,
+        &streams,
+        &pending,
+        &pending_responses,
+        &ready,
+        &sessions,
+        &buffered_request_bytes,
+        7,
+        null,
+        null,
+        null,
+        &in_flight_jobs,
+        &conn_recv_window,
+        null,
+    ));
+
+    // The registry's only reference is gone either way; the fix is that
+    // `runtimeDetach` still ran despite the write failing, so the consumer
+    // side (simulated here) can still detach and free it instead of it
+    // leaking as an unreachable, still-runtime-attached session.
+    try std.testing.expect(!sessions.contains(7));
+    try std.testing.expect(session.consumerDetach());
+    // The WINDOW_UPDATE write failed, so the peer was never actually
+    // credited: the local counter must not move either, or it would
+    // desync from what the peer really has.
+    try std.testing.expectEqual(@as(i64, 15_535), conn_recv_window);
+    session.deinit();
+    allocator.destroy(session);
+}
+
+test "h2DetachSession never orphans a session when its connection-credit WINDOW_UPDATE write fails" {
+    const allocator = std.testing.allocator;
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer sessions.deinit();
+    var buffered_request_bytes: usize = 0;
+
+    const session = try allocator.create(http.h2_stream_session.Session);
+    session.* = try http.h2_stream_session.Session.init(allocator, 7, 64, 64);
+    try session.deliverInbound("abcd");
+    var buf: [4]u8 = undefined;
+    _ = session.read(&buf);
+    try sessions.put(7, session);
+
+    var failing_writer = TestAlwaysFailingWriter{};
+    var conn_recv_window: i64 = 15_535;
+    try std.testing.expectError(error.BrokenPipe, h2DetachSession(&failing_writer, allocator, &sessions, &buffered_request_bytes, 7, &conn_recv_window));
+
+    try std.testing.expect(!sessions.contains(7));
+    try std.testing.expect(session.consumerDetach());
+    try std.testing.expectEqual(@as(i64, 15_535), conn_recv_window);
+    session.deinit();
+    allocator.destroy(session);
 }
 
 const H2FrameReadProvenanceHarness = struct {
@@ -9771,6 +12770,10 @@ test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
     try streams.put(3, http.http2_stream.Stream.init(3, 65_535));
     var ready = std.array_list.Managed(u31).init(allocator);
     defer ready.deinit();
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer sessions.deinit();
+    var state: GatewayState = undefined;
+    state.h2_session_test_hook = null;
 
     const block = try http.hpack.encodeLiteralHeaderBlock(allocator, &.{
         .{ .name = ":method", .value = "CONNECT" },
@@ -9788,6 +12791,8 @@ test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
         &pending,
         &streams,
         &ready,
+        &sessions,
+        &state,
         1,
         block,
         true,

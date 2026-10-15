@@ -15,6 +15,15 @@ const Entry = struct {
 };
 const Active = struct { entry: Entry, offset: usize = 0 };
 
+/// Payload length of an already-framed entry if it is a DATA frame, else 0.
+/// Only DATA frame payloads consume HTTP/2 send-window credit; every other
+/// frame type (HEADERS, RST_STREAM, WINDOW_UPDATE, ...) does not.
+fn dataFramePayloadLen(frame_bytes: []const u8) usize {
+    if (frame_bytes.len < 9) return 0;
+    if (frame_bytes[3] != @intFromEnum(http2_frame.Type.data)) return 0;
+    return (@as(usize, frame_bytes[0]) << 16) | (@as(usize, frame_bytes[1]) << 8) | @as(usize, frame_bytes[2]);
+}
+
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
     max_queued_bytes: usize,
@@ -141,13 +150,23 @@ pub const Scheduler = struct {
 
     /// Remove unsent frames for a stream after an inbound RST_STREAM.  A frame
     /// already partially written must finish so its wire framing remains valid.
-    pub fn cancelStream(self: *Scheduler, stream_id: u31) void {
+    ///
+    /// Returns the sum of DATA frame payload bytes among the frames actually
+    /// removed (never counting a frame that is mid-transmission, since it is
+    /// deliberately left to finish). A removed DATA frame's payload already
+    /// debited the connection (and, until the stream is torn down, per-stream)
+    /// HTTP/2 send-window credit when it was queued; that debit must be
+    /// refunded here or it is permanently lost, starving unrelated streams
+    /// even though those bytes were never actually sent to the peer.
+    pub fn cancelStream(self: *Scheduler, stream_id: u31) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
+        var refunded_payload_bytes: usize = 0;
         var i: usize = 0;
         while (i < self.entries.items.len) {
             if (self.entries.items[i].stream_id == stream_id) {
                 const removed = self.entries.orderedRemove(i);
+                refunded_payload_bytes += dataFramePayloadLen(removed.bytes);
                 self.queued_bytes -= removed.bytes.len;
                 self.allocator.free(removed.bytes);
                 continue;
@@ -156,6 +175,7 @@ pub const Scheduler = struct {
         }
         if (self.active) |active| {
             if (active.entry.stream_id == stream_id and active.offset == 0) {
+                refunded_payload_bytes += dataFramePayloadLen(active.entry.bytes);
                 self.active = null;
                 self.queued_bytes -= active.entry.bytes.len;
                 self.allocator.free(active.entry.bytes);
@@ -165,6 +185,7 @@ pub const Scheduler = struct {
             self.drainWakeLocked();
             self.wake_pending.store(false, .release);
         }
+        return refunded_payload_bytes;
     }
 
     /// The sole connection runtime calls this. A temporary `WouldBlock` keeps
@@ -409,7 +430,10 @@ test "cancel stream drops unsent active and queued frames but keeps siblings" {
     var writer = BlockingWriter{ .out = .init(std.testing.allocator) };
     defer writer.out.deinit();
     try scheduler.flush(&writer);
-    scheduler.cancelStream(1);
+    // Neither the still-unsent active frame (offset 0) nor the queued
+    // follower frame was ever written to the peer, so their 1-byte DATA
+    // payloads must both come back as send-window refund.
+    try std.testing.expectEqual(@as(usize, 2), scheduler.cancelStream(1));
     writer.blocked = false;
     try scheduler.flush(&writer);
     try std.testing.expectEqualSlices(u8, &sibling, writer.out.written());
@@ -445,7 +469,10 @@ test "cancel stream finishes a partial frame but drops later frames" {
     var writer = PartialWriter{ .out = .init(std.testing.allocator) };
     defer writer.out.deinit();
     try scheduler.flush(&writer);
-    scheduler.cancelStream(1);
+    // The active frame is already mid-transmission (offset 4 of 10), so it
+    // must finish rather than be refunded; only the still-queued follower's
+    // 1-byte DATA payload counts as send-window refund.
+    try std.testing.expectEqual(@as(usize, 1), scheduler.cancelStream(1));
     try scheduler.flush(&writer);
     try std.testing.expectEqualSlices(u8, &first, writer.out.written()[0..first.len]);
     try std.testing.expectEqualSlices(u8, &sibling, writer.out.written()[first.len..]);

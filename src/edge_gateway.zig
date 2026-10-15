@@ -4196,6 +4196,35 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
                     continue;
                 }
+                if (!streams.contains(frame.stream_id) and !sessions.contains(frame.stream_id) and !pending.contains(frame.stream_id)) {
+                    if (frame.stream_id > last_client_stream_id) {
+                        // Genuinely idle: the client never opened this
+                        // stream with HEADERS. RFC 9113 §5.1 makes sending
+                        // DATA on an idle stream a connection error.
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                        return error.InvalidHttp2StreamId;
+                    }
+                    // Previously observed but already fully torn down (e.g.
+                    // a refused #867 session admission or an earlier
+                    // h2ResetStreamState): `h2StreamAcceptsInboundFrame`
+                    // returns true for a stream id absent from `streams`,
+                    // so this is the only place left to catch DATA that was
+                    // already in flight from the peer when we reset it.
+                    // RFC 9113 §5.1 requires tolerating it rather than
+                    // treating it as a connection-wide protocol error, but
+                    // RFC 9113 §6.9 still requires the bytes to count
+                    // against the connection-wide receive window the
+                    // instant they arrive; since there is no stream left to
+                    // carry that credit forward, return it immediately via
+                    // a stream-0-only WINDOW_UPDATE.
+                    const stale_charge: i64 = @intCast(frame.payload.len);
+                    if (conn_recv_window - stale_charge < 0) {
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                        return error.Http2FlowControlError;
+                    }
+                    if (stale_charge > 0) try http.http2_frame.writeWindowUpdate(outbound_writer, 0, @intCast(stale_charge));
+                    continue;
+                }
                 const data_payload = h2DataPayload(frame.payload, frame.flags) catch |err| {
                     try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return err;
@@ -9386,6 +9415,19 @@ fn testGrantIfConnSendCredit(frame: *const http.http2_frame.Frame, credit: *Test
     }
 }
 
+/// Joins a thread at most once: a slot already nulled out by an earlier
+/// join (success path or a prior cleanup call) is left alone. `std.Thread`
+/// has no built-in way to ask "was this already joined?", and calling
+/// `join()` twice on the same handle is undefined behavior, so every
+/// caller that might run both a normal join and a failure-path cleanup
+/// join must go through this instead of calling `.join()` directly.
+fn testJoinOnce(thread_slot: *?std.Thread) void {
+    if (thread_slot.*) |t| {
+        t.join();
+        thread_slot.* = null;
+    }
+}
+
 /// `errdefer`-only safety net for the live H2 session tests: if a test
 /// returns early via an assertion/read failure before reaching its normal
 /// trailing `server_thread.join(); ...; consumer_thread.?.join();` lines,
@@ -9396,19 +9438,47 @@ fn testGrantIfConnSendCredit(frame: *const http.http2_frame.Frame, credit: *Test
 /// `handleHttp2Connection` to unwind (settling every attached session, the
 /// same as an ordinary GOAWAY/EOF teardown), which lets a blocked consumer
 /// observe termination and exit on its own; joining both threads here then
-/// guarantees neither outlives the stack frame they close over. Never runs
-/// on the success path (`errdefer`), so it can never race the normal joins.
-fn testShutdownAndJoinOnFailure(server_fd: std.posix.fd_t, server_thread: std.Thread, consumer_thread_slot: *?std.Thread) void {
+/// guarantees neither outlives the stack frame they close over. Takes both
+/// threads as slots and joins through `testJoinOnce` because a failure can
+/// land after the normal-path join of either thread already succeeded --
+/// without the slot, this `errdefer` would join an already-joined handle.
+fn testShutdownAndJoinOnFailure(server_fd: std.posix.fd_t, server_thread_slot: *?std.Thread, consumer_thread_slot: *?std.Thread) void {
     _ = std.c.shutdown(server_fd, std.c.SHUT.RDWR);
-    server_thread.join();
-    if (consumer_thread_slot.*) |t| t.join();
+    testJoinOnce(server_thread_slot);
+    testJoinOnce(consumer_thread_slot);
 }
 
 /// Same as `testShutdownAndJoinOnFailure`, for the one live test whose hook
 /// never spawns a consumer worker at all (`StallingSessionHookCtx`).
-fn testShutdownAndJoinServerOnFailure(server_fd: std.posix.fd_t, server_thread: std.Thread) void {
+fn testShutdownAndJoinServerOnFailure(server_fd: std.posix.fd_t, server_thread_slot: *?std.Thread) void {
     _ = std.c.shutdown(server_fd, std.c.SHUT.RDWR);
-    server_thread.join();
+    testJoinOnce(server_thread_slot);
+}
+
+/// Same as `testShutdownAndJoinOnFailure`, for the live tests that also
+/// pace a DATA sender against this process's own connection-send-credit
+/// model from a second thread (see `TestConnSendCredit`). Closing the
+/// server socket does nothing to wake a sender blocked in
+/// `send_credit.take()` -- it is a userspace condvar, not I/O -- and
+/// `send_credit.cancelAndBroadcast()` does nothing to wake a sender blocked
+/// in a real blocking `write()` on `client_fd` once the kernel socket
+/// buffer is full. Both must happen, and the socket shutdown must happen
+/// before any join is attempted, or a failed assertion deadlocks tearing
+/// down the test instead of unwinding it.
+fn testShutdownAndJoinSenderOnFailure(
+    server_fd: std.posix.fd_t,
+    client_fd: std.posix.fd_t,
+    send_credit: *TestConnSendCredit,
+    send_thread_slot: *?std.Thread,
+    server_thread_slot: *?std.Thread,
+    consumer_thread_slot: *?std.Thread,
+) void {
+    send_credit.cancelAndBroadcast();
+    _ = std.c.shutdown(client_fd, std.c.SHUT.RDWR);
+    _ = std.c.shutdown(server_fd, std.c.SHUT.RDWR);
+    testJoinOnce(send_thread_slot);
+    testJoinOnce(server_thread_slot);
+    testJoinOnce(consumer_thread_slot);
 }
 
 /// Blocking client-side wrapper over a raw socket fd, used only by the live
@@ -9596,8 +9666,12 @@ const ChurnSessionHookCtx = struct {
         self.consumer_threads.deinit();
     }
 
+    /// Idempotent: clears the list after joining so a failure-path
+    /// `errdefer` call and the normal trailing call never join the same
+    /// handle twice, which is undefined behavior.
     fn joinAll(self: *ChurnSessionHookCtx) void {
         for (self.consumer_threads.items) |t| t.join();
+        self.consumer_threads.clearRetainingCapacity();
     }
 
     fn shouldAttach(raw: ?*anyopaque, ps: *const Http2PendingStream) bool {
@@ -9676,8 +9750,8 @@ test "H2 live session: bidirectional DATA, sibling dispatch, window exhaustion/r
     var cfg = std.mem.zeroes(edge_config.EdgeConfig);
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinOnFailure(server_fd, server_thread, &hook_ctx.consumer_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -9767,16 +9841,15 @@ test "H2 live session: bidirectional DATA, sibling dispatch, window exhaustion/r
         }
     };
     var send_ctx = SendCtx{ .client = &client, .send_buf = expected.items, .credit = &send_credit };
-    const send_thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
-    // `send_thread` can be parked indefinitely inside `send_credit.take`;
-    // unlike the server/consumer threads, closing the server socket does
-    // nothing to wake it, so a failed assertion below must cancel it
-    // explicitly before this stack frame (and `send_ctx`/`send_credit`/
-    // `client`/`expected`) goes away.
-    errdefer {
-        send_credit.cancelAndBroadcast();
-        send_thread.join();
-    }
+    var send_thread: ?std.Thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
+    // `send_thread` can be parked indefinitely inside `send_credit.take`, or
+    // blocked in a real blocking `write()` on `client_fd` once the kernel
+    // socket buffer fills; unlike the server/consumer threads, neither
+    // closing the server socket nor `cancelAndBroadcast` alone wakes the
+    // latter case, so a failed assertion below must shut down both sockets
+    // before joining, or this join can hang forever on the about-to-be-
+    // destroyed stack (`send_ctx`/`send_credit`/`client`/`expected`).
+    errdefer testShutdownAndJoinSenderOnFailure(server_fd, client_fd, &send_credit, &send_thread, &server_thread, &hook_ctx.consumer_thread);
 
     // Read every frame the server has sent so far without granting any
     // more send credit yet: the sibling response (stream 3) must already
@@ -9825,16 +9898,16 @@ test "H2 live session: bidirectional DATA, sibling dispatch, window exhaustion/r
         if (frames_read > 20_000) return error.TestFrameBudgetExceeded;
     }
     try std.testing.expectEqualSlices(u8, expected.items, echoed.items);
-    send_thread.join();
+    testJoinOnce(&send_thread);
     try send_ctx.result;
 
     // GOAWAY (without ever ending stream 1 locally) proves connection-wide
     // teardown settles a still-active session and wakes its blocked
     // consumer, instead of leaking it.
     try http.http2_frame.writeGoaway(client.writer(), 3, 0);
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try server_ctx.result;
-    hook_ctx.consumer_thread.?.join();
+    testJoinOnce(&hook_ctx.consumer_thread);
 }
 
 test "H2 live session: client RST_STREAM settles the consumer without leaking or dropping the connection (#867)" {
@@ -9868,8 +9941,8 @@ test "H2 live session: client RST_STREAM settles the consumer without leaking or
     var cfg = std.mem.zeroes(edge_config.EdgeConfig);
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinOnFailure(server_fd, server_thread, &hook_ctx.consumer_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -9911,9 +9984,9 @@ test "H2 live session: client RST_STREAM settles the consumer without leaking or
     try std.testing.expectEqual(@as(u31, 3), ordinary_response.stream_id);
 
     try http.http2_frame.writeGoaway(client.writer(), 3, 0);
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try server_ctx.result;
-    hook_ctx.consumer_thread.?.join();
+    testJoinOnce(&hook_ctx.consumer_thread);
 }
 
 test "H2 live RST_STREAM on a stalled session returns the abandoned connection receive credit (#867)" {
@@ -9947,8 +10020,8 @@ test "H2 live RST_STREAM on a stalled session returns the abandoned connection r
     var cfg = std.mem.zeroes(edge_config.EdgeConfig);
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinServerOnFailure(server_fd, server_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinServerOnFailure(server_fd, &server_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -10044,7 +10117,7 @@ test "H2 live RST_STREAM on a stalled session returns the abandoned connection r
     try std.testing.expectEqual(@as(u31, 3), ordinary_response.stream_id);
 
     try http.http2_frame.writeGoaway(client.writer(), 3, 0);
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try server_ctx.result;
 
     // The stalling hook never attached a consumer worker, so the runtime
@@ -10094,8 +10167,8 @@ test "H2 live: an over-budget second session is refused at stream scope while th
     cfg.max_connection_memory_bytes = 1_400_000;
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinOnFailure(server_fd, server_thread, &hook_ctx.consumer_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -10166,9 +10239,143 @@ test "H2 live: an over-budget second session is refused at stream scope while th
     try std.testing.expectEqualStrings("still-alive", echoed.payload);
 
     try http.http2_frame.writeGoaway(client.writer(), 5, 0);
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try server_ctx.result;
-    hook_ctx.consumer_thread.?.join();
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+test "H2 live: DATA already in flight on a just-refused stream is tolerated with a live sibling, but DATA on a truly idle stream still ends the connection (#867)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    // One session reserves `HTTP2_SESSION_RESERVED_BYTES` (~1.25 MiB); size
+    // the budget to admit exactly one and refuse a second, so stream 3 is
+    // refused at stream scope below rather than ever being admitted.
+    cfg.max_connection_memory_bytes = 1_400_000;
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var first_session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &first_session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, first_session_headers.typ);
+    try std.testing.expectEqual(@as(u31, 1), first_session_headers.stream_id);
+
+    // A second session on a fresh stream cannot be admitted under the
+    // connection budget and is refused at stream scope.
+    try client.sendHeaders(allocator, 3, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var refusal = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &refusal);
+    try std.testing.expectEqual(http.http2_frame.Type.rst_stream, refusal.typ);
+    try std.testing.expectEqual(@as(u31, 3), refusal.stream_id);
+
+    // DATA for stream 3 that was already in flight from the client when our
+    // RST_STREAM(REFUSED_STREAM) arrived: `h2ResetStreamState` has already
+    // removed stream 3 from every map (RFC 9113 §5.1 still requires
+    // tolerating frames already in flight for it), so this must be
+    // discriminated from a brand-new idle-stream violation rather than
+    // tearing down the whole connection with GOAWAY.
+    try client.sendData(3, true, "already in flight");
+
+    // The connection (and dispatcher) must still be alive: an ordinary
+    // sibling request on yet another stream completes normally. Skip any
+    // incidental connection-level WINDOW_UPDATE the discarded DATA above
+    // earns back before the response headers arrive.
+    try client.sendHeaders(allocator, 5, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var ordinary_response: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.stream_id == 5 and frame.typ == .headers) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
+    defer http.http2_frame.deinitFrame(allocator, &ordinary_response);
+
+    // The first session is still live too: DATA sent on it is still echoed
+    // back, proving the tolerated post-refusal DATA never tore it down.
+    try client.sendData(1, false, "still-alive");
+    var echoed: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.stream_id == 1 and frame.typ == .data) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
+    defer http.http2_frame.deinitFrame(allocator, &echoed);
+    try std.testing.expectEqualStrings("still-alive", echoed.payload);
+
+    // By contrast, DATA on a stream the client never opened with HEADERS at
+    // all is a genuine idle-stream violation (RFC 9113 §5.1) and must still
+    // tear down the whole connection with a connection-level GOAWAY.
+    try client.sendData(99, true, "never opened");
+    var goaway: http.http2_frame.Frame = undefined;
+    var frames_read: usize = 0;
+    while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.typ == .goaway) {
+            goaway = frame;
+            break;
+        }
+        http.http2_frame.deinitFrame(allocator, &frame);
+        frames_read += 1;
+        if (frames_read > 100) return error.TestFrameBudgetExceeded;
+    }
+    defer http.http2_frame.deinitFrame(allocator, &goaway);
+    try std.testing.expectEqual(@as(u32, http.http2_stream.ErrorCode.protocol_error.value()), std.mem.readInt(u32, goaway.payload[4..8], .big));
+
+    testJoinOnce(&server_thread);
+    try std.testing.expectError(error.InvalidHttp2StreamId, server_ctx.result);
+    testJoinOnce(&hook_ctx.consumer_thread);
 }
 
 test "H2 live: repeated over-budget session refusals retire their stream bookkeeping instead of exhausting the concurrent-stream limit (#867)" {
@@ -10205,8 +10412,8 @@ test "H2 live: repeated over-budget session refusals retire their stream bookkee
     cfg.max_connection_memory_bytes = 1_400_000;
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinOnFailure(server_fd, server_thread, &hook_ctx.consumer_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -10267,9 +10474,9 @@ test "H2 live: repeated over-budget session refusals retire their stream bookkee
     try std.testing.expectEqual(stream_id, ordinary_response.stream_id);
 
     try http.http2_frame.writeGoaway(client.writer(), stream_id, 0);
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try server_ctx.result;
-    hook_ctx.consumer_thread.?.join();
+    testJoinOnce(&hook_ctx.consumer_thread);
 }
 
 test "H2 live: stream-only send-window exhaustion stalls independently of connection credit, resumed by a stream-only WINDOW_UPDATE (#867)" {
@@ -10303,8 +10510,8 @@ test "H2 live: stream-only send-window exhaustion stalls independently of connec
     var cfg = std.mem.zeroes(edge_config.EdgeConfig);
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinOnFailure(server_fd, server_thread, &hook_ctx.consumer_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -10373,9 +10580,9 @@ test "H2 live: stream-only send-window exhaustion stalls independently of connec
     try std.testing.expectEqualSlices(u8, &send_buf, echoed.items);
 
     try http.http2_frame.writeGoaway(client.writer(), 1, 0);
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try server_ctx.result;
-    hook_ctx.consumer_thread.?.join();
+    testJoinOnce(&hook_ctx.consumer_thread);
 }
 
 test "H2 live: connection-only send-window exhaustion stalls independently of stream credit, resumed by a connection-only WINDOW_UPDATE (#867)" {
@@ -10409,8 +10616,8 @@ test "H2 live: connection-only send-window exhaustion stalls independently of st
     var cfg = std.mem.zeroes(edge_config.EdgeConfig);
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinOnFailure(server_fd, server_thread, &hook_ctx.consumer_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -10472,16 +10679,15 @@ test "H2 live: connection-only send-window exhaustion stalls independently of st
         }
     };
     var send_ctx = SendCtx{ .client = &client, .send_buf = expected.items, .credit = &send_credit };
-    const send_thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
-    // `send_thread` can be parked indefinitely inside `send_credit.take`;
-    // unlike the server/consumer threads, closing the server socket does
-    // nothing to wake it, so a failed assertion below must cancel it
-    // explicitly before this stack frame (and `send_ctx`/`send_credit`/
-    // `client`/`expected`) goes away.
-    errdefer {
-        send_credit.cancelAndBroadcast();
-        send_thread.join();
-    }
+    var send_thread: ?std.Thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
+    // `send_thread` can be parked indefinitely inside `send_credit.take`, or
+    // blocked in a real blocking `write()` on `client_fd` once the kernel
+    // socket buffer fills; unlike the server/consumer threads, neither
+    // closing the server socket nor `cancelAndBroadcast` alone wakes the
+    // latter case, so a failed assertion below must shut down both sockets
+    // before joining, or this join can hang forever on the about-to-be-
+    // destroyed stack (`send_ctx`/`send_credit`/`client`/`expected`).
+    errdefer testShutdownAndJoinSenderOnFailure(server_fd, client_fd, &send_credit, &send_thread, &server_thread, &hook_ctx.consumer_thread);
 
     var echoed = std.array_list.Managed(u8).init(allocator);
     defer echoed.deinit();
@@ -10516,13 +10722,13 @@ test "H2 live: connection-only send-window exhaustion stalls independently of st
         if (frames_read > 20_000) return error.TestFrameBudgetExceeded;
     }
     try std.testing.expectEqualSlices(u8, expected.items, echoed.items);
-    send_thread.join();
+    testJoinOnce(&send_thread);
     try send_ctx.result;
 
     try http.http2_frame.writeGoaway(client.writer(), 1, 0);
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try server_ctx.result;
-    hook_ctx.consumer_thread.?.join();
+    testJoinOnce(&hook_ctx.consumer_thread);
 }
 
 test "H2 live: a stalled consumer can receive DATA up to the full advertised window without a premature reset, then resumes (#867)" {
@@ -10556,8 +10762,8 @@ test "H2 live: a stalled consumer can receive DATA up to the full advertised win
     var cfg = std.mem.zeroes(edge_config.EdgeConfig);
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinOnFailure(server_fd, server_thread, &hook_ctx.consumer_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -10642,9 +10848,9 @@ test "H2 live: a stalled consumer can receive DATA up to the full advertised win
     try std.testing.expectEqualSlices(u8, expected.items, echoed.items);
 
     try http.http2_frame.writeGoaway(client.writer(), 1, 0);
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try server_ctx.result;
-    hook_ctx.consumer_thread.?.join();
+    testJoinOnce(&hook_ctx.consumer_thread);
 }
 
 test "H2 live: DATA beyond the advertised connection-level receive window is a flow-control GOAWAY (#867)" {
@@ -10678,8 +10884,8 @@ test "H2 live: DATA beyond the advertised connection-level receive window is a f
     var cfg = std.mem.zeroes(edge_config.EdgeConfig);
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinOnFailure(server_fd, server_thread, &hook_ctx.consumer_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -10737,9 +10943,9 @@ test "H2 live: DATA beyond the advertised connection-level receive window is a f
     try std.testing.expectEqual(@as(u32, http.http2_stream.ErrorCode.flow_control_error.value()), std.mem.readInt(u32, goaway.payload[4..8], .big));
 
     hook_ctx.released.store(true, .release);
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try std.testing.expectError(error.Http2FlowControlError, server_ctx.result);
-    hook_ctx.consumer_thread.?.join();
+    testJoinOnce(&hook_ctx.consumer_thread);
 }
 
 test "H2 live: a stalled client reader does not unbound the session's outbound memory, and recovers once it reads (#867)" {
@@ -10773,8 +10979,8 @@ test "H2 live: a stalled client reader does not unbound the session's outbound m
     var cfg = std.mem.zeroes(edge_config.EdgeConfig);
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinOnFailure(server_fd, server_thread, &hook_ctx.consumer_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -10840,16 +11046,15 @@ test "H2 live: a stalled client reader does not unbound the session's outbound m
         }
     };
     var send_ctx = SendCtx{ .client = &client, .send_buf = expected.items, .credit = &send_credit };
-    const send_thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
-    // `send_thread` can be parked indefinitely inside `send_credit.take`;
-    // unlike the server/consumer threads, closing the server socket does
-    // nothing to wake it, so a failed assertion below must cancel it
-    // explicitly before this stack frame (and `send_ctx`/`send_credit`/
-    // `client`/`expected`) goes away.
-    errdefer {
-        send_credit.cancelAndBroadcast();
-        send_thread.join();
-    }
+    var send_thread: ?std.Thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
+    // `send_thread` can be parked indefinitely inside `send_credit.take`, or
+    // blocked in a real blocking `write()` on `client_fd` once the kernel
+    // socket buffer fills; unlike the server/consumer threads, neither
+    // closing the server socket nor `cancelAndBroadcast` alone wakes the
+    // latter case, so a failed assertion below must shut down both sockets
+    // before joining, or this join can hang forever on the about-to-be-
+    // destroyed stack (`send_ctx`/`send_credit`/`client`/`expected`).
+    errdefer testShutdownAndJoinSenderOnFailure(server_fd, client_fd, &send_credit, &send_thread, &server_thread, &hook_ctx.consumer_thread);
 
     // Deliberately read nothing for a while: the echo consumer should run
     // ahead of what the wire can absorb and then block inside
@@ -10869,13 +11074,13 @@ test "H2 live: a stalled client reader does not unbound the session's outbound m
         if (frames_read > 100_000) return error.TestFrameBudgetExceeded;
     }
     try std.testing.expectEqualSlices(u8, expected.items, echoed.items);
-    send_thread.join();
+    testJoinOnce(&send_thread);
     try send_ctx.result;
 
     try http.http2_frame.writeGoaway(client.writer(), 1, 0);
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try server_ctx.result;
-    hook_ctx.consumer_thread.?.join();
+    testJoinOnce(&hook_ctx.consumer_thread);
 }
 
 test "H2 live: an abrupt client disconnect (no GOAWAY) settles the active session as connection_closed without leaking (#867)" {
@@ -10908,8 +11113,8 @@ test "H2 live: an abrupt client disconnect (no GOAWAY) settles the active sessio
     var cfg = std.mem.zeroes(edge_config.EdgeConfig);
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinOnFailure(server_fd, server_thread, &hook_ctx.consumer_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -10946,7 +11151,7 @@ test "H2 live: an abrupt client disconnect (no GOAWAY) settles the active sessio
     // force-killed client would.
     _ = std.c.close(client_fd);
 
-    server_thread.join();
+    testJoinOnce(&server_thread);
     // An abrupt close can surface either as a clean return (the next read
     // sees EOF first) or as a benign write-side error (a queued
     // receive-credit WINDOW_UPDATE loses its race against the close) --
@@ -10960,7 +11165,7 @@ test "H2 live: an abrupt client disconnect (no GOAWAY) settles the active sessio
         // WINDOW_UPDATE write losing its race against the close.
         try std.testing.expect(isBenignDisconnect(err) or err == error.SocketWriteFailed);
     };
-    hook_ctx.consumer_thread.?.join();
+    testJoinOnce(&hook_ctx.consumer_thread);
 }
 
 test "H2 live: graceful shutdown settles the active session as shutdown without leaking (#867)" {
@@ -10996,8 +11201,8 @@ test "H2 live: graceful shutdown settles the active session as shutdown without 
     var cfg = std.mem.zeroes(edge_config.EdgeConfig);
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
-    errdefer testShutdownAndJoinOnFailure(server_fd, server_thread, &hook_ctx.consumer_thread);
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
 
     var client = TestH2Client{ .fd = client_fd };
 
@@ -11045,9 +11250,9 @@ test "H2 live: graceful shutdown settles the active session as shutdown without 
     try std.testing.expectEqual(http.http2_frame.Type.ping, ping_ack.typ);
     try std.testing.expect((ping_ack.flags & http.http2_frame.Flags.ACK) != 0);
 
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try server_ctx.result;
-    hook_ctx.consumer_thread.?.join();
+    testJoinOnce(&hook_ctx.consumer_thread);
 }
 
 test "H2 live: repeated session attach/close churn over one connection settles every session with no leak (#867)" {
@@ -11082,10 +11287,10 @@ test "H2 live: repeated session attach/close churn over one connection settles e
     var cfg = std.mem.zeroes(edge_config.EdgeConfig);
     var dummy_session = ConnectionSession{};
     var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
-    const server_thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
     errdefer {
         _ = std.c.shutdown(server_fd, std.c.SHUT.RDWR);
-        server_thread.join();
+        testJoinOnce(&server_thread);
         hook_ctx.joinAll();
     }
 
@@ -11146,7 +11351,7 @@ test "H2 live: repeated session attach/close churn over one connection settles e
     }
 
     try http.http2_frame.writeGoaway(client.writer(), churn * 2 - 1, 0);
-    server_thread.join();
+    testJoinOnce(&server_thread);
     try server_ctx.result;
     hook_ctx.joinAll();
 }

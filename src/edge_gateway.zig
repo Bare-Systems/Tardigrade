@@ -4177,6 +4177,22 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // END_STREAM is a stream error (RFC 7540 §5.1,
                 // half_closed_remote), not new body for a dispatched request.
                 if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
+                    // RFC 9113 §6.9/§5.1: DATA on a stream we already
+                    // closed for receiving still counts against the
+                    // connection-wide receive window the instant it
+                    // arrives -- a peer that keeps sending to a closed
+                    // stream after we reset it must not get to bypass the
+                    // connection cap that way. Charge it, fail the
+                    // connection on a genuine violation, and otherwise
+                    // discard the payload and return the credit at once
+                    // via a stream-0 WINDOW_UPDATE, since there is no
+                    // longer a stream to carry it forward.
+                    const charge: i64 = @intCast(frame.payload.len);
+                    if (conn_recv_window - charge < 0) {
+                        try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                        return error.Http2FlowControlError;
+                    }
+                    if (charge > 0) try http.http2_frame.writeWindowUpdate(outbound_writer, 0, @intCast(charge));
                     try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
                     continue;
                 }
@@ -4205,6 +4221,14 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         const refunded = outbound.cancelStream(frame.stream_id);
                         if (refunded > 0) conn_send_window +|= @intCast(@min(refunded, std.math.maxInt(i32)));
                         try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                        // These bytes already counted against the
+                        // connection window the instant they arrived
+                        // (checked just above); since this stream is
+                        // being torn down and can no longer carry its own
+                        // window forward, return that credit immediately
+                        // via a stream-0 WINDOW_UPDATE instead of leaving
+                        // the connection permanently short.
+                        if (charge > 0) try http.http2_frame.writeWindowUpdate(outbound_writer, 0, @intCast(charge));
                         try h2ResetStreamState(outbound_writer, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, null, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
                         continue;
                     }
@@ -9320,6 +9344,10 @@ const TestConnSendCredit = struct {
     mutex: compat.Mutex = .{},
     cond: compat.Condition = .{},
     available: i64 = 65_535,
+    /// Set by `cancelAndBroadcast` so a sender thread blocked in `take`
+    /// wakes up and exits instead of waiting forever once a failed test is
+    /// unwinding and will never grant more credit.
+    canceled: bool = false,
 
     fn grant(self: *@This(), amount: u32) void {
         self.mutex.lock();
@@ -9329,14 +9357,25 @@ const TestConnSendCredit = struct {
     }
 
     /// Blocks until at least one byte of credit exists, then reserves and
-    /// returns up to `want` bytes of it.
-    fn take(self: *@This(), want: usize) usize {
+    /// returns up to `want` bytes of it. Returns `null` once canceled,
+    /// whether or not a wait was actually needed.
+    fn take(self: *@This(), want: usize) ?usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        while (self.available <= 0) self.cond.wait(&self.mutex);
+        while (self.available <= 0 and !self.canceled) self.cond.wait(&self.mutex);
+        if (self.canceled) return null;
         const n = @min(self.available, @as(i64, @intCast(want)));
         self.available -= n;
         return @intCast(n);
+    }
+
+    /// Wakes a sender thread blocked in `take` so it can exit instead of
+    /// outliving the stack it closes over when a live test fails early.
+    fn cancelAndBroadcast(self: *@This()) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.canceled = true;
+        self.cond.broadcast();
     }
 };
 
@@ -9720,7 +9759,7 @@ test "H2 live session: bidirectional DATA, sibling dispatch, window exhaustion/r
             var sent: usize = 0;
             while (sent < self.send_buf.len) {
                 const want = @min(HTTP2_MAX_FRAME_SIZE, self.send_buf.len - sent);
-                const n = self.credit.take(want);
+                const n = self.credit.take(want) orelse return;
                 self.result = self.client.sendData(1, false, self.send_buf[sent .. sent + n]);
                 self.result catch return;
                 sent += n;
@@ -9729,6 +9768,15 @@ test "H2 live session: bidirectional DATA, sibling dispatch, window exhaustion/r
     };
     var send_ctx = SendCtx{ .client = &client, .send_buf = expected.items, .credit = &send_credit };
     const send_thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
+    // `send_thread` can be parked indefinitely inside `send_credit.take`;
+    // unlike the server/consumer threads, closing the server socket does
+    // nothing to wake it, so a failed assertion below must cancel it
+    // explicitly before this stack frame (and `send_ctx`/`send_credit`/
+    // `client`/`expected`) goes away.
+    errdefer {
+        send_credit.cancelAndBroadcast();
+        send_thread.join();
+    }
 
     // Read every frame the server has sent so far without granting any
     // more send credit yet: the sibling response (stream 3) must already
@@ -10416,7 +10464,7 @@ test "H2 live: connection-only send-window exhaustion stalls independently of st
             var sent: usize = 0;
             while (sent < self.send_buf.len) {
                 const want = @min(HTTP2_MAX_FRAME_SIZE, self.send_buf.len - sent);
-                const n = self.credit.take(want);
+                const n = self.credit.take(want) orelse return;
                 self.result = self.client.sendData(1, false, self.send_buf[sent .. sent + n]);
                 self.result catch return;
                 sent += n;
@@ -10425,6 +10473,15 @@ test "H2 live: connection-only send-window exhaustion stalls independently of st
     };
     var send_ctx = SendCtx{ .client = &client, .send_buf = expected.items, .credit = &send_credit };
     const send_thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
+    // `send_thread` can be parked indefinitely inside `send_credit.take`;
+    // unlike the server/consumer threads, closing the server socket does
+    // nothing to wake it, so a failed assertion below must cancel it
+    // explicitly before this stack frame (and `send_ctx`/`send_credit`/
+    // `client`/`expected`) goes away.
+    errdefer {
+        send_credit.cancelAndBroadcast();
+        send_thread.join();
+    }
 
     var echoed = std.array_list.Managed(u8).init(allocator);
     defer echoed.deinit();
@@ -10775,7 +10832,7 @@ test "H2 live: a stalled client reader does not unbound the session's outbound m
             var sent: usize = 0;
             while (sent < self.send_buf.len) {
                 const want = @min(HTTP2_MAX_FRAME_SIZE, self.send_buf.len - sent);
-                const n = self.credit.take(want);
+                const n = self.credit.take(want) orelse return;
                 self.result = self.client.sendData(1, false, self.send_buf[sent .. sent + n]);
                 self.result catch return;
                 sent += n;
@@ -10784,6 +10841,15 @@ test "H2 live: a stalled client reader does not unbound the session's outbound m
     };
     var send_ctx = SendCtx{ .client = &client, .send_buf = expected.items, .credit = &send_credit };
     const send_thread = try std.Thread.spawn(.{}, SendCtx.run, .{&send_ctx});
+    // `send_thread` can be parked indefinitely inside `send_credit.take`;
+    // unlike the server/consumer threads, closing the server socket does
+    // nothing to wake it, so a failed assertion below must cancel it
+    // explicitly before this stack frame (and `send_ctx`/`send_credit`/
+    // `client`/`expected`) goes away.
+    errdefer {
+        send_credit.cancelAndBroadcast();
+        send_thread.join();
+    }
 
     // Deliberately read nothing for a while: the echo consumer should run
     // ahead of what the wire can absorb and then block inside

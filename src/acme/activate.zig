@@ -717,13 +717,17 @@ fn markCorrupt(generations: *state_mod.SubDir, name: []const u8) void {
 /// ineligible entries ahead of a real orphan (in whatever order the
 /// filesystem happens to iterate) can ever stall deletion — then deletes
 /// that batch and rescans; repeated calls (every persist/load) eventually
-/// reclaim every eligible orphan.
+/// reclaim every eligible orphan. A batch that removes nothing (every
+/// candidate is a stuck regular file, symlink, mode-insecure directory, or
+/// a non-empty directory) stops the scan rather than resubmitting the same
+/// undeletable names forever.
 fn pruneGenerations(generations: *state_mod.SubDir, keep: []const []const u8) void {
     while (true) {
         var names: [64][64]u8 = undefined;
         var lens: [64]usize = undefined;
         const count = generations.listMatching(&names, &lens, keep, isPruneCandidate) catch return;
         if (count == 0) return;
+        var removed: usize = 0;
         for (0..count) |i| {
             const name = names[i][0..lens[i]];
             var doomed = generations.openSubdirStrict(name) catch continue;
@@ -732,7 +736,14 @@ fn pruneGenerations(generations: *state_mod.SubDir, keep: []const []const u8) vo
             doomed.removeFile(generation_file_meta);
             doomed.close();
             generations.removeEmpty(name) catch continue;
+            removed += 1;
         }
+        // A batch that deletes nothing means every eligible candidate is
+        // currently undeletable (a regular file, symlink, mode-insecure
+        // directory, or a directory with an unexpected extra file). Without
+        // this check, `listMatching` would keep returning the same stuck
+        // names forever and the caller would hang holding the state lock.
+        if (removed == 0) return;
     }
 }
 

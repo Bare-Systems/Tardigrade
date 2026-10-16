@@ -1041,3 +1041,131 @@ test "pruneGenerations reclaims orphans behind a wall of retained corrupt archiv
     try testing.expectEqualStrings(persisted.generationId(), loaded.generationId());
     try testing.expect(!std.mem.eql(u8, first.generationId(), persisted.generationId()));
 }
+
+test "pruneGenerations stops rather than looping forever on a stuck generation-shaped regular file" {
+    const allocator = testing.allocator;
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try state_mod.StateDir.open(tmp.path);
+    defer state.close();
+
+    const hosts = [_][]const u8{"a.example.com"};
+    var fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 90 * day);
+    defer {
+        fixture.key.deinit();
+        allocator.free(fixture.pem);
+    }
+    const first = try activate.verifyAndPersist(allocator, &state, "group-1", &fixture.key, fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    const removable_orphan = "1000-0000000000000001";
+    const stuck_name = "1001-0000000000000002";
+    {
+        var groups = try state.openSubdirStrict("groups");
+        defer groups.close();
+        var group = try groups.openSubdirStrict("group-1");
+        defer group.close();
+        var generations = try group.openSubdirStrict("generations");
+        defer generations.close();
+
+        // A genuinely removable orphan, so a successful batch is still
+        // possible alongside the stuck entry below.
+        var orphan = try generations.openOrCreateSubdir(removable_orphan);
+        orphan.close();
+
+        // A regular file shaped like a generation id: `openSubdirStrict`
+        // fails with `error.UnsafeFileType` on every pass, so without a
+        // progress check `pruneGenerations` would resubmit it forever.
+        try generations.writeFileAtomic(stuck_name, "not a directory", 0o600);
+    }
+
+    var second = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 120 * day);
+    defer {
+        second.key.deinit();
+        allocator.free(second.pem);
+    }
+    const persisted = try activate.verifyAndPersist(allocator, &state, "group-1", &second.key, second.pem, .{ .hostnames = &hosts, .now = base_now });
+    try testing.expect(!std.mem.eql(u8, first.generationId(), persisted.generationId()));
+
+    var groups = try state.openSubdirStrict("groups");
+    defer groups.close();
+    var group = try groups.openSubdirStrict("group-1");
+    defer group.close();
+    var generations = try group.openSubdirStrict("generations");
+    defer generations.close();
+
+    try testing.expectError(error.NotFound, generations.openSubdirStrict(removable_orphan));
+    // The stuck file is left in place rather than causing a hang; the
+    // committed pair is unaffected.
+    const stuck_stat = try generations.readFileAlloc(allocator, stuck_name, 64, false);
+    defer allocator.free(stuck_stat);
+    try testing.expectEqualStrings("not a directory", stuck_stat);
+
+    var loaded = (try activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now)).?;
+    defer loaded.deinit(allocator);
+    try testing.expectEqualStrings(persisted.generationId(), loaded.generationId());
+}
+
+test "pruneGenerations stops rather than looping forever on a non-empty generation directory" {
+    const allocator = testing.allocator;
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try state_mod.StateDir.open(tmp.path);
+    defer state.close();
+
+    const hosts = [_][]const u8{"a.example.com"};
+    var fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 90 * day);
+    defer {
+        fixture.key.deinit();
+        allocator.free(fixture.pem);
+    }
+    const first = try activate.verifyAndPersist(allocator, &state, "group-1", &fixture.key, fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    const removable_orphan = "1000-0000000000000001";
+    const stuck_name = "1001-0000000000000002";
+    {
+        var groups = try state.openSubdirStrict("groups");
+        defer groups.close();
+        var group = try groups.openSubdirStrict("group-1");
+        defer group.close();
+        var generations = try group.openSubdirStrict("generations");
+        defer generations.close();
+
+        var orphan = try generations.openOrCreateSubdir(removable_orphan);
+        orphan.close();
+
+        // A generation directory with an unexpected extra file alongside
+        // it: removing the three known generation files still leaves the
+        // directory non-empty, so `removeEmpty` keeps failing every pass.
+        var stuck = try generations.openOrCreateSubdir(stuck_name);
+        try stuck.writeFileAtomic("unexpected.txt", "surprise", 0o600);
+        stuck.close();
+    }
+
+    var second = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 120 * day);
+    defer {
+        second.key.deinit();
+        allocator.free(second.pem);
+    }
+    const persisted = try activate.verifyAndPersist(allocator, &state, "group-1", &second.key, second.pem, .{ .hostnames = &hosts, .now = base_now });
+    try testing.expect(!std.mem.eql(u8, first.generationId(), persisted.generationId()));
+
+    var groups = try state.openSubdirStrict("groups");
+    defer groups.close();
+    var group = try groups.openSubdirStrict("group-1");
+    defer group.close();
+    var generations = try group.openSubdirStrict("generations");
+    defer generations.close();
+
+    try testing.expectError(error.NotFound, generations.openSubdirStrict(removable_orphan));
+    // The stuck directory survives (its extra file blocks `removeEmpty`)
+    // rather than causing a hang; the committed pair is unaffected.
+    var stuck = try generations.openSubdirStrict(stuck_name);
+    defer stuck.close();
+    const leftover = try stuck.readFileAlloc(allocator, "unexpected.txt", 64, false);
+    defer allocator.free(leftover);
+    try testing.expectEqualStrings("surprise", leftover);
+
+    var loaded = (try activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now)).?;
+    defer loaded.deinit(allocator);
+    try testing.expectEqualStrings(persisted.generationId(), loaded.generationId());
+}

@@ -2,6 +2,7 @@
 //! Phase A2: nothing here issues or activates a certificate (A3/A4 own that).
 
 pub const account = @import("account.zig");
+pub const csr = @import("csr.zig");
 pub const json_limits = @import("json_limits.zig");
 pub const state = @import("state.zig");
 pub const url = @import("url.zig");

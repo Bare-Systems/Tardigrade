@@ -1010,6 +1010,11 @@ pub fn build(b: *std.Build) void {
     // they need the same "pki" module wired directly.
     session_cache_mod.addImport("pki", pki_mod);
     session_cache_persistence_mod.addImport("pki", pki_mod);
+    // #878: the native PKCS#10 CSR writer in `src/acme/csr.zig` reuses
+    // `pki.der`'s bounded TLV encode primitives and `pki.oid`; pki has no
+    // reverse dependency on exe_mod, so this stays acyclic too.
+    exe_mod.addImport("pki", pki_mod);
+    exe_test_mod.addImport("pki", pki_mod);
     const pki_tests = b.addTest(.{ .root_module = pki_test_mod });
     const run_pki_tests = b.addRunArtifact(pki_tests);
     const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");
@@ -1028,6 +1033,7 @@ pub fn build(b: *std.Build) void {
     acme_test_mod.addImport("crypto", crypto_mod);
     acme_test_mod.addImport("zig_compat", compat_mod);
     acme_test_mod.addImport("tls_core", tls_core_mod);
+    acme_test_mod.addImport("pki", pki_mod);
     const acme_tests = b.addTest(.{ .root_module = acme_test_mod });
     const run_acme_tests = b.addRunArtifact(acme_tests);
     const acme_step = b.step("test-acme", "Run native ACME account/JWS/state unit and corpus tests (#832)");

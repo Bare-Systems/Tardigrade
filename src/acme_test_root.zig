@@ -5,6 +5,7 @@ const std = @import("std");
 
 test {
     _ = @import("acme/root.zig");
+    _ = @import("acme/csr.zig");
     _ = @import("http/acme_tls_dialer.zig");
     _ = @import("http/acme_challenge_store.zig");
 }
@@ -22,6 +23,7 @@ fn productionText(source: []const u8) []const u8 {
 test "ACME implementation stays behind the native compat boundary (#832)" {
     const files = .{
         .{ "acme/account.zig", @embedFile("acme/account.zig") },
+        .{ "acme/csr.zig", @embedFile("acme/csr.zig") },
         .{ "acme/names.zig", @embedFile("acme/names.zig") },
         .{ "acme/contact.zig", @embedFile("acme/contact.zig") },
         .{ "acme/client.zig", @embedFile("acme/client.zig") },

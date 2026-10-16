@@ -328,6 +328,11 @@ pub const EdgeConfig = struct {
     /// `TARDIGRADE_TLS_ACME_EAB_KID` or `_EAB_HMAC_KEY_PATH` was set. External
     /// account binding is reserved and rejected until implemented.
     tls_acme_eab_requested: bool,
+    /// `TARDIGRADE_TLS_ACME_HTTP01_LISTEN` (directive `acme_http01_listen`):
+    /// `host:port` for the dedicated bounded HTTP-01 challenge listener
+    /// (docs/ACME_AUTOMATIC_HTTPS.md §8.0, #881). Startup-fixed; must differ
+    /// from the main listener.
+    tls_acme_http01_listen: []const u8,
     http1_enabled: bool,
     http2_enabled: bool,
     tls_http1_no_alpn_fallback: bool,
@@ -808,6 +813,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.tls_acme_ca_bundle_path);
         allocator.free(self.tls_acme_domains_spec);
         allocator.free(self.tls_acme_challenges);
+        allocator.free(self.tls_acme_http01_listen);
         allocator.free(self.trust_gateway_id);
         allocator.free(self.trust_shared_secret);
         for (self.trusted_upstream_identities) |id| allocator.free(id);
@@ -1093,6 +1099,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         break :blk false;
     };
+    const tls_acme_http01_listen = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", "", "0.0.0.0:80") catch unreachable;
+    errdefer allocator.free(tls_acme_http01_listen);
     const upstream_protocol_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_PROTOCOL", "http1") catch unreachable;
     defer allocator.free(upstream_protocol_str);
     const upstream_protocol = try parseUpstreamProtocolConfig(upstream_protocol_str);
@@ -1871,6 +1879,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_acme_ca_bundle_path = tls_acme_ca_bundle_path,
         .tls_acme_challenges = tls_acme_challenges,
         .tls_acme_eab_requested = tls_acme_eab_requested,
+        .tls_acme_http01_listen = tls_acme_http01_listen,
         .http1_enabled = http1_enabled,
         .http2_enabled = http2_enabled,
         .tls_http1_no_alpn_fallback = tls_http1_no_alpn_fallback,
@@ -2600,6 +2609,64 @@ fn conflictingFileOverrideValue(key: []const u8, env_value: []const u8) ?[]const
 }
 
 const default_acme_directory_url = "https://acme-v02.api.letsencrypt.org/directory";
+const default_acme_http01_listen = "0.0.0.0:80";
+
+/// A `host:port` dedicated-listener address (docs/ACME_AUTOMATIC_HTTPS.md
+/// §8.0). Host and port are returned as-is (no normalization) so a caller
+/// can both bind the address and compare it against `listen_host`/
+/// `listen_port` for the "cannot equal the main listener" rule.
+pub const AcmeHttp01ListenAddr = struct { host: []const u8, port: u16 };
+
+pub fn parseAcmeHttp01Listen(raw: []const u8) !AcmeHttp01ListenAddr {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const parts = splitHostPort(trimmed) orelse return error.InvalidConfigValue;
+    if (parts[0].len == 0) return error.InvalidConfigValue;
+    const port = std.fmt.parseInt(u16, parts[1], 10) catch return error.InvalidConfigValue;
+    if (port == 0) return error.InvalidConfigValue;
+    // #897 review: validate with the exact literal-IP-only parser
+    // `Listener.start` binds with, so an unresolved hostname (`localhost`,
+    // `not-an-ip-address`) that splits cleanly into host:port but can never
+    // actually bind fails configuration validation here -- before any
+    // socket opens (§8.0) -- instead of surfacing only as a late startup
+    // bind error.
+    _ = std.Io.net.IpAddress.parse(parts[0], port) catch return error.InvalidConfigValue;
+    return .{ .host = parts[0], .port = port };
+}
+
+/// True when `a` and `b` are the same bindable endpoint, or when one is the
+/// IPv4/IPv6 wildcard address on the same port as the other: a wildcard bind
+/// also accepts connections addressed to every specific local address on
+/// that port, so a dedicated listener on a specific address and a wildcard
+/// listener on the main port cannot both bind separately (#897 review).
+/// An IPv6 wildcard (`::`) is also reported as overlapping every IPv4
+/// endpoint on the same port: Linux's (and most other platforms') default
+/// `IPV6_V6ONLY=0` dual-stack behavior means an IPv6-wildcard bind already
+/// reserves the IPv4 wildcard/specific endpoints on that port too, so the
+/// later bind of a same-port IPv4 listener would fail even though this
+/// raw-endpoint comparison alone would not otherwise flag it (#897 review).
+/// A non-wildcard, family-specific IPv6 address is not modeled against IPv4
+/// peers beyond that; neither listener binds IPv4-mapped IPv6 addresses.
+fn listenAddressesOverlap(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
+    if (a.getPort() != b.getPort()) return false;
+    return switch (a) {
+        .ip4 => |a4| switch (b) {
+            .ip4 => |b4| a4.eql(b4) or isWildcardIp4(a4) or isWildcardIp4(b4),
+            .ip6 => |b6| isWildcardIp6(b6),
+        },
+        .ip6 => |a6| switch (b) {
+            .ip6 => |b6| a6.eql(b6) or isWildcardIp6(a6) or isWildcardIp6(b6),
+            .ip4 => isWildcardIp6(a6),
+        },
+    };
+}
+
+fn isWildcardIp4(addr: std.Io.net.Ip4Address) bool {
+    return std.mem.allEqual(u8, &addr.bytes, 0);
+}
+
+fn isWildcardIp6(addr: std.Io.net.Ip6Address) bool {
+    return std.mem.allEqual(u8, &addr.bytes, 0);
+}
 
 /// `TARDIGRADE_TLS_X` -> `TARDIGRADE_X`: the name a native config-file
 /// directive (`acme_state_dir`) normalizes to.
@@ -3718,6 +3785,31 @@ fn validateAcmeConfig(cfg: *const EdgeConfig) !void {
     // A pre-provisioned account key must exist; it is read, never created.
     try validateOptionalFile(cfg.tls_acme_account_key_path, "tls_acme_account_key_path");
     try validateOptionalFile(cfg.tls_acme_ca_bundle_path, "tls_acme_ca_bundle_path");
+    // §8.0: the dedicated HTTP-01 challenge listener address. Required (a
+    // default is always present) and startup-fixed; it must not collide
+    // with the main listener, since a CA validating on this address could
+    // otherwise reach ordinary application routing instead of the bounded
+    // challenge-only listener (#881).
+    const http01_listen = parseAcmeHttp01Listen(cfg.tls_acme_http01_listen) catch {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_HTTP01_LISTEN must be host:port with a literal, bindable IP address", .{});
+        return error.InvalidConfigValue;
+    };
+    // #897 review: compare normalized endpoints (catching wildcard overlap,
+    // e.g. main `127.0.0.1:80` vs ACME `0.0.0.0:80`), not raw host strings.
+    // `parseAcmeHttp01Listen` above already proved `http01_listen.host`
+    // parses; `cfg.listen_host` is validated the same way at bind time
+    // (`edge_gateway.run`), so a parse failure here just means that bind
+    // will fail on its own and the raw-string fallback below still catches
+    // the exact-match case.
+    const http01_addr = std.Io.net.IpAddress.parse(http01_listen.host, http01_listen.port) catch unreachable;
+    const overlaps = if (std.Io.net.IpAddress.parse(cfg.listen_host, cfg.listen_port)) |main_addr|
+        listenAddressesOverlap(main_addr, http01_addr)
+    else |_|
+        std.mem.eql(u8, http01_listen.host, cfg.listen_host) and http01_listen.port == cfg.listen_port;
+    if (overlaps) {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_HTTP01_LISTEN must not overlap the main listener ({s}:{d})", .{ cfg.listen_host, cfg.listen_port });
+        return error.InvalidConfigValue;
+    }
 }
 
 /// Any ACME setting that differs from its default.
@@ -3731,7 +3823,8 @@ fn acmeSettingsNonDefault(cfg: *const EdgeConfig) bool {
         cfg.tls_acme_renew_days_before_expiry != 30 or
         cfg.tls_acme_agree_tos or
         cfg.tls_acme_ca_bundle_path.len != 0 or
-        !std.mem.eql(u8, cfg.tls_acme_challenges, "http-01");
+        !std.mem.eql(u8, cfg.tls_acme_challenges, "http-01") or
+        !std.mem.eql(u8, cfg.tls_acme_http01_listen, default_acme_http01_listen);
 }
 
 /// `tardi run` has nothing that can serve or activate an ACME-managed
@@ -4412,6 +4505,78 @@ fn splitHostPort(raw: []const u8) ?struct { []const u8, []const u8 } {
     const idx = std.mem.findScalarLast(u8, raw, ':') orelse return null;
     if (idx == 0 or idx + 1 >= raw.len) return null;
     return .{ std.mem.trim(u8, raw[0..idx], " \t\r\n"), std.mem.trim(u8, raw[idx + 1 ..], " \t\r\n") };
+}
+
+test "parseAcmeHttp01Listen parses host:port and rejects malformed addresses (#881)" {
+    const addr = try parseAcmeHttp01Listen("0.0.0.0:80");
+    try std.testing.expectEqualStrings("0.0.0.0", addr.host);
+    try std.testing.expectEqual(@as(u16, 80), addr.port);
+
+    const addr2 = try parseAcmeHttp01Listen("  127.0.0.1:8080  ");
+    try std.testing.expectEqualStrings("127.0.0.1", addr2.host);
+    try std.testing.expectEqual(@as(u16, 8080), addr2.port);
+
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("no-port-here"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen(":80"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("host:"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("host:0"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("host:not-a-number"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("host:99999"));
+}
+
+test "parseAcmeHttp01Listen rejects unresolved hostnames (#897 review)" {
+    // These split cleanly into host:port but are not literal IP addresses,
+    // so `Listener.start`'s `std.Io.net.IpAddress.parse` can never bind
+    // them; validation must reject them with the same parser.
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("localhost:80"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("not-an-ip-address:80"));
+}
+
+test "listenAddressesOverlap reports wildcard-vs-specific same-port overlap but not distinct addresses (#897 review)" {
+    const wildcard4 = try std.Io.net.IpAddress.parse("0.0.0.0", 80);
+    const specific4 = try std.Io.net.IpAddress.parse("127.0.0.1", 80);
+    const other_specific4 = try std.Io.net.IpAddress.parse("10.0.0.1", 80);
+    try std.testing.expect(listenAddressesOverlap(wildcard4, specific4));
+    try std.testing.expect(listenAddressesOverlap(specific4, wildcard4));
+    try std.testing.expect(listenAddressesOverlap(specific4, specific4));
+    try std.testing.expect(!listenAddressesOverlap(specific4, other_specific4));
+
+    const specific4_other_port = try std.Io.net.IpAddress.parse("127.0.0.1", 81);
+    try std.testing.expect(!listenAddressesOverlap(specific4, specific4_other_port));
+
+    const wildcard6 = try std.Io.net.IpAddress.parse("::", 80);
+    const specific6 = try std.Io.net.IpAddress.parse("::1", 80);
+    try std.testing.expect(listenAddressesOverlap(wildcard6, specific6));
+    // A non-wildcard, family-specific pair is still never reported as
+    // overlapping: only the IPv6 wildcard's dual-stack reservation is
+    // modeled across families.
+    try std.testing.expect(!listenAddressesOverlap(specific4, specific6));
+}
+
+test "listenAddressesOverlap reports IPv6-wildcard dual-stack collisions with IPv4 peers (#897 review)" {
+    // Linux's (and most platforms') default IPV6_V6ONLY=0 means an IPv6
+    // wildcard bind also reserves the IPv4 wildcard/specific endpoints on
+    // the same port: a main `0.0.0.0:443` plus an ACME `:::443`, or a main
+    // `[::]:80` plus an ACME `127.0.0.1:80`, would otherwise pass this
+    // validator and only fail at the later bind.
+    const wildcard4 = try std.Io.net.IpAddress.parse("0.0.0.0", 443);
+    const wildcard6 = try std.Io.net.IpAddress.parse("::", 443);
+    try std.testing.expect(listenAddressesOverlap(wildcard4, wildcard6));
+    try std.testing.expect(listenAddressesOverlap(wildcard6, wildcard4));
+
+    const wildcard6_80 = try std.Io.net.IpAddress.parse("::", 80);
+    const specific4_80 = try std.Io.net.IpAddress.parse("127.0.0.1", 80);
+    try std.testing.expect(listenAddressesOverlap(wildcard6_80, specific4_80));
+    try std.testing.expect(listenAddressesOverlap(specific4_80, wildcard6_80));
+
+    // A plain (non-wildcard) IPv6 address is not modeled as colliding with
+    // any IPv4 endpoint.
+    const specific6_80 = try std.Io.net.IpAddress.parse("::1", 80);
+    try std.testing.expect(!listenAddressesOverlap(specific6_80, specific4_80));
+
+    // Different ports never overlap, even with an IPv6 wildcard involved.
+    const wildcard6_81 = try std.Io.net.IpAddress.parse("::", 81);
+    try std.testing.expect(!listenAddressesOverlap(wildcard6_81, specific4_80));
 }
 
 test "parse token hashes from csv" {
@@ -5512,6 +5677,41 @@ test "automatic HTTPS grammar is validated before the support gate (#832)" {
         }.f },
         .{ .mutate = struct {
             fn f(c: *EdgeConfig) void {
+                c.tls_acme_http01_listen = "not-a-host-port";
+            }
+        }.f },
+        .{
+            .mutate = struct {
+                // §8.0: the dedicated listener cannot equal the main one.
+                fn f(c: *EdgeConfig) void {
+                    c.tls_acme_http01_listen = "0.0.0.0:8069";
+                }
+            }.f,
+        },
+        .{
+            .mutate = struct {
+                // #897 review: the main listener's "0.0.0.0" wildcard also
+                // accepts connections addressed to every specific local
+                // address on the same port, so a specific-address ACME
+                // listener on the main port overlaps too, not only an exact
+                // string match.
+                fn f(c: *EdgeConfig) void {
+                    c.tls_acme_http01_listen = "127.0.0.1:8069";
+                }
+            }.f,
+        },
+        .{
+            .mutate = struct {
+                // #897 review: an unresolved hostname splits cleanly into
+                // host:port but can never bind; reject it here rather than
+                // only failing much later at `Listener.start`.
+                fn f(c: *EdgeConfig) void {
+                    c.tls_acme_http01_listen = "localhost:80";
+                }
+            }.f,
+        },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
                 c.tls_acme_domains_spec = "*.example.com";
             }
         }.f },
@@ -5570,7 +5770,7 @@ test "automatic HTTPS grammar is validated before the support gate (#832)" {
     }
     // §4.5 step 1: with the opt-in off, every non-default ACME field is an
     // error, one field at a time; reserved EAB too.
-    for (0..11) |which| {
+    for (0..12) |which| {
         var cfg = base;
         switch (which) {
             0 => cfg.tls_acme_directory_url = "https://ca.example/dir",
@@ -5583,7 +5783,8 @@ test "automatic HTTPS grammar is validated before the support gate (#832)" {
             7 => cfg.tls_acme_agree_tos = true,
             8 => cfg.tls_acme_ca_bundle_path = "/etc/ssl/cert.pem",
             9 => cfg.tls_acme_challenges = "tls-alpn-01",
-            else => cfg.tls_acme_eab_requested = true,
+            10 => cfg.tls_acme_eab_requested = true,
+            else => cfg.tls_acme_http01_listen = "127.0.0.1:8080",
         }
         try std.testing.expectError(error.InvalidConfigValue, validateNativeTlsBuildConfig(&cfg));
     }

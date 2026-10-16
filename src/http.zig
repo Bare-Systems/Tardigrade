@@ -65,6 +65,7 @@ pub const acme_client = @import("http/acme_client.zig");
 /// Native ACME accounts, JWS transport and durable state (#832).
 pub const acme = @import("acme/root.zig");
 pub const acme_tls_dialer = @import("http/acme_tls_dialer.zig");
+pub const acme_http01_listener = @import("http/acme_http01_listener.zig");
 pub const hpack = @import("http/hpack.zig");
 pub const http2_frame = @import("http/http2_frame.zig");
 pub const http2_stream = @import("http/http2_stream.zig");

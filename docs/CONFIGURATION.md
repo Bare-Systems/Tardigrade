@@ -738,6 +738,7 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 | `TARDIGRADE_TLS_ACME_EMAIL` | email | `""` | ACME account email. | `TARDIGRADE_TLS_ACME_EMAIL=ops@example.com` |
 | `TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH` | path | `""` | Optional pre-provisioned PEM P-256 account key (must exist, `0600`, owned by the runtime user); read only, never created. Empty uses `account.key` in the state directory. | `TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH=/var/lib/tardigrade/acme/account.key` |
 | `TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY` | u32 days | `30` | Renewal trigger window. | `TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY=21` |
+| `TARDIGRADE_TLS_ACME_HTTP01_LISTEN` | `host:port` | `0.0.0.0:80` | Dedicated bounded HTTP-01 challenge listener (#881, docs/ACME_AUTOMATIC_HTTPS.md §8.0); must differ from the main listener. Startup-fixed (a reload that changes it is rejected). Bound before the privilege drop like the main listener, but not reachable yet: `tardi run` still refuses every ACME-enabled config. | `TARDIGRADE_TLS_ACME_HTTP01_LISTEN=127.0.0.1:8080` |
 
 ### HTTP/3 And QUIC
 

@@ -203,6 +203,28 @@ pub fn hotReloadConfig(
         }
     }
     {
+        // #881: the dedicated ACME HTTP-01 challenge listener is bound once
+        // at startup, before the privilege drop, exactly like the main and
+        // HTTP/3 listeners (design docs/ACME_AUTOMATIC_HTTPS.md §8.0). A
+        // changed address needs a fresh bind, so reject the reload rather
+        // than silently continuing to serve the old address.
+        var current_lease = worker_ctx.config_store.acquire();
+        const acme_http01_listener_config_changed = acmeHttp01ListenerConfigChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (acme_http01_listener_config_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "ACME HTTP-01 challenge listener address changed; restart required", .{}) catch "ACME HTTP-01 challenge listener address changed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: TARDIGRADE_TLS_ACME_HTTP01_LISTEN changed; restart the process to change the ACME HTTP-01 challenge listener address", .{});
+            return;
+        }
+    }
+    {
         // The circuit breaker is process-owned state constructed once at
         // startup. Reloading its policy in place would require generation-safe
         // permit migration, so reject those changes and keep config/state
@@ -528,6 +550,99 @@ pub fn circuitBreakerConfigChanged(
 ) bool {
     return current.cb_threshold != proposed.cb_threshold or
         current.cb_timeout_ms != proposed.cb_timeout_ms;
+}
+
+/// #881 (review #897): the dedicated HTTP-01 challenge listener binds once at
+/// startup, before the privilege drop, and borrows `cfg.tls_acme_domains` for
+/// its lifetime (`Listener.start`). A reload cannot rebind the listener nor
+/// swap its borrowed host set in place, so any change to the listener's
+/// address, enabled state, or managed-host set -- not just the address --
+/// must reject the whole reload (§8.0); otherwise the published config would
+/// advertise managed hosts the running listener's admission check never
+/// learns about. `tls_acme_domains_spec` is the pre-normalization source of
+/// `tls_acme_domains`, so comparing it also catches reordering/case changes
+/// that resolve to the same validated set -- a conservative restart-required
+/// classification, never a false negative.
+///
+/// The listener's per-IP admission cap (`max_connections_per_ip`) is in the
+/// same boat: it is copied into the listener's own startup-owned pool state
+/// once in `Listener.start` and is not reachable from the normal hot-reload
+/// path, unlike the main accept path's `state.max_connections_per_ip`
+/// (#897 review). Without this check, lowering the configured cap while ACME
+/// is active would leave the main listener enforcing the new limit while the
+/// challenge listener kept silently admitting up to the old one (and a raise
+/// would leave it artificially under-limited) -- so a cap change while ACME
+/// is enabled is restart-required too.
+pub fn acmeHttp01ListenerConfigChanged(
+    current: *const edge_config.EdgeConfig,
+    proposed: *const edge_config.EdgeConfig,
+) bool {
+    return current.tls_acme_enabled != proposed.tls_acme_enabled or
+        !std.mem.eql(u8, current.tls_acme_http01_listen, proposed.tls_acme_http01_listen) or
+        !std.mem.eql(u8, current.tls_acme_domains_spec, proposed.tls_acme_domains_spec) or
+        (current.tls_acme_enabled and
+            current.max_connections_per_ip != proposed.max_connections_per_ip);
+}
+
+test "acmeHttp01ListenerConfigChanged detects an address change (#881)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    try std.testing.expect(!acmeHttp01ListenerConfigChanged(&base, &proposed));
+    // `deinit` frees this field, so the replacement must be heap-owned too.
+    allocator.free(proposed.tls_acme_http01_listen);
+    proposed.tls_acme_http01_listen = try allocator.dupe(u8, "127.0.0.1:8080");
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+}
+
+test "acmeHttp01ListenerConfigChanged detects a managed-host set change (#897 review)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    allocator.free(proposed.tls_acme_domains_spec);
+    proposed.tls_acme_domains_spec = try allocator.dupe(u8, "a.example.com");
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+}
+
+test "acmeHttp01ListenerConfigChanged detects an enabled-flag change (#897 review)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    proposed.tls_acme_enabled = !base.tls_acme_enabled;
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+}
+
+test "acmeHttp01ListenerConfigChanged rejects a per-IP cap change while ACME is enabled, but not while disabled (#897 review)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    base.tls_acme_enabled = true;
+    proposed.tls_acme_enabled = true;
+    base.max_connections_per_ip = 64;
+    proposed.max_connections_per_ip = 2;
+    // Changing *only* the cap while ACME is active must still be seen as a
+    // listener-affecting change: the dedicated listener's own pool would
+    // otherwise keep enforcing the stale 64 limit after a reload lowers the
+    // configured cap to 2, while the main accept path enforces 2.
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+
+    // The same cap change is irrelevant when ACME is not enabled: there is
+    // no dedicated listener holding a stale value to diverge from.
+    base.tls_acme_enabled = false;
+    proposed.tls_acme_enabled = false;
+    try std.testing.expect(!acmeHttp01ListenerConfigChanged(&base, &proposed));
 }
 
 test "earlyDataReplayConfigChanged detects mode and capacity changes independently" {

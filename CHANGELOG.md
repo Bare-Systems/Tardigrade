@@ -70,6 +70,23 @@ All notable user-facing changes to Tardigrade are documented here.
   default-port tricks rather than normalizing them. No certificate is
   requested, issued or activated; the dedicated HTTP-01 listener and ACME
   order state machine remain out of scope (tracked in #833).
+- **Isolated, bounded native HTTP-01 challenge listener (#881, epic #759
+  phase A3 slice).** New `src/http/acme_http01_listener.zig`: a dedicated
+  plaintext listener (`TARDIGRADE_TLS_ACME_HTTP01_LISTEN`, directive
+  `acme_http01_listen`, default `0.0.0.0:80`) with its own small bounded
+  accept pool (≤ 64 concurrent connections, excess accepted-and-closed; 8 KiB
+  request-head cap; a 5 s head-read deadline and a 10 s total per-connection
+  deadline; one request per connection, no bodies, upgrades, or keep-alive).
+  It serves only `GET`/`HEAD /.well-known/acme-challenge/<token>` for a
+  managed host from the existing `ChallengeStore` (#877) — `404` for a miss,
+  `421` for an unmanaged Host — and never reaches application routing,
+  proxying, auth or rewrite. Bound before the privilege drop/chroot, like the
+  main listener; a bind failure fails startup, and the address is
+  startup-fixed (a reload that changes it is rejected as restart-required).
+  No certificate is requested, issued or activated, and `tardi run` still
+  refuses every ACME-enabled config (`rejectAcmeRuntime`) regardless of this
+  change; the order engine (#882) and its end-to-end wiring through a live
+  local CA (#883) remain separate, open children of #833.
 - **WebSocket reactor lifecycle observability (#829, #827).** Tunnel close
   metrics now distinguish `client_error` from `upstream_error` (previously one
   `error` label; the access log keeps `error`). New gauges/counters:

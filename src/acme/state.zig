@@ -63,6 +63,9 @@ pub const Fault = enum {
     close_file,
     rename,
     fsync_dir,
+    /// A newly-created child directory is not durable until its name has
+    /// been synced through its parent.
+    mkdir_fsync_parent,
 };
 
 pub const StateDir = struct {
@@ -125,14 +128,27 @@ pub const StateDir = struct {
     /// Replace `name` atomically with `data` at `mode`. On any failure the
     /// previous `name` is untouched and the temp file is removed.
     pub fn writeFileAtomic(self: *StateDir, name: []const u8, data: []const u8, mode: u32) Error!void {
-        return writeFileAtomicRaw(self.dir_fd, &self.fault, name, data, mode);
+        return self.writeFileAtomicLimit(name, data, mode, max_state_file_len);
+    }
+
+    /// The same hardened atomic replacement procedure with a caller-specific
+    /// bounded payload limit. Certificate chains have a larger documented
+    /// budget than account and metadata state.
+    pub fn writeFileAtomicLimit(self: *StateDir, name: []const u8, data: []const u8, mode: u32, max_len: usize) Error!void {
+        return writeFileAtomicRaw(self.dir_fd, &self.fault, name, data, mode, max_len);
     }
 
     /// Read `name` (bounded). With `private`, any group/other permission bit
     /// is `InsecurePermissions`. Never follows symlinks. When `private`, the
     /// caller owns key material and must free with `secrets.secureZeroAndFree`.
     pub fn readFileAlloc(self: *const StateDir, allocator: std.mem.Allocator, name: []const u8, max_len: usize, private: bool) Error![]u8 {
-        return readFileAllocRaw(self.dir_fd, allocator, name, max_len, private);
+        return readFileAllocRaw(self.dir_fd, allocator, name, max_len, private, null);
+    }
+
+    /// Read a private regular file whose permission bits must be exactly
+    /// `mode` (used for commit markers with a documented 0600 contract).
+    pub fn readFileAllocExactMode(self: *const StateDir, allocator: std.mem.Allocator, name: []const u8, max_len: usize, mode: u32) Error![]u8 {
+        return readFileAllocRaw(self.dir_fd, allocator, name, max_len, true, mode);
     }
 
     /// Open (creating as `0700` if absent) a single-component subdirectory
@@ -177,11 +193,19 @@ pub const SubDir = struct {
     }
 
     pub fn writeFileAtomic(self: *SubDir, name: []const u8, data: []const u8, mode: u32) Error!void {
-        return writeFileAtomicRaw(self.fd, self.fault, name, data, mode);
+        return self.writeFileAtomicLimit(name, data, mode, max_state_file_len);
+    }
+
+    pub fn writeFileAtomicLimit(self: *SubDir, name: []const u8, data: []const u8, mode: u32, max_len: usize) Error!void {
+        return writeFileAtomicRaw(self.fd, self.fault, name, data, mode, max_len);
     }
 
     pub fn readFileAlloc(self: *const SubDir, allocator: std.mem.Allocator, name: []const u8, max_len: usize, private: bool) Error![]u8 {
-        return readFileAllocRaw(self.fd, allocator, name, max_len, private);
+        return readFileAllocRaw(self.fd, allocator, name, max_len, private, null);
+    }
+
+    pub fn readFileAllocExactMode(self: *const SubDir, allocator: std.mem.Allocator, name: []const u8, max_len: usize, mode: u32) Error![]u8 {
+        return readFileAllocRaw(self.fd, allocator, name, max_len, true, mode);
     }
 
     pub fn openOrCreateSubdir(self: *SubDir, name: []const u8) Error!SubDir {
@@ -231,6 +255,23 @@ pub const SubDir = struct {
         }
         return count;
     }
+
+    /// Like `listNames`, but never reports a successful partial snapshot.
+    /// Callers that would make a correctness decision from enumeration must
+    /// use this variant (rather than silently treating the first 64 entries
+    /// as the complete history).
+    pub fn listNamesStrict(self: *const SubDir, out: *[64][64]u8, out_len: *[64]usize) Error!usize {
+        var it = self.dir().iterate();
+        var count: usize = 0;
+        while (it.next(zig_compat.io()) catch return error.IoFailure) |entry| {
+            if (entry.name.len == 0 or entry.name.len >= 64) continue;
+            if (count == out.len) return error.TooLarge;
+            @memcpy(out[count][0..entry.name.len], entry.name);
+            out_len[count] = entry.name.len;
+            count += 1;
+        }
+        return count;
+    }
 };
 
 fn hitFault(fault: *Fault, point: Fault) Error!void {
@@ -241,9 +282,9 @@ fn hitFault(fault: *Fault, point: Fault) Error!void {
     }
 }
 
-fn writeFileAtomicRaw(dir_fd: zig_compat.Fd, fault: *Fault, name: []const u8, data: []const u8, mode: u32) Error!void {
+fn writeFileAtomicRaw(dir_fd: zig_compat.Fd, fault: *Fault, name: []const u8, data: []const u8, mode: u32, max_len: usize) Error!void {
     if (!validName(name)) return error.InvalidPath;
-    if (data.len > max_state_file_len) return error.TooLarge;
+    if (data.len > max_len) return error.TooLarge;
 
     var random: [8]u8 = undefined;
     zig_compat.randomBytes(&random);
@@ -285,7 +326,7 @@ fn writeFileAtomicRaw(dir_fd: zig_compat.Fd, fault: *Fault, name: []const u8, da
     zig_compat.fsyncFd(dir_fd) catch return error.IoFailure;
 }
 
-fn readFileAllocRaw(dir_fd: zig_compat.Fd, allocator: std.mem.Allocator, name: []const u8, max_len: usize, private: bool) Error![]u8 {
+fn readFileAllocRaw(dir_fd: zig_compat.Fd, allocator: std.mem.Allocator, name: []const u8, max_len: usize, private: bool, required_mode: ?u32) Error![]u8 {
     if (!validName(name)) return error.InvalidPath;
     const parent: std.Io.Dir = .{ .handle = dir_fd };
     const st = parent.statFile(zig_compat.io(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
@@ -294,6 +335,7 @@ fn readFileAllocRaw(dir_fd: zig_compat.Fd, allocator: std.mem.Allocator, name: [
     };
     if (st.kind != .file) return error.UnsafeFileType;
     if (private and modeBits(st) & 0o077 != 0) return error.InsecurePermissions;
+    if (required_mode) |mode| if (modeBits(st) != mode) return error.InsecurePermissions;
     if (st.size > max_len) return error.TooLarge;
 
     const fd = zig_compat.openAtNoFollow(dir_fd, name, .{}, 0) catch |err| switch (err) {
@@ -307,6 +349,7 @@ fn readFileAllocRaw(dir_fd: zig_compat.Fd, allocator: std.mem.Allocator, name: [
     if (private) {
         if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
         if (identity.mode & 0o077 != 0) return error.InsecurePermissions;
+        if (required_mode) |mode| if (identity.mode & 0o777 != mode) return error.InsecurePermissions;
     }
 
     var buf = try allocator.alloc(u8, @intCast(st.size));
@@ -330,12 +373,15 @@ fn readFileAllocRaw(dir_fd: zig_compat.Fd, allocator: std.mem.Allocator, name: [
 /// every nesting level gets identical defenses.
 fn openSubdirRaw(parent_fd: zig_compat.Fd, fault: *Fault, name: []const u8, create: bool) Error!SubDir {
     if (!validName(name)) return error.InvalidPath;
-    if (create) {
+    const created = if (create) blk: {
         zig_compat.mkdirAt(parent_fd, name, 0o700) catch |err| switch (err) {
-            error.Exists => {},
+            error.Exists => break :blk false,
             else => return error.IoFailure,
         };
-    }
+        // mkdirAt only returns success for the process that linked the new
+        // component into its parent.
+        break :blk true;
+    } else false;
     const fd = zig_compat.openDirAtNoFollow(parent_fd, name) catch |err| switch (err) {
         error.NotFound => return error.NotFound,
         else => {
@@ -353,6 +399,10 @@ fn openSubdirRaw(parent_fd: zig_compat.Fd, fault: *Fault, name: []const u8, crea
     if (!identity.is_directory) return error.UnsafeFileType;
     if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
     if (identity.mode & 0o022 != 0) return error.InsecurePermissions;
+    if (created) {
+        try hitFault(fault, .mkdir_fsync_parent);
+        zig_compat.fsyncFd(parent_fd) catch return error.IoFailure;
+    }
     removeStaleTempsRaw(fd);
     return .{ .fd = fd, .fault = fault };
 }

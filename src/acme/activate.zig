@@ -71,6 +71,7 @@ const generation_file_meta = "meta.json";
 const current_name = "current";
 const current_tmp_name = "current.tmp";
 const max_generation_id_len = 40;
+const max_current_len = 2 * max_generation_id_len + 2;
 const max_meta_len = 4096;
 const meta_version: u32 = 1;
 
@@ -261,22 +262,52 @@ fn proofOfPossession(leaf_key: *const LeafKey, leaf_public_sec1: []const u8) Err
     crypto_provider.verify(.ecdsa_secp256r1_sha256, leaf_public_sec1, probe, der_sig) catch return error.KeyCertificateMismatch;
 }
 
-/// SAN must equal the requested set exactly: every requested name matches
-/// (RFC 9525 via `pki.identity.verifyHost`) and nothing else is present.
+/// SAN must equal the requested set exactly. `verifyHost` deliberately
+/// supports wildcards, so it is an eligibility check only; it cannot prove
+/// that two sets are equal. We first validate the requested DNS set and
+/// establish a one-to-one exact (case-insensitive, one trailing-dot
+/// canonicalized) mapping, then retain `verifyHost` as defense in depth.
 fn verifySanExact(leaf: *const pki.x509.Certificate, hostnames: []const []const u8) Error!void {
     const san = leaf.subjectAltName() orelse return error.SanMismatch;
-    var dns_count: usize = 0;
-    for (san) |name| {
-        switch (name) {
-            .dns_name => dns_count += 1,
-            else => return error.SanMismatch,
+    var matched: [max_hostnames_per_group]bool = [_]bool{false} ** max_hostnames_per_group;
+    for (hostnames, 0..) |host, i| {
+        const ref = pki.identity.dnsReference(host) catch return error.SanMismatch;
+        const canonical = switch (ref) { .dns_name => |name| name, else => return error.SanMismatch };
+        for (hostnames[0..i]) |prior| {
+            const prior_ref = pki.identity.dnsReference(prior) catch return error.SanMismatch;
+            const prior_name = switch (prior_ref) { .dns_name => |name| name, else => return error.SanMismatch };
+            if (std.ascii.eqlIgnoreCase(canonical, prior_name)) return error.SanMismatch;
         }
     }
-    if (dns_count != hostnames.len) return error.SanMismatch;
-    for (hostnames) |host| {
+    for (san) |name| {
+        const presented = switch (name) {
+            .dns_name => |dns| dns,
+            else => return error.SanMismatch,
+        };
+        // A wildcard is never an HTTP-01 managed identity, even if it would
+        // happen to cover a requested concrete name.
+        if (std.mem.indexOfScalar(u8, presented, '*') != null) return error.SanMismatch;
+        var found: ?usize = null;
+        for (hostnames, 0..) |host, i| {
+            const ref = pki.identity.dnsReference(host) catch return error.SanMismatch;
+            const canonical = switch (ref) { .dns_name => |value| value, else => return error.SanMismatch };
+            if (pki.identity.presentedDnsIdMatches(presented, canonical) and std.ascii.eqlIgnoreCase(trimOneTrailingDot(presented), canonical)) {
+                if (found != null or matched[i]) return error.SanMismatch;
+                found = i;
+            }
+        }
+        const index = found orelse return error.SanMismatch;
+        matched[index] = true;
+    }
+    for (hostnames, 0..) |host, i| {
+        if (!matched[i]) return error.SanMismatch;
         const verdict = pki.identity.verifyHost(leaf, host) catch return error.SanMismatch;
         if (!verdict.isMatch()) return error.SanMismatch;
     }
+}
+
+fn trimOneTrailingDot(name: []const u8) []const u8 {
+    return if (name.len > 0 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
 }
 
 fn verifyValidityWindow(validity: pki.x509.Validity, options: VerifyOptions) Error!void {
@@ -315,6 +346,15 @@ const GenerationId = struct {
     fn slice(self: *const GenerationId) []const u8 {
         return self.buf[0..self.len];
     }
+};
+
+/// The atomic `current` record is the sole authority for committed state.
+/// Its optional second line records the previous committed generation, which
+/// lets restart recovery distinguish a known fallback from a complete but
+/// uncommitted orphan directory.
+const CommitPointer = struct {
+    current: GenerationId,
+    previous: ?GenerationId = null,
 };
 
 pub const LoadedMeta = struct {
@@ -395,16 +435,8 @@ pub fn verifyAndPersist(
     var generations = try group.openOrCreateSubdir(generations_dir_name);
     defer generations.close();
 
-    // Copied out of the `?GenerationId` right away: a slice into the
-    // optional's if-captured payload would dangle once that block ends, and
-    // `keep` below is used well after any such capture would go out of scope.
-    var old_current_buf: [max_generation_id_len]u8 = undefined;
-    var old_current_len: usize = 0;
-    if (readCurrentPointer(allocator, &group)) |oc| {
-        old_current_len = oc.len;
-        @memcpy(old_current_buf[0..oc.len], oc.buf[0..oc.len]);
-    }
-    const seq = nextSequence(&generations);
+    const old_pointer = try readCurrentPointer(allocator, &group);
+    const seq = try nextSequence(old_pointer);
     var nonce: [8]u8 = undefined;
     zig_compat.randomBytes(&nonce);
     var name_buf: [max_generation_id_len]u8 = undefined;
@@ -414,22 +446,20 @@ pub fn verifyAndPersist(
         var gen_dir = try generations.openOrCreateSubdir(gen_name);
         defer gen_dir.close();
         try gen_dir.writeFileAtomic(generation_file_leaf_key, leaf_pem, 0o600);
-        try gen_dir.writeFileAtomic(generation_file_chain, chain_pem, 0o600);
+        try gen_dir.writeFileAtomicLimit(generation_file_chain, chain_pem, 0o600, 2 * max_certificate_flight_bytes);
         try gen_dir.writeFileAtomic(generation_file_meta, meta_json, 0o600);
         try gen_dir.fsync();
     }
     try generations.fsync();
 
-    var current_line_buf: [max_generation_id_len + 1]u8 = undefined;
-    const current_line = std.fmt.bufPrint(&current_line_buf, "{s}\n", .{gen_name}) catch unreachable;
-    try group.writeFileAtomic(current_tmp_name, current_line, 0o600);
-    try group.renameWithin(current_tmp_name, current_name);
-    try group.fsync();
+    var previous: ?GenerationId = null;
+    if (old_pointer) |pointer| previous = pointer.current;
+    try rewriteCurrent(&group, gen_name, previous);
 
     var keep: [2][]const u8 = .{ gen_name, gen_name };
     var keep_count: usize = 1;
-    if (old_current_len > 0 and !std.mem.eql(u8, old_current_buf[0..old_current_len], gen_name)) {
-        keep[1] = old_current_buf[0..old_current_len];
+    if (previous) |old_current| {
+        keep[1] = old_current.slice();
         keep_count = 2;
     }
     pruneGenerations(&generations, keep[0..keep_count]);
@@ -461,53 +491,54 @@ pub fn loadCommitted(
     var generations = group.openSubdirStrict(generations_dir_name) catch |err| return softNotFoundToNull(err);
     defer generations.close();
 
-    var names: [64][64]u8 = undefined;
-    var lens: [64]usize = undefined;
-    const count = generations.listNames(&names, &lens);
+    const pointer = (try readCurrentPointer(allocator, &group)) orelse return null;
 
-    var order: [64]usize = undefined;
-    var order_count: usize = 0;
-    for (0..count) |i| {
-        if (parseGenerationName(names[i][0..lens[i]]) != null) {
-            order[order_count] = i;
-            order_count += 1;
-        }
-    }
-    sortDescendingBySequence(&names, &lens, order[0..order_count]);
-
-    const current = readCurrentPointer(allocator, &group);
-    var current_tried = false;
-
-    if (current) |cur| {
-        for (0..order_count) |i| {
-            const name = names[order[i]][0..lens[order[i]]];
-            if (!std.mem.eql(u8, name, cur.slice())) continue;
-            current_tried = true;
-            if (tryLoadGeneration(allocator, &generations, name, hostnames, now)) |loaded| {
-                pruneGenerations(&generations, &.{name});
-                return loaded;
+    if (tryLoadGeneration(allocator, &generations, pointer.current.slice(), hostnames, now)) |loaded| {
+        // The fallback is retained only if it is still independently valid.
+        var retained_previous: ?GenerationId = null;
+        if (pointer.previous) |previous| {
+            if (tryLoadGeneration(allocator, &generations, previous.slice(), hostnames, now)) |candidate| {
+                var discard = candidate;
+                discard.deinit(allocator);
+                retained_previous = previous;
             } else |err| {
                 if (isHardError(err)) return err;
-                markCorrupt(&generations, name);
+                markCorrupt(&generations, previous.slice());
             }
-            break;
         }
+        if (!sameGeneration(retained_previous, pointer.previous))
+            try rewriteCurrent(&group, pointer.current.slice(), retained_previous);
+        var keep = [_][]const u8{ pointer.current.slice(), pointer.current.slice() };
+        var keep_count: usize = 1;
+        if (retained_previous) |previous| {
+            keep[1] = previous.slice();
+            keep_count = 2;
+        }
+        pruneGenerations(&generations, keep[0..keep_count]);
+        return loaded;
+    } else |err| {
+        if (isHardError(err)) return err;
+        markCorrupt(&generations, pointer.current.slice());
     }
 
-    for (0..order_count) |i| {
-        const name = names[order[i]][0..lens[order[i]]];
-        if (current_tried and current != null and std.mem.eql(u8, name, current.?.slice())) continue;
-        if (tryLoadGeneration(allocator, &generations, name, hostnames, now)) |loaded| {
-            rewriteCurrent(&group, name);
-            pruneGenerations(&generations, &.{name});
-            return loaded;
-        } else |err| {
-            if (isHardError(err)) return err;
-            markCorrupt(&generations, name);
-        }
+    // Only the generation explicitly recorded as the prior commit may be a
+    // fallback. Never scan complete-looking directories: a crash before the
+    // final pointer rename must remain uncommitted.
+    const previous = pointer.previous orelse return null;
+    if (tryLoadGeneration(allocator, &generations, previous.slice(), hostnames, now)) |loaded| {
+        try rewriteCurrent(&group, previous.slice(), null);
+        pruneGenerations(&generations, &.{previous.slice()});
+        return loaded;
+    } else |err| {
+        if (isHardError(err)) return err;
+        markCorrupt(&generations, previous.slice());
+        return null;
     }
+}
 
-    return null;
+fn sameGeneration(a: ?GenerationId, b: ?GenerationId) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?.slice(), b.?.slice());
 }
 
 fn softNotFoundToNull(err: Error) Error!?LoadedGeneration {
@@ -556,7 +587,10 @@ fn tryLoadGeneration(
     errdefer meta_parsed.deinit();
     if (meta_parsed.value.version != meta_version) return error.CorruptState;
 
-    _ = try verifyChain(allocator, &leaf_key, chain_pem, .{ .hostnames = hostnames, .now = now });
+    const summary = try verifyChain(allocator, &leaf_key, chain_pem, .{ .hostnames = hostnames, .now = now });
+    if (!sameHostnameSet(meta_parsed.value.hostnames, hostnames) or
+        meta_parsed.value.not_before != summary.not_before or
+        meta_parsed.value.not_after != summary.not_after) return error.CorruptState;
 
     var loaded = LoadedGeneration{
         .leaf_key = leaf_key,
@@ -569,23 +603,62 @@ fn tryLoadGeneration(
     return loaded;
 }
 
-fn readCurrentPointer(allocator: std.mem.Allocator, group: *state_mod.SubDir) ?GenerationId {
-    const bytes = group.readFileAlloc(allocator, current_name, 64, false) catch return null;
+fn sameHostnameSet(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len or a.len > max_hostnames_per_group) return false;
+    for (a, 0..) |name, i| {
+        const ref = pki.identity.dnsReference(name) catch return false;
+        const canonical = switch (ref) { .dns_name => |value| value, else => return false };
+        for (a[0..i]) |prior| {
+            const prior_ref = pki.identity.dnsReference(prior) catch return false;
+            const prior_name = switch (prior_ref) { .dns_name => |value| value, else => return false };
+            if (std.ascii.eqlIgnoreCase(canonical, prior_name)) return false;
+        }
+        var found = false;
+        for (b) |other| {
+            const other_ref = pki.identity.dnsReference(other) catch return false;
+            const other_name = switch (other_ref) { .dns_name => |value| value, else => return false };
+            if (std.ascii.eqlIgnoreCase(canonical, other_name)) {
+                if (found) return false;
+                found = true;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn readCurrentPointer(allocator: std.mem.Allocator, group: *state_mod.SubDir) Error!?CommitPointer {
+    const bytes = group.readFileAllocExactMode(allocator, current_name, max_current_len, 0o600) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
     defer allocator.free(bytes);
-    if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') return null;
-    const line = bytes[0 .. bytes.len - 1];
-    if (parseGenerationName(line) == null) return null;
-    if (line.len > max_generation_id_len) return null;
-    var out = GenerationId{ .buf = undefined, .len = line.len };
-    @memcpy(out.buf[0..line.len], line);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    const current = lines.next() orelse return error.CorruptState;
+    const previous_line = lines.next() orelse return error.CorruptState;
+    const terminator = lines.next() orelse return error.CorruptState;
+    if (terminator.len != 0 or lines.next() != null or current.len == 0 or parseGenerationName(current) == null) return error.CorruptState;
+    var out = CommitPointer{ .current = generationIdFromSlice(current), .previous = null };
+    if (previous_line.len > 0) {
+        if (parseGenerationName(previous_line) == null or std.mem.eql(u8, current, previous_line)) return error.CorruptState;
+        out.previous = generationIdFromSlice(previous_line);
+    }
     return out;
 }
 
-fn rewriteCurrent(group: *state_mod.SubDir, name: []const u8) void {
-    var buf: [max_generation_id_len + 1]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "{s}\n", .{name}) catch return;
-    group.writeFileAtomic(current_tmp_name, line, 0o600) catch return;
-    group.renameWithin(current_tmp_name, current_name) catch {};
+fn generationIdFromSlice(name: []const u8) GenerationId {
+    var out = GenerationId{ .buf = undefined, .len = name.len };
+    @memcpy(out.buf[0..name.len], name);
+    return out;
+}
+
+fn rewriteCurrent(group: *state_mod.SubDir, name: []const u8, previous: ?GenerationId) Error!void {
+    if (parseGenerationName(name) == null) return error.CorruptState;
+    var buf: [max_current_len]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "{s}\n{s}\n", .{ name, if (previous) |value| value.slice() else "" }) catch return error.CorruptState;
+    try group.writeFileAtomic(current_tmp_name, line, 0o600);
+    try group.renameWithin(current_tmp_name, current_name);
+    try group.fsync();
 }
 
 fn markCorrupt(generations: *state_mod.SubDir, name: []const u8) void {
@@ -600,7 +673,7 @@ fn markCorrupt(generations: *state_mod.SubDir, name: []const u8) void {
 fn pruneGenerations(generations: *state_mod.SubDir, keep: []const []const u8) void {
     var names: [64][64]u8 = undefined;
     var lens: [64]usize = undefined;
-    const count = generations.listNames(&names, &lens);
+    const count = generations.listNamesStrict(&names, &lens) catch return;
     for (0..count) |i| {
         const name = names[i][0..lens[i]];
         if (parseGenerationName(name) == null) continue;
@@ -621,31 +694,10 @@ fn pruneGenerations(generations: *state_mod.SubDir, keep: []const []const u8) vo
     }
 }
 
-fn nextSequence(generations: *state_mod.SubDir) u64 {
-    var names: [64][64]u8 = undefined;
-    var lens: [64]usize = undefined;
-    const count = generations.listNames(&names, &lens);
-    var max: u64 = 0;
-    for (0..count) |i| {
-        if (parseGenerationName(names[i][0..lens[i]])) |seq| {
-            if (seq > max) max = seq;
-        }
-    }
-    return max + 1;
-}
-
-fn sortDescendingBySequence(names: *const [64][64]u8, lens: *const [64]usize, order: []usize) void {
-    var i: usize = 1;
-    while (i < order.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            const a = parseGenerationName(names[order[j]][0..lens[order[j]]]).?;
-            const b = parseGenerationName(names[order[j - 1]][0..lens[order[j - 1]]]).?;
-            if (a <= b) break;
-            std.mem.swap(usize, &order[j], &order[j - 1]);
-            j -= 1;
-        }
-    }
+fn nextSequence(pointer: ?CommitPointer) Error!u64 {
+    const current = pointer orelse return 1;
+    const seq = parseGenerationName(current.current.slice()).?;
+    return std.math.add(u64, seq, 1) catch error.CorruptState;
 }
 
 /// `^[0-9]{1,20}-[0-9a-f]{16}$`, no leading zero unless the sequence is

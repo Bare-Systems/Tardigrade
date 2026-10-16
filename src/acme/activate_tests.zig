@@ -290,6 +290,34 @@ test "verifyChain rejects a missing or an extra SAN entry" {
     try testing.expectError(error.SanMismatch, activate.verifyChain(allocator, &fixture.key, fixture.pem, .{ .hostnames = &too_many, .now = base_now }));
 }
 
+test "verifyChain rejects wildcard coverage, duplicate requests, and duplicate SANs" {
+    const allocator = testing.allocator;
+    const requested = [_][]const u8{ "a.example.com", "b.example.com" };
+    const wildcard_plus_extra = [_][]const u8{ "*.example.com", "extra.invalid" };
+    var wildcard = try selfSignedLeaf(allocator, &wildcard_plus_extra, base_now - hour, base_now + 90 * day);
+    defer {
+        wildcard.key.deinit();
+        allocator.free(wildcard.pem);
+    }
+    try testing.expectError(error.SanMismatch, activate.verifyChain(allocator, &wildcard.key, wildcard.pem, .{ .hostnames = &requested, .now = base_now }));
+
+    const duplicate_san = [_][]const u8{ "a.example.com", "a.example.com" };
+    var duplicate = try selfSignedLeaf(allocator, &duplicate_san, base_now - hour, base_now + 90 * day);
+    defer {
+        duplicate.key.deinit();
+        allocator.free(duplicate.pem);
+    }
+    try testing.expectError(error.SanMismatch, activate.verifyChain(allocator, &duplicate.key, duplicate.pem, .{ .hostnames = &requested, .now = base_now }));
+
+    const duplicate_request = [_][]const u8{ "a.example.com", "A.EXAMPLE.COM" };
+    var ordinary = try selfSignedLeaf(allocator, &.{"a.example.com"}, base_now - hour, base_now + 90 * day);
+    defer {
+        ordinary.key.deinit();
+        allocator.free(ordinary.pem);
+    }
+    try testing.expectError(error.SanMismatch, activate.verifyChain(allocator, &ordinary.key, ordinary.pem, .{ .hostnames = &duplicate_request, .now = base_now }));
+}
+
 test "verifyChain rejects a private key that does not match the certificate" {
     const allocator = testing.allocator;
     const hosts = [_][]const u8{"a.example.com"};
@@ -427,6 +455,54 @@ test "loadCommitted returns null for a group that was never persisted" {
     try testing.expectEqual(@as(?activate.LoadedGeneration, null), try activate.loadCommitted(allocator, &state, "never-seen", &hosts, base_now));
 }
 
+test "loadCommitted never promotes a generation without a committed current pointer" {
+    const allocator = testing.allocator;
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try state_mod.StateDir.open(tmp.path);
+    defer state.close();
+    const hosts = [_][]const u8{"a.example.com"};
+    var fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 90 * day);
+    defer {
+        fixture.key.deinit();
+        allocator.free(fixture.pem);
+    }
+    _ = try activate.verifyAndPersist(allocator, &state, "group-1", &fixture.key, fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    var groups = try state.openSubdirStrict("groups");
+    defer groups.close();
+    var group = try groups.openSubdirStrict("group-1");
+    defer group.close();
+    try group.renameWithin("current", "current.tmp");
+
+    try testing.expectEqual(@as(?activate.LoadedGeneration, null), try activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now));
+}
+
+test "loadCommitted rejects an insecure current pointer without mutating generations" {
+    const allocator = testing.allocator;
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try state_mod.StateDir.open(tmp.path);
+    defer state.close();
+    const hosts = [_][]const u8{"a.example.com"};
+    var fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 90 * day);
+    defer {
+        fixture.key.deinit();
+        allocator.free(fixture.pem);
+    }
+    _ = try activate.verifyAndPersist(allocator, &state, "group-1", &fixture.key, fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    var groups = try state.openSubdirStrict("groups");
+    defer groups.close();
+    var group = try groups.openSubdirStrict("group-1");
+    defer group.close();
+    const current_fd = try zig_compat.openAtNoFollow(group.fd, "current", .{ .write = true }, 0);
+    defer zig_compat.closeFd(current_fd);
+    try zig_compat.fchmodFd(current_fd, 0o666);
+
+    try testing.expectError(error.InsecurePermissions, activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now));
+}
+
 test "verifyAndPersist leaves the prior committed generation untouched on failed verification" {
     const allocator = testing.allocator;
     var tmp = try TempState.init();
@@ -508,6 +584,11 @@ test "loadCommitted falls back to the previous generation when the current one i
     }
     const second = try activate.verifyAndPersist(allocator, &state, "group-1", &second_fixture.key, second_fixture.pem, .{ .hostnames = &hosts, .now = base_now });
     try testing.expect(!std.mem.eql(u8, first.generationId(), second.generationId()));
+
+    // A healthy restart must retain the prior committed fallback, not prune
+    // it merely because the current generation verified successfully.
+    var initial_restart = (try activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now)).?;
+    initial_restart.deinit(allocator);
 
     // Corrupt the now-current (second) generation's leaf key directly on
     // disk, simulating a crash that left a half-written/garbled file.

@@ -83,7 +83,10 @@ pub fn validate(raw: []const u8, private_ca: bool) Error!Summary {
     return .{ .names = names, .groups = groups };
 }
 
-fn validateName(name: []const u8, private_ca: bool) Error!void {
+/// Per-name syntax, case, and IP-literal rules shared by `validate` and by
+/// direct per-name callers (`csr.zig`) that need the same canonical-identity
+/// guarantees without the grouping/count bookkeeping `validate` also does.
+pub fn validateName(name: []const u8, private_ca: bool) Error!void {
     if (std.mem.indexOfScalar(u8, name, '*') != null) return error.WildcardUnsupported;
     dns_name.validateHostName(name) catch return error.InvalidName;
     for (name) |c| if (c >= 'A' and c <= 'Z') return error.NotLowercase;

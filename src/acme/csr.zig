@@ -23,7 +23,6 @@ const names_mod = @import("names.zig");
 const pki = @import("pki");
 const crypto = @import("crypto");
 const zig_compat = @import("zig_compat");
-const dns_name = @import("tls_core").dns_name;
 
 const secrets = crypto.secrets;
 const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
@@ -34,6 +33,8 @@ pub const Error = account.Error || error{
     TooManyNames,
     InvalidName,
     WildcardUnsupported,
+    IpLiteral,
+    NotLowercase,
     Duplicate,
 };
 
@@ -74,12 +75,25 @@ pub fn issue(allocator: std.mem.Allocator, order_group: []const []const u8) Erro
     return .{ .key = key, .csr_der = csr_der };
 }
 
+/// Re-runs `names.validateName`'s DNS-only, lowercase, no-IP-literal rules
+/// directly (not just `dns_name.validateHostName`) so canonical order-group
+/// identity and SAN membership hold even when `issue` is called without
+/// going through `names.validate` first. `private_ca` is fixed `true`: this
+/// module has no CA policy context, so it defers the public-CA private-name
+/// restriction to whichever caller does have that context, instead of
+/// silently applying it here.
 fn validateGroup(order_group: []const []const u8) Error!void {
     if (order_group.len == 0) return error.Empty;
     if (order_group.len > max_names_per_csr) return error.TooManyNames;
     for (order_group, 0..) |name, i| {
-        if (std.mem.indexOfScalar(u8, name, '*') != null) return error.WildcardUnsupported;
-        dns_name.validateHostName(name) catch return error.InvalidName;
+        names_mod.validateName(name, true) catch |err| return switch (err) {
+            error.WildcardUnsupported => error.WildcardUnsupported,
+            error.InvalidName => error.InvalidName,
+            error.NotLowercase => error.NotLowercase,
+            error.IpLiteral => error.IpLiteral,
+            error.PrivateNameForPublicCa => unreachable,
+            else => unreachable,
+        };
         for (order_group[0..i]) |earlier| {
             if (std.mem.eql(u8, earlier, name)) return error.Duplicate;
         }
@@ -154,6 +168,7 @@ fn buildSubjectPublicKeyInfo(allocator: std.mem.Allocator, key: *const LeafKey) 
     try spki.appendSlice(allocator, pub_tlv.items);
 
     var spki_seq: std.ArrayList(u8) = .empty;
+    defer spki_seq.deinit(allocator);
     try tlv(allocator, &spki_seq, SEQUENCE, spki.items);
     return spki_seq.toOwnedSlice(allocator);
 }
@@ -201,6 +216,7 @@ fn buildAttributes(allocator: std.mem.Allocator, order_group: []const []const u8
     try tlv(allocator, &attribute, SEQUENCE, ext_req_attr.items);
 
     var attributes: std.ArrayList(u8) = .empty;
+    defer attributes.deinit(allocator);
     try tlv(allocator, &attributes, Tag.contextSpecific(0, true), attribute.items);
     return attributes.toOwnedSlice(allocator);
 }
@@ -228,6 +244,7 @@ fn buildCertificationRequestInfo(allocator: std.mem.Allocator, key: *const LeafK
     try body.appendSlice(allocator, attributes);
 
     var tbs: std.ArrayList(u8) = .empty;
+    defer tbs.deinit(allocator);
     try tlv(allocator, &tbs, SEQUENCE, body.items);
     return tbs.toOwnedSlice(allocator);
 }
@@ -261,6 +278,7 @@ fn buildCsr(allocator: std.mem.Allocator, key: *const LeafKey, order_group: []co
     try body.appendSlice(allocator, sig_tlv.items);
 
     var csr: std.ArrayList(u8) = .empty;
+    defer csr.deinit(allocator);
     try tlv(allocator, &csr, SEQUENCE, body.items);
     return csr.toOwnedSlice(allocator);
 }
@@ -396,6 +414,13 @@ test "ACME CSR: rejects invalid, wildcard, duplicate and oversized groups" {
     try testing.expectError(error.InvalidName, issue(testing.allocator, &[_][]const u8{"exa mple.com"}));
     try testing.expectError(error.Duplicate, issue(testing.allocator, &[_][]const u8{ "a.example.com", "a.example.com" }));
 
+    // Direct calls (bypassing `names.validate`) still enforce the same
+    // canonical-identity rules: no IP literals, no case aliases.
+    try testing.expectError(error.IpLiteral, issue(testing.allocator, &[_][]const u8{"192.168.1.1"}));
+    try testing.expectError(error.IpLiteral, issue(testing.allocator, &[_][]const u8{"8.8.8.8"}));
+    try testing.expectError(error.NotLowercase, issue(testing.allocator, &[_][]const u8{"A.EXAMPLE.COM"}));
+    try testing.expectError(error.NotLowercase, issue(testing.allocator, &[_][]const u8{ "a.example.com", "A.EXAMPLE.COM" }));
+
     var too_many: [max_names_per_csr + 1][]const u8 = undefined;
     var buf: [(max_names_per_csr + 1) * 32]u8 = undefined;
     var len: usize = 0;
@@ -428,6 +453,27 @@ test "ACME CSR: boundary-sized name at the DNS length cap round-trips" {
     defer parsed.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), parsed.san.items.len);
     try testing.expectEqualStrings(boundary_name, parsed.san.items[0]);
+}
+
+test "ACME CSR: private/test-CA style names remain issuable directly" {
+    // `issue` has no CA policy context, so it does not apply the
+    // public-CA-only `PrivateNameForPublicCa` restriction itself; that
+    // belongs to whichever caller does have CA context (`names.validate`).
+    for ([_][]const u8{ "localhost", "host.local", "host.internal", "host.test" }) |name| {
+        const order_group = [_][]const u8{name};
+        var result = try issue(testing.allocator, &order_group);
+        defer result.deinit(testing.allocator);
+    }
+}
+
+test "ACME CSR: no leaks on allocation failure during issuance" {
+    const order_group = [_][]const u8{ "a.example.com", "b.example.com" };
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, names: []const []const u8) !void {
+            var result = try issue(allocator, names);
+            result.deinit(allocator);
+        }
+    }.run, .{&order_group});
 }
 
 fn fuzzIssue(_: void, smith: *testing.Smith) !void {

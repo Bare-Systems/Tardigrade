@@ -6520,21 +6520,29 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             ghandlers.logAccessForRequest(state, &ctx, &request, status);
             return;
         }
-        const token = request.uri.path[acme_prefix.len..];
-        if (state.acme_challenge_store.?.getCopy(allocator, token)) |key_auth| {
-            defer allocator.free(key_auth);
-            var acme_response = http.Response.init(allocator);
-            defer acme_response.deinit();
-            _ = acme_response.setStatus(.ok)
-                .setBody(key_auth)
-                .setHeader("Content-Type", "application/octet-stream")
-                .setConnection(keep_alive);
-            try acme_response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
-            // ACME HTTP-01 challenges are ordinary requests; keep them visible in
-            // access logs and status metrics like every other terminal (#201).
-            state.metricsRecord(200);
-            ghandlers.logAccessForRequest(state, &ctx, &request, 200);
-            return;
+        // Host-scoped (#877): the token alone is not the key. A request Host
+        // that is not one of the operator's configured managed hostnames
+        // never reaches the lookup, so a token minted for one host cannot be
+        // disclosed to a client claiming a different, wrong, or malformed
+        // Host.
+        if (http.acme_client.matchManagedHost(cfg.tls_acme_domains, request.headers.get("host"))) |managed_host| {
+            const token = request.uri.path[acme_prefix.len..];
+            const now_s: i64 = @intCast(@divFloor(compat.nanoTimestamp(), std.time.ns_per_s));
+            if (state.acme_challenge_store.?.getCopy(allocator, now_s, managed_host, token)) |key_auth| {
+                defer allocator.free(key_auth);
+                var acme_response = http.Response.init(allocator);
+                defer acme_response.deinit();
+                _ = acme_response.setStatus(.ok)
+                    .setBody(key_auth)
+                    .setHeader("Content-Type", "application/octet-stream")
+                    .setConnection(keep_alive);
+                try acme_response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+                // ACME HTTP-01 challenges are ordinary requests; keep them visible in
+                // access logs and status metrics like every other terminal (#201).
+                state.metricsRecord(200);
+                ghandlers.logAccessForRequest(state, &ctx, &request, 200);
+                return;
+            }
         }
     }
 

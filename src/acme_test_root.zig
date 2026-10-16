@@ -6,6 +6,7 @@ const std = @import("std");
 test {
     _ = @import("acme/root.zig");
     _ = @import("http/acme_tls_dialer.zig");
+    _ = @import("http/acme_challenge_store.zig");
 }
 
 /// Production (non-test) text of a source file: everything before its first
@@ -29,6 +30,7 @@ test "ACME implementation stays behind the native compat boundary (#832)" {
         .{ "acme/transport.zig", @embedFile("acme/transport.zig") },
         .{ "acme/url.zig", @embedFile("acme/url.zig") },
         .{ "http/acme_tls_dialer.zig", @embedFile("http/acme_tls_dialer.zig") },
+        .{ "http/acme_challenge_store.zig", @embedFile("http/acme_challenge_store.zig") },
     };
     // Direct libc/POSIX calls belong in zig_compat.zig; no foreign crypto or
     // C interop anywhere in the ACME implementation.

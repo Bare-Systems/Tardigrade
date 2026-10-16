@@ -5120,8 +5120,11 @@ fn executeHttp2ProxyRoute(
                 try client_view.asserted_names.appendSlice(allocator, fa.upstream_headers);
             }
             try gfa.applyUpstreamHeaders(&request.headers, fa, &decision);
-            try forward_auth_grants.add(allocator, decision);
+            // `Grants.add` takes ownership of `decision` whether it succeeds
+            // or fails (its own `errdefer` frees it on error), so the flag
+            // must clear before the call, not after the `try` (#888).
             decision_owned = false;
+            try forward_auth_grants.add(allocator, decision);
         }
         if (gate_only) {
             // A rewrite back into itself is answered from the server root
@@ -8954,6 +8957,7 @@ const H2ForwardAuthHarness = struct {
         try self.streams.put(id, http.http2_stream.Stream.init(id, 65_535));
         errdefer _ = self.streams.remove(id);
         try self.ready.append(id);
+        errdefer _ = self.ready.pop();
         try self.pending.put(id, ps);
     }
 
@@ -9564,6 +9568,129 @@ test "H2 rewritten-path approval policy honors the client's own token despite a 
     try std.testing.expect(std.mem.find(u8, written, "200") != null);
     try std.testing.expect(std.mem.find(u8, written, "guarded-secret") != null);
     try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+}
+
+test "H2 forward_auth across rewrite hops frees every Decision exactly once on allocation failure (#888)" {
+    const Scenario = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            // Hop A allows and mints an upstream-only credential (exercises
+            // `client_view.preserve`/`asserted_names.appendSlice`); hop B
+            // allows with a client-facing `Set-Cookie` (exercises the fallible
+            // `Grants.add` transfer at the end of the loop). The backing
+            // allocator here is the real leak/double-free detecting
+            // `std.testing.allocator`, so a regression of the ownership bug
+            // this guards against aborts the run instead of merely leaking.
+            var auth_server = try gfa.TestAuthServer.start(std.testing.allocator, &.{
+                "HTTP/1.1 200 OK\r\nAuthorization: Bearer minted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nSet-Cookie: refreshed=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            });
+            defer auth_server.stop();
+            try auth_server.run();
+            var url_buf: [64]u8 = undefined;
+            const auth_url = auth_server.url(&url_buf, "/verify");
+            var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+                .{
+                    .match_type = .exact,
+                    .pattern = "/go",
+                    .priority = 0,
+                    .action = .{ .rewrite = .{ .replacement = "/landing", .flag = .last } },
+                    .forward_auth = .{ .url = auth_url, .upstream_headers = &.{"Authorization"} },
+                },
+                .{
+                    .match_type = .exact,
+                    .pattern = "/landing",
+                    .priority = 1,
+                    .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+                    .forward_auth = .{ .url = auth_url, .client_headers = &.{"Set-Cookie"} },
+                },
+            };
+            var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+            cfg.location_blocks = blocks[0..];
+
+            var h: H2ForwardAuthHarness = undefined;
+            h.init(allocator);
+            defer h.deinit();
+            h.conn.handshake_complete = true;
+            try h.addStream(1, "GET", "/go", false);
+            try h.dispatch(&cfg);
+
+            const written = h.conn.out.written();
+            try std.testing.expect(std.mem.find(u8, written, "200") != null);
+            try std.testing.expect(std.mem.find(u8, written, "refreshed=1") != null);
+        }
+    };
+
+    // A hand-rolled `std.testing.checkAllAllocationFailures` sweep rather than
+    // the stdlib helper: this request's header copies (`http.Request.parse`,
+    // `client_view.preserve`, `gfa.applyUpstreamHeaders`) run through
+    // `Headers.append`, which has its own pre-existing, independently tracked
+    // OOM cleanup leak (mentioned, out of scope, in PR #886's description) --
+    // it leaks a lowercased name buffer when the paired value `dupe` or the
+    // backing `items.append` fails right after it. That bug is orthogonal to
+    // the Decision-ownership double free this test guards against, so leaks
+    // whose stack trace passes through `Headers.append` are tolerated here;
+    // any other leak, a double free, or a swallowed failure still fails the
+    // test. Each iteration gets its own `DebugAllocator` (rather than the
+    // shared `std.testing.allocator`) so a tolerated leak doesn't accumulate
+    // across iterations and trip this test's own end-of-run leak check --
+    // while still catching a real double free immediately, as a hard panic.
+    const needed_alloc_count = x: {
+        var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        try Scenario.run(probe.allocator());
+        break :x probe.alloc_index;
+    };
+    for (0..needed_alloc_count) |fail_index| {
+        var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+        var fa = std.testing.FailingAllocator.init(debug_alloc.allocator(), .{ .fail_index = fail_index });
+        if (Scenario.run(fa.allocator())) |_| {
+            _ = debug_alloc.deinit();
+            if (fa.has_induced_failure) return error.SwallowedOutOfMemoryError;
+            return error.NondeterministicMemoryUsage;
+        } else |err| switch (err) {
+            // The response writer (`std.Io.Writer.Allocating`) wraps a failed
+            // buffer growth as `error.WriteFailed`, not `error.OutOfMemory`,
+            // so an induced failure during response serialization surfaces
+            // under that name instead.
+            error.OutOfMemory, error.WriteFailed => {
+                if (fa.allocated_bytes != fa.freed_bytes) {
+                    var trace_buf: [4096]u8 = undefined;
+                    const trace = std.fmt.bufPrint(&trace_buf, "{f}", .{
+                        std.debug.FormatStackTrace{ .stack_trace = fa.getStackTrace() },
+                    }) catch &trace_buf;
+                    if (std.mem.find(u8, trace, "http/headers.zig") != null) {
+                        debug_alloc.deinitWithoutLeakChecks();
+                        continue;
+                    }
+                    std.debug.print("\nfail_index: {d}/{d}\nallocated: {d}\nfreed: {d}\n{s}\n", .{
+                        fail_index, needed_alloc_count, fa.allocated_bytes, fa.freed_bytes, trace,
+                    });
+                    return error.MemoryLeakDetected;
+                }
+                _ = debug_alloc.deinit();
+            },
+            else => |e| {
+                _ = debug_alloc.deinit();
+                return e;
+            },
+        }
+    }
+}
+
+test "H2 harness addStream keeps ready/pending/streams consistent on allocation failure (#888)" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var h: H2ForwardAuthHarness = undefined;
+            h.init(allocator);
+            defer h.deinit();
+            const result = h.addStream(1, "GET", "/x", false);
+            // A failure partway through `addStream` must roll back every
+            // partial insertion together, not strand `ready` with an ID that
+            // `pending`/`streams` never ended up holding.
+            try std.testing.expectEqual(h.streams.count(), h.ready.items.len);
+            try std.testing.expectEqual(h.streams.count(), h.pending.count());
+            return result;
+        }
+    }.run, .{});
 }
 
 test "H2 ordinary stream dispatch remains unchanged" {

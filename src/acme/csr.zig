@@ -82,7 +82,12 @@ pub fn issue(allocator: std.mem.Allocator, order_group: []const []const u8) Erro
 /// module has no CA policy context, so it defers the public-CA private-name
 /// restriction to whichever caller does have that context, instead of
 /// silently applying it here.
-fn validateGroup(order_group: []const []const u8) Error!void {
+///
+/// `pub` so the order engine (`orders.zig`, #882) can fail fast on a
+/// malformed order group before any network round trip, instead of only
+/// discovering it later when this module's own `issue` runs at finalize
+/// time; both call sites get the identical rule, not two copies of it.
+pub fn validateGroup(order_group: []const []const u8) Error!void {
     if (order_group.len == 0) return error.Empty;
     if (order_group.len > max_names_per_csr) return error.TooManyNames;
     for (order_group, 0..) |name, i| {

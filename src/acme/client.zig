@@ -349,12 +349,21 @@ pub const Client = struct {
     /// CA returned, at most `max_bad_nonce_retries` times. Returns the 2xx
     /// response; any other status becomes an error and updates diagnostics.
     pub fn signedPost(self: *Client, url: []const u8, payload: ?[]const u8, auth: account_mod.Auth) Error!transport_mod.Response {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.signedPostLocked(url, payload, auth) catch |err| return self.fail(err);
+        return self.signedPostMaxBody(url, payload, auth, self.transport.limits.max_body_bytes);
     }
 
-    fn signedPostLocked(self: *Client, url: []const u8, payload: ?[]const u8, auth: account_mod.Auth) Error!transport_mod.Response {
+    /// Same as `signedPost`, but reads the response body under
+    /// `max_body_bytes` instead of the transport's default JSON cap. The
+    /// order engine (`orders.zig`, #882) needs this for certificate chain
+    /// downloads, which design §9.1 caps at 128 KiB, well above the 64 KiB
+    /// JSON default every other ACME response uses.
+    pub fn signedPostMaxBody(self: *Client, url: []const u8, payload: ?[]const u8, auth: account_mod.Auth, max_body_bytes: usize) Error!transport_mod.Response {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.signedPostLocked(url, payload, auth, max_body_bytes) catch |err| return self.fail(err);
+    }
+
+    fn signedPostLocked(self: *Client, url: []const u8, payload: ?[]const u8, auth: account_mod.Auth, max_body_bytes: usize) Error!transport_mod.Response {
         const target = try url_mod.requireCaOrigin(url, self.directory_origin, self.config.allow_cross_host_urls);
         try self.ensureDirectoryLocked();
 
@@ -371,7 +380,7 @@ pub const Client = struct {
 
             // Every path below either returns `resp` to the caller or frees it
             // exactly once; nothing between here and there can fail.
-            var resp = try self.transport.request(.POST, target, jws, "application/jose+json");
+            var resp = try self.transport.requestWithBodyLimit(.POST, target, jws, "application/jose+json", max_body_bytes);
             self.noteResponse(&resp);
             if (resp.status >= 200 and resp.status < 300) {
                 self.diagnostics.last_problem = .none;
@@ -422,6 +431,12 @@ pub const Client = struct {
 
     /// POST-as-GET against an account-bound URL using the stored `kid`.
     pub fn signedPostAsGet(self: *Client, url: []const u8) Error!transport_mod.Response {
+        return self.signedPostAsGetMaxBody(url, self.transport.limits.max_body_bytes);
+    }
+
+    /// Same as `signedPostAsGet`, but reads the response body under
+    /// `max_body_bytes` (see `signedPostMaxBody`).
+    pub fn signedPostAsGetMaxBody(self: *Client, url: []const u8, max_body_bytes: usize) Error!transport_mod.Response {
         const kid = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -429,7 +444,18 @@ pub const Client = struct {
         };
         // The slice stays valid: kid is only replaced via setKid/deinit, which
         // callers do not run concurrently with in-flight requests.
-        return self.signedPost(url, null, .{ .kid = kid });
+        return self.signedPostMaxBody(url, null, .{ .kid = kid }, max_body_bytes);
+    }
+
+    /// `newOrder` endpoint URL (RFC 8555 §7.1.1), fetching the directory
+    /// first if needed. The order engine (`orders.zig`, #882) uses this
+    /// instead of reaching into `self.directory` directly, keeping the
+    /// directory fetch/cache logic owned by this file.
+    pub fn newOrderUrl(self: *Client) Error![]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.ensureDirectoryLocked() catch |err| return self.fail(err);
+        return self.directory.?.new_order;
     }
 
     /// newAccount (RFC 8555 §7.3). Idempotent per key: a CA that already knows

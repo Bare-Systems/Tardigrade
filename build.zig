@@ -1015,6 +1015,7 @@ pub fn build(b: *std.Build) void {
     // reverse dependency on exe_mod, so this stays acyclic too.
     exe_mod.addImport("pki", pki_mod);
     exe_test_mod.addImport("pki", pki_mod);
+    allocation_regression_mod.addImport("pki", pki_mod);
     const pki_tests = b.addTest(.{ .root_module = pki_test_mod });
     const run_pki_tests = b.addRunArtifact(pki_tests);
     const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");

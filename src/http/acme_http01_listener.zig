@@ -157,7 +157,11 @@ pub const Listener = struct {
 
         self.slots_mutex.lock();
         for (&self.slots) |*slot| {
-            if (slot.in_use and !slot.finished) {
+            // `fd >= 0` (not just `!slot.finished`): `finishConnection` sets
+            // `fd = -1` in the same critical section it closes it in, so a
+            // slot can only be `in_use` with a live `fd` here if its handler
+            // has not yet reached that section (#897 review).
+            if (slot.in_use and slot.fd >= 0) {
                 _ = std.c.shutdown(slot.fd, std.c.SHUT.RDWR);
             }
         }
@@ -266,10 +270,24 @@ pub const Listener = struct {
     }
 
     /// Called by a handler thread as the very last thing it does
-    /// (`handleConnection`'s `defer`) to mark its slot reapable.
-    fn finishConnection(self: *Listener, idx: usize) void {
+    /// (`handleConnection`'s `defer`) to close its own fd and mark its slot
+    /// reapable, both under `slots_mutex`. #897 review: closing `fd` before
+    /// taking this lock raced `deinit`'s shutdown scan, which also runs
+    /// under `slots_mutex` and decides whether to `shutdown()` a slot's `fd`
+    /// from whether it is `in_use && !finished`. If the handler closed `fd`
+    /// first and the OS reused that descriptor number for an unrelated
+    /// connection before the handler reacquired the lock, `deinit` could
+    /// `shutdown()` that unrelated connection instead. Closing and marking
+    /// `finished` in one critical section -- with `deinit` only ever acting
+    /// on a slot's `fd` while holding the same lock -- makes that
+    /// interleaving impossible: either this closes first and `deinit` never
+    /// observes `fd` again, or `deinit` shuts it down first and this close
+    /// races harmlessly with that shutdown on the same, still-owned fd.
+    fn finishConnection(self: *Listener, idx: usize, fd: std.posix.fd_t) void {
         self.slots_mutex.lock();
         defer self.slots_mutex.unlock();
+        _ = std.c.close(fd);
+        self.slots[idx].fd = -1;
         self.slots[idx].finished = true;
     }
 
@@ -331,13 +349,15 @@ pub const Listener = struct {
     }
 
     fn handleConnection(self: *Listener, fd: std.posix.fd_t, slot_idx: usize) void {
-        const started_ms = compat.milliTimestamp();
-        defer {
-            _ = std.c.close(fd);
-            self.finishConnection(slot_idx);
-        }
-        const head_deadline_ms = started_ms + @as(i64, self.head_read_deadline_ms);
-        const total_deadline_ms = started_ms + @as(i64, self.total_deadline_ms);
+        // #897 review: deadlines are derived from the monotonic clock
+        // (`std.Io.Clock.awake`, not `std.Io.Clock.real`), so a wall-clock
+        // adjustment (NTP correction, manual set, VM clock jump) during a
+        // connection's lifetime can neither extend nor shorten its stated
+        // 5 s head / 10 s total budget.
+        const started_ns = compat.monotonicNanoTimestamp();
+        defer self.finishConnection(slot_idx, fd);
+        const head_deadline_ns = started_ns + @as(i128, self.head_read_deadline_ms) * std.time.ns_per_ms;
+        const total_deadline_ns = started_ns + @as(i128, self.total_deadline_ms) * std.time.ns_per_ms;
         const stream = compat.NetStream{ .handle = fd, .inner = null };
 
         var buf: [max_head_bytes]u8 = undefined;
@@ -352,10 +372,10 @@ pub const Listener = struct {
             // zero as either the head or total deadline approaches, so the
             // loop cannot run past `min(head_deadline, total_deadline)` no
             // matter how the peer paces its bytes.
-            const now = compat.milliTimestamp();
-            const deadline_ms = @min(head_deadline_ms, total_deadline_ms);
-            if (now >= deadline_ms) break;
-            const remaining_ms: u32 = @intCast(deadline_ms - now);
+            const now_ns = compat.monotonicNanoTimestamp();
+            const deadline_ns = @min(head_deadline_ns, total_deadline_ns);
+            if (now_ns >= deadline_ns) break;
+            const remaining_ms = msFromRemainingNs(deadline_ns - now_ns);
             // Fail closed, not silently unbounded, if the timeout can't be
             // set (a `{0,0}` SO_RCVTIMEO means "block forever" on every
             // supported platform, so skipping a failed setup here would be
@@ -374,52 +394,48 @@ pub const Listener = struct {
         // request that was never fully read (slowloris / oversize head).
         const end = head_len orelse return;
 
-        const now_after_head = compat.milliTimestamp();
-        if (now_after_head >= total_deadline_ms) return;
-        const remaining_ms: u32 = @intCast(total_deadline_ms - now_after_head);
-        // Bounds the response write by the same absolute total deadline.
-        compat.setSocketTimeoutsMsChecked(fd, remaining_ms, remaining_ms) catch return;
-
+        const now_after_head_ns = compat.monotonicNanoTimestamp();
+        if (now_after_head_ns >= total_deadline_ns) return;
         const parsed = request_mod.Request.parseHead(self.allocator, buf[0..end], 0) catch {
-            respondStatus(self.allocator, stream, .bad_request);
+            respondStatus(self.allocator, fd, total_deadline_ns, .bad_request);
             return;
         };
         var req = parsed.request;
         defer req.deinit();
-        self.dispatch(&req, stream);
+        self.dispatch(&req, fd, total_deadline_ns);
     }
 
-    fn dispatch(self: *Listener, req: *const request_mod.Request, stream: compat.NetStream) void {
+    fn dispatch(self: *Listener, req: *const request_mod.Request, fd: std.posix.fd_t, total_deadline_ns: i128) void {
         // Only GET/HEAD ever reach a response; everything else -- including
         // every other method -- is a plain 404, never a routed verb error,
         // since there is no application route behind this listener (§8.0).
         if (req.method != .GET and req.method != .HEAD) {
-            respondStatus(self.allocator, stream, .not_found);
+            respondStatus(self.allocator, fd, total_deadline_ns, .not_found);
             return;
         }
         if (hasBodyOrUpgrade(req)) {
-            respondStatus(self.allocator, stream, .bad_request);
+            respondStatus(self.allocator, fd, total_deadline_ns, .bad_request);
             return;
         }
         if (!std.mem.startsWith(u8, req.uri.path, challenge_prefix)) {
-            respondStatus(self.allocator, stream, .not_found);
+            respondStatus(self.allocator, fd, total_deadline_ns, .not_found);
             return;
         }
         const token = req.uri.path[challenge_prefix.len..];
         if (token.len == 0 or std.mem.indexOfAny(u8, token, "/?#") != null) {
-            respondStatus(self.allocator, stream, .not_found);
+            respondStatus(self.allocator, fd, total_deadline_ns, .not_found);
             return;
         }
         const managed_host = matchManagedHost(self.managed_hosts, req.host()) orelse {
-            respondStatus(self.allocator, stream, .misdirected_request);
+            respondStatus(self.allocator, fd, total_deadline_ns, .misdirected_request);
             return;
         };
         const key_auth = self.store.getCopy(self.allocator, compat.unixTimestamp(), managed_host, token) orelse {
-            respondStatus(self.allocator, stream, .not_found);
+            respondStatus(self.allocator, fd, total_deadline_ns, .not_found);
             return;
         };
         defer self.allocator.free(key_auth);
-        respondChallenge(self.allocator, stream, key_auth, req.method == .HEAD);
+        respondChallenge(self.allocator, fd, total_deadline_ns, key_auth, req.method == .HEAD);
     }
 };
 
@@ -435,14 +451,14 @@ fn hasBodyOrUpgrade(req: *const request_mod.Request) bool {
     return false;
 }
 
-fn respondStatus(allocator: std.mem.Allocator, stream: compat.NetStream, code: status_mod.Status) void {
+fn respondStatus(allocator: std.mem.Allocator, fd: std.posix.fd_t, total_deadline_ns: i128, code: status_mod.Status) void {
     var resp = response_mod.Response.init(allocator);
     defer resp.deinit();
     _ = resp.setStatus(code).setConnection(false);
-    resp.write(stream.writer()) catch {};
+    writeResponseBeforeDeadline(allocator, fd, total_deadline_ns, &resp, "");
 }
 
-fn respondChallenge(allocator: std.mem.Allocator, stream: compat.NetStream, key_authorization: []const u8, head_only: bool) void {
+fn respondChallenge(allocator: std.mem.Allocator, fd: std.posix.fd_t, total_deadline_ns: i128, key_authorization: []const u8, head_only: bool) void {
     var resp = response_mod.Response.init(allocator);
     defer resp.deinit();
     _ = resp.setStatus(.ok)
@@ -450,11 +466,59 @@ fn respondChallenge(allocator: std.mem.Allocator, stream: compat.NetStream, key_
         .setHeader("Content-Type", "application/octet-stream")
         .setHeader("Cache-Control", "no-store")
         .setConnection(false);
-    if (head_only) {
-        resp.writeHead(stream.writer()) catch {};
-    } else {
-        resp.write(stream.writer()) catch {};
+    writeResponseBeforeDeadline(allocator, fd, total_deadline_ns, &resp, if (head_only) "" else key_authorization);
+}
+
+/// Emits the listener's deliberately small response in one `writev` call.
+/// Do not use `NetStream.writeAll`/`writeGatheredAll` here: those correctly
+/// retry partial writes for ordinary HTTP responses, but each retry receives a
+/// fresh `SO_SNDTIMEO` and could extend this listener's absolute connection
+/// budget. A partial response is harmless because this listener always closes
+/// the connection; fail closed instead of attempting a second blocking write.
+fn writeResponseBeforeDeadline(
+    allocator: std.mem.Allocator,
+    fd: std.posix.fd_t,
+    total_deadline_ns: i128,
+    resp: *response_mod.Response,
+    body: []const u8,
+) void {
+    const header = resp.buildHeaderBytes(allocator) catch return;
+    defer allocator.free(header);
+
+    var fragments: [2]std.posix.iovec_const = undefined;
+    fragments[0] = .{ .base = header.ptr, .len = header.len };
+    const fragment_count: usize = if (body.len > 0) blk: {
+        fragments[1] = .{ .base = body.ptr, .len = body.len };
+        break :blk 2;
+    } else 1;
+
+    while (true) {
+        const now_ns = compat.monotonicNanoTimestamp();
+        if (now_ns >= total_deadline_ns) return;
+        // Recompute the remaining monotonic budget immediately before the
+        // only potentially-blocking write, including response parsing and
+        // header construction in the total budget.
+        const remaining_ms = msFromRemainingNs(total_deadline_ns - now_ns);
+        compat.setSocketTimeoutsMsChecked(fd, remaining_ms, remaining_ms) catch return;
+        const rc = std.c.writev(fd, fragments[0..fragment_count].ptr, @intCast(fragment_count));
+        switch (std.c.errno(rc)) {
+            .SUCCESS => return, // Partial output is intentionally not retried.
+            .INTR => continue, // No output was produced; retain the original deadline.
+            else => return,
+        }
     }
+}
+
+/// Converts a positive remaining-nanosecond budget (caller already checked
+/// `> 0`) into whole milliseconds for `SO_RCVTIMEO`/`SO_SNDTIMEO`, rounding
+/// any nonzero sub-millisecond remainder up rather than down to zero: a
+/// zero timeout means "block forever" on every supported platform, which
+/// would turn an almost-expired deadline into no deadline at all.
+fn msFromRemainingNs(remaining_ns: i128) u32 {
+    const ms = @divFloor(remaining_ns, std.time.ns_per_ms);
+    const rem = @mod(remaining_ns, std.time.ns_per_ms);
+    const rounded = ms + @as(i128, @intFromBool(rem != 0));
+    return @intCast(@max(rounded, 1));
 }
 
 fn setNonBlocking(fd: std.posix.fd_t) !void {
@@ -803,6 +867,51 @@ test "Listener.deinit forcibly unblocks and joins an in-flight handler instead o
     const deinit_elapsed_ms = compat.milliTimestamp() - deinit_started_ms;
     stream.close();
     try testing.expect(deinit_elapsed_ms < 3_000);
+}
+
+test "finishConnection closes and invalidates a slot's fd atomically, so deinit's shutdown scan can never observe a reused descriptor (#897 review)" {
+    const allocator = testing.allocator;
+    var store = ChallengeStore.init(allocator);
+    defer store.deinit();
+    const managed = [_][]const u8{"a.example.com"};
+    var listener: Listener = undefined;
+    try listener.start(allocator, "127.0.0.1", 0, .{ .managed_hosts = &managed, .store = &store });
+    defer listener.deinit();
+
+    // A real, closeable fd (one end of an AF_UNIX socketpair, matching
+    // this codebase's established pattern for synthesizing a test fd --
+    // `std.posix.pipe` is not available on every platform Zig 0.16
+    // supports) standing in for an accepted connection: `finishConnection`
+    // must actually close it, not merely forget it, so the kernel is free
+    // to reuse the descriptor number only *after* this slot can no longer
+    // be mistaken for still owning it.
+    var fds: [2]std.posix.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer _ = std.c.close(fds[1]);
+    const idx = listener.tryAdmit(null, fds[0]) orelse return error.TestUnexpectedResult;
+    try testing.expect(listener.slots[idx].fd == fds[0]);
+
+    listener.finishConnection(idx, fds[0]);
+
+    // The old code closed `fd` *before* taking `slots_mutex`, leaving a
+    // window where `deinit`'s shutdown scan (also gated on this same lock)
+    // could see `in_use && !finished` and call `shutdown()` on a descriptor
+    // number the kernel had already reassigned elsewhere. Asserting both
+    // conditions together, read back under the lock, is exactly the state
+    // `deinit`'s scan inspects.
+    listener.slots_mutex.lock();
+    const slot = listener.slots[idx];
+    listener.slots_mutex.unlock();
+    try testing.expect(slot.finished);
+    try testing.expect(slot.fd < 0);
+
+    // The fd was really closed by the OS (not merely forgotten by the
+    // slot): `fcntl(F.GETFD)` on an already-closed descriptor fails with
+    // EBADF. (Not a write-based probe: writing to a peer-closed socket can
+    // raise SIGPIPE and kill the test process.)
+    try testing.expectEqual(std.posix.E.BADF, std.posix.errno(std.c.fcntl(fds[0], std.c.F.GETFD, @as(c_int, 0))));
+
+    listener.releaseUnstarted(idx);
 }
 
 test "Listener.start fails deterministically on an invalid listen address" {

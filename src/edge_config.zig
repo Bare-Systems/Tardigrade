@@ -2638,18 +2638,24 @@ pub fn parseAcmeHttp01Listen(raw: []const u8) !AcmeHttp01ListenAddr {
 /// also accepts connections addressed to every specific local address on
 /// that port, so a dedicated listener on a specific address and a wildcard
 /// listener on the main port cannot both bind separately (#897 review).
-/// Cross-family (IPv4 vs IPv6) pairs are never reported as overlapping here;
-/// the OS's own dual-stack behavior for that case is not modeled.
+/// An IPv6 wildcard (`::`) is also reported as overlapping every IPv4
+/// endpoint on the same port: Linux's (and most other platforms') default
+/// `IPV6_V6ONLY=0` dual-stack behavior means an IPv6-wildcard bind already
+/// reserves the IPv4 wildcard/specific endpoints on that port too, so the
+/// later bind of a same-port IPv4 listener would fail even though this
+/// raw-endpoint comparison alone would not otherwise flag it (#897 review).
+/// A non-wildcard, family-specific IPv6 address is not modeled against IPv4
+/// peers beyond that; neither listener binds IPv4-mapped IPv6 addresses.
 fn listenAddressesOverlap(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
     if (a.getPort() != b.getPort()) return false;
     return switch (a) {
         .ip4 => |a4| switch (b) {
             .ip4 => |b4| a4.eql(b4) or isWildcardIp4(a4) or isWildcardIp4(b4),
-            .ip6 => false,
+            .ip6 => |b6| isWildcardIp6(b6),
         },
         .ip6 => |a6| switch (b) {
             .ip6 => |b6| a6.eql(b6) or isWildcardIp6(a6) or isWildcardIp6(b6),
-            .ip4 => false,
+            .ip4 => isWildcardIp6(a6),
         },
     };
 }
@@ -4541,8 +4547,36 @@ test "listenAddressesOverlap reports wildcard-vs-specific same-port overlap but 
     const wildcard6 = try std.Io.net.IpAddress.parse("::", 80);
     const specific6 = try std.Io.net.IpAddress.parse("::1", 80);
     try std.testing.expect(listenAddressesOverlap(wildcard6, specific6));
-    // Cross-family pairs are never reported as overlapping.
-    try std.testing.expect(!listenAddressesOverlap(wildcard4, wildcard6));
+    // A non-wildcard, family-specific pair is still never reported as
+    // overlapping: only the IPv6 wildcard's dual-stack reservation is
+    // modeled across families.
+    try std.testing.expect(!listenAddressesOverlap(specific4, specific6));
+}
+
+test "listenAddressesOverlap reports IPv6-wildcard dual-stack collisions with IPv4 peers (#897 review)" {
+    // Linux's (and most platforms') default IPV6_V6ONLY=0 means an IPv6
+    // wildcard bind also reserves the IPv4 wildcard/specific endpoints on
+    // the same port: a main `0.0.0.0:443` plus an ACME `:::443`, or a main
+    // `[::]:80` plus an ACME `127.0.0.1:80`, would otherwise pass this
+    // validator and only fail at the later bind.
+    const wildcard4 = try std.Io.net.IpAddress.parse("0.0.0.0", 443);
+    const wildcard6 = try std.Io.net.IpAddress.parse("::", 443);
+    try std.testing.expect(listenAddressesOverlap(wildcard4, wildcard6));
+    try std.testing.expect(listenAddressesOverlap(wildcard6, wildcard4));
+
+    const wildcard6_80 = try std.Io.net.IpAddress.parse("::", 80);
+    const specific4_80 = try std.Io.net.IpAddress.parse("127.0.0.1", 80);
+    try std.testing.expect(listenAddressesOverlap(wildcard6_80, specific4_80));
+    try std.testing.expect(listenAddressesOverlap(specific4_80, wildcard6_80));
+
+    // A plain (non-wildcard) IPv6 address is not modeled as colliding with
+    // any IPv4 endpoint.
+    const specific6_80 = try std.Io.net.IpAddress.parse("::1", 80);
+    try std.testing.expect(!listenAddressesOverlap(specific6_80, specific4_80));
+
+    // Different ports never overlap, even with an IPv6 wildcard involved.
+    const wildcard6_81 = try std.Io.net.IpAddress.parse("::", 81);
+    try std.testing.expect(!listenAddressesOverlap(wildcard6_81, specific4_80));
 }
 
 test "parse token hashes from csv" {

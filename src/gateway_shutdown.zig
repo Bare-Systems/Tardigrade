@@ -563,13 +563,25 @@ pub fn circuitBreakerConfigChanged(
 /// `tls_acme_domains`, so comparing it also catches reordering/case changes
 /// that resolve to the same validated set -- a conservative restart-required
 /// classification, never a false negative.
+///
+/// The listener's per-IP admission cap (`max_connections_per_ip`) is in the
+/// same boat: it is copied into the listener's own startup-owned pool state
+/// once in `Listener.start` and is not reachable from the normal hot-reload
+/// path, unlike the main accept path's `state.max_connections_per_ip`
+/// (#897 review). Without this check, lowering the configured cap while ACME
+/// is active would leave the main listener enforcing the new limit while the
+/// challenge listener kept silently admitting up to the old one (and a raise
+/// would leave it artificially under-limited) -- so a cap change while ACME
+/// is enabled is restart-required too.
 pub fn acmeHttp01ListenerConfigChanged(
     current: *const edge_config.EdgeConfig,
     proposed: *const edge_config.EdgeConfig,
 ) bool {
     return current.tls_acme_enabled != proposed.tls_acme_enabled or
         !std.mem.eql(u8, current.tls_acme_http01_listen, proposed.tls_acme_http01_listen) or
-        !std.mem.eql(u8, current.tls_acme_domains_spec, proposed.tls_acme_domains_spec);
+        !std.mem.eql(u8, current.tls_acme_domains_spec, proposed.tls_acme_domains_spec) or
+        (current.tls_acme_enabled and
+            current.max_connections_per_ip != proposed.max_connections_per_ip);
 }
 
 test "acmeHttp01ListenerConfigChanged detects an address change (#881)" {
@@ -607,6 +619,30 @@ test "acmeHttp01ListenerConfigChanged detects an enabled-flag change (#897 revie
 
     proposed.tls_acme_enabled = !base.tls_acme_enabled;
     try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+}
+
+test "acmeHttp01ListenerConfigChanged rejects a per-IP cap change while ACME is enabled, but not while disabled (#897 review)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    base.tls_acme_enabled = true;
+    proposed.tls_acme_enabled = true;
+    base.max_connections_per_ip = 64;
+    proposed.max_connections_per_ip = 2;
+    // Changing *only* the cap while ACME is active must still be seen as a
+    // listener-affecting change: the dedicated listener's own pool would
+    // otherwise keep enforcing the stale 64 limit after a reload lowers the
+    // configured cap to 2, while the main accept path enforces 2.
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+
+    // The same cap change is irrelevant when ACME is not enabled: there is
+    // no dedicated listener holding a stale value to diverge from.
+    base.tls_acme_enabled = false;
+    proposed.tls_acme_enabled = false;
+    try std.testing.expect(!acmeHttp01ListenerConfigChanged(&base, &proposed));
 }
 
 test "earlyDataReplayConfigChanged detects mode and capacity changes independently" {

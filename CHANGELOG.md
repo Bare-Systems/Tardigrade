@@ -208,6 +208,15 @@ All notable user-facing changes to Tardigrade are documented here.
   (preserving headers, applying upstream assertions, or adding it to the
   per-request grant set), instead of only on the ordinary deny/add paths.
 
+- **Native H2 no longer double-frees an allowed `forward_auth` `Decision` on
+  an allocation failure while adding it to the per-request grant set (#888).**
+  `gateway_forward_auth.Grants.add` takes ownership of the `Decision` it is
+  given whether it succeeds or fails, freeing its arena itself on error. The
+  caller cleared its own "still owned" flag only after that call returned,
+  so an `OutOfMemory` from `Grants.add` left the flag set and the caller's
+  deferred cleanup freed the same arena a second time. The flag now clears
+  before the call.
+
 - **Every production secret wipe now uses the canonical zeroization helper,
   and the crypto-boundary audit enforces it (#784).** About 100 remaining
   wipes in the pure-Zig crypto provider and the TLS 1.3 backend

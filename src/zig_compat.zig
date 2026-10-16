@@ -270,6 +270,34 @@ fn writevFd(fd: std.posix.fd_t, iovecs: []const std.posix.iovec_const) !usize {
     }
 }
 
+/// Sends vectored data on a socket without allowing a peer close to deliver
+/// SIGPIPE to the process. `MSG_NOSIGNAL` is available on the supported POSIX
+/// targets (including Linux and Darwin); unlike a process-wide SIGPIPE policy,
+/// it affects only this send operation.
+///
+/// Callers intentionally receive peer-close errors so they can treat them as
+/// ordinary connection failures rather than process-fatal events.
+pub fn sendSocketIovNoSignal(fd: std.posix.fd_t, iovecs: []const std.posix.iovec_const) !usize {
+    var message: std.posix.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = iovecs.ptr,
+        .iovlen = @intCast(iovecs.len),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    const rc = std.posix.system.sendmsg(fd, &message, std.posix.MSG.NOSIGNAL);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        .INTR => return error.Interrupted,
+        .AGAIN => return error.WouldBlock,
+        .PIPE => return error.BrokenPipe,
+        .CONNRESET => return error.ConnectionReset,
+        else => return error.SendFailed,
+    }
+}
+
 pub fn netStreamFromFd(fd: std.posix.fd_t) NetStream {
     return .{
         .inner = null,
@@ -1187,6 +1215,37 @@ test "writevAllWith retries interrupt and reports zero and error" {
     var fail = ScriptedWritev.init(std.testing.allocator, &fail_steps);
     defer fail.deinit();
     try std.testing.expectError(error.WouldBlock, writevAllWith(*ScriptedWritev, &fail, &parts, ScriptedWritev.call));
+}
+
+test "sendSocketIovNoSignal survives a default-SIGPIPE peer close in a subprocess" {
+    // The child deliberately restores SIGPIPE's default disposition. If this
+    // regresses to writev/sendmsg without MSG_NOSIGNAL, the child dies from
+    // SIGPIPE and the parent observes a nonzero wait status instead of losing
+    // the whole test runner.
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer _ = std.c.close(fds[0]);
+    _ = std.c.close(fds[1]);
+
+    const child_pid = std.c.fork();
+    try std.testing.expect(child_pid >= 0);
+    if (child_pid == 0) {
+        var action = std.mem.zeroes(std.posix.Sigaction);
+        action.handler = .{ .handler = std.posix.SIG.DFL };
+        std.posix.sigaction(.PIPE, &action, null);
+
+        const bytes = "response";
+        const fragments = [_]std.posix.iovec_const{.{ .base = bytes.ptr, .len = bytes.len }};
+        _ = sendSocketIovNoSignal(fds[0], &fragments) catch |err| switch (err) {
+            error.BrokenPipe, error.ConnectionReset => std.c._exit(0),
+            else => std.c._exit(1),
+        };
+        std.c._exit(1);
+    }
+
+    var status: c_int = undefined;
+    try std.testing.expectEqual(child_pid, std.c.waitpid(child_pid, &status, 0));
+    try std.testing.expectEqual(@as(c_int, 0), status);
 }
 
 test "trimRight removes trailing characters" {

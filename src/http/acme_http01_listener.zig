@@ -395,7 +395,7 @@ pub const Listener = struct {
         const end = head_len orelse return;
 
         const now_after_head_ns = compat.monotonicNanoTimestamp();
-        if (now_after_head_ns >= total_deadline_ns) return;
+        if (!completedHeadWithinDeadlines(now_after_head_ns, head_deadline_ns, total_deadline_ns)) return;
         const parsed = request_mod.Request.parseHead(self.allocator, buf[0..end], 0) catch {
             respondStatus(self.allocator, fd, total_deadline_ns, .bad_request);
             return;
@@ -451,6 +451,13 @@ fn hasBodyOrUpgrade(req: *const request_mod.Request) bool {
     return false;
 }
 
+/// A request head that became complete after either absolute budget expired is
+/// never dispatched. Keeping this comparison separate makes the post-read
+/// check testable without relying on scheduler timing around a socket read.
+fn completedHeadWithinDeadlines(now_ns: i128, head_deadline_ns: i128, total_deadline_ns: i128) bool {
+    return now_ns < head_deadline_ns and now_ns < total_deadline_ns;
+}
+
 fn respondStatus(allocator: std.mem.Allocator, fd: std.posix.fd_t, total_deadline_ns: i128, code: status_mod.Status) void {
     var resp = response_mod.Response.init(allocator);
     defer resp.deinit();
@@ -469,12 +476,10 @@ fn respondChallenge(allocator: std.mem.Allocator, fd: std.posix.fd_t, total_dead
     writeResponseBeforeDeadline(allocator, fd, total_deadline_ns, &resp, if (head_only) "" else key_authorization);
 }
 
-/// Emits the listener's deliberately small response in one `writev` call.
-/// Do not use `NetStream.writeAll`/`writeGatheredAll` here: those correctly
-/// retry partial writes for ordinary HTTP responses, but each retry receives a
-/// fresh `SO_SNDTIMEO` and could extend this listener's absolute connection
-/// budget. A partial response is harmless because this listener always closes
-/// the connection; fail closed instead of attempting a second blocking write.
+/// Emits the listener's deliberately small response before its original total
+/// deadline. A successful vectored send may be short, so remaining header and
+/// body bytes are retried with a freshly reduced socket timeout; the absolute
+/// monotonic deadline itself is never reset.
 fn writeResponseBeforeDeadline(
     allocator: std.mem.Allocator,
     fd: std.posix.fd_t,
@@ -485,27 +490,69 @@ fn writeResponseBeforeDeadline(
     const header = resp.buildHeaderBytes(allocator) catch return;
     defer allocator.free(header);
 
-    var fragments: [2]std.posix.iovec_const = undefined;
-    fragments[0] = .{ .base = header.ptr, .len = header.len };
-    const fragment_count: usize = if (body.len > 0) blk: {
-        fragments[1] = .{ .base = body.ptr, .len = body.len };
-        break :blk 2;
-    } else 1;
+    const Context = struct {
+        fd: std.posix.fd_t,
 
-    while (true) {
-        const now_ns = compat.monotonicNanoTimestamp();
-        if (now_ns >= total_deadline_ns) return;
-        // Recompute the remaining monotonic budget immediately before the
-        // only potentially-blocking write, including response parsing and
-        // header construction in the total budget.
-        const remaining_ms = msFromRemainingNs(total_deadline_ns - now_ns);
-        compat.setSocketTimeoutsMsChecked(fd, remaining_ms, remaining_ms) catch return;
-        const rc = std.c.writev(fd, fragments[0..fragment_count].ptr, @intCast(fragment_count));
-        switch (std.c.errno(rc)) {
-            .SUCCESS => return, // Partial output is intentionally not retried.
-            .INTR => continue, // No output was produced; retain the original deadline.
-            else => return,
+        fn clock(_: @This()) i128 {
+            return compat.monotonicNanoTimestamp();
         }
+
+        fn setTimeouts(self: @This(), timeout_ms: u32) !void {
+            try compat.setSocketTimeoutsMsChecked(self.fd, timeout_ms, timeout_ms);
+        }
+
+        fn send(self: @This(), fragments: []const std.posix.iovec_const) !usize {
+            return compat.sendSocketIovNoSignal(self.fd, fragments);
+        }
+    };
+    writeResponseFragmentsBeforeDeadline(Context, .{ .fd = fd }, total_deadline_ns, header, body, Context.clock, Context.setTimeouts, Context.send);
+}
+
+fn writeResponseFragmentsBeforeDeadline(
+    comptime Context: type,
+    context: Context,
+    total_deadline_ns: i128,
+    header: []const u8,
+    body: []const u8,
+    clock_fn: *const fn (Context) i128,
+    set_timeouts_fn: *const fn (Context, u32) anyerror!void,
+    send_fn: *const fn (Context, []const std.posix.iovec_const) anyerror!usize,
+) void {
+    var header_offset: usize = 0;
+    var body_offset: usize = 0;
+    while (header_offset < header.len or body_offset < body.len) {
+        const now_ns = clock_fn(context);
+        if (now_ns >= total_deadline_ns) return;
+        const remaining_ms = msFromRemainingNs(total_deadline_ns - now_ns);
+        set_timeouts_fn(context, remaining_ms) catch return;
+
+        var fragments: [2]std.posix.iovec_const = undefined;
+        var fragment_count: usize = 0;
+        if (header_offset < header.len) {
+            fragments[fragment_count] = .{ .base = header[header_offset..].ptr, .len = header.len - header_offset };
+            fragment_count += 1;
+        }
+        if (body_offset < body.len) {
+            fragments[fragment_count] = .{ .base = body[body_offset..].ptr, .len = body.len - body_offset };
+            fragment_count += 1;
+        }
+        const written = send_fn(context, fragments[0..fragment_count]) catch |err| switch (err) {
+            error.Interrupted => continue,
+            error.BrokenPipe, error.ConnectionReset => return,
+            else => return,
+        };
+        if (written == 0) return;
+
+        const pending = header.len - header_offset + body.len - body_offset;
+        if (written > pending) return;
+        var remaining = written;
+        if (header_offset < header.len) {
+            const header_remaining = header.len - header_offset;
+            const consumed = @min(remaining, header_remaining);
+            header_offset += consumed;
+            remaining -= consumed;
+        }
+        body_offset += remaining;
     }
 }
 
@@ -555,6 +602,110 @@ fn sendAndRecv(allocator: std.mem.Allocator, listener_port: u16, request_bytes: 
         if (n == 0) break;
         try out.appendSlice(allocator, buf[0..n]);
     }
+}
+
+const ScriptedResponseWriter = struct {
+    allocator: std.mem.Allocator,
+    clock_values: []const i128,
+    write_sizes: []const usize,
+    clock_index: usize = 0,
+    write_index: usize = 0,
+    output: std.ArrayList(u8) = .empty,
+    timeout_values: std.ArrayList(u32) = .empty,
+
+    fn deinit(self: *ScriptedResponseWriter) void {
+        self.output.deinit(self.allocator);
+        self.timeout_values.deinit(self.allocator);
+    }
+
+    fn clock(self: *ScriptedResponseWriter) i128 {
+        const index = @min(self.clock_index, self.clock_values.len - 1);
+        self.clock_index += 1;
+        return self.clock_values[index];
+    }
+
+    fn setTimeouts(self: *ScriptedResponseWriter, timeout_ms: u32) !void {
+        try self.timeout_values.append(self.allocator, timeout_ms);
+    }
+
+    fn send(self: *ScriptedResponseWriter, fragments: []const std.posix.iovec_const) !usize {
+        if (self.write_index >= self.write_sizes.len) return error.TestUnexpectedSend;
+        const written = self.write_sizes[self.write_index];
+        self.write_index += 1;
+
+        var remaining = written;
+        for (fragments) |fragment| {
+            if (remaining == 0) break;
+            const taken = @min(remaining, fragment.len);
+            try self.output.appendSlice(self.allocator, fragment.base[0..taken]);
+            remaining -= taken;
+        }
+        if (remaining != 0) return error.TestSendBeyondInput;
+        return written;
+    }
+};
+
+test "a request head completed just after its head deadline is not dispatched" {
+    const head_deadline_ns = 5 * std.time.ns_per_s;
+    const total_deadline_ns = 10 * std.time.ns_per_s;
+    try testing.expect(!completedHeadWithinDeadlines(head_deadline_ns + 1, head_deadline_ns, total_deadline_ns));
+    try testing.expect(completedHeadWithinDeadlines(head_deadline_ns - 1, head_deadline_ns, total_deadline_ns));
+}
+
+test "HTTP-01 response retries short vectored writes without resetting its deadline" {
+    const deadline_ns = 100 * std.time.ns_per_ms;
+    const clock_values = [_]i128{ 0, 0, 0 };
+    const write_sizes = [_]usize{ 2, 4, 2 };
+    var writer = ScriptedResponseWriter{
+        .allocator = testing.allocator,
+        .clock_values = &clock_values,
+        .write_sizes = &write_sizes,
+    };
+    defer writer.deinit();
+
+    // The second write crosses the header/body boundary; a retry that starts
+    // over, or that drops the suffix, would not reproduce this exact stream.
+    writeResponseFragmentsBeforeDeadline(
+        *ScriptedResponseWriter,
+        &writer,
+        deadline_ns,
+        "HEAD",
+        "BODY",
+        ScriptedResponseWriter.clock,
+        ScriptedResponseWriter.setTimeouts,
+        ScriptedResponseWriter.send,
+    );
+
+    try testing.expectEqualStrings("HEADBODY", writer.output.items);
+    try testing.expectEqual(@as(usize, 3), writer.timeout_values.items.len);
+    for (writer.timeout_values.items) |timeout_ms| try testing.expectEqual(@as(u32, 100), timeout_ms);
+}
+
+test "HTTP-01 response stops after a short write when its original deadline expires" {
+    const deadline_ns = 100 * std.time.ns_per_ms;
+    const clock_values = [_]i128{ 0, deadline_ns };
+    const write_sizes = [_]usize{2};
+    var writer = ScriptedResponseWriter{
+        .allocator = testing.allocator,
+        .clock_values = &clock_values,
+        .write_sizes = &write_sizes,
+    };
+    defer writer.deinit();
+
+    writeResponseFragmentsBeforeDeadline(
+        *ScriptedResponseWriter,
+        &writer,
+        deadline_ns,
+        "HEAD",
+        "BODY",
+        ScriptedResponseWriter.clock,
+        ScriptedResponseWriter.setTimeouts,
+        ScriptedResponseWriter.send,
+    );
+
+    try testing.expectEqualStrings("HE", writer.output.items);
+    try testing.expectEqual(@as(usize, 1), writer.timeout_values.items.len);
+    try testing.expectEqual(@as(usize, 1), writer.write_index);
 }
 
 test "Listener serves a managed host's live challenge for GET and HEAD, fails closed otherwise (#881)" {

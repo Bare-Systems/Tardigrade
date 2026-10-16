@@ -63,6 +63,9 @@ pub const Fault = enum {
     close_file,
     rename,
     fsync_dir,
+    /// A newly-created child directory is not durable until its name has
+    /// been synced through its parent.
+    mkdir_fsync_parent,
 };
 
 pub const StateDir = struct {
@@ -70,6 +73,11 @@ pub const StateDir = struct {
     lock_fd: zig_compat.Fd,
     /// Test-only one-shot fault; ignored (and compiled out) outside tests.
     fault: Fault = .none,
+    /// Test-only: restrict `fault` to the named file (write target, or a
+    /// caller-supplied label for a non-write step such as a commit rename
+    /// or a post-rename fsync). `null` matches any file, preserving the
+    /// original "fires on the first occurrence of this step" behavior.
+    fault_file: ?[]const u8 = null,
 
     /// Open (creating with `0700` when absent) and lock `path`. The path's
     /// final component must be a real directory, not a symlink; its parent
@@ -122,122 +130,357 @@ pub const StateDir = struct {
         return .{ .handle = self.dir_fd };
     }
 
-    fn hit(self: *StateDir, point: Fault) Error!void {
-        if (!builtin.is_test) return;
-        if (self.fault == point) {
-            self.fault = .none;
-            return error.InjectedFault;
-        }
-    }
-
     /// Replace `name` atomically with `data` at `mode`. On any failure the
     /// previous `name` is untouched and the temp file is removed.
     pub fn writeFileAtomic(self: *StateDir, name: []const u8, data: []const u8, mode: u32) Error!void {
-        if (!validName(name)) return error.InvalidPath;
-        if (data.len > max_state_file_len) return error.TooLarge;
+        return self.writeFileAtomicLimit(name, data, mode, max_state_file_len);
+    }
 
-        var random: [8]u8 = undefined;
-        zig_compat.randomBytes(&random);
-        var temp_buf: [128]u8 = undefined;
-        const temp_name = std.fmt.bufPrint(&temp_buf, ".{s}.tmp-{x}", .{ name, random }) catch return error.InvalidPath;
-
-        try self.hit(.create_temp);
-        const fd = zig_compat.openAtNoFollow(self.dir_fd, temp_name, .{ .write = true, .create = true, .exclusive = true }, mode) catch return error.IoFailure;
-        var fd_open = true;
-        var renamed = false;
-        defer {
-            if (fd_open) zig_compat.closeFd(fd);
-            if (!renamed) zig_compat.unlinkAt(self.dir_fd, temp_name);
-        }
-        // umask may have narrowed the mode, never widened it; make it exact.
-        zig_compat.fchmodFd(fd, mode) catch return error.IoFailure;
-
-        try self.hit(.write);
-        const limit = if (self.fault == .short_write) data.len / 2 else data.len;
-        zig_compat.writeAllFd(fd, data[0..limit]) catch return error.IoFailure;
-        try self.hit(.short_write);
-
-        try self.hit(.fsync_file);
-        zig_compat.fsyncFd(fd) catch return error.IoFailure;
-        // close() can report deferred write errors; a reported failure must
-        // not be committed. The descriptor is consumed either way.
-        const close_result = zig_compat.closeFdChecked(fd);
-        fd_open = false;
-        try self.hit(.close_file);
-        close_result catch return error.IoFailure;
-
-        try self.hit(.rename);
-        zig_compat.renameAt(self.dir_fd, temp_name, name) catch return error.IoFailure;
-        renamed = true;
-
-        // The rename is already visible; a failed directory fsync means we
-        // cannot promise it survives a crash, which the caller must know.
-        try self.hit(.fsync_dir);
-        zig_compat.fsyncFd(self.dir_fd) catch return error.IoFailure;
+    /// The same hardened atomic replacement procedure with a caller-specific
+    /// bounded payload limit. Certificate chains have a larger documented
+    /// budget than account and metadata state.
+    pub fn writeFileAtomicLimit(self: *StateDir, name: []const u8, data: []const u8, mode: u32, max_len: usize) Error!void {
+        return writeFileAtomicRaw(self.dir_fd, &self.fault, &self.fault_file, name, data, mode, max_len);
     }
 
     /// Read `name` (bounded). With `private`, any group/other permission bit
     /// is `InsecurePermissions`. Never follows symlinks. When `private`, the
     /// caller owns key material and must free with `secrets.secureZeroAndFree`.
     pub fn readFileAlloc(self: *const StateDir, allocator: std.mem.Allocator, name: []const u8, max_len: usize, private: bool) Error![]u8 {
-        if (!validName(name)) return error.InvalidPath;
-        const st = self.dir().statFile(zig_compat.io(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => return error.NotFound,
-            else => return error.IoFailure,
-        };
-        if (st.kind != .file) return error.UnsafeFileType;
-        if (private and modeBits(st) & 0o077 != 0) return error.InsecurePermissions;
-        if (st.size > max_len) return error.TooLarge;
+        return readFileAllocRaw(self.dir_fd, allocator, name, max_len, private, null);
+    }
 
-        const fd = zig_compat.openAtNoFollow(self.dir_fd, name, .{}, 0) catch |err| switch (err) {
-            error.NotFound => return error.NotFound,
-            else => return error.IoFailure,
-        };
-        defer zig_compat.closeFd(fd);
-        // Re-check on the descriptor we will actually read.
-        const identity = zig_compat.statFdIdentity(fd) catch return error.IoFailure;
-        if (!identity.is_regular) return error.UnsafeFileType;
-        if (private) {
-            if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
-            if (identity.mode & 0o077 != 0) return error.InsecurePermissions;
-        }
+    /// Read a private regular file whose permission bits must be exactly
+    /// `mode` (used for commit markers with a documented 0600 contract).
+    pub fn readFileAllocExactMode(self: *const StateDir, allocator: std.mem.Allocator, name: []const u8, max_len: usize, mode: u32) Error![]u8 {
+        return readFileAllocRaw(self.dir_fd, allocator, name, max_len, true, mode);
+    }
 
-        var buf = try allocator.alloc(u8, @intCast(st.size));
-        errdefer if (private) secrets.secureZeroAndFree(allocator, buf) else allocator.free(buf);
-        var filled: usize = 0;
-        while (filled < buf.len) {
-            const n = zig_compat.readFd(fd, buf[filled..]) catch return error.IoFailure;
-            if (n == 0) return error.CorruptState; // shrank under us
-            filled += n;
-        }
-        // Grew under us: the bound we checked is no longer the truth.
-        var probe: [1]u8 = undefined;
-        const extra = zig_compat.readFd(fd, &probe) catch return error.IoFailure;
-        if (extra != 0) return error.CorruptState;
-        return buf;
+    /// Open (creating as `0700` if absent) a single-component subdirectory
+    /// of this state directory with the same symlink/ownership/permission
+    /// invariants as `open`, and remove any crashed writer's temp leftovers
+    /// inside it. Used to build the nested `groups/<id>/generations/<gen>/`
+    /// layout (#879, design §9.2) one validated level at a time.
+    pub fn openOrCreateSubdir(self: *StateDir, name: []const u8) Error!SubDir {
+        return openSubdirRaw(self.dir_fd, &self.fault, &self.fault_file, name, true);
+    }
+
+    /// Open an existing subdirectory with the same invariants as
+    /// `openOrCreateSubdir`, without creating it. `error.NotFound` if absent.
+    pub fn openSubdirStrict(self: *StateDir, name: []const u8) Error!SubDir {
+        return openSubdirRaw(self.dir_fd, &self.fault, &self.fault_file, name, false);
     }
 
     /// Remove `.<name>.tmp-*` leftovers from a crashed writer. We hold the
     /// lock, so no live writer owns them. Best effort: failure to clean up
     /// must not block startup, and a leftover is mode `0600` anyway.
     fn removeStaleTemps(self: *StateDir) void {
-        const io = zig_compat.io();
-        var it = self.dir().iterate();
-        var doomed: [8][128]u8 = undefined;
-        var doomed_len: [8]usize = undefined;
-        var count: usize = 0;
-        while (it.next(io) catch return) |entry| {
-            if (entry.kind != .file) continue;
-            if (entry.name.len < 6 or entry.name[0] != '.' or entry.name.len >= 128) continue;
-            if (std.mem.indexOf(u8, entry.name, ".tmp-") == null) continue;
-            if (count == doomed.len) break;
-            @memcpy(doomed[count][0..entry.name.len], entry.name);
-            doomed_len[count] = entry.name.len;
-            count += 1;
-        }
-        for (0..count) |i| zig_compat.unlinkAt(self.dir_fd, doomed[i][0..doomed_len[i]]);
+        removeStaleTempsRaw(self.dir_fd);
     }
 };
+
+/// A validated, single-component subdirectory opened relative to a parent
+/// directory descriptor (`StateDir.dir_fd` or another `SubDir`). Shares the
+/// parent `StateDir`'s one-shot fault cell (and optional file filter) so
+/// tests can inject a failure at any step of a nested write, and the same
+/// atomic-write/strict-read procedure as the top-level directory (#879).
+pub const SubDir = struct {
+    fd: zig_compat.Fd,
+    fault: *Fault,
+    fault_file: *const ?[]const u8,
+
+    pub fn close(self: *SubDir) void {
+        zig_compat.closeFd(self.fd);
+        self.* = undefined;
+    }
+
+    fn dir(self: *const SubDir) std.Io.Dir {
+        return .{ .handle = self.fd };
+    }
+
+    pub fn writeFileAtomic(self: *SubDir, name: []const u8, data: []const u8, mode: u32) Error!void {
+        return self.writeFileAtomicLimit(name, data, mode, max_state_file_len);
+    }
+
+    pub fn writeFileAtomicLimit(self: *SubDir, name: []const u8, data: []const u8, mode: u32, max_len: usize) Error!void {
+        return writeFileAtomicRaw(self.fd, self.fault, self.fault_file, name, data, mode, max_len);
+    }
+
+    pub fn readFileAlloc(self: *const SubDir, allocator: std.mem.Allocator, name: []const u8, max_len: usize, private: bool) Error![]u8 {
+        return readFileAllocRaw(self.fd, allocator, name, max_len, private, null);
+    }
+
+    pub fn readFileAllocExactMode(self: *const SubDir, allocator: std.mem.Allocator, name: []const u8, max_len: usize, mode: u32) Error![]u8 {
+        return readFileAllocRaw(self.fd, allocator, name, max_len, true, mode);
+    }
+
+    pub fn openOrCreateSubdir(self: *SubDir, name: []const u8) Error!SubDir {
+        return openSubdirRaw(self.fd, self.fault, self.fault_file, name, true);
+    }
+
+    pub fn openSubdirStrict(self: *SubDir, name: []const u8) Error!SubDir {
+        return openSubdirRaw(self.fd, self.fault, self.fault_file, name, false);
+    }
+
+    /// Test-only: inject `error.InjectedFault` at a named step that is not
+    /// otherwise reachable from a write (e.g. the `current.tmp -> current`
+    /// commit rename, or the fsync that follows it) when the one-shot
+    /// `fault`/`fault_file` pair matches. A no-op outside tests.
+    pub fn injectTestFault(self: *const SubDir, file: []const u8, point: Fault) Error!void {
+        return hitFault(self.fault, self.fault_file, file, point);
+    }
+
+    /// Rename `old` to `new` within this directory (the generation-commit
+    /// step: `current.tmp` -> `current`).
+    pub fn renameWithin(self: *SubDir, old: []const u8, new: []const u8) Error!void {
+        if (!validName(old) or !validName(new)) return error.InvalidPath;
+        zig_compat.renameAt(self.fd, old, new) catch return error.IoFailure;
+    }
+
+    /// Best-effort unlink; a missing file is not an error.
+    pub fn removeFile(self: *SubDir, name: []const u8) void {
+        if (!validName(name)) return;
+        zig_compat.unlinkAt(self.fd, name);
+    }
+
+    /// Remove the now-empty-of-live-files subdirectory `name`. The caller
+    /// must have already removed every entry it wrote inside it.
+    pub fn removeEmpty(self: *SubDir, name: []const u8) Error!void {
+        if (!validName(name)) return error.InvalidPath;
+        zig_compat.rmdirAt(self.fd, name) catch return error.IoFailure;
+    }
+
+    pub fn fsync(self: *const SubDir) Error!void {
+        zig_compat.fsyncFd(self.fd) catch return error.IoFailure;
+    }
+
+    /// Bounded iteration for generation discovery and orphan sweeps. Returns
+    /// a fixed-capacity snapshot (never partial-reads a live mutation: the
+    /// caller holds the top-level lock for the whole operation).
+    pub fn listNames(self: *const SubDir, out: *[64][64]u8, out_len: *[64]usize) usize {
+        var it = self.dir().iterate();
+        var count: usize = 0;
+        while (it.next(zig_compat.io()) catch return count) |entry| {
+            if (entry.name.len == 0 or entry.name.len >= 64) continue;
+            if (count == out.len) break;
+            @memcpy(out[count][0..entry.name.len], entry.name);
+            out_len[count] = entry.name.len;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Like `listNames`, but never reports a successful partial snapshot.
+    /// Callers that would make a correctness decision from enumeration must
+    /// use this variant (rather than silently treating the first 64 entries
+    /// as the complete history).
+    pub fn listNamesStrict(self: *const SubDir, out: *[64][64]u8, out_len: *[64]usize) Error!usize {
+        var it = self.dir().iterate();
+        var count: usize = 0;
+        while (it.next(zig_compat.io()) catch return error.IoFailure) |entry| {
+            if (entry.name.len == 0 or entry.name.len >= 64) continue;
+            if (count == out.len) return error.TooLarge;
+            @memcpy(out[count][0..entry.name.len], entry.name);
+            out_len[count] = entry.name.len;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Scan every entry in this directory — never bounded by the batch
+    /// size itself — and collect up to `out.len` names for which
+    /// `predicate(ctx, name)` is true. Unlike `listNames`/`listNamesStrict`,
+    /// entries the caller does not care about (e.g. retained `*.corrupt-*`
+    /// archives, or names already spoken for) are skipped without consuming
+    /// a slot, so a directory with arbitrarily many uninteresting entries
+    /// ahead of the interesting ones can never make a full scan report zero
+    /// candidates. Propagates iterator I/O failures rather than treating
+    /// them as a complete (or even successful) scan.
+    pub fn listMatching(
+        self: *const SubDir,
+        out: *[64][64]u8,
+        out_len: *[64]usize,
+        ctx: anytype,
+        comptime predicate: fn (@TypeOf(ctx), []const u8) bool,
+    ) Error!usize {
+        var it = self.dir().iterate();
+        var count: usize = 0;
+        while (it.next(zig_compat.io()) catch return error.IoFailure) |entry| {
+            if (entry.name.len == 0 or entry.name.len >= 64) continue;
+            if (!predicate(ctx, entry.name)) continue;
+            if (count == out.len) return count;
+            @memcpy(out[count][0..entry.name.len], entry.name);
+            out_len[count] = entry.name.len;
+            count += 1;
+        }
+        return count;
+    }
+};
+
+/// `file`, when non-null, restricts the match to one write target (or
+/// caller-supplied label); this lets tests pick a specific generation file
+/// and commit step instead of only ever hitting the first write the whole
+/// operation happens to make.
+fn hitFault(fault: *Fault, fault_file: *const ?[]const u8, file: []const u8, point: Fault) Error!void {
+    if (!builtin.is_test) return;
+    if (fault.* != point) return;
+    if (fault_file.*) |target| {
+        if (!std.mem.eql(u8, target, file)) return;
+    }
+    fault.* = .none;
+    return error.InjectedFault;
+}
+
+fn writeFileAtomicRaw(dir_fd: zig_compat.Fd, fault: *Fault, fault_file: *const ?[]const u8, name: []const u8, data: []const u8, mode: u32, max_len: usize) Error!void {
+    if (!validName(name)) return error.InvalidPath;
+    if (data.len > max_len) return error.TooLarge;
+
+    var random: [8]u8 = undefined;
+    zig_compat.randomBytes(&random);
+    var temp_buf: [128]u8 = undefined;
+    const temp_name = std.fmt.bufPrint(&temp_buf, ".{s}.tmp-{x}", .{ name, random }) catch return error.InvalidPath;
+
+    try hitFault(fault, fault_file, name, .create_temp);
+    const fd = zig_compat.openAtNoFollow(dir_fd, temp_name, .{ .write = true, .create = true, .exclusive = true }, mode) catch return error.IoFailure;
+    var fd_open = true;
+    var renamed = false;
+    defer {
+        if (fd_open) zig_compat.closeFd(fd);
+        if (!renamed) zig_compat.unlinkAt(dir_fd, temp_name);
+    }
+    // umask may have narrowed the mode, never widened it; make it exact.
+    zig_compat.fchmodFd(fd, mode) catch return error.IoFailure;
+
+    try hitFault(fault, fault_file, name, .write);
+    // Mirror hitFault's own target check: an untargeted short-write fault
+    // must not truncate an earlier, differently-named write on its way to
+    // the file the test actually means to hit.
+    const targeted_short_write = builtin.is_test and fault.* == .short_write and
+        (fault_file.* == null or std.mem.eql(u8, fault_file.*.?, name));
+    const limit = if (targeted_short_write) data.len / 2 else data.len;
+    zig_compat.writeAllFd(fd, data[0..limit]) catch return error.IoFailure;
+    try hitFault(fault, fault_file, name, .short_write);
+
+    try hitFault(fault, fault_file, name, .fsync_file);
+    zig_compat.fsyncFd(fd) catch return error.IoFailure;
+    // close() can report deferred write errors; a reported failure must
+    // not be committed. The descriptor is consumed either way.
+    const close_result = zig_compat.closeFdChecked(fd);
+    fd_open = false;
+    try hitFault(fault, fault_file, name, .close_file);
+    close_result catch return error.IoFailure;
+
+    try hitFault(fault, fault_file, name, .rename);
+    zig_compat.renameAt(dir_fd, temp_name, name) catch return error.IoFailure;
+    renamed = true;
+
+    // The rename is already visible; a failed directory fsync means we
+    // cannot promise it survives a crash, which the caller must know.
+    try hitFault(fault, fault_file, name, .fsync_dir);
+    zig_compat.fsyncFd(dir_fd) catch return error.IoFailure;
+}
+
+fn readFileAllocRaw(dir_fd: zig_compat.Fd, allocator: std.mem.Allocator, name: []const u8, max_len: usize, private: bool, required_mode: ?u32) Error![]u8 {
+    if (!validName(name)) return error.InvalidPath;
+    const parent: std.Io.Dir = .{ .handle = dir_fd };
+    const st = parent.statFile(zig_compat.io(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.NotFound,
+        else => return error.IoFailure,
+    };
+    if (st.kind != .file) return error.UnsafeFileType;
+    if (private and modeBits(st) & 0o077 != 0) return error.InsecurePermissions;
+    if (required_mode) |mode| if (modeBits(st) != mode) return error.InsecurePermissions;
+    if (st.size > max_len) return error.TooLarge;
+
+    const fd = zig_compat.openAtNoFollow(dir_fd, name, .{}, 0) catch |err| switch (err) {
+        error.NotFound => return error.NotFound,
+        else => return error.IoFailure,
+    };
+    defer zig_compat.closeFd(fd);
+    // Re-check on the descriptor we will actually read.
+    const identity = zig_compat.statFdIdentity(fd) catch return error.IoFailure;
+    if (!identity.is_regular) return error.UnsafeFileType;
+    if (private) {
+        if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
+        if (identity.mode & 0o077 != 0) return error.InsecurePermissions;
+        if (required_mode) |mode| if (identity.mode & 0o777 != mode) return error.InsecurePermissions;
+    }
+
+    var buf = try allocator.alloc(u8, @intCast(st.size));
+    errdefer if (private) secrets.secureZeroAndFree(allocator, buf) else allocator.free(buf);
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = zig_compat.readFd(fd, buf[filled..]) catch return error.IoFailure;
+        if (n == 0) return error.CorruptState; // shrank under us
+        filled += n;
+    }
+    // Grew under us: the bound we checked is no longer the truth.
+    var probe: [1]u8 = undefined;
+    const extra = zig_compat.readFd(fd, &probe) catch return error.IoFailure;
+    if (extra != 0) return error.CorruptState;
+    return buf;
+}
+
+/// Open (optionally creating, `0700`) a single validated-component
+/// subdirectory of `parent_fd`: never a symlink, owned by the effective uid,
+/// no group/other permission bits. Shared by `StateDir` and `SubDir` so
+/// every nesting level gets identical defenses.
+fn openSubdirRaw(parent_fd: zig_compat.Fd, fault: *Fault, fault_file: *const ?[]const u8, name: []const u8, create: bool) Error!SubDir {
+    if (!validName(name)) return error.InvalidPath;
+    const created = if (create) blk: {
+        zig_compat.mkdirAt(parent_fd, name, 0o700) catch |err| switch (err) {
+            error.Exists => break :blk false,
+            else => return error.IoFailure,
+        };
+        // mkdirAt only returns success for the process that linked the new
+        // component into its parent.
+        break :blk true;
+    } else false;
+    const fd = zig_compat.openDirAtNoFollow(parent_fd, name) catch |err| switch (err) {
+        error.NotFound => return error.NotFound,
+        else => {
+            // Say why when we can: a symlink or file is a different problem
+            // from an I/O failure (mirrors `StateDir.open`'s top-level check).
+            const parent: std.Io.Dir = .{ .handle = parent_fd };
+            if (parent.statFile(zig_compat.io(), name, .{ .follow_symlinks = false })) |st| {
+                if (st.kind != .directory) return error.UnsafeFileType;
+            } else |_| {}
+            return error.IoFailure;
+        },
+    };
+    errdefer zig_compat.closeFd(fd);
+    const identity = zig_compat.statFdIdentity(fd) catch return error.IoFailure;
+    if (!identity.is_directory) return error.UnsafeFileType;
+    if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
+    if (identity.mode & 0o022 != 0) return error.InsecurePermissions;
+    if (created) {
+        try hitFault(fault, fault_file, name, .mkdir_fsync_parent);
+        zig_compat.fsyncFd(parent_fd) catch return error.IoFailure;
+    }
+    removeStaleTempsRaw(fd);
+    return .{ .fd = fd, .fault = fault, .fault_file = fault_file };
+}
+
+/// Remove `.<name>.tmp-*` leftovers from a crashed writer. Best effort: a
+/// failure to clean up must not block startup, and a leftover is `0600`.
+fn removeStaleTempsRaw(dir_fd: zig_compat.Fd) void {
+    const parent: std.Io.Dir = .{ .handle = dir_fd };
+    const io = zig_compat.io();
+    var it = parent.iterate();
+    var doomed: [8][128]u8 = undefined;
+    var doomed_len: [8]usize = undefined;
+    var count: usize = 0;
+    while (it.next(io) catch return) |entry| {
+        if (entry.kind != .file) continue;
+        if (entry.name.len < 6 or entry.name[0] != '.' or entry.name.len >= 128) continue;
+        if (std.mem.indexOf(u8, entry.name, ".tmp-") == null) continue;
+        if (count == doomed.len) break;
+        @memcpy(doomed[count][0..entry.name.len], entry.name);
+        doomed_len[count] = entry.name.len;
+        count += 1;
+    }
+    for (0..count) |i| zig_compat.unlinkAt(dir_fd, doomed[i][0..doomed_len[i]]);
+}
 
 fn modeBits(st: std.Io.File.Stat) u32 {
     return @as(u32, @intCast(@intFromEnum(st.permissions))) & 0o777;
@@ -535,6 +778,26 @@ test "ACME state: a failure at every step keeps the previous file and removes th
     const got = try state.readFileAlloc(testing.allocator, "a.json", 64, true);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("replacement-content", got);
+}
+
+test "ACME state: a targeted short-write fault truncates only the named file" {
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try StateDir.open(tmp.path);
+    defer state.close();
+
+    state.fault_file = "b.json";
+    state.fault = .short_write;
+    try state.writeFileAtomic("a.json", "unaffected-content", 0o600);
+    try testing.expectError(error.InjectedFault, state.writeFileAtomic("b.json", "truncated-content", 0o600));
+    state.fault_file = null;
+
+    const a = try state.readFileAlloc(testing.allocator, "a.json", 64, true);
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("unaffected-content", a);
+    // The failed write never commits a truncated file: the atomic procedure
+    // discards the half-written temp file along with the error.
+    try testing.expectError(error.NotFound, state.readFileAlloc(testing.allocator, "b.json", 64, true));
 }
 
 test "ACME state: stale temp files from a crashed writer are removed at open" {

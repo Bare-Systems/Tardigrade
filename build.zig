@@ -1002,6 +1002,13 @@ pub fn build(b: *std.Build) void {
     // The appliance credential loader (#392) reuses the PKI PEM/X.509
     // machinery; pki does not import tls_core, so this stays acyclic.
     tls_core_mod.addImport("pki", pki_mod);
+    // `acme/activate.zig` (#879) reuses `pki.pem`/`pki.x509`/`pki.verify`/
+    // `pki.identity`/`pki.path_validator` the same way `appliance_credentials`
+    // does; it is reachable from both the exe graph (via `http.zig`) and the
+    // dedicated ACME test graph, so both need the module wired directly.
+    exe_mod.addImport("pki", pki_mod);
+    exe_test_mod.addImport("pki", pki_mod);
+    allocation_regression_mod.addImport("pki", pki_mod);
     // #634: `sni_provider.zig`'s default-identity SAN eligibility check
     // (`defaultIdentitySatisfiesSni`) reuses `pki.x509`/`pki.identity`.
     // `session_cache*_mod` build `session_cache.zig`/

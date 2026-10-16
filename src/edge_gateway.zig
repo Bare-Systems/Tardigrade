@@ -6530,15 +6530,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             const now_s: i64 = @intCast(@divFloor(compat.nanoTimestamp(), std.time.ns_per_s));
             if (state.acme_challenge_store.?.getCopy(allocator, now_s, managed_host, token)) |key_auth| {
                 defer allocator.free(key_auth);
-                var acme_response = http.Response.init(allocator);
-                defer acme_response.deinit();
-                _ = acme_response.setStatus(.ok)
-                    .setBody(key_auth)
-                    .setHeader("Content-Type", "application/octet-stream")
-                    .setConnection(keep_alive);
-                try acme_response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+                try ghandlers.writeAcmeChallengeResponse(allocator, writer, state, key_auth, keep_alive);
                 // ACME HTTP-01 challenges are ordinary requests; keep them visible in
                 // access logs and status metrics like every other terminal (#201).
+                // The token itself never reaches the log line (#877 review):
+                // `logAccessForRequest` redacts this route's path centrally.
                 state.metricsRecord(200);
                 ghandlers.logAccessForRequest(state, &ctx, &request, 200);
                 return;
@@ -13408,4 +13404,20 @@ test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
     try std.testing.expectEqual(@as(u8, 0x3), written[3]);
     const rst_stream_id: u32 = std.mem.readInt(u32, written[5..9], .big) & 0x7fff_ffff;
     try std.testing.expectEqual(@as(u32, 1), rst_stream_id);
+}
+
+test "an actual parsed request with a bracketed Host never reaches the ACME challenge lookup (#877 review)" {
+    // `Request.parseAuthority` accepts any nonempty bracket content as a
+    // host without validating it is actually an IP literal, so a real
+    // request's Host header can carry `[a.example.com]` through header
+    // parsing unchanged. `matchManagedHost` -- the gateway's actual
+    // host-scoping gate at this route -- must be the one that rejects it.
+    const allocator = std.testing.allocator;
+    const raw = "GET /.well-known/acme-challenge/tok HTTP/1.1\r\nHost: [a.example.com]\r\n\r\n";
+    const parsed = try http.Request.parse(allocator, raw, MAX_REQUEST_SIZE);
+    var request = parsed.request;
+    defer request.deinit();
+
+    const managed = [_][]const u8{"a.example.com"};
+    try std.testing.expect(http.acme_client.matchManagedHost(&managed, request.host()) == null);
 }

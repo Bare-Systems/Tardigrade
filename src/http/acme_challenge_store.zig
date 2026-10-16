@@ -22,6 +22,7 @@ const std = @import("std");
 const compat = @import("zig_compat");
 const crypto = @import("crypto");
 const secrets = crypto.secrets;
+const dns_name = @import("tls_core").dns_name;
 
 /// Store-wide caps (design §9.1).
 pub const max_entries: usize = 128;
@@ -38,6 +39,9 @@ pub const PutError = error{
     InvalidHost,
     InvalidToken,
     InvalidKeyAuthorization,
+    /// `expires_at` (after the ten-minute cap is applied) is at or before
+    /// `now`: there is no live window left to admit, so nothing is retained.
+    InvalidExpiry,
     StoreFull,
 };
 
@@ -118,11 +122,19 @@ pub const ChallengeStore = struct {
         key_authorization: []const u8,
         expires_at: i64,
     ) PutError!void {
-        if (host.len == 0 or host.len > max_host_len) return error.InvalidHost;
+        if (!isValidManagedHost(host)) return error.InvalidHost;
         if (!isValidToken(token)) return error.InvalidToken;
         if (key_authorization.len == 0 or key_authorization.len > max_key_authorization_len) {
             return error.InvalidKeyAuthorization;
         }
+
+        // Ten minutes or the CA's own (shorter) authorization deadline,
+        // whichever ends first (design §8.2/§9.1) -- applied once here so
+        // neither admission path can retain material past the policy
+        // window, however large a deadline a caller passes.
+        const ttl_end = std.math.add(i64, now, default_ttl_s) catch std.math.maxInt(i64);
+        const effective_expiry = @min(expires_at, ttl_end);
+        if (effective_expiry <= now) return error.InvalidExpiry;
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -132,7 +144,7 @@ pub const ChallengeStore = struct {
             const owned_value = try self.allocator.dupe(u8, key_authorization);
             secrets.secureZeroAndFree(self.allocator, self.slots.items[i].value);
             self.slots.items[i].value = owned_value;
-            self.slots.items[i].expires_at = expires_at;
+            self.slots.items[i].expires_at = effective_expiry;
             return;
         }
 
@@ -148,7 +160,7 @@ pub const ChallengeStore = struct {
             .host = owned_host,
             .token = owned_token,
             .value = owned_value,
-            .expires_at = expires_at,
+            .expires_at = effective_expiry,
         });
     }
 
@@ -174,6 +186,33 @@ pub const ChallengeStore = struct {
         var removed = self.slots.swapRemove(i);
         self.freeSlot(&removed);
         return .closed;
+    }
+
+    /// Store-key gate for `host`: a single, already-canonical-lowercase DNS
+    /// name, the same shape `acme/names.zig` requires for a managed
+    /// hostname (#877). `dns_name.validateHostName` alone already rejects
+    /// userinfo, ports, wildcards, and brackets -- none of those characters
+    /// are valid DNS label bytes -- so this only adds the canonical-case and
+    /// non-IP-literal checks `matchManagedHost`'s configured `managed_hosts`
+    /// set doesn't need (it is validated once at config time instead).
+    /// Rejecting rather than normalizing here keeps `findIndex`'s
+    /// case-sensitive comparison safe: two spellings of the same host can
+    /// never both be admitted into separate slots.
+    fn isValidManagedHost(host: []const u8) bool {
+        dns_name.validateHostName(host) catch return false;
+        for (host) |c| if (c >= 'A' and c <= 'Z') return false;
+        if (isAllDigitLabels(host)) return false;
+        return true;
+    }
+
+    /// Every label purely numeric: covers dotted-quad IPv4 literals, which
+    /// are not valid ACME managed-hostname identifiers.
+    fn isAllDigitLabels(host: []const u8) bool {
+        var it = std.mem.splitScalar(u8, host, '.');
+        while (it.next()) |label| {
+            for (label) |c| if (c < '0' or c > '9') return false;
+        }
+        return true;
     }
 
     /// Token charset/length gate: `^[A-Za-z0-9_-]{16,128}$` (design §6.3,
@@ -204,8 +243,18 @@ pub fn matchManagedHost(managed_hosts: []const []const u8, raw_host: ?[]const u8
     const host = raw_host orelse return null;
     const trimmed = std.mem.trim(u8, host, " \t\r\n");
     if (trimmed.len == 0) return null;
-    if (std.mem.indexOfScalar(u8, trimmed, '@') != null) return null;
-    const without_port = stripPort(trimmed);
+    // `[]@/\?#` and raw control bytes are rejected outright rather than
+    // parsed: brackets are an IPv6-literal marker, never valid around a DNS
+    // name, and this matcher is DNS-names-only (`acme/names.zig` forbids IP
+    // literals for managed hosts), so a bracketed authority is malformed
+    // input, not a literal to unwrap. `Request.parseAuthority` (a general
+    // HTTP authority parser) accepts bracket content it never validates as
+    // an IP literal, so this check -- not that parser -- is this matcher's
+    // only defense against a bracketed DNS name.
+    for (trimmed) |c| {
+        if (c < 0x20 or std.mem.indexOfScalar(u8, "[]@/\\?#", c) != null) return null;
+    }
+    const without_port = stripPort(trimmed) orelse return null;
     if (without_port.len == 0) return null;
     for (managed_hosts) |candidate| {
         if (std.ascii.eqlIgnoreCase(candidate, without_port)) return candidate;
@@ -213,19 +262,22 @@ pub fn matchManagedHost(managed_hosts: []const []const u8, raw_host: ?[]const u8
     return null;
 }
 
-/// Strips an optional `:port` suffix from a Host/authority value, honoring
-/// `[...]` IPv6 literals. Deliberately re-implemented rather than imported
-/// from `edge_config.stripHostPort` so this file keeps its original #379
+/// Strips an optional `:port` suffix from an already-bracket/control-byte-free
+/// Host/authority value. At most one colon is permitted, and the port (if
+/// present) must be a nonempty run of digits that fits in a `u16`; anything
+/// else is a malformed authority, not a value to pass through unstripped.
+/// Deliberately re-implemented rather than imported from
+/// `edge_config.stripHostPort` so this file keeps its original #379
 /// zero-dependency property (no `edge_config`/`http` import graph), which is
 /// what lets it be reached from both the OpenSSL and no-OpenSSL profiles.
-fn stripPort(host: []const u8) []const u8 {
-    if (host[0] == '[') {
-        const end = std.mem.findScalar(u8, host, ']') orelse return host;
-        return host[1..end];
-    }
-    const colon = std.mem.findScalarLast(u8, host, ':') orelse return host;
+fn stripPort(host: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, host, ':') orelse return host;
+    if (std.mem.indexOfScalar(u8, host[colon + 1 ..], ':') != null) return null;
     const head = host[0..colon];
-    if (std.mem.findScalar(u8, head, ':') != null) return host;
+    const port = host[colon + 1 ..];
+    if (port.len == 0) return null;
+    for (port) |c| if (c < '0' or c > '9') return null;
+    _ = std.fmt.parseInt(u16, port, 10) catch return null;
     return head;
 }
 
@@ -305,6 +357,93 @@ test "ChallengeStore rejects invalid token and oversize key authorization before
     try testing.expectEqual(@as(usize, 0), store.slots.items.len);
 }
 
+test "ChallengeStore put rejects a non-canonical or malformed host before allocating anything (#877 review)" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var store = ChallengeStore.init(failing.allocator());
+    defer store.deinit();
+
+    // Userinfo, mixed case, wildcard, port, IPv4 literal, and a bracketed
+    // name are all rejected -- none of them is the canonical managed-DNS
+    // key `matchManagedHost` would hand this API.
+    try testing.expectError(error.InvalidHost, store.put(0, "user@a.example.com", "abcdefghijklmnop", "value", 600));
+    try testing.expectError(error.InvalidHost, store.put(0, "A.Example.Com", "abcdefghijklmnop", "value", 600));
+    try testing.expectError(error.InvalidHost, store.put(0, "*.example.com", "abcdefghijklmnop", "value", 600));
+    try testing.expectError(error.InvalidHost, store.put(0, "a.example.com:443", "abcdefghijklmnop", "value", 600));
+    try testing.expectError(error.InvalidHost, store.put(0, "192.168.1.1", "abcdefghijklmnop", "value", 600));
+    try testing.expectError(error.InvalidHost, store.put(0, "[a.example.com]", "abcdefghijklmnop", "value", 600));
+
+    // `fail_index = 0` means the very first allocation attempt fails, so
+    // these rejections happening without error.OutOfMemory proves they were
+    // caught before any allocation was attempted.
+    try testing.expectEqual(@as(usize, 0), store.slots.items.len);
+}
+
+test "ChallengeStore never admits two case spellings of the same host into separate slots (#877 review)" {
+    var store = ChallengeStore.init(testing.allocator);
+    defer store.deinit();
+
+    try store.put(0, "a.example.com", "abcdefghijklmnop", "value", 600);
+    // A non-canonical spelling of the same name is rejected outright, not
+    // normalized into (and so never collides with) the existing slot.
+    try testing.expectError(error.InvalidHost, store.put(0, "A.Example.Com", "abcdefghijklmnop", "other-value", 600));
+    try testing.expectEqual(@as(usize, 1), store.slots.items.len);
+    try testing.expect(store.getCopy(testing.allocator, 0, "A.Example.Com", "abcdefghijklmnop") == null);
+}
+
+test "ChallengeStore put caps a CA deadline far beyond the default ten-minute window (#877 review)" {
+    var store = ChallengeStore.init(testing.allocator);
+    defer store.deinit();
+
+    try store.put(0, "a.example.com", "abcdefghijklmnop", "value", 86400);
+
+    const still_live = store.getCopy(testing.allocator, default_ttl_s - 1, "a.example.com", "abcdefghijklmnop").?;
+    testing.allocator.free(still_live);
+    // At and beyond the ten-minute boundary the entry is gone, regardless of
+    // the far-future deadline the caller originally asked for.
+    try testing.expect(store.getCopy(testing.allocator, default_ttl_s, "a.example.com", "abcdefghijklmnop") == null);
+    try testing.expect(store.getCopy(testing.allocator, default_ttl_s + 1, "a.example.com", "abcdefghijklmnop") == null);
+}
+
+test "ChallengeStore put honors a CA deadline shorter than the default window (#877 review)" {
+    var store = ChallengeStore.init(testing.allocator);
+    defer store.deinit();
+
+    try store.put(0, "a.example.com", "abcdefghijklmnop", "value", 120);
+
+    const still_live = store.getCopy(testing.allocator, 119, "a.example.com", "abcdefghijklmnop").?;
+    testing.allocator.free(still_live);
+    try testing.expect(store.getCopy(testing.allocator, 120, "a.example.com", "abcdefghijklmnop") == null);
+}
+
+test "ChallengeStore duplicate replacement re-applies the ten-minute cap against the new now (#877 review)" {
+    var store = ChallengeStore.init(testing.allocator);
+    defer store.deinit();
+
+    // First insertion: still live when the replacement below runs, so the
+    // second `put` genuinely replaces it in place rather than re-inserting
+    // into an already-expired slot.
+    try store.put(0, "a.example.com", "abcdefghijklmnop", "first", 86400);
+    // Replacing at a later `now` re-derives the cap from that `now`, not
+    // from the original insertion time or the first deadline.
+    try store.put(50, "a.example.com", "abcdefghijklmnop", "second", 86400);
+
+    try testing.expectEqual(@as(usize, 1), store.slots.items.len);
+    const still_live = store.getCopy(testing.allocator, 50 + default_ttl_s - 1, "a.example.com", "abcdefghijklmnop").?;
+    defer testing.allocator.free(still_live);
+    try testing.expectEqualStrings("second", still_live);
+    try testing.expect(store.getCopy(testing.allocator, 50 + default_ttl_s, "a.example.com", "abcdefghijklmnop") == null);
+}
+
+test "ChallengeStore put rejects a deadline at or before now without retaining bytes (#877 review)" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var store = ChallengeStore.init(failing.allocator());
+    defer store.deinit();
+
+    try testing.expectError(error.InvalidExpiry, store.put(100, "a.example.com", "abcdefghijklmnop", "value", 100));
+    try testing.expectError(error.InvalidExpiry, store.put(100, "a.example.com", "abcdefghijklmnop", "value", 50));
+    try testing.expectEqual(@as(usize, 0), store.slots.items.len);
+}
+
 test "ChallengeStore caps at 128 entries and never evicts a live challenge for a new one" {
     var store = ChallengeStore.init(testing.allocator);
     defer store.deinit();
@@ -371,4 +510,27 @@ test "matchManagedHost scopes by exact managed hostname and rejects userinfo/def
     try testing.expect(matchManagedHost(&managed, "") == null);
     try testing.expect(matchManagedHost(&managed, null) == null);
     try testing.expect(matchManagedHost(&managed, "sub.a.example.com") == null);
+}
+
+test "matchManagedHost rejects malformed authorities rather than unbracketing or truncating them (#877 review)" {
+    const managed = [_][]const u8{"a.example.com"};
+
+    // Brackets are an IPv6-literal marker; this matcher is DNS-names-only,
+    // so a bracketed DNS name is rejected outright, never unwrapped.
+    try testing.expect(matchManagedHost(&managed, "[a.example.com]") == null);
+    try testing.expect(matchManagedHost(&managed, "[a.example.com]garbage") == null);
+    // A non-numeric or out-of-range port, a dangling colon, and a second
+    // colon are all malformed rather than a value to pass through.
+    try testing.expect(matchManagedHost(&managed, "a.example.com:garbage") == null);
+    try testing.expect(matchManagedHost(&managed, "a.example.com:") == null);
+    try testing.expect(matchManagedHost(&managed, "a.example.com:1:2") == null);
+    try testing.expect(matchManagedHost(&managed, "a.example.com:99999") == null);
+
+    // `Request.parseAuthority` (`http/request.zig`, a general HTTP
+    // authority parser this file deliberately does not import -- see the
+    // module doc comment) accepts any nonempty bracket content as a host
+    // without validating it is actually an IP literal, so a parsed
+    // request's Host header can still carry this shape at the production
+    // boundary. `edge_gateway.zig`'s own test suite covers that boundary
+    // with an actual parsed request, since it already imports both sides.
 }

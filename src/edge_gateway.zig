@@ -4608,8 +4608,14 @@ fn respondHttp2Stream(
     // No executor configured (disabled, or a unit test exercising this
     // function directly): preserve the pre-#866 synchronous behavior exactly.
     var forward_auth_grants: gfa.Grants = .{};
+    // Owned here until transferred to `finalizeHttp2Response` below; released
+    // if `executeHttp2ProxyRoute` itself errors (e.g. OOM mid-hop), so an
+    // earlier hop's already-granted decisions never leak (#814).
+    var grants_owned = true;
+    errdefer if (grants_owned) forward_auth_grants.deinit(allocator);
     var early_data_refused = false;
     const result = try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle, &forward_auth_grants, &early_data_refused);
+    grants_owned = false;
     return finalizeHttp2Response(conn, writer, outbound, allocator, state, stream_id, method, correlation_id, .{ .routed = result }, forward_auth_grants, early_data_refused, ps.transport_early, streams, pending_responses, conn_send_window);
 }
 
@@ -5048,6 +5054,7 @@ fn executeHttp2ProxyRoute(
                 .status_code = @intFromEnum(http.Status.unauthorized),
                 .code = "unauthorized",
                 .message = "Unauthorized",
+                .no_store = true,
             } };
         }
         if (ghandlers.clientCertDenial(matched.block.client_cert, request.headers.client_cert)) |denial| {
@@ -5091,12 +5098,19 @@ fn executeHttp2ProxyRoute(
                 .body = request.body,
                 .asserted_names = client_view.asserted_names.items,
             });
+            // Owned until transferred to the `forward_auth_denied` result or
+            // to `forward_auth_grants` below; released on any error returned
+            // from the fallible preservation/assertion steps in between
+            // (#814).
+            var decision_owned = true;
+            defer if (decision_owned) decision.deinit();
             state.metricsRecordForwardAuth(.h2, decision.outcome);
             if (!decision.allowed()) {
                 if (!decision.relaysAuthResponse()) {
                     state.logger.warn(correlation_id, "forward_auth {s} ({s}) for {s}: failing closed with {d}", .{ @tagName(decision.outcome), decision.cause, matched.block.pattern, decision.status });
                 }
                 forward_auth_grants.clear();
+                decision_owned = false;
                 return .{ .forward_auth_denied = decision };
             }
             if (fa.upstream_headers.len > 0) {
@@ -5107,6 +5121,7 @@ fn executeHttp2ProxyRoute(
             }
             try gfa.applyUpstreamHeaders(&request.headers, fa, &decision);
             try forward_auth_grants.add(allocator, decision);
+            decision_owned = false;
         }
         if (gate_only) {
             // A rewrite back into itself is answered from the server root
@@ -5123,12 +5138,18 @@ fn executeHttp2ProxyRoute(
             else => break,
         };
         ghandlers.applyLocationRewrite(request, rewrite_rule.replacement);
-        if (ga.evaluatePolicy(state, route_cfg, method, request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |reason| {
+        // The rewritten target's policy must judge the caller's own headers,
+        // never a value an earlier hop's forward_auth asserted onto
+        // `request.headers` for the origin (#814): a verifier-minted
+        // `X-Approval-Token` must never satisfy an approval policy for a
+        // client that never presented one.
+        if (ga.evaluatePolicy(state, route_cfg, method, request.uri.path, ctx.identity, ctx.device_id, client_view.headers(request))) |reason| {
             forward_auth_grants.clear();
             return .{ .local_rejection = .{
                 .status_code = @intFromEnum(http.Status.forbidden),
                 .code = "forbidden",
                 .message = reason,
+                .no_store = true,
             } };
         }
         const next = http.location_router.matchLocation(allocator, request.uri.path, route_cfg.location_blocks) orelse {
@@ -5150,6 +5171,7 @@ fn executeHttp2ProxyRoute(
                 .status_code = @intFromEnum(http.Status.loop_detected),
                 .code = "rewrite_loop",
                 .message = "Rewrite limit exceeded",
+                .no_store = true,
             } };
         }
         hops += 1;
@@ -8921,12 +8943,18 @@ const H2ForwardAuthHarness = struct {
 
     fn addStream(self: *H2ForwardAuthHarness, id: u31, method: []const u8, path: []const u8, transport_early: bool) !void {
         var ps = Http2PendingStream.init(self.allocator);
+        // Owned here until the final `pending.put` below; every fallible step
+        // before it must leave `ps` ours to free on error, not already
+        // (partially) published into a map another caller's cleanup expects
+        // to own.
+        errdefer ps.deinit(self.allocator);
         ps.method = try self.allocator.dupe(u8, method);
         ps.path = try self.allocator.dupe(u8, path);
         ps.transport_early = transport_early;
-        try self.pending.put(id, ps);
         try self.streams.put(id, http.http2_stream.Stream.init(id, 65_535));
+        errdefer _ = self.streams.remove(id);
         try self.ready.append(id);
+        try self.pending.put(id, ps);
     }
 
     fn dispatch(self: *H2ForwardAuthHarness, cfg: *const edge_config.EdgeConfig) !void {
@@ -9406,6 +9434,136 @@ test "H2 forward_auth grants carry across rewrites and are dropped by a later de
     try std.testing.expect(std.mem.find(u8, denied, "403") != null);
     try std.testing.expect(std.mem.find(u8, denied, "refreshed") == null);
     try std.testing.expectEqual(@as(usize, 3), auth_server.requestCount());
+}
+
+/// Free an `H2ForwardAuthHarness`'s approvals test table, owned keys and all,
+/// without calling `ApprovalEntry.deinit` (private to `gateway_state.zig`).
+fn deinitH2ApprovalsTestMap(approvals: *std.StringHashMap(gs.ApprovalEntry), allocator: std.mem.Allocator) void {
+    var it = approvals.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.method);
+        allocator.free(entry.value_ptr.path);
+        allocator.free(entry.value_ptr.identity);
+        allocator.free(entry.value_ptr.command_id);
+        allocator.free(entry.value_ptr.decided_by);
+    }
+    approvals.deinit();
+}
+
+test "H2 rewritten-path approval policy rejects a forward_auth-asserted token the client never presented (#814)" {
+    const allocator = std.testing.allocator;
+
+    var h: H2ForwardAuthHarness = undefined;
+    h.init(allocator);
+    defer h.deinit();
+    h.conn.handshake_complete = true;
+    h.state.allocator = allocator;
+    h.state.approval_mutex = .{};
+    h.state.approval_persist_mutex = .{};
+    h.state.approvals = std.StringHashMap(gs.ApprovalEntry).init(allocator);
+    h.state.approval_store_path = "";
+    h.state.approval_escalation_webhook = "";
+    h.state.approval_ttl_ms = 60_000;
+    h.state.approval_max_pending_per_identity = 0;
+    defer deinitH2ApprovalsTestMap(&h.state.approvals, allocator);
+
+    // A real, approved token for GET /guarded that the client never presented
+    // -- only a (hypothetically compromised, or merely misconfigured)
+    // forward_auth service at an earlier hop asserts it.
+    const minted = try h.state.approvalCreate(allocator, "GET", "/guarded", "", null);
+    defer allocator.free(minted.token);
+    try std.testing.expect(h.state.approvalRespond(minted.token, .approve, "reviewer"));
+
+    const service_response = try std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\nX-Approval-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        .{minted.token},
+    );
+    defer allocator.free(service_response);
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{service_response});
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/old",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/guarded", .flag = .last } },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .upstream_headers = &.{"X-Approval-Token"} },
+        },
+        .{ .match_type = .exact, .pattern = "/guarded", .priority = 1, .action = .{ .return_response = .{ .status = 200, .body = "guarded-secret" } } },
+    };
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+    cfg.policy_approval_routes_raw = "GET|^/guarded$";
+
+    try h.addStream(1, "GET", "/old", false);
+    try h.dispatch(&cfg);
+
+    const written = h.conn.out.written();
+    try std.testing.expect(std.mem.find(u8, written, "403") != null);
+    try std.testing.expect(std.mem.find(u8, written, "Approval required") != null);
+    try std.testing.expect(std.mem.find(u8, written, "guarded-secret") == null);
+    try std.testing.expect(std.mem.find(u8, written, "no-store") != null);
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+}
+
+test "H2 rewritten-path approval policy honors the client's own token despite a differing forward_auth assertion (#814)" {
+    const allocator = std.testing.allocator;
+
+    var h: H2ForwardAuthHarness = undefined;
+    h.init(allocator);
+    defer h.deinit();
+    h.conn.handshake_complete = true;
+    h.state.allocator = allocator;
+    h.state.approval_mutex = .{};
+    h.state.approval_persist_mutex = .{};
+    h.state.approvals = std.StringHashMap(gs.ApprovalEntry).init(allocator);
+    h.state.approval_store_path = "";
+    h.state.approval_escalation_webhook = "";
+    h.state.approval_ttl_ms = 60_000;
+    h.state.approval_max_pending_per_identity = 0;
+    defer deinitH2ApprovalsTestMap(&h.state.approvals, allocator);
+
+    const minted = try h.state.approvalCreate(allocator, "GET", "/guarded", "", null);
+    defer allocator.free(minted.token);
+    try std.testing.expect(h.state.approvalRespond(minted.token, .approve, "reviewer"));
+
+    // Hop A allows the client but asserts an unrelated token for the origin;
+    // that assertion must never replace the client's own credential for the
+    // rewritten target's approval check.
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nX-Approval-Token: not-a-real-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/old",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/guarded", .flag = .last } },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .upstream_headers = &.{"X-Approval-Token"} },
+        },
+        .{ .match_type = .exact, .pattern = "/guarded", .priority = 1, .action = .{ .return_response = .{ .status = 200, .body = "guarded-secret" } } },
+    };
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+    cfg.policy_approval_routes_raw = "GET|^/guarded$";
+
+    try h.addStream(1, "GET", "/old", false);
+    try h.pending.getPtr(1).?.headers.append("X-Approval-Token", minted.token);
+    try h.dispatch(&cfg);
+
+    const written = h.conn.out.written();
+    try std.testing.expect(std.mem.find(u8, written, "200") != null);
+    try std.testing.expect(std.mem.find(u8, written, "guarded-secret") != null);
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
 }
 
 test "H2 ordinary stream dispatch remains unchanged" {

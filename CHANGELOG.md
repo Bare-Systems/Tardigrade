@@ -192,6 +192,22 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Security
 
+- **Native H2 rewrite targets are gated by the client's own credentials, never
+  a prior hop's `forward_auth`-asserted header (#814).** Follow-up to #885:
+  the bounded H2 rewrite loop's path-policy check (`auth_approval_routes`)
+  evaluated the *mutated* request headers after `forward_auth_upstream_headers`
+  had replaced a header for the origin, so a verifier-asserted
+  `X-Approval-Token` (or any other asserted header an approval policy reads)
+  could satisfy a rewritten location's approval requirement for a client that
+  never presented one, and could just as easily deny a legitimate client whose
+  own credential an earlier hop's assertion happened to overwrite. The check
+  now always sees the client's original headers, matching the existing
+  verifier/origin header separation. Rewritten `auth required`, rewritten-path
+  policy and rewrite-budget refusals are also now explicitly `no-store`, and a
+  `forward_auth` `Decision` is released on any error raised while recording it
+  (preserving headers, applying upstream assertions, or adding it to the
+  per-request grant set), instead of only on the ordinary deny/add paths.
+
 - **Every production secret wipe now uses the canonical zeroization helper,
   and the crypto-boundary audit enforces it (#784).** About 100 remaining
   wipes in the pure-Zig crypto provider and the TLS 1.3 backend

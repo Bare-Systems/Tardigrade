@@ -5313,6 +5313,76 @@ test "interop.h2.forward_auth_denial_and_allow" {
     try std.testing.expectEqual(@as(u32, 4), auth.requestCount());
 }
 
+// #814: native H2 previously had no `rewrite` support at all (`else => return
+// null` in `executeHttp2ProxyRoute`), so this location layout would 404 on
+// H2 while H1/H3 already enforced the gate. Mirrors "forward_auth cannot be
+// bypassed by rewriting into a protected location".
+test "interop.h2.rewrite_cannot_bypass_forward_auth_on_a_protected_location" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var auth = try UpstreamServer.start(allocator, &.{.{ .status_code = 403, .body = "h2-rewrite-denied" }});
+    defer auth.stop();
+    try auth.run();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).makePath("admin");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "admin/secret.txt", .data = "h2-top-secret-file" });
+    const site_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(site_root);
+
+    // The protected file is also reachable from the server-level root, so a
+    // rewrite that skipped the /admin/ location's gate would serve it.
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\root {s};
+        \\
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /go {{
+        \\    rewrite ^ /admin/secret.txt last;
+        \\}}
+        \\
+        \\location /admin/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    root {s};
+        \\}}
+    , .{ site_root, test_host, auth.port(), site_root });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+    try auth.resetCapture();
+
+    const headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/go" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const body = try pureZigH2GetBody(allocator, tardigrade.port, headers[0..]);
+    defer allocator.free(body);
+    try assertContains(body, "h2-rewrite-denied");
+    try std.testing.expect(std.mem.find(u8, body, "h2-top-secret-file") == null);
+    try std.testing.expectEqual(@as(u32, 1), auth.requestCount());
+    try std.testing.expectEqualStrings("/admin/secret.txt", auth.capturedHeader("X-Forwarded-Uri").?);
+}
+
 test "interop.h2.forward_auth_responses_are_not_shared_cacheable" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;

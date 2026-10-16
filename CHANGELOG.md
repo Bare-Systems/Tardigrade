@@ -19,6 +19,18 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **Native H2 `rewrite` support with `forward_auth` parity (#814).** The
+  native HTTP/2 route path now runs a bounded effective-route loop for
+  location `rewrite` actions, matching H1/H3: every location reached through
+  a rewrite enforces its own `auth required`, `forward_auth` and path policy
+  against the rewritten target, a self-rewrite falls back to the server root
+  only after re-gating, a `?query` in the replacement replaces the request
+  query, and chains longer than 4 locations fail closed with 508. Verifiers
+  judge the client's original credentials, never an earlier hop's
+  auth-asserted replacement, and forward_auth grants accumulate across hops
+  but are dropped by any later denial. Previously an H2 `rewrite` location
+  fell through to `else => return null` and answered with the default 404.
+
 - **Finite HTTP/2 request execution off the connection frame loop (#866).**
   Downstream H2 route/auth/proxy/static handling now runs on a bounded,
   shared worker pool (`TARDIGRADE_H2_REQUEST_WORKER_THREADS`,

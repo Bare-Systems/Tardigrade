@@ -124,11 +124,6 @@ an access decision cacheable.
 
 ## Notes
 
-- HTTP/2 does not run `rewrite` actions for forward_auth locations yet: such a
-  request gets 404 (it fails closed, it is never served unauthorized). Use
-  `proxy_pass`, `return` or `root`/`alias` locations if HTTP/2 clients must
-  behave the same as HTTP/1.1 and HTTP/3. Tracked in
-  [#814](https://github.com/Bare-Systems/Tardigrade/issues/814).
 - A `rewrite` that leads into a protected location is authorized against the
   rewritten target before anything is served, and asserted headers from an
   earlier hop stay in place for the origin; a rewrite never reaches

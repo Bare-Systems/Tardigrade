@@ -856,7 +856,9 @@ pub fn routeRequest(
 
 /// Point `request` at a location rewrite's replacement. A `?query` in the
 /// replacement replaces the original query; otherwise the original is kept.
-fn applyLocationRewrite(request: *http.Request, replacement: []const u8) void {
+/// Shared by H1 and H2 (#814): both route a single owned `http.Request`
+/// through their rewrite hops, unlike H3's separate path/query state.
+pub fn applyLocationRewrite(request: *http.Request, replacement: []const u8) void {
     if (std.mem.findScalar(u8, replacement, '?')) |idx| {
         request.uri.path = replacement[0..idx];
         request.uri.query = if (idx + 1 < replacement.len) replacement[idx + 1 ..] else null;
@@ -939,22 +941,23 @@ fn enforceLocationAuth(
     return auth_status_code;
 }
 
-/// What verifiers see of an HTTP/1.1 request across rewrite hops (#761).
-/// `forward_auth` rewrites `request.headers` in place with auth-asserted
-/// values meant for the origin; later verifiers (another `forward_auth`, or
-/// built-in `auth required`) must still judge the caller's own credentials,
-/// never a token an earlier auth service minted. `snapshot` holds the
-/// client's headers from before the first assertion, and `asserted_names`
-/// every name asserted so far, whose client copies are forged.
-const H1ClientAuthView = struct {
+/// What verifiers see of a request across rewrite hops (#761). `forward_auth`
+/// rewrites `request.headers` in place with auth-asserted values meant for
+/// the origin; later verifiers (another `forward_auth`, or built-in `auth
+/// required`) must still judge the caller's own credentials, never a token an
+/// earlier auth service minted. `snapshot` holds the client's headers from
+/// before the first assertion, and `asserted_names` every name asserted so
+/// far, whose client copies are forged. Shared by H1 and H2 (#814): both
+/// route a single owned `http.Request` through their rewrite hops.
+pub const H1ClientAuthView = struct {
     snapshot: ?http.Headers = null,
     asserted_names: std.ArrayList([]const u8) = .empty,
 
-    fn headers(self: *const H1ClientAuthView, request: *const http.Request) *const http.Headers {
+    pub fn headers(self: *const H1ClientAuthView, request: *const http.Request) *const http.Headers {
         return if (self.snapshot) |*snapshot| snapshot else &request.headers;
     }
 
-    fn preserve(self: *H1ClientAuthView, allocator: std.mem.Allocator, request: *const http.Request) !void {
+    pub fn preserve(self: *H1ClientAuthView, allocator: std.mem.Allocator, request: *const http.Request) !void {
         if (self.snapshot != null) return;
         var copy = http.Headers.init(allocator);
         errdefer copy.deinit();
@@ -965,7 +968,7 @@ const H1ClientAuthView = struct {
         self.snapshot = copy;
     }
 
-    fn deinit(self: *H1ClientAuthView, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *H1ClientAuthView, allocator: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit();
         self.asserted_names.deinit(allocator);
     }

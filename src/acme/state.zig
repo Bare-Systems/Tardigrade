@@ -73,6 +73,11 @@ pub const StateDir = struct {
     lock_fd: zig_compat.Fd,
     /// Test-only one-shot fault; ignored (and compiled out) outside tests.
     fault: Fault = .none,
+    /// Test-only: restrict `fault` to the named file (write target, or a
+    /// caller-supplied label for a non-write step such as a commit rename
+    /// or a post-rename fsync). `null` matches any file, preserving the
+    /// original "fires on the first occurrence of this step" behavior.
+    fault_file: ?[]const u8 = null,
 
     /// Open (creating with `0700` when absent) and lock `path`. The path's
     /// final component must be a real directory, not a symlink; its parent
@@ -135,7 +140,7 @@ pub const StateDir = struct {
     /// bounded payload limit. Certificate chains have a larger documented
     /// budget than account and metadata state.
     pub fn writeFileAtomicLimit(self: *StateDir, name: []const u8, data: []const u8, mode: u32, max_len: usize) Error!void {
-        return writeFileAtomicRaw(self.dir_fd, &self.fault, name, data, mode, max_len);
+        return writeFileAtomicRaw(self.dir_fd, &self.fault, &self.fault_file, name, data, mode, max_len);
     }
 
     /// Read `name` (bounded). With `private`, any group/other permission bit
@@ -157,13 +162,13 @@ pub const StateDir = struct {
     /// inside it. Used to build the nested `groups/<id>/generations/<gen>/`
     /// layout (#879, design §9.2) one validated level at a time.
     pub fn openOrCreateSubdir(self: *StateDir, name: []const u8) Error!SubDir {
-        return openSubdirRaw(self.dir_fd, &self.fault, name, true);
+        return openSubdirRaw(self.dir_fd, &self.fault, &self.fault_file, name, true);
     }
 
     /// Open an existing subdirectory with the same invariants as
     /// `openOrCreateSubdir`, without creating it. `error.NotFound` if absent.
     pub fn openSubdirStrict(self: *StateDir, name: []const u8) Error!SubDir {
-        return openSubdirRaw(self.dir_fd, &self.fault, name, false);
+        return openSubdirRaw(self.dir_fd, &self.fault, &self.fault_file, name, false);
     }
 
     /// Remove `.<name>.tmp-*` leftovers from a crashed writer. We hold the
@@ -176,12 +181,13 @@ pub const StateDir = struct {
 
 /// A validated, single-component subdirectory opened relative to a parent
 /// directory descriptor (`StateDir.dir_fd` or another `SubDir`). Shares the
-/// parent `StateDir`'s one-shot fault cell so tests can inject a failure at
-/// any step of a nested write, and the same atomic-write/strict-read
-/// procedure as the top-level directory (#879).
+/// parent `StateDir`'s one-shot fault cell (and optional file filter) so
+/// tests can inject a failure at any step of a nested write, and the same
+/// atomic-write/strict-read procedure as the top-level directory (#879).
 pub const SubDir = struct {
     fd: zig_compat.Fd,
     fault: *Fault,
+    fault_file: *const ?[]const u8,
 
     pub fn close(self: *SubDir) void {
         zig_compat.closeFd(self.fd);
@@ -197,7 +203,7 @@ pub const SubDir = struct {
     }
 
     pub fn writeFileAtomicLimit(self: *SubDir, name: []const u8, data: []const u8, mode: u32, max_len: usize) Error!void {
-        return writeFileAtomicRaw(self.fd, self.fault, name, data, mode, max_len);
+        return writeFileAtomicRaw(self.fd, self.fault, self.fault_file, name, data, mode, max_len);
     }
 
     pub fn readFileAlloc(self: *const SubDir, allocator: std.mem.Allocator, name: []const u8, max_len: usize, private: bool) Error![]u8 {
@@ -209,11 +215,19 @@ pub const SubDir = struct {
     }
 
     pub fn openOrCreateSubdir(self: *SubDir, name: []const u8) Error!SubDir {
-        return openSubdirRaw(self.fd, self.fault, name, true);
+        return openSubdirRaw(self.fd, self.fault, self.fault_file, name, true);
     }
 
     pub fn openSubdirStrict(self: *SubDir, name: []const u8) Error!SubDir {
-        return openSubdirRaw(self.fd, self.fault, name, false);
+        return openSubdirRaw(self.fd, self.fault, self.fault_file, name, false);
+    }
+
+    /// Test-only: inject `error.InjectedFault` at a named step that is not
+    /// otherwise reachable from a write (e.g. the `current.tmp -> current`
+    /// commit rename, or the fsync that follows it) when the one-shot
+    /// `fault`/`fault_file` pair matches. A no-op outside tests.
+    pub fn injectTestFault(self: *const SubDir, file: []const u8, point: Fault) Error!void {
+        return hitFault(self.fault, self.fault_file, file, point);
     }
 
     /// Rename `old` to `new` within this directory (the generation-commit
@@ -274,15 +288,21 @@ pub const SubDir = struct {
     }
 };
 
-fn hitFault(fault: *Fault, point: Fault) Error!void {
+/// `file`, when non-null, restricts the match to one write target (or
+/// caller-supplied label); this lets tests pick a specific generation file
+/// and commit step instead of only ever hitting the first write the whole
+/// operation happens to make.
+fn hitFault(fault: *Fault, fault_file: *const ?[]const u8, file: []const u8, point: Fault) Error!void {
     if (!builtin.is_test) return;
-    if (fault.* == point) {
-        fault.* = .none;
-        return error.InjectedFault;
+    if (fault.* != point) return;
+    if (fault_file.*) |target| {
+        if (!std.mem.eql(u8, target, file)) return;
     }
+    fault.* = .none;
+    return error.InjectedFault;
 }
 
-fn writeFileAtomicRaw(dir_fd: zig_compat.Fd, fault: *Fault, name: []const u8, data: []const u8, mode: u32, max_len: usize) Error!void {
+fn writeFileAtomicRaw(dir_fd: zig_compat.Fd, fault: *Fault, fault_file: *const ?[]const u8, name: []const u8, data: []const u8, mode: u32, max_len: usize) Error!void {
     if (!validName(name)) return error.InvalidPath;
     if (data.len > max_len) return error.TooLarge;
 
@@ -291,7 +311,7 @@ fn writeFileAtomicRaw(dir_fd: zig_compat.Fd, fault: *Fault, name: []const u8, da
     var temp_buf: [128]u8 = undefined;
     const temp_name = std.fmt.bufPrint(&temp_buf, ".{s}.tmp-{x}", .{ name, random }) catch return error.InvalidPath;
 
-    try hitFault(fault, .create_temp);
+    try hitFault(fault, fault_file, name, .create_temp);
     const fd = zig_compat.openAtNoFollow(dir_fd, temp_name, .{ .write = true, .create = true, .exclusive = true }, mode) catch return error.IoFailure;
     var fd_open = true;
     var renamed = false;
@@ -302,27 +322,27 @@ fn writeFileAtomicRaw(dir_fd: zig_compat.Fd, fault: *Fault, name: []const u8, da
     // umask may have narrowed the mode, never widened it; make it exact.
     zig_compat.fchmodFd(fd, mode) catch return error.IoFailure;
 
-    try hitFault(fault, .write);
+    try hitFault(fault, fault_file, name, .write);
     const limit = if (fault.* == .short_write) data.len / 2 else data.len;
     zig_compat.writeAllFd(fd, data[0..limit]) catch return error.IoFailure;
-    try hitFault(fault, .short_write);
+    try hitFault(fault, fault_file, name, .short_write);
 
-    try hitFault(fault, .fsync_file);
+    try hitFault(fault, fault_file, name, .fsync_file);
     zig_compat.fsyncFd(fd) catch return error.IoFailure;
     // close() can report deferred write errors; a reported failure must
     // not be committed. The descriptor is consumed either way.
     const close_result = zig_compat.closeFdChecked(fd);
     fd_open = false;
-    try hitFault(fault, .close_file);
+    try hitFault(fault, fault_file, name, .close_file);
     close_result catch return error.IoFailure;
 
-    try hitFault(fault, .rename);
+    try hitFault(fault, fault_file, name, .rename);
     zig_compat.renameAt(dir_fd, temp_name, name) catch return error.IoFailure;
     renamed = true;
 
     // The rename is already visible; a failed directory fsync means we
     // cannot promise it survives a crash, which the caller must know.
-    try hitFault(fault, .fsync_dir);
+    try hitFault(fault, fault_file, name, .fsync_dir);
     zig_compat.fsyncFd(dir_fd) catch return error.IoFailure;
 }
 
@@ -371,7 +391,7 @@ fn readFileAllocRaw(dir_fd: zig_compat.Fd, allocator: std.mem.Allocator, name: [
 /// subdirectory of `parent_fd`: never a symlink, owned by the effective uid,
 /// no group/other permission bits. Shared by `StateDir` and `SubDir` so
 /// every nesting level gets identical defenses.
-fn openSubdirRaw(parent_fd: zig_compat.Fd, fault: *Fault, name: []const u8, create: bool) Error!SubDir {
+fn openSubdirRaw(parent_fd: zig_compat.Fd, fault: *Fault, fault_file: *const ?[]const u8, name: []const u8, create: bool) Error!SubDir {
     if (!validName(name)) return error.InvalidPath;
     const created = if (create) blk: {
         zig_compat.mkdirAt(parent_fd, name, 0o700) catch |err| switch (err) {
@@ -400,11 +420,11 @@ fn openSubdirRaw(parent_fd: zig_compat.Fd, fault: *Fault, name: []const u8, crea
     if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
     if (identity.mode & 0o022 != 0) return error.InsecurePermissions;
     if (created) {
-        try hitFault(fault, .mkdir_fsync_parent);
+        try hitFault(fault, fault_file, name, .mkdir_fsync_parent);
         zig_compat.fsyncFd(parent_fd) catch return error.IoFailure;
     }
     removeStaleTempsRaw(fd);
-    return .{ .fd = fd, .fault = fault };
+    return .{ .fd = fd, .fault = fault, .fault_file = fault_file };
 }
 
 /// Remove `.<name>.tmp-*` leftovers from a crashed writer. Best effort: a

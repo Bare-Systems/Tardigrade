@@ -530,7 +530,7 @@ test "verifyAndPersist leaves the prior committed generation untouched on failed
     try testing.expectEqualStrings(first.generationId(), loaded.generationId());
 }
 
-test "a failure at every persist step keeps the previously committed generation" {
+test "a failure at every persist and commit step keeps the previously committed generation" {
     const allocator = testing.allocator;
     var tmp = try TempState.init();
     defer tmp.deinit();
@@ -545,20 +545,70 @@ test "a failure at every persist step keeps the previously committed generation"
     }
     const first = try activate.verifyAndPersist(allocator, &state, "group-1", &good.key, good.pem, .{ .hostnames = &hosts, .now = base_now });
 
-    const points = [_]state_mod.Fault{ .create_temp, .write, .short_write, .fsync_file, .close_file, .rename, .fsync_dir };
-    for (points) |point| {
+    // Target every write step at every file the persist procedure writes,
+    // not just `leaf.key` (the first write the old untargeted fault always
+    // hit): `chain.pem`, `meta.json`, and the commit marker's own write of
+    // `current.tmp` each get the same create/write/fsync/rename treatment.
+    const write_points = [_]state_mod.Fault{ .create_temp, .write, .short_write, .fsync_file, .close_file, .rename, .fsync_dir };
+    const write_targets = [_][]const u8{ "leaf.key", "chain.pem", "meta.json", "current.tmp" };
+    for (write_targets) |target| {
+        for (write_points) |point| {
+            var replacement = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 120 * day);
+            defer {
+                replacement.key.deinit();
+                allocator.free(replacement.pem);
+            }
+            state.fault_file = target;
+            state.fault = point;
+            try testing.expectError(error.InjectedFault, activate.verifyAndPersist(allocator, &state, "group-1", &replacement.key, replacement.pem, .{ .hostnames = &hosts, .now = base_now }));
+            state.fault_file = null;
+
+            var loaded = (try activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now)).?;
+            defer loaded.deinit(allocator);
+            try testing.expectEqualStrings(first.generationId(), loaded.generationId());
+            try testing.expectEqual(base_now + 90 * day, loaded.meta.notAfter());
+        }
+    }
+
+    // The `current.tmp -> current` commit rename itself: no ordinary
+    // write's own `.rename` fault point ever reaches this, because it is a
+    // second, separate rename performed after `current.tmp`'s own write
+    // (including its internal rename) already succeeded.
+    {
         var replacement = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 120 * day);
         defer {
             replacement.key.deinit();
             allocator.free(replacement.pem);
         }
-        state.fault = point;
+        state.fault_file = "current";
+        state.fault = .rename;
         try testing.expectError(error.InjectedFault, activate.verifyAndPersist(allocator, &state, "group-1", &replacement.key, replacement.pem, .{ .hostnames = &hosts, .now = base_now }));
+        state.fault_file = null;
 
         var loaded = (try activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now)).?;
         defer loaded.deinit(allocator);
         try testing.expectEqualStrings(first.generationId(), loaded.generationId());
         try testing.expectEqual(base_now + 90 * day, loaded.meta.notAfter());
+    }
+
+    // The fsync that follows the commit rename is ambiguous on failure: the
+    // rename already made the new generation visible, so (unlike every
+    // other step above) the correct outcome here is that the new
+    // generation becomes current despite the reported error.
+    {
+        var replacement = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 150 * day);
+        defer {
+            replacement.key.deinit();
+            allocator.free(replacement.pem);
+        }
+        state.fault_file = "current";
+        state.fault = .fsync_dir;
+        try testing.expectError(error.InjectedFault, activate.verifyAndPersist(allocator, &state, "group-1", &replacement.key, replacement.pem, .{ .hostnames = &hosts, .now = base_now }));
+        state.fault_file = null;
+
+        var loaded = (try activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now)).?;
+        defer loaded.deinit(allocator);
+        try testing.expectEqual(base_now + 150 * day, loaded.meta.notAfter());
     }
 }
 
@@ -638,4 +688,220 @@ test "verifyAndPersist refuses a symlinked groups directory" {
         allocator.free(fixture.pem);
     }
     try testing.expectError(error.UnsafeFileType, activate.verifyAndPersist(allocator, &state, "group-1", &fixture.key, fixture.pem, .{ .hostnames = &hosts, .now = base_now }));
+}
+
+test "loadCommitted does not leak the recovered generation on a hard error validating the retained previous" {
+    const allocator = testing.allocator;
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try state_mod.StateDir.open(tmp.path);
+    defer state.close();
+
+    const hosts = [_][]const u8{"a.example.com"};
+    var first_fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 90 * day);
+    defer {
+        first_fixture.key.deinit();
+        allocator.free(first_fixture.pem);
+    }
+    const first = try activate.verifyAndPersist(allocator, &state, "group-1", &first_fixture.key, first_fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    var second_fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 120 * day);
+    defer {
+        second_fixture.key.deinit();
+        allocator.free(second_fixture.pem);
+    }
+    _ = try activate.verifyAndPersist(allocator, &state, "group-1", &second_fixture.key, second_fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    // Make the retained-fallback (first) generation's metadata file insecure
+    // (group/other writable). Validating it during recovery must now be a
+    // hard error, not a soft "fall back further" corruption.
+    var groups = try state.openSubdirStrict("groups");
+    defer groups.close();
+    var group = try groups.openSubdirStrict("group-1");
+    defer group.close();
+    var generations = try group.openSubdirStrict("generations");
+    defer generations.close();
+    var gen_dir = try generations.openSubdirStrict(first.generationId());
+    const meta_fd = try zig_compat.openAtNoFollow(gen_dir.fd, "meta.json", .{ .write = true }, 0);
+    try zig_compat.fchmodFd(meta_fd, 0o666);
+    zig_compat.closeFd(meta_fd);
+    gen_dir.close();
+
+    // `testing.allocator` fails the build on any leak; this call must
+    // return the error without leaking the already-loaded current
+    // generation's leaf key, chain, or metadata.
+    try testing.expectError(error.InsecurePermissions, activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now));
+}
+
+test "loadCommitted does not leak the recovered generation when dropping a dead previous fails to commit" {
+    const allocator = testing.allocator;
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try state_mod.StateDir.open(tmp.path);
+    defer state.close();
+
+    const hosts = [_][]const u8{"a.example.com"};
+    var first_fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 90 * day);
+    defer {
+        first_fixture.key.deinit();
+        allocator.free(first_fixture.pem);
+    }
+    const first = try activate.verifyAndPersist(allocator, &state, "group-1", &first_fixture.key, first_fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    var second_fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 120 * day);
+    defer {
+        second_fixture.key.deinit();
+        allocator.free(second_fixture.pem);
+    }
+    _ = try activate.verifyAndPersist(allocator, &state, "group-1", &second_fixture.key, second_fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    // Soft-corrupt the retained fallback (first) so recovery drops it from
+    // the commit record — the marker rewrite that must then run is exactly
+    // the step the injected fault below targets.
+    var groups = try state.openSubdirStrict("groups");
+    defer groups.close();
+    var group = try groups.openSubdirStrict("group-1");
+    defer group.close();
+    var generations = try group.openSubdirStrict("generations");
+    defer generations.close();
+    var gen_dir = try generations.openSubdirStrict(first.generationId());
+    try gen_dir.writeFileAtomic("leaf.key", "not a key", 0o600);
+    gen_dir.close();
+
+    state.fault_file = "current";
+    state.fault = .fsync_dir;
+    defer state.fault_file = null;
+    try testing.expectError(error.InjectedFault, activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now));
+}
+
+test "loadCommitted rejects insecure permissions on chain.pem and meta.json without falling back" {
+    const allocator = testing.allocator;
+
+    inline for (.{ "chain.pem", "meta.json" }) |insecure_file| {
+        var tmp = try TempState.init();
+        defer tmp.deinit();
+        var state = try state_mod.StateDir.open(tmp.path);
+        defer state.close();
+
+        const hosts = [_][]const u8{"a.example.com"};
+        var fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 90 * day);
+        defer {
+            fixture.key.deinit();
+            allocator.free(fixture.pem);
+        }
+        const first = try activate.verifyAndPersist(allocator, &state, "group-1", &fixture.key, fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+        var groups = try state.openSubdirStrict("groups");
+        defer groups.close();
+        var group = try groups.openSubdirStrict("group-1");
+        defer group.close();
+        var generations = try group.openSubdirStrict("generations");
+        defer generations.close();
+        var gen_dir = try generations.openSubdirStrict(first.generationId());
+        const fd = try zig_compat.openAtNoFollow(gen_dir.fd, insecure_file, .{ .write = true }, 0);
+        try zig_compat.fchmodFd(fd, 0o666);
+        zig_compat.closeFd(fd);
+        gen_dir.close();
+
+        try testing.expectError(error.InsecurePermissions, activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now));
+    }
+}
+
+/// A maximal-length (253-octet) distinct DNS name: three 63-octet labels
+/// followed by a 61-octet label carrying `index` so every name differs.
+fn maxLengthHostname(buf: *[253]u8, index: u8) []const u8 {
+    var offset: usize = 0;
+    for (0..3) |_| {
+        @memset(buf[offset .. offset + 63], 'a');
+        offset += 63;
+        buf[offset] = '.';
+        offset += 1;
+    }
+    const last_label = buf[offset .. offset + 61];
+    last_label[0] = 'n';
+    last_label[1] = '0' + @as(u8, @intCast(index / 10));
+    last_label[2] = '0' + @as(u8, @intCast(index % 10));
+    @memset(last_label[3..], 'z');
+    offset += 61;
+    return buf[0..offset];
+}
+
+test "verifyAndPersist and loadCommitted round-trip a maximum-size 16-name group" {
+    const allocator = testing.allocator;
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try state_mod.StateDir.open(tmp.path);
+    defer state.close();
+
+    var name_bufs: [activate.max_hostnames_per_group][253]u8 = undefined;
+    var hosts: [activate.max_hostnames_per_group][]const u8 = undefined;
+    for (0..activate.max_hostnames_per_group) |i| {
+        hosts[i] = maxLengthHostname(&name_bufs[i], @intCast(i));
+    }
+
+    var fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 90 * day);
+    defer {
+        fixture.key.deinit();
+        allocator.free(fixture.pem);
+    }
+    const persisted = try activate.verifyAndPersist(allocator, &state, "group-1", &fixture.key, fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    var loaded = (try activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now)).?;
+    defer loaded.deinit(allocator);
+    try testing.expectEqualStrings(persisted.generationId(), loaded.generationId());
+    try testing.expectEqual(@as(usize, activate.max_hostnames_per_group), loaded.meta.hostnames().len);
+}
+
+test "pruneGenerations reclaims orphans past the 64-entry directory snapshot" {
+    const allocator = testing.allocator;
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try state_mod.StateDir.open(tmp.path);
+    defer state.close();
+
+    const hosts = [_][]const u8{"a.example.com"};
+    var fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 90 * day);
+    defer {
+        fixture.key.deinit();
+        allocator.free(fixture.pem);
+    }
+    const first = try activate.verifyAndPersist(allocator, &state, "group-1", &fixture.key, fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    {
+        var groups = try state.openSubdirStrict("groups");
+        defer groups.close();
+        var group = try groups.openSubdirStrict("group-1");
+        defer group.close();
+        var generations = try group.openSubdirStrict("generations");
+        defer generations.close();
+
+        // Far more orphan generation directories than the 64-entry
+        // enumeration snapshot can hold in one pass.
+        var i: u64 = 1000;
+        while (i < 1090) : (i += 1) {
+            var name_buf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "{d}-{x:0>16}", .{ i, i }) catch unreachable;
+            var orphan = try generations.openOrCreateSubdir(name);
+            orphan.close();
+        }
+    }
+
+    var second = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 120 * day);
+    defer {
+        second.key.deinit();
+        allocator.free(second.pem);
+    }
+    const persisted = try activate.verifyAndPersist(allocator, &state, "group-1", &second.key, second.pem, .{ .hostnames = &hosts, .now = base_now });
+    try testing.expect(!std.mem.eql(u8, first.generationId(), persisted.generationId()));
+
+    var groups = try state.openSubdirStrict("groups");
+    defer groups.close();
+    var group = try groups.openSubdirStrict("group-1");
+    defer group.close();
+    var generations = try group.openSubdirStrict("generations");
+    defer generations.close();
+    var names: [64][64]u8 = undefined;
+    var lens: [64]usize = undefined;
+    const count = try generations.listNamesStrict(&names, &lens);
+    try testing.expectEqual(@as(usize, 2), count);
 }

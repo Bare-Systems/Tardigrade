@@ -72,7 +72,10 @@ const current_name = "current";
 const current_tmp_name = "current.tmp";
 const max_generation_id_len = 40;
 const max_current_len = 2 * max_generation_id_len + 2;
-const max_meta_len = 4096;
+/// Must fit `buildMetaJson`'s worst case: `max_hostnames_per_group` names at
+/// the DNS 253-byte maximum, plus JSON quoting and the fixed fields. 8 KiB
+/// leaves generous headroom over the ~4.25 KiB that bound actually produces.
+const max_meta_len = 8192;
 const meta_version: u32 = 1;
 
 pub const VerifyError = error{
@@ -272,10 +275,16 @@ fn verifySanExact(leaf: *const pki.x509.Certificate, hostnames: []const []const 
     var matched: [max_hostnames_per_group]bool = [_]bool{false} ** max_hostnames_per_group;
     for (hostnames, 0..) |host, i| {
         const ref = pki.identity.dnsReference(host) catch return error.SanMismatch;
-        const canonical = switch (ref) { .dns_name => |name| name, else => return error.SanMismatch };
+        const canonical = switch (ref) {
+            .dns_name => |name| name,
+            else => return error.SanMismatch,
+        };
         for (hostnames[0..i]) |prior| {
             const prior_ref = pki.identity.dnsReference(prior) catch return error.SanMismatch;
-            const prior_name = switch (prior_ref) { .dns_name => |name| name, else => return error.SanMismatch };
+            const prior_name = switch (prior_ref) {
+                .dns_name => |name| name,
+                else => return error.SanMismatch,
+            };
             if (std.ascii.eqlIgnoreCase(canonical, prior_name)) return error.SanMismatch;
         }
     }
@@ -290,7 +299,10 @@ fn verifySanExact(leaf: *const pki.x509.Certificate, hostnames: []const []const 
         var found: ?usize = null;
         for (hostnames, 0..) |host, i| {
             const ref = pki.identity.dnsReference(host) catch return error.SanMismatch;
-            const canonical = switch (ref) { .dns_name => |value| value, else => return error.SanMismatch };
+            const canonical = switch (ref) {
+                .dns_name => |value| value,
+                else => return error.SanMismatch,
+            };
             if (pki.identity.presentedDnsIdMatches(presented, canonical) and std.ascii.eqlIgnoreCase(trimOneTrailingDot(presented), canonical)) {
                 if (found != null or matched[i]) return error.SanMismatch;
                 found = i;
@@ -409,9 +421,15 @@ pub const PersistResult = struct {
 /// Verify (§6.4) and durably persist `leaf_key`/`chain_pem` as a new
 /// generation of `group_id`, publishing nothing. On any verification or
 /// I/O failure the group's `current` pointer and every prior generation are
-/// untouched. On success `current` is rewritten only after every generation
-/// file is written and fsynced (§9.2 steps 1-3), and generations beyond the
-/// new one and the one it replaced are pruned.
+/// untouched, with one unavoidable exception: if the final post-rename
+/// `fsync` of the commit record itself fails, the rename is already visible
+/// (§9.2's own ambiguity) and `current` may have already moved even though
+/// this call reports an error. A caller that sees that specific failure
+/// must re-check committed state (e.g. via `loadCommitted`) rather than
+/// assume the previous generation is still current. On success `current` is
+/// rewritten only after every generation file is written and fsynced (§9.2
+/// steps 1-3), and generations beyond the new one and the one it replaced
+/// are pruned.
 pub fn verifyAndPersist(
     allocator: std.mem.Allocator,
     state: *state_mod.StateDir,
@@ -447,7 +465,7 @@ pub fn verifyAndPersist(
         defer gen_dir.close();
         try gen_dir.writeFileAtomic(generation_file_leaf_key, leaf_pem, 0o600);
         try gen_dir.writeFileAtomicLimit(generation_file_chain, chain_pem, 0o600, 2 * max_certificate_flight_bytes);
-        try gen_dir.writeFileAtomic(generation_file_meta, meta_json, 0o600);
+        try gen_dir.writeFileAtomicLimit(generation_file_meta, meta_json, 0o600, max_meta_len);
         try gen_dir.fsync();
     }
     try generations.fsync();
@@ -493,7 +511,9 @@ pub fn loadCommitted(
 
     const pointer = (try readCurrentPointer(allocator, &group)) orelse return null;
 
-    if (tryLoadGeneration(allocator, &generations, pointer.current.slice(), hostnames, now)) |loaded| {
+    if (tryLoadGeneration(allocator, &generations, pointer.current.slice(), hostnames, now)) |value| {
+        var loaded = value;
+        errdefer loaded.deinit(allocator);
         // The fallback is retained only if it is still independently valid.
         var retained_previous: ?GenerationId = null;
         if (pointer.previous) |previous| {
@@ -525,7 +545,9 @@ pub fn loadCommitted(
     // fallback. Never scan complete-looking directories: a crash before the
     // final pointer rename must remain uncommitted.
     const previous = pointer.previous orelse return null;
-    if (tryLoadGeneration(allocator, &generations, previous.slice(), hostnames, now)) |loaded| {
+    if (tryLoadGeneration(allocator, &generations, previous.slice(), hostnames, now)) |value| {
+        var loaded = value;
+        errdefer loaded.deinit(allocator);
         try rewriteCurrent(&group, previous.slice(), null);
         pruneGenerations(&generations, &.{previous.slice()});
         return loaded;
@@ -575,10 +597,13 @@ fn tryLoadGeneration(
     var leaf_key = account_mod.AccountKey.fromPkcs8Pem(leaf_pem) catch return error.CorruptState;
     errdefer leaf_key.deinit();
 
-    const chain_pem = try gen_dir.readFileAlloc(allocator, generation_file_chain, 2 * max_certificate_flight_bytes, false);
+    // Both files are written `0600` (verifyAndPersist); accepting a looser
+    // mode or a different owner here would let a tampered-with generation
+    // directory feed unverified identity/expiry data back into the caller.
+    const chain_pem = try gen_dir.readFileAlloc(allocator, generation_file_chain, 2 * max_certificate_flight_bytes, true);
     errdefer allocator.free(chain_pem);
 
-    const meta_bytes = try gen_dir.readFileAlloc(allocator, generation_file_meta, max_meta_len, false);
+    const meta_bytes = try gen_dir.readFileAlloc(allocator, generation_file_meta, max_meta_len, true);
     defer allocator.free(meta_bytes);
     var meta_parsed = json_limits.parseBounded(GenerationMetaJson, allocator, meta_bytes, meta_limits) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -607,16 +632,25 @@ fn sameHostnameSet(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len or a.len > max_hostnames_per_group) return false;
     for (a, 0..) |name, i| {
         const ref = pki.identity.dnsReference(name) catch return false;
-        const canonical = switch (ref) { .dns_name => |value| value, else => return false };
+        const canonical = switch (ref) {
+            .dns_name => |value| value,
+            else => return false,
+        };
         for (a[0..i]) |prior| {
             const prior_ref = pki.identity.dnsReference(prior) catch return false;
-            const prior_name = switch (prior_ref) { .dns_name => |value| value, else => return false };
+            const prior_name = switch (prior_ref) {
+                .dns_name => |value| value,
+                else => return false,
+            };
             if (std.ascii.eqlIgnoreCase(canonical, prior_name)) return false;
         }
         var found = false;
         for (b) |other| {
             const other_ref = pki.identity.dnsReference(other) catch return false;
-            const other_name = switch (other_ref) { .dns_name => |value| value, else => return false };
+            const other_name = switch (other_ref) {
+                .dns_name => |value| value,
+                else => return false,
+            };
             if (std.ascii.eqlIgnoreCase(canonical, other_name)) {
                 if (found) return false;
                 found = true;
@@ -652,12 +686,18 @@ fn generationIdFromSlice(name: []const u8) GenerationId {
     return out;
 }
 
+/// `current_name` is used as the test-only fault label for the two steps
+/// that `writeFileAtomic`'s own fault points cannot reach: the commit
+/// rename itself (distinct from the rename of `current_tmp_name`'s own
+/// write, which already completed) and the fsync that follows it.
 fn rewriteCurrent(group: *state_mod.SubDir, name: []const u8, previous: ?GenerationId) Error!void {
     if (parseGenerationName(name) == null) return error.CorruptState;
     var buf: [max_current_len]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "{s}\n{s}\n", .{ name, if (previous) |value| value.slice() else "" }) catch return error.CorruptState;
     try group.writeFileAtomic(current_tmp_name, line, 0o600);
+    try group.injectTestFault(current_name, .rename);
     try group.renameWithin(current_tmp_name, current_name);
+    try group.injectTestFault(current_name, .fsync_dir);
     try group.fsync();
 }
 
@@ -669,28 +709,44 @@ fn markCorrupt(generations: *state_mod.SubDir, name: []const u8) void {
 
 /// Delete every strictly-named generation directory except `keep`. Entries
 /// that are not shaped like a generation id (already-`.corrupt-`-renamed,
-/// or a stray name) are left untouched.
+/// or a stray name) are left untouched. `keep` (the caller's explicit
+/// current/previous ids), never directory enumeration, is the authority for
+/// what survives; a bounded 64-entry snapshot is only ever used here to
+/// pick deletion candidates, so an incomplete view just means this call
+/// prunes less, not that it prunes wrongly. When more than 64 entries exist
+/// (e.g. many retained `*.corrupt-*` archives), fall back to a best-effort
+/// lossy snapshot and repeat in bounded batches — each pass that deletes
+/// something shrinks the directory, so repeated calls (every persist/load)
+/// eventually reclaim every eligible orphan instead of giving up for good.
 fn pruneGenerations(generations: *state_mod.SubDir, keep: []const []const u8) void {
-    var names: [64][64]u8 = undefined;
-    var lens: [64]usize = undefined;
-    const count = generations.listNamesStrict(&names, &lens) catch return;
-    for (0..count) |i| {
-        const name = names[i][0..lens[i]];
-        if (parseGenerationName(name) == null) continue;
-        var keep_this = false;
-        for (keep) |k| {
-            if (std.mem.eql(u8, k, name)) {
-                keep_this = true;
-                break;
+    while (true) {
+        var names: [64][64]u8 = undefined;
+        var lens: [64]usize = undefined;
+        const count = generations.listNamesStrict(&names, &lens) catch |err| switch (err) {
+            error.TooLarge => generations.listNames(&names, &lens),
+            else => return,
+        };
+        var deleted_any = false;
+        for (0..count) |i| {
+            const name = names[i][0..lens[i]];
+            if (parseGenerationName(name) == null) continue;
+            var keep_this = false;
+            for (keep) |k| {
+                if (std.mem.eql(u8, k, name)) {
+                    keep_this = true;
+                    break;
+                }
             }
+            if (keep_this) continue;
+            var doomed = generations.openSubdirStrict(name) catch continue;
+            doomed.removeFile(generation_file_leaf_key);
+            doomed.removeFile(generation_file_chain);
+            doomed.removeFile(generation_file_meta);
+            doomed.close();
+            generations.removeEmpty(name) catch continue;
+            deleted_any = true;
         }
-        if (keep_this) continue;
-        var doomed = generations.openSubdirStrict(name) catch continue;
-        doomed.removeFile(generation_file_leaf_key);
-        doomed.removeFile(generation_file_chain);
-        doomed.removeFile(generation_file_meta);
-        doomed.close();
-        generations.removeEmpty(name) catch {};
+        if (!deleted_any) return;
     }
 }
 

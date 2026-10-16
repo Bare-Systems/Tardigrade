@@ -66,7 +66,7 @@ jobs:
 
       - name: Upload selected CI decision
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-decision
           path: ${{ runner.temp }}/ci-decision/decision.env
@@ -252,7 +252,7 @@ jobs:
 
       - name: Upload dependency inventories
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dependency-inventory-linux
           path: ${{ runner.temp }}/dependency-inventory-*.json
@@ -287,7 +287,7 @@ jobs:
 
       - name: Upload dependency inventory
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dependency-inventory-darwin
           path: ${{ runner.temp }}/dependency-inventory-darwin-general.json
@@ -577,7 +577,7 @@ jobs:
 
       - name: Upload differential mismatch artifacts
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pki-differential-core-mismatches
           path: |
@@ -822,7 +822,7 @@ jobs:
 
       - name: Upload perf smoke results
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: perf-smoke-results
           path: ${{ runner.temp }}/perf-artifacts/ci-smoke.json
@@ -869,7 +869,7 @@ jobs:
 
       - name: Upload crypto benchmark results
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: crypto-bench-results
           path: ${{ runner.temp }}/crypto-bench-artifacts/crypto-bench.json
@@ -1106,7 +1106,7 @@ jobs:
       # `certs/` directory.
       - name: Upload failure transcripts
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tls-interop-transcripts
           path: |
@@ -1154,7 +1154,7 @@ jobs:
 
       - name: Upload WebSocket reactor smoke evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: websocket-reactor-smoke
           path: ${{ runner.temp }}/websocket-reactor-smoke.json

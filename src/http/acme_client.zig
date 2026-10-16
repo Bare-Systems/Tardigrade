@@ -29,6 +29,9 @@ pub const AcmeError = error{
 
 /// Shared pure-Zig challenge token store (identical to the general profile).
 pub const ChallengeStore = @import("acme_challenge_store.zig").ChallengeStore;
+/// Host-scopes a request Host header against the managed-hostname set
+/// before a challenge lookup (#877).
+pub const matchManagedHost = @import("acme_challenge_store.zig").matchManagedHost;
 
 pub const AcmeOptions = struct {
     allocator: std.mem.Allocator,
@@ -61,8 +64,8 @@ pub fn runOnce(opts: AcmeOptions) AcmeError!void {
 test "stub ACME runOnce fails closed and shares the challenge store" {
     var store = ChallengeStore.init(std.testing.allocator);
     defer store.deinit();
-    try store.put("tok", "tok.key");
-    const copy = store.getCopy(std.testing.allocator, "tok").?;
+    try store.put(0, "example.com", "tokislongenoughxx", "tok.key", 600);
+    const copy = store.getCopy(std.testing.allocator, 0, "example.com", "tokislongenoughxx").?;
     defer std.testing.allocator.free(copy);
     try std.testing.expectEqualStrings("tok.key", copy);
 

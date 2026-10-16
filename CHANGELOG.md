@@ -55,6 +55,21 @@ All notable user-facing changes to Tardigrade are documented here.
   `-Dacme-experimental` builds add `tardi acme-account` (account bootstrap only).
   Tests: `zig build test-acme` (fake CA that verifies every signed request,
   plus `fuzz: ACME:` corpus targets).
+- **Bounded, host-scoped native HTTP-01 challenge store (#877, epic #759
+  phase A3 slice).** `src/http/acme_challenge_store.zig`'s `ChallengeStore`
+  now keys entries by `(managed host, token)` instead of token alone, so a
+  token minted for one managed hostname can never be used to retrieve the
+  key authorization for a different, wrong, or malformed Host. Tokens are
+  validated against `^[A-Za-z0-9_-]{16,128}$` and key authorizations capped
+  at 256 bytes before any byte is retained; the store caps out at 128 live
+  entries with a caller-supplied TTL, enforces expiry on every lookup (not
+  only a sweep), and a full store rejects the new challenge rather than
+  evicting an active one. `getCopy`/`put`/`remove`/`expire` take an explicit
+  `now` so expiry is deterministic in tests, and `matchManagedHost` scopes a
+  request Host against the configured managed set, rejecting userinfo and
+  default-port tricks rather than normalizing them. No certificate is
+  requested, issued or activated; the dedicated HTTP-01 listener and ACME
+  order state machine remain out of scope (tracked in #833).
 - **WebSocket reactor lifecycle observability (#829, #827).** Tunnel close
   metrics now distinguish `client_error` from `upstream_error` (previously one
   `error` label; the access log keeps `error`). New gauges/counters:

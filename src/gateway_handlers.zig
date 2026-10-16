@@ -227,6 +227,28 @@ pub fn writeTooEarlyResponse(
     return @intFromEnum(plan.status);
 }
 
+/// Renders a successful HTTP-01 challenge body response (design §8.2/#877):
+/// fixed content type plus `Cache-Control: no-store`, so an intermediary can
+/// never retain a validation response past the challenge's own expiry --
+/// store-side expiry alone cannot prevent that once a response has already
+/// been cached.
+pub fn writeAcmeChallengeResponse(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    state: *GatewayState,
+    key_authorization: []const u8,
+    keep_alive: bool,
+) !void {
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok)
+        .setBody(key_authorization)
+        .setHeader("Content-Type", "application/octet-stream")
+        .setHeader("Cache-Control", "no-store")
+        .setConnection(keep_alive);
+    try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+}
+
 test "resolveRoutePath: reload-status and metrics precede location matching" {
     const blocks = [_]http.location_router.LocationBlock{
         .{ .match_type = .prefix, .pattern = "/", .priority = 0, .action = .{ .return_response = .{ .status = 200, .body = "" } } },
@@ -358,6 +380,61 @@ test "writeTooEarlyResponse emits no-store 425 without double-counting callers" 
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"code\":\"too_early\"") != null);
     try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
     try std.testing.expectEqual(@as(u64, 1), state.metrics.status_4xx);
+}
+
+test "writeAcmeChallengeResponse sets a fixed content type and a no-store cache policy (#877 review)" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    try writeAcmeChallengeResponse(allocator, &output.writer, &state, "key-authorization.thumbprint", true);
+
+    const raw = output.written();
+    try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, raw, "cache-control: no-store\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "content-type: application/octet-stream\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "key-authorization.thumbprint") != null);
+}
+
+var acme_log_capture_buf: [4096]u8 = undefined;
+var acme_log_capture_len: usize = 0;
+
+fn acmeLogCaptureSink(bytes: []const u8) usize {
+    const n = @min(bytes.len, acme_log_capture_buf.len - acme_log_capture_len);
+    @memcpy(acme_log_capture_buf[acme_log_capture_len..][0..n], bytes[0..n]);
+    acme_log_capture_len += n;
+    return bytes.len;
+}
+
+test "logAccessForRequest redacts the ACME HTTP-01 challenge token on every logging path (#877 review)" {
+    const allocator = std.testing.allocator;
+    try http.access_log.init(allocator, .{ .format = .json });
+    defer http.access_log.deinit();
+    http.access_log.resetSinkForTest();
+    acme_log_capture_len = 0;
+    http.access_log.sink_override = acmeLogCaptureSink;
+    defer http.access_log.resetSinkForTest();
+
+    const raw_request = "GET /.well-known/acme-challenge/super-secret-challenge-token HTTP/1.1\r\nHost: a.example.com\r\n\r\n";
+    const parsed = try http.Request.parse(allocator, raw_request, MAX_REQUEST_SIZE);
+    var request = parsed.request;
+    defer request.deinit();
+
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var ctx = http.request_context.RequestContext.init(allocator, "req-acme", "127.0.0.1");
+
+    // Covers the success path (200) and an early-rejection/wrong-host path
+    // (404) alike: redaction is centralized in `logAccessForRequest`, not
+    // tied to one status.
+    logAccessForRequest(&state, &ctx, &request, 200);
+    logAccessForRequest(&state, &ctx, &request, 404);
+
+    const logged = acme_log_capture_buf[0..acme_log_capture_len];
+    try std.testing.expect(std.mem.indexOf(u8, logged, "super-secret-challenge-token") == null);
+    try std.testing.expect(std.mem.count(u8, logged, "/.well-known/acme-challenge/[redacted]") == 2);
 }
 
 /// The rendering decision for a location `return` directive, shared by h1 and h3
@@ -6060,11 +6137,25 @@ pub fn handleHttp3Request(
     try handleHttp3Connection(allocator, request, response, &effective_ctx);
 }
 
+/// Access-log path for an ACME HTTP-01 challenge route, fixed so the token
+/// segment never reaches a log line. The token is live key-authorization
+/// material for the life of the challenge (design §8.2/#877), so it must be
+/// redacted on every logging path through this route -- the successful
+/// lookup, a wrong/unmatched Host, and any early rejection alike -- not only
+/// a single call site that happens to serve a 200.
+const acme_challenge_log_prefix = "/.well-known/acme-challenge/";
+const acme_challenge_log_path = acme_challenge_log_prefix ++ "[redacted]";
+
+fn redactedAccessPath(path: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, path, acme_challenge_log_prefix)) return acme_challenge_log_path;
+    return path;
+}
+
 /// Emit an access-log line pulling method/path/user-agent straight from the
 /// request — the shape repeated at every guard and terminal. Prefer this over
 /// calling `logAccess` with the four fields spelled out.
 pub fn logAccessForRequest(state: *GatewayState, ctx: *const http.request_context.RequestContext, request: *const http.Request, status: u16) void {
-    logAccess(state, ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
+    logAccess(state, ctx, request.method.toString(), redactedAccessPath(request.uri.path), status, request.headers.get("user-agent") orelse "");
 }
 
 pub fn logAccess(state: *GatewayState, ctx: *const http.request_context.RequestContext, method: []const u8, path: []const u8, status: u16, user_agent: []const u8) void {

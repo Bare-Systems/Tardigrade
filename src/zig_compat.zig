@@ -1311,6 +1311,31 @@ pub fn openDirNoFollow(path: []const u8) StateFileError!std.posix.fd_t {
     return std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0) catch error.IoFailure;
 }
 
+/// `mkdirat(dir_fd, name, mode)`; an already-existing name is `error.Exists`.
+pub fn mkdirAt(dir_fd: std.posix.fd_t, name: []const u8, mode: u32) StateFileError!void {
+    var buf: [256]u8 = undefined;
+    const z = try cString(&buf, name);
+    const rc = std.c.mkdirat(dir_fd, z, @intCast(mode));
+    if (rc == 0) return;
+    return if (std.posix.errno(rc) == .EXIST) error.Exists else error.IoFailure;
+}
+
+/// Descriptor-relative directory open that never follows a final symlink.
+/// Caller closes.
+pub fn openDirAtNoFollow(dir_fd: std.posix.fd_t, name: []const u8) StateFileError!std.posix.fd_t {
+    return std.posix.openat(dir_fd, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0) catch |err| switch (err) {
+        error.FileNotFound => error.NotFound,
+        else => error.IoFailure,
+    };
+}
+
+/// `unlinkat(dir_fd, name, AT_REMOVEDIR)`: remove an empty directory.
+pub fn rmdirAt(dir_fd: std.posix.fd_t, name: []const u8) StateFileError!void {
+    var buf: [256]u8 = undefined;
+    const z = try cString(&buf, name);
+    if (std.c.unlinkat(dir_fd, z, std.posix.AT.REMOVEDIR) != 0) return error.IoFailure;
+}
+
 pub const OpenAtFlags = struct {
     write: bool = false,
     create: bool = false,

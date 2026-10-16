@@ -556,8 +556,10 @@ fn failure(reason: FailureReason, certificate_index: ?usize) ValidationFailure {
 
 /// Convert the parser's validated UTC date to Unix seconds without consulting
 /// ambient time. Howard Hinnant's civil-date transform handles pre-1970 dates
-/// as well as the full four-digit GeneralizedTime range.
-fn unixSeconds(value: x509.Time) i64 {
+/// as well as the full four-digit GeneralizedTime range. Exposed for other
+/// §6.4-style validity-window checks (e.g. ACME activation, #879) that need
+/// the same conversion without duplicating it.
+pub fn unixSeconds(value: x509.Time) i64 {
     var year: i64 = value.year;
     const month: i64 = value.month;
     const day: i64 = value.day;

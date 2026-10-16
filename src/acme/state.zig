@@ -122,122 +122,261 @@ pub const StateDir = struct {
         return .{ .handle = self.dir_fd };
     }
 
-    fn hit(self: *StateDir, point: Fault) Error!void {
-        if (!builtin.is_test) return;
-        if (self.fault == point) {
-            self.fault = .none;
-            return error.InjectedFault;
-        }
-    }
-
     /// Replace `name` atomically with `data` at `mode`. On any failure the
     /// previous `name` is untouched and the temp file is removed.
     pub fn writeFileAtomic(self: *StateDir, name: []const u8, data: []const u8, mode: u32) Error!void {
-        if (!validName(name)) return error.InvalidPath;
-        if (data.len > max_state_file_len) return error.TooLarge;
-
-        var random: [8]u8 = undefined;
-        zig_compat.randomBytes(&random);
-        var temp_buf: [128]u8 = undefined;
-        const temp_name = std.fmt.bufPrint(&temp_buf, ".{s}.tmp-{x}", .{ name, random }) catch return error.InvalidPath;
-
-        try self.hit(.create_temp);
-        const fd = zig_compat.openAtNoFollow(self.dir_fd, temp_name, .{ .write = true, .create = true, .exclusive = true }, mode) catch return error.IoFailure;
-        var fd_open = true;
-        var renamed = false;
-        defer {
-            if (fd_open) zig_compat.closeFd(fd);
-            if (!renamed) zig_compat.unlinkAt(self.dir_fd, temp_name);
-        }
-        // umask may have narrowed the mode, never widened it; make it exact.
-        zig_compat.fchmodFd(fd, mode) catch return error.IoFailure;
-
-        try self.hit(.write);
-        const limit = if (self.fault == .short_write) data.len / 2 else data.len;
-        zig_compat.writeAllFd(fd, data[0..limit]) catch return error.IoFailure;
-        try self.hit(.short_write);
-
-        try self.hit(.fsync_file);
-        zig_compat.fsyncFd(fd) catch return error.IoFailure;
-        // close() can report deferred write errors; a reported failure must
-        // not be committed. The descriptor is consumed either way.
-        const close_result = zig_compat.closeFdChecked(fd);
-        fd_open = false;
-        try self.hit(.close_file);
-        close_result catch return error.IoFailure;
-
-        try self.hit(.rename);
-        zig_compat.renameAt(self.dir_fd, temp_name, name) catch return error.IoFailure;
-        renamed = true;
-
-        // The rename is already visible; a failed directory fsync means we
-        // cannot promise it survives a crash, which the caller must know.
-        try self.hit(.fsync_dir);
-        zig_compat.fsyncFd(self.dir_fd) catch return error.IoFailure;
+        return writeFileAtomicRaw(self.dir_fd, &self.fault, name, data, mode);
     }
 
     /// Read `name` (bounded). With `private`, any group/other permission bit
     /// is `InsecurePermissions`. Never follows symlinks. When `private`, the
     /// caller owns key material and must free with `secrets.secureZeroAndFree`.
     pub fn readFileAlloc(self: *const StateDir, allocator: std.mem.Allocator, name: []const u8, max_len: usize, private: bool) Error![]u8 {
-        if (!validName(name)) return error.InvalidPath;
-        const st = self.dir().statFile(zig_compat.io(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => return error.NotFound,
-            else => return error.IoFailure,
-        };
-        if (st.kind != .file) return error.UnsafeFileType;
-        if (private and modeBits(st) & 0o077 != 0) return error.InsecurePermissions;
-        if (st.size > max_len) return error.TooLarge;
+        return readFileAllocRaw(self.dir_fd, allocator, name, max_len, private);
+    }
 
-        const fd = zig_compat.openAtNoFollow(self.dir_fd, name, .{}, 0) catch |err| switch (err) {
-            error.NotFound => return error.NotFound,
-            else => return error.IoFailure,
-        };
-        defer zig_compat.closeFd(fd);
-        // Re-check on the descriptor we will actually read.
-        const identity = zig_compat.statFdIdentity(fd) catch return error.IoFailure;
-        if (!identity.is_regular) return error.UnsafeFileType;
-        if (private) {
-            if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
-            if (identity.mode & 0o077 != 0) return error.InsecurePermissions;
-        }
+    /// Open (creating as `0700` if absent) a single-component subdirectory
+    /// of this state directory with the same symlink/ownership/permission
+    /// invariants as `open`, and remove any crashed writer's temp leftovers
+    /// inside it. Used to build the nested `groups/<id>/generations/<gen>/`
+    /// layout (#879, design §9.2) one validated level at a time.
+    pub fn openOrCreateSubdir(self: *StateDir, name: []const u8) Error!SubDir {
+        return openSubdirRaw(self.dir_fd, &self.fault, name, true);
+    }
 
-        var buf = try allocator.alloc(u8, @intCast(st.size));
-        errdefer if (private) secrets.secureZeroAndFree(allocator, buf) else allocator.free(buf);
-        var filled: usize = 0;
-        while (filled < buf.len) {
-            const n = zig_compat.readFd(fd, buf[filled..]) catch return error.IoFailure;
-            if (n == 0) return error.CorruptState; // shrank under us
-            filled += n;
-        }
-        // Grew under us: the bound we checked is no longer the truth.
-        var probe: [1]u8 = undefined;
-        const extra = zig_compat.readFd(fd, &probe) catch return error.IoFailure;
-        if (extra != 0) return error.CorruptState;
-        return buf;
+    /// Open an existing subdirectory with the same invariants as
+    /// `openOrCreateSubdir`, without creating it. `error.NotFound` if absent.
+    pub fn openSubdirStrict(self: *StateDir, name: []const u8) Error!SubDir {
+        return openSubdirRaw(self.dir_fd, &self.fault, name, false);
     }
 
     /// Remove `.<name>.tmp-*` leftovers from a crashed writer. We hold the
     /// lock, so no live writer owns them. Best effort: failure to clean up
     /// must not block startup, and a leftover is mode `0600` anyway.
     fn removeStaleTemps(self: *StateDir) void {
-        const io = zig_compat.io();
-        var it = self.dir().iterate();
-        var doomed: [8][128]u8 = undefined;
-        var doomed_len: [8]usize = undefined;
-        var count: usize = 0;
-        while (it.next(io) catch return) |entry| {
-            if (entry.kind != .file) continue;
-            if (entry.name.len < 6 or entry.name[0] != '.' or entry.name.len >= 128) continue;
-            if (std.mem.indexOf(u8, entry.name, ".tmp-") == null) continue;
-            if (count == doomed.len) break;
-            @memcpy(doomed[count][0..entry.name.len], entry.name);
-            doomed_len[count] = entry.name.len;
-            count += 1;
-        }
-        for (0..count) |i| zig_compat.unlinkAt(self.dir_fd, doomed[i][0..doomed_len[i]]);
+        removeStaleTempsRaw(self.dir_fd);
     }
 };
+
+/// A validated, single-component subdirectory opened relative to a parent
+/// directory descriptor (`StateDir.dir_fd` or another `SubDir`). Shares the
+/// parent `StateDir`'s one-shot fault cell so tests can inject a failure at
+/// any step of a nested write, and the same atomic-write/strict-read
+/// procedure as the top-level directory (#879).
+pub const SubDir = struct {
+    fd: zig_compat.Fd,
+    fault: *Fault,
+
+    pub fn close(self: *SubDir) void {
+        zig_compat.closeFd(self.fd);
+        self.* = undefined;
+    }
+
+    fn dir(self: *const SubDir) std.Io.Dir {
+        return .{ .handle = self.fd };
+    }
+
+    pub fn writeFileAtomic(self: *SubDir, name: []const u8, data: []const u8, mode: u32) Error!void {
+        return writeFileAtomicRaw(self.fd, self.fault, name, data, mode);
+    }
+
+    pub fn readFileAlloc(self: *const SubDir, allocator: std.mem.Allocator, name: []const u8, max_len: usize, private: bool) Error![]u8 {
+        return readFileAllocRaw(self.fd, allocator, name, max_len, private);
+    }
+
+    pub fn openOrCreateSubdir(self: *SubDir, name: []const u8) Error!SubDir {
+        return openSubdirRaw(self.fd, self.fault, name, true);
+    }
+
+    pub fn openSubdirStrict(self: *SubDir, name: []const u8) Error!SubDir {
+        return openSubdirRaw(self.fd, self.fault, name, false);
+    }
+
+    /// Rename `old` to `new` within this directory (the generation-commit
+    /// step: `current.tmp` -> `current`).
+    pub fn renameWithin(self: *SubDir, old: []const u8, new: []const u8) Error!void {
+        if (!validName(old) or !validName(new)) return error.InvalidPath;
+        zig_compat.renameAt(self.fd, old, new) catch return error.IoFailure;
+    }
+
+    /// Best-effort unlink; a missing file is not an error.
+    pub fn removeFile(self: *SubDir, name: []const u8) void {
+        if (!validName(name)) return;
+        zig_compat.unlinkAt(self.fd, name);
+    }
+
+    /// Remove the now-empty-of-live-files subdirectory `name`. The caller
+    /// must have already removed every entry it wrote inside it.
+    pub fn removeEmpty(self: *SubDir, name: []const u8) Error!void {
+        if (!validName(name)) return error.InvalidPath;
+        zig_compat.rmdirAt(self.fd, name) catch return error.IoFailure;
+    }
+
+    pub fn fsync(self: *const SubDir) Error!void {
+        zig_compat.fsyncFd(self.fd) catch return error.IoFailure;
+    }
+
+    /// Bounded iteration for generation discovery and orphan sweeps. Returns
+    /// a fixed-capacity snapshot (never partial-reads a live mutation: the
+    /// caller holds the top-level lock for the whole operation).
+    pub fn listNames(self: *const SubDir, out: *[64][64]u8, out_len: *[64]usize) usize {
+        var it = self.dir().iterate();
+        var count: usize = 0;
+        while (it.next(zig_compat.io()) catch return count) |entry| {
+            if (entry.name.len == 0 or entry.name.len >= 64) continue;
+            if (count == out.len) break;
+            @memcpy(out[count][0..entry.name.len], entry.name);
+            out_len[count] = entry.name.len;
+            count += 1;
+        }
+        return count;
+    }
+};
+
+fn hitFault(fault: *Fault, point: Fault) Error!void {
+    if (!builtin.is_test) return;
+    if (fault.* == point) {
+        fault.* = .none;
+        return error.InjectedFault;
+    }
+}
+
+fn writeFileAtomicRaw(dir_fd: zig_compat.Fd, fault: *Fault, name: []const u8, data: []const u8, mode: u32) Error!void {
+    if (!validName(name)) return error.InvalidPath;
+    if (data.len > max_state_file_len) return error.TooLarge;
+
+    var random: [8]u8 = undefined;
+    zig_compat.randomBytes(&random);
+    var temp_buf: [128]u8 = undefined;
+    const temp_name = std.fmt.bufPrint(&temp_buf, ".{s}.tmp-{x}", .{ name, random }) catch return error.InvalidPath;
+
+    try hitFault(fault, .create_temp);
+    const fd = zig_compat.openAtNoFollow(dir_fd, temp_name, .{ .write = true, .create = true, .exclusive = true }, mode) catch return error.IoFailure;
+    var fd_open = true;
+    var renamed = false;
+    defer {
+        if (fd_open) zig_compat.closeFd(fd);
+        if (!renamed) zig_compat.unlinkAt(dir_fd, temp_name);
+    }
+    // umask may have narrowed the mode, never widened it; make it exact.
+    zig_compat.fchmodFd(fd, mode) catch return error.IoFailure;
+
+    try hitFault(fault, .write);
+    const limit = if (fault.* == .short_write) data.len / 2 else data.len;
+    zig_compat.writeAllFd(fd, data[0..limit]) catch return error.IoFailure;
+    try hitFault(fault, .short_write);
+
+    try hitFault(fault, .fsync_file);
+    zig_compat.fsyncFd(fd) catch return error.IoFailure;
+    // close() can report deferred write errors; a reported failure must
+    // not be committed. The descriptor is consumed either way.
+    const close_result = zig_compat.closeFdChecked(fd);
+    fd_open = false;
+    try hitFault(fault, .close_file);
+    close_result catch return error.IoFailure;
+
+    try hitFault(fault, .rename);
+    zig_compat.renameAt(dir_fd, temp_name, name) catch return error.IoFailure;
+    renamed = true;
+
+    // The rename is already visible; a failed directory fsync means we
+    // cannot promise it survives a crash, which the caller must know.
+    try hitFault(fault, .fsync_dir);
+    zig_compat.fsyncFd(dir_fd) catch return error.IoFailure;
+}
+
+fn readFileAllocRaw(dir_fd: zig_compat.Fd, allocator: std.mem.Allocator, name: []const u8, max_len: usize, private: bool) Error![]u8 {
+    if (!validName(name)) return error.InvalidPath;
+    const parent: std.Io.Dir = .{ .handle = dir_fd };
+    const st = parent.statFile(zig_compat.io(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.NotFound,
+        else => return error.IoFailure,
+    };
+    if (st.kind != .file) return error.UnsafeFileType;
+    if (private and modeBits(st) & 0o077 != 0) return error.InsecurePermissions;
+    if (st.size > max_len) return error.TooLarge;
+
+    const fd = zig_compat.openAtNoFollow(dir_fd, name, .{}, 0) catch |err| switch (err) {
+        error.NotFound => return error.NotFound,
+        else => return error.IoFailure,
+    };
+    defer zig_compat.closeFd(fd);
+    // Re-check on the descriptor we will actually read.
+    const identity = zig_compat.statFdIdentity(fd) catch return error.IoFailure;
+    if (!identity.is_regular) return error.UnsafeFileType;
+    if (private) {
+        if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
+        if (identity.mode & 0o077 != 0) return error.InsecurePermissions;
+    }
+
+    var buf = try allocator.alloc(u8, @intCast(st.size));
+    errdefer if (private) secrets.secureZeroAndFree(allocator, buf) else allocator.free(buf);
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = zig_compat.readFd(fd, buf[filled..]) catch return error.IoFailure;
+        if (n == 0) return error.CorruptState; // shrank under us
+        filled += n;
+    }
+    // Grew under us: the bound we checked is no longer the truth.
+    var probe: [1]u8 = undefined;
+    const extra = zig_compat.readFd(fd, &probe) catch return error.IoFailure;
+    if (extra != 0) return error.CorruptState;
+    return buf;
+}
+
+/// Open (optionally creating, `0700`) a single validated-component
+/// subdirectory of `parent_fd`: never a symlink, owned by the effective uid,
+/// no group/other permission bits. Shared by `StateDir` and `SubDir` so
+/// every nesting level gets identical defenses.
+fn openSubdirRaw(parent_fd: zig_compat.Fd, fault: *Fault, name: []const u8, create: bool) Error!SubDir {
+    if (!validName(name)) return error.InvalidPath;
+    if (create) {
+        zig_compat.mkdirAt(parent_fd, name, 0o700) catch |err| switch (err) {
+            error.Exists => {},
+            else => return error.IoFailure,
+        };
+    }
+    const fd = zig_compat.openDirAtNoFollow(parent_fd, name) catch |err| switch (err) {
+        error.NotFound => return error.NotFound,
+        else => {
+            // Say why when we can: a symlink or file is a different problem
+            // from an I/O failure (mirrors `StateDir.open`'s top-level check).
+            const parent: std.Io.Dir = .{ .handle = parent_fd };
+            if (parent.statFile(zig_compat.io(), name, .{ .follow_symlinks = false })) |st| {
+                if (st.kind != .directory) return error.UnsafeFileType;
+            } else |_| {}
+            return error.IoFailure;
+        },
+    };
+    errdefer zig_compat.closeFd(fd);
+    const identity = zig_compat.statFdIdentity(fd) catch return error.IoFailure;
+    if (!identity.is_directory) return error.UnsafeFileType;
+    if (identity.uid != zig_compat.effectiveUid()) return error.WrongOwner;
+    if (identity.mode & 0o022 != 0) return error.InsecurePermissions;
+    removeStaleTempsRaw(fd);
+    return .{ .fd = fd, .fault = fault };
+}
+
+/// Remove `.<name>.tmp-*` leftovers from a crashed writer. Best effort: a
+/// failure to clean up must not block startup, and a leftover is `0600`.
+fn removeStaleTempsRaw(dir_fd: zig_compat.Fd) void {
+    const parent: std.Io.Dir = .{ .handle = dir_fd };
+    const io = zig_compat.io();
+    var it = parent.iterate();
+    var doomed: [8][128]u8 = undefined;
+    var doomed_len: [8]usize = undefined;
+    var count: usize = 0;
+    while (it.next(io) catch return) |entry| {
+        if (entry.kind != .file) continue;
+        if (entry.name.len < 6 or entry.name[0] != '.' or entry.name.len >= 128) continue;
+        if (std.mem.indexOf(u8, entry.name, ".tmp-") == null) continue;
+        if (count == doomed.len) break;
+        @memcpy(doomed[count][0..entry.name.len], entry.name);
+        doomed_len[count] = entry.name.len;
+        count += 1;
+    }
+    for (0..count) |i| zig_compat.unlinkAt(dir_fd, doomed[i][0..doomed_len[i]]);
+}
 
 fn modeBits(st: std.Io.File.Stat) u32 {
     return @as(u32, @intCast(@intFromEnum(st.permissions))) & 0o777;

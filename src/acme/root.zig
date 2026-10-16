@@ -1,5 +1,8 @@
 //! Native ACME account, JWS transport and durable state (#832, epic #759).
-//! Phase A2: nothing here issues or activates a certificate (A3/A4 own that).
+//! Phase A2 landed the account/state foundation; #879 (A4) adds
+//! pre-activation verification and durable generation storage in
+//! `activate.zig`. Nothing here publishes a live TLS identity yet (#880/#884
+//! own that).
 
 pub const account = @import("account.zig");
 pub const json_limits = @import("json_limits.zig");
@@ -9,12 +12,16 @@ pub const contact = @import("contact.zig");
 pub const names = @import("names.zig");
 pub const transport = @import("transport.zig");
 pub const client = @import("client.zig");
+pub const activate = @import("activate.zig");
 
 /// Test-only fake CA (see `fake_ca.zig`); absent from non-test builds.
 pub const fake_ca = if (@import("builtin").is_test) @import("fake_ca.zig") else struct {};
 
 comptime {
-    if (@import("builtin").is_test) _ = @import("client_tests.zig");
+    if (@import("builtin").is_test) {
+        _ = @import("client_tests.zig");
+        _ = @import("activate_tests.zig");
+    }
 }
 
 test {

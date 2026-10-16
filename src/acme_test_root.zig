@@ -25,6 +25,7 @@ test "ACME implementation stays behind the native compat boundary (#832)" {
         .{ "acme/names.zig", @embedFile("acme/names.zig") },
         .{ "acme/contact.zig", @embedFile("acme/contact.zig") },
         .{ "acme/client.zig", @embedFile("acme/client.zig") },
+        .{ "acme/activate.zig", @embedFile("acme/activate.zig") },
         .{ "acme/json_limits.zig", @embedFile("acme/json_limits.zig") },
         .{ "acme/state.zig", @embedFile("acme/state.zig") },
         .{ "acme/transport.zig", @embedFile("acme/transport.zig") },

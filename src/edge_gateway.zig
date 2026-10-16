@@ -314,6 +314,29 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         break :blk fd;
     };
 
+    // #881: the dedicated ACME HTTP-01 challenge listener (design
+    // docs/ACME_AUTOMATIC_HTTPS.md §8.0) is bound here, alongside the main
+    // listener and before the privilege drop/chroot below, so its default
+    // privileged port (:80) can still be bound after `tardi run` drops root.
+    // A bind failure fails startup exactly like the main listener's. Gated
+    // on `cfg.tls_acme_enabled`, which the validated config guarantees
+    // implies a non-empty `cfg.tls_acme_domains` and therefore a non-null
+    // `state.acme_challenge_store` (`validateAcmeConfig`, `acme/names.zig`).
+    var acme_http01_listener: http.acme_http01_listener.Listener = undefined;
+    var acme_http01_listener_active = false;
+    defer if (acme_http01_listener_active) acme_http01_listener.deinit();
+    if (cfg.tls_acme_enabled) {
+        const http01_addr = try edge_config.parseAcmeHttp01Listen(cfg.tls_acme_http01_listen);
+        acme_http01_listener.start(state_allocator, http01_addr.host, http01_addr.port, .{
+            .managed_hosts = cfg.tls_acme_domains,
+            .store = &state.acme_challenge_store.?,
+        }) catch |err| {
+            state.logger.err(null, "failed to bind ACME HTTP-01 challenge listener on {s}:{d}: {}", .{ http01_addr.host, http01_addr.port, err });
+            return err;
+        };
+        acme_http01_listener_active = true;
+    }
+
     applyRuntimeIdentity(cfg, &state.logger) catch |err| {
         state.logger.warn(null, "privilege drop configuration failed: {}", .{err});
     };

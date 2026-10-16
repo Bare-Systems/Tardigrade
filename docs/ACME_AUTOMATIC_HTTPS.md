@@ -836,9 +836,9 @@ Behavior worth knowing:
   names only with a non-default directory plus CA bundle), renew window
   `1..=60`, `http-01` only, reserved EAB, pre-provisioned account key path,
   and with the opt-in off **every** non-default `acme_*` setting is an error.
-  Still open for later phases because they need the listener/redirect:
-  `acme_http01_listen` and `https_redirect` (A3/A4), and the §4.7 overlap rule
-  with manual SNI certificates (A4).
+  `acme_http01_listen` (§8.0) is validated as of #881 (§10.2). Still open for
+  later phases: `https_redirect` (A4), and the §4.7 overlap rule with manual
+  SNI certificates (A4).
 - `acme_experimental` (`zig build -Dacme-experimental`, off by default and for
   release artifacts) is the §4.5 build gate. Only general-profile builds with
   it accept the validated opt-in, and `tardi acme-account` is the sole
@@ -861,6 +861,44 @@ Behavior worth knowing:
 
 Run the focused gate with `zig build test-acme` (includes the
 `fuzz: ACME: ...` corpus targets); the same tests also run under `zig build test`.
+
+### 10.2 A3 as implemented (partial, #881)
+
+G9 (the dedicated challenge listener, §8.0) lands as a standalone,
+independently testable component. The order/authorization engine (#882) and
+its end-to-end wiring through a live local CA (#883) are separate, still-open
+children of #833; this slice only adds the listener and its config.
+
+| File | What it provides |
+| --- | --- |
+| `src/http/acme_http01_listener.zig` | `Listener`: binds `host:port`, a dedicated poll-driven accept loop (own thread, 250 ms shutdown check, matching `gateway_accept.zig`'s shard loop), an atomic admission counter capping concurrent connections (excess accepted-and-closed), and a per-connection handler with an 8 KiB fixed head buffer, a head-read deadline, and a total per-connection deadline. Serves `GET`/`HEAD /.well-known/acme-challenge/<token>` via the existing host-scoped `ChallengeStore` (#877); everything else is `404`, and an unmanaged Host is `421`. No bodies, upgrades, or keep-alive. |
+| `src/edge_config.zig` | `tls_acme_http01_listen` (`TARDIGRADE_TLS_ACME_HTTP01_LISTEN`, directive `acme_http01_listen`, default `0.0.0.0:80`); `parseAcmeHttp01Listen` grammar check plus the "must not equal the main listener" rule (§8.0), wired into `validateAcmeConfig` and the non-default-without-opt-in check. |
+| `src/gateway_shutdown.zig` | `acmeHttp01ListenerConfigChanged`: a reload that changes the address is rejected as restart-required, like the main and HTTP/3 listener topology checks. |
+| `src/edge_gateway.zig` | Binds the listener next to the main listener, before `applyRuntimeIdentity` (privilege drop/chroot), when `cfg.tls_acme_enabled`; a bind failure fails startup with the attempted address. Torn down by the same `defer` ordering as every other startup-owned runtime object. |
+
+Behavior worth knowing:
+
+- This is still reached by nothing in production: `edge_config.rejectAcmeRuntime`
+  (unconditional on `tls_acme_enabled`, called from `main.zig`'s `tardi run`
+  path, not from `validateNativeTlsBuildConfig`) still refuses to start a
+  server with ACME enabled in every build, so the new bind code in
+  `edge_gateway.zig` is exercised only by tests that construct a validated
+  ACME-enabled config directly (bypassing the CLI gate), not by any reachable
+  `tardi run` invocation. Activation (A4, #884) is what lifts that gate.
+- The listener's own tests in `acme_http01_listener.zig` bind a real
+  ephemeral-port socket and drive it with real TCP connections (not just
+  `ChallengeStore` calls directly): correct host/token serving for GET and
+  HEAD, `421` for an unmanaged Host, `404` for a path/token miss and for
+  non-GET/HEAD methods, `400` for a request carrying a body, the admission
+  counter's cap and release accounting, a stalled connection closing once its
+  total deadline elapses, and a deterministic bind-failure path.
+- `max_head_bytes` (8 KiB) is a compile-time constant sizing a fixed
+  per-connection stack buffer; `max_connections` and both deadlines are
+  `Options` fields defaulted to the §8.0 values but overridable, which is what
+  lets the deadline tests run on a millisecond clock instead of the real 5s/10s
+  budget.
+- The listener does not read request bodies, so Transfer-Encoding/Content-Length
+  are rejected as a protocol violation (`400`) rather than consumed.
 
 ## 11. Test plan
 

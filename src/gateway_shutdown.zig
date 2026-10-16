@@ -203,6 +203,28 @@ pub fn hotReloadConfig(
         }
     }
     {
+        // #881: the dedicated ACME HTTP-01 challenge listener is bound once
+        // at startup, before the privilege drop, exactly like the main and
+        // HTTP/3 listeners (design docs/ACME_AUTOMATIC_HTTPS.md §8.0). A
+        // changed address needs a fresh bind, so reject the reload rather
+        // than silently continuing to serve the old address.
+        var current_lease = worker_ctx.config_store.acquire();
+        const acme_http01_listener_config_changed = acmeHttp01ListenerConfigChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (acme_http01_listener_config_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "ACME HTTP-01 challenge listener address changed; restart required", .{}) catch "ACME HTTP-01 challenge listener address changed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: TARDIGRADE_TLS_ACME_HTTP01_LISTEN changed; restart the process to change the ACME HTTP-01 challenge listener address", .{});
+            return;
+        }
+    }
+    {
         // The circuit breaker is process-owned state constructed once at
         // startup. Reloading its policy in place would require generation-safe
         // permit migration, so reject those changes and keep config/state
@@ -528,6 +550,30 @@ pub fn circuitBreakerConfigChanged(
 ) bool {
     return current.cb_threshold != proposed.cb_threshold or
         current.cb_timeout_ms != proposed.cb_timeout_ms;
+}
+
+/// #881: the dedicated HTTP-01 challenge listener is bound once at startup,
+/// before the privilege drop, like the main and HTTP/3 listeners. Changing
+/// its address requires a fresh bind, so reload rejects it (§8.0).
+pub fn acmeHttp01ListenerConfigChanged(
+    current: *const edge_config.EdgeConfig,
+    proposed: *const edge_config.EdgeConfig,
+) bool {
+    return !std.mem.eql(u8, current.tls_acme_http01_listen, proposed.tls_acme_http01_listen);
+}
+
+test "acmeHttp01ListenerConfigChanged detects an address change (#881)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    try std.testing.expect(!acmeHttp01ListenerConfigChanged(&base, &proposed));
+    // `deinit` frees this field, so the replacement must be heap-owned too.
+    allocator.free(proposed.tls_acme_http01_listen);
+    proposed.tls_acme_http01_listen = try allocator.dupe(u8, "127.0.0.1:8080");
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
 }
 
 test "earlyDataReplayConfigChanged detects mode and capacity changes independently" {

@@ -328,6 +328,11 @@ pub const EdgeConfig = struct {
     /// `TARDIGRADE_TLS_ACME_EAB_KID` or `_EAB_HMAC_KEY_PATH` was set. External
     /// account binding is reserved and rejected until implemented.
     tls_acme_eab_requested: bool,
+    /// `TARDIGRADE_TLS_ACME_HTTP01_LISTEN` (directive `acme_http01_listen`):
+    /// `host:port` for the dedicated bounded HTTP-01 challenge listener
+    /// (docs/ACME_AUTOMATIC_HTTPS.md §8.0, #881). Startup-fixed; must differ
+    /// from the main listener.
+    tls_acme_http01_listen: []const u8,
     http1_enabled: bool,
     http2_enabled: bool,
     tls_http1_no_alpn_fallback: bool,
@@ -808,6 +813,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.tls_acme_ca_bundle_path);
         allocator.free(self.tls_acme_domains_spec);
         allocator.free(self.tls_acme_challenges);
+        allocator.free(self.tls_acme_http01_listen);
         allocator.free(self.trust_gateway_id);
         allocator.free(self.trust_shared_secret);
         for (self.trusted_upstream_identities) |id| allocator.free(id);
@@ -1093,6 +1099,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         break :blk false;
     };
+    const tls_acme_http01_listen = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", "", "0.0.0.0:80") catch unreachable;
+    errdefer allocator.free(tls_acme_http01_listen);
     const upstream_protocol_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_PROTOCOL", "http1") catch unreachable;
     defer allocator.free(upstream_protocol_str);
     const upstream_protocol = try parseUpstreamProtocolConfig(upstream_protocol_str);
@@ -1871,6 +1879,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_acme_ca_bundle_path = tls_acme_ca_bundle_path,
         .tls_acme_challenges = tls_acme_challenges,
         .tls_acme_eab_requested = tls_acme_eab_requested,
+        .tls_acme_http01_listen = tls_acme_http01_listen,
         .http1_enabled = http1_enabled,
         .http2_enabled = http2_enabled,
         .tls_http1_no_alpn_fallback = tls_http1_no_alpn_fallback,
@@ -2600,6 +2609,22 @@ fn conflictingFileOverrideValue(key: []const u8, env_value: []const u8) ?[]const
 }
 
 const default_acme_directory_url = "https://acme-v02.api.letsencrypt.org/directory";
+const default_acme_http01_listen = "0.0.0.0:80";
+
+/// A `host:port` dedicated-listener address (docs/ACME_AUTOMATIC_HTTPS.md
+/// §8.0). Host and port are returned as-is (no normalization) so a caller
+/// can both bind the address and compare it against `listen_host`/
+/// `listen_port` for the "cannot equal the main listener" rule.
+pub const AcmeHttp01ListenAddr = struct { host: []const u8, port: u16 };
+
+pub fn parseAcmeHttp01Listen(raw: []const u8) !AcmeHttp01ListenAddr {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const parts = splitHostPort(trimmed) orelse return error.InvalidConfigValue;
+    if (parts[0].len == 0) return error.InvalidConfigValue;
+    const port = std.fmt.parseInt(u16, parts[1], 10) catch return error.InvalidConfigValue;
+    if (port == 0) return error.InvalidConfigValue;
+    return .{ .host = parts[0], .port = port };
+}
 
 /// `TARDIGRADE_TLS_X` -> `TARDIGRADE_X`: the name a native config-file
 /// directive (`acme_state_dir`) normalizes to.
@@ -3718,6 +3743,19 @@ fn validateAcmeConfig(cfg: *const EdgeConfig) !void {
     // A pre-provisioned account key must exist; it is read, never created.
     try validateOptionalFile(cfg.tls_acme_account_key_path, "tls_acme_account_key_path");
     try validateOptionalFile(cfg.tls_acme_ca_bundle_path, "tls_acme_ca_bundle_path");
+    // §8.0: the dedicated HTTP-01 challenge listener address. Required (a
+    // default is always present) and startup-fixed; it must not collide
+    // with the main listener, since a CA validating on this address could
+    // otherwise reach ordinary application routing instead of the bounded
+    // challenge-only listener (#881).
+    const http01_listen = parseAcmeHttp01Listen(cfg.tls_acme_http01_listen) catch {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_HTTP01_LISTEN must be host:port", .{});
+        return error.InvalidConfigValue;
+    };
+    if (std.mem.eql(u8, http01_listen.host, cfg.listen_host) and http01_listen.port == cfg.listen_port) {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_HTTP01_LISTEN must not equal the main listener ({s}:{d})", .{ cfg.listen_host, cfg.listen_port });
+        return error.InvalidConfigValue;
+    }
 }
 
 /// Any ACME setting that differs from its default.
@@ -3731,7 +3769,8 @@ fn acmeSettingsNonDefault(cfg: *const EdgeConfig) bool {
         cfg.tls_acme_renew_days_before_expiry != 30 or
         cfg.tls_acme_agree_tos or
         cfg.tls_acme_ca_bundle_path.len != 0 or
-        !std.mem.eql(u8, cfg.tls_acme_challenges, "http-01");
+        !std.mem.eql(u8, cfg.tls_acme_challenges, "http-01") or
+        !std.mem.eql(u8, cfg.tls_acme_http01_listen, default_acme_http01_listen);
 }
 
 /// `tardi run` has nothing that can serve or activate an ACME-managed
@@ -4412,6 +4451,23 @@ fn splitHostPort(raw: []const u8) ?struct { []const u8, []const u8 } {
     const idx = std.mem.findScalarLast(u8, raw, ':') orelse return null;
     if (idx == 0 or idx + 1 >= raw.len) return null;
     return .{ std.mem.trim(u8, raw[0..idx], " \t\r\n"), std.mem.trim(u8, raw[idx + 1 ..], " \t\r\n") };
+}
+
+test "parseAcmeHttp01Listen parses host:port and rejects malformed addresses (#881)" {
+    const addr = try parseAcmeHttp01Listen("0.0.0.0:80");
+    try std.testing.expectEqualStrings("0.0.0.0", addr.host);
+    try std.testing.expectEqual(@as(u16, 80), addr.port);
+
+    const addr2 = try parseAcmeHttp01Listen("  127.0.0.1:8080  ");
+    try std.testing.expectEqualStrings("127.0.0.1", addr2.host);
+    try std.testing.expectEqual(@as(u16, 8080), addr2.port);
+
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("no-port-here"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen(":80"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("host:"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("host:0"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("host:not-a-number"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("host:99999"));
 }
 
 test "parse token hashes from csv" {
@@ -5512,6 +5568,19 @@ test "automatic HTTPS grammar is validated before the support gate (#832)" {
         }.f },
         .{ .mutate = struct {
             fn f(c: *EdgeConfig) void {
+                c.tls_acme_http01_listen = "not-a-host-port";
+            }
+        }.f },
+        .{
+            .mutate = struct {
+                // §8.0: the dedicated listener cannot equal the main one.
+                fn f(c: *EdgeConfig) void {
+                    c.tls_acme_http01_listen = "0.0.0.0:8069";
+                }
+            }.f,
+        },
+        .{ .mutate = struct {
+            fn f(c: *EdgeConfig) void {
                 c.tls_acme_domains_spec = "*.example.com";
             }
         }.f },
@@ -5570,7 +5639,7 @@ test "automatic HTTPS grammar is validated before the support gate (#832)" {
     }
     // §4.5 step 1: with the opt-in off, every non-default ACME field is an
     // error, one field at a time; reserved EAB too.
-    for (0..11) |which| {
+    for (0..12) |which| {
         var cfg = base;
         switch (which) {
             0 => cfg.tls_acme_directory_url = "https://ca.example/dir",
@@ -5583,7 +5652,8 @@ test "automatic HTTPS grammar is validated before the support gate (#832)" {
             7 => cfg.tls_acme_agree_tos = true,
             8 => cfg.tls_acme_ca_bundle_path = "/etc/ssl/cert.pem",
             9 => cfg.tls_acme_challenges = "tls-alpn-01",
-            else => cfg.tls_acme_eab_requested = true,
+            10 => cfg.tls_acme_eab_requested = true,
+            else => cfg.tls_acme_http01_listen = "127.0.0.1:8080",
         }
         try std.testing.expectError(error.InvalidConfigValue, validateNativeTlsBuildConfig(&cfg));
     }

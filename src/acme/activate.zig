@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! groups/<group-id>/
-//!   current                  "<seq>-<nonce-hex>\n", the sole commit pointer
+//!   current                  "<current>\n<previous-or-empty>\n", durable commit record
 //!   generations/
 //!     <seq>-<nonce-hex>/
 //!       leaf.key             PKCS#8 PEM, 0600

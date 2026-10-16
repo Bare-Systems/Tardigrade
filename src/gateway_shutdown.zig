@@ -552,14 +552,24 @@ pub fn circuitBreakerConfigChanged(
         current.cb_timeout_ms != proposed.cb_timeout_ms;
 }
 
-/// #881: the dedicated HTTP-01 challenge listener is bound once at startup,
-/// before the privilege drop, like the main and HTTP/3 listeners. Changing
-/// its address requires a fresh bind, so reload rejects it (§8.0).
+/// #881 (review #897): the dedicated HTTP-01 challenge listener binds once at
+/// startup, before the privilege drop, and borrows `cfg.tls_acme_domains` for
+/// its lifetime (`Listener.start`). A reload cannot rebind the listener nor
+/// swap its borrowed host set in place, so any change to the listener's
+/// address, enabled state, or managed-host set -- not just the address --
+/// must reject the whole reload (§8.0); otherwise the published config would
+/// advertise managed hosts the running listener's admission check never
+/// learns about. `tls_acme_domains_spec` is the pre-normalization source of
+/// `tls_acme_domains`, so comparing it also catches reordering/case changes
+/// that resolve to the same validated set -- a conservative restart-required
+/// classification, never a false negative.
 pub fn acmeHttp01ListenerConfigChanged(
     current: *const edge_config.EdgeConfig,
     proposed: *const edge_config.EdgeConfig,
 ) bool {
-    return !std.mem.eql(u8, current.tls_acme_http01_listen, proposed.tls_acme_http01_listen);
+    return current.tls_acme_enabled != proposed.tls_acme_enabled or
+        !std.mem.eql(u8, current.tls_acme_http01_listen, proposed.tls_acme_http01_listen) or
+        !std.mem.eql(u8, current.tls_acme_domains_spec, proposed.tls_acme_domains_spec);
 }
 
 test "acmeHttp01ListenerConfigChanged detects an address change (#881)" {
@@ -573,6 +583,29 @@ test "acmeHttp01ListenerConfigChanged detects an address change (#881)" {
     // `deinit` frees this field, so the replacement must be heap-owned too.
     allocator.free(proposed.tls_acme_http01_listen);
     proposed.tls_acme_http01_listen = try allocator.dupe(u8, "127.0.0.1:8080");
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+}
+
+test "acmeHttp01ListenerConfigChanged detects a managed-host set change (#897 review)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    allocator.free(proposed.tls_acme_domains_spec);
+    proposed.tls_acme_domains_spec = try allocator.dupe(u8, "a.example.com");
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+}
+
+test "acmeHttp01ListenerConfigChanged detects an enabled-flag change (#897 review)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    proposed.tls_acme_enabled = !base.tls_acme_enabled;
     try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
 }
 

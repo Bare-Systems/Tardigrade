@@ -38,8 +38,56 @@ pub const Options = struct {
     /// Borrowed; must outlive the listener.
     store: *ChallengeStore,
     max_connections: usize = default_max_connections,
+    /// §8.0's "per-IP accept cap shared with existing accept limits":
+    /// typically `cfg.max_connections_per_ip`. `0` disables the per-IP
+    /// cap (global `max_connections` still applies), matching the main
+    /// listener's own zero-means-unlimited convention.
+    max_connections_per_ip: u32 = 0,
     head_read_deadline_ms: u32 = default_head_read_deadline_ms,
     total_deadline_ms: u32 = default_total_deadline_ms,
+};
+
+/// A peer's raw address bytes, family-tagged, for per-IP admission counting.
+/// Deliberately not a formatted string: this listener never allocates on
+/// the accept path, so a fixed-size bounded table of these is scanned
+/// in-place instead (#897 review).
+const PeerKey = struct {
+    family: u32,
+    bytes: [16]u8 = @splat(0),
+
+    fn eql(a: PeerKey, b: PeerKey) bool {
+        return a.family == b.family and std.mem.eql(u8, &a.bytes, &b.bytes);
+    }
+
+    fn fromSockAddr(address: *const std.c.sockaddr.storage) ?PeerKey {
+        return switch (address.family) {
+            std.posix.AF.INET => blk: {
+                const sin: *const std.c.sockaddr.in = @ptrCast(address);
+                var key = PeerKey{ .family = @intCast(address.family) };
+                @memcpy(key.bytes[0..4], @as(*const [4]u8, @ptrCast(&sin.addr)));
+                break :blk key;
+            },
+            std.posix.AF.INET6 => blk: {
+                const sin6: *const std.c.sockaddr.in6 = @ptrCast(address);
+                break :blk .{ .family = @intCast(address.family), .bytes = sin6.addr };
+            },
+            else => null,
+        };
+    }
+};
+
+/// One admitted connection's bookkeeping. Every field is guarded by the
+/// owning `Listener.slots_mutex`; `thread` is only ever written by the
+/// (single) accept-loop thread and only ever joined by `reapFinishedLocked`
+/// (called from `tryAdmit`, on the accept-loop thread, and unconditionally
+/// from `deinit`), so a handler thread never touches another slot's memory
+/// (#897 review).
+const ConnSlot = struct {
+    in_use: bool = false,
+    finished: bool = false,
+    fd: std.posix.fd_t = -1,
+    peer: ?PeerKey = null,
+    thread: ?std.Thread = null,
 };
 
 /// Bounded, isolated HTTP-01 challenge listener. Caller owns storage with a
@@ -53,10 +101,12 @@ pub const Listener = struct {
     managed_hosts: []const []const u8,
     store: *ChallengeStore,
     max_connections: usize,
+    max_connections_per_ip: u32,
     head_read_deadline_ms: u32,
     total_deadline_ms: u32,
     stopping: std.atomic.Value(bool) = .init(false),
-    active: std.atomic.Value(usize) = .init(0),
+    slots_mutex: compat.Mutex = .{},
+    slots: [default_max_connections]ConnSlot = @splat(.{}),
     accept_thread: ?std.Thread = null,
 
     /// Binds `host:port` -- before privilege drop/chroot, per §8.0 and §9.3 --
@@ -77,50 +127,150 @@ pub const Listener = struct {
             .listen_fd = fd,
             .managed_hosts = options.managed_hosts,
             .store = options.store,
-            .max_connections = @max(options.max_connections, 1),
+            // §8.0's ceiling is an advertised invariant, not an
+            // operator-overridable one: silently clamp an override above it
+            // rather than admitting more than the design's bounded pool
+            // promise (#897 review).
+            .max_connections = std.math.clamp(options.max_connections, 1, default_max_connections),
+            .max_connections_per_ip = options.max_connections_per_ip,
             .head_read_deadline_ms = options.head_read_deadline_ms,
             .total_deadline_ms = options.total_deadline_ms,
         };
         self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
     }
 
-    /// Stops accepting, joins the accept thread, and waits for in-flight
-    /// connections to settle. Every handler enforces its own
-    /// `total_deadline_ms` budget, so this is bounded even if a peer never
-    /// sends another byte -- it never blocks indefinitely. Safe to call at
-    /// most once; idempotent no-op if `start` never ran or already failed.
+    /// Stops accepting, joins the accept thread, forcibly unblocks any
+    /// in-flight connection's socket I/O, and -- unconditionally, not just
+    /// up to some deadline -- joins every handler thread before tearing
+    /// down `self.server` and `self.* = undefined`. #897 review: a handler
+    /// that outlived a bounded wait here would go on to dereference `self`
+    /// and its borrowed `store`/`allocator` after they were freed; this
+    /// listener's own absolute head/total deadlines (`handleConnection`)
+    /// plus the forced `shutdown()` below keep that join bounded in
+    /// practice, but correctness here does not depend on that bound. Safe
+    /// to call at most once; idempotent no-op if `start` never ran or
+    /// already failed.
     pub fn deinit(self: *Listener) void {
         self.stopping.store(true, .release);
         if (self.accept_thread) |t| t.join();
         self.accept_thread = null;
 
-        const settle_deadline_ms = compat.milliTimestamp() + @as(i64, self.total_deadline_ms) + 1_000;
-        while (self.active.load(.acquire) > 0 and compat.milliTimestamp() < settle_deadline_ms) {
-            compat.sleepNs(10 * std.time.ns_per_ms);
+        self.slots_mutex.lock();
+        for (&self.slots) |*slot| {
+            if (slot.in_use and !slot.finished) {
+                _ = std.c.shutdown(slot.fd, std.c.SHUT.RDWR);
+            }
+        }
+        self.slots_mutex.unlock();
+
+        while (true) {
+            self.slots_mutex.lock();
+            self.reapFinishedLocked();
+            const remaining = self.activeCountLocked();
+            self.slots_mutex.unlock();
+            if (remaining == 0) break;
+            compat.sleepNs(5 * std.time.ns_per_ms);
         }
         self.server.deinit(compat.io());
         self.* = undefined;
     }
 
     /// Current in-flight connection count (test/observability only).
-    pub fn activeConnections(self: *const Listener) usize {
-        return self.active.load(.acquire);
+    pub fn activeConnections(self: *Listener) usize {
+        self.slots_mutex.lock();
+        defer self.slots_mutex.unlock();
+        self.reapFinishedLocked();
+        return self.activeCountLocked();
     }
 
     pub fn port(self: *const Listener) u16 {
         return self.server.socket.address.getPort();
     }
 
-    fn tryAdmit(self: *Listener) bool {
-        while (true) {
-            const cur = self.active.load(.monotonic);
-            if (cur >= self.max_connections) return false;
-            if (self.active.cmpxchgWeak(cur, cur + 1, .monotonic, .monotonic) == null) return true;
+    fn activeCountLocked(self: *const Listener) usize {
+        var count: usize = 0;
+        for (self.slots) |slot| {
+            if (slot.in_use) count += 1;
+        }
+        return count;
+    }
+
+    /// Joins and frees every slot whose handler has already signaled
+    /// completion (`finishConnection`). By the time `finished` is visible
+    /// here (under `slots_mutex`, the same lock `finishConnection` sets it
+    /// under), the handler thread has no remaining work -- `finished` is
+    /// the last thing it does before returning -- so `join()` here never
+    /// blocks meaningfully. Caller holds `slots_mutex`.
+    fn reapFinishedLocked(self: *Listener) void {
+        for (&self.slots) |*slot| {
+            // `thread != null` matters here: `acceptLoop` reserves a slot
+            // (via `tryAdmit`) and spawns its handler *before* it can store
+            // the resulting `std.Thread` back into `slots[idx].thread`. A
+            // handler fast enough to finish inside that window would set
+            // `finished = true` while `thread` is still `null`; resetting
+            // the slot right then would both leak that not-yet-stored
+            // handle and free the slot for a *different* connection just
+            // before `acceptLoop` overwrites its `thread` field with the
+            // stale handle. Leaving `finished`-but-not-yet-handled slots
+            // alone for one more pass (they are still `in_use`, so still
+            // correctly counted) avoids that.
+            if (slot.in_use and slot.finished and slot.thread != null) {
+                slot.thread.?.join();
+                slot.* = .{};
+            }
         }
     }
 
-    fn release(self: *Listener) void {
-        _ = self.active.fetchSub(1, .release);
+    /// Admits `fd` from `peer` if both the global and (when configured)
+    /// per-IP caps allow it, reserving a slot and returning its index.
+    /// Caller spawns the handler and must store the resulting `std.Thread`
+    /// into `slots[idx].thread` (see `acceptLoop`); nothing joins a
+    /// not-yet-stored `null` thread handle, since a reserved slot only
+    /// becomes reapable once `finished` is set, and `finishConnection`
+    /// runs strictly after the accept loop has stored the handle.
+    fn tryAdmit(self: *Listener, peer: ?PeerKey, fd: std.posix.fd_t) ?usize {
+        self.slots_mutex.lock();
+        defer self.slots_mutex.unlock();
+        self.reapFinishedLocked();
+
+        if (self.activeCountLocked() >= self.max_connections) return null;
+        if (self.max_connections_per_ip > 0) {
+            if (peer) |p| {
+                var count_for_peer: u32 = 0;
+                for (self.slots) |slot| {
+                    if (slot.in_use) {
+                        if (slot.peer) |sp| {
+                            if (PeerKey.eql(sp, p)) count_for_peer += 1;
+                        }
+                    }
+                }
+                if (count_for_peer >= self.max_connections_per_ip) return null;
+            }
+        }
+        for (&self.slots, 0..) |*slot, i| {
+            if (!slot.in_use) {
+                slot.* = .{ .in_use = true, .fd = fd, .peer = peer };
+                return i;
+            }
+        }
+        return null; // unreachable: active < max_connections <= slots.len
+    }
+
+    /// Releases a slot reserved by `tryAdmit` that never got a handler
+    /// thread (spawn failure); unlike `finishConnection`, there is no
+    /// thread to join.
+    fn releaseUnstarted(self: *Listener, idx: usize) void {
+        self.slots_mutex.lock();
+        defer self.slots_mutex.unlock();
+        self.slots[idx] = .{};
+    }
+
+    /// Called by a handler thread as the very last thing it does
+    /// (`handleConnection`'s `defer`) to mark its slot reapable.
+    fn finishConnection(self: *Listener, idx: usize) void {
+        self.slots_mutex.lock();
+        defer self.slots_mutex.unlock();
+        self.slots[idx].finished = true;
     }
 
     fn acceptLoop(self: *Listener) void {
@@ -134,7 +284,9 @@ pub const Listener = struct {
             if ((pfd[0].revents & std.posix.POLL.IN) == 0) continue;
 
             while (!self.stopping.load(.acquire)) {
-                const client_fd = std.c.accept(self.listen_fd, null, null);
+                var peer_storage: std.c.sockaddr.storage = undefined;
+                var peer_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
+                const client_fd = std.c.accept(self.listen_fd, @ptrCast(&peer_storage), &peer_len);
                 if (client_fd < 0) {
                     const e = std.posix.errno(client_fd);
                     if (e == .AGAIN) break;
@@ -142,38 +294,73 @@ pub const Listener = struct {
                     break;
                 }
                 _ = std.c.fcntl(client_fd, std.c.F.SETFD, @as(c_int, 1)); // FD_CLOEXEC
+                // #897 review: some platforms hand an accepted connection
+                // the listening socket's O_NONBLOCK; force it back to
+                // blocking so `handleConnection`'s SO_RCVTIMEO-bounded reads
+                // actually wait instead of returning WouldBlock instantly.
+                setBlocking(client_fd) catch {
+                    _ = std.c.close(client_fd);
+                    continue;
+                };
 
                 // Excess connections are accepted off the kernel backlog and
                 // immediately closed rather than left pending or queued
                 // behind the main listener's worker pool (§8.0): a flood here
-                // can never exceed this listener's own small bounded pool.
-                if (self.stopping.load(.acquire) or !self.tryAdmit()) {
+                // can never exceed this listener's own small bounded pool,
+                // nor its per-IP share of it.
+                const peer = PeerKey.fromSockAddr(&peer_storage);
+                const slot_idx = if (self.stopping.load(.acquire)) null else self.tryAdmit(peer, client_fd);
+                const idx = slot_idx orelse {
                     _ = std.c.close(client_fd);
-                    continue;
-                }
-                const handle = std.Thread.spawn(.{}, handleConnection, .{ self, client_fd }) catch {
-                    _ = std.c.close(client_fd);
-                    self.release();
                     continue;
                 };
-                handle.detach();
+                const handle = std.Thread.spawn(.{}, handleConnection, .{ self, client_fd, idx }) catch {
+                    _ = std.c.close(client_fd);
+                    self.releaseUnstarted(idx);
+                    continue;
+                };
+                // Joinable, not detached (#897 review): `reapFinishedLocked`
+                // (from `tryAdmit` opportunistically, and unconditionally
+                // from `deinit`) is the only code that joins this handle,
+                // and only after the handler has signaled completion.
+                self.slots_mutex.lock();
+                self.slots[idx].thread = handle;
+                self.slots_mutex.unlock();
             }
         }
     }
 
-    fn handleConnection(self: *Listener, fd: std.posix.fd_t) void {
+    fn handleConnection(self: *Listener, fd: std.posix.fd_t, slot_idx: usize) void {
+        const started_ms = compat.milliTimestamp();
         defer {
             _ = std.c.close(fd);
-            self.release();
+            self.finishConnection(slot_idx);
         }
-        const started_ms = compat.milliTimestamp();
-        compat.setSocketTimeoutsMs(fd, self.head_read_deadline_ms, self.head_read_deadline_ms);
+        const head_deadline_ms = started_ms + @as(i64, self.head_read_deadline_ms);
+        const total_deadline_ms = started_ms + @as(i64, self.total_deadline_ms);
         const stream = compat.NetStream{ .handle = fd, .inner = null };
 
         var buf: [max_head_bytes]u8 = undefined;
         var len: usize = 0;
         var head_len: ?usize = null;
         while (len < buf.len) {
+            // #897 review: recompute and reapply the *absolute* remaining
+            // budget before every blocking read, rather than resetting a
+            // fixed per-read timeout. A peer that trickles one byte just
+            // before each read's timeout would otherwise keep resetting an
+            // unbounded clock; here each read's own timeout shrinks toward
+            // zero as either the head or total deadline approaches, so the
+            // loop cannot run past `min(head_deadline, total_deadline)` no
+            // matter how the peer paces its bytes.
+            const now = compat.milliTimestamp();
+            const deadline_ms = @min(head_deadline_ms, total_deadline_ms);
+            if (now >= deadline_ms) break;
+            const remaining_ms: u32 = @intCast(deadline_ms - now);
+            // Fail closed, not silently unbounded, if the timeout can't be
+            // set (a `{0,0}` SO_RCVTIMEO means "block forever" on every
+            // supported platform, so skipping a failed setup here would be
+            // exactly the bug this rewrite fixes).
+            compat.setSocketTimeoutsMsChecked(fd, remaining_ms, remaining_ms) catch return;
             const n = stream.read(buf[len..]) catch break;
             if (n == 0) break;
             len += n;
@@ -181,16 +368,17 @@ pub const Listener = struct {
                 head_len = idx + 4;
                 break;
             }
-            if (self.elapsedMs(started_ms) >= self.total_deadline_ms) break;
         }
         // No complete head within the byte cap, the read deadline, or the
         // total deadline: close without a response rather than acting on a
         // request that was never fully read (slowloris / oversize head).
         const end = head_len orelse return;
 
-        const remaining = self.remainingMs(started_ms);
-        if (remaining == 0) return;
-        compat.setSocketTimeoutsMs(fd, remaining, remaining);
+        const now_after_head = compat.milliTimestamp();
+        if (now_after_head >= total_deadline_ms) return;
+        const remaining_ms: u32 = @intCast(total_deadline_ms - now_after_head);
+        // Bounds the response write by the same absolute total deadline.
+        compat.setSocketTimeoutsMsChecked(fd, remaining_ms, remaining_ms) catch return;
 
         const parsed = request_mod.Request.parseHead(self.allocator, buf[0..end], 0) catch {
             respondStatus(self.allocator, stream, .bad_request);
@@ -199,18 +387,6 @@ pub const Listener = struct {
         var req = parsed.request;
         defer req.deinit();
         self.dispatch(&req, stream);
-    }
-
-    fn elapsedMs(self: *const Listener, started_ms: i64) u32 {
-        const now = compat.milliTimestamp();
-        if (now <= started_ms) return 0;
-        const diff = now - started_ms;
-        if (diff >= self.total_deadline_ms) return self.total_deadline_ms;
-        return @intCast(diff);
-    }
-
-    fn remainingMs(self: *const Listener, started_ms: i64) u32 {
-        return self.total_deadline_ms - self.elapsedMs(started_ms);
     }
 
     fn dispatch(self: *Listener, req: *const request_mod.Request, stream: compat.NetStream) void {
@@ -286,6 +462,21 @@ fn setNonBlocking(fd: std.posix.fd_t) !void {
     if (flags < 0) return error.Unexpected;
     const nonblock: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
     if (std.c.fcntl(fd, std.c.F.SETFL, flags | nonblock) < 0) return error.Unexpected;
+}
+
+/// #897 review: on at least one supported platform, a connection `accept()`-ed
+/// off this listener's non-blocking listening socket inherits `O_NONBLOCK`
+/// on the new fd too. `handleConnection`'s absolute-deadline reads depend on
+/// `SO_RCVTIMEO` actually blocking -- on a non-blocking socket it is inert
+/// and every read returns `WouldBlock` immediately regardless of the
+/// timeout, which would silently turn every deadline into "close instantly"
+/// instead of "close at the deadline". Force each accepted connection back
+/// to blocking mode before handing it to a handler.
+fn setBlocking(fd: std.posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.Unexpected;
+    const nonblock: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
+    if (std.c.fcntl(fd, std.c.F.SETFL, flags & ~nonblock) < 0) return error.Unexpected;
 }
 
 const testing = std.testing;
@@ -390,13 +581,56 @@ test "Listener admission cap accepts up to the configured bound and rejects beyo
     try listener.start(allocator, "127.0.0.1", 0, .{ .managed_hosts = &managed, .store = &store, .max_connections = 2 });
     defer listener.deinit();
 
-    try testing.expect(listener.tryAdmit());
-    try testing.expect(listener.tryAdmit());
-    try testing.expect(!listener.tryAdmit());
-    listener.release();
-    try testing.expect(listener.tryAdmit());
-    listener.release();
-    listener.release();
+    const slot1 = listener.tryAdmit(null, -1) orelse return error.TestUnexpectedResult;
+    const slot2 = listener.tryAdmit(null, -1) orelse return error.TestUnexpectedResult;
+    try testing.expect(listener.tryAdmit(null, -1) == null);
+    listener.releaseUnstarted(slot1);
+    const slot3 = listener.tryAdmit(null, -1) orelse return error.TestUnexpectedResult;
+    listener.releaseUnstarted(slot2);
+    listener.releaseUnstarted(slot3);
+    try testing.expectEqual(@as(usize, 0), listener.activeConnections());
+}
+
+test "Listener clamps an overridden max_connections to the §8.0 ceiling of 64 (#897 review)" {
+    const allocator = testing.allocator;
+    var store = ChallengeStore.init(allocator);
+    defer store.deinit();
+    const managed = [_][]const u8{"a.example.com"};
+    var listener: Listener = undefined;
+    try listener.start(allocator, "127.0.0.1", 0, .{ .managed_hosts = &managed, .store = &store, .max_connections = 1_000 });
+    defer listener.deinit();
+    try testing.expectEqual(default_max_connections, listener.max_connections);
+}
+
+test "Listener per-IP admission cap bounds one peer without starving a different peer (#897 review)" {
+    const allocator = testing.allocator;
+    var store = ChallengeStore.init(allocator);
+    defer store.deinit();
+    const managed = [_][]const u8{"a.example.com"};
+    var listener: Listener = undefined;
+    try listener.start(allocator, "127.0.0.1", 0, .{
+        .managed_hosts = &managed,
+        .store = &store,
+        .max_connections = 4,
+        .max_connections_per_ip = 2,
+    });
+    defer listener.deinit();
+
+    const peer_a: PeerKey = .{ .family = std.posix.AF.INET, .bytes = [_]u8{ 10, 0, 0, 1 } ++ ([_]u8{0} ** 12) };
+    const peer_b: PeerKey = .{ .family = std.posix.AF.INET, .bytes = [_]u8{ 10, 0, 0, 2 } ++ ([_]u8{0} ** 12) };
+
+    const a1 = listener.tryAdmit(peer_a, -1) orelse return error.TestUnexpectedResult;
+    const a2 = listener.tryAdmit(peer_a, -1) orelse return error.TestUnexpectedResult;
+    // The global cap (4) still has room, but peer_a alone has already
+    // saturated its own per-IP cap (2): a third connection from the same
+    // address is rejected even though the listener as a whole is not full.
+    try testing.expect(listener.tryAdmit(peer_a, -1) == null);
+    // A different peer is unaffected by peer_a's per-IP saturation.
+    const b1 = listener.tryAdmit(peer_b, -1) orelse return error.TestUnexpectedResult;
+
+    listener.releaseUnstarted(a1);
+    listener.releaseUnstarted(a2);
+    listener.releaseUnstarted(b1);
     try testing.expectEqual(@as(usize, 0), listener.activeConnections());
 }
 
@@ -436,6 +670,139 @@ test "Listener closes a connection that never completes its head within the tota
         compat.sleepNs(10 * std.time.ns_per_ms);
     }
     try testing.expect(closed);
+}
+
+fn trickleWriter(stream: compat.NetStream, count: usize, interval_ms: u64) void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        stream.writeAll("x") catch return;
+        compat.sleepNs(interval_ms * std.time.ns_per_ms);
+    }
+}
+
+test "Listener closes by the absolute head deadline even when the total deadline is looser (#897 review)" {
+    const allocator = testing.allocator;
+    var store = ChallengeStore.init(allocator);
+    defer store.deinit();
+    const managed = [_][]const u8{"a.example.com"};
+    var listener: Listener = undefined;
+    try listener.start(allocator, "127.0.0.1", 0, .{
+        .managed_hosts = &managed,
+        .store = &store,
+        .head_read_deadline_ms = 120,
+        .total_deadline_ms = 200,
+    });
+    defer listener.deinit();
+
+    const stream = try compat.tcpConnectToHost(allocator, "127.0.0.1", listener.port());
+    defer stream.close();
+
+    const started_ms = compat.milliTimestamp();
+    // One byte every 40 ms, never completing the head. Resetting a fixed
+    // per-read timeout on every successful read would let this run to the
+    // 200 ms total-deadline check instead (the bug this rewrite fixes);
+    // the absolute 120 ms head deadline must close it well before that.
+    const writer_thread = try std.Thread.spawn(.{}, trickleWriter, .{ stream, @as(usize, 10), @as(u64, 40) });
+    defer writer_thread.join();
+
+    var buf: [16]u8 = undefined;
+    var closed = false;
+    while (true) {
+        const n = stream.read(&buf) catch {
+            closed = true;
+            break;
+        };
+        if (n == 0) {
+            closed = true;
+            break;
+        }
+    }
+    const elapsed_ms = compat.milliTimestamp() - started_ms;
+    try testing.expect(closed);
+    try testing.expect(elapsed_ms < 180);
+}
+
+test "Listener closes by the absolute total deadline, not a stale fixed per-read timeout (#897 review)" {
+    const allocator = testing.allocator;
+    var store = ChallengeStore.init(allocator);
+    defer store.deinit();
+    const managed = [_][]const u8{"a.example.com"};
+    var listener: Listener = undefined;
+    try listener.start(allocator, "127.0.0.1", 0, .{
+        .managed_hosts = &managed,
+        .store = &store,
+        .head_read_deadline_ms = 500,
+        .total_deadline_ms = 150,
+    });
+    defer listener.deinit();
+
+    const stream = try compat.tcpConnectToHost(allocator, "127.0.0.1", listener.port());
+    defer stream.close();
+
+    const started_ms = compat.milliTimestamp();
+    // A partial header sent once, then silence. The old code set
+    // SO_RCVTIMEO to the fixed 500 ms head-read deadline once and only
+    // checked the 150 ms total deadline after a read *returned*; a read
+    // that blocks until its own timeout never reaches that check, so the
+    // stall would run the full 500 ms instead of closing at ~150 ms.
+    try stream.writeAll("GET /.well-known/acme-challenge/abcdefghijklmnop HTTP/1.1\r\n");
+
+    var buf: [16]u8 = undefined;
+    var closed = false;
+    while (true) {
+        const n = stream.read(&buf) catch {
+            closed = true;
+            break;
+        };
+        if (n == 0) {
+            closed = true;
+            break;
+        }
+    }
+    const elapsed_ms = compat.milliTimestamp() - started_ms;
+    try testing.expect(closed);
+    try testing.expect(elapsed_ms < 300);
+}
+
+test "Listener.deinit forcibly unblocks and joins an in-flight handler instead of freeing early (#897 review)" {
+    const allocator = testing.allocator;
+    var store = ChallengeStore.init(allocator);
+    defer store.deinit();
+    const managed = [_][]const u8{"a.example.com"};
+    var listener: Listener = undefined;
+    try listener.start(allocator, "127.0.0.1", 0, .{
+        .managed_hosts = &managed,
+        .store = &store,
+        // A head-read deadline far longer than the total deadline: the old
+        // code's fixed SO_RCVTIMEO used this value directly, so a stuck
+        // handler's blocking read could still be waiting on it long after
+        // `deinit`'s old bounded settle wait (total_deadline_ms + 1 s) gave
+        // up and freed the listener out from under it. The 400 ms total
+        // deadline (rather than something tighter) leaves comfortable
+        // margin for the polling loop below to observe the connection
+        // before the handler's own deadline reaps it on a slow CI host.
+        .head_read_deadline_ms = 5_000,
+        .total_deadline_ms = 400,
+    });
+
+    const stream = try compat.tcpConnectToHost(allocator, "127.0.0.1", listener.port());
+    try stream.writeAll("GET /.well-known/acme-challenge/abcdefghijklmnop HTTP/1.1\r\n");
+
+    var waited: usize = 0;
+    while (listener.activeConnections() == 0 and waited < 2_000) : (waited += 1) {
+        compat.sleepNs(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(listener.activeConnections() > 0);
+
+    // The regression check is `deinit` itself: it must not return (and
+    // free `self`/`self.store`) until the handler has actually finished.
+    // A crash, a hang past the stale 5 s timeout, or a use-after-free
+    // under a sanitizer is the failure mode this guards against.
+    const deinit_started_ms = compat.milliTimestamp();
+    listener.deinit();
+    const deinit_elapsed_ms = compat.milliTimestamp() - deinit_started_ms;
+    stream.close();
+    try testing.expect(deinit_elapsed_ms < 3_000);
 }
 
 test "Listener.start fails deterministically on an invalid listen address" {

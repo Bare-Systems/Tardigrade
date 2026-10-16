@@ -2623,7 +2623,43 @@ pub fn parseAcmeHttp01Listen(raw: []const u8) !AcmeHttp01ListenAddr {
     if (parts[0].len == 0) return error.InvalidConfigValue;
     const port = std.fmt.parseInt(u16, parts[1], 10) catch return error.InvalidConfigValue;
     if (port == 0) return error.InvalidConfigValue;
+    // #897 review: validate with the exact literal-IP-only parser
+    // `Listener.start` binds with, so an unresolved hostname (`localhost`,
+    // `not-an-ip-address`) that splits cleanly into host:port but can never
+    // actually bind fails configuration validation here -- before any
+    // socket opens (§8.0) -- instead of surfacing only as a late startup
+    // bind error.
+    _ = std.Io.net.IpAddress.parse(parts[0], port) catch return error.InvalidConfigValue;
     return .{ .host = parts[0], .port = port };
+}
+
+/// True when `a` and `b` are the same bindable endpoint, or when one is the
+/// IPv4/IPv6 wildcard address on the same port as the other: a wildcard bind
+/// also accepts connections addressed to every specific local address on
+/// that port, so a dedicated listener on a specific address and a wildcard
+/// listener on the main port cannot both bind separately (#897 review).
+/// Cross-family (IPv4 vs IPv6) pairs are never reported as overlapping here;
+/// the OS's own dual-stack behavior for that case is not modeled.
+fn listenAddressesOverlap(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
+    if (a.getPort() != b.getPort()) return false;
+    return switch (a) {
+        .ip4 => |a4| switch (b) {
+            .ip4 => |b4| a4.eql(b4) or isWildcardIp4(a4) or isWildcardIp4(b4),
+            .ip6 => false,
+        },
+        .ip6 => |a6| switch (b) {
+            .ip6 => |b6| a6.eql(b6) or isWildcardIp6(a6) or isWildcardIp6(b6),
+            .ip4 => false,
+        },
+    };
+}
+
+fn isWildcardIp4(addr: std.Io.net.Ip4Address) bool {
+    return std.mem.allEqual(u8, &addr.bytes, 0);
+}
+
+fn isWildcardIp6(addr: std.Io.net.Ip6Address) bool {
+    return std.mem.allEqual(u8, &addr.bytes, 0);
 }
 
 /// `TARDIGRADE_TLS_X` -> `TARDIGRADE_X`: the name a native config-file
@@ -3749,11 +3785,23 @@ fn validateAcmeConfig(cfg: *const EdgeConfig) !void {
     // otherwise reach ordinary application routing instead of the bounded
     // challenge-only listener (#881).
     const http01_listen = parseAcmeHttp01Listen(cfg.tls_acme_http01_listen) catch {
-        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_HTTP01_LISTEN must be host:port", .{});
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_HTTP01_LISTEN must be host:port with a literal, bindable IP address", .{});
         return error.InvalidConfigValue;
     };
-    if (std.mem.eql(u8, http01_listen.host, cfg.listen_host) and http01_listen.port == cfg.listen_port) {
-        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_HTTP01_LISTEN must not equal the main listener ({s}:{d})", .{ cfg.listen_host, cfg.listen_port });
+    // #897 review: compare normalized endpoints (catching wildcard overlap,
+    // e.g. main `127.0.0.1:80` vs ACME `0.0.0.0:80`), not raw host strings.
+    // `parseAcmeHttp01Listen` above already proved `http01_listen.host`
+    // parses; `cfg.listen_host` is validated the same way at bind time
+    // (`edge_gateway.run`), so a parse failure here just means that bind
+    // will fail on its own and the raw-string fallback below still catches
+    // the exact-match case.
+    const http01_addr = std.Io.net.IpAddress.parse(http01_listen.host, http01_listen.port) catch unreachable;
+    const overlaps = if (std.Io.net.IpAddress.parse(cfg.listen_host, cfg.listen_port)) |main_addr|
+        listenAddressesOverlap(main_addr, http01_addr)
+    else |_|
+        std.mem.eql(u8, http01_listen.host, cfg.listen_host) and http01_listen.port == cfg.listen_port;
+    if (overlaps) {
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_ACME_HTTP01_LISTEN must not overlap the main listener ({s}:{d})", .{ cfg.listen_host, cfg.listen_port });
         return error.InvalidConfigValue;
     }
 }
@@ -4468,6 +4516,33 @@ test "parseAcmeHttp01Listen parses host:port and rejects malformed addresses (#8
     try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("host:0"));
     try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("host:not-a-number"));
     try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("host:99999"));
+}
+
+test "parseAcmeHttp01Listen rejects unresolved hostnames (#897 review)" {
+    // These split cleanly into host:port but are not literal IP addresses,
+    // so `Listener.start`'s `std.Io.net.IpAddress.parse` can never bind
+    // them; validation must reject them with the same parser.
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("localhost:80"));
+    try std.testing.expectError(error.InvalidConfigValue, parseAcmeHttp01Listen("not-an-ip-address:80"));
+}
+
+test "listenAddressesOverlap reports wildcard-vs-specific same-port overlap but not distinct addresses (#897 review)" {
+    const wildcard4 = try std.Io.net.IpAddress.parse("0.0.0.0", 80);
+    const specific4 = try std.Io.net.IpAddress.parse("127.0.0.1", 80);
+    const other_specific4 = try std.Io.net.IpAddress.parse("10.0.0.1", 80);
+    try std.testing.expect(listenAddressesOverlap(wildcard4, specific4));
+    try std.testing.expect(listenAddressesOverlap(specific4, wildcard4));
+    try std.testing.expect(listenAddressesOverlap(specific4, specific4));
+    try std.testing.expect(!listenAddressesOverlap(specific4, other_specific4));
+
+    const specific4_other_port = try std.Io.net.IpAddress.parse("127.0.0.1", 81);
+    try std.testing.expect(!listenAddressesOverlap(specific4, specific4_other_port));
+
+    const wildcard6 = try std.Io.net.IpAddress.parse("::", 80);
+    const specific6 = try std.Io.net.IpAddress.parse("::1", 80);
+    try std.testing.expect(listenAddressesOverlap(wildcard6, specific6));
+    // Cross-family pairs are never reported as overlapping.
+    try std.testing.expect(!listenAddressesOverlap(wildcard4, wildcard6));
 }
 
 test "parse token hashes from csv" {
@@ -5576,6 +5651,28 @@ test "automatic HTTPS grammar is validated before the support gate (#832)" {
                 // §8.0: the dedicated listener cannot equal the main one.
                 fn f(c: *EdgeConfig) void {
                     c.tls_acme_http01_listen = "0.0.0.0:8069";
+                }
+            }.f,
+        },
+        .{
+            .mutate = struct {
+                // #897 review: the main listener's "0.0.0.0" wildcard also
+                // accepts connections addressed to every specific local
+                // address on the same port, so a specific-address ACME
+                // listener on the main port overlaps too, not only an exact
+                // string match.
+                fn f(c: *EdgeConfig) void {
+                    c.tls_acme_http01_listen = "127.0.0.1:8069";
+                }
+            }.f,
+        },
+        .{
+            .mutate = struct {
+                // #897 review: an unresolved hostname splits cleanly into
+                // host:port but can never bind; reject it here rather than
+                // only failing much later at `Listener.start`.
+                fn f(c: *EdgeConfig) void {
+                    c.tls_acme_http01_listen = "localhost:80";
                 }
             }.f,
         },

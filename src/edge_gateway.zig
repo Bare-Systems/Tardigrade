@@ -330,6 +330,11 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         acme_http01_listener.start(state_allocator, http01_addr.host, http01_addr.port, .{
             .managed_hosts = cfg.tls_acme_domains,
             .store = &state.acme_challenge_store.?,
+            // §8.0: "per-IP accept cap shared with existing accept limits"
+            // (#897 review) -- the same configured bound as the main
+            // listener's per-IP cap, enforced independently in this
+            // listener's own small bounded pool.
+            .max_connections_per_ip = cfg.max_connections_per_ip,
         }) catch |err| {
             state.logger.err(null, "failed to bind ACME HTTP-01 challenge listener on {s}:{d}: {}", .{ http01_addr.host, http01_addr.port, err });
             return err;

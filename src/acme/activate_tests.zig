@@ -252,6 +252,39 @@ fn chainWithIntermediate(allocator: std.mem.Allocator, hostnames: []const []cons
     return .{ .pem = pem, .key = key };
 }
 
+/// A two-entry leaf-first chain shaped exactly like `chainWithIntermediate`,
+/// except the leaf is signed by an unrelated key instead of the
+/// intermediate's — the issuer/subject DNs still match, so verification
+/// reaches the signature check and deterministically fails it.
+fn chainWithBadLeafSignature(allocator: std.mem.Allocator, hostnames: []const []const u8, not_before: i64, not_after: i64) !struct {
+    pem: []u8,
+    key: account_mod.AccountKey,
+} {
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var ca_seed: [EcdsaP256Sha256.KeyPair.seed_length]u8 = undefined;
+    zig_compat.randomBytes(&ca_seed);
+    const ca_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(ca_seed);
+    const ca_pub_sec1 = ca_kp.public_key.toUncompressedSec1();
+    const ca_extensions = [_][]const u8{try basicConstraintsCaExtension(arena)};
+    const ca_der = try buildCertDer(arena, ca_kp, 2, "Tardigrade ACME Test CA", "Tardigrade ACME Test CA", &ca_pub_sec1, not_before, not_after, &ca_extensions);
+
+    var wrong_seed: [EcdsaP256Sha256.KeyPair.seed_length]u8 = undefined;
+    zig_compat.randomBytes(&wrong_seed);
+    const wrong_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(wrong_seed);
+
+    var key = try account_mod.AccountKey.generate();
+    errdefer key.deinit();
+    const leaf_pub_sec1 = key.key.publicKeySec1();
+    const leaf_extensions = [_][]const u8{try sanExtension(arena, hostnames)};
+    const leaf_der = try buildCertDer(arena, wrong_kp, 1, "Tardigrade ACME Test CA", "acme-leaf", &leaf_pub_sec1, not_before, not_after, &leaf_extensions);
+
+    const pem = try pemEncodeChain(allocator, &.{ leaf_der, ca_der });
+    return .{ .pem = pem, .key = key };
+}
+
 const hour: i64 = 60 * 60;
 const day: i64 = 24 * hour;
 const base_now: i64 = 1_800_000_000; // 2027-01-15, well inside UTCTime's 2-digit-year range.
@@ -383,18 +416,40 @@ test "verifyChain accepts a coherent two-certificate chain and rejects a tampere
         fixture.key.deinit();
         allocator.free(fixture.pem);
     }
-
     _ = try activate.verifyChain(allocator, &fixture.key, fixture.pem, .{ .hostnames = &hosts, .now = base_now });
 
-    // Flip a byte inside the PEM's base64 body (comfortably inside the
-    // leaf's signature bytes near the end of the first block) and confirm
-    // the chain no longer verifies.
-    const tampered = try allocator.dupe(u8, fixture.pem);
-    defer allocator.free(tampered);
-    const marker = "-----END CERTIFICATE-----";
-    const end = std.mem.indexOf(u8, tampered, marker).?;
-    tampered[end - 4] = if (tampered[end - 4] == 'A') 'B' else 'A';
-    try testing.expectError(error.CertificateSignatureInvalid, activate.verifyChain(allocator, &fixture.key, tampered, .{ .hostnames = &hosts, .now = base_now }));
+    // An unambiguously well-formed chain whose leaf was actually signed by
+    // an unrelated key (its issuer DN still matches the intermediate's
+    // subject DN, so chain ordering passes before the signature check
+    // runs). Deterministic regardless of the random ECDSA signature's DER
+    // encoding/length, unlike flipping an arbitrary byte near the end of
+    // the PEM body, which can land on a DER tag/length/boundary instead of
+    // signature content and produce `MalformedChain` on some seeds.
+    var tampered = try chainWithBadLeafSignature(allocator, &hosts, base_now - hour, base_now + 90 * day);
+    defer {
+        tampered.key.deinit();
+        allocator.free(tampered.pem);
+    }
+    try testing.expectError(error.CertificateSignatureInvalid, activate.verifyChain(allocator, &tampered.key, tampered.pem, .{ .hostnames = &hosts, .now = base_now }));
+}
+
+test "verifyChain rejects a structurally malformed certificate" {
+    const allocator = testing.allocator;
+    const hosts = [_][]const u8{"a.example.com"};
+    var fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 90 * day);
+    defer {
+        fixture.key.deinit();
+        allocator.free(fixture.pem);
+    }
+
+    // An invalid base64 character inside the PEM body breaks decoding
+    // independent of the certificate's random content.
+    var corrupted = try allocator.dupe(u8, fixture.pem);
+    defer allocator.free(corrupted);
+    const marker = "-----BEGIN CERTIFICATE-----\n";
+    const start = std.mem.indexOf(u8, corrupted, marker).? + marker.len;
+    corrupted[start] = '!';
+    try testing.expectError(error.MalformedChain, activate.verifyChain(allocator, &fixture.key, corrupted, .{ .hostnames = &hosts, .now = base_now }));
 }
 
 // ---------------------------------------------------------------------------
@@ -904,4 +959,85 @@ test "pruneGenerations reclaims orphans past the 64-entry directory snapshot" {
     var lens: [64]usize = undefined;
     const count = try generations.listNamesStrict(&names, &lens);
     try testing.expectEqual(@as(usize, 2), count);
+}
+
+test "pruneGenerations reclaims orphans behind a wall of retained corrupt archives" {
+    const allocator = testing.allocator;
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try state_mod.StateDir.open(tmp.path);
+    defer state.close();
+
+    const hosts = [_][]const u8{"a.example.com"};
+    var fixture = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 90 * day);
+    defer {
+        fixture.key.deinit();
+        allocator.free(fixture.pem);
+    }
+    const first = try activate.verifyAndPersist(allocator, &state, "group-1", &fixture.key, fixture.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    const orphan_count = 20;
+    {
+        var groups = try state.openSubdirStrict("groups");
+        defer groups.close();
+        var group = try groups.openSubdirStrict("group-1");
+        defer group.close();
+        var generations = try group.openSubdirStrict("generations");
+        defer generations.close();
+
+        // More retained `*.corrupt-*` archives than a single 64-entry
+        // enumeration snapshot can hold, so a scan that gives up after the
+        // first 64 raw entries would never see the orphans below,
+        // regardless of the filesystem's iteration order.
+        var i: u64 = 0;
+        while (i < 70) : (i += 1) {
+            var name_buf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "{d}-{x:0>16}.corrupt-{d}", .{ 500 + i, i, i }) catch unreachable;
+            var corrupt = try generations.openOrCreateSubdir(name);
+            corrupt.close();
+        }
+        // Real orphans, sitting behind the archive wall in creation order.
+        var j: u64 = 1000;
+        while (j < 1000 + orphan_count) : (j += 1) {
+            var name_buf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "{d}-{x:0>16}", .{ j, j }) catch unreachable;
+            var orphan = try generations.openOrCreateSubdir(name);
+            orphan.close();
+        }
+    }
+
+    var second = try selfSignedLeaf(allocator, &hosts, base_now - hour, base_now + 120 * day);
+    defer {
+        second.key.deinit();
+        allocator.free(second.pem);
+    }
+    const persisted = try activate.verifyAndPersist(allocator, &state, "group-1", &second.key, second.pem, .{ .hostnames = &hosts, .now = base_now });
+
+    var groups = try state.openSubdirStrict("groups");
+    defer groups.close();
+    var group = try groups.openSubdirStrict("group-1");
+    defer group.close();
+    var generations = try group.openSubdirStrict("generations");
+    defer generations.close();
+
+    var j: u64 = 1000;
+    while (j < 1000 + orphan_count) : (j += 1) {
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{d}-{x:0>16}", .{ j, j }) catch unreachable;
+        try testing.expectError(error.NotFound, generations.openSubdirStrict(name));
+    }
+
+    var i: u64 = 0;
+    while (i < 70) : (i += 1) {
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{d}-{x:0>16}.corrupt-{d}", .{ 500 + i, i, i }) catch unreachable;
+        var corrupt = try generations.openSubdirStrict(name);
+        corrupt.close();
+    }
+
+    // The two live generations are untouched by the sweep.
+    var loaded = (try activate.loadCommitted(allocator, &state, "group-1", &hosts, base_now)).?;
+    defer loaded.deinit(allocator);
+    try testing.expectEqualStrings(persisted.generationId(), loaded.generationId());
+    try testing.expect(!std.mem.eql(u8, first.generationId(), persisted.generationId()));
 }

@@ -286,6 +286,35 @@ pub const SubDir = struct {
         }
         return count;
     }
+
+    /// Scan every entry in this directory — never bounded by the batch
+    /// size itself — and collect up to `out.len` names for which
+    /// `predicate(ctx, name)` is true. Unlike `listNames`/`listNamesStrict`,
+    /// entries the caller does not care about (e.g. retained `*.corrupt-*`
+    /// archives, or names already spoken for) are skipped without consuming
+    /// a slot, so a directory with arbitrarily many uninteresting entries
+    /// ahead of the interesting ones can never make a full scan report zero
+    /// candidates. Propagates iterator I/O failures rather than treating
+    /// them as a complete (or even successful) scan.
+    pub fn listMatching(
+        self: *const SubDir,
+        out: *[64][64]u8,
+        out_len: *[64]usize,
+        ctx: anytype,
+        comptime predicate: fn (@TypeOf(ctx), []const u8) bool,
+    ) Error!usize {
+        var it = self.dir().iterate();
+        var count: usize = 0;
+        while (it.next(zig_compat.io()) catch return error.IoFailure) |entry| {
+            if (entry.name.len == 0 or entry.name.len >= 64) continue;
+            if (!predicate(ctx, entry.name)) continue;
+            if (count == out.len) return count;
+            @memcpy(out[count][0..entry.name.len], entry.name);
+            out_len[count] = entry.name.len;
+            count += 1;
+        }
+        return count;
+    }
 };
 
 /// `file`, when non-null, restricts the match to one write target (or
@@ -323,7 +352,12 @@ fn writeFileAtomicRaw(dir_fd: zig_compat.Fd, fault: *Fault, fault_file: *const ?
     zig_compat.fchmodFd(fd, mode) catch return error.IoFailure;
 
     try hitFault(fault, fault_file, name, .write);
-    const limit = if (fault.* == .short_write) data.len / 2 else data.len;
+    // Mirror hitFault's own target check: an untargeted short-write fault
+    // must not truncate an earlier, differently-named write on its way to
+    // the file the test actually means to hit.
+    const targeted_short_write = builtin.is_test and fault.* == .short_write and
+        (fault_file.* == null or std.mem.eql(u8, fault_file.*.?, name));
+    const limit = if (targeted_short_write) data.len / 2 else data.len;
     zig_compat.writeAllFd(fd, data[0..limit]) catch return error.IoFailure;
     try hitFault(fault, fault_file, name, .short_write);
 
@@ -744,6 +778,26 @@ test "ACME state: a failure at every step keeps the previous file and removes th
     const got = try state.readFileAlloc(testing.allocator, "a.json", 64, true);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("replacement-content", got);
+}
+
+test "ACME state: a targeted short-write fault truncates only the named file" {
+    var tmp = try TempState.init();
+    defer tmp.deinit();
+    var state = try StateDir.open(tmp.path);
+    defer state.close();
+
+    state.fault_file = "b.json";
+    state.fault = .short_write;
+    try state.writeFileAtomic("a.json", "unaffected-content", 0o600);
+    try testing.expectError(error.InjectedFault, state.writeFileAtomic("b.json", "truncated-content", 0o600));
+    state.fault_file = null;
+
+    const a = try state.readFileAlloc(testing.allocator, "a.json", 64, true);
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("unaffected-content", a);
+    // The failed write never commits a truncated file: the atomic procedure
+    // discards the half-written temp file along with the error.
+    try testing.expectError(error.NotFound, state.readFileAlloc(testing.allocator, "b.json", 64, true));
 }
 
 test "ACME state: stale temp files from a crashed writer are removed at open" {

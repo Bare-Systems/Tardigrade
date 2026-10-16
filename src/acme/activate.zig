@@ -711,43 +711,37 @@ fn markCorrupt(generations: *state_mod.SubDir, name: []const u8) void {
 /// that are not shaped like a generation id (already-`.corrupt-`-renamed,
 /// or a stray name) are left untouched. `keep` (the caller's explicit
 /// current/previous ids), never directory enumeration, is the authority for
-/// what survives; a bounded 64-entry snapshot is only ever used here to
-/// pick deletion candidates, so an incomplete view just means this call
-/// prunes less, not that it prunes wrongly. When more than 64 entries exist
-/// (e.g. many retained `*.corrupt-*` archives), fall back to a best-effort
-/// lossy snapshot and repeat in bounded batches — each pass that deletes
-/// something shrinks the directory, so repeated calls (every persist/load)
-/// eventually reclaim every eligible orphan instead of giving up for good.
+/// what survives. Each pass scans the *entire* directory via `listMatching`
+/// to collect up to 64 eligible candidates — retained `*.corrupt-*`
+/// archives or the live generations never consume a slot, so no number of
+/// ineligible entries ahead of a real orphan (in whatever order the
+/// filesystem happens to iterate) can ever stall deletion — then deletes
+/// that batch and rescans; repeated calls (every persist/load) eventually
+/// reclaim every eligible orphan.
 fn pruneGenerations(generations: *state_mod.SubDir, keep: []const []const u8) void {
     while (true) {
         var names: [64][64]u8 = undefined;
         var lens: [64]usize = undefined;
-        const count = generations.listNamesStrict(&names, &lens) catch |err| switch (err) {
-            error.TooLarge => generations.listNames(&names, &lens),
-            else => return,
-        };
-        var deleted_any = false;
+        const count = generations.listMatching(&names, &lens, keep, isPruneCandidate) catch return;
+        if (count == 0) return;
         for (0..count) |i| {
             const name = names[i][0..lens[i]];
-            if (parseGenerationName(name) == null) continue;
-            var keep_this = false;
-            for (keep) |k| {
-                if (std.mem.eql(u8, k, name)) {
-                    keep_this = true;
-                    break;
-                }
-            }
-            if (keep_this) continue;
             var doomed = generations.openSubdirStrict(name) catch continue;
             doomed.removeFile(generation_file_leaf_key);
             doomed.removeFile(generation_file_chain);
             doomed.removeFile(generation_file_meta);
             doomed.close();
             generations.removeEmpty(name) catch continue;
-            deleted_any = true;
         }
-        if (!deleted_any) return;
     }
+}
+
+fn isPruneCandidate(keep: []const []const u8, name: []const u8) bool {
+    if (parseGenerationName(name) == null) return false;
+    for (keep) |k| {
+        if (std.mem.eql(u8, k, name)) return false;
+    }
+    return true;
 }
 
 fn nextSequence(pointer: ?CommitPointer) Error!u64 {

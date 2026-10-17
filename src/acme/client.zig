@@ -259,16 +259,21 @@ pub const Client = struct {
     pub fn fetchDirectory(self: *Client) Error!void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.fetchDirectoryLocked() catch |err| return self.fail(err);
+        self.fetchDirectoryLocked(null) catch |err| return self.fail(err);
     }
 
-    fn ensureDirectoryLocked(self: *Client) Error!void {
-        if (self.directory == null) try self.fetchDirectoryLocked();
+    /// `deadline`, if given, is an absolute point on `self.transport`'s own
+    /// clock: the remaining budget shrinks across every request a single
+    /// logical call makes (directory, nonce, the signed POST), rather than
+    /// each getting its own fresh `request_deadline_ms` (#898).
+    fn ensureDirectoryLocked(self: *Client, deadline: ?i64) Error!void {
+        if (self.directory == null) try self.fetchDirectoryLocked(deadline);
     }
 
-    fn fetchDirectoryLocked(self: *Client) Error!void {
+    fn fetchDirectoryLocked(self: *Client, deadline: ?i64) Error!void {
         self.diagnostics.directory_fetches +|= 1;
-        var resp = try self.transport.request(.GET, self.directory_origin, null, null);
+        const cap = try self.remainingCapMs(deadline);
+        var resp = try self.transport.requestWithBodyLimit(.GET, self.directory_origin, null, null, self.transport.limits.max_body_bytes, .json, cap);
         defer resp.deinit();
         self.noteResponse(&resp);
         if (resp.status != 200) return error.CaRejected;
@@ -321,11 +326,12 @@ pub const Client = struct {
         }
     }
 
-    fn fetchNonceLocked(self: *Client) Error!void {
-        try self.ensureDirectoryLocked();
+    fn fetchNonceLocked(self: *Client, deadline: ?i64) Error!void {
+        try self.ensureDirectoryLocked(deadline);
         const target = try url_mod.requireCaOrigin(self.directory.?.new_nonce, self.directory_origin, self.config.allow_cross_host_urls);
         self.diagnostics.nonce_fetches +|= 1;
-        var resp = try self.transport.request(.HEAD, target, null, null);
+        const cap = try self.remainingCapMs(deadline);
+        var resp = try self.transport.requestWithBodyLimit(.HEAD, target, null, null, self.transport.limits.max_body_bytes, .json, cap);
         defer resp.deinit();
         self.noteResponse(&resp);
         if (resp.status != 200 and resp.status != 204) return error.CaRejected;
@@ -334,12 +340,24 @@ pub const Client = struct {
 
     /// Take the cached nonce (fetching one if needed) and clear the slot: the
     /// caller now owns it for exactly one request.
-    fn takeNonceLocked(self: *Client, out: *[account_mod.max_nonce_len]u8) Error![]const u8 {
-        if (self.nonce_len == 0) try self.fetchNonceLocked();
+    fn takeNonceLocked(self: *Client, out: *[account_mod.max_nonce_len]u8, deadline: ?i64) Error![]const u8 {
+        if (self.nonce_len == 0) try self.fetchNonceLocked(deadline);
         const len = self.nonce_len;
         @memcpy(out[0..len], self.nonce_buf[0..len]);
         self.nonce_len = 0;
         return out[0..len];
+    }
+
+    /// Remaining budget until `deadline` (an absolute point on
+    /// `self.transport`'s clock), or `null` when the caller gave no cap.
+    /// Fails closed with `error.Timeout` rather than handing a sub-request a
+    /// nonsensical zero/negative budget once the deadline has already
+    /// passed between two requests of the same logical call.
+    fn remainingCapMs(self: *Client, deadline: ?i64) Error!?u32 {
+        const d = deadline orelse return null;
+        const remaining = d - self.transport.nowMs();
+        if (remaining <= 0) return error.Timeout;
+        return @intCast(@min(remaining, @as(i64, std.math.maxInt(u32))));
     }
 
     // -- signed requests --------------------------------------------------
@@ -349,19 +367,60 @@ pub const Client = struct {
     /// CA returned, at most `max_bad_nonce_retries` times. Returns the 2xx
     /// response; any other status becomes an error and updates diagnostics.
     pub fn signedPost(self: *Client, url: []const u8, payload: ?[]const u8, auth: account_mod.Auth) Error!transport_mod.Response {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.signedPostLocked(url, payload, auth) catch |err| return self.fail(err);
+        return self.signedPostMaxBody(url, payload, auth, self.transport.limits.max_body_bytes);
     }
 
-    fn signedPostLocked(self: *Client, url: []const u8, payload: ?[]const u8, auth: account_mod.Auth) Error!transport_mod.Response {
+    /// Same as `signedPost`, but reads the response body under
+    /// `max_body_bytes` instead of the transport's default JSON cap. The
+    /// order engine (`orders.zig`, #882) needs this for certificate chain
+    /// downloads, which design §9.1 caps at 128 KiB, well above the 64 KiB
+    /// JSON default every other ACME response uses.
+    pub fn signedPostMaxBody(self: *Client, url: []const u8, payload: ?[]const u8, auth: account_mod.Auth, max_body_bytes: usize) Error!transport_mod.Response {
+        return self.signedPostOptions(url, payload, auth, max_body_bytes, .json, null);
+    }
+
+    /// Same as `signedPostMaxBody`, with the request's `Accept` header and a
+    /// cap on the per-request deadline both overridable. The order engine's
+    /// certificate download (`orders.zig`, #882) needs
+    /// `Accept: application/pem-certificate-chain` (design §5.1) and a
+    /// deadline bounded by its own remaining per-order budget rather than the
+    /// transport's independent default.
+    pub fn signedPostOptions(
+        self: *Client,
+        url: []const u8,
+        payload: ?[]const u8,
+        auth: account_mod.Auth,
+        max_body_bytes: usize,
+        accept: transport_mod.Accept,
+        deadline_cap_ms: ?u32,
+    ) Error!transport_mod.Response {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.signedPostLocked(url, payload, auth, max_body_bytes, accept, deadline_cap_ms) catch |err| return self.fail(err);
+    }
+
+    fn signedPostLocked(
+        self: *Client,
+        url: []const u8,
+        payload: ?[]const u8,
+        auth: account_mod.Auth,
+        max_body_bytes: usize,
+        accept: transport_mod.Accept,
+        deadline_cap_ms: ?u32,
+    ) Error!transport_mod.Response {
         const target = try url_mod.requireCaOrigin(url, self.directory_origin, self.config.allow_cross_host_urls);
-        try self.ensureDirectoryLocked();
+        // `deadline_cap_ms`, when given, is the remaining budget for this
+        // whole logical call -- not just the final POST -- so it becomes one
+        // fixed absolute deadline here and every sub-request (directory,
+        // nonce, the POST itself, each badNonce retry) recomputes what is
+        // left of it instead of each getting an independent fresh cap.
+        const deadline: ?i64 = if (deadline_cap_ms) |cap| self.transport.nowMs() + @as(i64, cap) else null;
+        try self.ensureDirectoryLocked(deadline);
 
         var retries: u8 = 0;
         while (true) {
             var nonce_storage: [account_mod.max_nonce_len]u8 = undefined;
-            const nonce = try self.takeNonceLocked(&nonce_storage);
+            const nonce = try self.takeNonceLocked(&nonce_storage, deadline);
             const jws = account_mod.signJws(self.allocator, self.key, .{ .url = url, .nonce = nonce, .auth = auth }, payload) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.JwsFailed,
@@ -371,7 +430,8 @@ pub const Client = struct {
 
             // Every path below either returns `resp` to the caller or frees it
             // exactly once; nothing between here and there can fail.
-            var resp = try self.transport.request(.POST, target, jws, "application/jose+json");
+            const cap = try self.remainingCapMs(deadline);
+            var resp = try self.transport.requestWithBodyLimit(.POST, target, jws, "application/jose+json", max_body_bytes, accept, cap);
             self.noteResponse(&resp);
             if (resp.status >= 200 and resp.status < 300) {
                 self.diagnostics.last_problem = .none;
@@ -422,6 +482,24 @@ pub const Client = struct {
 
     /// POST-as-GET against an account-bound URL using the stored `kid`.
     pub fn signedPostAsGet(self: *Client, url: []const u8) Error!transport_mod.Response {
+        return self.signedPostAsGetMaxBody(url, self.transport.limits.max_body_bytes);
+    }
+
+    /// Same as `signedPostAsGet`, but reads the response body under
+    /// `max_body_bytes` (see `signedPostMaxBody`).
+    pub fn signedPostAsGetMaxBody(self: *Client, url: []const u8, max_body_bytes: usize) Error!transport_mod.Response {
+        return self.signedPostAsGetOptions(url, max_body_bytes, .json, null);
+    }
+
+    /// Same as `signedPostAsGetMaxBody`, with the request's `Accept` header
+    /// and a deadline cap both overridable (see `signedPostOptions`).
+    pub fn signedPostAsGetOptions(
+        self: *Client,
+        url: []const u8,
+        max_body_bytes: usize,
+        accept: transport_mod.Accept,
+        deadline_cap_ms: ?u32,
+    ) Error!transport_mod.Response {
         const kid = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -429,7 +507,23 @@ pub const Client = struct {
         };
         // The slice stays valid: kid is only replaced via setKid/deinit, which
         // callers do not run concurrently with in-flight requests.
-        return self.signedPost(url, null, .{ .kid = kid });
+        return self.signedPostOptions(url, null, .{ .kid = kid }, max_body_bytes, accept, deadline_cap_ms);
+    }
+
+    /// `newOrder` endpoint URL (RFC 8555 §7.1.1), fetching the directory
+    /// first if needed. The order engine (`orders.zig`, #882) uses this
+    /// instead of reaching into `self.directory` directly, keeping the
+    /// directory fetch/cache logic owned by this file. `deadline_cap_ms`
+    /// bounds a cold directory GET by the caller's own remaining budget (the
+    /// same contract as `signedPostOptions`'s `deadline_cap_ms`), so this can
+    /// never itself consume more than what is left of the order's absolute
+    /// deadline before the later signed `newOrder` POST even runs (#898).
+    pub fn newOrderUrl(self: *Client, deadline_cap_ms: u32) Error![]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const deadline = self.transport.nowMs() + @as(i64, deadline_cap_ms);
+        self.ensureDirectoryLocked(deadline) catch |err| return self.fail(err);
+        return self.directory.?.new_order;
     }
 
     /// newAccount (RFC 8555 §7.3). Idempotent per key: a CA that already knows
@@ -443,7 +537,7 @@ pub const Client = struct {
         self.mutex.lock();
         const url = blk: {
             defer self.mutex.unlock();
-            self.ensureDirectoryLocked() catch |err| return self.fail(err);
+            self.ensureDirectoryLocked(null) catch |err| return self.fail(err);
             break :blk self.allocator.dupe(u8, self.directory.?.new_account) catch return self.fail(error.OutOfMemory);
         };
         defer self.allocator.free(url);

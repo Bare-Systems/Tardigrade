@@ -72,6 +72,151 @@ pub const Script = struct {
     /// Replace the directory / newAccount response bodies verbatim (fuzzing).
     directory_body: ?[]const u8 = null,
     account_body: ?[]const u8 = null,
+
+    new_order: NewOrderBehavior = .{},
+    authz: AuthzBehavior = .{},
+    challenge: ChallengeBehavior = .{},
+    finalize: FinalizeBehavior = .{},
+    order_poll: OrderPollBehavior = .{},
+    cert: CertBehavior = .{},
+};
+
+/// Scripted hostile behavior for `POST /new-order` (#882 order engine).
+pub const NewOrderBehavior = struct {
+    status_500: bool = false,
+    rate_limited: bool = false,
+    malformed_json: bool = false,
+    /// The response lists one more `dns` identifier than was requested.
+    extra_identifier: bool = false,
+    /// The response drops the last requested identifier.
+    missing_identifier: bool = false,
+    /// `identifiers[]` lists every requested name, but the final one has a
+    /// preexisting authorization and therefore no URL in this new order.
+    missing_authorization: bool = false,
+    /// A ready order with every requested identifier preauthorized.
+    ready_without_authorizations: bool = false,
+    /// One `authorizations[]` entry points at a different (non-CA) origin.
+    cross_host_authorization: bool = false,
+    /// The last `authorizations[]` entry is replaced with a repeat of the
+    /// first one's URL (same count as identifiers, but a real duplicate).
+    duplicate_authorization: bool = false,
+    /// `finalize` points at a different (non-CA) origin.
+    cross_host_finalize: bool = false,
+    /// Replace the `status` field with an arbitrary scripted value (e.g. an
+    /// unrecognized string, or `valid`), instead of the normal `pending`.
+    status_override: ?[]const u8 = null,
+    /// RFC 3339 order lifetime emitted by both newOrder and order polling.
+    expires_override: ?[]const u8 = null,
+    /// Omit the optional `expires` member from the new-order object.
+    omit_expires: bool = false,
+};
+
+/// Scripted hostile behavior for authorization GET polls.
+pub const AuthzBehavior = struct {
+    /// Reports an identifier the client never requested (confused-deputy
+    /// check: `orders.zig` must reject this even though `new-order` was
+    /// honest).
+    wrong_identifier: bool = false,
+    /// `challenges[]` contains no `http-01` entry.
+    no_http01: bool = false,
+    /// The `http-01` challenge's `url` points at a different origin.
+    cross_host_challenge: bool = false,
+    /// `challenges[]` contains two distinct `http-01` entries (different
+    /// URLs/tokens), so the client cannot tell which one is actually bound.
+    duplicate_http01: bool = false,
+    /// Every authorization reports the identifier of the very first
+    /// authorization ever created, simulating two distinct authorization
+    /// URLs that both claim to cover the same requested name.
+    collapse_identifier: bool = false,
+    /// Authorization id 1 reports its own identifier on the first GET (so it
+    /// claims the correct `seen` slot), then switches to authorization id
+    /// 2's (still in-group) identifier on every later GET.
+    swap_identifier_on_poll: bool = false,
+    /// How many polls answer "pending" before the terminal status below.
+    polls_before_final: u32 = 0,
+    final_status: enum { valid, invalid } = .valid,
+    /// 429 + Retry-After for this many polls before answering normally.
+    rate_limited_polls: u32 = 0,
+    /// 429 + Retry-After for this many initial POST-as-GET reads before the
+    /// authorization object is returned.
+    rate_limited_first_gets: u32 = 0,
+    /// 500 for this many polls (including the first fetch) before answering
+    /// normally; the order engine's bounded transient retry (design §5.2)
+    /// must survive this and still finish.
+    transient_failures: u32 = 0,
+    malformed_json: bool = false,
+    /// Every GET answers 500, forever -- including the very first fetch,
+    /// before the challenge is ever published: the order engine's transient
+    /// retry (around that first fetch) must still give up after its bounded
+    /// attempt count rather than retrying forever.
+    status_500: bool = false,
+    /// Every GET *from the second one onward* (i.e. once the challenge has
+    /// already been published and triggered) answers 500, forever. Unlike
+    /// `status_500`, the first fetch still succeeds, so this specifically
+    /// exercises `authorizeOne`'s poll-loop transient-retry exhaustion and
+    /// its post-publication cleanup, not `fetchAuthorizationRetrying`'s
+    /// wrapper around the first fetch.
+    status_500_after_first_get: bool = false,
+    /// If set, included verbatim as the authorization's `expires` field
+    /// (RFC 8555 §7.1.4), so a test can assert the published challenge's
+    /// store expiry is bounded by it.
+    expires_override: ?[]const u8 = null,
+};
+
+/// Scripted hostile behavior for `POST /authz/{id}/http-01` (challenge
+/// ready-trigger).
+pub const ChallengeBehavior = struct {
+    /// The CA rejects the trigger itself (not validation).
+    rejected: bool = false,
+    malformed_ack: bool = false,
+    mismatched_ack_url: bool = false,
+    mismatched_ack_token: bool = false,
+    invalid_ack_status: bool = false,
+};
+
+/// Scripted hostile behavior for `POST /order/{id}/finalize`.
+pub const FinalizeBehavior = struct {
+    /// badCSR problem.
+    rejected: bool = false,
+    status_500: bool = false,
+    malformed_json: bool = false,
+    /// Replace `status` with an arbitrary value instead of the normal
+    /// `processing` (e.g. an already-terminal `invalid`, or an unrecognized
+    /// string).
+    status_override: ?[]const u8 = null,
+    /// Echo `identifiers` in the finalize response, with the first entry
+    /// replaced by a name outside the requested group.
+    mismatched_identifiers: bool = false,
+};
+
+/// Scripted hostile behavior for order-status polls after finalize.
+pub const OrderPollBehavior = struct {
+    polls_before_final: u32 = 0,
+    final_status: enum { valid, invalid } = .valid,
+    rate_limited_polls: u32 = 0,
+    /// 500 for this many polls before answering normally (see
+    /// `AuthzBehavior.transient_failures`).
+    transient_failures: u32 = 0,
+    /// Every poll answers 500, forever (see `AuthzBehavior.status_500`).
+    status_500: bool = false,
+    cross_host_certificate: bool = false,
+    malformed_json: bool = false,
+    mismatched_identifiers: bool = false,
+    mismatched_authorizations: bool = false,
+    mismatched_finalize: bool = false,
+    /// Replace the poll response's `expires` value without changing the
+    /// new-order response (for malformed-poll coverage).
+    expires_override: ?[]const u8 = null,
+    /// Omit `expires` only while an order is processing. It remains present
+    /// when the fake CA reports valid, as RFC 8555 requires.
+    omit_expires_while_processing: bool = false,
+};
+
+/// Scripted hostile behavior for `POST /cert/{id}` (certificate download).
+pub const CertBehavior = struct {
+    status_500: bool = false,
+    huge_body: bool = false,
+    empty_body: bool = false,
 };
 
 pub const Logged = struct {
@@ -96,11 +241,26 @@ pub const FakeClock = struct {
     }
 };
 
+/// Where `script.stall_ms_per_read`'s simulated slow-peer time goes. Lets a
+/// caller whose own clock is not a `FakeClock` (e.g. `orders_tests.zig`,
+/// which drives both a monotonic and a Unix clock off one shared struct)
+/// still observe the stall, rather than requiring every caller to adopt
+/// `FakeClock` itself.
+pub const ClockSink = struct {
+    ctx: ?*anyopaque = null,
+    advanceFn: ?*const fn (ctx: ?*anyopaque, ms: i64) void = null,
+
+    pub fn advance(self: ClockSink, ms: i64) void {
+        if (self.advanceFn) |f| f(self.ctx, ms);
+    }
+};
+
 pub const FakeCa = struct {
     allocator: std.mem.Allocator,
     base: []const u8 = "https://ca.test",
     script: Script = .{},
     clock: ?*FakeClock = null,
+    clock_sink: ClockSink = .{},
 
     nonce_seq: u64 = 0,
     valid_nonces: std.StringHashMapUnmanaged(void) = .empty,
@@ -113,7 +273,54 @@ pub const FakeCa = struct {
     /// Decoded payload of the last verified newAccount request.
     last_payload: ?[]u8 = null,
 
+    orders: std.ArrayList(Order) = .empty,
+    authorizations: std.ArrayList(Authz) = .empty,
+    certificates: std.ArrayList([]u8) = .empty,
+
     const Account = struct { x: [32]u8, y: [32]u8 };
+
+    const OrderStatus = enum { pending, processing, valid, invalid };
+    const AuthzStatus = enum { pending, processing, valid, invalid };
+
+    const Order = struct {
+        identifiers: std.ArrayList([]u8) = .empty,
+        authz_ids: std.ArrayList(usize) = .empty,
+        status: OrderStatus = .pending,
+        finalized: bool = false,
+        polls_before_final: u32,
+        poll_count: u32 = 0,
+        rate_limited_remaining: u32,
+        transient_remaining: u32,
+        certificate_id: ?usize = null,
+
+        fn deinit(self: *Order, allocator: std.mem.Allocator) void {
+            for (self.identifiers.items) |id| allocator.free(id);
+            self.identifiers.deinit(allocator);
+            self.authz_ids.deinit(allocator);
+        }
+    };
+
+    const Authz = struct {
+        identifier: []u8,
+        token: []u8,
+        status: AuthzStatus = .pending,
+        triggered: bool = false,
+        polls_before_final: u32,
+        poll_count: u32 = 0,
+        rate_limited_remaining: u32,
+        transient_remaining: u32,
+        initial_rate_limited_remaining: u32 = 0,
+        /// Every GET against this authorization, including the first fetch
+        /// before the challenge is triggered; `swap_identifier_on_poll` uses
+        /// this to report a different in-group identifier from the second
+        /// GET onward.
+        get_count: u32 = 0,
+
+        fn deinit(self: *Authz, allocator: std.mem.Allocator) void {
+            allocator.free(self.identifier);
+            allocator.free(self.token);
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator) FakeCa {
         return .{ .allocator = allocator };
@@ -132,6 +339,12 @@ pub const FakeCa = struct {
         self.log.deinit(self.allocator);
         for (self.dialed.items) |h| self.allocator.free(h);
         self.dialed.deinit(self.allocator);
+        for (self.orders.items) |*o| o.deinit(self.allocator);
+        self.orders.deinit(self.allocator);
+        for (self.authorizations.items) |*a| a.deinit(self.allocator);
+        self.authorizations.deinit(self.allocator);
+        for (self.certificates.items) |c| self.allocator.free(c);
+        self.certificates.deinit(self.allocator);
     }
 
     pub fn dialer(self: *FakeCa) transport.Dialer {
@@ -196,6 +409,7 @@ pub const FakeCa = struct {
     fn read(ptr: *anyopaque, buf: []u8) transport.IoError!usize {
         const conn: *Conn = @ptrCast(@alignCast(ptr));
         if (conn.ca.clock) |c| c.now += conn.ca.script.stall_ms_per_read;
+        conn.ca.clock_sink.advance(conn.ca.script.stall_ms_per_read);
         if (conn.response == null) {
             conn.response = conn.ca.handle(conn.allocator, conn.request.items) catch return error.Failed;
         }
@@ -230,6 +444,14 @@ pub const FakeCa = struct {
         const path = parts.next().?;
         const method: transport.Method = if (std.mem.eql(u8, method_s, "GET")) .GET else if (std.mem.eql(u8, method_s, "HEAD")) .HEAD else .POST;
 
+        var accept_header: ?[]const u8 = null;
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (std.ascii.eqlIgnoreCase(line[0..colon], "accept")) {
+                accept_header = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            }
+        }
+
         const log_index = self.log.items.len;
         try self.log.append(self.allocator, .{ .method = method, .path = try self.allocator.dupe(u8, path) });
 
@@ -249,6 +471,18 @@ pub const FakeCa = struct {
             try self.newAccount(allocator, body, log_index, &resp);
         } else if (method == .POST and std.mem.startsWith(u8, path, "/acct/")) {
             try self.accountGet(allocator, path, body, log_index, &resp);
+        } else if (method == .POST and std.mem.eql(u8, path, "/new-order")) {
+            try self.newOrder(allocator, body, log_index, &resp);
+        } else if (method == .POST and std.mem.endsWith(u8, path, "/http-01")) {
+            try self.challengeTrigger(allocator, path, body, log_index, &resp);
+        } else if (method == .POST and std.mem.startsWith(u8, path, "/authz/")) {
+            try self.authzGet(allocator, path, body, log_index, &resp);
+        } else if (method == .POST and std.mem.endsWith(u8, path, "/finalize")) {
+            try self.finalize(allocator, path, body, log_index, &resp);
+        } else if (method == .POST and std.mem.startsWith(u8, path, "/order/")) {
+            try self.orderGet(allocator, path, body, log_index, &resp);
+        } else if (method == .POST and std.mem.startsWith(u8, path, "/cert/")) {
+            try self.certGet(allocator, path, body, log_index, &resp, accept_header);
         } else {
             resp.status = 404;
             try resp.problem(allocator, "urn:ietf:params:acme:error:malformed");
@@ -569,6 +803,483 @@ pub const FakeCa = struct {
         self.log.items[log_index].used_kid = v.used_kid;
         if (!v.ok) return self.failPost(allocator, v, resp);
         resp.body = "{\"status\":\"valid\"}";
+        resp.nonce = try self.freshNonce(allocator);
+    }
+
+    // -- orders / authorizations / finalize / download (#882) --------------
+
+    fn trimSuffix(path: []const u8, suffix: []const u8) []const u8 {
+        if (std.mem.endsWith(u8, path, suffix)) return path[0 .. path.len - suffix.len];
+        return path;
+    }
+
+    fn parseTrailingId(path: []const u8, prefix: []const u8) ?usize {
+        if (!std.mem.startsWith(u8, path, prefix)) return null;
+        return std.fmt.parseInt(usize, path[prefix.len..], 10) catch null;
+    }
+
+    fn notFound(self: *FakeCa, allocator: std.mem.Allocator, resp: *Reply) !void {
+        resp.status = 404;
+        try resp.problem(allocator, "urn:ietf:params:acme:error:malformed");
+        resp.nonce = try self.freshNonce(allocator);
+    }
+
+    fn buildFakeCertPem(allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(
+            allocator,
+            "-----BEGIN CERTIFICATE-----\nZmFrZS1sZWFmLWNlcnRpZmljYXRlLWJ5dGVz\n-----END CERTIFICATE-----\n" ++
+                "-----BEGIN CERTIFICATE-----\nZmFrZS1pbnRlcm1lZGlhdGUtY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n",
+            .{},
+        );
+    }
+
+    fn newOrder(self: *FakeCa, allocator: std.mem.Allocator, body: []const u8, log_index: usize, resp: *Reply) !void {
+        const v = try self.verify(allocator, "/new-order", body);
+        defer allocator.free(v.payload);
+        self.log.items[log_index].signature_ok = v.ok;
+        self.log.items[log_index].used_kid = v.used_kid;
+        if (!v.ok) return self.failPost(allocator, v, resp);
+
+        const b = self.script.new_order;
+        if (b.status_500) {
+            resp.status = 500;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:serverInternal");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        if (b.rate_limited) {
+            resp.status = 429;
+            resp.retry_after = "60";
+            try resp.problem(allocator, "urn:ietf:params:acme:error:rateLimited");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        if (b.malformed_json) {
+            resp.status = 201;
+            resp.body = "{\"status\": ";
+            const loc = try std.fmt.allocPrint(allocator, "{s}/order/1", .{self.base});
+            resp.location = loc;
+            resp.location_owned = loc;
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+
+        const RequestIdentifier = struct { type: []const u8, value: []const u8 };
+        const RequestJson = struct { identifiers: []const RequestIdentifier };
+        const parsed = std.json.parseFromSlice(RequestJson, allocator, v.payload, .{}) catch {
+            resp.status = 400;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:malformed");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        };
+        defer parsed.deinit();
+
+        // No `errdefer order.deinit(...)` here: once `order` is appended to
+        // `self.orders` below, it is owned there and `FakeCa.deinit` frees
+        // it; an errdefer spanning past that append would double-free on a
+        // later allocation failure in this function (test-helper code, so a
+        // leak on an injected OOM here -- never exercised by ordinary test
+        // runs -- is an acceptable trade for not double-freeing).
+        var order = Order{
+            .polls_before_final = self.script.order_poll.polls_before_final,
+            .rate_limited_remaining = self.script.order_poll.rate_limited_polls,
+            .transient_remaining = self.script.order_poll.transient_failures,
+        };
+        for (parsed.value.identifiers) |id| {
+            try order.identifiers.append(self.allocator, try self.allocator.dupe(u8, id.value));
+        }
+        if (b.missing_identifier and order.identifiers.items.len > 0) {
+            self.allocator.free(order.identifiers.pop().?);
+        }
+        if (b.extra_identifier) {
+            try order.identifiers.append(self.allocator, try self.allocator.dupe(u8, "bogus-extra.example.com"));
+        }
+
+        for (order.identifiers.items, 0..) |id, identifier_index| {
+            // RFC 8555 does not require one URL per requested identifier:
+            // omit one or all URLs to model preauthorized names.
+            if (b.ready_without_authorizations or (b.missing_authorization and identifier_index + 1 == order.identifiers.items.len)) continue;
+            self.nonce_seq += 1;
+            var token_buf: [22]u8 = undefined;
+            const token = std.fmt.bufPrint(&token_buf, "token{d:0>17}", .{self.nonce_seq}) catch unreachable;
+            try self.authorizations.append(self.allocator, .{
+                .identifier = try self.allocator.dupe(u8, id),
+                .token = try self.allocator.dupe(u8, token),
+                .polls_before_final = self.script.authz.polls_before_final,
+                .rate_limited_remaining = self.script.authz.rate_limited_polls,
+                .transient_remaining = self.script.authz.transient_failures,
+                .initial_rate_limited_remaining = self.script.authz.rate_limited_first_gets,
+            });
+            try order.authz_ids.append(self.allocator, self.authorizations.items.len - 1);
+        }
+
+        try self.orders.append(self.allocator, order);
+        const order_id = self.orders.items.len;
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        const default_status = if (b.ready_without_authorizations) "ready" else "pending";
+        try buf.print(allocator, "{{\"status\":\"{s}\",\"identifiers\":[", .{b.status_override orelse default_status});
+        for (order.identifiers.items, 0..) |id, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.print(allocator, "{{\"type\":\"dns\",\"value\":\"{s}\"}}", .{id});
+        }
+        try buf.appendSlice(allocator, "],\"authorizations\":[");
+        const authz_count = order.authz_ids.items.len;
+        for (order.authz_ids.items, 0..) |aid, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            // `duplicate_authorization` replaces the *last* entry with the
+            // first one's id (same count, a real repeated URL) rather than
+            // appending an extra entry, so this scenario is distinguishable
+            // from `authorizations.len > identifiers.len`.
+            const effective_aid = if (b.duplicate_authorization and authz_count >= 2 and i == authz_count - 1)
+                order.authz_ids.items[0]
+            else
+                aid;
+            if (b.cross_host_authorization and i == 0) {
+                try buf.print(allocator, "\"https://evil.test/authz/{d}\"", .{effective_aid + 1});
+            } else {
+                try buf.print(allocator, "\"{s}/authz/{d}\"", .{ self.base, effective_aid + 1 });
+            }
+        }
+        try buf.appendSlice(allocator, "],\"finalize\":\"");
+        if (b.cross_host_finalize) {
+            try buf.appendSlice(allocator, "https://evil.test/order/1/finalize");
+        } else {
+            try buf.print(allocator, "{s}/order/{d}/finalize", .{ self.base, order_id });
+        }
+        if (b.omit_expires) {
+            try buf.appendSlice(allocator, "\"}");
+        } else {
+            try buf.print(allocator, "\",\"expires\":\"{s}\"}}", .{b.expires_override orelse "2023-11-14T22:18:20Z"});
+        }
+
+        resp.status = 201;
+        resp.body_owned = try buf.toOwnedSlice(allocator);
+        resp.body = resp.body_owned.?;
+        const loc = try std.fmt.allocPrint(allocator, "{s}/order/{d}", .{ self.base, order_id });
+        resp.location = loc;
+        resp.location_owned = loc;
+        resp.nonce = try self.freshNonce(allocator);
+    }
+
+    fn authzGet(self: *FakeCa, allocator: std.mem.Allocator, path: []const u8, body: []const u8, log_index: usize, resp: *Reply) !void {
+        const v = try self.verify(allocator, path, body);
+        defer allocator.free(v.payload);
+        self.log.items[log_index].signature_ok = v.ok;
+        self.log.items[log_index].used_kid = v.used_kid;
+        if (!v.ok) return self.failPost(allocator, v, resp);
+
+        const id = parseTrailingId(path, "/authz/") orelse return self.notFound(allocator, resp);
+        if (id == 0 or id > self.authorizations.items.len) return self.notFound(allocator, resp);
+        const b = self.script.authz;
+        var authz = &self.authorizations.items[id - 1];
+        if (authz.get_count == 0 and authz.initial_rate_limited_remaining > 0) {
+            authz.initial_rate_limited_remaining -= 1;
+            resp.status = 429;
+            resp.retry_after = "1";
+            try resp.problem(allocator, "urn:ietf:params:acme:error:rateLimited");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        if (b.status_500) {
+            resp.status = 500;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:serverInternal");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        if (b.status_500_after_first_get and self.authorizations.items[id - 1].get_count > 0) {
+            resp.status = 500;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:serverInternal");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        if (b.malformed_json) {
+            resp.body = "{\"status\": ";
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+
+        // Only from the second GET onward (the poll loop, after the
+        // challenge is already published): a test exercising the poll
+        // loop's bounded transient retry should not also have to account
+        // for the separate retry wrapper around the very first fetch.
+        if (authz.get_count > 0 and authz.transient_remaining > 0) {
+            authz.transient_remaining -= 1;
+            resp.status = 500;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:serverInternal");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        authz.get_count += 1;
+        if (authz.triggered and authz.status == .pending) authz.status = .processing;
+        if (authz.status == .processing) {
+            if (authz.poll_count < authz.polls_before_final) {
+                if (authz.rate_limited_remaining > 0) {
+                    authz.rate_limited_remaining -= 1;
+                    resp.status = 429;
+                    resp.retry_after = "1";
+                    try resp.problem(allocator, "urn:ietf:params:acme:error:rateLimited");
+                    resp.nonce = try self.freshNonce(allocator);
+                    return;
+                }
+                authz.poll_count += 1;
+            } else {
+                authz.status = if (b.final_status == .valid) .valid else .invalid;
+            }
+        }
+
+        const status_str = @tagName(authz.status);
+        const identifier_value = if (b.wrong_identifier)
+            "attacker-controlled.example.net"
+        else if (b.collapse_identifier and self.authorizations.items.len > 0)
+            self.authorizations.items[0].identifier
+        else if (b.swap_identifier_on_poll and id == 1 and authz.get_count > 1 and self.authorizations.items.len > 1)
+            self.authorizations.items[1].identifier
+        else
+            authz.identifier;
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.print(allocator, "{{\"status\":\"{s}\",\"identifier\":{{\"type\":\"dns\",\"value\":\"{s}\"}}", .{ status_str, identifier_value });
+        if (b.expires_override) |expires| try buf.print(allocator, ",\"expires\":\"{s}\"", .{expires});
+        try buf.appendSlice(allocator, ",\"challenges\":[");
+        if (!b.no_http01) {
+            if (b.cross_host_challenge) {
+                try buf.print(allocator, "{{\"type\":\"http-01\",\"url\":\"https://evil.test/authz/{d}/http-01\",\"token\":\"{s}\"}}", .{ id, authz.token });
+            } else {
+                try buf.print(allocator, "{{\"type\":\"http-01\",\"url\":\"{s}/authz/{d}/http-01\",\"token\":\"{s}\"}}", .{ self.base, id, authz.token });
+            }
+            if (b.duplicate_http01) {
+                // A second, distinct http-01 entry: different URL and token,
+                // so a client that just takes "the first one" would trigger
+                // and poll the wrong challenge without ever noticing.
+                try buf.print(allocator, ",{{\"type\":\"http-01\",\"url\":\"{s}/authz/{d}/http-01-dup\",\"token\":\"{s}-dup\"}}", .{ self.base, id, authz.token });
+            }
+        }
+        try buf.appendSlice(allocator, "]}");
+
+        resp.body_owned = try buf.toOwnedSlice(allocator);
+        resp.body = resp.body_owned.?;
+        resp.nonce = try self.freshNonce(allocator);
+    }
+
+    fn challengeTrigger(self: *FakeCa, allocator: std.mem.Allocator, path: []const u8, body: []const u8, log_index: usize, resp: *Reply) !void {
+        const v = try self.verify(allocator, path, body);
+        defer allocator.free(v.payload);
+        self.log.items[log_index].signature_ok = v.ok;
+        self.log.items[log_index].used_kid = v.used_kid;
+        if (!v.ok) return self.failPost(allocator, v, resp);
+
+        const id = parseTrailingId(trimSuffix(path, "/http-01"), "/authz/") orelse return self.notFound(allocator, resp);
+        if (id == 0 or id > self.authorizations.items.len) return self.notFound(allocator, resp);
+        if (self.script.challenge.rejected) {
+            resp.status = 403;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:unauthorized");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+
+        var authz = &self.authorizations.items[id - 1];
+        authz.triggered = true;
+        if (authz.status == .pending) authz.status = .processing;
+        if (self.script.challenge.malformed_ack) {
+            resp.body = "{\"status\":";
+        } else {
+            const ack_url = if (self.script.challenge.mismatched_ack_url) "https://ca.test/other" else try std.fmt.allocPrint(allocator, "{s}{s}", .{ self.base, path });
+            const ack_token = if (self.script.challenge.mismatched_ack_token) "other-token" else authz.token;
+            const ack_status = if (self.script.challenge.invalid_ack_status) "pending" else "processing";
+            defer if (!self.script.challenge.mismatched_ack_url) allocator.free(ack_url);
+            resp.body_owned = try std.fmt.allocPrint(allocator, "{{\"type\":\"http-01\",\"url\":\"{s}\",\"token\":\"{s}\",\"status\":\"{s}\"}}", .{ ack_url, ack_token, ack_status });
+            resp.body = resp.body_owned.?;
+        }
+        resp.nonce = try self.freshNonce(allocator);
+    }
+
+    fn finalize(self: *FakeCa, allocator: std.mem.Allocator, path: []const u8, body: []const u8, log_index: usize, resp: *Reply) !void {
+        const v = try self.verify(allocator, path, body);
+        defer allocator.free(v.payload);
+        self.log.items[log_index].signature_ok = v.ok;
+        self.log.items[log_index].used_kid = v.used_kid;
+        if (!v.ok) return self.failPost(allocator, v, resp);
+
+        const id = parseTrailingId(trimSuffix(path, "/finalize"), "/order/") orelse return self.notFound(allocator, resp);
+        if (id == 0 or id > self.orders.items.len) return self.notFound(allocator, resp);
+        const b = self.script.finalize;
+        if (b.status_500) {
+            resp.status = 500;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:serverInternal");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        if (b.rejected) {
+            resp.status = 400;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:badCSR");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        if (b.malformed_json) {
+            resp.body = "{\"status\": ";
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+
+        var order = &self.orders.items[id - 1];
+        order.finalized = true;
+        order.status = .processing;
+        const status_str = b.status_override orelse "processing";
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.print(allocator, "{{\"status\":\"{s}\"", .{status_str});
+        if (b.mismatched_identifiers) {
+            try buf.appendSlice(allocator, ",\"identifiers\":[");
+            for (order.identifiers.items, 0..) |id2, i| {
+                if (i > 0) try buf.append(allocator, ',');
+                const value = if (i == 0) "attacker-controlled.example.net" else id2;
+                try buf.print(allocator, "{{\"type\":\"dns\",\"value\":\"{s}\"}}", .{value});
+            }
+            try buf.appendSlice(allocator, "]");
+        }
+        try buf.appendSlice(allocator, "}");
+        resp.body_owned = try buf.toOwnedSlice(allocator);
+        resp.body = resp.body_owned.?;
+        resp.nonce = try self.freshNonce(allocator);
+    }
+
+    fn orderGet(self: *FakeCa, allocator: std.mem.Allocator, path: []const u8, body: []const u8, log_index: usize, resp: *Reply) !void {
+        const v = try self.verify(allocator, path, body);
+        defer allocator.free(v.payload);
+        self.log.items[log_index].signature_ok = v.ok;
+        self.log.items[log_index].used_kid = v.used_kid;
+        if (!v.ok) return self.failPost(allocator, v, resp);
+
+        const id = parseTrailingId(path, "/order/") orelse return self.notFound(allocator, resp);
+        if (id == 0 or id > self.orders.items.len) return self.notFound(allocator, resp);
+        const b = self.script.order_poll;
+        if (b.malformed_json) {
+            resp.body = "{\"status\": ";
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        if (b.status_500) {
+            resp.status = 500;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:serverInternal");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+
+        var order = &self.orders.items[id - 1];
+        if (order.transient_remaining > 0) {
+            order.transient_remaining -= 1;
+            resp.status = 500;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:serverInternal");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        if (order.finalized and order.status == .processing) {
+            if (order.poll_count < order.polls_before_final) {
+                if (order.rate_limited_remaining > 0) {
+                    order.rate_limited_remaining -= 1;
+                    resp.status = 429;
+                    resp.retry_after = "1";
+                    try resp.problem(allocator, "urn:ietf:params:acme:error:rateLimited");
+                    resp.nonce = try self.freshNonce(allocator);
+                    return;
+                }
+                order.poll_count += 1;
+            } else {
+                order.status = if (b.final_status == .valid) .valid else .invalid;
+                if (order.status == .valid) {
+                    const cert_pem = try buildFakeCertPem(self.allocator);
+                    try self.certificates.append(self.allocator, cert_pem);
+                    order.certificate_id = self.certificates.items.len;
+                }
+            }
+        }
+
+        const status_str = @tagName(order.status);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.print(allocator, "{{\"status\":\"{s}\",\"identifiers\":[", .{status_str});
+        for (order.identifiers.items, 0..) |name, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            const value = if (b.mismatched_identifiers and i == 0) "attacker-controlled.example.net" else name;
+            try buf.print(allocator, "{{\"type\":\"dns\",\"value\":\"{s}\"}}", .{value});
+        }
+        try buf.appendSlice(allocator, "],\"authorizations\":[");
+        for (order.authz_ids.items, 0..) |aid, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            if (b.mismatched_authorizations and i == 0) {
+                try buf.appendSlice(allocator, "\"https://ca.test/authz/changed\"");
+            } else {
+                try buf.print(allocator, "\"{s}/authz/{d}\"", .{ self.base, aid + 1 });
+            }
+        }
+        try buf.appendSlice(allocator, "],\"finalize\":\"");
+        if (b.mismatched_finalize) {
+            try buf.appendSlice(allocator, "https://ca.test/order/changed/finalize");
+        } else {
+            try buf.print(allocator, "{s}/order/{d}/finalize", .{ self.base, id });
+        }
+        if (!(b.omit_expires_while_processing and order.status == .processing)) {
+            try buf.print(allocator, "\",\"expires\":\"{s}\"", .{b.expires_override orelse self.script.new_order.expires_override orelse "2023-11-14T22:18:20Z"});
+        } else {
+            try buf.append(allocator, '"');
+        }
+        if (order.status == .valid) {
+            if (b.cross_host_certificate) {
+                try buf.print(allocator, ",\"certificate\":\"https://evil.test/cert/{d}\"", .{order.certificate_id.?});
+            } else {
+                try buf.print(allocator, ",\"certificate\":\"{s}/cert/{d}\"", .{ self.base, order.certificate_id.? });
+            }
+        }
+        try buf.appendSlice(allocator, "}");
+
+        resp.body_owned = try buf.toOwnedSlice(allocator);
+        resp.body = resp.body_owned.?;
+        resp.nonce = try self.freshNonce(allocator);
+    }
+
+    fn certGet(self: *FakeCa, allocator: std.mem.Allocator, path: []const u8, body: []const u8, log_index: usize, resp: *Reply, accept: ?[]const u8) !void {
+        const v = try self.verify(allocator, path, body);
+        defer allocator.free(v.payload);
+        self.log.items[log_index].signature_ok = v.ok;
+        self.log.items[log_index].used_kid = v.used_kid;
+        if (!v.ok) return self.failPost(allocator, v, resp);
+
+        // A real CA may content-negotiate; a client that still advertises
+        // `Accept: application/json` for this POST-as-GET (design §5.1)
+        // misrepresents what it can use, so this fake CA refuses it rather
+        // than silently answering with PEM anyway.
+        if (!std.mem.eql(u8, accept orelse "", "application/pem-certificate-chain")) {
+            resp.status = 406;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:malformed");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+
+        const id = parseTrailingId(path, "/cert/") orelse return self.notFound(allocator, resp);
+        const b = self.script.cert;
+        if (b.status_500) {
+            resp.status = 500;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:serverInternal");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        if (id == 0 or id > self.certificates.items.len) return self.notFound(allocator, resp);
+
+        resp.content_type = "application/pem-certificate-chain";
+        if (b.empty_body) {
+            resp.body = "";
+        } else if (b.huge_body) {
+            const big = try allocator.alloc(u8, 200 * 1024);
+            @memset(big, 'a');
+            resp.body_owned = big;
+            resp.body = big;
+        } else {
+            resp.body = self.certificates.items[id - 1];
+        }
         resp.nonce = try self.freshNonce(allocator);
     }
 };

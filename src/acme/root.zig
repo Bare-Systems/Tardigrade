@@ -14,6 +14,7 @@ pub const names = @import("names.zig");
 pub const transport = @import("transport.zig");
 pub const client = @import("client.zig");
 pub const activate = @import("activate.zig");
+pub const orders = @import("orders.zig");
 
 /// Test-only fake CA (see `fake_ca.zig`); absent from non-test builds.
 pub const fake_ca = if (@import("builtin").is_test) @import("fake_ca.zig") else struct {};
@@ -22,6 +23,7 @@ comptime {
     if (@import("builtin").is_test) {
         _ = @import("client_tests.zig");
         _ = @import("activate_tests.zig");
+        _ = @import("orders_tests.zig");
     }
 }
 

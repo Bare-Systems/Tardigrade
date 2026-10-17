@@ -938,6 +938,34 @@ it on every exit (success, CA failure, timeout, or cancellation).
   imports); no real CA, no live network beyond loopback, no activation --
   `IssuedChain` is still handed back owned and unverified, exactly as A4
   (#834/#879) expects to consume it.
+- `src/acme/live_ca_server.zig` closes the one remaining gap in the above:
+  a real loopback TCP listener terminating a real server-role TLS 1.3
+  handshake (the same `Tls13Backend`/`PureZigRecordStream` pair the
+  production listener and `tests/tls_interop_tool.zig`'s server role use,
+  over the test-only identity in `tests/fixtures/tls/acme_live_ca/`), in
+  front of `fake_ca.zig`'s unchanged `handle()` -- the same real JWS/nonce
+  verification and directory/account/order/authz/finalize/certificate state
+  machine as every other ACME test here, just reached over actual bytes
+  instead of the in-memory `Connection`. `live_http01_tests.zig`'s
+  `RealCaEnv` points the production `http/acme_tls_dialer.zig`
+  (`UpstreamTlsConn`, real hostname/chain verification against a real
+  trust anchor) at it, so every directory/account/order/authz/finalize/
+  certificate exchange -- not just the HTTP-01 validation GET -- crosses a
+  real socket and a real TLS handshake.
+  - Covered: single-host issuance through the real CA and the real
+    listener end to end, and a two-identifier order where both names are
+    independently live-validated over real sockets (RFC 8555 §7.1.3
+    multi-identifier orders).
+  - Also covered (`Env`, the lighter real-listener/in-memory-CA harness):
+    cancelling an outstanding order mid-poll, an authorization whose CA
+    never finalizes it (bounded by the authorization's own deadline, not a
+    CA response), and a listener stop/restart between two issuances --
+    every case asserting the real `ChallengeStore` and `Listener` are left
+    with no residual slot, token, or connection.
+  - Run with `zig build test-acme` or `zig build test` (both reach this
+    file through the same import `live_http01_tests.zig` already had);
+    expect every test above to pass with no real network beyond loopback
+    and no activation, same as the rest of this section.
 
 ## 11. Test plan
 

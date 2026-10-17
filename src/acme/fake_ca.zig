@@ -137,10 +137,18 @@ pub const AuthzBehavior = struct {
     /// must survive this and still finish.
     transient_failures: u32 = 0,
     malformed_json: bool = false,
-    /// Every poll answers 500, forever: the order engine's transient retry
-    /// must still give up after its bounded attempt count rather than
-    /// retrying this authorization forever.
+    /// Every GET answers 500, forever -- including the very first fetch,
+    /// before the challenge is ever published: the order engine's transient
+    /// retry (around that first fetch) must still give up after its bounded
+    /// attempt count rather than retrying forever.
     status_500: bool = false,
+    /// Every GET *from the second one onward* (i.e. once the challenge has
+    /// already been published and triggered) answers 500, forever. Unlike
+    /// `status_500`, the first fetch still succeeds, so this specifically
+    /// exercises `authorizeOne`'s poll-loop transient-retry exhaustion and
+    /// its post-publication cleanup, not `fetchAuthorizationRetrying`'s
+    /// wrapper around the first fetch.
+    status_500_after_first_get: bool = false,
     /// If set, included verbatim as the authorization's `expires` field
     /// (RFC 8555 §7.1.4), so a test can assert the published challenge's
     /// store expiry is bounded by it.
@@ -939,6 +947,12 @@ pub const FakeCa = struct {
         if (id == 0 or id > self.authorizations.items.len) return self.notFound(allocator, resp);
         const b = self.script.authz;
         if (b.status_500) {
+            resp.status = 500;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:serverInternal");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
+        if (b.status_500_after_first_get and self.authorizations.items[id - 1].get_count > 0) {
             resp.status = 500;
             try resp.problem(allocator, "urn:ietf:params:acme:error:serverInternal");
             resp.nonce = try self.freshNonce(allocator);

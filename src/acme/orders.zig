@@ -178,9 +178,9 @@ test "ACME orders: the production Waiter returns promptly when cancelled mid-wai
     defer setter.join();
 
     const start_ns = zig_compat.monotonicNanoTimestamp();
-    // A real production wait with the same 30s ceiling `waitForRetry` passes
-    // for a `Retry-After: 30` response; cancellation a few slices in must
-    // return almost immediately rather than blocking for the full 30s.
+    // A real production wait with the same 30s ceiling `retryAfterWaitMs`
+    // allows for a `Retry-After: 30` response; cancellation a few slices in
+    // must return almost immediately rather than blocking for the full 30s.
     const cancelled = (Waiter{}).wait(30_000, cancel);
     const elapsed_ms = @divTrunc(zig_compat.monotonicNanoTimestamp() - start_ns, std.time.ns_per_ms);
 
@@ -302,6 +302,21 @@ fn remainingOrderMs(options: Options, order_deadline_ms: i64) u32 {
     return @intCast(@min(@max(remaining, 1), @as(i64, std.math.maxInt(u32))));
 }
 
+/// Clamp a poll/backoff wait to whatever remains of `deadline_ms`, and fail
+/// closed with `timeout_err` the instant that deadline is reached -- before
+/// waiting at all, or immediately after -- rather than handing the full
+/// CA-requested `Retry-After`/backoff duration to `options.waiter.wait`.
+/// Without this, a 30s `Retry-After` (or an 8s transient backoff) can
+/// overrun an order/authorization/CA-expiry deadline that has only a second
+/// or two left, in violation of #882's finite deadline contract (#898).
+fn waitWithinDeadline(options: Options, requested_ms: u32, deadline_ms: i64, timeout_err: Error) Error!void {
+    const remaining = deadline_ms - options.clock.now();
+    if (remaining <= 0) return timeout_err;
+    const capped: u32 = @intCast(@min(@as(i64, requested_ms), remaining));
+    if (options.waiter.wait(capped, options.cancel)) return error.Cancelled;
+    if (options.clock.now() >= deadline_ms) return timeout_err;
+}
+
 // ---------------------------------------------------------------------------
 // newOrder (RFC 8555 §7.4)
 // ---------------------------------------------------------------------------
@@ -353,7 +368,12 @@ fn identifiersMatchGroup(identifiers: []const IdentifierJson, order_group: []con
 }
 
 fn newOrder(allocator: std.mem.Allocator, client: *client_mod.Client, order_group: []const []const u8, options: Options, order_deadline_ms: i64) Error!Order {
-    const new_order_url = try client.newOrderUrl();
+    // A cold directory fetch is itself capped by the remaining order budget
+    // (#898); recheck liveness immediately after, since that GET can consume
+    // an arbitrary slice of it before the signed `newOrder` POST below ever
+    // runs.
+    const new_order_url = try client.newOrderUrl(remainingOrderMs(options, order_deadline_ms));
+    try checkLive(options, order_deadline_ms);
 
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(allocator);
@@ -529,36 +549,67 @@ fn fetchAuthorizationRetrying(
     authz_deadline_ms: i64,
 ) Error!FetchedAuthz {
     var transient_attempt: u32 = 0;
+    const deadline_ms = @min(order_deadline_ms, authz_deadline_ms);
     while (true) {
-        const cap = remainingOrderMs(options, @min(order_deadline_ms, authz_deadline_ms));
+        const cap = remainingOrderMs(options, deadline_ms);
         return fetchAuthorization(allocator, client, url, order_group, cap) catch |err| {
             if (!isTransientFailure(client, err) or transient_attempt >= max_transient_retries) return err;
             transient_attempt += 1;
             try checkLive(options, order_deadline_ms);
-            if (options.clock.now() >= authz_deadline_ms) return error.AuthorizationTimedOut;
-            if (options.waiter.wait(transientBackoffMs(transient_attempt - 1), options.cancel)) return error.Cancelled;
+            try waitWithinDeadline(options, transientBackoffMs(transient_attempt - 1), deadline_ms, error.AuthorizationTimedOut);
             continue;
         };
     }
 }
 
-/// Bounded RFC 3339 UTC timestamp parser for the CA-supplied authorization
-/// `expires` field (RFC 8555 §7.1.4). Accepts exactly
-/// `YYYY-MM-DDTHH:MM:SS[.fff...]Z` -- the only form an ACME CA emits -- and
-/// rejects anything else (a non-UTC offset, trailing garbage, an absurdly
-/// long value) rather than guessing at it. Reformats into ASN.1
+fn parseTwoDigits(s: []const u8) ?u8 {
+    if (s[0] < '0' or s[0] > '9' or s[1] < '0' or s[1] > '9') return null;
+    return (s[0] - '0') * 10 + (s[1] - '0');
+}
+
+/// Bounded RFC 3339 timestamp parser for the CA-supplied authorization
+/// `expires` field (RFC 8555 §7.1.4). Accepts
+/// `YYYY-MM-DDTHH:MM:SS[.fff...](Z|+HH:MM|-HH:MM)` -- RFC 3339 §5.6's full
+/// set of timezone designators, not just `Z`: RFC 8555 only requires RFC
+/// 3339, and a CA is free to emit a numeric offset instead. Rejects anything
+/// else (trailing garbage, an out-of-range offset, an absurdly long value)
+/// rather than guessing at it. Reformats the local date/time into ASN.1
 /// GeneralizedTime so the actual calendar validation (leap years, days per
 /// month) is `pki.time.parseGeneralizedTime`'s, not a second bespoke copy of
-/// it here.
+/// it here; the offset is then applied on top to land on the UTC instant.
 fn parseRfc3339ToUnix(value: []const u8) ?i64 {
     if (value.len < 20 or value.len > 40) return null;
     if (value[4] != '-' or value[7] != '-' or value[10] != 'T' or value[13] != ':' or value[16] != ':') return null;
-    if (value[value.len - 1] != 'Z') return null;
-    if (value.len > 20) {
-        const frac = value[19 .. value.len - 1];
+
+    const tz = value[value.len - 1];
+    var offset_seconds: i64 = 0;
+    var datetime_end: usize = undefined;
+    if (tz == 'Z' or tz == 'z') {
+        datetime_end = value.len - 1;
+    } else {
+        // `+HH:MM`/`-HH:MM`: a fixed 6-byte suffix (sign, 2-digit hours,
+        // ':', 2-digit minutes).
+        if (value.len < 25) return null;
+        const off = value[value.len - 6 ..];
+        if (off[3] != ':') return null;
+        const sign: i64 = switch (off[0]) {
+            '+' => 1,
+            '-' => -1,
+            else => return null,
+        };
+        const hh = parseTwoDigits(off[1..3]) orelse return null;
+        const mm = parseTwoDigits(off[4..6]) orelse return null;
+        if (hh > 23 or mm > 59) return null;
+        offset_seconds = sign * (@as(i64, hh) * 3600 + @as(i64, mm) * 60);
+        datetime_end = value.len - 6;
+    }
+    if (datetime_end < 19) return null;
+    if (datetime_end > 19) {
+        const frac = value[19..datetime_end];
         if (frac.len < 2 or frac[0] != '.') return null;
         for (frac[1..]) |c| if (c < '0' or c > '9') return null;
     }
+
     var compact: [15]u8 = undefined;
     compact[0..4].* = value[0..4].*;
     compact[4..6].* = value[5..7].*;
@@ -577,7 +628,42 @@ fn parseRfc3339ToUnix(value: []const u8) ?i64 {
         .second = parsed.second,
         .encoding = .generalized,
     };
-    return pki.path_validator.unixSeconds(t);
+    // `+HH:MM` means local time is ahead of UTC by that much, so the UTC
+    // instant is the local wall-clock time *minus* the offset (and
+    // symmetrically for `-HH:MM`).
+    return pki.path_validator.unixSeconds(t) - offset_seconds;
+}
+
+test "parseRfc3339ToUnix: Z and equivalent numeric offsets agree on the same instant" {
+    const z = parseRfc3339ToUnix("2026-10-17T01:00:00Z") orelse return error.TestUnexpectedResult;
+    const zero_offset = parseRfc3339ToUnix("2026-10-17T01:00:00+00:00") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(z, zero_offset);
+
+    // 21:00 local at -04:00 is the same instant as 01:00Z the next day.
+    const negative_offset = parseRfc3339ToUnix("2026-10-16T21:00:00-04:00") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(z, negative_offset);
+
+    // A fractional-second value with a positive offset still lands on a
+    // consistent, decodable instant (exact value not asserted here, only
+    // that it parses and that the offset actually shifted it from the
+    // naive, offset-ignored reading).
+    const positive_offset = parseRfc3339ToUnix("2026-10-17T05:00:00.123+04:00") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(z, positive_offset);
+}
+
+test "parseRfc3339ToUnix: rejects out-of-range or malformed offsets" {
+    try std.testing.expectEqual(@as(?i64, null), parseRfc3339ToUnix("2026-10-17T01:00:00+24:00"));
+    try std.testing.expectEqual(@as(?i64, null), parseRfc3339ToUnix("2026-10-17T01:00:00+00:60"));
+    try std.testing.expectEqual(@as(?i64, null), parseRfc3339ToUnix("2026-10-17T01:00:00+0000"));
+    try std.testing.expectEqual(@as(?i64, null), parseRfc3339ToUnix("2026-10-17T01:00:00"));
+    try std.testing.expectEqual(@as(?i64, null), parseRfc3339ToUnix("not-a-timestamp"));
+}
+
+test "parseRfc3339ToUnix: still rejects a leap-date that the calendar validator catches" {
+    // 2026 is not a leap year; Feb 29 must still fail closed regardless of
+    // which timezone designator is used.
+    try std.testing.expectEqual(@as(?i64, null), parseRfc3339ToUnix("2026-02-29T00:00:00Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseRfc3339ToUnix("2026-02-29T00:00:00+01:00"));
 }
 
 fn identifierIndexInGroup(order_group: []const []const u8, value: []const u8) ?usize {
@@ -640,22 +726,34 @@ fn authorizeOne(
     const key_authorization = try buildKeyAuthorization(client, token, &key_auth_buf);
 
     const now_unix = options.unix_clock.now();
-    const remaining_s = @divTrunc(remainingOrderMs(options, @min(order_deadline_ms, authz_deadline_ms)), 1000);
-    var expires_at = std.math.add(i64, now_unix, remaining_s) catch std.math.maxInt(i64);
     // The CA's own authorization lifetime (RFC 8555 §7.1.4), when given,
-    // must bound the published challenge too: serving it past that lifetime
-    // claims a validity the CA itself never promised (design §8.2).
+    // must bound not just the published challenge's store TTL but every
+    // later poll/wait of this authorization too: a CA that promises
+    // `expires` in 2 seconds and then keeps answering `pending` for 120
+    // would otherwise let this worker poll (and potentially accept a late
+    // `valid`) well past a lifetime the CA itself never promised (design
+    // §8.2, #898).
+    var effective_authz_deadline_ms = authz_deadline_ms;
+    var ca_expiry_unix: ?i64 = null;
     if (first.expires) |expires_str| {
-        const ca_expiry_unix = parseRfc3339ToUnix(expires_str) orelse return error.BadAuthorizationResponse;
-        if (ca_expiry_unix <= now_unix) return error.AuthorizationTimedOut;
-        expires_at = @min(expires_at, ca_expiry_unix);
+        const parsed_expiry = parseRfc3339ToUnix(expires_str) orelse return error.BadAuthorizationResponse;
+        if (parsed_expiry <= now_unix) return error.AuthorizationTimedOut;
+        ca_expiry_unix = parsed_expiry;
+        const ca_remaining_s = parsed_expiry - now_unix;
+        const ca_remaining_ms = std.math.mul(i64, ca_remaining_s, 1000) catch std.math.maxInt(i64);
+        const ca_deadline_ms = std.math.add(i64, options.clock.now(), ca_remaining_ms) catch std.math.maxInt(i64);
+        effective_authz_deadline_ms = @min(effective_authz_deadline_ms, ca_deadline_ms);
     }
+
+    const remaining_s = @divTrunc(remainingOrderMs(options, effective_authz_deadline_ms), 1000);
+    var expires_at = std.math.add(i64, now_unix, remaining_s) catch std.math.maxInt(i64);
+    if (ca_expiry_unix) |ca_u| expires_at = @min(expires_at, ca_u);
     try store.put(now_unix, host, token, key_authorization, expires_at);
     errdefer _ = store.remove(host, token);
 
     {
         const kid = client.kid orelse return error.BadAccountResponse;
-        var trigger = try client.signedPostOptions(challenge_url, "{}", .{ .kid = kid }, client.transport.limits.max_body_bytes, .json, remainingOrderMs(options, @min(order_deadline_ms, authz_deadline_ms)));
+        var trigger = try client.signedPostOptions(challenge_url, "{}", .{ .kid = kid }, client.transport.limits.max_body_bytes, .json, remainingOrderMs(options, effective_authz_deadline_ms));
         trigger.deinit();
     }
 
@@ -663,28 +761,34 @@ fn authorizeOne(
     var transient_attempt: u32 = 0;
     while (true) {
         if (options.cancel.isCancelled()) return error.Cancelled;
-        const now_ms = options.clock.now();
-        if (now_ms >= authz_deadline_ms or now_ms >= order_deadline_ms) return error.AuthorizationTimedOut;
-        if (poll_attempt >= options.limits.max_polls) return error.AuthorizationTimedOut;
+        if (options.clock.now() >= effective_authz_deadline_ms) {
+            _ = store.remove(host, token);
+            return error.AuthorizationTimedOut;
+        }
+        if (poll_attempt >= options.limits.max_polls) {
+            _ = store.remove(host, token);
+            return error.AuthorizationTimedOut;
+        }
 
-        const cap = remainingOrderMs(options, @min(order_deadline_ms, authz_deadline_ms));
+        const cap = remainingOrderMs(options, effective_authz_deadline_ms);
         var polled = fetchAuthorization(allocator, client, authz_url, order_group, cap) catch |err| {
             if (err == error.RateLimited) {
-                if (waitForRetry(client, options)) {
+                waitWithinDeadline(options, retryAfterWaitMs(client, options), effective_authz_deadline_ms, error.AuthorizationTimedOut) catch |e| {
                     _ = store.remove(host, token);
-                    return error.Cancelled;
-                }
+                    return e;
+                };
                 poll_attempt +|= 1;
                 continue;
             }
             if (isTransientFailure(client, err) and transient_attempt < max_transient_retries) {
                 transient_attempt += 1;
-                if (options.waiter.wait(transientBackoffMs(transient_attempt - 1), options.cancel)) {
+                waitWithinDeadline(options, transientBackoffMs(transient_attempt - 1), effective_authz_deadline_ms, error.AuthorizationTimedOut) catch |e| {
                     _ = store.remove(host, token);
-                    return error.Cancelled;
-                }
+                    return e;
+                };
                 continue;
             }
+            _ = store.remove(host, token);
             return err;
         };
         defer polled.deinit();
@@ -694,7 +798,10 @@ fn authorizeOne(
         // different (still in-group) identifier would otherwise leave that
         // other name's authorization uncovered while this `seen` slot wrongly
         // reads as already satisfied.
-        if (!std.mem.eql(u8, polled.identifier_value, host)) return error.UnexpectedIdentifier;
+        if (!std.mem.eql(u8, polled.identifier_value, host)) {
+            _ = store.remove(host, token);
+            return error.UnexpectedIdentifier;
+        }
 
         switch (polled.terminal) {
             .valid => {
@@ -707,10 +814,10 @@ fn authorizeOne(
             },
             .pending => {
                 const wait_ms = retryAfterOrPollInterval(client, poll_attempt, options.limits);
-                if (options.waiter.wait(wait_ms, options.cancel)) {
+                waitWithinDeadline(options, wait_ms, effective_authz_deadline_ms, error.AuthorizationTimedOut) catch |e| {
                     _ = store.remove(host, token);
-                    return error.Cancelled;
-                }
+                    return e;
+                };
                 poll_attempt +|= 1;
             },
         }
@@ -786,13 +893,13 @@ fn finalizeAndPoll(
 
         var resp = client.signedPostAsGetOptions(order.order_url, client.transport.limits.max_body_bytes, .json, remainingOrderMs(options, order_deadline_ms)) catch |err| {
             if (err == error.RateLimited) {
-                if (waitForRetry(client, options)) return error.Cancelled;
+                try waitWithinDeadline(options, retryAfterWaitMs(client, options), order_deadline_ms, error.OrderTimedOut);
                 poll_attempt +|= 1;
                 continue;
             }
             if (isTransientFailure(client, err) and transient_attempt < max_transient_retries) {
                 transient_attempt += 1;
-                if (options.waiter.wait(transientBackoffMs(transient_attempt - 1), options.cancel)) return error.Cancelled;
+                try waitWithinDeadline(options, transientBackoffMs(transient_attempt - 1), order_deadline_ms, error.OrderTimedOut);
                 continue;
             }
             return err;
@@ -814,7 +921,7 @@ fn finalizeAndPoll(
         }
         if (std.mem.eql(u8, v.status, "pending") or std.mem.eql(u8, v.status, "ready") or std.mem.eql(u8, v.status, "processing")) {
             const wait_ms = retryAfterOrPollInterval(client, poll_attempt, options.limits);
-            if (options.waiter.wait(wait_ms, options.cancel)) return error.Cancelled;
+            try waitWithinDeadline(options, wait_ms, order_deadline_ms, error.OrderTimedOut);
             poll_attempt +|= 1;
             continue;
         }
@@ -861,10 +968,12 @@ fn retryAfterOrPollInterval(client: *client_mod.Client, attempt: u32, limits: Li
     return @min(scaled, limits.poll_interval_max_s) * 1000;
 }
 
-/// Returns `true` if `options.cancel` fired during the wait.
-fn waitForRetry(client: *client_mod.Client, options: Options) bool {
+/// The clamped `Retry-After` wait (or the configured maximum, lacking one),
+/// in milliseconds, for a 429 response -- the caller clamps this further to
+/// whatever remains of its own deadline via `waitWithinDeadline` (#898).
+fn retryAfterWaitMs(client: *client_mod.Client, options: Options) u32 {
     const seconds = clampRetryAfter(client.diagnostics.last_retry_after_s orelse options.limits.retry_after_max_s, options.limits);
-    return options.waiter.wait(seconds * 1000, options.cancel);
+    return seconds * 1000;
 }
 
 // ---------------------------------------------------------------------------

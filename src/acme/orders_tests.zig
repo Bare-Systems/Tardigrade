@@ -672,7 +672,7 @@ test "ACME orders: transient 5xx authorization polls retry with bounded backoff 
     try env.expectStoreEmpty();
 }
 
-test "ACME orders: perpetual 5xx on authorization polling exhausts the bounded retry budget" {
+test "ACME orders: perpetual 5xx on the very first authorization fetch exhausts the bounded retry budget" {
     var env = try Env.init();
     defer env.deinit();
     const session = try env.openSession();
@@ -682,6 +682,21 @@ test "ACME orders: perpetual 5xx on authorization polling exhausts the bounded r
     const names = [_][]const u8{"a.example.com"};
     try testing.expectError(error.CaRejected, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
     try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1/http-01"));
+}
+
+test "ACME orders: perpetual 5xx on authorization polling (after publication) exhausts the bounded retry budget" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.status_500_after_first_get = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.CaRejected, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 1), env.ca.countRequests(.POST, "/authz/1/http-01"));
+    try testing.expect(env.ca.countRequests(.POST, "/authz/1") <= 5);
 }
 
 test "ACME orders: transient 5xx order polls retry with bounded backoff then succeed" {
@@ -720,6 +735,50 @@ test "ACME orders: an already-expired CA authorization expiry rejects before pub
     try testing.expectError(error.AuthorizationTimedOut, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
     try env.expectStoreEmpty();
     try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1/http-01"));
+}
+
+test "ACME orders: a near-future CA authorization expiry caps polling even while pending" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    // 3 seconds after `TestTime.unix`'s starting value (1_700_000_000 =
+    // 2023-11-14T22:13:20Z): short enough that the CA's own `expires` --
+    // not the ordinary 120s authorization deadline -- is what must stop
+    // polling, even though the CA keeps answering `processing` forever.
+    env.ca.script.authz.expires_override = "2023-11-14T22:13:23Z";
+    env.ca.script.authz.polls_before_final = 1_000_000;
+    var opts = env.options();
+    fastPoll(&opts);
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.AuthorizationTimedOut, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+    try env.expectStoreEmpty();
+    try testing.expect(env.ca.countRequests(.POST, "/authz/1") <= 5);
+}
+
+test "ACME orders: a stalled cold directory GET cannot outrun the order deadline before newOrder" {
+    var env = try Env.init();
+    defer env.deinit();
+    const first_session = try env.openSession();
+    first_session.close();
+
+    // Reopening against the now-persisted account record reuses the stored
+    // `kid` with no network call at all (`client.zig`'s `Session.open`), so
+    // this fresh `Client` starts with an uncached directory -- unlike every
+    // other test here, where `openSession`'s account registration already
+    // warmed it. This is the only way to exercise `client.newOrderUrl`'s own
+    // deadline cap on a genuinely cold directory GET (#898).
+    const session = try env.openSession();
+    defer session.close();
+
+    env.ca.script.stall_ms_per_read = 2_000;
+    var opts = env.options();
+    opts.limits.order_deadline_s = 1;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.Timeout, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/new-order"));
 }
 
 test "ACME orders: a malformed CA authorization expiry fails closed" {

@@ -513,11 +513,16 @@ pub const Client = struct {
     /// `newOrder` endpoint URL (RFC 8555 §7.1.1), fetching the directory
     /// first if needed. The order engine (`orders.zig`, #882) uses this
     /// instead of reaching into `self.directory` directly, keeping the
-    /// directory fetch/cache logic owned by this file.
-    pub fn newOrderUrl(self: *Client) Error![]const u8 {
+    /// directory fetch/cache logic owned by this file. `deadline_cap_ms`
+    /// bounds a cold directory GET by the caller's own remaining budget (the
+    /// same contract as `signedPostOptions`'s `deadline_cap_ms`), so this can
+    /// never itself consume more than what is left of the order's absolute
+    /// deadline before the later signed `newOrder` POST even runs (#898).
+    pub fn newOrderUrl(self: *Client, deadline_cap_ms: u32) Error![]const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.ensureDirectoryLocked(null) catch |err| return self.fail(err);
+        const deadline = self.transport.nowMs() + @as(i64, deadline_cap_ms);
+        self.ensureDirectoryLocked(deadline) catch |err| return self.fail(err);
         return self.directory.?.new_order;
     }
 

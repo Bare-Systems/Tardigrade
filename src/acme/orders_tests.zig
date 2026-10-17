@@ -435,6 +435,18 @@ test "ACME orders: a malformed new-order response fails closed" {
     try testing.expectError(error.BadOrderResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
 }
 
+test "ACME orders: a malformed new-order expiry fails closed before authorization work" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.new_order.expires_override = "not-a-timestamp";
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadOrderResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1"));
+}
+
 test "ACME orders: an oversized certificate response is rejected" {
     var env = try Env.init();
     defer env.deinit();
@@ -457,7 +469,7 @@ test "ACME orders: an empty certificate response is rejected" {
     try testing.expectError(error.BadCertificateResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
 }
 
-test "ACME orders: an authorization dropped from a matching-identifier order fails closed" {
+test "ACME orders: a preauthorized name may have no authorization URL" {
     var env = try Env.init();
     defer env.deinit();
     const session = try env.openSession();
@@ -465,11 +477,13 @@ test "ACME orders: an authorization dropped from a matching-identifier order fai
     env.ca.script.new_order.missing_authorization = true;
 
     const names = [_][]const u8{ "a.example.com", "b.example.com" };
-    try testing.expectError(error.TooManyAuthorizations, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
-    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1"));
+    var issued = try orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options());
+    defer issued.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), env.ca.countRequests(.POST, "/authz/1"));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/2"));
 }
 
-test "ACME orders: two authorization URLs claiming the same identifier fail closed" {
+test "ACME orders: distinct authorization URLs may cover the same requested name" {
     var env = try Env.init();
     defer env.deinit();
     const session = try env.openSession();
@@ -477,8 +491,22 @@ test "ACME orders: two authorization URLs claiming the same identifier fail clos
     env.ca.script.authz.collapse_identifier = true;
 
     const names = [_][]const u8{ "a.example.com", "b.example.com" };
-    try testing.expectError(error.UnexpectedIdentifier, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    var issued = try orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options());
+    defer issued.deinit(testing.allocator);
     try env.expectStoreEmpty();
+}
+
+test "ACME orders: a ready order may have no authorization URLs" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.new_order.ready_without_authorizations = true;
+
+    const names = [_][]const u8{ "a.example.com", "b.example.com" };
+    var issued = try orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options());
+    defer issued.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1"));
 }
 
 test "ACME orders: an authorization identifier that changes mid-poll fails closed" {
@@ -791,6 +819,132 @@ test "ACME orders: a malformed CA authorization expiry fails closed" {
     const names = [_][]const u8{"a.example.com"};
     try testing.expectError(error.BadAuthorizationResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
     try env.expectStoreEmpty();
+}
+
+test "ACME orders: a malformed challenge acknowledgement stops before polling and clears the store" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.challenge.malformed_ack = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadAuthorizationResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 1), env.ca.countRequests(.POST, "/authz/1"));
+}
+
+test "ACME orders: a mismatched challenge acknowledgement stops before polling" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.challenge.mismatched_ack_token = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadAuthorizationResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 1), env.ca.countRequests(.POST, "/authz/1"));
+}
+
+test "ACME orders: an invalid challenge acknowledgement status stops before polling" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.challenge.invalid_ack_status = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadAuthorizationResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 1), env.ca.countRequests(.POST, "/authz/1"));
+}
+
+test "ACME orders: a rate-limited initial authorization GET retries before publishing" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.rate_limited_first_gets = 1;
+
+    const names = [_][]const u8{"a.example.com"};
+    var issued = try orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options());
+    defer issued.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), env.ca.countRequests(.POST, "/authz/1"));
+}
+
+test "ACME orders: cancellation during initial authorization Retry-After returns promptly" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.rate_limited_first_gets = 1;
+    var opts = env.options();
+    opts.cancel = .{ .ctx = &env.ca, .checkFn = struct {
+        fn check(ctx: ?*anyopaque) bool {
+            const ca: *fake.FakeCa = @ptrCast(@alignCast(ctx.?));
+            return ca.countRequests(.POST, "/authz/1") >= 1;
+        }
+    }.check };
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.Cancelled, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1/http-01"));
+}
+
+test "ACME orders: initial authorization Retry-After obeys the absolute deadline" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.rate_limited_first_gets = 1;
+    var opts = env.options();
+    opts.limits.order_deadline_s = 1;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.AuthorizationTimedOut, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1/http-01"));
+}
+
+test "ACME orders: a polled order with changed identifiers is rejected before certificate download" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.order_poll.mismatched_identifiers = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.UnexpectedIdentifier, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/cert/1"));
+}
+
+test "ACME orders: a polled order with changed authorization URLs is rejected before certificate download" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.order_poll.mismatched_authorizations = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadOrderResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/cert/1"));
+}
+
+test "ACME orders: a near-future CA order expiry caps polling before download" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.new_order.expires_override = "2023-11-14T22:13:23Z";
+    env.ca.script.order_poll.polls_before_final = 1_000_000;
+    var opts = env.options();
+    fastPoll(&opts);
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.OrderTimedOut, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/cert/1"));
 }
 
 test "ACME orders: the issued chain owns a durable copy of the requested order group" {

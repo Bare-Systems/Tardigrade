@@ -70,6 +70,13 @@ pub const Limits = struct {
     /// actually advances, but a hard ceiling means a frozen clock fails
     /// closed instead of spinning forever.
     max_polls: u32 = 1000,
+    /// Independent finite ceiling on `order.authorizations.len` (RFC 8555
+    /// §7.1.3: a CA's authorization count need not match the requested
+    /// identifier count -- fewer when identities are preauthorized, more
+    /// when a CA hands back distinct authorizations for the same name).
+    /// This bounds worst-case work per order without assuming any
+    /// particular CA authorization policy (#898).
+    max_authz_urls: u32 = 64,
 };
 
 /// Monotonic millisecond clock; the same shape as `transport.Clock` so a
@@ -244,39 +251,44 @@ pub fn obtain(
 
     var order = try newOrder(allocator, client, order_group, options, order_deadline_ms);
     defer order.deinit(allocator);
+    // The CA's own order `expires` (RFC 8555 §7.1.3), when given, bounds
+    // every request/wait for this order from here on, the same way an
+    // authorization's own `expires` bounds `authorizeOne` (design §8.2,
+    // #898): the local 300s default must never outlive a CA-promised
+    // shorter lifetime.
+    const effective_order_deadline_ms = order.effective_deadline_ms;
 
-    // Exactly one authorization per requested identifier: fewer entries
-    // would let a multi-name order finalize without ever authorizing every
-    // name, and `authorizeOne`'s `seen` bookkeeping below only makes sense
-    // against a count that already matches `order_group`.
-    if (order.authorizations.len != order_group.len) return error.TooManyAuthorizations;
+    // RFC 8555 §7.1.3: the number of authorizations a CA returns need not
+    // match the number of requested identifiers -- fewer when an identity
+    // is already preauthorized, more when the CA hands back distinct
+    // authorizations for the same name. Only an independent, finite
+    // ceiling and URL deduplication are enforced here; the actual security
+    // boundary is each URL's identifier staying inside the requested group
+    // (checked per-fetch below) and A4's exact SAN verification of the
+    // issued certificate.
+    if (order.authorizations.len > options.limits.max_authz_urls) return error.TooManyAuthorizations;
     for (order.authorizations, 0..) |url, i| {
         for (order.authorizations[0..i]) |earlier| {
             if (std.mem.eql(u8, earlier, url)) return error.DuplicateAuthorizationUrl;
         }
     }
 
-    // Tracks which `order_group` members have been bound to an
-    // authorization URL so far, so a CA response cannot cover the same name
-    // twice while silently never covering another (#882's exact
-    // group/authorization binding requirement).
-    var seen = [_]bool{false} ** names_mod.max_names_per_group;
     for (order.authorizations) |authz_url| {
-        try checkLive(options, order_deadline_ms);
-        try authorizeOne(allocator, client, store, order_group, authz_url, options, order_deadline_ms, seen[0..order_group.len]);
+        try checkLive(options, effective_order_deadline_ms);
+        try authorizeOne(allocator, client, store, order_group, authz_url, options, effective_order_deadline_ms);
     }
 
-    try checkLive(options, order_deadline_ms);
+    try checkLive(options, effective_order_deadline_ms);
     var issued_csr = try csr_mod.issue(allocator, order_group);
     errdefer issued_csr.key.deinit();
     defer allocator.free(issued_csr.csr_der);
 
-    const certificate_url = try finalizeAndPoll(allocator, client, &order, order_group, issued_csr.csr_der, options, order_deadline_ms);
+    const certificate_url = try finalizeAndPoll(allocator, client, &order, order_group, issued_csr.csr_der, options, effective_order_deadline_ms);
     defer allocator.free(certificate_url);
 
-    const chain_pem = try downloadCertificate(allocator, client, certificate_url, options, order_deadline_ms);
+    const chain_pem = try downloadCertificate(allocator, client, certificate_url, options, effective_order_deadline_ms);
     errdefer allocator.free(chain_pem);
-    try checkLive(options, order_deadline_ms);
+    try checkLive(options, effective_order_deadline_ms);
 
     const hostnames = try dupeGroup(allocator, order_group);
 
@@ -331,6 +343,8 @@ const NewOrderResponseJson = struct {
     identifiers: []const IdentifierJson,
     authorizations: []const []const u8,
     finalize: []const u8,
+    /// RFC 8555 §7.1.3 requires this on a pending or ready order object.
+    expires: []const u8,
 };
 
 const Order = struct {
@@ -339,6 +353,11 @@ const Order = struct {
     order_url: []u8,
     finalize_url: []u8,
     authorizations: [][]u8,
+    /// The earlier of the local 300s default and the CA's own order
+    /// `expires` (RFC 8555 §7.1.3), computed once from the initial
+    /// `newOrder` response; every later request/wait for this order must
+    /// respect it (#898).
+    effective_deadline_ms: i64,
 
     fn deinit(self: *Order, allocator: std.mem.Allocator) void {
         allocator.free(self.order_url);
@@ -409,7 +428,15 @@ fn newOrder(allocator: std.mem.Allocator, client: *client_mod.Client, order_grou
     // a status the CA could not legitimately have produced here.
     if (!std.mem.eql(u8, v.status, "pending") and !std.mem.eql(u8, v.status, "ready")) return error.BadOrderResponse;
     if (!identifiersMatchGroup(v.identifiers, order_group)) return error.UnexpectedIdentifier;
-    if (v.authorizations.len != order_group.len) return error.TooManyAuthorizations;
+    if (v.authorizations.len > options.limits.max_authz_urls) return error.TooManyAuthorizations;
+
+    const now_unix = options.unix_clock.now();
+    const parsed_expiry = parseRfc3339ToUnix(v.expires) orelse return error.BadOrderResponse;
+    if (parsed_expiry <= now_unix) return error.OrderTimedOut;
+    const ca_remaining_s = parsed_expiry - now_unix;
+    const ca_remaining_ms = std.math.mul(i64, ca_remaining_s, 1000) catch std.math.maxInt(i64);
+    const ca_deadline_ms = std.math.add(i64, options.clock.now(), ca_remaining_ms) catch std.math.maxInt(i64);
+    const effective_deadline_ms = @min(order_deadline_ms, ca_deadline_ms);
 
     const order_url = try allocator.dupe(u8, location);
     errdefer allocator.free(order_url);
@@ -427,7 +454,7 @@ fn newOrder(allocator: std.mem.Allocator, client: *client_mod.Client, order_grou
         filled += 1;
     }
 
-    return .{ .order_url = order_url, .finalize_url = finalize_url, .authorizations = authorizations };
+    return .{ .order_url = order_url, .finalize_url = finalize_url, .authorizations = authorizations, .effective_deadline_ms = effective_deadline_ms };
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +465,16 @@ const ChallengeJson = struct {
     type: []const u8,
     url: []const u8,
     token: []const u8,
+};
+
+/// RFC 8555 §7.5.1 requires the response to a challenge acknowledgement to
+/// be the updated challenge object. Keep every identity-binding field
+/// mandatory so malformed acknowledgements fail closed.
+const ChallengeAckJson = struct {
+    type: []const u8,
+    url: []const u8,
+    token: []const u8,
+    status: []const u8,
 };
 
 const AuthorizationJson = struct {
@@ -549,13 +586,23 @@ fn fetchAuthorizationRetrying(
     authz_deadline_ms: i64,
 ) Error!FetchedAuthz {
     var transient_attempt: u32 = 0;
+    var rate_limit_attempt: u32 = 0;
     const deadline_ms = @min(order_deadline_ms, authz_deadline_ms);
     while (true) {
+        if (options.cancel.isCancelled()) return error.Cancelled;
+        if (options.clock.now() >= deadline_ms) return error.AuthorizationTimedOut;
+        if (rate_limit_attempt >= options.limits.max_polls) return error.AuthorizationTimedOut;
         const cap = remainingOrderMs(options, deadline_ms);
         return fetchAuthorization(allocator, client, url, order_group, cap) catch |err| {
+            // This POST-as-GET is idempotent, just like later authz polls.
+            // A CA may rate-limit it before the challenge is published.
+            if (err == error.RateLimited) {
+                rate_limit_attempt +|= 1;
+                try waitWithinDeadline(options, retryAfterWaitMs(client, options), deadline_ms, error.AuthorizationTimedOut);
+                continue;
+            }
             if (!isTransientFailure(client, err) or transient_attempt >= max_transient_retries) return err;
             transient_attempt += 1;
-            try checkLive(options, order_deadline_ms);
             try waitWithinDeadline(options, transientBackoffMs(transient_attempt - 1), deadline_ms, error.AuthorizationTimedOut);
             continue;
         };
@@ -686,13 +733,6 @@ fn authorizeOne(
     authz_url: []const u8,
     options: Options,
     order_deadline_ms: i64,
-    /// One slot per `order_group` member; `authorizeOne` claims exactly one
-    /// unseen slot for this authorization and every later poll of the same
-    /// `authz_url` must keep reporting that same identifier (RFC 8555 §7.1.4
-    /// never allows an authorization's identifier to change). This is how
-    /// the engine refuses both a second authorization URL reporting the
-    /// same name and a single URL whose identifier changes mid-poll.
-    seen: []bool,
 ) Error!void {
     const authz_deadline_ms = @min(order_deadline_ms, options.clock.now() + options.limits.authz_deadline_s * 1000);
 
@@ -701,9 +741,13 @@ fn authorizeOne(
     // runs when this function returns, via the `defer` below.
     var first = try fetchAuthorizationRetrying(allocator, client, authz_url, order_group, options, order_deadline_ms, authz_deadline_ms);
     defer first.deinit();
-    const index = identifierIndexInGroup(order_group, first.identifier_value) orelse return error.UnexpectedIdentifier;
-    if (seen[index]) return error.UnexpectedIdentifier;
-    seen[index] = true;
+    // RFC 8555 §7.1.3 does not guarantee a 1:1 count between requested
+    // identifiers and authorizations, so this only checks group membership
+    // -- never that the identifier is still "unclaimed" by an earlier
+    // authorization URL -- leaving a later poll of this same `authz_url`
+    // (below) to enforce the one invariant the RFC does promise: its
+    // identifier never changes mid-poll.
+    _ = identifierIndexInGroup(order_group, first.identifier_value) orelse return error.UnexpectedIdentifier;
     switch (first.terminal) {
         .valid => return,
         .invalid => return error.AuthorizationInvalid,
@@ -754,7 +798,24 @@ fn authorizeOne(
     {
         const kid = client.kid orelse return error.BadAccountResponse;
         var trigger = try client.signedPostOptions(challenge_url, "{}", .{ .kid = kid }, client.transport.limits.max_body_bytes, .json, remainingOrderMs(options, effective_authz_deadline_ms));
-        trigger.deinit();
+        defer trigger.deinit();
+        // RFC 8555 §7.5.1: the response is the updated challenge object, not
+        // an arbitrary 2xx. Checking it means a CA-controlled malformed
+        // body, a mismatched url/token/type, or an unrecognized status
+        // fails closed here instead of silently falling through to the
+        // poll loop below on a challenge this client never actually
+        // acknowledged (#898).
+        if (trigger.status != 200 or !trigger.content_type_json) return error.BadAuthorizationResponse;
+        var ack = json_limits.parseBounded(ChallengeAckJson, allocator, trigger.body, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.BadAuthorizationResponse,
+        };
+        defer ack.deinit();
+        const av = ack.value;
+        if (!std.mem.eql(u8, av.type, "http-01") or !std.mem.eql(u8, av.url, challenge_url) or !std.mem.eql(u8, av.token, token))
+            return error.BadAuthorizationResponse;
+        if (!std.mem.eql(u8, av.status, "processing") and !std.mem.eql(u8, av.status, "valid"))
+            return error.BadAuthorizationResponse;
     }
 
     var poll_attempt: u32 = 0;
@@ -830,8 +891,33 @@ fn authorizeOne(
 
 const OrderStatusJson = struct {
     status: []const u8,
+    identifiers: []const IdentifierJson,
+    authorizations: []const []const u8,
+    finalize: []const u8,
+    expires: []const u8,
     certificate: ?[]const u8 = null,
 };
+
+fn authorizationUrlsMatch(expected: []const []u8, actual: []const []const u8) bool {
+    if (expected.len != actual.len) return false;
+    for (actual, 0..) |url, i| {
+        // `newOrder` already rejected duplicated URLs. Repeat that check on
+        // the later representation before comparing the order-insensitive
+        // set, without tying this helper to a compile-time policy limit.
+        for (actual[0..i]) |earlier| {
+            if (std.mem.eql(u8, earlier, url)) return false;
+        }
+        var found = false;
+        for (expected) |known| {
+            if (std.mem.eql(u8, known, url)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
 
 /// The finalize response is the order object again (RFC 8555 §7.1.3); only
 /// `identifiers` (when the CA echoes it) is checked here, not `certificate`
@@ -914,6 +1000,15 @@ fn finalizeAndPoll(
         };
         defer parsed.deinit();
         const v = parsed.value;
+
+        // RFC 8555 §7.1.3 makes these pieces of order identity immutable.
+        // Reject a CA response that changes them before acting on `valid`.
+        if (!identifiersMatchGroup(v.identifiers, order_group)) return error.UnexpectedIdentifier;
+        if (!authorizationUrlsMatch(order.authorizations, v.authorizations)) return error.BadOrderResponse;
+        if (!std.mem.eql(u8, v.finalize, order.finalize_url)) return error.BadOrderResponse;
+        // The original expiry set the absolute deadline. A later malformed
+        // expiry cannot be ignored merely because no deadline is extended.
+        if (parseRfc3339ToUnix(v.expires) == null) return error.BadOrderResponse;
 
         if (std.mem.eql(u8, v.status, "valid")) {
             const certificate_url = v.certificate orelse return error.BadOrderResponse;

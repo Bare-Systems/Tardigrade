@@ -103,23 +103,6 @@ pub const UnixClock = struct {
     }
 };
 
-/// Injectable backoff/poll-interval wait. Production uses a real sleep;
-/// tests substitute one that advances a fake clock instead of blocking, so
-/// polling/backoff/timeout behavior is deterministic (design: "fake clock or
-/// injected waits").
-pub const Waiter = struct {
-    ctx: ?*anyopaque = null,
-    sleepFn: *const fn (ctx: ?*anyopaque, ms: u32) void = defaultSleep,
-
-    fn defaultSleep(_: ?*anyopaque, ms: u32) void {
-        zig_compat.sleepNs(@as(u64, ms) * std.time.ns_per_ms);
-    }
-
-    pub fn wait(self: Waiter, ms: u32) void {
-        self.sleepFn(self.ctx, ms);
-    }
-};
-
 /// Cooperative cancellation, checked between every network call and every
 /// poll wait (design §5.5): "the worker waits on an interruptible
 /// condition, not an uninterruptible sleep."
@@ -136,6 +119,37 @@ pub const Cancel = struct {
     }
 };
 
+/// Injectable backoff/poll-interval wait. A production wait can be up to
+/// `retry_after_max_s` (30s); design §5.5 requires that wait be interruptible
+/// rather than an uninterruptible sleep, so the default implementation sleeps
+/// in small slices and checks `cancel` between each one, returning as soon as
+/// cancellation fires instead of blocking for the full duration. Tests
+/// substitute a waiter that advances a fake clock instead of sleeping at all,
+/// so polling/backoff/timeout behavior stays deterministic (design: "fake
+/// clock or injected waits").
+pub const Waiter = struct {
+    ctx: ?*anyopaque = null,
+    waitFn: *const fn (ctx: ?*anyopaque, ms: u32, cancel: Cancel) bool = defaultWait,
+
+    const slice_ms: u32 = 200;
+
+    fn defaultWait(_: ?*anyopaque, ms: u32, cancel: Cancel) bool {
+        var remaining = ms;
+        while (remaining > 0) {
+            if (cancel.isCancelled()) return true;
+            const this_slice = @min(remaining, slice_ms);
+            zig_compat.sleepNs(@as(u64, this_slice) * std.time.ns_per_ms);
+            remaining -= this_slice;
+        }
+        return cancel.isCancelled();
+    }
+
+    /// Returns `true` if `cancel` fired during (or before) the wait.
+    pub fn wait(self: Waiter, ms: u32, cancel: Cancel) bool {
+        return self.waitFn(self.ctx, ms, cancel);
+    }
+};
+
 pub const Options = struct {
     limits: Limits = .{},
     clock: Clock = .{},
@@ -144,6 +158,35 @@ pub const Options = struct {
     cancel: Cancel = .{},
 };
 
+test "ACME orders: the production Waiter returns promptly when cancelled mid-wait" {
+    var flag = std.atomic.Value(bool).init(false);
+    const cancel: Cancel = .{ .ctx = &flag, .checkFn = struct {
+        fn check(ctx: ?*anyopaque) bool {
+            const f: *std.atomic.Value(bool) = @ptrCast(@alignCast(ctx.?));
+            return f.load(.acquire);
+        }
+    }.check };
+
+    const Setter = struct {
+        fn run(f: *std.atomic.Value(bool)) void {
+            zig_compat.sleepNs(50 * std.time.ns_per_ms);
+            f.store(true, .release);
+        }
+    };
+    const setter = try std.Thread.spawn(.{}, Setter.run, .{&flag});
+    defer setter.join();
+
+    const start_ns = zig_compat.monotonicNanoTimestamp();
+    // A real production wait with the same 30s ceiling `waitForRetry` passes
+    // for a `Retry-After: 30` response; cancellation a few slices in must
+    // return almost immediately rather than blocking for the full 30s.
+    const cancelled = (Waiter{}).wait(30_000, cancel);
+    const elapsed_ms = @divTrunc(zig_compat.monotonicNanoTimestamp() - start_ns, std.time.ns_per_ms);
+
+    try std.testing.expect(cancelled);
+    try std.testing.expect(elapsed_ms < 2_000);
+}
+
 /// Owned result: a fresh, distinct leaf key and the issued chain, never
 /// activated or published. Caller (A4) must call `deinit` exactly once.
 pub const IssuedChain = struct {
@@ -151,12 +194,34 @@ pub const IssuedChain = struct {
     /// Leaf-first PEM chain exactly as downloaded; not yet parsed or
     /// verified (that is `activate.verifyChain`, §6.4).
     chain_pem: []u8,
+    /// Owned copy of the exact requested order-group identity (RFC 8555
+    /// SAN set) this key/chain was issued for. A4's `activate.verifyChain`
+    /// needs the precise group this call processed; copying it here means
+    /// the caller's `order_group` slice can be mutated or freed after
+    /// `obtain` returns without any ad hoc correlation channel back to it.
+    hostnames: [][]u8,
 
     pub fn deinit(self: *IssuedChain, allocator: std.mem.Allocator) void {
         self.key.deinit();
         allocator.free(self.chain_pem);
+        for (self.hostnames) |h| allocator.free(h);
+        allocator.free(self.hostnames);
     }
 };
+
+fn dupeGroup(allocator: std.mem.Allocator, order_group: []const []const u8) Error![][]u8 {
+    const out = try allocator.alloc([]u8, order_group.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |h| allocator.free(h);
+        allocator.free(out);
+    }
+    for (order_group, 0..) |name, i| {
+        out[i] = try allocator.dupe(u8, name);
+        filled += 1;
+    }
+    return out;
+}
 
 const key_authorization_buf_len = challenge_store_mod.max_token_len + 1 + account_mod.thumbprint_len;
 
@@ -174,24 +239,33 @@ pub fn obtain(
     try csr_mod.validateGroup(order_group);
 
     const order_deadline_ms = options.clock.now() + options.limits.order_deadline_s * 1000;
+    try checkLive(options, order_deadline_ms);
 
     var order = try newOrder(allocator, client, order_group);
     defer order.deinit(allocator);
 
-    if (order.authorizations.len > order_group.len) return error.TooManyAuthorizations;
+    // Exactly one authorization per requested identifier: fewer entries
+    // would let a multi-name order finalize without ever authorizing every
+    // name, and `authorizeOne`'s `seen` bookkeeping below only makes sense
+    // against a count that already matches `order_group`.
+    if (order.authorizations.len != order_group.len) return error.TooManyAuthorizations;
     for (order.authorizations, 0..) |url, i| {
         for (order.authorizations[0..i]) |earlier| {
             if (std.mem.eql(u8, earlier, url)) return error.DuplicateAuthorizationUrl;
         }
     }
 
+    // Tracks which `order_group` members have been bound to an
+    // authorization URL so far, so a CA response cannot cover the same name
+    // twice while silently never covering another (#882's exact
+    // group/authorization binding requirement).
+    var seen = [_]bool{false} ** names_mod.max_names_per_group;
     for (order.authorizations) |authz_url| {
-        if (options.cancel.isCancelled()) return error.Cancelled;
-        if (options.clock.now() >= order_deadline_ms) return error.OrderTimedOut;
-        try authorizeOne(allocator, client, store, order_group, authz_url, options, order_deadline_ms);
+        try checkLive(options, order_deadline_ms);
+        try authorizeOne(allocator, client, store, order_group, authz_url, options, order_deadline_ms, seen[0..order_group.len]);
     }
 
-    if (options.clock.now() >= order_deadline_ms) return error.OrderTimedOut;
+    try checkLive(options, order_deadline_ms);
     var issued_csr = try csr_mod.issue(allocator, order_group);
     errdefer issued_csr.key.deinit();
     defer allocator.free(issued_csr.csr_der);
@@ -199,9 +273,32 @@ pub fn obtain(
     const certificate_url = try finalizeAndPoll(allocator, client, &order, issued_csr.csr_der, options, order_deadline_ms);
     defer allocator.free(certificate_url);
 
-    const chain_pem = try downloadCertificate(allocator, client, certificate_url, options);
+    const chain_pem = try downloadCertificate(allocator, client, certificate_url, options, order_deadline_ms);
+    errdefer allocator.free(chain_pem);
+    try checkLive(options, order_deadline_ms);
 
-    return .{ .key = issued_csr.key, .chain_pem = chain_pem };
+    const hostnames = try dupeGroup(allocator, order_group);
+
+    return .{ .key = issued_csr.key, .chain_pem = chain_pem, .hostnames = hostnames };
+}
+
+/// Fails closed on cancellation or an expired order deadline. Called before
+/// every CA-affecting step (design §9.1/§5.5) -- not just between polls --
+/// so an attempt that is already cancelled or out of budget never issues a
+/// fresh request (new-order, finalize, download) and never returns a
+/// key/certificate once the deadline has passed, even if the triggering CA
+/// response itself was fast.
+fn checkLive(options: Options, order_deadline_ms: i64) Error!void {
+    if (options.cancel.isCancelled()) return error.Cancelled;
+    if (options.clock.now() >= order_deadline_ms) return error.OrderTimedOut;
+}
+
+/// Remaining budget until `order_deadline_ms`, clamped into `u32` for the
+/// transport's per-request deadline cap. `checkLive` must already have
+/// passed, so the remainder here is always positive.
+fn remainingOrderMs(options: Options, order_deadline_ms: i64) u32 {
+    const remaining = order_deadline_ms - options.clock.now();
+    return @intCast(@min(@max(remaining, 1), @as(i64, std.math.maxInt(u32))));
 }
 
 // ---------------------------------------------------------------------------
@@ -283,8 +380,15 @@ fn newOrder(allocator: std.mem.Allocator, client: *client_mod.Client, order_grou
     defer parsed.deinit();
     const v = parsed.value;
     if (std.mem.eql(u8, v.status, "invalid")) return error.OrderInvalid;
+    // Only `pending` (the ordinary case) and `ready` (every requested
+    // identifier already has a valid authorization from an earlier order)
+    // are sane statuses for a response this engine has never finalized yet;
+    // anything else -- `valid`, `deactivated`, `expired`, an unrecognized
+    // string -- fails closed rather than walking into challenge issuance on
+    // a status the CA could not legitimately have produced here.
+    if (!std.mem.eql(u8, v.status, "pending") and !std.mem.eql(u8, v.status, "ready")) return error.BadOrderResponse;
     if (!identifiersMatchGroup(v.identifiers, order_group)) return error.UnexpectedIdentifier;
-    if (v.authorizations.len == 0 or v.authorizations.len > order_group.len) return error.TooManyAuthorizations;
+    if (v.authorizations.len != order_group.len) return error.TooManyAuthorizations;
 
     const order_url = try allocator.dupe(u8, location);
     errdefer allocator.free(order_url);
@@ -356,7 +460,7 @@ fn fetchAuthorization(
     errdefer parsed.deinit();
     const v = parsed.value;
     if (!std.mem.eql(u8, v.identifier.type, "dns")) return error.BadAuthorizationResponse;
-    if (!identifierInGroup(order_group, v.identifier.value)) return error.UnexpectedIdentifier;
+    if (identifierIndexInGroup(order_group, v.identifier.value) == null) return error.UnexpectedIdentifier;
 
     const terminal: Terminal = if (std.mem.eql(u8, v.status, "valid"))
         .valid
@@ -368,22 +472,26 @@ fn fetchAuthorization(
         // become `valid`.
         .invalid;
 
+    // Exactly one http-01 entry is accepted: a second one would leave it
+    // ambiguous which challenge is actually bound to this authorization, and
+    // #882 requires this duplicate shape to fail closed rather than silently
+    // picking the first.
     var http01: ?Http01Challenge = null;
     for (v.challenges) |c| {
         if (std.mem.eql(u8, c.type, "http-01")) {
+            if (http01 != null) return error.BadAuthorizationResponse;
             http01 = .{ .url = c.url, .token = c.token };
-            break;
         }
     }
 
     return .{ .parsed = parsed, .terminal = terminal, .http01 = http01, .identifier_value = v.identifier.value };
 }
 
-fn identifierInGroup(order_group: []const []const u8, value: []const u8) bool {
-    for (order_group) |name| {
-        if (std.mem.eql(u8, name, value)) return true;
+fn identifierIndexInGroup(order_group: []const []const u8, value: []const u8) ?usize {
+    for (order_group, 0..) |name, i| {
+        if (std.mem.eql(u8, name, value)) return i;
     }
-    return false;
+    return null;
 }
 
 fn buildKeyAuthorization(client: *client_mod.Client, token: []const u8, out: *[key_authorization_buf_len]u8) Error![]const u8 {
@@ -399,6 +507,13 @@ fn authorizeOne(
     authz_url: []const u8,
     options: Options,
     order_deadline_ms: i64,
+    /// One slot per `order_group` member; `authorizeOne` claims exactly one
+    /// unseen slot for this authorization and every later poll of the same
+    /// `authz_url` must keep reporting that same identifier (RFC 8555 §7.1.4
+    /// never allows an authorization's identifier to change). This is how
+    /// the engine refuses both a second authorization URL reporting the
+    /// same name and a single URL whose identifier changes mid-poll.
+    seen: []bool,
 ) Error!void {
     const authz_deadline_ms = @min(order_deadline_ms, options.clock.now() + options.limits.authz_deadline_s * 1000);
 
@@ -407,6 +522,9 @@ fn authorizeOne(
     // runs when this function returns, via the `defer` below.
     var first = try fetchAuthorization(allocator, client, authz_url, order_group);
     defer first.deinit();
+    const index = identifierIndexInGroup(order_group, first.identifier_value) orelse return error.UnexpectedIdentifier;
+    if (seen[index]) return error.UnexpectedIdentifier;
+    seen[index] = true;
     switch (first.terminal) {
         .valid => return,
         .invalid => return error.AuthorizationInvalid,
@@ -440,13 +558,22 @@ fn authorizeOne(
 
         var polled = fetchAuthorization(allocator, client, authz_url, order_group) catch |err| {
             if (err == error.RateLimited) {
-                waitForRetry(client, options);
+                if (waitForRetry(client, options)) {
+                    _ = store.remove(host, token);
+                    return error.Cancelled;
+                }
                 poll_attempt +|= 1;
                 continue;
             }
             return err;
         };
         defer polled.deinit();
+        // The same `authz_url` must keep reporting the identifier it
+        // reported on its very first fetch; a CA that later swaps in a
+        // different (still in-group) identifier would otherwise leave that
+        // other name's authorization uncovered while this `seen` slot wrongly
+        // reads as already satisfied.
+        if (!std.mem.eql(u8, polled.identifier_value, host)) return error.UnexpectedIdentifier;
 
         switch (polled.terminal) {
             .valid => {
@@ -459,7 +586,10 @@ fn authorizeOne(
             },
             .pending => {
                 const wait_ms = retryAfterOrPollInterval(client, poll_attempt, options.limits);
-                options.waiter.wait(wait_ms);
+                if (options.waiter.wait(wait_ms, options.cancel)) {
+                    _ = store.remove(host, token);
+                    return error.Cancelled;
+                }
                 poll_attempt +|= 1;
             },
         }
@@ -490,6 +620,7 @@ fn finalizeAndPoll(
     const payload = try std.fmt.allocPrint(allocator, "{{\"csr\":\"{s}\"}}", .{csr_b64});
     defer allocator.free(payload);
 
+    try checkLive(options, order_deadline_ms);
     {
         const kid = client.kid orelse return error.BadAccountResponse;
         var resp = try client.signedPost(order.finalize_url, payload, .{ .kid = kid });
@@ -498,13 +629,12 @@ fn finalizeAndPoll(
 
     var poll_attempt: u32 = 0;
     while (true) {
-        if (options.cancel.isCancelled()) return error.Cancelled;
-        if (options.clock.now() >= order_deadline_ms) return error.OrderTimedOut;
+        try checkLive(options, order_deadline_ms);
         if (poll_attempt >= options.limits.max_polls) return error.OrderTimedOut;
 
         var resp = client.signedPostAsGet(order.order_url) catch |err| {
             if (err == error.RateLimited) {
-                waitForRetry(client, options);
+                if (waitForRetry(client, options)) return error.Cancelled;
                 poll_attempt +|= 1;
                 continue;
             }
@@ -526,7 +656,7 @@ fn finalizeAndPoll(
         }
         if (std.mem.eql(u8, v.status, "pending") or std.mem.eql(u8, v.status, "ready") or std.mem.eql(u8, v.status, "processing")) {
             const wait_ms = retryAfterOrPollInterval(client, poll_attempt, options.limits);
-            options.waiter.wait(wait_ms);
+            if (options.waiter.wait(wait_ms, options.cancel)) return error.Cancelled;
             poll_attempt +|= 1;
             continue;
         }
@@ -535,8 +665,21 @@ fn finalizeAndPoll(
     }
 }
 
-fn downloadCertificate(allocator: std.mem.Allocator, client: *client_mod.Client, certificate_url: []const u8, options: Options) Error![]u8 {
-    var resp = try client.signedPostAsGetMaxBody(certificate_url, options.limits.max_certificate_bytes);
+fn downloadCertificate(allocator: std.mem.Allocator, client: *client_mod.Client, certificate_url: []const u8, options: Options, order_deadline_ms: i64) Error![]u8 {
+    try checkLive(options, order_deadline_ms);
+    // PEM, not JSON (design §5.1): the default `Accept: application/json`
+    // would misrepresent what this engine can use, masking interop failures
+    // with a CA that content-negotiates. The request is also capped to
+    // whatever remains of the absolute order deadline, not just the
+    // transport's own independent default, so a slow certificate endpoint
+    // cannot push this single request past the 300s budget design §9.1
+    // promises.
+    var resp = try client.signedPostAsGetOptions(
+        certificate_url,
+        options.limits.max_certificate_bytes,
+        .pem_certificate_chain,
+        remainingOrderMs(options, order_deadline_ms),
+    );
     defer resp.deinit();
     if (!std.mem.startsWith(u8, resp.body, "-----BEGIN CERTIFICATE-----")) return error.BadCertificateResponse;
     return allocator.dupe(u8, resp.body);
@@ -560,9 +703,10 @@ fn retryAfterOrPollInterval(client: *client_mod.Client, attempt: u32, limits: Li
     return @min(scaled, limits.poll_interval_max_s) * 1000;
 }
 
-fn waitForRetry(client: *client_mod.Client, options: Options) void {
+/// Returns `true` if `options.cancel` fired during the wait.
+fn waitForRetry(client: *client_mod.Client, options: Options) bool {
     const seconds = clampRetryAfter(client.diagnostics.last_retry_after_s orelse options.limits.retry_after_max_s, options.limits);
-    options.waiter.wait(seconds * 1000);
+    return options.waiter.wait(seconds * 1000, options.cancel);
 }
 
 // ---------------------------------------------------------------------------

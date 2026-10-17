@@ -90,6 +90,10 @@ pub const NewOrderBehavior = struct {
     extra_identifier: bool = false,
     /// The response drops the last requested identifier.
     missing_identifier: bool = false,
+    /// `identifiers[]` lists every requested name, but `authorizations[]`
+    /// drops the last entry, so one name is left without any authorization
+    /// URL at all.
+    missing_authorization: bool = false,
     /// One `authorizations[]` entry points at a different (non-CA) origin.
     cross_host_authorization: bool = false,
     /// The last `authorizations[]` entry is replaced with a repeat of the
@@ -97,6 +101,9 @@ pub const NewOrderBehavior = struct {
     duplicate_authorization: bool = false,
     /// `finalize` points at a different (non-CA) origin.
     cross_host_finalize: bool = false,
+    /// Replace the `status` field with an arbitrary scripted value (e.g. an
+    /// unrecognized string, or `valid`), instead of the normal `pending`.
+    status_override: ?[]const u8 = null,
 };
 
 /// Scripted hostile behavior for authorization GET polls.
@@ -109,6 +116,17 @@ pub const AuthzBehavior = struct {
     no_http01: bool = false,
     /// The `http-01` challenge's `url` points at a different origin.
     cross_host_challenge: bool = false,
+    /// `challenges[]` contains two distinct `http-01` entries (different
+    /// URLs/tokens), so the client cannot tell which one is actually bound.
+    duplicate_http01: bool = false,
+    /// Every authorization reports the identifier of the very first
+    /// authorization ever created, simulating two distinct authorization
+    /// URLs that both claim to cover the same requested name.
+    collapse_identifier: bool = false,
+    /// Authorization id 1 reports its own identifier on the first GET (so it
+    /// claims the correct `seen` slot), then switches to authorization id
+    /// 2's (still in-group) identifier on every later GET.
+    swap_identifier_on_poll: bool = false,
     /// How many polls answer "pending" before the terminal status below.
     polls_before_final: u32 = 0,
     final_status: enum { valid, invalid } = .valid,
@@ -222,6 +240,11 @@ pub const FakeCa = struct {
         polls_before_final: u32,
         poll_count: u32 = 0,
         rate_limited_remaining: u32,
+        /// Every GET against this authorization, including the first fetch
+        /// before the challenge is triggered; `swap_identifier_on_poll` uses
+        /// this to report a different in-group identifier from the second
+        /// GET onward.
+        get_count: u32 = 0,
 
         fn deinit(self: *Authz, allocator: std.mem.Allocator) void {
             allocator.free(self.identifier);
@@ -350,6 +373,14 @@ pub const FakeCa = struct {
         const path = parts.next().?;
         const method: transport.Method = if (std.mem.eql(u8, method_s, "GET")) .GET else if (std.mem.eql(u8, method_s, "HEAD")) .HEAD else .POST;
 
+        var accept_header: ?[]const u8 = null;
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (std.ascii.eqlIgnoreCase(line[0..colon], "accept")) {
+                accept_header = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            }
+        }
+
         const log_index = self.log.items.len;
         try self.log.append(self.allocator, .{ .method = method, .path = try self.allocator.dupe(u8, path) });
 
@@ -380,7 +411,7 @@ pub const FakeCa = struct {
         } else if (method == .POST and std.mem.startsWith(u8, path, "/order/")) {
             try self.orderGet(allocator, path, body, log_index, &resp);
         } else if (method == .POST and std.mem.startsWith(u8, path, "/cert/")) {
-            try self.certGet(allocator, path, body, log_index, &resp);
+            try self.certGet(allocator, path, body, log_index, &resp, accept_header);
         } else {
             resp.status = 404;
             try resp.problem(allocator, "urn:ietf:params:acme:error:malformed");
@@ -810,14 +841,18 @@ pub const FakeCa = struct {
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
-        try buf.appendSlice(allocator, "{\"status\":\"pending\",\"identifiers\":[");
+        try buf.print(allocator, "{{\"status\":\"{s}\",\"identifiers\":[", .{b.status_override orelse "pending"});
         for (order.identifiers.items, 0..) |id, i| {
             if (i > 0) try buf.append(allocator, ',');
             try buf.print(allocator, "{{\"type\":\"dns\",\"value\":\"{s}\"}}", .{id});
         }
         try buf.appendSlice(allocator, "],\"authorizations\":[");
         const authz_count = order.authz_ids.items.len;
-        for (order.authz_ids.items, 0..) |aid, i| {
+        // `missing_authorization` drops the last entry while every
+        // `identifiers[]` entry above stays intact, so the mismatch is in
+        // the authorization count alone, not in which names were requested.
+        const emitted_count = if (b.missing_authorization and authz_count > 0) authz_count - 1 else authz_count;
+        for (order.authz_ids.items[0..emitted_count], 0..) |aid, i| {
             if (i > 0) try buf.append(allocator, ',');
             // `duplicate_authorization` replaces the *last* entry with the
             // first one's id (same count, a real repeated URL) rather than
@@ -873,6 +908,7 @@ pub const FakeCa = struct {
         }
 
         var authz = &self.authorizations.items[id - 1];
+        authz.get_count += 1;
         if (authz.triggered and authz.status == .pending) authz.status = .processing;
         if (authz.status == .processing) {
             if (authz.poll_count < authz.polls_before_final) {
@@ -891,7 +927,14 @@ pub const FakeCa = struct {
         }
 
         const status_str = @tagName(authz.status);
-        const identifier_value = if (b.wrong_identifier) "attacker-controlled.example.net" else authz.identifier;
+        const identifier_value = if (b.wrong_identifier)
+            "attacker-controlled.example.net"
+        else if (b.collapse_identifier and self.authorizations.items.len > 0)
+            self.authorizations.items[0].identifier
+        else if (b.swap_identifier_on_poll and id == 1 and authz.get_count > 1 and self.authorizations.items.len > 1)
+            self.authorizations.items[1].identifier
+        else
+            authz.identifier;
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
@@ -901,6 +944,12 @@ pub const FakeCa = struct {
                 try buf.print(allocator, "{{\"type\":\"http-01\",\"url\":\"https://evil.test/authz/{d}/http-01\",\"token\":\"{s}\"}}", .{ id, authz.token });
             } else {
                 try buf.print(allocator, "{{\"type\":\"http-01\",\"url\":\"{s}/authz/{d}/http-01\",\"token\":\"{s}\"}}", .{ self.base, id, authz.token });
+            }
+            if (b.duplicate_http01) {
+                // A second, distinct http-01 entry: different URL and token,
+                // so a client that just takes "the first one" would trigger
+                // and poll the wrong challenge without ever noticing.
+                try buf.print(allocator, ",{{\"type\":\"http-01\",\"url\":\"{s}/authz/{d}/http-01-dup\",\"token\":\"{s}-dup\"}}", .{ self.base, id, authz.token });
             }
         }
         try buf.appendSlice(allocator, "]}");
@@ -1024,12 +1073,23 @@ pub const FakeCa = struct {
         resp.nonce = try self.freshNonce(allocator);
     }
 
-    fn certGet(self: *FakeCa, allocator: std.mem.Allocator, path: []const u8, body: []const u8, log_index: usize, resp: *Reply) !void {
+    fn certGet(self: *FakeCa, allocator: std.mem.Allocator, path: []const u8, body: []const u8, log_index: usize, resp: *Reply, accept: ?[]const u8) !void {
         const v = try self.verify(allocator, path, body);
         defer allocator.free(v.payload);
         self.log.items[log_index].signature_ok = v.ok;
         self.log.items[log_index].used_kid = v.used_kid;
         if (!v.ok) return self.failPost(allocator, v, resp);
+
+        // A real CA may content-negotiate; a client that still advertises
+        // `Accept: application/json` for this POST-as-GET (design §5.1)
+        // misrepresents what it can use, so this fake CA refuses it rather
+        // than silently answering with PEM anyway.
+        if (!std.mem.eql(u8, accept orelse "", "application/pem-certificate-chain")) {
+            resp.status = 406;
+            try resp.problem(allocator, "urn:ietf:params:acme:error:malformed");
+            resp.nonce = try self.freshNonce(allocator);
+            return;
+        }
 
         const id = parseTrailingId(path, "/cert/") orelse return self.notFound(allocator, resp);
         const b = self.script.cert;

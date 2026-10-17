@@ -358,12 +358,38 @@ pub const Client = struct {
     /// downloads, which design §9.1 caps at 128 KiB, well above the 64 KiB
     /// JSON default every other ACME response uses.
     pub fn signedPostMaxBody(self: *Client, url: []const u8, payload: ?[]const u8, auth: account_mod.Auth, max_body_bytes: usize) Error!transport_mod.Response {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.signedPostLocked(url, payload, auth, max_body_bytes) catch |err| return self.fail(err);
+        return self.signedPostOptions(url, payload, auth, max_body_bytes, .json, null);
     }
 
-    fn signedPostLocked(self: *Client, url: []const u8, payload: ?[]const u8, auth: account_mod.Auth, max_body_bytes: usize) Error!transport_mod.Response {
+    /// Same as `signedPostMaxBody`, with the request's `Accept` header and a
+    /// cap on the per-request deadline both overridable. The order engine's
+    /// certificate download (`orders.zig`, #882) needs
+    /// `Accept: application/pem-certificate-chain` (design §5.1) and a
+    /// deadline bounded by its own remaining per-order budget rather than the
+    /// transport's independent default.
+    pub fn signedPostOptions(
+        self: *Client,
+        url: []const u8,
+        payload: ?[]const u8,
+        auth: account_mod.Auth,
+        max_body_bytes: usize,
+        accept: transport_mod.Accept,
+        deadline_cap_ms: ?u32,
+    ) Error!transport_mod.Response {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.signedPostLocked(url, payload, auth, max_body_bytes, accept, deadline_cap_ms) catch |err| return self.fail(err);
+    }
+
+    fn signedPostLocked(
+        self: *Client,
+        url: []const u8,
+        payload: ?[]const u8,
+        auth: account_mod.Auth,
+        max_body_bytes: usize,
+        accept: transport_mod.Accept,
+        deadline_cap_ms: ?u32,
+    ) Error!transport_mod.Response {
         const target = try url_mod.requireCaOrigin(url, self.directory_origin, self.config.allow_cross_host_urls);
         try self.ensureDirectoryLocked();
 
@@ -380,7 +406,7 @@ pub const Client = struct {
 
             // Every path below either returns `resp` to the caller or frees it
             // exactly once; nothing between here and there can fail.
-            var resp = try self.transport.requestWithBodyLimit(.POST, target, jws, "application/jose+json", max_body_bytes);
+            var resp = try self.transport.requestWithBodyLimit(.POST, target, jws, "application/jose+json", max_body_bytes, accept, deadline_cap_ms);
             self.noteResponse(&resp);
             if (resp.status >= 200 and resp.status < 300) {
                 self.diagnostics.last_problem = .none;
@@ -437,6 +463,18 @@ pub const Client = struct {
     /// Same as `signedPostAsGet`, but reads the response body under
     /// `max_body_bytes` (see `signedPostMaxBody`).
     pub fn signedPostAsGetMaxBody(self: *Client, url: []const u8, max_body_bytes: usize) Error!transport_mod.Response {
+        return self.signedPostAsGetOptions(url, max_body_bytes, .json, null);
+    }
+
+    /// Same as `signedPostAsGetMaxBody`, with the request's `Accept` header
+    /// and a deadline cap both overridable (see `signedPostOptions`).
+    pub fn signedPostAsGetOptions(
+        self: *Client,
+        url: []const u8,
+        max_body_bytes: usize,
+        accept: transport_mod.Accept,
+        deadline_cap_ms: ?u32,
+    ) Error!transport_mod.Response {
         const kid = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -444,7 +482,7 @@ pub const Client = struct {
         };
         // The slice stays valid: kid is only replaced via setKid/deinit, which
         // callers do not run concurrently with in-flight requests.
-        return self.signedPostMaxBody(url, null, .{ .kid = kid }, max_body_bytes);
+        return self.signedPostOptions(url, null, .{ .kid = kid }, max_body_bytes, accept, deadline_cap_ms);
     }
 
     /// `newOrder` endpoint URL (RFC 8555 §7.1.1), fetching the directory

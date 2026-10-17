@@ -41,10 +41,11 @@ fn tickUnix(ctx: ?*anyopaque) i64 {
     return t.unix;
 }
 
-fn advanceOnWait(ctx: ?*anyopaque, ms: u32) void {
+fn advanceOnWait(ctx: ?*anyopaque, ms: u32, cancel: orders_mod.Cancel) bool {
     const t: *TestTime = @ptrCast(@alignCast(ctx.?));
     t.ms += ms;
     t.unix += @divTrunc(ms, 1000) + 1;
+    return cancel.isCancelled();
 }
 
 const Env = struct {
@@ -99,7 +100,7 @@ const Env = struct {
         return .{
             .clock = .{ .ctx = &self.time, .nowFn = tickMs },
             .unix_clock = .{ .ctx = &self.time, .nowFn = tickUnix },
-            .waiter = .{ .ctx = &self.time, .sleepFn = advanceOnWait },
+            .waiter = .{ .ctx = &self.time, .waitFn = advanceOnWait },
         };
     }
 
@@ -444,4 +445,163 @@ test "ACME orders: an empty certificate response is rejected" {
 
     const names = [_][]const u8{"a.example.com"};
     try testing.expectError(error.BadCertificateResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+}
+
+test "ACME orders: an authorization dropped from a matching-identifier order fails closed" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.new_order.missing_authorization = true;
+
+    const names = [_][]const u8{ "a.example.com", "b.example.com" };
+    try testing.expectError(error.TooManyAuthorizations, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1"));
+}
+
+test "ACME orders: two authorization URLs claiming the same identifier fail closed" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.collapse_identifier = true;
+
+    const names = [_][]const u8{ "a.example.com", "b.example.com" };
+    try testing.expectError(error.UnexpectedIdentifier, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try env.expectStoreEmpty();
+}
+
+test "ACME orders: an authorization identifier that changes mid-poll fails closed" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.swap_identifier_on_poll = true;
+
+    const names = [_][]const u8{ "a.example.com", "b.example.com" };
+    try testing.expectError(error.UnexpectedIdentifier, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try env.expectStoreEmpty();
+}
+
+test "ACME orders: a duplicate http-01 challenge fails closed without publishing anything" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.duplicate_http01 = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadAuthorizationResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1/http-01"));
+}
+
+test "ACME orders: a surprising new-order status fails closed before any authorization request" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.new_order.status_override = "bogus";
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadOrderResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1"));
+}
+
+test "ACME orders: a premature valid new-order status fails closed before any authorization request" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.new_order.status_override = "valid";
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadOrderResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1"));
+}
+
+test "ACME orders: an invalid new-order status fails closed before any authorization request" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.new_order.status_override = "invalid";
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.OrderInvalid, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1"));
+}
+
+test "ACME orders: an already-cancelled attempt makes no CA request" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    var opts = env.options();
+    opts.cancel = .{ .checkFn = struct {
+        fn check(_: ?*anyopaque) bool {
+            return true;
+        }
+    }.check };
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.Cancelled, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/new-order"));
+}
+
+test "ACME orders: an already-expired order deadline makes no CA request" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    var opts = env.options();
+    opts.limits.order_deadline_s = 0;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.OrderTimedOut, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/new-order"));
+}
+
+test "ACME orders: cancellation after the final order poll aborts before certificate download" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    var opts = env.options();
+    opts.cancel = .{
+        .ctx = &env.ca,
+        .checkFn = struct {
+            fn check(ctx: ?*anyopaque) bool {
+                const ca: *fake.FakeCa = @ptrCast(@alignCast(ctx.?));
+                // True only once the final order-status poll (not the
+                // `/finalize` submission, a different path) has actually been
+                // sent, so this fires right as `obtain` is about to download
+                // the certificate -- not any earlier.
+                return ca.countRequests(.POST, "/order/1") >= 1;
+            }
+        }.check,
+    };
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.Cancelled, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/cert/1"));
+}
+
+test "ACME orders: the issued chain owns a durable copy of the requested order group" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+
+    var names = [_][]const u8{ "a.example.com", "b.example.com" };
+    var issued = try orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options());
+    defer issued.deinit(testing.allocator);
+
+    // The caller's slice is mutated after `obtain` returns: the result must
+    // not alias it.
+    names[0] = "mutated.example.com";
+
+    try testing.expectEqual(@as(usize, 2), issued.hostnames.len);
+    try testing.expectEqualStrings("a.example.com", issued.hostnames[0]);
+    try testing.expectEqualStrings("b.example.com", issued.hostnames[1]);
 }

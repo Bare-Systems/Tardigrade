@@ -43,6 +43,20 @@ pub const Method = enum {
     }
 };
 
+/// Representation a request can advertise it accepts (RFC 8555 §5.1, ACME
+/// certificate downloads need PEM, everything else needs JSON).
+pub const Accept = enum {
+    json,
+    pem_certificate_chain,
+
+    fn headerValue(self: Accept) []const u8 {
+        return switch (self) {
+            .json => "application/json",
+            .pem_certificate_chain => "application/pem-certificate-chain",
+        };
+    }
+};
+
 pub const Limits = struct {
     /// Connect + TLS + request + response, wall budget.
     request_deadline_ms: u32 = 15_000,
@@ -146,9 +160,14 @@ pub const Transport = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
     ) Error!Response {
-        return self.requestWithBodyLimit(method, target, body, content_type, self.limits.max_body_bytes);
+        return self.requestWithBodyLimit(method, target, body, content_type, self.limits.max_body_bytes, .json, null);
     }
 
+    /// `accept` sets the request's `Accept` header; `deadline_cap_ms`, if
+    /// given, further bounds `self.limits.request_deadline_ms` (never
+    /// extends it) so a caller tracking its own wall-clock budget (A3's
+    /// per-order deadline, design §9.1) cannot have a single request outlive
+    /// that budget even though the transport's own deadline is longer.
     pub fn requestWithBodyLimit(
         self: *const Transport,
         method: Method,
@@ -156,9 +175,12 @@ pub const Transport = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
         max_body_bytes: usize,
+        accept: Accept,
+        deadline_cap_ms: ?u32,
     ) Error!Response {
         if (body) |b| if (b.len > self.limits.max_request_body_bytes) return error.RequestTooLarge;
-        const deadline = self.clock.now() + @as(i64, self.limits.request_deadline_ms);
+        const budget_ms: i64 = if (deadline_cap_ms) |cap| @min(@as(i64, self.limits.request_deadline_ms), @as(i64, cap)) else self.limits.request_deadline_ms;
+        const deadline = self.clock.now() + budget_ms;
 
         var host_buf: [url_mod.max_host_len + 8]u8 = undefined;
         const host_header = target.writeHostHeader(&host_buf) orelse return error.InvalidUrl;
@@ -177,8 +199,8 @@ pub const Transport = struct {
         var head_buf: [url_mod.max_url_len + 512]u8 = undefined;
         const head = std.fmt.bufPrint(
             &head_buf,
-            "{s} {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: tardigrade-acme/1\r\nAccept: application/json\r\nConnection: close\r\n",
-            .{ method.name(), target.target, host_header },
+            "{s} {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: tardigrade-acme/1\r\nAccept: {s}\r\nConnection: close\r\n",
+            .{ method.name(), target.target, host_header, accept.headerValue() },
         ) catch return error.InvalidUrl;
         var tail_buf: [128]u8 = undefined;
         const tail = if (body) |b|

@@ -37,9 +37,24 @@ pub fn loadIdentity(
     const key_raw = try readSmallFile(allocator, key_path);
     defer secrets.secureZeroAndFree(allocator, key_raw);
 
-    const cert_chain = try certChainFromPemOrDer(allocator, cert_raw);
+    return loadIdentityFromBytes(allocator, cert_raw, key_raw, entropy);
+}
+
+/// Same as `loadIdentity`, but from owned-in-memory PEM or DER bytes rather
+/// than file paths — the entry point for credential material a caller has
+/// already produced/verified in memory (e.g. an issued ACME chain and leaf
+/// key) rather than read from disk. Neither `cert_bytes` nor `key_bytes` is
+/// retained or mutated; both may be freed by the caller as soon as this
+/// returns.
+pub fn loadIdentityFromBytes(
+    allocator: std.mem.Allocator,
+    cert_bytes: []const u8,
+    key_bytes: []const u8,
+    entropy: crypto_provider_pkg.Entropy,
+) !LoadedIdentity {
+    const cert_chain = try certChainFromPemOrDer(allocator, cert_bytes);
     errdefer freeCertChain(allocator, cert_chain);
-    const key_der = try keyDerFromPemOrDer(allocator, key_raw);
+    const key_der = try keyDerFromPemOrDer(allocator, key_bytes);
     errdefer secrets.secureZeroAndFree(allocator, key_der);
 
     if (cert_chain.len == 0) return error.PemBlockNotFound;
@@ -138,8 +153,14 @@ pub fn certChainFromPemOrDer(allocator: std.mem.Allocator, raw: []const u8) ![][
 
 pub fn keyDerFromPemOrDer(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (raw.len > 0 and raw[0] == 0x30) return allocator.dupe(u8, raw);
-    if (pemBlockToDer(allocator, raw, "PRIVATE KEY")) |der| return der else |_| {}
-    return pemBlockToDer(allocator, raw, "EC PRIVATE KEY");
+    // Only a genuinely absent "PRIVATE KEY" block justifies retrying as the
+    // legacy SEC1 "EC PRIVATE KEY" label -- any other failure (malformed
+    // block, bad base64, or a real allocation failure) must propagate as
+    // itself rather than being discarded in favor of a doomed second guess.
+    return pemBlockToDer(allocator, raw, "PRIVATE KEY") catch |err| switch (err) {
+        error.PemBlockNotFound => pemBlockToDer(allocator, raw, "EC PRIVATE KEY"),
+        else => err,
+    };
 }
 
 pub fn pemBlockToDer(allocator: std.mem.Allocator, pem: []const u8, block_name: []const u8) ![]u8 {

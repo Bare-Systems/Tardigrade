@@ -51,14 +51,27 @@ pub const NativeCredentialStore = struct {
     entropy_source: production_crypto.OsEntropy = .{},
     /// Whether the currently-installed generation carries any managed (ACME)
     /// bundle, set from `PreparedReload.has_managed_bundles` on every
-    /// successful `commitPreparedReload` (atomic: publication and the
-    /// file-only reload path below may run from different threads). Exists
-    /// so `prepareReloadFromFiles` can refuse to silently replace an active
-    /// managed generation with a manual-only one -- until #884 wires the
-    /// hot-reload caller (`gateway_shutdown.hotReloadConfig`) up to the
-    /// complete persisted managed set, it has no way to re-pass every
-    /// currently-managed group alongside a routine file-only reload (#880).
+    /// successful `commitPreparedReload`. Exists so a file-only reload can
+    /// refuse to silently replace an active managed generation with a
+    /// manual-only one -- until #884 wires the hot-reload caller
+    /// (`gateway_shutdown.hotReloadConfig`) up to the complete persisted
+    /// managed set, it has no way to re-pass every currently-managed group
+    /// alongside a routine file-only reload (#880).
+    ///
+    /// The authoritative check lives in `commitPreparedReload`'s critical
+    /// section below, guarded by `commit_mutex` alongside the `install()`
+    /// call and this flag's update, so a file-only `PreparedReload` can
+    /// never publish over a managed generation that activated after it was
+    /// prepared (a time-of-check/time-of-use gap a prepare-time-only check
+    /// would leave open). `prepareReloadFromFiles` still reads this
+    /// atomically for a cheap, non-authoritative fail-fast.
     has_managed_bundles: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Serializes the commit critical section (the managed-active check,
+    /// `provider_state.install`, and the `has_managed_bundles` update) so
+    /// the three happen as one atomic step from the perspective of any
+    /// other committer. File parsing, CA I/O, and snapshot building all
+    /// happen in `prepareReload*` before this mutex is ever touched.
+    commit_mutex: compat.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) NativeCredentialStore {
         return .{
@@ -84,12 +97,19 @@ pub const NativeCredentialStore = struct {
         sni_certs: []const SniCertSpec,
     ) !void {
         var prepared = try self.prepareReloadFromFiles(default_cert_path, default_key_path, sni_certs);
+        defer prepared.deinit();
         try self.commitPreparedReload(&prepared);
     }
 
     pub const PreparedReload = struct {
         snapshot: ?*sni_provider.Snapshot,
         has_managed_bundles: bool = false,
+        /// Set only by `prepareReloadFromFiles`. A deliberate empty managed
+        /// set published through `prepareReloadFromBundles` (`&.{}`) is NOT
+        /// file-only: it is the caller's explicit declaration that the
+        /// managed set has legitimately gone empty, and must still clear
+        /// `has_managed_bundles` on commit.
+        file_only: bool = false,
 
         pub fn deinit(self: *PreparedReload) void {
             if (self.snapshot) |snapshot| snapshot.release();
@@ -106,6 +126,12 @@ pub const NativeCredentialStore = struct {
     /// `prepareReloadFromBundles`/`reloadFromBundles` instead, re-passing the
     /// complete current managed set every time (see that function's doc
     /// comment).
+    ///
+    /// This early check is a cheap, non-authoritative fail-fast only -- it
+    /// cannot see a managed reload that activates *after* this call returns
+    /// but *before* the resulting `PreparedReload` is committed. The
+    /// authoritative check that closes that race lives in
+    /// `commitPreparedReload`.
     pub fn prepareReloadFromFiles(
         self: *NativeCredentialStore,
         default_cert_path: []const u8,
@@ -113,7 +139,9 @@ pub const NativeCredentialStore = struct {
         sni_certs: []const SniCertSpec,
     ) !PreparedReload {
         if (self.has_managed_bundles.load(.acquire)) return error.ManagedCredentialsActive;
-        return self.prepareReloadFromFilesAndBundles(default_cert_path, default_key_path, sni_certs, &.{});
+        var prepared = try self.prepareReloadFromFilesAndBundles(default_cert_path, default_key_path, sni_certs, &.{});
+        prepared.file_only = true;
+        return prepared;
     }
 
     /// Bytes-based sibling of `prepareReloadFromFiles` (#880): builds the
@@ -153,6 +181,7 @@ pub const NativeCredentialStore = struct {
         managed_bundles: []const ManagedBundleSpec,
     ) !void {
         var prepared = try self.prepareReloadFromBundles(default_cert_path, default_key_path, sni_certs, managed_bundles);
+        defer prepared.deinit();
         try self.commitPreparedReload(&prepared);
     }
 
@@ -209,9 +238,27 @@ pub const NativeCredentialStore = struct {
         return .{ .snapshot = snapshot, .has_managed_bundles = managed_bundles.len > 0 };
     }
 
+    /// The managed-active check, `provider_state.install`, and the
+    /// `has_managed_bundles` update below all happen under `commit_mutex`
+    /// as one step, so a file-only `prepared` can never publish over a
+    /// managed generation that activated after it was built: this is the
+    /// only authoritative check (see `prepareReloadFromFiles`'s doc
+    /// comment), and nothing else may install a snapshot or observe/update
+    /// the flag in between. On the `ManagedCredentialsActive` rejection
+    /// below, `prepared.snapshot` is left owned by the caller -- every
+    /// caller (`reloadFromFiles`/`reloadFromBundles`) defers
+    /// `prepared.deinit()` to release it in that case.
     pub fn commitPreparedReload(self: *NativeCredentialStore, prepared: *PreparedReload) !void {
         const snapshot = prepared.snapshot orelse return;
         const has_managed_bundles = prepared.has_managed_bundles;
+        const file_only = prepared.file_only;
+
+        self.commit_mutex.lock();
+        defer self.commit_mutex.unlock();
+
+        if (file_only and self.has_managed_bundles.load(.acquire)) {
+            return error.ManagedCredentialsActive;
+        }
         prepared.snapshot = null;
         try self.provider_state.install(snapshot);
         self.has_managed_bundles.store(has_managed_bundles, .release);
@@ -1164,6 +1211,59 @@ test "prepareReloadFromFiles rejects a routine file-only reload while a managed 
     try store.reloadFromBundles(default_cert_path, default_key_path, &.{}, &.{});
     var prepared = try store.prepareReloadFromFiles(default_cert_path, default_key_path, &.{});
     prepared.deinit();
+}
+
+test "commitPreparedReload rejects a file-only reload prepared before a racing managed reload activated, even though the file-only snapshot is newer" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const default_cert_path = try std.fmt.allocPrint(allocator, "{s}/default.crt", .{tmp_abs});
+    defer allocator.free(default_cert_path);
+    const default_key_path = try std.fmt.allocPrint(allocator, "{s}/default.key", .{tmp_abs});
+    defer allocator.free(default_key_path);
+
+    const default_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.crt", 256 * 1024);
+    defer allocator.free(default_cert);
+    const default_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.key", 256 * 1024);
+    defer allocator.free(default_key);
+    const managed_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.crt", 256 * 1024);
+    defer allocator.free(managed_cert);
+    const managed_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.key", 256 * 1024);
+    defer allocator.free(managed_key);
+    const managed_chain = try tls.identity_loader.certChainFromPemOrDer(allocator, managed_cert);
+    defer freeTestCertChain(allocator, managed_chain);
+
+    try compat.cwd().writeFile(.{ .sub_path = default_cert_path, .data = default_cert });
+    try compat.cwd().writeFile(.{ .sub_path = default_key_path, .data = default_key });
+
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    try store.reloadFromFiles(default_cert_path, default_key_path, &.{});
+
+    // Both prepared while `has_managed_bundles` is still false, so the
+    // prepare-time fast-fail in `prepareReloadFromFiles` cannot see the
+    // managed reload below -- exactly the race the commit-time guard
+    // exists to close. `managed` is prepared (and generation-stamped)
+    // first, but `file_only` is prepared, and so stamped with a *higher*
+    // generation, before either one commits.
+    const managed_specs = [_]ManagedBundleSpec{.{ .hostnames = &.{"managed.example.test"}, .chain_pem = managed_cert, .key_pem = managed_key }};
+    var managed = try store.prepareReloadFromBundles(default_cert_path, default_key_path, &.{}, &managed_specs);
+    defer managed.deinit();
+    var file_only = try store.prepareReloadFromFiles(default_cert_path, default_key_path, &.{});
+    defer file_only.deinit();
+
+    try store.commitPreparedReload(&managed);
+    try expectSelectedLeafFor(store.provider(), "managed.example.test", managed_chain[0]);
+
+    // `file_only`'s snapshot generation is newer, so a prepare-time-only
+    // guard (or a naive generation comparison) would let it win and
+    // silently drop the managed identity just committed. The commit-time
+    // check must reject it instead, and ownership of its (unpublished)
+    // snapshot must still land back with the caller via `deinit()` above.
+    try std.testing.expectError(error.ManagedCredentialsActive, store.commitPreparedReload(&file_only));
+    try expectSelectedLeafFor(store.provider(), "managed.example.test", managed_chain[0]);
 }
 
 test "prepareReloadFromBundles rejects an oversize managed set before parsing any key material" {

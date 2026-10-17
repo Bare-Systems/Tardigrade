@@ -881,10 +881,14 @@ pub fn routeRequest(
                     else => break,
                 };
                 applyLocationRewrite(request, rewrite_rule.replacement);
-                if (ga.evaluatePolicy(state, cfg, request.method.toString(), request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |reason| {
+                // The rewritten target's approval policy must judge the
+                // caller's own headers, never an earlier hop's forward_auth
+                // assertion into `request.headers` (#887, mirrors H2's #886
+                // fix): `request.headers` still carries the mutated values
+                // needed for the eventual upstream request below.
+                if (ga.evaluatePolicy(state, cfg, request.method.toString(), request.uri.path, ctx.identity, ctx.device_id, client_view.headers(request))) |reason| {
                     grants.clear();
-                    try sendApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive.*, state);
-                    state.metricsRecord(403);
+                    try sendRefusalApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive.*, state);
                     return .{ .status = 403, .mirror_allowed = false };
                 }
                 const next = http.location_router.matchLocation(allocator, request.uri.path, cfg.location_blocks) orelse {
@@ -1078,16 +1082,31 @@ fn sendClientCertRefusal(
     correlation_id: []const u8,
     keep_alive: bool,
 ) !void {
-    const payload = try buildApiErrorJson(allocator, denial.code, denial.message, correlation_id);
+    try sendRefusalApiError(allocator, writer, .forbidden, denial.code, denial.message, correlation_id, keep_alive, state);
+}
+
+/// Write a gateway-generated access-control refusal that cannot be retained
+/// by shared caches, even when global response headers otherwise allow it.
+fn sendRefusalApiError(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    status: http.Status,
+    code: []const u8,
+    message: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+) !void {
+    const payload = try buildApiErrorJson(allocator, code, message, correlation_id);
     defer allocator.free(payload);
     var response = http.Response.json(allocator, payload);
     defer response.deinit();
-    _ = response.setStatus(.forbidden).setConnection(keep_alive);
+    _ = response.setStatus(status).setConnection(keep_alive);
     setRequestIdHeaders(&response, correlation_id);
     applyRefusalResponseHeaders(state, &response);
     try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
-    state.metricsRecord(403);
-    state.metricsRecordErrorCode(denial.code);
+    state.metricsRecord(@intFromEnum(status));
+    state.metricsRecordErrorCode(code);
 }
 
 /// Protocol-neutral request target (`path[?query]`) for the auth service.

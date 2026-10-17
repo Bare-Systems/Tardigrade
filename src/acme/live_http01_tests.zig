@@ -399,6 +399,74 @@ test "ACME A3 (#883): the real listener serves issuance again after a stop/resta
     try testing.expectEqual(@as(usize, 0), env.listener.activeConnections());
 }
 
+/// Live-fetches `host`/`token` on the real listener before and after a real
+/// wall-clock sleep, so a single hook invocation (itself a blocking read
+/// inside the production authorization *poll* call) can observe the
+/// published challenge both live and -- purely through `ChallengeStore`'s
+/// own TTL enforcement, never an explicit `store.remove` -- expired, while
+/// the order engine itself is still blocked in that very call, not yet past
+/// any deadline/cleanup check of its own (#883 P2 review).
+const ExpiryCtx = struct {
+    allocator: std.mem.Allocator,
+    listener_port: u16,
+    before_status: u16 = 0,
+    before_body_matched: bool = false,
+    after_status: u16 = 0,
+
+    fn validate(ctx: ?*anyopaque, host: []const u8, token: []const u8, key_authorization: []const u8) bool {
+        const self: *ExpiryCtx = @ptrCast(@alignCast(ctx.?));
+
+        var before = liveFetch(self.allocator, self.listener_port, host, token) catch return false;
+        defer before.deinit(self.allocator);
+        self.before_status = before.status;
+        self.before_body_matched = std.mem.eql(u8, before.body, key_authorization);
+
+        // Comfortably past the short real TTL this test's `authz_deadline_s`
+        // bounds the published challenge to (design §8.2): the store must
+        // expire this entry on its own, independent of the order engine
+        // (which is blocked right here, inside this very poll call, and has
+        // not reached any deadline check since publishing it).
+        zig_compat.sleepNs(3 * std.time.ns_per_s);
+
+        var after = liveFetch(self.allocator, self.listener_port, host, token) catch return false;
+        defer after.deinit(self.allocator);
+        self.after_status = after.status;
+
+        // Report a validation failure either way: the point of this test is
+        // the two live fetches above, not a successful issuance.
+        return false;
+    }
+};
+
+test "ACME A3 (#883 P2): the live listener serves a published challenge before its TTL and 404s after it expires while the authorization is still in flight" {
+    const hosts = [_][]const u8{"a.example.com"};
+    var env: Env = .{};
+    try env.start(&hosts);
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+
+    var ctx = ExpiryCtx{ .allocator = testing.allocator, .listener_port = env.listener.port() };
+    env.ca.live_validate = .{ .ctx = &ctx, .validateFn = ExpiryCtx.validate };
+
+    var opts = orders_mod.Options{};
+    fastPoll(&opts);
+    // Short enough that `store.put`'s TTL (bounded by this deadline, design
+    // §8.2/§9.1) elapses during `ExpiryCtx.validate`'s sleep above; the
+    // order engine's own read of that same poll response then times out too
+    // (the same real clock, the same deadline), so `obtain` itself still
+    // fails closed on a bounded, ordinary deadline error.
+    opts.limits.authz_deadline_s = 2;
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.AuthorizationTimedOut, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+
+    try testing.expectEqual(@as(u16, 200), ctx.before_status);
+    try testing.expect(ctx.before_body_matched);
+    try testing.expectEqual(@as(u16, 404), ctx.after_status);
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 0), env.listener.activeConnections());
+}
+
 // -- #883 P1: a genuinely independent CA, over real TLS and real wire bytes --
 
 /// Records every host this hook actually live-fetched and validated, so a
@@ -555,6 +623,54 @@ test "ACME A3 (#883 P1/P2): a real independent TLS CA issues a multi-identifier 
     try testing.expect(ctx.saw("a.example.com"));
     try testing.expect(ctx.saw("b.example.com"));
     try testing.expect(std.mem.startsWith(u8, issued.chain_pem, "-----BEGIN CERTIFICATE-----"));
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 0), env.listener.activeConnections());
+}
+
+// -- #883 P2: hostile CA responses over the real TLS wire, not only the
+// in-memory fake `Connection` `orders_tests.zig` already covers --
+
+test "ACME A3 (#883 P2): malformed JSON from the real independent TLS CA's new-order response fails closed with no residue" {
+    const hosts = [_][]const u8{"a.example.com"};
+    var env: RealCaEnv = .{};
+    try env.start(&hosts);
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+
+    env.ca.script.new_order.malformed_json = true;
+
+    var opts = orders_mod.Options{};
+    fastPoll(&opts);
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadOrderResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+
+    // No authorization was ever reached, so there is nothing for the live
+    // listener's store to have admitted in the first place.
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 0), env.listener.activeConnections());
+}
+
+test "ACME A3 (#883 P2): a cross-origin authorization URL from the real independent TLS CA is rejected closed with no residue" {
+    const hosts = [_][]const u8{"a.example.com"};
+    var env: RealCaEnv = .{};
+    try env.start(&hosts);
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+
+    // The new-order response's first `authorizations[]` entry points at
+    // `https://evil.test/authz/1` instead of this harness's own real CA
+    // origin: #832's SSRF-pinning `requireCaOrigin` must reject this before
+    // ever dialing that origin, over the real TLS transport exactly as it
+    // would over the in-memory fake.
+    env.ca.script.new_order.cross_host_authorization = true;
+
+    var opts = orders_mod.Options{};
+    fastPoll(&opts);
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.CrossHostUrl, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+
     try env.expectStoreEmpty();
     try testing.expectEqual(@as(usize, 0), env.listener.activeConnections());
 }

@@ -31,6 +31,7 @@
 
 const std = @import("std");
 const zig_compat = @import("zig_compat");
+const pki = @import("pki");
 const account_mod = @import("account.zig");
 const client_mod = @import("client.zig");
 const csr_mod = @import("csr.zig");
@@ -241,7 +242,7 @@ pub fn obtain(
     const order_deadline_ms = options.clock.now() + options.limits.order_deadline_s * 1000;
     try checkLive(options, order_deadline_ms);
 
-    var order = try newOrder(allocator, client, order_group);
+    var order = try newOrder(allocator, client, order_group, options, order_deadline_ms);
     defer order.deinit(allocator);
 
     // Exactly one authorization per requested identifier: fewer entries
@@ -270,7 +271,7 @@ pub fn obtain(
     errdefer issued_csr.key.deinit();
     defer allocator.free(issued_csr.csr_der);
 
-    const certificate_url = try finalizeAndPoll(allocator, client, &order, issued_csr.csr_der, options, order_deadline_ms);
+    const certificate_url = try finalizeAndPoll(allocator, client, &order, order_group, issued_csr.csr_der, options, order_deadline_ms);
     defer allocator.free(certificate_url);
 
     const chain_pem = try downloadCertificate(allocator, client, certificate_url, options, order_deadline_ms);
@@ -351,7 +352,7 @@ fn identifiersMatchGroup(identifiers: []const IdentifierJson, order_group: []con
     return true;
 }
 
-fn newOrder(allocator: std.mem.Allocator, client: *client_mod.Client, order_group: []const []const u8) Error!Order {
+fn newOrder(allocator: std.mem.Allocator, client: *client_mod.Client, order_group: []const []const u8, options: Options, order_deadline_ms: i64) Error!Order {
     const new_order_url = try client.newOrderUrl();
 
     var payload: std.ArrayList(u8) = .empty;
@@ -367,7 +368,7 @@ fn newOrder(allocator: std.mem.Allocator, client: *client_mod.Client, order_grou
     try payload.appendSlice(allocator, "]}");
 
     const kid = client.kid orelse return error.BadAccountResponse;
-    var resp = try client.signedPost(new_order_url, payload.items, .{ .kid = kid });
+    var resp = try client.signedPostOptions(new_order_url, payload.items, .{ .kid = kid }, client.transport.limits.max_body_bytes, .json, remainingOrderMs(options, order_deadline_ms));
     defer resp.deinit();
     if (resp.status != 201) return error.BadOrderResponse;
     const location = resp.location() orelse return error.BadOrderResponse;
@@ -423,6 +424,9 @@ const AuthorizationJson = struct {
     status: []const u8,
     identifier: IdentifierJson,
     challenges: []const ChallengeJson,
+    /// RFC 8555 §7.1.4: when present, the CA's own authorization lifetime.
+    /// The published key authorization must never outlive it (design §8.2).
+    expires: ?[]const u8 = null,
 };
 
 const Terminal = enum { pending, valid, invalid };
@@ -437,6 +441,7 @@ const FetchedAuthz = struct {
     terminal: Terminal,
     http01: ?Http01Challenge,
     identifier_value: []const u8,
+    expires: ?[]const u8,
 
     fn deinit(self: *FetchedAuthz) void {
         self.parsed.deinit();
@@ -448,8 +453,9 @@ fn fetchAuthorization(
     client: *client_mod.Client,
     url: []const u8,
     order_group: []const []const u8,
+    cap_ms: u32,
 ) Error!FetchedAuthz {
-    var resp = try client.signedPostAsGet(url);
+    var resp = try client.signedPostAsGetOptions(url, client.transport.limits.max_body_bytes, .json, cap_ms);
     defer resp.deinit();
     if (!resp.content_type_json) return error.BadAuthorizationResponse;
 
@@ -484,7 +490,94 @@ fn fetchAuthorization(
         }
     }
 
-    return .{ .parsed = parsed, .terminal = terminal, .http01 = http01, .identifier_value = v.identifier.value };
+    return .{ .parsed = parsed, .terminal = terminal, .http01 = http01, .identifier_value = v.identifier.value, .expires = v.expires };
+}
+
+/// Up to `max_transient_retries` retries for a single transient CA failure
+/// on an idempotent POST-as-GET read (design §5.2/§5.4): a dial/timeout/
+/// connection failure, or any 5xx, retries the same read with bounded
+/// backoff. Never applied to `newOrder`, the challenge-ready trigger or
+/// `finalize`: those are not idempotent, and a blind retry after an
+/// ambiguous network failure risks a second CA-side effect.
+const max_transient_retries: u32 = 3;
+
+fn isTransientFailure(client: *client_mod.Client, err: anyerror) bool {
+    return switch (err) {
+        error.Timeout, error.DialFailed, error.ConnectionFailed => true,
+        error.CaRejected => client.diagnostics.last_http_status >= 500,
+        else => false,
+    };
+}
+
+/// 2s, 4s, 8s (design §5.4: "bounded exponential backoff, 2s -> 8s").
+fn transientBackoffMs(attempt: u32) u32 {
+    const shift: u5 = @intCast(@min(attempt, 2));
+    return @as(u32, 2000) << shift;
+}
+
+/// Wraps the very first authorization fetch (before any challenge is
+/// published) with the same bounded transient retry the poll loop below
+/// uses, so a single dropped connection or 5xx on that fetch does not abort
+/// the whole attempt.
+fn fetchAuthorizationRetrying(
+    allocator: std.mem.Allocator,
+    client: *client_mod.Client,
+    url: []const u8,
+    order_group: []const []const u8,
+    options: Options,
+    order_deadline_ms: i64,
+    authz_deadline_ms: i64,
+) Error!FetchedAuthz {
+    var transient_attempt: u32 = 0;
+    while (true) {
+        const cap = remainingOrderMs(options, @min(order_deadline_ms, authz_deadline_ms));
+        return fetchAuthorization(allocator, client, url, order_group, cap) catch |err| {
+            if (!isTransientFailure(client, err) or transient_attempt >= max_transient_retries) return err;
+            transient_attempt += 1;
+            try checkLive(options, order_deadline_ms);
+            if (options.clock.now() >= authz_deadline_ms) return error.AuthorizationTimedOut;
+            if (options.waiter.wait(transientBackoffMs(transient_attempt - 1), options.cancel)) return error.Cancelled;
+            continue;
+        };
+    }
+}
+
+/// Bounded RFC 3339 UTC timestamp parser for the CA-supplied authorization
+/// `expires` field (RFC 8555 §7.1.4). Accepts exactly
+/// `YYYY-MM-DDTHH:MM:SS[.fff...]Z` -- the only form an ACME CA emits -- and
+/// rejects anything else (a non-UTC offset, trailing garbage, an absurdly
+/// long value) rather than guessing at it. Reformats into ASN.1
+/// GeneralizedTime so the actual calendar validation (leap years, days per
+/// month) is `pki.time.parseGeneralizedTime`'s, not a second bespoke copy of
+/// it here.
+fn parseRfc3339ToUnix(value: []const u8) ?i64 {
+    if (value.len < 20 or value.len > 40) return null;
+    if (value[4] != '-' or value[7] != '-' or value[10] != 'T' or value[13] != ':' or value[16] != ':') return null;
+    if (value[value.len - 1] != 'Z') return null;
+    if (value.len > 20) {
+        const frac = value[19 .. value.len - 1];
+        if (frac.len < 2 or frac[0] != '.') return null;
+        for (frac[1..]) |c| if (c < '0' or c > '9') return null;
+    }
+    var compact: [15]u8 = undefined;
+    compact[0..4].* = value[0..4].*;
+    compact[4..6].* = value[5..7].*;
+    compact[6..8].* = value[8..10].*;
+    compact[8..10].* = value[11..13].*;
+    compact[10..12].* = value[14..16].*;
+    compact[12..14].* = value[17..19].*;
+    compact[14] = 'Z';
+    const parsed = pki.time.parseGeneralizedTime(&compact) catch return null;
+    const t = pki.x509.Time{
+        .year = parsed.year,
+        .month = parsed.month,
+        .day = parsed.day,
+        .hour = parsed.hour,
+        .minute = parsed.minute,
+        .second = parsed.second,
+        .encoding = .generalized,
+    };
+    return pki.path_validator.unixSeconds(t);
 }
 
 fn identifierIndexInGroup(order_group: []const []const u8, value: []const u8) ?usize {
@@ -520,7 +613,7 @@ fn authorizeOne(
     // `first`'s backing JSON (and therefore `host`/`token`/`challenge_url`,
     // which point into it) stays valid for the whole function: `deinit` only
     // runs when this function returns, via the `defer` below.
-    var first = try fetchAuthorization(allocator, client, authz_url, order_group);
+    var first = try fetchAuthorizationRetrying(allocator, client, authz_url, order_group, options, order_deadline_ms, authz_deadline_ms);
     defer first.deinit();
     const index = identifierIndexInGroup(order_group, first.identifier_value) orelse return error.UnexpectedIdentifier;
     if (seen[index]) return error.UnexpectedIdentifier;
@@ -535,28 +628,47 @@ fn authorizeOne(
     const token = challenge.token;
     const challenge_url = challenge.url;
 
+    // The fetch above spent an unknown slice of this authorization's budget
+    // on an independent transport request; re-check both deadlines (and
+    // cancellation) before publishing a key authorization or acknowledging
+    // the challenge, so an attempt that ran out of budget during that fetch
+    // can never still produce these CA-visible side effects (#898).
+    try checkLive(options, order_deadline_ms);
+    if (options.clock.now() >= authz_deadline_ms) return error.AuthorizationTimedOut;
+
     var key_auth_buf: [key_authorization_buf_len]u8 = undefined;
     const key_authorization = try buildKeyAuthorization(client, token, &key_auth_buf);
 
     const now_unix = options.unix_clock.now();
-    const expires_at = std.math.add(i64, now_unix, options.limits.authz_deadline_s) catch std.math.maxInt(i64);
+    const remaining_s = @divTrunc(remainingOrderMs(options, @min(order_deadline_ms, authz_deadline_ms)), 1000);
+    var expires_at = std.math.add(i64, now_unix, remaining_s) catch std.math.maxInt(i64);
+    // The CA's own authorization lifetime (RFC 8555 §7.1.4), when given,
+    // must bound the published challenge too: serving it past that lifetime
+    // claims a validity the CA itself never promised (design §8.2).
+    if (first.expires) |expires_str| {
+        const ca_expiry_unix = parseRfc3339ToUnix(expires_str) orelse return error.BadAuthorizationResponse;
+        if (ca_expiry_unix <= now_unix) return error.AuthorizationTimedOut;
+        expires_at = @min(expires_at, ca_expiry_unix);
+    }
     try store.put(now_unix, host, token, key_authorization, expires_at);
     errdefer _ = store.remove(host, token);
 
     {
         const kid = client.kid orelse return error.BadAccountResponse;
-        var trigger = try client.signedPost(challenge_url, "{}", .{ .kid = kid });
+        var trigger = try client.signedPostOptions(challenge_url, "{}", .{ .kid = kid }, client.transport.limits.max_body_bytes, .json, remainingOrderMs(options, @min(order_deadline_ms, authz_deadline_ms)));
         trigger.deinit();
     }
 
     var poll_attempt: u32 = 0;
+    var transient_attempt: u32 = 0;
     while (true) {
         if (options.cancel.isCancelled()) return error.Cancelled;
         const now_ms = options.clock.now();
         if (now_ms >= authz_deadline_ms or now_ms >= order_deadline_ms) return error.AuthorizationTimedOut;
         if (poll_attempt >= options.limits.max_polls) return error.AuthorizationTimedOut;
 
-        var polled = fetchAuthorization(allocator, client, authz_url, order_group) catch |err| {
+        const cap = remainingOrderMs(options, @min(order_deadline_ms, authz_deadline_ms));
+        var polled = fetchAuthorization(allocator, client, authz_url, order_group, cap) catch |err| {
             if (err == error.RateLimited) {
                 if (waitForRetry(client, options)) {
                     _ = store.remove(host, token);
@@ -565,9 +677,18 @@ fn authorizeOne(
                 poll_attempt +|= 1;
                 continue;
             }
+            if (isTransientFailure(client, err) and transient_attempt < max_transient_retries) {
+                transient_attempt += 1;
+                if (options.waiter.wait(transientBackoffMs(transient_attempt - 1), options.cancel)) {
+                    _ = store.remove(host, token);
+                    return error.Cancelled;
+                }
+                continue;
+            }
             return err;
         };
         defer polled.deinit();
+        transient_attempt = 0;
         // The same `authz_url` must keep reporting the identifier it
         // reported on its very first fetch; a CA that later swaps in a
         // different (still in-group) identifier would otherwise leave that
@@ -605,10 +726,24 @@ const OrderStatusJson = struct {
     certificate: ?[]const u8 = null,
 };
 
+/// The finalize response is the order object again (RFC 8555 §7.1.3); only
+/// `identifiers` (when the CA echoes it) is checked here, not `certificate`
+/// -- a synchronously-issued `valid` status still has to go through the
+/// ordinary poll loop below to pick up the certificate URL.
+const FinalizeOrderJson = struct {
+    status: []const u8,
+    identifiers: ?[]const IdentifierJson = null,
+};
+
+fn isAcceptablePostFinalizeStatus(status: []const u8) bool {
+    return std.mem.eql(u8, status, "processing") or std.mem.eql(u8, status, "valid");
+}
+
 fn finalizeAndPoll(
     allocator: std.mem.Allocator,
     client: *client_mod.Client,
     order: *const Order,
+    order_group: []const []const u8,
     csr_der: []const u8,
     options: Options,
     order_deadline_ms: i64,
@@ -623,24 +758,47 @@ fn finalizeAndPoll(
     try checkLive(options, order_deadline_ms);
     {
         const kid = client.kid orelse return error.BadAccountResponse;
-        var resp = try client.signedPost(order.finalize_url, payload, .{ .kid = kid });
-        resp.deinit();
+        var resp = try client.signedPostOptions(order.finalize_url, payload, .{ .kid = kid }, client.transport.limits.max_body_bytes, .json, remainingOrderMs(options, order_deadline_ms));
+        defer resp.deinit();
+        // The 2xx status is already guaranteed by `signedPostOptions`
+        // (anything else became an error above); what is not yet checked is
+        // whether the body is actually the bounded order object this engine
+        // expects, naming a sane post-finalize status and, if given, the
+        // exact requested identifiers -- not just any 2xx JSON (#898).
+        if (!resp.content_type_json) return error.BadOrderResponse;
+        var parsed = json_limits.parseBounded(FinalizeOrderJson, allocator, resp.body, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.BadOrderResponse,
+        };
+        defer parsed.deinit();
+        const v = parsed.value;
+        if (v.identifiers) |ids| {
+            if (!identifiersMatchGroup(ids, order_group)) return error.UnexpectedIdentifier;
+        }
+        if (!isAcceptablePostFinalizeStatus(v.status)) return error.OrderInvalid;
     }
 
     var poll_attempt: u32 = 0;
+    var transient_attempt: u32 = 0;
     while (true) {
         try checkLive(options, order_deadline_ms);
         if (poll_attempt >= options.limits.max_polls) return error.OrderTimedOut;
 
-        var resp = client.signedPostAsGet(order.order_url) catch |err| {
+        var resp = client.signedPostAsGetOptions(order.order_url, client.transport.limits.max_body_bytes, .json, remainingOrderMs(options, order_deadline_ms)) catch |err| {
             if (err == error.RateLimited) {
                 if (waitForRetry(client, options)) return error.Cancelled;
                 poll_attempt +|= 1;
                 continue;
             }
+            if (isTransientFailure(client, err) and transient_attempt < max_transient_retries) {
+                transient_attempt += 1;
+                if (options.waiter.wait(transientBackoffMs(transient_attempt - 1), options.cancel)) return error.Cancelled;
+                continue;
+            }
             return err;
         };
         defer resp.deinit();
+        transient_attempt = 0;
         if (!resp.content_type_json) return error.BadOrderResponse;
 
         var parsed = json_limits.parseBounded(OrderStatusJson, allocator, resp.body, .{}) catch |err| switch (err) {

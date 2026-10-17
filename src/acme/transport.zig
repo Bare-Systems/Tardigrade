@@ -163,6 +163,15 @@ pub const Transport = struct {
         return self.requestWithBodyLimit(method, target, body, content_type, self.limits.max_body_bytes, .json, null);
     }
 
+    /// Current time on the injected clock. The ACME client (`client.zig`,
+    /// #832/#882) uses this to track one absolute deadline across the
+    /// several transport requests (directory, nonce, the signed POST itself)
+    /// a single logical call can make, instead of giving each its own fresh
+    /// `request_deadline_ms`.
+    pub fn nowMs(self: *const Transport) i64 {
+        return self.clock.now();
+    }
+
     /// `accept` sets the request's `Accept` header; `deadline_cap_ms`, if
     /// given, further bounds `self.limits.request_deadline_ms` (never
     /// extends it) so a caller tracking its own wall-clock budget (A3's

@@ -78,6 +78,16 @@ const Env = struct {
     }
 
     fn transport(self: *Env) *const transport_mod.Transport {
+        // Lets `script.stall_ms_per_read` (a simulated slow peer) advance
+        // the same shared `TestTime.ms` that `options().clock` reads, so a
+        // test can make a single CA response read consume real budget from
+        // the order/authorization deadlines (#898).
+        self.ca.clock_sink = .{ .ctx = &self.time, .advanceFn = struct {
+            fn advance(ctx: ?*anyopaque, ms: i64) void {
+                const t: *TestTime = @ptrCast(@alignCast(ctx.?));
+                t.ms += ms;
+            }
+        }.advance };
         self.t = .{
             .allocator = testing.allocator,
             .dialer = self.ca.dialer(),
@@ -585,6 +595,143 @@ test "ACME orders: cancellation after the final order poll aborts before certifi
     const names = [_][]const u8{"a.example.com"};
     try testing.expectError(error.Cancelled, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
     try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/cert/1"));
+}
+
+// ---------------------------------------------------------------------------
+// #898 follow-up: finalize response validation, absolute deadlines across
+// authorization fetch/publish, bounded transient-failure retry, and
+// CA-bounded authorization expiry.
+// ---------------------------------------------------------------------------
+
+test "ACME orders: a malformed finalize response fails closed before any order poll" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.finalize.malformed_json = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadOrderResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/order/1"));
+}
+
+test "ACME orders: an invalid-status finalize response fails closed before any order poll" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.finalize.status_override = "invalid";
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.OrderInvalid, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/order/1"));
+}
+
+test "ACME orders: a finalize response naming identifiers outside the requested group fails closed" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.finalize.mismatched_identifiers = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.UnexpectedIdentifier, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/order/1"));
+}
+
+test "ACME orders: an authorization deadline consumed during its own fetch publishes nothing" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    // Every CA response read advances the shared clock by 300ms; the
+    // authorization's own 2s budget cannot survive reading even one
+    // authorization response, but the generous order budget means this is
+    // specifically the authorization deadline firing, not the order one.
+    env.ca.script.stall_ms_per_read = 300;
+    var opts = env.options();
+    opts.limits.order_deadline_s = 600;
+    opts.limits.authz_deadline_s = 2;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.AuthorizationTimedOut, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1/http-01"));
+}
+
+test "ACME orders: transient 5xx authorization polls retry with bounded backoff then succeed" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.transient_failures = 2;
+
+    const names = [_][]const u8{"a.example.com"};
+    var issued = try orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options());
+    defer issued.deinit(testing.allocator);
+    try env.expectStoreEmpty();
+}
+
+test "ACME orders: perpetual 5xx on authorization polling exhausts the bounded retry budget" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.status_500 = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.CaRejected, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try env.expectStoreEmpty();
+}
+
+test "ACME orders: transient 5xx order polls retry with bounded backoff then succeed" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.order_poll.transient_failures = 2;
+
+    const names = [_][]const u8{"a.example.com"};
+    var issued = try orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options());
+    defer issued.deinit(testing.allocator);
+}
+
+test "ACME orders: perpetual 5xx on order polling exhausts the bounded retry budget" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.order_poll.status_500 = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.CaRejected, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+}
+
+test "ACME orders: an already-expired CA authorization expiry rejects before publishing anything" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    // One second before `TestTime.unix`'s starting value (1_700_000_000 =
+    // 2023-11-14T22:13:20Z).
+    env.ca.script.authz.expires_override = "2023-11-14T22:13:19Z";
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.AuthorizationTimedOut, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try env.expectStoreEmpty();
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1/http-01"));
+}
+
+test "ACME orders: a malformed CA authorization expiry fails closed" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.expires_override = "not-a-timestamp";
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadAuthorizationResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try env.expectStoreEmpty();
 }
 
 test "ACME orders: the issued chain owns a durable copy of the requested order group" {

@@ -16,6 +16,7 @@
 const std = @import("std");
 const account = @import("account.zig");
 const transport = @import("transport.zig");
+const challenge_store = @import("../http/acme_challenge_store.zig");
 
 const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const b64url = std.base64.url_safe_no_pad;
@@ -255,12 +256,24 @@ pub const ClockSink = struct {
     }
 };
 
+/// Hook for #883's live-listener integration tests: instead of trusting
+/// `AuthzBehavior.final_status` blindly, perform a real check (typically a
+/// real TCP HTTP-01 fetch against the actual gateway listener) and let its
+/// result decide the authorization's terminal status. `null` (the default)
+/// preserves every existing scripted-only test's behavior exactly.
+pub const LiveValidate = struct {
+    ctx: ?*anyopaque = null,
+    validateFn: *const fn (ctx: ?*anyopaque, host: []const u8, token: []const u8, key_authorization: []const u8) bool,
+};
+
 pub const FakeCa = struct {
     allocator: std.mem.Allocator,
     base: []const u8 = "https://ca.test",
     script: Script = .{},
     clock: ?*FakeClock = null,
     clock_sink: ClockSink = .{},
+    /// See `LiveValidate`.
+    live_validate: ?LiveValidate = null,
 
     nonce_seq: u64 = 0,
     valid_nonces: std.StringHashMapUnmanaged(void) = .empty,
@@ -1024,6 +1037,19 @@ pub const FakeCa = struct {
                     return;
                 }
                 authz.poll_count += 1;
+            } else if (self.live_validate) |lv| {
+                // Real validation, not a scripted outcome: the account's
+                // thumbprint plus this authorization's own token is exactly
+                // what the order engine published to the `ChallengeStore`
+                // (`buildKeyAuthorization` in `orders.zig`); recomputing it
+                // here and handing it to the caller's real fetch is what
+                // makes this a genuine end-to-end proof instead of an
+                // in-process fake.
+                const acct = self.accounts.items[self.accounts.items.len - 1];
+                const thumb = (account.Jwk{ .x = acct.x, .y = acct.y }).thumbprint();
+                var key_auth_buf: [challenge_store.max_token_len + 1 + account.thumbprint_len]u8 = undefined;
+                const key_authorization = std.fmt.bufPrint(&key_auth_buf, "{s}.{s}", .{ authz.token, thumb }) catch unreachable;
+                authz.status = if (lv.validateFn(lv.ctx, authz.identifier, authz.token, key_authorization)) .valid else .invalid;
             } else {
                 authz.status = if (b.final_status == .valid) .valid else .invalid;
             }

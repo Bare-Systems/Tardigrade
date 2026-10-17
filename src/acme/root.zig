@@ -24,6 +24,7 @@ comptime {
         _ = @import("client_tests.zig");
         _ = @import("activate_tests.zig");
         _ = @import("orders_tests.zig");
+        _ = @import("live_http01_tests.zig");
     }
 }
 

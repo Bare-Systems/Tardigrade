@@ -1042,6 +1042,11 @@ pub fn build(b: *std.Build) void {
     acme_test_mod.addImport("zig_compat", compat_mod);
     acme_test_mod.addImport("tls_core", tls_core_mod);
     acme_test_mod.addImport("pki", pki_mod);
+    // #883: `acme/live_http01_tests.zig` wires the real gateway
+    // `http/acme_http01_listener.zig` into this graph for the first time,
+    // and that listener's `response.zig` dependency needs `build_options`
+    // (already shared via `.createModule()` with every other module below).
+    acme_test_mod.addImport("build_options", build_options.createModule());
     const acme_tests = b.addTest(.{ .root_module = acme_test_mod });
     const run_acme_tests = b.addRunArtifact(acme_tests);
     const acme_step = b.step("test-acme", "Run native ACME account/JWS/state unit and corpus tests (#832)");

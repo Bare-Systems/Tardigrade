@@ -85,8 +85,27 @@ All notable user-facing changes to Tardigrade are documented here.
   startup-fixed (a reload that changes it is rejected as restart-required).
   No certificate is requested, issued or activated, and `tardi run` still
   refuses every ACME-enabled config (`rejectAcmeRuntime`) regardless of this
-  change; the order engine (#882) and its end-to-end wiring through a live
-  local CA (#883) remain separate, open children of #833.
+  change.
+- **Native ACME order/authorization/finalize/download engine, wired end to
+  end through the real gateway HTTP-01 listener (#882, #883, epic #759 phase
+  A3, closes #833's remaining children).** `src/acme/orders.zig`'s `obtain()`
+  drives one RFC 8555 order group end to end (new-order, per-authorization
+  HTTP-01 challenge ack/poll, finalize, download) over A2's `Client`,
+  publishing each key authorization to the #877 `ChallengeStore` only
+  immediately before the challenge-ready POST and removing it on every exit
+  path -- success, CA failure, timeout, or cancellation. New
+  `src/acme/live_http01_tests.zig` (`zig build test-acme`) proves this engine
+  composes with the real, running #881 `Listener` and the real
+  `ChallengeStore`: a live TCP HTTP-01 GET against the real listener (not an
+  in-process fake) drives the fake CA's validation decision, exercising
+  single-host issuance to an owned, unverified `IssuedChain`; that a token
+  published for one managed host never answers for a sibling managed host;
+  and that a key-authorization mismatch on the live fetch fails the
+  authorization closed with no residue in either the store or the listener.
+  No certificate is requested against a real CA, issued to, or activated for
+  any live TLS identity -- `tardi run` still refuses every ACME-enabled
+  config regardless of this change; A4 (#834/#879) owns verification,
+  persistence and activation of the `IssuedChain` this engine returns.
 - **WebSocket reactor lifecycle observability (#829, #827).** Tunnel close
   metrics now distinguish `client_error` from `upstream_error` (previously one
   `error` label; the access log keeps `error`). New gauges/counters:

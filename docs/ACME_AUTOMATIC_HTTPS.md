@@ -862,12 +862,13 @@ Behavior worth knowing:
 Run the focused gate with `zig build test-acme` (includes the
 `fuzz: ACME: ...` corpus targets); the same tests also run under `zig build test`.
 
-### 10.2 A3 as implemented (partial, #881)
+### 10.2 A3 as implemented (#881, #882, #883)
 
-G9 (the dedicated challenge listener, §8.0) lands as a standalone,
-independently testable component. The order/authorization engine (#882) and
-its end-to-end wiring through a live local CA (#883) are separate, still-open
-children of #833; this slice only adds the listener and its config.
+G9 (the dedicated challenge listener, §8.0) landed as a standalone,
+independently testable component (#881), then the order/authorization engine
+(#882), then its end-to-end wiring through a local CA fixture (#883). This
+slice only adds the listener and its config; the order engine and the live
+wiring proof are documented separately below.
 
 | File | What it provides |
 | --- | --- |
@@ -899,6 +900,72 @@ Behavior worth knowing:
   budget.
 - The listener does not read request bodies, so Transfer-Encoding/Content-Length
   are rejected as a protocol violation (`400`) rather than consumed.
+
+### 10.3 A3 order engine and live-listener wiring (#882, #883)
+
+`src/acme/orders.zig`'s `obtain()` (#882) drives one order group through RFC
+8555 §7.1–7.4.2 end to end using A2's `client.Client` for every CA request
+and #878's `csr.issue` for the leaf key/CSR, returning an owned, unactivated
+`IssuedChain`. It publishes each authorization's key authorization to the
+`ChallengeStore` only immediately before the challenge-ready POST and removes
+it on every exit (success, CA failure, timeout, or cancellation).
+
+#883 proves that engine, the real #877 `ChallengeStore` and the real #881
+`Listener` compose into one working path, closing the last open A3 child:
+
+- `src/acme/live_http01_tests.zig` starts a real `acme_http01_listener.Listener`
+  bound to a real loopback TCP port, drives `orders.obtain()` against it with
+  the real (not mocked) `ChallengeStore`, and wires `fake_ca.zig`'s new
+  `live_validate` hook so the fake CA's authorization-poll decision is made
+  by an actual TCP HTTP-01 GET against the live listener -- the same request
+  shape an independent CA (Pebble or any other RFC 8555 peer) would send --
+  instead of a scripted outcome. The ACME directory/account/order/finalize
+  protocol itself still runs over `fake_ca.zig`'s in-memory `Connection` (the
+  already-reviewed A2/A3 CA-transport fake); only the HTTP-01 validation leg
+  crosses the real network, because that is the integration point #833's
+  acceptance criteria actually require proof of.
+- Covered: single-host issuance end to end (the live GET returns exactly the
+  token the order engine published, the issued chain starts with
+  `-----BEGIN CERTIFICATE-----`, the store and the live listener both have no
+  residual entry afterward); a token published for one managed host never
+  answers a live GET claiming a sibling managed host (host-scoped storage,
+  not just the existing unmanaged-Host `421`); and a key-authorization
+  mismatch on the live fetch (the CA got back the wrong bytes) fails the
+  authorization closed (`AuthorizationInvalid`) with the same clean-store,
+  clean-listener outcome as any other CA-reported failure.
+- Run with `zig build test-acme` (this suite is also reachable from
+  `zig build test` via `http.zig`'s existing `acme`/`acme_http01_listener`
+  imports); no real CA, no live network beyond loopback, no activation --
+  `IssuedChain` is still handed back owned and unverified, exactly as A4
+  (#834/#879) expects to consume it.
+- `src/acme/live_ca_server.zig` closes the one remaining gap in the above:
+  a real loopback TCP listener terminating a real server-role TLS 1.3
+  handshake (the same `Tls13Backend`/`PureZigRecordStream` pair the
+  production listener and `tests/tls_interop_tool.zig`'s server role use,
+  over the test-only identity in `tests/fixtures/tls/acme_live_ca/`), in
+  front of `fake_ca.zig`'s unchanged `handle()` -- the same real JWS/nonce
+  verification and directory/account/order/authz/finalize/certificate state
+  machine as every other ACME test here, just reached over actual bytes
+  instead of the in-memory `Connection`. `live_http01_tests.zig`'s
+  `RealCaEnv` points the production `http/acme_tls_dialer.zig`
+  (`UpstreamTlsConn`, real hostname/chain verification against a real
+  trust anchor) at it, so every directory/account/order/authz/finalize/
+  certificate exchange -- not just the HTTP-01 validation GET -- crosses a
+  real socket and a real TLS handshake.
+  - Covered: single-host issuance through the real CA and the real
+    listener end to end, and a two-identifier order where both names are
+    independently live-validated over real sockets (RFC 8555 §7.1.3
+    multi-identifier orders).
+  - Also covered (`Env`, the lighter real-listener/in-memory-CA harness):
+    cancelling an outstanding order mid-poll, an authorization whose CA
+    never finalizes it (bounded by the authorization's own deadline, not a
+    CA response), and a listener stop/restart between two issuances --
+    every case asserting the real `ChallengeStore` and `Listener` are left
+    with no residual slot, token, or connection.
+  - Run with `zig build test-acme` or `zig build test` (both reach this
+    file through the same import `live_http01_tests.zig` already had);
+    expect every test above to pass with no real network beyond loopback
+    and no activation, same as the rest of this section.
 
 ## 11. Test plan
 

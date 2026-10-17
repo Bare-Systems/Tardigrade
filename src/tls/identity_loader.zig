@@ -37,9 +37,24 @@ pub fn loadIdentity(
     const key_raw = try readSmallFile(allocator, key_path);
     defer secrets.secureZeroAndFree(allocator, key_raw);
 
-    const cert_chain = try certChainFromPemOrDer(allocator, cert_raw);
+    return loadIdentityFromBytes(allocator, cert_raw, key_raw, entropy);
+}
+
+/// Same as `loadIdentity`, but from owned-in-memory PEM or DER bytes rather
+/// than file paths — the entry point for credential material a caller has
+/// already produced/verified in memory (e.g. an issued ACME chain and leaf
+/// key) rather than read from disk. Neither `cert_bytes` nor `key_bytes` is
+/// retained or mutated; both may be freed by the caller as soon as this
+/// returns.
+pub fn loadIdentityFromBytes(
+    allocator: std.mem.Allocator,
+    cert_bytes: []const u8,
+    key_bytes: []const u8,
+    entropy: crypto_provider_pkg.Entropy,
+) !LoadedIdentity {
+    const cert_chain = try certChainFromPemOrDer(allocator, cert_bytes);
     errdefer freeCertChain(allocator, cert_chain);
-    const key_der = try keyDerFromPemOrDer(allocator, key_raw);
+    const key_der = try keyDerFromPemOrDer(allocator, key_bytes);
     errdefer secrets.secureZeroAndFree(allocator, key_der);
 
     if (cert_chain.len == 0) return error.PemBlockNotFound;

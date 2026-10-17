@@ -23,6 +23,23 @@ pub const SniCertSpec = struct {
     key_path: []const u8,
 };
 
+/// One ACME-managed group's already-verified chain and leaf key, owned by
+/// the caller as in-memory bytes rather than files (#880). The A4
+/// persistence ticket (`acme.activate.verifyChain`/`verifyAndPersist`) is
+/// the intended source: `chain_pem` is the exact leaf-first PEM chain it
+/// verified, and `key_pem` is the matching leaf key re-encoded via
+/// `LeafKey.toPkcs8Pem`. Neither is re-verified here -- this store only
+/// parses and publishes what has already been judged safe to activate.
+/// `hostnames` must be the group's exact managed names (no wildcards;
+/// HTTP-01 never issues for one) and must exactly match the hostnames of
+/// any later call for the same group, otherwise the two are treated as
+/// unrelated groups, not a rotation.
+pub const ManagedBundleSpec = struct {
+    hostnames: []const []const u8,
+    chain_pem: []const u8,
+    key_pem: []const u8,
+};
+
 /// Downstream client-certificate trust anchors (#763); shared with HTTP/3.
 pub const ClientTrustStore = tls.client_trust.ClientTrustStore;
 pub const ClientPolicySet = tls.client_trust.PolicySet;
@@ -75,7 +92,57 @@ pub const NativeCredentialStore = struct {
         default_key_path: []const u8,
         sni_certs: []const SniCertSpec,
     ) !PreparedReload {
-        var loaded = try self.allocator.alloc(LoadedBundle, 1 + sni_certs.len);
+        return self.prepareReloadFromFilesAndBundles(default_cert_path, default_key_path, sni_certs, &.{});
+    }
+
+    /// Bytes-based sibling of `prepareReloadFromFiles` (#880): builds the
+    /// same default/manual-SNI bundles from files, plus one bundle per
+    /// `managed_bundles` entry loaded from owned in-memory bytes, into a
+    /// single `Snapshot` committed through the same `commitPreparedReload`.
+    /// There is no separate managed-credential store or selector -- this
+    /// composes exactly the `sni_provider.ReloadableProvider` every other
+    /// native TLS/H3 credential already shares.
+    ///
+    /// Per design doc §7.1, the managed set is rebuilt from **every**
+    /// currently-managed group on each call (not just the one being
+    /// renewed) -- the caller, not this function, is responsible for
+    /// re-passing every group's current verified bundle alongside any
+    /// newly issued one, so an unrelated group is never dropped by a
+    /// publish for a different one. `managed_bundles` entries may not
+    /// share a hostname with each other; they are not checked against
+    /// `sni_certs`/the default bundle, which keep their existing
+    /// first-match-by-array-order precedence (needed by the legitimate
+    /// same-hostname-different-key-type case, #565).
+    pub fn prepareReloadFromBundles(
+        self: *NativeCredentialStore,
+        default_cert_path: []const u8,
+        default_key_path: []const u8,
+        sni_certs: []const SniCertSpec,
+        managed_bundles: []const ManagedBundleSpec,
+    ) !PreparedReload {
+        try validateManagedBundles(managed_bundles);
+        return self.prepareReloadFromFilesAndBundles(default_cert_path, default_key_path, sni_certs, managed_bundles);
+    }
+
+    pub fn reloadFromBundles(
+        self: *NativeCredentialStore,
+        default_cert_path: []const u8,
+        default_key_path: []const u8,
+        sni_certs: []const SniCertSpec,
+        managed_bundles: []const ManagedBundleSpec,
+    ) !void {
+        var prepared = try self.prepareReloadFromBundles(default_cert_path, default_key_path, sni_certs, managed_bundles);
+        try self.commitPreparedReload(&prepared);
+    }
+
+    fn prepareReloadFromFilesAndBundles(
+        self: *NativeCredentialStore,
+        default_cert_path: []const u8,
+        default_key_path: []const u8,
+        sni_certs: []const SniCertSpec,
+        managed_bundles: []const ManagedBundleSpec,
+    ) !PreparedReload {
+        var loaded = try self.allocator.alloc(LoadedBundle, 1 + sni_certs.len + managed_bundles.len);
         defer self.allocator.free(loaded);
         var loaded_len: usize = 0;
         defer {
@@ -92,6 +159,10 @@ pub const NativeCredentialStore = struct {
         loaded_len += 1;
         for (sni_certs) |spec| {
             try loaded[loaded_len].initNamed(self.allocator, spec, load_entropy);
+            loaded_len += 1;
+        }
+        for (managed_bundles) |spec| {
+            try loaded[loaded_len].initManaged(self.allocator, spec, load_entropy);
             loaded_len += 1;
         }
 
@@ -124,10 +195,35 @@ pub const NativeCredentialStore = struct {
     }
 };
 
+/// Rejects a managed set before any PEM/key parsing: an empty or wildcard
+/// hostname is never a valid HTTP-01 managed name, and two different
+/// managed groups may never claim the same hostname -- unlike the
+/// manual-bundle case (#565), there is no legitimate reason for two ACME
+/// groups to compete for one name, so this fails closed instead of letting
+/// bundle array order decide (#880).
+fn validateManagedBundles(managed_bundles: []const ManagedBundleSpec) !void {
+    for (managed_bundles, 0..) |spec, i| {
+        if (spec.hostnames.len == 0) return error.EmptyHostPattern;
+        for (spec.hostnames) |host| {
+            if (host.len == 0 or std.mem.indexOfScalar(u8, host, '*') != null) return error.InvalidHostPattern;
+        }
+        for (managed_bundles[0..i]) |prior| {
+            for (spec.hostnames) |host| {
+                for (prior.hostnames) |prior_host| {
+                    if (sni_provider.asciiEqlIgnoreCase(host, prior_host)) return error.DuplicateManagedHostname;
+                }
+            }
+        }
+    }
+}
+
 const LoadedBundle = struct {
     loaded: tls.identity_loader.LoadedIdentity = undefined,
     chain: []const []const u8 = &.{},
-    patterns: [1][]const u8 = undefined,
+    /// Owned copy (allocated with `loaded.allocator`), freed in `deinit`.
+    /// A slice rather than a fixed single-entry array because a managed
+    /// (ACME) bundle may cover several hostnames at once (#880).
+    patterns: []const []const u8 = &.{},
     supported_schemes: [1]credentials.SignatureScheme = undefined,
     is_default: bool = false,
 
@@ -138,34 +234,56 @@ const LoadedBundle = struct {
         key_path: []const u8,
         entropy: @import("crypto").provider.Entropy,
     ) !void {
-        try self.init(allocator, cert_path, key_path, "default.invalid", true, entropy);
+        try self.initFromFiles(allocator, cert_path, key_path, &.{"default.invalid"}, true, entropy);
     }
 
     fn initNamed(self: *LoadedBundle, allocator: std.mem.Allocator, spec: SniCertSpec, entropy: @import("crypto").provider.Entropy) !void {
-        try self.init(allocator, spec.cert_path, spec.key_path, spec.server_name, false, entropy);
+        try self.initFromFiles(allocator, spec.cert_path, spec.key_path, &.{spec.server_name}, false, entropy);
     }
 
-    fn init(
+    fn initFromFiles(
         self: *LoadedBundle,
         allocator: std.mem.Allocator,
         cert_path: []const u8,
         key_path: []const u8,
-        pattern: []const u8,
+        patterns: []const []const u8,
         is_default: bool,
         entropy: @import("crypto").provider.Entropy,
     ) !void {
         self.* = .{};
         self.loaded = try tls.identity_loader.loadIdentity(allocator, cert_path, key_path, entropy);
+        errdefer self.loaded.deinit();
         self.chain = self.loaded.cert_chain;
-        self.patterns = .{pattern};
+        self.patterns = try allocator.dupe([]const u8, patterns);
         self.supported_schemes = .{self.loaded.identity.signatureScheme()};
         self.is_default = is_default;
+    }
+
+    /// Loads a managed bundle's identity from owned in-memory PEM/DER bytes
+    /// rather than file paths (#880) -- the entry point an A4 persistence
+    /// ticket uses to publish an already-verified (`activate.verifyChain`)
+    /// ACME chain and leaf key without ever touching disk through this
+    /// store. Never a default identity: a managed bundle is only ever
+    /// selected by its own exact hostnames.
+    fn initManaged(
+        self: *LoadedBundle,
+        allocator: std.mem.Allocator,
+        spec: ManagedBundleSpec,
+        entropy: @import("crypto").provider.Entropy,
+    ) !void {
+        self.* = .{};
+        self.loaded = try tls.identity_loader.loadIdentityFromBytes(allocator, spec.chain_pem, spec.key_pem, entropy);
+        errdefer self.loaded.deinit();
+        self.chain = self.loaded.cert_chain;
+        self.patterns = try allocator.dupe([]const u8, spec.hostnames);
+        self.supported_schemes = .{self.loaded.identity.signatureScheme()};
+        self.is_default = false;
     }
 
     fn config(self: *const LoadedBundle, entropy: @import("crypto").provider.Entropy) sni_provider.CredentialBundleConfig {
         return .{
             .chain = self.chain,
-            .patterns = self.patterns[0..],
+            .patterns = self.patterns,
             .signer = sni_provider.SignAdapter.fromIdentity(self.loaded.identity, entropy),
             .key_kind = keyKindForScheme(self.supported_schemes[0]),
             .supported_schemes = self.supported_schemes[0..],
@@ -174,6 +292,8 @@ const LoadedBundle = struct {
     }
 
     fn deinit(self: *LoadedBundle) void {
+        const allocator = self.loaded.allocator;
+        allocator.free(self.patterns);
         self.loaded.deinit();
         self.* = undefined;
     }
@@ -766,6 +886,198 @@ test "prepared native credential reload does not publish same-path cert changes 
     try expectSelectedLeaf(store.provider(), chain_b[0]);
 }
 
+test "prepareReloadFromBundles publishes an in-memory managed bundle alongside an untouched manual/default bundle, pinning the old generation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const default_cert_path = try std.fmt.allocPrint(allocator, "{s}/default.crt", .{tmp_abs});
+    defer allocator.free(default_cert_path);
+    const default_key_path = try std.fmt.allocPrint(allocator, "{s}/default.key", .{tmp_abs});
+    defer allocator.free(default_key_path);
+    const manual_cert_path = try std.fmt.allocPrint(allocator, "{s}/manual.crt", .{tmp_abs});
+    defer allocator.free(manual_cert_path);
+    const manual_key_path = try std.fmt.allocPrint(allocator, "{s}/manual.key", .{tmp_abs});
+    defer allocator.free(manual_key_path);
+
+    const default_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.crt", 256 * 1024);
+    defer allocator.free(default_cert);
+    const default_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.key", 256 * 1024);
+    defer allocator.free(default_key);
+    const manual_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.crt", 256 * 1024);
+    defer allocator.free(manual_cert);
+    const manual_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.key", 256 * 1024);
+    defer allocator.free(manual_key);
+    const managed_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.crt", 256 * 1024);
+    defer allocator.free(managed_cert);
+    const managed_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.key", 256 * 1024);
+    defer allocator.free(managed_key);
+
+    const default_chain = try tls.identity_loader.certChainFromPemOrDer(allocator, default_cert);
+    defer freeTestCertChain(allocator, default_chain);
+    const manual_chain = try tls.identity_loader.certChainFromPemOrDer(allocator, manual_cert);
+    defer freeTestCertChain(allocator, manual_chain);
+    const managed_chain = try tls.identity_loader.certChainFromPemOrDer(allocator, managed_cert);
+    defer freeTestCertChain(allocator, managed_chain);
+
+    try compat.cwd().writeFile(.{ .sub_path = default_cert_path, .data = default_cert });
+    try compat.cwd().writeFile(.{ .sub_path = default_key_path, .data = default_key });
+    try compat.cwd().writeFile(.{ .sub_path = manual_cert_path, .data = manual_cert });
+    try compat.cwd().writeFile(.{ .sub_path = manual_key_path, .data = manual_key });
+
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    const sni_certs = [_]SniCertSpec{.{ .server_name = "manual.example.test", .cert_path = manual_cert_path, .key_path = manual_key_path }};
+    try store.reloadFromFiles(default_cert_path, default_key_path, &sni_certs);
+    try expectSelectedLeafFor(store.provider(), "manual.example.test", manual_chain[0]);
+
+    // Held across the managed-bundle publish, as an in-flight handshake
+    // would hold its selection across a later reload.
+    const pinned = try selectFor(store.provider(), null);
+    defer pinned.release();
+
+    const managed_specs = [_]ManagedBundleSpec{.{
+        .hostnames = &.{"managed.example.test"},
+        .chain_pem = managed_cert,
+        .key_pem = managed_key,
+    }};
+    try store.reloadFromBundles(default_cert_path, default_key_path, &sni_certs, &managed_specs);
+
+    try expectSelectedLeafFor(store.provider(), "managed.example.test", managed_chain[0]);
+    try expectSelectedLeafFor(store.provider(), "manual.example.test", manual_chain[0]);
+    try expectSelectedLeafFor(store.provider(), null, default_chain[0]);
+
+    // The handle selected before the managed publish still serves (and can
+    // still sign for) generation 1's default identity.
+    try std.testing.expectEqualSlices(u8, default_chain[0], pinned.certificateChain().leaf().?);
+    var sig: [128]u8 = undefined;
+    const progress = try pinned.sign("pinned generation stays reachable after managed publish", &sig);
+    _ = switch (progress) {
+        .complete => |written| written,
+        .pending => return error.TestUnexpectedPending,
+    };
+}
+
+test "prepareReloadFromBundles rejects two managed bundles claiming the same hostname, or a key/cert type mismatch, without touching the active generation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const default_cert_path = try std.fmt.allocPrint(allocator, "{s}/default.crt", .{tmp_abs});
+    defer allocator.free(default_cert_path);
+    const default_key_path = try std.fmt.allocPrint(allocator, "{s}/default.key", .{tmp_abs});
+    defer allocator.free(default_key_path);
+
+    const default_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.crt", 256 * 1024);
+    defer allocator.free(default_cert);
+    const default_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.key", 256 * 1024);
+    defer allocator.free(default_key);
+    const managed_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.crt", 256 * 1024);
+    defer allocator.free(managed_cert);
+    const managed_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.key", 256 * 1024);
+    defer allocator.free(managed_key);
+    const default_chain = try tls.identity_loader.certChainFromPemOrDer(allocator, default_cert);
+    defer freeTestCertChain(allocator, default_chain);
+
+    try compat.cwd().writeFile(.{ .sub_path = default_cert_path, .data = default_cert });
+    try compat.cwd().writeFile(.{ .sub_path = default_key_path, .data = default_key });
+
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    try store.reloadFromFiles(default_cert_path, default_key_path, &.{});
+    try expectSelectedLeafFor(store.provider(), null, default_chain[0]);
+
+    const duplicate_hostname = [_]ManagedBundleSpec{
+        .{ .hostnames = &.{"shared.example.test"}, .chain_pem = managed_cert, .key_pem = managed_key },
+        .{ .hostnames = &.{"shared.example.test"}, .chain_pem = managed_cert, .key_pem = managed_key },
+    };
+    try std.testing.expectError(
+        error.DuplicateManagedHostname,
+        store.reloadFromBundles(default_cert_path, default_key_path, &.{}, &duplicate_hostname),
+    );
+    try expectSelectedLeafFor(store.provider(), null, default_chain[0]);
+
+    const wildcard_hostname = [_]ManagedBundleSpec{.{ .hostnames = &.{"*.example.test"}, .chain_pem = managed_cert, .key_pem = managed_key }};
+    try std.testing.expectError(
+        error.InvalidHostPattern,
+        store.reloadFromBundles(default_cert_path, default_key_path, &.{}, &wildcard_hostname),
+    );
+    try expectSelectedLeafFor(store.provider(), null, default_chain[0]);
+
+    // An RSA leaf certificate paired with an Ed25519 key: both parse
+    // independently, but the leaf's own SPKI key kind disagrees with the
+    // signer's -- #880 relies on `buildBundle`'s existing `KeySignerMismatch`
+    // check here, not a second check of its own.
+    const mismatched_key = [_]ManagedBundleSpec{.{ .hostnames = &.{"mismatched.example.test"}, .chain_pem = managed_cert, .key_pem = default_key }};
+    try std.testing.expectError(
+        error.KeySignerMismatch,
+        store.reloadFromBundles(default_cert_path, default_key_path, &.{}, &mismatched_key),
+    );
+    try expectSelectedLeafFor(store.provider(), null, default_chain[0]);
+
+    var oversize_hostnames: [sni_provider.max_patterns_per_bundle + 1][]const u8 = undefined;
+    var oversize_bufs: [sni_provider.max_patterns_per_bundle + 1][32]u8 = undefined;
+    for (0..oversize_hostnames.len) |i| {
+        oversize_hostnames[i] = std.fmt.bufPrint(&oversize_bufs[i], "h{d}.example.test", .{i}) catch unreachable;
+    }
+    const oversize = [_]ManagedBundleSpec{.{ .hostnames = oversize_hostnames[0..], .chain_pem = managed_cert, .key_pem = managed_key }};
+    try std.testing.expectError(
+        error.EmptyHostPattern,
+        store.reloadFromBundles(default_cert_path, default_key_path, &.{}, &oversize),
+    );
+    try expectSelectedLeafFor(store.provider(), null, default_chain[0]);
+}
+
+test "prepareReloadFromBundles repeated managed-bundle rotation settles owned signer and buffer state without leaks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const default_cert_path = try std.fmt.allocPrint(allocator, "{s}/default.crt", .{tmp_abs});
+    defer allocator.free(default_cert_path);
+    const default_key_path = try std.fmt.allocPrint(allocator, "{s}/default.key", .{tmp_abs});
+    defer allocator.free(default_key_path);
+
+    const default_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.crt", 256 * 1024);
+    defer allocator.free(default_cert);
+    const default_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.key", 256 * 1024);
+    defer allocator.free(default_key);
+    const cert_a = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.crt", 256 * 1024);
+    defer allocator.free(cert_a);
+    const key_a = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.key", 256 * 1024);
+    defer allocator.free(key_a);
+    const cert_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.crt", 256 * 1024);
+    defer allocator.free(cert_b);
+    const key_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.key", 256 * 1024);
+    defer allocator.free(key_b);
+    const chain_a = try tls.identity_loader.certChainFromPemOrDer(allocator, cert_a);
+    defer freeTestCertChain(allocator, chain_a);
+    const chain_b = try tls.identity_loader.certChainFromPemOrDer(allocator, cert_b);
+    defer freeTestCertChain(allocator, chain_b);
+
+    try compat.cwd().writeFile(.{ .sub_path = default_cert_path, .data = default_cert });
+    try compat.cwd().writeFile(.{ .sub_path = default_key_path, .data = default_key });
+
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    try store.reloadFromFiles(default_cert_path, default_key_path, &.{});
+
+    const rotations = [_]struct { cert: []const u8, key: []const u8, chain: [][]u8 }{
+        .{ .cert = cert_a, .key = key_a, .chain = chain_a },
+        .{ .cert = cert_b, .key = key_b, .chain = chain_b },
+        .{ .cert = cert_a, .key = key_a, .chain = chain_a },
+        .{ .cert = cert_b, .key = key_b, .chain = chain_b },
+    };
+    for (rotations) |rotation| {
+        const specs = [_]ManagedBundleSpec{.{ .hostnames = &.{"rotating.example.test"}, .chain_pem = rotation.cert, .key_pem = rotation.key }};
+        try store.reloadFromBundles(default_cert_path, default_key_path, &.{}, &specs);
+        try expectSelectedLeafFor(store.provider(), "rotating.example.test", rotation.chain[0]);
+    }
+}
+
 // #565 review: the production file-loading composition
 // (`NativeCredentialStore.reloadFromFiles` -> `LoadedBundle.init` ->
 // `identity_loader.loadIdentity`) could not construct an RSA identity at
@@ -902,6 +1214,31 @@ fn expectSelectedLeaf(provider: credentials.CredentialProvider, expected_leaf: [
 fn freeTestCertChain(allocator: std.mem.Allocator, chain: [][]u8) void {
     for (chain) |entry| allocator.free(entry);
     allocator.free(chain);
+}
+
+/// Like `expectSelectedLeaf`, but for a specific SNI (or `null` for the
+/// absent-SNI/default case) and offering ed25519/ecdsa/rsa schemes so a
+/// managed (RSA) bundle is selectable too (#880).
+fn selectFor(provider: credentials.CredentialProvider, server_name: ?[]const u8) !credentials.SelectedCredential {
+    const selection = credentials.SelectionContext{
+        .role = .server,
+        .server_name = server_name,
+        .peer_signature_schemes = &.{ 0x0807, 0x0403, 0x0804 },
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    };
+    return switch (try provider.selectCredential(&selection)) {
+        .complete => |credential| credential,
+        .pending => error.TestUnexpectedPending,
+    };
+}
+
+fn expectSelectedLeafFor(provider: credentials.CredentialProvider, server_name: ?[]const u8, expected_leaf: []const u8) !void {
+    const credential = try selectFor(provider, server_name);
+    defer credential.release();
+    try std.testing.expectEqualSlices(u8, expected_leaf, credential.certificateChain().leaf().?);
 }
 
 fn testResumptionRuntime(allocator: std.mem.Allocator) !tls.resumption_runtime.Runtime {

@@ -343,8 +343,9 @@ const NewOrderResponseJson = struct {
     identifiers: []const IdentifierJson,
     authorizations: []const []const u8,
     finalize: []const u8,
-    /// RFC 8555 §7.1.3 requires this on a pending or ready order object.
-    expires: []const u8,
+    /// RFC 8555 §7.1.3 requires this on a pending order object, but permits
+    /// it to be omitted on ready orders.
+    expires: ?[]const u8 = null,
 };
 
 const Order = struct {
@@ -430,13 +431,22 @@ fn newOrder(allocator: std.mem.Allocator, client: *client_mod.Client, order_grou
     if (!identifiersMatchGroup(v.identifiers, order_group)) return error.UnexpectedIdentifier;
     if (v.authorizations.len > options.limits.max_authz_urls) return error.TooManyAuthorizations;
 
-    const now_unix = options.unix_clock.now();
-    const parsed_expiry = parseRfc3339ToUnix(v.expires) orelse return error.BadOrderResponse;
-    if (parsed_expiry <= now_unix) return error.OrderTimedOut;
-    const ca_remaining_s = parsed_expiry - now_unix;
-    const ca_remaining_ms = std.math.mul(i64, ca_remaining_s, 1000) catch std.math.maxInt(i64);
-    const ca_deadline_ms = std.math.add(i64, options.clock.now(), ca_remaining_ms) catch std.math.maxInt(i64);
-    const effective_deadline_ms = @min(order_deadline_ms, ca_deadline_ms);
+    // `expires` is required for a pending order, but RFC 8555 §7.1.3
+    // permits a ready order (whose identifiers were preauthorized) to omit
+    // it. When present it is still hostile CA input and must be valid; when
+    // absent, retain the local absolute deadline.
+    var effective_deadline_ms = order_deadline_ms;
+    if (v.expires) |expires| {
+        const now_unix = options.unix_clock.now();
+        const parsed_expiry = parseRfc3339ToUnix(expires) orelse return error.BadOrderResponse;
+        if (parsed_expiry <= now_unix) return error.OrderTimedOut;
+        const ca_remaining_s = parsed_expiry - now_unix;
+        const ca_remaining_ms = std.math.mul(i64, ca_remaining_s, 1000) catch std.math.maxInt(i64);
+        const ca_deadline_ms = std.math.add(i64, options.clock.now(), ca_remaining_ms) catch std.math.maxInt(i64);
+        effective_deadline_ms = @min(effective_deadline_ms, ca_deadline_ms);
+    } else if (std.mem.eql(u8, v.status, "pending")) {
+        return error.BadOrderResponse;
+    }
 
     const order_url = try allocator.dupe(u8, location);
     errdefer allocator.free(order_url);
@@ -894,7 +904,9 @@ const OrderStatusJson = struct {
     identifiers: []const IdentifierJson,
     authorizations: []const []const u8,
     finalize: []const u8,
-    expires: []const u8,
+    /// RFC 8555 §7.1.3 requires this for pending and valid orders, but not
+    /// for processing (or ready) orders.
+    expires: ?[]const u8 = null,
     certificate: ?[]const u8 = null,
 };
 
@@ -1006,9 +1018,16 @@ fn finalizeAndPoll(
         if (!identifiersMatchGroup(v.identifiers, order_group)) return error.UnexpectedIdentifier;
         if (!authorizationUrlsMatch(order.authorizations, v.authorizations)) return error.BadOrderResponse;
         if (!std.mem.eql(u8, v.finalize, order.finalize_url)) return error.BadOrderResponse;
+        const requires_expiry = std.mem.eql(u8, v.status, "pending") or std.mem.eql(u8, v.status, "valid");
         // The original expiry set the absolute deadline. A later malformed
-        // expiry cannot be ignored merely because no deadline is extended.
-        if (parseRfc3339ToUnix(v.expires) == null) return error.BadOrderResponse;
+        // expiry cannot be ignored merely because no deadline is extended;
+        // `processing`/`ready` may omit it, however, so retain that original
+        // ceiling in that case.
+        if (v.expires) |expires| {
+            if (parseRfc3339ToUnix(expires) == null) return error.BadOrderResponse;
+        } else if (requires_expiry) {
+            return error.BadOrderResponse;
+        }
 
         if (std.mem.eql(u8, v.status, "valid")) {
             const certificate_url = v.certificate orelse return error.BadOrderResponse;

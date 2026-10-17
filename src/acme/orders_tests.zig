@@ -509,6 +509,19 @@ test "ACME orders: a ready order may have no authorization URLs" {
     try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/authz/1"));
 }
 
+test "ACME orders: a ready new-order response may omit expires" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.new_order.ready_without_authorizations = true;
+    env.ca.script.new_order.omit_expires = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    var issued = try orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options());
+    defer issued.deinit(testing.allocator);
+}
+
 test "ACME orders: an authorization identifier that changes mid-poll fails closed" {
     var env = try Env.init();
     defer env.deinit();
@@ -944,6 +957,33 @@ test "ACME orders: a near-future CA order expiry caps polling before download" {
 
     const names = [_][]const u8{"a.example.com"};
     try testing.expectError(error.OrderTimedOut, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));
+    try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/cert/1"));
+}
+
+test "ACME orders: a processing order poll may omit expires" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.order_poll.polls_before_final = 1;
+    env.ca.script.order_poll.omit_expires_while_processing = true;
+    var opts = env.options();
+    fastPoll(&opts);
+
+    const names = [_][]const u8{"a.example.com"};
+    var issued = try orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts);
+    defer issued.deinit(testing.allocator);
+}
+
+test "ACME orders: a malformed supplied order-poll expiry fails closed" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.order_poll.expires_override = "not-a-timestamp";
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadOrderResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
     try testing.expectEqual(@as(usize, 0), env.ca.countRequests(.POST, "/cert/1"));
 }
 

@@ -107,6 +107,8 @@ pub const NewOrderBehavior = struct {
     status_override: ?[]const u8 = null,
     /// RFC 3339 order lifetime emitted by both newOrder and order polling.
     expires_override: ?[]const u8 = null,
+    /// Omit the optional `expires` member from the new-order object.
+    omit_expires: bool = false,
 };
 
 /// Scripted hostile behavior for authorization GET polls.
@@ -202,6 +204,12 @@ pub const OrderPollBehavior = struct {
     mismatched_identifiers: bool = false,
     mismatched_authorizations: bool = false,
     mismatched_finalize: bool = false,
+    /// Replace the poll response's `expires` value without changing the
+    /// new-order response (for malformed-poll coverage).
+    expires_override: ?[]const u8 = null,
+    /// Omit `expires` only while an order is processing. It remains present
+    /// when the fake CA reports valid, as RFC 8555 requires.
+    omit_expires_while_processing: bool = false,
 };
 
 /// Scripted hostile behavior for `POST /cert/{id}` (certificate download).
@@ -940,7 +948,11 @@ pub const FakeCa = struct {
         } else {
             try buf.print(allocator, "{s}/order/{d}/finalize", .{ self.base, order_id });
         }
-        try buf.print(allocator, "\",\"expires\":\"{s}\"}}", .{b.expires_override orelse "2023-11-14T22:18:20Z"});
+        if (b.omit_expires) {
+            try buf.appendSlice(allocator, "\"}");
+        } else {
+            try buf.print(allocator, "\",\"expires\":\"{s}\"}}", .{b.expires_override orelse "2023-11-14T22:18:20Z"});
+        }
 
         resp.status = 201;
         resp.body_owned = try buf.toOwnedSlice(allocator);
@@ -1210,7 +1222,11 @@ pub const FakeCa = struct {
         } else {
             try buf.print(allocator, "{s}/order/{d}/finalize", .{ self.base, id });
         }
-        try buf.print(allocator, "\",\"expires\":\"{s}\"", .{self.script.new_order.expires_override orelse "2023-11-14T22:18:20Z"});
+        if (!(b.omit_expires_while_processing and order.status == .processing)) {
+            try buf.print(allocator, "\",\"expires\":\"{s}\"", .{b.expires_override orelse self.script.new_order.expires_override orelse "2023-11-14T22:18:20Z"});
+        } else {
+            try buf.append(allocator, '"');
+        }
         if (order.status == .valid) {
             if (b.cross_host_certificate) {
                 try buf.print(allocator, ",\"certificate\":\"https://evil.test/cert/{d}\"", .{order.certificate_id.?});

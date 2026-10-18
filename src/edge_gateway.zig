@@ -12796,6 +12796,11 @@ fn runH1ForwardAuthRequest(
     defer request.request.deinit();
     initForwardAuthProbeState(state);
     var ctx = http.request_context.RequestContext.init(allocator, "req-fa", "127.0.0.1");
+    // A real connection's `ctx` lives in a per-request arena; this helper
+    // uses the raw test allocator instead, so anything `setUpstreamResult`
+    // dupes onto it (reached once a test exercises `proxy_pass`) must be
+    // freed explicitly here or the leak detector flags it.
+    defer if (ctx.upstream_addr) |v| allocator.free(v);
     var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-fa", 0);
     var keep_alive = true;
     return executeH1PostPreflightOrchestration(
@@ -13438,6 +13443,45 @@ test "H1 rewrite preserves caller approval for later verifiers and the asserted 
     state.approval_ttl_ms = 60_000;
     state.approval_max_pending_per_identity = 0;
     defer deinitApprovalsTestMap(&state.approvals, allocator);
+    // This is the only H1 forward_auth test whose location chain ends in a
+    // real `proxy_pass`, so (unlike its sibling tests above) it needs the
+    // upstream-dispatch state `initForwardAuthProbeState` doesn't set: that
+    // helper only covers the location-auth/forward_auth/response-writing
+    // fields exercised by `return_response`/static-file locations.
+    // Leaving these `undefined` lets the proxy path lock a garbage
+    // `circuit_mutex`/`upstream_mutex` and hang forever instead of failing.
+    state.circuit_mutex = .{};
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{});
+    state.upstream_mutex = .{};
+    state.upstream_health = std.StringHashMap(gs.UpstreamHealth).init(allocator);
+    state.upstream_active_requests = std.StringHashMap(usize).init(allocator);
+    state.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    state.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+    // No static upstream pool is configured, so `nextUpstreamBaseUrl` always
+    // consults `dns_discovery` (under its own mutex) before falling back —
+    // it must be a real `DnsDiscovery`, not `undefined`, even though
+    // discovery itself never activates here.
+    state.dns_discovery = http.dns_discovery.DnsDiscovery.init(allocator, .{});
+    state.transcript_mutex = .{};
+    state.transcript_store_path = "";
+    state.proxy_buffer_limits = .{
+        .per_stream_low_watermark = 256 * 1024,
+        .per_stream_high_watermark = 768 * 1024,
+        .per_stream_hard_limit = 1024 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    defer {
+        state.upstream_pool.deinit();
+        state.h2_pool.deinit();
+        state.dns_discovery.deinit();
+        var active_it = state.upstream_active_requests.keyIterator();
+        while (active_it.next()) |key| allocator.free(key.*);
+        state.upstream_active_requests.deinit();
+        var health_it = state.upstream_health.keyIterator();
+        while (health_it.next()) |key| allocator.free(key.*);
+        state.upstream_health.deinit();
+    }
 
     const caller = try state.approvalCreate(allocator, "GET", "/guarded", "", null);
     defer allocator.free(caller.token);

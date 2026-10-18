@@ -302,6 +302,15 @@ pub fn isCacheableRequest(
     if (cfg.policy_rules_raw.len > 0 or cfg.policy_approval_routes_raw.len > 0) return false;
     if (headers.get("authorization") != null) return false;
     if (headers.get("cookie") != null) return false;
+    // An event-stream is an open-ended, per-subscriber representation even
+    // when an upstream happens to finish one response. C1 intentionally has
+    // no streaming semantics, so an explicit client request for SSE must
+    // never look up or fill the shared cache. Likewise an Upgrade request is
+    // not an ordinary GET representation (including WebSocket handshakes).
+    if (headers.get("accept")) |accept| {
+        if (hasEventStreamMediaType(accept)) return false;
+    }
+    if (headers.get("upgrade") != null) return false;
     // `X-Session-Token` is consumed before routing and becomes an asserted
     // upstream identity header. Reject it even if validation failed or a
     // caller did not have a context to report.
@@ -322,6 +331,18 @@ pub const Freshness = struct {
     initial_age_seconds: u32,
 };
 
+/// Match an HTTP media type while ignoring case, surrounding whitespace, and
+/// parameters. `Accept` may contain a comma-separated list; response
+/// Content-Type normally contains one item, and both forms are handled here.
+fn hasEventStreamMediaType(value: []const u8) bool {
+    var values = std.mem.splitScalar(u8, value, ',');
+    while (values.next()) |raw_value| {
+        const media_type = std.mem.trim(u8, raw_value[0 .. std.mem.indexOfScalar(u8, raw_value, ';') orelse raw_value.len], " \t");
+        if (std.ascii.eqlIgnoreCase(media_type, "text/event-stream")) return true;
+    }
+    return false;
+}
+
 /// Response-side cacheability and effective freshness. Requires an explicit
 /// `max-age`/`s-maxage` from the origin (no heuristic/`Expires`-only
 /// freshness); `Set-Cookie`, `Vary` (any value), `no-store`, `private`, and
@@ -337,6 +358,7 @@ pub fn responseFreshness(headers: anytype, ceiling_seconds: u32) ?Freshness {
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "set-cookie")) return null;
         if (std.ascii.eqlIgnoreCase(h.name, "vary")) return null;
+        if (std.ascii.eqlIgnoreCase(h.name, "content-type") and hasEventStreamMediaType(h.value)) return null;
         if (std.ascii.eqlIgnoreCase(h.name, "age")) {
             if (response_age != null) return null;
             response_age = std.fmt.parseInt(u32, std.mem.trim(u8, h.value, " \t"), 10) catch return null;
@@ -466,6 +488,14 @@ test "isCacheableRequest refuses bodyful, framed, streamed, and gated GETs" {
     try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, true));
     try headers.append("Content-Length", "1");
     try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+    try headers.append("Accept", "text/event-stream; charset=utf-8, application/json");
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+    try headers.append("Upgrade", "websocket");
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
 }
 
 const TestHeader = struct { name: []const u8, value: []const u8 };
@@ -512,6 +542,10 @@ test "responseFreshness requires explicit max-age, caps by ceiling and honors Ag
     try std.testing.expectEqual(@as(?Freshness, null), responseFreshness(&[_]TestHeader{
         .{ .name = "Cache-Control", .value = "max-age=60" },
         .{ .name = "Age", .value = "60" },
+    }, 300));
+    try std.testing.expectEqual(@as(?Freshness, null), responseFreshness(&[_]TestHeader{
+        .{ .name = "Content-Type", .value = "Text/Event-Stream; charset=utf-8" },
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
     }, 300));
 }
 

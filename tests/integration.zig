@@ -5092,6 +5092,64 @@ test "interop.openssl.h2.proxy_request_translation_is_secret_safe" {
     try std.testing.expect(std.mem.indexOf(u8, transcript_body, secret_token) == null);
 }
 
+test "interop.h2.generic proxy response cache replays a bounded public GET (#901)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "h2-cache-first", .headers = fresh },
+        .{ .body = "h2-cache-should-not-be-fetched", .headers = fresh },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-cache {{
+        \\    proxy_pass http://{s}:{d}/h2-cache;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const request_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-cache?public=1" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    var first = try pureZigH2GetResponse(allocator, tardigrade.port, request_headers[0..]);
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+    try assertContains(first.body, "h2-cache-first");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+
+    var second = try pureZigH2GetResponse(allocator, tardigrade.port, request_headers[0..]);
+    defer second.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), second.status);
+    try assertContains(second.body, "h2-cache-first");
+    try std.testing.expect(second.header("Age") != null);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+}
+
 test "interop.openssl.h2.auth_required_proxy_fails_closed" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -14576,6 +14634,46 @@ test "generic proxy_pass response cache isolates by query string and never share
     defer cookie2.deinit();
     try assertContains(cookie2.body, "cookie-2");
     try std.testing.expectEqual(@as(u32, 6), origin.requestCount());
+}
+
+test "generic proxy_pass response cache never stores finite SSE responses (#901)" {
+    const allocator = std.testing.allocator;
+    const event_headers: []const ResponseHeader = &.{
+        .{ .name = "Content-Type", .value = "text/event-stream; charset=utf-8" },
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "data: subscriber-one\n\n", .headers = event_headers },
+        .{ .body = "data: subscriber-two\n\n", .headers = event_headers },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /events {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    var first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/events", .body = null, .headers = &.{} });
+    defer first.deinit();
+    try assertContains(first.body, "subscriber-one");
+    var second = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/events", .body = null, .headers = &.{} });
+    defer second.deinit();
+    try assertContains(second.body, "subscriber-two");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
 }
 
 test "forward_auth refusals stay no-store despite global CDN cache headers over h1" {

@@ -5339,9 +5339,17 @@ fn executeHttp2ProxyRoute(
                 };
             };
             if (hit) |value| {
-                state.metricsRecordProxyCacheOutcome(.hit);
-                ctx.setUpstreamResult(target, value.status_code, value.body.len);
-                return .{ .response = try http2CachedProxyResponse(allocator, &value) };
+                // This copy is solely for replaying an already-cached value
+                // into H2-owned buffers. It must fail open just like cache
+                // lookup/fill: the live origin remains authoritative when a
+                // request allocator cannot service this optional copy.
+                if (http2CachedProxyResponse(allocator, &value)) |cached| {
+                    state.metricsRecordProxyCacheOutcome(.hit);
+                    ctx.setUpstreamResult(target, value.status_code, value.body.len);
+                    return .{ .response = cached };
+                } else |_| {
+                    state.metricsRecordProxyCacheOutcome(.fill_error);
+                }
             }
             state.metricsRecordProxyCacheOutcome(.miss);
             response_cache_key = key_buf;

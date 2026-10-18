@@ -3248,6 +3248,57 @@ pub fn stickyAffinityEligible(cfg: *const edge_config.EdgeConfig, pool: Upstream
     return upstreams > 1;
 }
 
+/// C1 cache entries are keyed by a stable effective origin. A relative
+/// `proxy_pass` backed by a pool can choose a different primary, backup, or
+/// discovery result per request, so it cannot safely use the generic cache
+/// until selection is made part of its key. Keep the cache conservative and
+/// bypass those routes rather than selecting twice or replaying one member's
+/// representation for another member.
+pub fn proxyResponseCacheHasDynamicUpstream(cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, proxy_pass_target: []const u8) bool {
+    if (isAbsoluteHttpUrl(std.mem.trim(u8, proxy_pass_target, " \t\r\n"))) return false;
+    if (pool.primary_urls.len > 1 or pool.backup_urls.len > 0) return true;
+    return pool.primary_urls.len == 0 and (cfg.upstream_srv_name.len > 0 or cfg.upstream_dns_discovery_host.len > 0);
+}
+
+test "proxy response cache bypasses dynamic relative upstream pools" {
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    const one = [_][]const u8{"http://one.example"};
+    const two = [_][]const u8{ "http://one.example", "http://two.example" };
+    const backup = [_][]const u8{"http://backup.example"};
+
+    try std.testing.expect(!proxyResponseCacheHasDynamicUpstream(&cfg, .{
+        .fallback_url = one[0],
+        .primary_urls = &one,
+        .primary_weights = &.{},
+        .backup_urls = &.{},
+    }, "/api"));
+    try std.testing.expect(proxyResponseCacheHasDynamicUpstream(&cfg, .{
+        .fallback_url = one[0],
+        .primary_urls = &two,
+        .primary_weights = &.{},
+        .backup_urls = &.{},
+    }, "/api"));
+    try std.testing.expect(proxyResponseCacheHasDynamicUpstream(&cfg, .{
+        .fallback_url = one[0],
+        .primary_urls = &one,
+        .primary_weights = &.{},
+        .backup_urls = &backup,
+    }, "/api"));
+    cfg.upstream_dns_discovery_host = "origin.example";
+    try std.testing.expect(proxyResponseCacheHasDynamicUpstream(&cfg, .{
+        .fallback_url = one[0],
+        .primary_urls = &.{},
+        .primary_weights = &.{},
+        .backup_urls = &.{},
+    }, "/api"));
+    try std.testing.expect(!proxyResponseCacheHasDynamicUpstream(&cfg, .{
+        .fallback_url = one[0],
+        .primary_urls = &two,
+        .primary_weights = &.{},
+        .backup_urls = &.{},
+    }, "http://fixed.example/api"));
+}
+
 pub fn prepareStickyAffinityRequest(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,

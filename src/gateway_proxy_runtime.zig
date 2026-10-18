@@ -663,6 +663,8 @@ pub fn handleLocationProxyPass(
             encountered_identity_gate or ctx.authenticated or ctx.identity != null,
         ) or sticky_affinity != null) {
             state.metricsRecordProxyCacheOutcome(.bypass);
+        } else if (gs.proxyResponseCacheHasDynamicUpstream(cfg, upstream_pool, target)) {
+            state.metricsRecordProxyCacheOutcome(.bypass);
         } else if (ga.shouldBypassProxyCache(&request.headers)) {
             state.metricsRecordProxyCacheOutcome(.bypass);
         } else {
@@ -687,25 +689,40 @@ pub fn handleLocationProxyPass(
                 };
             };
             if (cache_hit) |hit| {
-                state.metricsRecordProxyCacheOutcome(.hit);
-                const headers_with_age = try temp_allocator.alloc(gpc.CacheHeader, hit.headers.len + 1);
-                @memcpy(headers_with_age[0..hit.headers.len], hit.headers);
-                var age_buf: [20]u8 = undefined;
-                const age_str = std.fmt.bufPrint(&age_buf, "{d}", .{hit.age_seconds}) catch unreachable;
-                headers_with_age[hit.headers.len] = .{
-                    .name = try temp_allocator.dupe(u8, "Age"),
-                    .value = try temp_allocator.dupe(u8, age_str),
-                };
-                const replay = .{
-                    .status_code = hit.status_code,
-                    .reason = hit.reason,
-                    .headers = headers_with_age,
-                    .body = hit.body,
-                };
-                ctx.setUpstreamResult(target, hit.status_code, hit.body.len);
-                try writeBufferedUpstreamResponseWithMetrics(writer, &replay, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, null, &state.metrics, &state.metrics_mutex);
-                state.metricsRecord(hit.status_code);
-                return hit.status_code;
+                // Replay assembly is cache-only work. If it cannot allocate,
+                // leave the live upstream path available instead of turning
+                // an otherwise healthy request into an OOM response.
+                replay: {
+                    const headers_with_age = temp_allocator.alloc(gp.UpstreamHeader, hit.headers.len + 1) catch {
+                        state.metricsRecordProxyCacheOutcome(.fill_error);
+                        break :replay;
+                    };
+                    for (hit.headers, 0..) |header, idx| {
+                        headers_with_age[idx] = .{ .name = header.name, .value = header.value };
+                    }
+                    var age_buf: [20]u8 = undefined;
+                    const age_str = std.fmt.bufPrint(&age_buf, "{d}", .{hit.age_seconds}) catch unreachable;
+                    const owned_age_name = temp_allocator.dupe(u8, "Age") catch {
+                        state.metricsRecordProxyCacheOutcome(.fill_error);
+                        break :replay;
+                    };
+                    const owned_age = temp_allocator.dupe(u8, age_str) catch {
+                        state.metricsRecordProxyCacheOutcome(.fill_error);
+                        break :replay;
+                    };
+                    headers_with_age[hit.headers.len] = .{ .name = owned_age_name, .value = owned_age };
+                    const replay = .{
+                        .status_code = hit.status_code,
+                        .reason = hit.reason,
+                        .headers = headers_with_age,
+                        .body = hit.body,
+                    };
+                    state.metricsRecordProxyCacheOutcome(.hit);
+                    ctx.setUpstreamResult(target, hit.status_code, hit.body.len);
+                    try writeBufferedUpstreamResponseWithMetrics(writer, &replay, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, null, &state.metrics, &state.metrics_mutex);
+                    state.metricsRecord(hit.status_code);
+                    return hit.status_code;
+                }
             }
             state.metricsRecordProxyCacheOutcome(.miss);
             response_cache_key = key_buf;

@@ -2999,6 +2999,8 @@ fn handleHttp3LocationProxyPass(
             encountered_identity_gate or ctx.authenticated or ctx.identity != null,
         ) or gs.stickyAffinityEligible(ctx.cfg, gs.upstreamPoolForScope(ctx.cfg, .global), target)) {
             ctx.state.metricsRecordProxyCacheOutcome(.bypass);
+        } else if (gs.proxyResponseCacheHasDynamicUpstream(ctx.cfg, gs.upstreamPoolForScope(ctx.cfg, .global), target)) {
+            ctx.state.metricsRecordProxyCacheOutcome(.bypass);
         } else if (ga.shouldBypassProxyCache(&request.headers)) {
             ctx.state.metricsRecordProxyCacheOutcome(.bypass);
         } else {
@@ -3023,9 +3025,15 @@ fn handleHttp3LocationProxyPass(
                 };
             };
             if (cache_hit) |hit| {
-                ctx.state.metricsRecordProxyCacheOutcome(.hit);
-                try applyHttp3ProxyCacheHit(allocator, response, ctx.state, &hit, correlation_id);
-                return;
+                // A cached replay must fail open. `applyHttp3ProxyCacheHit`
+                // allocates its body before mutating `response`, so a failure
+                // here can safely fall through to the live origin request.
+                if (applyHttp3ProxyCacheHit(allocator, response, ctx.state, &hit, correlation_id)) |_| {
+                    ctx.state.metricsRecordProxyCacheOutcome(.hit);
+                    return;
+                } else |_| {
+                    ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+                }
             }
             ctx.state.metricsRecordProxyCacheOutcome(.miss);
             response_cache_key = key_buf;

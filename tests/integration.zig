@@ -14558,6 +14558,9 @@ test "generic proxy_pass response cache isolates by query string and never share
     var origin = try UpstreamServer.start(allocator, &.{
         .{ .status_code = 200, .body = "query-a", .headers = fresh }, // GET /obj?a=1
         .{ .status_code = 200, .body = "query-b", .headers = fresh }, // GET /obj?a=2
+        .{ .status_code = 200, .body = "bypass-split", .headers = fresh }, // split Cache-Control
+        .{ .status_code = 200, .body = "bypass-reversed", .headers = fresh }, // split Cache-Control (reversed)
+        .{ .status_code = 200, .body = "bypass-zero", .headers = fresh }, // Cache-Control: max-age=000
         .{ .status_code = 200, .body = "auth-1", .headers = fresh }, // GET /obj?a=1 with Authorization
         .{ .status_code = 200, .body = "auth-2", .headers = fresh }, // GET /obj?a=1 with Authorization (again)
         .{ .status_code = 200, .body = "cookie-1", .headers = fresh_with_cookie }, // GET /cookie
@@ -14603,6 +14606,41 @@ test "generic proxy_pass response cache isolates by query string and never share
     try assertContains(a1_again.body, "query-a");
     try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
 
+    // Cache-Control is list-valued across separate fields. Any no-cache
+    // directive, regardless of field order, and a numeric zero max-age must
+    // bypass the existing HIT rather than replay `query-a`.
+    var split_bypass = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/obj?a=1",
+        .body = null,
+        .headers = &.{
+            .{ .name = "Cache-Control", .value = "public" },
+            .{ .name = "Cache-Control", .value = "no-cache" },
+        },
+    });
+    defer split_bypass.deinit();
+    try assertContains(split_bypass.body, "bypass-split");
+    var reversed_bypass = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/obj?a=1",
+        .body = null,
+        .headers = &.{
+            .{ .name = "Cache-Control", .value = "no-cache" },
+            .{ .name = "Cache-Control", .value = "public" },
+        },
+    });
+    defer reversed_bypass.deinit();
+    try assertContains(reversed_bypass.body, "bypass-reversed");
+    var zero_bypass = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/obj?a=1",
+        .body = null,
+        .headers = &.{.{ .name = "Cache-Control", .value = "max-age=000" }},
+    });
+    defer zero_bypass.deinit();
+    try assertContains(zero_bypass.body, "bypass-zero");
+    try std.testing.expectEqual(@as(u32, 5), origin.requestCount());
+
     // A request carrying `Authorization` is never answered from the shared
     // cache and never fills it: both calls reach the origin.
     var auth1 = try sendRequest(allocator, tardigrade.port, .{
@@ -14613,7 +14651,7 @@ test "generic proxy_pass response cache isolates by query string and never share
     });
     defer auth1.deinit();
     try assertContains(auth1.body, "auth-1");
-    try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
+    try std.testing.expectEqual(@as(u32, 6), origin.requestCount());
     var auth2 = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",
         .path = "/obj?a=1",
@@ -14622,18 +14660,18 @@ test "generic proxy_pass response cache isolates by query string and never share
     });
     defer auth2.deinit();
     try assertContains(auth2.body, "auth-2");
-    try std.testing.expectEqual(@as(u32, 4), origin.requestCount());
+    try std.testing.expectEqual(@as(u32, 7), origin.requestCount());
 
     // A response carrying `Set-Cookie` is never stored, even though it is
     // otherwise marked `public, max-age=60`: both calls reach the origin.
     var cookie1 = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/cookie", .body = null, .headers = &.{} });
     defer cookie1.deinit();
     try assertContains(cookie1.body, "cookie-1");
-    try std.testing.expectEqual(@as(u32, 5), origin.requestCount());
+    try std.testing.expectEqual(@as(u32, 8), origin.requestCount());
     var cookie2 = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/cookie", .body = null, .headers = &.{} });
     defer cookie2.deinit();
     try assertContains(cookie2.body, "cookie-2");
-    try std.testing.expectEqual(@as(u32, 6), origin.requestCount());
+    try std.testing.expectEqual(@as(u32, 9), origin.requestCount());
 }
 
 test "generic proxy_pass response cache never stores finite SSE responses (#901)" {
@@ -17942,6 +17980,48 @@ test "sticky affinity cookie pins relative proxy_pass upstream and sets secure d
     try std.testing.expectEqual(@as(u16, 200), second_response.status_code);
     try std.testing.expectEqual(@as(u32, 2), first_upstream.requestCount());
     try std.testing.expectEqual(@as(u32, 0), second_upstream.requestCount());
+}
+
+test "generic response cache bypasses relative proxy_pass upstream pools (#901)" {
+    const allocator = std.testing.allocator;
+    const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
+    var first_upstream = try UpstreamServer.start(allocator, &.{.{ .body = "first-member", .headers = fresh }});
+    defer first_upstream.stop();
+    try first_upstream.run();
+    var second_upstream = try UpstreamServer.start(allocator, &.{.{ .body = "second-member", .headers = fresh }});
+    defer second_upstream.stop();
+    try second_upstream.run();
+
+    const upstream_urls = try std.fmt.allocPrint(
+        allocator,
+        "http://{s}:{d},http://{s}:{d}",
+        .{ test_host, first_upstream.port(), test_host, second_upstream.port() },
+    );
+    defer allocator.free(upstream_urls);
+    const config_text = try allocator.dupe(u8,
+        \\location /pool/ {
+        \\    proxy_pass /upstream/;
+        \\}
+    );
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_BASE_URLS", .value = upstream_urls },
+            .{ .name = "TARDIGRADE_UPSTREAM_LB_ALGORITHM", .value = "round_robin" },
+            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/pool/item", .body = null, .headers = &.{} });
+    defer first.deinit();
+    try assertContains(first.body, "first-member");
+    var second = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/pool/item", .body = null, .headers = &.{} });
+    defer second.deinit();
+    try assertContains(second.body, "second-member");
+    try std.testing.expectEqual(@as(u32, 1), first_upstream.requestCount());
+    try std.testing.expectEqual(@as(u32, 1), second_upstream.requestCount());
 }
 
 test "sticky affinity ignores tampered cookie and rotates to a healthy upstream" {

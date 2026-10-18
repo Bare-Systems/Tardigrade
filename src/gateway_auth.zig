@@ -158,18 +158,54 @@ pub fn shouldBypassProxyCache(headers: *const http.Headers) bool {
         if (std.ascii.indexOfIgnoreCase(pragma, "no-cache") != null) return true;
     }
 
-    if (headers.get("cache-control")) |cache_control| {
-        var it = std.mem.splitScalar(u8, cache_control, ',');
+    // Cache-Control is a list-valued field: independent field lines have the
+    // same meaning as a single comma-joined value. Looking only at `get()`
+    // would let a later no-cache directive be hidden behind an earlier field.
+    for (headers.iterator()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "cache-control")) continue;
+        var it = std.mem.splitScalar(u8, header.value, ',');
         while (it.next()) |part| {
             const token = std.mem.trim(u8, part, " \t\r\n");
-            if (std.ascii.eqlIgnoreCase(token, "no-cache") or std.ascii.eqlIgnoreCase(token, "no-store")) return true;
-            if (std.ascii.startsWithIgnoreCase(token, "max-age=")) {
-                const val = std.mem.trim(u8, token["max-age=".len..], " \t\r\n");
-                if (std.mem.eql(u8, val, "0")) return true;
+            const equals = std.mem.indexOfScalar(u8, token, '=');
+            const name = std.mem.trim(u8, token[0..(equals orelse token.len)], " \t\r\n");
+            if (std.ascii.eqlIgnoreCase(name, "no-cache") or std.ascii.eqlIgnoreCase(name, "no-store")) return true;
+            if (std.ascii.eqlIgnoreCase(name, "max-age")) {
+                const value_start = equals orelse return true;
+                const val = std.mem.trim(u8, token[value_start + 1 ..], " \t\r\n");
+                // Delta-seconds accepts leading zeroes. Treat malformed
+                // values conservatively too: a caller asking for a bounded
+                // freshness that cannot be parsed must not receive a HIT.
+                const max_age = std.fmt.parseUnsigned(u64, val, 10) catch return true;
+                if (max_age == 0) return true;
             }
         }
     }
     return false;
+}
+
+test "proxy cache bypass honors every Cache-Control field and numeric zero freshness" {
+    var headers = http.Headers.init(std.testing.allocator);
+    defer headers.deinit();
+
+    try headers.append("Cache-Control", "public");
+    try headers.append("Cache-Control", "no-cache");
+    try std.testing.expect(shouldBypassProxyCache(&headers));
+
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+    try headers.append("Cache-Control", "max-age=000");
+    try std.testing.expect(shouldBypassProxyCache(&headers));
+
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+    try headers.append("Cache-Control", "no-cache=\"X-Secret\"");
+    try std.testing.expect(shouldBypassProxyCache(&headers));
+
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+    try headers.append("Cache-Control", "public");
+    try headers.append("Cache-Control", "max-age=60");
+    try std.testing.expect(!shouldBypassProxyCache(&headers));
 }
 
 pub fn isGeoBlocked(blocked: []const []const u8, country: ?[]const u8) bool {

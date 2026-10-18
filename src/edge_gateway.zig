@@ -5316,6 +5316,7 @@ fn executeHttp2ProxyRoute(
                 encountered_identity_gate,
             ) or
             gs.stickyAffinityEligible(route_cfg, gs.upstreamPoolForScope(route_cfg, .global), target) or
+            gs.proxyResponseCacheHasDynamicUpstream(route_cfg, gs.upstreamPoolForScope(route_cfg, .global), target) or
             ga.shouldBypassProxyCache(&request.headers))
         {
             state.metricsRecordProxyCacheOutcome(.bypass);

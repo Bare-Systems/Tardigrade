@@ -67,6 +67,12 @@ pub const NativeCredentialStore = struct {
     /// would leave open). `prepareReloadFromFiles` still reads this
     /// atomically for a cheap, non-authoritative fail-fast.
     has_managed_bundles: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// False only during the ACME-only first-boot interval, before either a
+    /// manual identity or a verified managed generation has been installed.
+    /// A configuration reload in that state must be able to update unrelated
+    /// runtime settings while leaving the provider deliberately uninstalled
+    /// (and therefore fail-closed for every TLS handshake).
+    has_active_credentials: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// The config generation whose manual default/SNI inputs were used to
     /// build the installed snapshot.  An ACME worker may finish long after a
     /// SIGHUP has rotated those inputs; it must not install its old view over
@@ -89,6 +95,10 @@ pub const NativeCredentialStore = struct {
 
     pub fn provider(self: *NativeCredentialStore) credentials.CredentialProvider {
         return self.provider_state.provider();
+    }
+
+    pub fn hasActiveCredentials(self: *const NativeCredentialStore) bool {
+        return self.has_active_credentials.load(.acquire);
     }
 
     pub fn deinit(self: *NativeCredentialStore) void {
@@ -290,6 +300,7 @@ pub const NativeCredentialStore = struct {
         prepared.snapshot = null;
         try self.provider_state.install(snapshot);
         self.has_managed_bundles.store(has_managed_bundles, .release);
+        self.has_active_credentials.store(true, .release);
         if (manual_config_generation != 0) self.manual_config_generation = manual_config_generation;
     }
 };
@@ -1069,6 +1080,88 @@ test "prepareReloadFromBundles publishes an in-memory managed bundle alongside a
         .complete => |written| written,
         .pending => return error.TestUnexpectedPending,
     };
+}
+
+test "a stale ACME publish cannot overwrite a newer manual SNI generation and retries with that generation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+
+    const manual_a_cert_path = try std.fmt.allocPrint(allocator, "{s}/manual-a.crt", .{tmp_abs});
+    defer allocator.free(manual_a_cert_path);
+    const manual_a_key_path = try std.fmt.allocPrint(allocator, "{s}/manual-a.key", .{tmp_abs});
+    defer allocator.free(manual_a_key_path);
+    const manual_b_cert_path = try std.fmt.allocPrint(allocator, "{s}/manual-b.crt", .{tmp_abs});
+    defer allocator.free(manual_b_cert_path);
+    const manual_b_key_path = try std.fmt.allocPrint(allocator, "{s}/manual-b.key", .{tmp_abs});
+    defer allocator.free(manual_b_key_path);
+
+    const manual_a_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.crt", 256 * 1024);
+    defer allocator.free(manual_a_cert);
+    const manual_a_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.key", 256 * 1024);
+    defer allocator.free(manual_a_key);
+    const manual_b_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.crt", 256 * 1024);
+    defer allocator.free(manual_b_cert);
+    const manual_b_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.key", 256 * 1024);
+    defer allocator.free(manual_b_key);
+    const managed_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.crt", 256 * 1024);
+    defer allocator.free(managed_cert);
+    const managed_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.key", 256 * 1024);
+    defer allocator.free(managed_key);
+    const manual_a_chain = try tls.identity_loader.certChainFromPemOrDer(allocator, manual_a_cert);
+    defer freeTestCertChain(allocator, manual_a_chain);
+    const manual_b_chain = try tls.identity_loader.certChainFromPemOrDer(allocator, manual_b_cert);
+    defer freeTestCertChain(allocator, manual_b_chain);
+    const managed_chain = try tls.identity_loader.certChainFromPemOrDer(allocator, managed_cert);
+    defer freeTestCertChain(allocator, managed_chain);
+
+    try compat.cwd().writeFile(.{ .sub_path = manual_a_cert_path, .data = manual_a_cert });
+    try compat.cwd().writeFile(.{ .sub_path = manual_a_key_path, .data = manual_a_key });
+    try compat.cwd().writeFile(.{ .sub_path = manual_b_cert_path, .data = manual_b_cert });
+    try compat.cwd().writeFile(.{ .sub_path = manual_b_key_path, .data = manual_b_key });
+
+    const manual_a = [_]SniCertSpec{.{ .server_name = "manual.example.test", .cert_path = manual_a_cert_path, .key_path = manual_a_key_path }};
+    const manual_b = [_]SniCertSpec{.{ .server_name = "manual.example.test", .cert_path = manual_b_cert_path, .key_path = manual_b_key_path }};
+    const managed = [_]ManagedBundleSpec{.{
+        .hostnames = &.{"managed.example.test"},
+        .chain_pem = managed_cert,
+        .key_pem = managed_key,
+    }};
+
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    try store.reloadFromFiles("", "", &manual_a);
+    const pinned_a = try selectFor(store.provider(), "manual.example.test");
+    defer pinned_a.release();
+
+    // This is the bootstrap's old preparation, deliberately held before its
+    // commit while SIGHUP prepares and commits manual certificate B.
+    var stale_publish = try store.prepareReloadFromBundles("", "", &manual_a, &managed);
+    defer stale_publish.deinit();
+    stale_publish.manual_config_generation = 1;
+    var reload_b = try store.prepareReloadFromFiles("", "", &manual_b);
+    defer reload_b.deinit();
+    reload_b.manual_config_generation = 2;
+    try store.commitPreparedReload(&reload_b);
+    try expectSelectedLeafFor(store.provider(), "manual.example.test", manual_b_chain[0]);
+
+    try std.testing.expectError(error.StaleManualCredentialConfig, store.commitPreparedReload(&stale_publish));
+    try expectSelectedLeafFor(store.provider(), "manual.example.test", manual_b_chain[0]);
+    try std.testing.expectError(error.NoCredentialAvailable, selectFor(store.provider(), "managed.example.test"));
+
+    // `publishManagedBundles` retries after that exact error with a current
+    // configuration lease; the mixed retry preserves B and activates the
+    // managed leaf without giving unknown SNI a default fallback.
+    var retry = try store.prepareReloadFromBundles("", "", &manual_b, &managed);
+    defer retry.deinit();
+    retry.manual_config_generation = 2;
+    try store.commitPreparedReload(&retry);
+    try expectSelectedLeafFor(store.provider(), "manual.example.test", manual_b_chain[0]);
+    try expectSelectedLeafFor(store.provider(), "managed.example.test", managed_chain[0]);
+    try std.testing.expectError(error.NoCredentialAvailable, selectFor(store.provider(), "unknown.example.test"));
+    try std.testing.expectEqualSlices(u8, manual_a_chain[0], pinned_a.certificateChain().leaf().?);
 }
 
 test "a store that never reloaded (no default, no managed bundle) fails every selection closed (#884 G11 bootstrap)" {

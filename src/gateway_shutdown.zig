@@ -359,18 +359,30 @@ pub fn hotReloadConfig(
         // publish compose correctly no matter which one happens to run
         // first.
         if (cfg_ptr.tls_acme_enabled) {
-            prepared_native_credentials = reloadAcmeManagedCredentials(allocator, store, cfg_ptr, sni_specs) catch |err| {
-                worker_ctx.config_store.destroyVersion(prepared_version);
-                const msg = std.fmt.bufPrint(&state.last_reload_error, "ACME-managed native TLS credential reload failed: {}", .{err}) catch "ACME-managed native TLS credential reload failed";
-                state.reload_mutex.lock();
-                state.last_reload_ok = false;
-                state.last_reload_at_ms = now_ms;
-                state.last_reload_error_len = msg.len;
-                state.reload_mutex.unlock();
-                state.metricsRecordReloadFailure();
-                state.logger.warn(null, "config reload rejected by ACME-managed native TLS credential reload: {}", .{err});
-                return;
-            };
+            if (reloadAcmeManagedCredentials(allocator, store, cfg_ptr, sni_specs)) |prepared| {
+                prepared_native_credentials = prepared;
+            } else |err| {
+                // During an ACME-only first boot there is intentionally no
+                // provider snapshot yet.  Do not turn an unrelated SIGHUP
+                // into `EmptyCredentialSet`: retain that uninstalled
+                // provider so TLS still fails closed, and let the bootstrap
+                // worker publish a complete generation later using its lease
+                // on the newly installed configuration.
+                if (err == error.NoActiveCredentialSet) {
+                    // Nothing to prepare or commit is the correct result.
+                } else {
+                    worker_ctx.config_store.destroyVersion(prepared_version);
+                    const msg = std.fmt.bufPrint(&state.last_reload_error, "ACME-managed native TLS credential reload failed: {}", .{err}) catch "ACME-managed native TLS credential reload failed";
+                    state.reload_mutex.lock();
+                    state.last_reload_ok = false;
+                    state.last_reload_at_ms = now_ms;
+                    state.last_reload_error_len = msg.len;
+                    state.reload_mutex.unlock();
+                    state.metricsRecordReloadFailure();
+                    state.logger.warn(null, "config reload rejected by ACME-managed native TLS credential reload: {}", .{err});
+                    return;
+                }
+            }
         } else {
             prepared_native_credentials = store.prepareReloadFromFiles(cfg_ptr.tls_cert_path, cfg_ptr.tls_key_path, sni_specs) catch |err| {
                 worker_ctx.config_store.destroyVersion(prepared_version);
@@ -514,6 +526,9 @@ fn reloadAcmeManagedCredentials(
     defer acme_state.close();
     var bundles = try acme_activation.loadManagedBundleSet(allocator, &acme_state, &group_list, compat.unixTimestamp());
     defer bundles.deinit();
+    if (cfg_ptr.tls_cert_path.len == 0 and cfg_ptr.tls_key_path.len == 0 and sni_specs.len == 0 and bundles.slice().len == 0 and !store.hasActiveCredentials()) {
+        return error.NoActiveCredentialSet;
+    }
     return store.prepareReloadFromBundles(cfg_ptr.tls_cert_path, cfg_ptr.tls_key_path, sni_specs, bundles.slice());
 }
 
@@ -568,6 +583,40 @@ test "reloadAcmeManagedCredentials republishes an active managed generation that
     var prepared = try reloadAcmeManagedCredentials(allocator, &store, &cfg, &.{});
     defer prepared.deinit();
     try store.commitPreparedReload(&prepared);
+}
+
+test "reloadAcmeManagedCredentials permits an unrelated reload before the first ACME identity exists" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const state_dir = try std.fmt.allocPrint(allocator, "{s}/state", .{tmp_abs});
+    defer allocator.free(state_dir);
+
+    var cfg = try edge_config.loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    cfg.tls_acme_enabled = true;
+    allocator.free(cfg.tls_acme_cert_dir);
+    cfg.tls_acme_cert_dir = try allocator.dupe(u8, state_dir);
+    allocator.free(cfg.tls_acme_domains_spec);
+    cfg.tls_acme_domains_spec = try allocator.dupe(u8, "a.example.test");
+
+    var store = http.native_tls_connection.NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    try std.testing.expect(!store.hasActiveCredentials());
+    try std.testing.expectError(error.NoActiveCredentialSet, reloadAcmeManagedCredentials(allocator, &store, &cfg, &.{}));
+    // The uninstalled provider remains deliberately fail-closed; the caller
+    // can publish the non-credential configuration generation independently.
+    try std.testing.expectError(error.NoCredentialAvailable, store.provider().selectCredential(&.{
+        .role = .server,
+        .server_name = "a.example.test",
+        .peer_signature_schemes = &.{0x0403},
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    }));
 }
 
 /// True when a proposed configuration changes any input that feeds the

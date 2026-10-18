@@ -664,8 +664,8 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         ).early_data_replay_gate;
     }
     if (cfg.http3_enabled) {
-        if (!edge_config.hasTlsFiles(cfg)) {
-            state.logger.warn(null, "HTTP/3 requested without TLS cert/key; QUIC bootstrap will remain incomplete", .{});
+        if (!edge_config.usesNativeTls(cfg)) {
+            state.logger.warn(null, "HTTP/3 requested without native TLS; QUIC bootstrap will remain incomplete", .{});
         }
         if (cfg.http3_qlog_dir.len > 0 or cfg.http3_keylog_path.len > 0) {
             http3_observability_artifacts = http.http3_runtime.ObservabilityArtifacts.initWithLogger(
@@ -849,8 +849,8 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
 
     state.logger.info(null, "Tardigrade edge listening on {s}:{d}", .{ cfg.listen_host, cfg.listen_port });
     state.logger.info(null, "Event loop initialized with backend: {s}", .{event_loop.backendName()});
-    if (!edge_config.hasTlsFiles(cfg)) {
-        state.logger.warn(null, "TLS cert/key not set; serving HTTP only", .{});
+    if (!edge_config.usesNativeTls(cfg)) {
+        state.logger.warn(null, "TLS credentials not set; serving HTTP only", .{});
     } else {
         state.logger.info(null, "TLS termination enabled with cert/key at {s} and {s}", .{ cfg.tls_cert_path, cfg.tls_key_path });
     }
@@ -5345,7 +5345,7 @@ fn executeHttp2ProxyRoute(
                 .method = method,
                 .uri = target,
                 .host = ps.authority orelse request.headers.get("host"),
-                .proto = if (edge_config.hasTlsFiles(route_cfg)) "https" else "http",
+                .proto = if (edge_config.usesNativeTls(route_cfg)) "https" else "http",
                 .client_ip = ctx.client_ip,
                 .correlation_id = correlation_id,
                 .headers = client_view.headers(request),
@@ -5478,7 +5478,7 @@ fn executeHttp2ProxyRoute(
         } else {
             var key_buf: [64]u8 = undefined;
             _ = gproxy_cache.buildCacheKey(&key_buf, .{
-                .scheme = if (edge_config.hasTlsFiles(route_cfg)) "https" else "http",
+                .scheme = if (edge_config.usesNativeTls(route_cfg)) "https" else "http",
                 .host = ps.authority orelse request.headers.get("host") orelse "",
                 .method = request.method.toString(),
                 .location_id = matched.block.pattern,
@@ -5518,7 +5518,7 @@ fn executeHttp2ProxyRoute(
     var upstream_url = try gp.appendProxyQueryString(allocator, resolved.url, request.uri.query);
     defer upstream_url.deinit(allocator);
 
-    const forwarded_proto = if (edge_config.hasTlsFiles(route_cfg)) "https" else "http";
+    const forwarded_proto = if (edge_config.usesNativeTls(route_cfg)) "https" else "http";
     var proxy_response = try gproxy_runtime.executeBufferedDataPlaneProxyRequest(
         allocator,
         route_cfg,

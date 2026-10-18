@@ -67,6 +67,11 @@ pub const NativeCredentialStore = struct {
     /// would leave open). `prepareReloadFromFiles` still reads this
     /// atomically for a cheap, non-authoritative fail-fast.
     has_managed_bundles: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The config generation whose manual default/SNI inputs were used to
+    /// build the installed snapshot.  An ACME worker may finish long after a
+    /// SIGHUP has rotated those inputs; it must not install its old view over
+    /// that newer generation.
+    manual_config_generation: u64 = 0,
     /// Serializes the commit critical section (the managed-active check,
     /// `provider_state.install`, and the `has_managed_bundles` update) so
     /// the three happen as one atomic step from the perspective of any
@@ -105,6 +110,9 @@ pub const NativeCredentialStore = struct {
     pub const PreparedReload = struct {
         snapshot: ?*sni_provider.Snapshot,
         has_managed_bundles: bool = false,
+        /// Zero is for callers not associated with a reloadable gateway
+        /// configuration (unit tests and one-shot stores).
+        manual_config_generation: u64 = 0,
         /// Set only by `prepareReloadFromFiles`. A deliberate empty managed
         /// set published through `prepareReloadFromBundles` (`&.{}`) is NOT
         /// file-only: it is the caller's explicit declaration that the
@@ -268,6 +276,7 @@ pub const NativeCredentialStore = struct {
         const snapshot = prepared.snapshot orelse return;
         const has_managed_bundles = prepared.has_managed_bundles;
         const file_only = prepared.file_only;
+        const manual_config_generation = prepared.manual_config_generation;
 
         self.commit_mutex.lock();
         defer self.commit_mutex.unlock();
@@ -275,9 +284,13 @@ pub const NativeCredentialStore = struct {
         if (file_only and self.has_managed_bundles.load(.acquire)) {
             return error.ManagedCredentialsActive;
         }
+        if (manual_config_generation != 0 and manual_config_generation < self.manual_config_generation) {
+            return error.StaleManualCredentialConfig;
+        }
         prepared.snapshot = null;
         try self.provider_state.install(snapshot);
         self.has_managed_bundles.store(has_managed_bundles, .release);
+        if (manual_config_generation != 0) self.manual_config_generation = manual_config_generation;
     }
 };
 

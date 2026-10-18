@@ -74,6 +74,29 @@ fn acmePublishedHostCheck(ctx: ?*anyopaque, host: []const u8) bool {
     return published.isPublished(host);
 }
 
+/// Prepares an ACME publication using a lease on the current configuration.
+/// The generation stamp makes a concurrently completed SIGHUP win over a
+/// bootstrap worker that began with older manual certificate paths.
+fn prepareCurrentAcmeCredentials(
+    raw_store: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    store: *http.native_tls_connection.NativeCredentialStore,
+    bundles: []const http.native_tls_connection.ManagedBundleSpec,
+) !http.native_tls_connection.NativeCredentialStore.PreparedReload {
+    const config_store: *ReloadableConfigStore = @ptrCast(@alignCast(raw_store.?));
+    var lease = config_store.acquire();
+    defer lease.release();
+    const cfg = lease.cfg;
+    var sni_specs = try allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
+    defer allocator.free(sni_specs);
+    for (cfg.tls_sni_certs, 0..) |spec, i| {
+        sni_specs[i] = .{ .server_name = spec.server_name, .cert_path = spec.cert_path, .key_path = spec.key_path };
+    }
+    var prepared = try store.prepareReloadFromBundles(cfg.tls_cert_path, cfg.tls_key_path, sni_specs, bundles);
+    prepared.manual_config_generation = lease.version.generation;
+    return prepared;
+}
+
 /// Takes a mutable config because the startup generation publishes its parsed
 /// ACL back onto it (`EdgeConfig.parsed_access_control`), which is what pairs
 /// authorization state with the configuration generation a request leases.
@@ -527,7 +550,11 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             h3_credential_provider = owner.provider();
         } else {
             native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
-            if (edge_config.hasTlsFiles(cfg)) {
+            // A manual SNI-only deployment has no default certificate, but
+            // still needs a first snapshot before the ACME worker obtains a
+            // managed group.  Otherwise a transient CA outage would take an
+            // unrelated, valid manual hostname offline.
+            if (edge_config.hasTlsFiles(cfg) or native_sni_specs.len != 0) {
                 try native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs);
             }
             native_tls_provider = native_credentials.?.provider();
@@ -575,6 +602,8 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             .store = &native_credentials.?,
             .challenge_store = &state.acme_challenge_store.?,
             .published = &published_hosts.?,
+            .prepare_current_credentials = prepareCurrentAcmeCredentials,
+            .credential_config_ctx = &config_store,
             .group_list = recovered.group_list,
             .needs_issuance = recovered.needs_issuance,
             .logger = state.logger,

@@ -143,7 +143,16 @@ pub fn loadManagedBundleSet(
         loaded.leaf_key.deinit();
         loaded.meta.deinit();
 
+        // `loaded` no longer owns either PEM after the detach above, but the
+        // list does not own them until this append succeeds.  In particular,
+        // preserve the private-key wipe on an OOM here.
+        var transferred = false;
+        errdefer if (!transferred) {
+            allocator.free(chain_pem);
+            secrets.secureZeroAndFree(allocator, key_pem);
+        };
         try owned_list.append(allocator, .{ .chain_pem = chain_pem, .key_pem = key_pem });
+        transferred = true;
         try specs_list.append(allocator, .{ .hostnames = group.slice(), .chain_pem = chain_pem, .key_pem = key_pem });
     }
 
@@ -211,7 +220,7 @@ pub fn recoverFromDisk(
         }
     }
 
-    if (default_cert_path.len > 0 or bundles.slice().len > 0) {
+    if (default_cert_path.len > 0 or sni_certs.len > 0 or bundles.slice().len > 0) {
         var prepared = try store.prepareReloadFromBundles(default_cert_path, default_key_path, sni_certs, bundles.slice());
         defer prepared.deinit();
         try store.commitPreparedReload(&prepared);
@@ -247,6 +256,17 @@ pub const BootstrapCtx = struct {
     store: *NativeCredentialStore,
     challenge_store: *ChallengeStore,
     published: *PublishedHosts,
+    /// Builds a publication snapshot from the currently live config rather
+    /// than the startup-only manual cert/SNI mapping.  The gateway supplies
+    /// this so an issuance completing after SIGHUP cannot resurrect stale
+    /// manual credentials.  Kept optional for focused unit tests.
+    prepare_current_credentials: ?*const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        *NativeCredentialStore,
+        []const ManagedBundleSpec,
+    ) anyerror!NativeCredentialStore.PreparedReload = null,
+    credential_config_ctx: ?*anyopaque = null,
     group_list: acme.groups.GroupList,
     needs_issuance: [acme.groups.max_groups]bool,
     logger: http.logger.Logger,
@@ -301,23 +321,28 @@ fn runBootstrapWithDialer(ctx: *BootstrapCtx, dialer: acme.transport.Dialer) !vo
     }
     if (!any_needed) return;
 
-    var state = try acme.state.StateDir.open(ctx.state_dir_path);
-    defer state.close();
-
     var transport_inst = acme.transport.Transport{ .allocator = ctx.allocator, .dialer = dialer };
-    const session = try acme.client.Session.open(ctx.allocator, &transport_inst, &state, .{
-        .directory_url = ctx.issue.directory_url,
-        .contact_email = ctx.issue.contact_email,
-        .terms_of_service_agreed = ctx.issue.terms_of_service_agreed,
-        .account_key_path = ctx.issue.account_key_path,
-    }, compat.unixTimestamp());
+    // StateDir's advisory lock protects short durable-state transitions, not
+    // the potentially minutes-long HTTP-01 order/polling loop.  The session
+    // retains its key/client after this scope, so routine SIGHUP reloads can
+    // read the last committed managed set while issuance is in flight.
+    const session = blk: {
+        var state = try acme.state.StateDir.open(ctx.state_dir_path);
+        defer state.close();
+        break :blk try acme.client.Session.open(ctx.allocator, &transport_inst, &state, .{
+            .directory_url = ctx.issue.directory_url,
+            .contact_email = ctx.issue.contact_email,
+            .terms_of_service_agreed = ctx.issue.terms_of_service_agreed,
+            .account_key_path = ctx.issue.account_key_path,
+        }, compat.unixTimestamp());
+    };
     defer session.close();
 
     var issued_any = false;
     for (ctx.group_list.slice(), 0..) |group, i| {
         if (ctx.cancel.load(.acquire)) break;
         if (!ctx.needs_issuance[i]) continue;
-        issueGroup(ctx, &state, &session.client, group) catch |err| {
+        issueGroup(ctx, &session.client, group) catch |err| {
             ctx.logger.warn(null, "ACME issuance failed for a managed group (class={s}, error={s})", .{ @tagName(acme.client.classify(err)), @errorName(err) });
             continue;
         };
@@ -325,24 +350,48 @@ fn runBootstrapWithDialer(ctx: *BootstrapCtx, dialer: acme.transport.Dialer) !vo
     }
     if (!issued_any) return;
 
-    var bundles = try loadManagedBundleSet(ctx.allocator, &state, &ctx.group_list, compat.unixTimestamp());
+    var bundles = blk: {
+        var state = try acme.state.StateDir.open(ctx.state_dir_path);
+        defer state.close();
+        break :blk try loadManagedBundleSet(ctx.allocator, &state, &ctx.group_list, compat.unixTimestamp());
+    };
     defer bundles.deinit();
     if (bundles.slice().len == 0) return;
-    var prepared = try ctx.store.prepareReloadFromBundles(ctx.default_cert_path, ctx.default_key_path, ctx.sni_certs, bundles.slice());
-    defer prepared.deinit();
-    try ctx.store.commitPreparedReload(&prepared);
+    // The state-directory lock was released after the durable generation was
+    // fully loaded above; all later work is in memory.
+    try publishManagedBundles(ctx, bundles.slice());
     for (bundles.slice()) |spec| try ctx.published.markGroup(spec.hostnames);
 }
 
-fn issueGroup(ctx: *BootstrapCtx, state: *acme.state.StateDir, client: *acme.client.Client, group: acme.groups.Group) !void {
+fn publishManagedBundles(ctx: *BootstrapCtx, bundles: []const ManagedBundleSpec) !void {
+    var attempts: u8 = 0;
+    while (attempts < 3) : (attempts += 1) {
+        var prepared = if (ctx.prepare_current_credentials) |prepare|
+            try prepare(ctx.credential_config_ctx, ctx.allocator, ctx.store, bundles)
+        else
+            try ctx.store.prepareReloadFromBundles(ctx.default_cert_path, ctx.default_key_path, ctx.sni_certs, bundles);
+        defer prepared.deinit();
+        ctx.store.commitPreparedReload(&prepared) catch |err| {
+            if (err == error.StaleManualCredentialConfig) continue;
+            return err;
+        };
+        return;
+    }
+    return error.StaleManualCredentialConfig;
+}
+
+fn issueGroup(ctx: *BootstrapCtx, client: *acme.client.Client, group: acme.groups.Group) !void {
     var issued = try acme.orders.obtain(ctx.allocator, client, ctx.challenge_store, group.slice(), .{
         .cancel = .{ .ctx = &ctx.cancel, .checkFn = cancelCheck },
     });
     defer issued.deinit(ctx.allocator);
 
+    // Hold the filesystem lock only for the atomic verify/persist step.
+    var state = try acme.state.StateDir.open(ctx.state_dir_path);
+    defer state.close();
     var id_buf: [acme.groups.group_id_len]u8 = undefined;
     const group_id = acme.groups.groupId(&id_buf, group.slice());
-    _ = try acme.activate.verifyAndPersist(ctx.allocator, state, group_id, &issued.key, issued.chain_pem, .{
+    _ = try acme.activate.verifyAndPersist(ctx.allocator, &state, group_id, &issued.key, issued.chain_pem, .{
         .hostnames = group.slice(),
         .now = compat.unixTimestamp(),
     });
@@ -402,6 +451,57 @@ test "recoverFromDisk publishes nothing and reports every group as needing issua
     try testing.expectError(error.NoCredentialAvailable, store.provider().selectCredential(&selection));
 }
 
+test "recoverFromDisk publishes a manual SNI-only identity before ACME issuance (#929 review)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const state_dir = try std.fmt.allocPrint(allocator, "{s}/state", .{tmp_abs});
+    defer allocator.free(state_dir);
+
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    var published = PublishedHosts.init(allocator);
+    defer published.deinit();
+    const sni = [_]SniCertSpec{.{
+        .server_name = "manual.example.test",
+        .cert_path = "tests/fixtures/tls/native_p256.crt",
+        .key_path = "tests/fixtures/tls/native_p256.key",
+    }};
+
+    const result = try recoverFromDisk(allocator, "managed.example.test", state_dir, "", "", &sni, &store, &published, 1_700_000_000);
+    try testing.expect(result.needs_issuance[0]);
+
+    const credentials = @import("tls_core").credentials;
+    const manual = credentials.SelectionContext{
+        .role = .server,
+        .server_name = "manual.example.test",
+        .peer_signature_schemes = &.{ 0x0403, 0x0804 },
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    };
+    const selection = try store.provider().selectCredential(&manual);
+    const selected = switch (selection) {
+        .complete => |value| value,
+        .pending => return error.TestUnexpectedPending,
+    };
+    selected.release();
+
+    const unmanaged = credentials.SelectionContext{
+        .role = .server,
+        .server_name = "unmanaged.example.test",
+        .peer_signature_schemes = &.{ 0x0403, 0x0804 },
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    };
+    try testing.expectError(error.NoCredentialAvailable, store.provider().selectCredential(&unmanaged));
+}
+
 test "issueGroup never persists or publishes a CA-issued chain that fails §6.4 verification" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -422,13 +522,15 @@ test "issueGroup never persists or publishes a CA-issued chain that fails §6.4 
 
     var challenge_store = ChallengeStore.init(allocator);
     defer challenge_store.deinit();
-    var state = try acme.state.StateDir.open(state_dir);
-    defer state.close();
     var transport_inst = acme.transport.Transport{ .allocator = allocator, .dialer = ca.dialer() };
-    const session = try acme.client.Session.open(allocator, &transport_inst, &state, .{
-        .directory_url = "https://ca.test/directory",
-        .terms_of_service_agreed = true,
-    }, 1_700_000_000);
+    const session = blk: {
+        var state = try acme.state.StateDir.open(state_dir);
+        defer state.close();
+        break :blk try acme.client.Session.open(allocator, &transport_inst, &state, .{
+            .directory_url = "https://ca.test/directory",
+            .terms_of_service_agreed = true,
+        }, 1_700_000_000);
+    };
     defer session.close();
 
     // `issueGroup` never reads `ctx.issue.trust_anchors` itself (only
@@ -460,10 +562,12 @@ test "issueGroup never persists or publishes a CA-issued chain that fails §6.4 
     // PEM header, never parse it) -- exactly the untrusted-CA-response case
     // §6.4 exists for. `issueGroup` must surface that failure, not swallow
     // it or persist/publish anything.
-    try testing.expectError(error.MalformedChain, issueGroup(&ctx, &state, &session.client, group));
+    try testing.expectError(error.MalformedChain, issueGroup(&ctx, &session.client, group));
 
     var id_buf: [acme.groups.group_id_len]u8 = undefined;
     const group_id = acme.groups.groupId(&id_buf, group.slice());
+    var state = try acme.state.StateDir.open(state_dir);
+    defer state.close();
     const loaded = try acme.activate.loadCommitted(allocator, &state, group_id, group.slice(), 1_700_000_100);
     try testing.expect(loaded == null);
 }

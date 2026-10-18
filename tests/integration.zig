@@ -23176,6 +23176,67 @@ test "automatic HTTPS (#884, G11): a real fresh-start experimental tardi run sel
     }
 }
 
+test "automatic HTTPS validates ACME-only native listener protocol and TLS restrictions (#929 review)" {
+    if (!integration_options.acme_experimental or std.mem.eql(u8, build_options.tls_profile, "appliance")) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    const state_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-acme-native-policy-{d}", .{compat.nanoTimestamp()});
+    defer allocator.free(state_rel);
+    defer compat.cwd().deleteTree(state_rel) catch {};
+    try compat.cwd().makePath(state_rel);
+    const config_rel = try std.fmt.allocPrint(allocator, "{s}.conf", .{state_rel});
+    defer allocator.free(config_rel);
+    defer compat.cwd().deleteFile(config_rel) catch {};
+    try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = "" });
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("TARDIGRADE_TLS_AUTOMATIC_HTTPS", "true");
+    try env_map.put("TARDIGRADE_TLS_ACME_AGREE_TOS", "true");
+    try env_map.put("TARDIGRADE_TLS_ACME_STATE_DIR", state_rel);
+    try env_map.put("TARDIGRADE_TLS_ACME_DOMAINS", "example.com");
+    try env_map.put("TARDIGRADE_HTTP1_ENABLED", "false");
+    try env_map.put("TARDIGRADE_HTTP2_ENABLED", "true");
+    _ = env_map.swapRemove("TARDIGRADE_TLS_CERT_PATH");
+    _ = env_map.swapRemove("TARDIGRADE_TLS_KEY_PATH");
+
+    const h2_only = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(h2_only.stdout);
+    defer allocator.free(h2_only.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, h2_only.term);
+
+    try env_map.put("TARDIGRADE_PROXY_PROTOCOL", "v1");
+    const proxy = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(proxy.stdout);
+    defer allocator.free(proxy.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, proxy.term);
+    try assertContains(proxy.stderr, "TARDIGRADE_PROXY_PROTOCOL");
+
+    try env_map.put("TARDIGRADE_PROXY_PROTOCOL", "off");
+    try env_map.put("TARDIGRADE_TLS_MAX_VERSION", "1.2");
+    const version = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(version.stdout);
+    defer allocator.free(version.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, version.term);
+    try assertContains(version.stderr, "TLS 1.3-only");
+}
+
 test "appliance hot reload rejects turning TLS on for a server that started plaintext" {
     try requireApplianceTlsProfile();
     try requireNativeTlsProfile();

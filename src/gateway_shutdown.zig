@@ -308,7 +308,7 @@ pub fn hotReloadConfig(
     // this guard is the generic-native owner of the rule.)
     {
         var current_lease = worker_ctx.config_store.acquire();
-        const tls_topology_changed = edge_config.hasTlsFiles(current_lease.cfg) != edge_config.hasTlsFiles(cfg_ptr);
+        const tls_topology_changed = edge_config.usesNativeTls(current_lease.cfg) != edge_config.usesNativeTls(cfg_ptr);
         current_lease.release();
         if (tls_topology_changed) {
             worker_ctx.config_store.destroyVersion(prepared_version);
@@ -441,6 +441,9 @@ pub fn hotReloadConfig(
     }
     if (worker_ctx.native_credentials) |store| {
         if (prepared_native_credentials) |*prepared| {
+            // The ACME bootstrap worker compares this stamp before it can
+            // publish a snapshot assembled from an older manual mapping.
+            prepared.manual_config_generation = prepared_version.generation;
             store.commitPreparedReload(prepared) catch |err| {
                 worker_ctx.config_store.destroyVersion(prepared_version);
                 const msg = std.fmt.bufPrint(&state.last_reload_error, "native TLS credential publish failed: {}", .{err}) catch "native TLS credential publish failed";
@@ -682,6 +685,7 @@ pub fn acmeHttp01ListenerConfigChanged(
     return current.tls_acme_enabled != proposed.tls_acme_enabled or
         !std.mem.eql(u8, current.tls_acme_http01_listen, proposed.tls_acme_http01_listen) or
         !std.mem.eql(u8, current.tls_acme_domains_spec, proposed.tls_acme_domains_spec) or
+        current.tls_https_redirect != proposed.tls_https_redirect or
         (current.tls_acme_enabled and
             current.max_connections_per_ip != proposed.max_connections_per_ip);
 }
@@ -720,6 +724,24 @@ test "acmeHttp01ListenerConfigChanged detects an enabled-flag change (#897 revie
     defer proposed.deinit(allocator);
 
     proposed.tls_acme_enabled = !base.tls_acme_enabled;
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+}
+
+test "acmeHttp01ListenerConfigChanged rejects either redirect transition (#929 review)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    base.tls_acme_enabled = true;
+    proposed.tls_acme_enabled = true;
+    base.tls_https_redirect = false;
+    proposed.tls_https_redirect = true;
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+
+    base.tls_https_redirect = true;
+    proposed.tls_https_redirect = false;
     try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
 }
 

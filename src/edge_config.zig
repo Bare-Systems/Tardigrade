@@ -3634,6 +3634,14 @@ pub fn hasTlsFiles(cfg: *const EdgeConfig) bool {
     return cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0;
 }
 
+/// Whether the main TCP listener is a native-TLS listener.  This is broader
+/// than `hasTlsFiles`: automatic HTTPS deliberately starts native TLS before
+/// it has obtained its first certificate, failing handshakes closed until a
+/// credential generation is published.
+pub fn usesNativeTls(cfg: *const EdgeConfig) bool {
+    return hasTlsFiles(cfg) or cfg.tls_acme_enabled;
+}
+
 /// True when this binary was built with the Bare Systems appliance TLS
 /// profile (#379/#392): pure-Zig TLS only, fixed single-identity credential
 /// contract, no OpenSSL linkage.
@@ -3901,14 +3909,14 @@ fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
 
     // Checked before the gate for the same reason as ACME: it is precisely
     // the no-identity case that must not fall through to plaintext.
-    if (cfg.anyClientAuth() and !hasTlsFiles(cfg)) {
+    if (cfg.anyClientAuth() and !usesNativeTls(cfg)) {
         // Without a server identity the listener would serve plaintext, i.e.
         // unauthenticated, despite client verification being demanded.
-        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_CLIENT_VERIFY requires TARDIGRADE_TLS_CERT_PATH and TARDIGRADE_TLS_KEY_PATH", .{});
+        logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_CLIENT_VERIFY requires a native TLS listener (certificate/key files or automatic HTTPS)", .{});
         return error.UnsupportedNativeTlsConfiguration;
     }
 
-    if (!hasTlsFiles(cfg)) return;
+    if (!usesNativeTls(cfg)) return;
 
     if (!std.mem.eql(u8, cfg.tls_min_version, "1.3") or !std.mem.eql(u8, cfg.tls_max_version, "1.3")) {
         logConfigDiagnostic("config validation failed: native-TLS builds are TLS 1.3-only; TARDIGRADE_TLS_MIN_VERSION and TARDIGRADE_TLS_MAX_VERSION must both be \"1.3\"", .{});
@@ -4006,7 +4014,7 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: http3_alt_svc_max_age_seconds must be <= 86400", .{});
         return error.InvalidConfigValue;
     }
-    try validateListenerProtocolPolicy(cfg.http1_enabled, cfg.http2_enabled, hasTlsFiles(cfg), true);
+    try validateListenerProtocolPolicy(cfg.http1_enabled, cfg.http2_enabled, usesNativeTls(cfg), true);
 
     validateAccessControlConfig(cfg.access_control_rules) catch |err| {
         std.log.err("config validation failed: TARDIGRADE_ACCESS_CONTROL contains an invalid rule: {}", .{err});

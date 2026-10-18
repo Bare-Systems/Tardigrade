@@ -14416,6 +14416,154 @@ test "forward_auth responses are never shared-cacheable over h1" {
     try std.testing.expectEqualStrings("no-store", split.header("Cache-Control").?);
 }
 
+test "generic proxy_pass response cache serves a GET hit without a second upstream request, then refetches after expiry (#901)" {
+    const allocator = std.testing.allocator;
+
+    const fresh_for_one_second: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=1" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 200, .body = "generation-one", .headers = fresh_for_one_second },
+        .{ .status_code = 200, .body = "generation-two", .headers = fresh_for_one_second },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /public {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    // First GET: a real MISS, fetched from the origin.
+    var first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/public?a=1", .body = null, .headers = &.{} });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try assertContains(first.body, "generation-one");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    // Second GET, same effective request: a HIT -- no second origin call, and
+    // a correct non-zero Age on the replayed entry.
+    var second = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/public?a=1", .body = null, .headers = &.{} });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 200), second.status_code);
+    try assertContains(second.body, "generation-one");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+    try std.testing.expect(second.header("Age") != null);
+    try std.testing.expectEqualStrings("public, max-age=1", second.header("Cache-Control").?);
+
+    // After the 1-second origin freshness window elapses, the entry is no
+    // longer fresh and a third GET must reach the origin again.
+    compat.sleepNs(1_100 * std.time.ns_per_ms);
+    var third = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/public?a=1", .body = null, .headers = &.{} });
+    defer third.deinit();
+    try std.testing.expectEqual(@as(u16, 200), third.status_code);
+    try assertContains(third.body, "generation-two");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+}
+
+test "generic proxy_pass response cache isolates by query string and never shares Authorization/Set-Cookie responses (#901)" {
+    const allocator = std.testing.allocator;
+
+    const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
+    const fresh_with_cookie: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "Set-Cookie", .value = "sid=abc" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 200, .body = "query-a", .headers = fresh }, // GET /obj?a=1
+        .{ .status_code = 200, .body = "query-b", .headers = fresh }, // GET /obj?a=2
+        .{ .status_code = 200, .body = "auth-1", .headers = fresh }, // GET /obj?a=1 with Authorization
+        .{ .status_code = 200, .body = "auth-2", .headers = fresh }, // GET /obj?a=1 with Authorization (again)
+        .{ .status_code = 200, .body = "cookie-1", .headers = fresh_with_cookie }, // GET /cookie
+        .{ .status_code = 200, .body = "cookie-2", .headers = fresh_with_cookie }, // GET /cookie (again)
+    });
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /obj {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\
+        \\location /cookie {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port(), test_host, origin.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    // Distinct query strings on the same path never share an entry.
+    var a1 = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/obj?a=1", .body = null, .headers = &.{} });
+    defer a1.deinit();
+    try assertContains(a1.body, "query-a");
+    var a2 = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/obj?a=2", .body = null, .headers = &.{} });
+    defer a2.deinit();
+    try assertContains(a2.body, "query-b");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+    // The `a=1` entry is still a HIT behind the `a=2` fill.
+    var a1_again = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/obj?a=1", .body = null, .headers = &.{} });
+    defer a1_again.deinit();
+    try assertContains(a1_again.body, "query-a");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+
+    // A request carrying `Authorization` is never answered from the shared
+    // cache and never fills it: both calls reach the origin.
+    var auth1 = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/obj?a=1",
+        .body = null,
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer whatever" }},
+    });
+    defer auth1.deinit();
+    try assertContains(auth1.body, "auth-1");
+    try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
+    var auth2 = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/obj?a=1",
+        .body = null,
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer whatever" }},
+    });
+    defer auth2.deinit();
+    try assertContains(auth2.body, "auth-2");
+    try std.testing.expectEqual(@as(u32, 4), origin.requestCount());
+
+    // A response carrying `Set-Cookie` is never stored, even though it is
+    // otherwise marked `public, max-age=60`: both calls reach the origin.
+    var cookie1 = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/cookie", .body = null, .headers = &.{} });
+    defer cookie1.deinit();
+    try assertContains(cookie1.body, "cookie-1");
+    try std.testing.expectEqual(@as(u32, 5), origin.requestCount());
+    var cookie2 = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/cookie", .body = null, .headers = &.{} });
+    defer cookie2.deinit();
+    try assertContains(cookie2.body, "cookie-2");
+    try std.testing.expectEqual(@as(u32, 6), origin.requestCount());
+}
+
 test "forward_auth refusals stay no-store despite global CDN cache headers over h1" {
     const allocator = std.testing.allocator;
 

@@ -11,6 +11,7 @@ const edge_config = @import("edge_config.zig");
 const gp = @import("gateway_proxy.zig");
 const gc = @import("gateway_connection.zig");
 const gs = @import("gateway_state.zig");
+const gpc = @import("gateway_proxy_cache.zig");
 
 const GatewayState = gs.GatewayState;
 const WorkerContext = gs.WorkerContext;
@@ -941,6 +942,21 @@ fn applyReloadedRuntimeConfig(
     state.proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds;
     state.proxy_cache_mutex.unlock();
 
+    // #901: wholesale rebuild, same convention as proxy_cache_store above --
+    // simpler and still bounded than trying to generation-tag entries across
+    // a reload that may have changed routing/upstreams/TLS.
+    state.proxy_response_cache_mutex.lock();
+    if (state.proxy_response_cache) |*prc| prc.deinit();
+    state.proxy_response_cache = if (cfg.proxy_cache_ttl_seconds > 0)
+        gpc.ProxyResponseCache.init(state.allocator, .{
+            .max_object_bytes = cfg.proxy_response_cache_max_object_bytes,
+            .max_entries = cfg.proxy_response_cache_max_entries,
+            .max_total_bytes = cfg.proxy_response_cache_max_total_bytes,
+        })
+    else
+        null;
+    state.proxy_response_cache_mutex.unlock();
+
     // HSTS is prepared before any reload mutation and swapped only on the
     // successful commit path, preserving the old value if parsing or allocation
     // failed.
@@ -1090,6 +1106,8 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
     state.proxy_cache_store = null;
     state.proxy_cache_path = "";
     state.proxy_cache_ttl_seconds = 0;
+    state.proxy_response_cache_mutex = .{};
+    state.proxy_response_cache = null;
     state.runtime_mutex = .{};
     // `metricsToPrometheus` (called below) locks this via `muxMetricsSnapshot`
     // — left uninitialized, `.lock()` on garbage memory hangs indefinitely

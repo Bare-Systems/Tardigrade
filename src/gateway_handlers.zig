@@ -13,6 +13,7 @@ const gp = @import("gateway_proxy.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const gpr = @import("gateway_protocols.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
+const gpc = @import("gateway_proxy_cache.zig");
 const gs = @import("gateway_state.zig");
 const tls_core_client_trust = @import("tls_core").client_trust;
 const gstatic = @import("gateway_static_runtime.zig");
@@ -682,6 +683,8 @@ fn initHttp3ProxyTestState(state: *GatewayState, allocator: std.mem.Allocator, a
     state.upstream_active_requests = std.StringHashMap(usize).init(allocator);
     state.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
     state.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+    state.proxy_response_cache_mutex = .{};
+    state.proxy_response_cache = null;
     state.proxy_buffer_limits = .{
         .per_stream_low_watermark = 256 * 1024,
         .per_stream_high_watermark = 768 * 1024,
@@ -2964,6 +2967,41 @@ fn handleHttp3LocationProxyPass(
     /// Request headers after `forward_auth` rewrote them, when it did.
     headers_override: ?*const http.Headers,
 ) !void {
+    // #901: see the matching comment in `gateway_proxy_runtime.handleLocationProxyPass`
+    // (the H1/H2 counterpart); this is the H3 path's own copy because H3
+    // builds its response into `response` rather than writing a stream
+    // directly, so the hit/fill shapes differ even though the eligibility
+    // and freshness rules (`gateway_proxy_cache.zig`) are shared.
+    var response_cache_key: ?[64]u8 = null;
+    if (ctx.cfg.proxy_cache_ttl_seconds > 0) {
+        if (!gpc.isCacheableRequest(ctx.cfg, matched.block, request.method, &request.headers)) {
+            ctx.state.metricsRecordProxyCacheOutcome(.bypass);
+        } else if (ga.shouldBypassProxyCache(&request.headers)) {
+            ctx.state.metricsRecordProxyCacheOutcome(.bypass);
+        } else {
+            var key_buf: [64]u8 = undefined;
+            _ = gpc.buildCacheKey(&key_buf, .{
+                .scheme = if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
+                .host = request.headers.get(":authority") orelse request.headers.get("host") orelse "",
+                .method = request.method,
+                .location_id = matched.block.pattern,
+                .upstream_target = target,
+                .path = request_path,
+                .query = request_query orelse "",
+            });
+            const lookup_now_ms = http.event_loop.monotonicMs();
+            var hit_arena = std.heap.ArenaAllocator.init(allocator);
+            defer hit_arena.deinit();
+            if (try ctx.state.proxyResponseCacheLookup(hit_arena.allocator(), key_buf[0..], lookup_now_ms)) |hit| {
+                ctx.state.metricsRecordProxyCacheOutcome(.hit);
+                try applyHttp3ProxyCacheHit(allocator, response, ctx.state, &hit, correlation_id);
+                return;
+            }
+            ctx.state.metricsRecordProxyCacheOutcome(.miss);
+            response_cache_key = key_buf;
+        }
+    }
+
     const resolved = try resolveProxyTarget(allocator, ctx.cfg.upstream_base_url, target, proxySuffixPathForLocation(request_path, matched, ctx.cfg.location_blocks));
     defer allocator.free(resolved.url);
     var upstream_url = try appendProxyQueryString(allocator, resolved.url, request_query);
@@ -3052,7 +3090,56 @@ fn handleHttp3LocationProxyPass(
         recordHttp3ProxyOutcome(ctx.state, ctx.cfg, ctx.cfg.upstream_base_url, absolute_target, upstream_response.statusCode(), permit);
         attempt_executor.circuit_permit = null;
     }
+    if (response_cache_key) |key_bytes| {
+        const buffered = upstream_response.boundedBufferedForCompatibility();
+        if (buffered.status_code == 200) {
+            if (gpc.responseFreshness(buffered.headers, ctx.cfg.proxy_cache_ttl_seconds)) |freshness| {
+                const put_headers = try allocator.alloc(gpc.CacheHeaderView, buffered.headers.len);
+                defer allocator.free(put_headers);
+                var put_header_count: usize = 0;
+                for (buffered.headers) |h| {
+                    if (std.ascii.eqlIgnoreCase(h.name, "age")) continue;
+                    put_headers[put_header_count] = .{ .name = h.name, .value = h.value };
+                    put_header_count += 1;
+                }
+                ctx.state.proxyResponseCachePut(http.event_loop.monotonicMs(), key_bytes[0..], .{
+                    .status_code = buffered.status_code,
+                    .reason = buffered.reason,
+                    .headers = put_headers[0..put_header_count],
+                    .body = buffered.body,
+                    .ttl_seconds = freshness.ttl_seconds,
+                    .initial_age_seconds = freshness.initial_age_seconds,
+                }) catch {
+                    ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+                };
+            }
+        }
+    }
     try applyHttp3ProxyResponse(allocator, response, ctx.state, &upstream_response, correlation_id);
+}
+
+/// Replays a #901 generic proxy-cache hit the same way `applyHttp3ProxyResponse`
+/// renders a live buffered upstream response, plus a freshly computed `Age`.
+fn applyHttp3ProxyCacheHit(
+    allocator: std.mem.Allocator,
+    response: *http.Response,
+    state: *GatewayState,
+    hit: *const gpc.LookupResult,
+    correlation_id: []const u8,
+) !void {
+    _ = response
+        .setStatus(@enumFromInt(hit.status_code))
+        .setBodyOwned(try allocator.dupe(u8, hit.body))
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    for (hit.headers) |header| {
+        _ = response.setHeader(header.name, header.value);
+    }
+    var age_buf: [20]u8 = undefined;
+    const age_str = std.fmt.bufPrint(&age_buf, "{d}", .{hit.age_seconds}) catch unreachable;
+    _ = response.setHeader("Age", age_str);
+    finalizeHttp3Response(response);
+    applyResponseHeaders(state, response);
+    state.metricsRecord(hit.status_code);
 }
 
 fn handleHttp3StaticLocation(
@@ -6265,6 +6352,7 @@ test {
     _ = @import("gateway_proxy.zig");
     _ = @import("gateway_proxy_runtime.zig");
     _ = @import("gateway_control_plane_proxy.zig");
+    _ = @import("gateway_proxy_cache.zig");
 }
 
 test "H3 handler binds handshake policy to the routing config generation, closing the reload publication window (#763)" {

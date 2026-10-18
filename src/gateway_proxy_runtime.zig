@@ -12,6 +12,8 @@ const gp = @import("gateway_proxy.zig");
 const gpt = @import("gateway_proxy_target.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const gcp = @import("gateway_control_plane_proxy.zig");
+const gpc = @import("gateway_proxy_cache.zig");
+const ga = @import("gateway_auth.zig");
 const gs = @import("gateway_state.zig");
 const gws_tunnel = @import("gateway_websocket_tunnel.zig");
 
@@ -596,6 +598,55 @@ pub fn handleLocationProxyPass(
     defer proxy_temp_arena.deinit();
     const temp_allocator = proxy_temp_arena.allocator();
 
+    // #901: conservative, bounded GET response cache. Runs after every gate
+    // above it (auth/forward_auth/policy already settled this request) and
+    // before any upstream selection, so a hit never touches the upstream
+    // pool/circuit-breaker/retry machinery below at all.
+    var response_cache_key: ?[64]u8 = null;
+    if (cfg.proxy_cache_ttl_seconds > 0) {
+        const cache_method = request.method.toString();
+        if (!gpc.isCacheableRequest(cfg, matched_block, cache_method, &request.headers)) {
+            state.metricsRecordProxyCacheOutcome(.bypass);
+        } else if (ga.shouldBypassProxyCache(&request.headers)) {
+            state.metricsRecordProxyCacheOutcome(.bypass);
+        } else {
+            var key_buf: [64]u8 = undefined;
+            _ = gpc.buildCacheKey(&key_buf, .{
+                .scheme = if (edge_config.hasTlsFiles(cfg)) "https" else "http",
+                .host = incoming_host orelse "",
+                .method = cache_method,
+                .location_id = location_id,
+                .upstream_target = target,
+                .path = request.uri.path,
+                .query = request.uri.query orelse "",
+            });
+            const lookup_now_ms = http.event_loop.monotonicMs();
+            if (try state.proxyResponseCacheLookup(temp_allocator, key_buf[0..], lookup_now_ms)) |hit| {
+                state.metricsRecordProxyCacheOutcome(.hit);
+                const headers_with_age = try temp_allocator.alloc(gpc.CacheHeader, hit.headers.len + 1);
+                @memcpy(headers_with_age[0..hit.headers.len], hit.headers);
+                var age_buf: [20]u8 = undefined;
+                const age_str = std.fmt.bufPrint(&age_buf, "{d}", .{hit.age_seconds}) catch unreachable;
+                headers_with_age[hit.headers.len] = .{
+                    .name = try temp_allocator.dupe(u8, "Age"),
+                    .value = try temp_allocator.dupe(u8, age_str),
+                };
+                const replay = .{
+                    .status_code = hit.status_code,
+                    .reason = hit.reason,
+                    .headers = headers_with_age,
+                    .body = hit.body,
+                };
+                ctx.setUpstreamResult(target, hit.status_code, hit.body.len);
+                try writeBufferedUpstreamResponseWithMetrics(writer, &replay, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, null, &state.metrics, &state.metrics_mutex);
+                state.metricsRecord(hit.status_code);
+                return hit.status_code;
+            }
+            state.metricsRecordProxyCacheOutcome(.miss);
+            response_cache_key = key_buf;
+        }
+    }
+
     var sticky_affinity = try prepareStickyAffinityRequest(
         temp_allocator,
         cfg,
@@ -941,6 +992,31 @@ pub fn handleLocationProxyPass(
     };
     defer upstream_response.deinit(allocator);
     defer state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
+
+    if (response_cache_key) |key_bytes| {
+        const buffered = upstream_response.boundedBufferedForCompatibility();
+        if (buffered.status_code == 200) {
+            if (gpc.responseFreshness(buffered.headers, cfg.proxy_cache_ttl_seconds)) |freshness| {
+                const put_headers = try temp_allocator.alloc(gpc.CacheHeaderView, buffered.headers.len);
+                var put_header_count: usize = 0;
+                for (buffered.headers) |h| {
+                    if (std.ascii.eqlIgnoreCase(h.name, "age")) continue;
+                    put_headers[put_header_count] = .{ .name = h.name, .value = h.value };
+                    put_header_count += 1;
+                }
+                state.proxyResponseCachePut(http.event_loop.monotonicMs(), key_bytes[0..], .{
+                    .status_code = buffered.status_code,
+                    .reason = buffered.reason,
+                    .headers = put_headers[0..put_header_count],
+                    .body = buffered.body,
+                    .ttl_seconds = freshness.ttl_seconds,
+                    .initial_age_seconds = freshness.initial_age_seconds,
+                }) catch {
+                    state.metricsRecordProxyCacheOutcome(.fill_error);
+                };
+            }
+        }
+    }
 
     const transcript_redactions: []const []const u8 = if (request.headers.get("authorization")) |raw_auth|
         if (http.auth.parseBearerToken(raw_auth)) |token| &.{token} else &.{}

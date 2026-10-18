@@ -4,6 +4,7 @@ const secrets = @import("crypto").secrets;
 const http = @import("http.zig");
 const tls_core = @import("tls_core");
 const edge_config = @import("edge_config.zig");
+const gpc = @import("gateway_proxy_cache.zig");
 
 /// Shared inbound request buffer size limit, also used as a default proxy
 /// response buffer ceiling when no explicit limit is configured.
@@ -496,6 +497,9 @@ pub const GatewayState = struct {
     //   rate_limiter_mutex — taken once per request when rate limiting enabled
     //   upstream_mutex     — taken once per proxied request for LB selection
     //   circuit_mutex      — taken once per proxied request when CB enabled
+    //   proxy_response_cache_mutex — taken once (lookup) or twice (lookup
+    //     then fill) per cacheable GET proxy_pass request, only when the
+    //     generic response cache is enabled (#901)
     //
     // WARM-PATH mutexes (taken per connection, not per request on keepalive):
     //   connection_mutex
@@ -522,6 +526,14 @@ pub const GatewayState = struct {
     proxy_cache_store: ?http.idempotency.IdempotencyStore, // owned; rebuilt on reload [proxy_cache_mutex]
     proxy_cache_path: []const u8, // borrowed from cfg; rebound on reload [proxy_cache_mutex]
     proxy_cache_ttl_seconds: u32, // cfg snapshot [proxy_cache_mutex]
+    proxy_response_cache_mutex: compat.Mutex = .{}, // guards proxy_response_cache
+    /// Generic `proxy_pass` GET response cache (#901). Owned; rebuilt wholesale
+    /// on every reload (never generation-tagged: a full rebuild is simpler and
+    /// still bounded). `null` when `cfg.proxy_cache_ttl_seconds == 0`, the same
+    /// disabled-by-default convention as `proxy_cache_store`. Distinct from
+    /// `proxy_cache_store`/`proxy_cache_path` above, which remain the
+    /// control-plane JSON proxy's own (differently-shaped) cache. [proxy_response_cache_mutex]
+    proxy_response_cache: ?gpc.ProxyResponseCache,
     security_headers: http.security_headers.SecurityHeaders, // cfg-derived; re-derived on reload [runtime_mutex]
     /// Owned HSTS header value. Empty when HSTS is disabled or TLS is not
     /// configured. Heap-owned; re-derived (old value freed) on reload. [runtime_mutex]
@@ -646,6 +658,7 @@ pub const GatewayState = struct {
         if (self.rate_limiter) |*rl| rl.deinit();
         if (self.idempotency_store) |*is| is.deinit();
         if (self.proxy_cache_store) |*pc| pc.deinit();
+        if (self.proxy_response_cache) |*prc| prc.deinit();
         if (self.session_store) |*ss| ss.deinit();
         self.upstream_client.deinit();
         if (self.acme_challenge_store) |*store| store.deinit();
@@ -1092,6 +1105,33 @@ pub const GatewayState = struct {
             std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(10), .awake) catch {}; // interrupt wakes are fine; loop continues immediately
         }
         return false;
+    }
+
+    /// #901: generic `proxy_pass` response-cache lookup. Returns a deep copy
+    /// allocated from `scratch` (the caller's request-scoped arena), so the
+    /// mutex here never needs to stay held past this call -- no cache
+    /// operation here crosses network I/O.
+    pub fn proxyResponseCacheLookup(self: *GatewayState, scratch: std.mem.Allocator, key: []const u8, now_ms: u64) !?gpc.LookupResult {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache) |*cache| {
+            return try cache.lookup(scratch, key, now_ms);
+        }
+        return null;
+    }
+
+    /// #901: fills one entry. Fails open: every error (too large, at
+    /// capacity, disabled, or allocation failure) just means the next
+    /// request is a miss too -- the caller already proxied this response
+    /// normally and only needs the error to count a `fill_error` metric.
+    pub fn proxyResponseCachePut(self: *GatewayState, now_ms: u64, key: []const u8, params: gpc.PutParams) !void {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache) |*cache| {
+            try cache.put(now_ms, key, params);
+            return;
+        }
+        return error.ProxyResponseCacheDisabled;
     }
 
     pub fn createSession(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8, client_ip: []const u8, device_id: ?[]const u8) ![]const u8 {
@@ -1843,6 +1883,12 @@ pub const GatewayState = struct {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
         self.metrics.recordProxyStreamingFallback(reason);
+    }
+
+    pub fn metricsRecordProxyCacheOutcome(self: *GatewayState, outcome: http.metrics.ProxyCacheOutcome) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyCacheOutcome(outcome);
     }
 
     pub fn metricsRecordProxyBufferReservation(

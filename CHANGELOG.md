@@ -19,6 +19,28 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **Conservative in-memory `proxy_pass` response caching (#901).** Setting
+  `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` above `0` now turns on a bounded,
+  shared, in-memory GET response cache for the generic reverse-proxy data
+  plane (H1, H2 and H3) -- previously this knob, and the sibling
+  `_PATH`/`_KEY_TEMPLATE`/`_STALE_WHILE_REVALIDATE_SECONDS` config, only fed
+  an unused control-plane helper store with no live reader, so enabling it
+  did nothing for ordinary `proxy_pass` traffic. The cache runs strictly
+  after routing, rewrite, auth/mTLS/`forward_auth`/policy/rate gates (a
+  denial is never answered from a cache); only complete, buffered `GET 200`
+  responses with an explicit origin `max-age`/`s-maxage` are stored, capped
+  by the TTL and by new `TARDIGRADE_PROXY_CACHE_MAX_OBJECT_BYTES`/
+  `_MAX_ENTRIES`/`_MAX_TOTAL_BYTES` limits; `Authorization`/`Cookie`/verified
+  client-certificate requests, `auth required`/`forward_auth`/policy-gated
+  routes, `HEAD`/`Range`/conditional requests, and `Set-Cookie`/`Vary`/
+  `no-store`/`private`/`no-cache` responses all bypass it outright. New
+  `tardigrade_proxy_cache_outcome_total{outcome="hit"|"miss"|"bypass"|"fill_error"}`
+  metric. `TARDIGRADE_PROXY_CACHE_PATH` and
+  `_STALE_WHILE_REVALIDATE_SECONDS` (no disk tier or stale-while-revalidate
+  serving yet) now fail `tardi check`/startup instead of silently doing
+  nothing. See the Support Matrix for the full contract; `Vary`/conditional
+  handling (#902) and a hardened disk tier (#903) are tracked separately.
+
 - **Native H2 `rewrite` support with `forward_auth` parity (#814).** The
   native HTTP/2 route path now runs a bounded effective-route loop for
   location `rewrite` actions, matching H1/H3: every location reached through

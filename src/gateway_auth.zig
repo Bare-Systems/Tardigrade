@@ -143,7 +143,10 @@ fn isJsonContentType(content_type: ?[]const u8) bool {
     return std.mem.find(u8, lower, JSON_CONTENT_TYPE) != null;
 }
 
-fn shouldBypassProxyCache(headers: *const http.Headers) bool {
+/// A client-forced bypass of the shared cache (#901): the request is still
+/// eligible to *fill* the cache for later callers, but this response must be
+/// fetched fresh rather than answered from a stored entry.
+pub fn shouldBypassProxyCache(headers: *const http.Headers) bool {
     if (headers.get("x-proxy-cache-bypass")) |raw| {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         if (std.ascii.eqlIgnoreCase(trimmed, "1") or std.ascii.eqlIgnoreCase(trimmed, "true") or std.ascii.eqlIgnoreCase(trimmed, "yes")) {

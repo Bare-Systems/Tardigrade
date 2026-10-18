@@ -63,6 +63,10 @@ pub const ProxyStreamingFallbackReason = enum {
 /// #761: per-location `forward_auth` subrequest outcomes. Closed enum; the
 /// Prometheus label is the tag name.
 pub const ForwardAuthOutcome = enum { allowed, denied, timeout, unavailable, invalid_response, body_too_large };
+/// #901: generic `proxy_pass` response-cache outcomes. Closed enum; the
+/// Prometheus label is the tag name. `fill_error` is additive to `miss` (a
+/// miss that then failed to store, not a fifth mutually-exclusive outcome).
+pub const ProxyCacheOutcome = enum { hit, miss, bypass, fill_error };
 /// #812: WebSocket upgrade outcomes on `proxy_websocket` locations. Closed
 /// enum; the Prometheus label is the tag name.
 pub const WebSocketUpgradeOutcome = enum {
@@ -281,6 +285,10 @@ pub const Metrics = struct {
     proxy_streaming_fallback_body_dependent_middleware: u64,
     proxy_streaming_fallback_unsupported_route_type: u64,
     proxy_streaming_fallback_early_data_retry_semantics: u64,
+    proxy_cache_hit: u64,
+    proxy_cache_miss: u64,
+    proxy_cache_bypass: u64,
+    proxy_cache_fill_error: u64,
     proxy_ttfb_ms_count: u64,
     proxy_ttfb_ms_sum: u64,
     // Upstream keep-alive connection pool (#141). Populated from the pool's own
@@ -549,6 +557,10 @@ pub const Metrics = struct {
             .proxy_streaming_fallback_body_dependent_middleware = 0,
             .proxy_streaming_fallback_unsupported_route_type = 0,
             .proxy_streaming_fallback_early_data_retry_semantics = 0,
+            .proxy_cache_hit = 0,
+            .proxy_cache_miss = 0,
+            .proxy_cache_bypass = 0,
+            .proxy_cache_fill_error = 0,
             .proxy_ttfb_ms_count = 0,
             .proxy_ttfb_ms_sum = 0,
             .upstream_connections_new = 0,
@@ -1208,6 +1220,18 @@ pub const Metrics = struct {
         }
     }
 
+    /// Exhaustive by construction, same rationale as
+    /// `recordProxyStreamingFallback`: a new `ProxyCacheOutcome` case fails
+    /// to compile here until it has a counter.
+    pub fn recordProxyCacheOutcome(self: *Metrics, outcome: ProxyCacheOutcome) void {
+        switch (outcome) {
+            .hit => self.proxy_cache_hit += 1,
+            .miss => self.proxy_cache_miss += 1,
+            .bypass => self.proxy_cache_bypass += 1,
+            .fill_error => self.proxy_cache_fill_error += 1,
+        }
+    }
+
     fn recordProxyTtfbMs(self: *Metrics, ttfb_ms: u64) void {
         self.proxy_ttfb_ms_count += 1;
         self.proxy_ttfb_ms_sum += ttfb_ms;
@@ -1491,6 +1515,12 @@ pub const Metrics = struct {
             \\tardigrade_proxy_streaming_fallback_total{{reason="body_dependent_middleware"}} {d}
             \\tardigrade_proxy_streaming_fallback_total{{reason="unsupported_route_type"}} {d}
             \\tardigrade_proxy_streaming_fallback_total{{reason="early_data_retry_semantics"}} {d}
+            \\# HELP tardigrade_proxy_cache_outcome_total Total generic proxy_pass response-cache outcomes by result
+            \\# TYPE tardigrade_proxy_cache_outcome_total counter
+            \\tardigrade_proxy_cache_outcome_total{{outcome="hit"}} {d}
+            \\tardigrade_proxy_cache_outcome_total{{outcome="miss"}} {d}
+            \\tardigrade_proxy_cache_outcome_total{{outcome="bypass"}} {d}
+            \\tardigrade_proxy_cache_outcome_total{{outcome="fill_error"}} {d}
             \\# HELP tardigrade_proxy_ttfb_ms Proxied upstream time to first byte in milliseconds
             \\# TYPE tardigrade_proxy_ttfb_ms summary
             \\tardigrade_proxy_ttfb_ms_sum {d}
@@ -1525,6 +1555,10 @@ pub const Metrics = struct {
             self.proxy_streaming_fallback_body_dependent_middleware,
             self.proxy_streaming_fallback_unsupported_route_type,
             self.proxy_streaming_fallback_early_data_retry_semantics,
+            self.proxy_cache_hit,
+            self.proxy_cache_miss,
+            self.proxy_cache_bypass,
+            self.proxy_cache_fill_error,
             self.proxy_ttfb_ms_sum,
             self.proxy_ttfb_ms_count,
             self.upstream_connections_new,
@@ -3423,6 +3457,26 @@ test "Metrics records proxy streaming fallback reasons" {
             &expected_buf,
             "tardigrade_proxy_streaming_fallback_total{{reason=\"{s}\"}} 1",
             .{reason.label()},
+        );
+        try std.testing.expect(std.mem.find(u8, prom, expected) != null);
+    }
+}
+
+test "Metrics records proxy cache outcomes" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+    for (std.enums.values(ProxyCacheOutcome)) |outcome| {
+        m.recordProxyCacheOutcome(outcome);
+    }
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+    for (std.enums.values(ProxyCacheOutcome)) |outcome| {
+        var expected_buf: [96]u8 = undefined;
+        const expected = try std.fmt.bufPrint(
+            &expected_buf,
+            "tardigrade_proxy_cache_outcome_total{{outcome=\"{s}\"}} 1",
+            .{@tagName(outcome)},
         );
         try std.testing.expect(std.mem.find(u8, prom, expected) != null);
     }

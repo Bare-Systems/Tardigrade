@@ -38,6 +38,7 @@ const gconn = @import("gateway_connection.zig");
 const gshutdown = @import("gateway_shutdown.zig");
 const ghandlers = @import("gateway_handlers.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
+const gproxy_cache = @import("gateway_proxy_cache.zig");
 const gprotocol_policy = @import("gateway_protocol_policy.zig");
 const gp = @import("gateway_proxy.zig");
 const gws_tunnel = @import("gateway_websocket_tunnel.zig");
@@ -94,6 +95,14 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             null,
         .proxy_cache_path = cfg.proxy_cache_path,
         .proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds,
+        .proxy_response_cache = if (cfg.proxy_cache_ttl_seconds > 0)
+            gproxy_cache.ProxyResponseCache.init(state_allocator, .{
+                .max_object_bytes = cfg.proxy_response_cache_max_object_bytes,
+                .max_entries = cfg.proxy_response_cache_max_entries,
+                .max_total_bytes = cfg.proxy_response_cache_max_total_bytes,
+            })
+        else
+            null,
         .security_headers = blk: {
             var s = if (cfg.security_headers_enabled)
                 http.security_headers.SecurityHeaders.api
@@ -720,6 +729,18 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             };
             state.logger.info(null, "Proxy cache disk path enabled: {s}", .{cfg.proxy_cache_path});
         }
+    }
+    if (state.proxy_response_cache != null) {
+        state.logger.info(
+            null,
+            "Generic proxy_pass response cache enabled (conservative in-memory GET-only, #901): TTL {d}s max_object_bytes={d} max_entries={d} max_total_bytes={d}",
+            .{
+                cfg.proxy_cache_ttl_seconds,
+                cfg.proxy_response_cache_max_object_bytes,
+                cfg.proxy_response_cache_max_entries,
+                cfg.proxy_response_cache_max_total_bytes,
+            },
+        );
     }
     if (state.session_store != null) {
         state.logger.info(null, "Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });

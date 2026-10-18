@@ -3140,6 +3140,12 @@ fn handleHttp3LocationProxyPass(
 
 /// Replays a #901 generic proxy-cache hit the same way `applyHttp3ProxyResponse`
 /// renders a live buffered upstream response, plus a freshly computed `Age`.
+fn copyHttp3CacheReplayBody(allocator: std.mem.Allocator, hit: *const gpc.LookupResult) ![]u8 {
+    // Do this before mutating `response`: a cache-only OOM must leave the
+    // caller free to dispatch the live upstream response instead.
+    return allocator.dupe(u8, hit.body);
+}
+
 fn applyHttp3ProxyCacheHit(
     allocator: std.mem.Allocator,
     response: *http.Response,
@@ -3147,9 +3153,11 @@ fn applyHttp3ProxyCacheHit(
     hit: *const gpc.LookupResult,
     correlation_id: []const u8,
 ) !void {
+    const body = try copyHttp3CacheReplayBody(allocator, hit);
+    errdefer allocator.free(body);
     _ = response
         .setStatus(@enumFromInt(hit.status_code))
-        .setBodyOwned(try allocator.dupe(u8, hit.body))
+        .setBodyOwned(body)
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
     for (hit.headers) |header| {
         _ = response.setHeader(header.name, header.value);
@@ -3160,6 +3168,20 @@ fn applyHttp3ProxyCacheHit(
     finalizeHttp3Response(response);
     applyResponseHeaders(state, response);
     state.metricsRecord(hit.status_code);
+}
+
+test "H3 cache replay copies its body before mutating a response" {
+    var reason = [_]u8{ 'O', 'K' };
+    var body = [_]u8{ 'c', 'a', 'c', 'h', 'e', 'd' };
+    const hit = gpc.LookupResult{
+        .status_code = 200,
+        .reason = &reason,
+        .headers = &.{},
+        .body = &body,
+        .age_seconds = 1,
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, copyHttp3CacheReplayBody(failing.allocator(), &hit));
 }
 
 fn handleHttp3StaticLocation(

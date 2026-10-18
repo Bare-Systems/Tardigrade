@@ -40,6 +40,38 @@ const writeBufferedUpstreamResponseWithMetrics = gp.writeBufferedUpstreamRespons
 
 pub const StreamingRequestBody = gp.StreamingRequestBody;
 
+/// Cache-hit metadata is prepared before the H1 writer observes any part of a
+/// response.  Keeping this optional work in one fallible helper makes the
+/// fail-open boundary explicit: callers can discard an allocation failure and
+/// proceed with the normal live upstream request.
+pub const Http1CacheReplay = struct {
+    headers: []gp.UpstreamHeader,
+
+    pub fn deinit(self: *Http1CacheReplay, allocator: std.mem.Allocator) void {
+        const age_header = self.headers[self.headers.len - 1];
+        allocator.free(@constCast(age_header.name));
+        allocator.free(@constCast(age_header.value));
+        allocator.free(self.headers);
+        self.* = undefined;
+    }
+};
+
+pub fn prepareHttp1CacheReplay(allocator: std.mem.Allocator, hit: *const gpc.LookupResult) !Http1CacheReplay {
+    const headers = try allocator.alloc(gp.UpstreamHeader, hit.headers.len + 1);
+    errdefer allocator.free(headers);
+    for (hit.headers, 0..) |header, idx| {
+        headers[idx] = .{ .name = header.name, .value = header.value };
+    }
+    var age_buf: [20]u8 = undefined;
+    const age_str = std.fmt.bufPrint(&age_buf, "{d}", .{hit.age_seconds}) catch unreachable;
+    const owned_age_name = try allocator.dupe(u8, "Age");
+    errdefer allocator.free(owned_age_name);
+    const owned_age = try allocator.dupe(u8, age_str);
+    errdefer allocator.free(owned_age);
+    headers[hit.headers.len] = .{ .name = owned_age_name, .value = owned_age };
+    return .{ .headers = headers };
+}
+
 /// Best-effort cache fill shared by H1/H2-style and H3 proxy paths. Every
 /// allocation is deliberately inside this fallible helper so a cache-only OOM
 /// leaves the already-complete live upstream response deliverable.
@@ -96,6 +128,26 @@ pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
         => false,
         else => true,
     };
+}
+
+test "H1 cache replay preparation fails before any cached response is written" {
+    var reason = [_]u8{ 'O', 'K' };
+    var header_name = [_]u8{ 'X', '-', 'T', 'e', 's', 't' };
+    var header_value = [_]u8{'v'};
+    var body = [_]u8{ 'c', 'a', 'c', 'h', 'e', 'd' };
+    var headers = [_]gpc.CacheHeader{.{ .name = &header_name, .value = &header_value }};
+    const hit = gpc.LookupResult{
+        .status_code = 200,
+        .reason = &reason,
+        .headers = &headers,
+        .body = &body,
+        .age_seconds = 1,
+    };
+
+    // Every replay allocation is cache-only. The caller catches this error
+    // before invoking its writer, leaving the live proxy path available.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, prepareHttp1CacheReplay(failing.allocator(), &hit));
 }
 
 pub const UpstreamErrorResponse = struct {
@@ -693,28 +745,15 @@ pub fn handleLocationProxyPass(
                 // leave the live upstream path available instead of turning
                 // an otherwise healthy request into an OOM response.
                 replay: {
-                    const headers_with_age = temp_allocator.alloc(gp.UpstreamHeader, hit.headers.len + 1) catch {
+                    var prepared = prepareHttp1CacheReplay(temp_allocator, &hit) catch {
                         state.metricsRecordProxyCacheOutcome(.fill_error);
                         break :replay;
                     };
-                    for (hit.headers, 0..) |header, idx| {
-                        headers_with_age[idx] = .{ .name = header.name, .value = header.value };
-                    }
-                    var age_buf: [20]u8 = undefined;
-                    const age_str = std.fmt.bufPrint(&age_buf, "{d}", .{hit.age_seconds}) catch unreachable;
-                    const owned_age_name = temp_allocator.dupe(u8, "Age") catch {
-                        state.metricsRecordProxyCacheOutcome(.fill_error);
-                        break :replay;
-                    };
-                    const owned_age = temp_allocator.dupe(u8, age_str) catch {
-                        state.metricsRecordProxyCacheOutcome(.fill_error);
-                        break :replay;
-                    };
-                    headers_with_age[hit.headers.len] = .{ .name = owned_age_name, .value = owned_age };
+                    defer prepared.deinit(temp_allocator);
                     const replay = .{
                         .status_code = hit.status_code,
                         .reason = hit.reason,
-                        .headers = headers_with_age,
+                        .headers = prepared.headers,
                         .body = hit.body,
                     };
                     state.metricsRecordProxyCacheOutcome(.hit);

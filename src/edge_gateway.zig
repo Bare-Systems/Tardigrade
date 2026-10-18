@@ -5018,6 +5018,23 @@ fn http2CachedProxyResponse(
     };
 }
 
+test "H2 cached replay conversion is fallible before route completion" {
+    var reason = [_]u8{ 'O', 'K' };
+    var header_name = [_]u8{ 'X', '-', 'T', 'e', 's', 't' };
+    var header_value = [_]u8{'v'};
+    var body = [_]u8{ 'c', 'a', 'c', 'h', 'e', 'd' };
+    var headers = [_]gproxy_cache.CacheHeader{.{ .name = &header_name, .value = &header_value }};
+    const hit = gproxy_cache.LookupResult{
+        .status_code = 200,
+        .reason = &reason,
+        .headers = &headers,
+        .body = &body,
+        .age_seconds = 1,
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, http2CachedProxyResponse(failing.allocator(), &hit));
+}
+
 const Http2LocalRejection = struct {
     status_code: u16,
     code: []const u8,

@@ -225,6 +225,7 @@ const RequestCapture = struct {
     headers_raw: []u8,
     path_history: std.array_list.Managed([]u8),
     body_history: std.array_list.Managed([]u8),
+    headers_history: std.array_list.Managed([]u8),
     request_count: u32,
 
     fn init(allocator: std.mem.Allocator) !RequestCapture {
@@ -237,6 +238,7 @@ const RequestCapture = struct {
             .headers_raw = try allocator.dupe(u8, ""),
             .path_history = std.array_list.Managed([]u8).init(allocator),
             .body_history = std.array_list.Managed([]u8).init(allocator),
+            .headers_history = std.array_list.Managed([]u8).init(allocator),
             .request_count = 0,
         };
     }
@@ -251,6 +253,8 @@ const RequestCapture = struct {
         self.path_history.deinit();
         for (self.body_history.items) |body| self.allocator.free(body);
         self.body_history.deinit();
+        for (self.headers_history.items) |headers| self.allocator.free(headers);
+        self.headers_history.deinit();
         self.* = undefined;
     }
 
@@ -264,6 +268,8 @@ const RequestCapture = struct {
         self.path_history.clearRetainingCapacity();
         for (self.body_history.items) |body| self.allocator.free(body);
         self.body_history.clearRetainingCapacity();
+        for (self.headers_history.items) |headers| self.allocator.free(headers);
+        self.headers_history.clearRetainingCapacity();
         self.method = try self.allocator.dupe(u8, "");
         self.path = try self.allocator.dupe(u8, "");
         self.body = try self.allocator.dupe(u8, "");
@@ -287,6 +293,7 @@ const RequestCapture = struct {
         try self.body_history.append(try self.allocator.dupe(u8, message.body));
         self.correlation_id = try self.allocator.dupe(u8, headerValue(message.headers_raw, "X-Correlation-ID") orelse "");
         self.headers_raw = try self.allocator.dupe(u8, message.headers_raw);
+        try self.headers_history.append(try self.allocator.dupe(u8, message.headers_raw));
         self.request_count += 1;
     }
 };
@@ -493,6 +500,14 @@ const UpstreamServer = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return headerValue(self.capture.headers_raw, name);
+    }
+
+    fn capturedHeaderHistoryAt(self: *UpstreamServer, allocator: std.mem.Allocator, name: []const u8, index: usize) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (index >= self.capture.headers_history.items.len) return null;
+        const value = headerValue(self.capture.headers_history.items[index], name) orelse return null;
+        return @as(?[]u8, try allocator.dupe(u8, value));
     }
 
     fn capturedPath(self: *UpstreamServer, allocator: std.mem.Allocator) ![]u8 {
@@ -1046,6 +1061,98 @@ fn gatedUpstreamThreadMain(server: *GatedUpstream) void {
             continue;
         };
     }
+}
+
+/// A two-request variant of `GatedUpstream` used to prove that two cache
+/// misses were both live at the origin before either is allowed to fill.  The
+/// listening thread dispatches each connection to its own handler; a serial
+/// fixture would itself prevent the condition this test is meant to establish.
+const TwoArrivalGatedUpstream = struct {
+    allocator: std.mem.Allocator,
+    server: compat.NetServer,
+    accept_thread: ?std.Thread,
+    worker_threads: [2]?std.Thread = .{ null, null },
+    stop_flag: std.atomic.Value(bool),
+    release_flag: std.atomic.Value(bool),
+    arrivals: std.atomic.Value(u32),
+
+    fn start(allocator: std.mem.Allocator) !TwoArrivalGatedUpstream {
+        return .{
+            .allocator = allocator,
+            .server = try compat.listenTcp(test_host, 0),
+            .accept_thread = null,
+            .stop_flag = std.atomic.Value(bool).init(false),
+            .release_flag = std.atomic.Value(bool).init(false),
+            .arrivals = std.atomic.Value(u32).init(0),
+        };
+    }
+
+    fn port(self: *const TwoArrivalGatedUpstream) u16 {
+        return self.server.port();
+    }
+
+    fn run(self: *TwoArrivalGatedUpstream) !void {
+        self.accept_thread = try std.Thread.spawn(.{}, twoArrivalGatedAcceptMain, .{self});
+    }
+
+    fn stop(self: *TwoArrivalGatedUpstream) void {
+        self.stop_flag.store(true, .seq_cst);
+        self.release_flag.store(true, .seq_cst);
+        wakeListener(self.port());
+        if (self.accept_thread) |thread| thread.join();
+        for (self.worker_threads) |thread| if (thread) |worker| worker.join();
+        self.server.deinit();
+        self.* = undefined;
+    }
+
+    fn waitForArrivals(self: *const TwoArrivalGatedUpstream, expected: u32, timeout_ms: u64) !void {
+        const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (compat.milliTimestamp() < deadline) {
+            if (self.arrivals.load(.acquire) >= expected) return;
+            compat.sleepNs(2 * std.time.ns_per_ms);
+        }
+        return error.GatedUpstreamNotEntered;
+    }
+
+    fn release(self: *TwoArrivalGatedUpstream) void {
+        self.release_flag.store(true, .release);
+    }
+};
+
+fn twoArrivalGatedAcceptMain(server: *TwoArrivalGatedUpstream) void {
+    var index: usize = 0;
+    while (index < server.worker_threads.len and !server.stop_flag.load(.seq_cst)) {
+        const conn = server.server.accept() catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("two-arrival gated upstream accept failed: {}\n", .{err});
+            continue;
+        };
+        server.worker_threads[index] = std.Thread.spawn(.{}, twoArrivalGatedConnectionMain, .{ server, conn, index }) catch {
+            conn.stream.close();
+            return;
+        };
+        index += 1;
+    }
+}
+
+fn twoArrivalGatedConnectionMain(server: *TwoArrivalGatedUpstream, conn: compat.NetConnection, index: usize) void {
+    defer conn.stream.close();
+    const req = readHttpMessage(server.allocator, conn.stream, 1024 * 1024) catch return;
+    defer server.allocator.free(req.raw);
+    if (req.request_line.len == 0) return;
+
+    _ = server.arrivals.fetchAdd(1, .release);
+    while (!server.release_flag.load(.acquire)) {
+        if (server.stop_flag.load(.seq_cst)) return;
+        compat.sleepNs(2 * std.time.ns_per_ms);
+    }
+    if (server.stop_flag.load(.seq_cst)) return;
+
+    const body = if (index == 0) "first-live" else "second-live";
+    var out = std.array_list.Managed(u8).init(server.allocator);
+    defer out.deinit();
+    out.print("HTTP/1.1 200 OK\r\nCache-Control: public, max-age=60\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
+    conn.stream.writeAll(out.items) catch {};
 }
 
 /// #520: drives one real native TLS H1 request against `port`'s `/race`
@@ -14906,9 +15013,9 @@ test "generic proxy response cache bypasses valid session identities (#901)" {
 
     const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
     var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "anonymous-origin", .headers = fresh },
         .{ .body = "alice-origin", .headers = fresh },
         .{ .body = "bob-origin", .headers = fresh },
-        .{ .body = "anonymous-origin", .headers = fresh },
     });
     defer origin.stop();
     try origin.run();
@@ -14934,6 +15041,11 @@ test "generic proxy response cache bypasses valid session identities (#901)" {
     });
     defer tardigrade.stop();
 
+    // Seed the one representation this route may share. Valid sessions must
+    // bypass it, while a later anonymous request proves it was left intact.
+    var anonymous_seed = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/identity", .body = null, .headers = &.{} });
+    defer anonymous_seed.deinit();
+    try assertContains(anonymous_seed.body, "anonymous-origin");
     var alice = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/identity", .body = null, .headers = &.{.{ .name = "X-Session-Token", .value = session_a }} });
     defer alice.deinit();
     try assertContains(alice.body, "alice-origin");
@@ -14944,19 +15056,25 @@ test "generic proxy response cache bypasses valid session identities (#901)" {
     defer anonymous.deinit();
     try assertContains(anonymous.body, "anonymous-origin");
     try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
+    try std.testing.expect(anonymous.header("Age") != null);
+
+    const anonymous_identity = try origin.capturedHeaderHistoryAt(allocator, "X-Tardigrade-Auth-Identity", 0);
+    defer if (anonymous_identity) |value| allocator.free(value);
+    try std.testing.expect(anonymous_identity == null);
+    const alice_identity = (try origin.capturedHeaderHistoryAt(allocator, "X-Tardigrade-Auth-Identity", 1)) orelse return error.MissingAssertedIdentity;
+    defer allocator.free(alice_identity);
+    try std.testing.expectEqualStrings("alice", alice_identity);
+    const bob_identity = (try origin.capturedHeaderHistoryAt(allocator, "X-Tardigrade-Auth-Identity", 2)) orelse return error.MissingAssertedIdentity;
+    defer allocator.free(bob_identity);
+    try std.testing.expectEqualStrings("bob", bob_identity);
 }
 
 test "generic proxy response cache keeps concurrent misses independent (#901)" {
     const allocator = std.testing.allocator;
-    const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
-    // The first request remains at the origin while the second worker reaches
-    // the same cache key. Both must retain their live response ownership;
-    // only a later request may use the resulting bounded entry.
-    var origin = try UpstreamServer.start(allocator, &.{
-        .{ .body = "first-live", .headers = fresh, .delay_ms = 500 },
-        .{ .body = "second-live", .headers = fresh },
-        .{ .body = "must-not-run", .headers = fresh },
-    });
+    // This fixture does not release either response until both requests have
+    // arrived, making two live misses an observed condition rather than a
+    // scheduling-dependent consequence of a fixed sleep.
+    var origin = try TwoArrivalGatedUpstream.start(std.heap.page_allocator);
     defer origin.stop();
     try origin.run();
     const config_text = try std.fmt.allocPrint(allocator,
@@ -14997,14 +15115,25 @@ test "generic proxy response cache keeps concurrent misses independent (#901)" {
         }
     };
     var first = Result{};
-    const first_thread = try std.Thread.spawn(.{}, Result.run, .{ &first, tardigrade.port });
-    // `requestCount == 1` means the first cache miss has escaped the gateway
-    // and is held at the origin before the second client begins.
-    try waitForUpstreamCount(&origin, 1, 5_000);
+    var first_thread: ?std.Thread = null;
+    var second_thread: ?std.Thread = null;
+    defer {
+        // Do not leave a test worker parked at the origin if any assertion or
+        // bounded wait above fails before the normal release/join sequence.
+        origin.release();
+        if (first_thread) |thread| thread.join();
+        if (second_thread) |thread| thread.join();
+    }
+    first_thread = try std.Thread.spawn(.{}, Result.run, .{ &first, tardigrade.port });
+    try origin.waitForArrivals(1, 5_000);
     var second = Result{};
-    const second_thread = try std.Thread.spawn(.{}, Result.run, .{ &second, tardigrade.port });
-    first_thread.join();
-    second_thread.join();
+    second_thread = try std.Thread.spawn(.{}, Result.run, .{ &second, tardigrade.port });
+    try origin.waitForArrivals(2, 5_000);
+    origin.release();
+    first_thread.?.join();
+    first_thread = null;
+    second_thread.?.join();
+    second_thread = null;
     if (first.err) |err| return err;
     if (second.err) |err| return err;
     var first_response = first.response orelse return error.InvalidHttpResponse;
@@ -15013,13 +15142,13 @@ test "generic proxy response cache keeps concurrent misses independent (#901)" {
     defer second_response.deinit();
     try assertContains(first_response.body, "first-live");
     try assertContains(second_response.body, "second-live");
-    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+    try std.testing.expectEqual(@as(u32, 2), origin.arrivals.load(.acquire));
 
     var cached = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/same", .body = null, .headers = &.{} });
     defer cached.deinit();
     try std.testing.expect(cached.header("Age") != null);
     try std.testing.expect(std.mem.indexOf(u8, cached.body, "first-live") != null or std.mem.indexOf(u8, cached.body, "second-live") != null);
-    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+    try std.testing.expectEqual(@as(u32, 2), origin.arrivals.load(.acquire));
 }
 
 test "generic proxy response cache never fills from a truncated origin response (#901)" {

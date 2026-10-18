@@ -633,6 +633,19 @@ pub fn handleLocationProxyPass(
     defer proxy_temp_arena.deinit();
     const temp_allocator = proxy_temp_arena.allocator();
 
+    // Sticky affinity chooses an upstream and can mint a gateway-owned cookie.
+    // C1 does not partition or replay either, so establish applicability
+    // before considering a cache lookup and bypass the cache wholesale.
+    var sticky_affinity = try prepareStickyAffinityRequest(
+        temp_allocator,
+        cfg,
+        upstream_pool,
+        &request.headers,
+        incoming_host,
+        location_id,
+        target,
+    );
+
     // #901: conservative, bounded GET response cache. Runs after every gate
     // above it (auth/forward_auth/policy already settled this request) and
     // before any upstream selection, so a hit never touches the upstream
@@ -647,8 +660,8 @@ pub fn handleLocationProxyPass(
             &request.headers,
             if (request.body) |body| body.len != 0 else false,
             streaming_request_body != null,
-            encountered_identity_gate,
-        )) {
+            encountered_identity_gate or ctx.authenticated or ctx.identity != null,
+        ) or sticky_affinity != null) {
             state.metricsRecordProxyCacheOutcome(.bypass);
         } else if (ga.shouldBypassProxyCache(&request.headers)) {
             state.metricsRecordProxyCacheOutcome(.bypass);
@@ -698,16 +711,6 @@ pub fn handleLocationProxyPass(
             response_cache_key = key_buf;
         }
     }
-
-    var sticky_affinity = try prepareStickyAffinityRequest(
-        temp_allocator,
-        cfg,
-        upstream_pool,
-        &request.headers,
-        incoming_host,
-        location_id,
-        target,
-    );
 
     const upstream_hash_key = if (suffix_path) |suffix| suffix else target;
     const selection: StickyUpstreamSelection = if (sticky_affinity) |*value|

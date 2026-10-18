@@ -3234,7 +3234,7 @@ fn stickyCookieSecret(cfg: *const edge_config.EdgeConfig) []const u8 {
     return "";
 }
 
-fn stickyAffinityEligible(cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, proxy_pass_target: []const u8) bool {
+pub fn stickyAffinityEligible(cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, proxy_pass_target: []const u8) bool {
     if (stickyCookieSecret(cfg).len == 0) return false;
     if (isAbsoluteHttpUrl(std.mem.trim(u8, proxy_pass_target, " \t\r\n"))) return false;
 

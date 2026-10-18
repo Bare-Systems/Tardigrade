@@ -2996,8 +2996,8 @@ fn handleHttp3LocationProxyPass(
             &request.headers,
             request.body.len != 0,
             false,
-            encountered_identity_gate,
-        )) {
+            encountered_identity_gate or ctx.authenticated or ctx.identity != null,
+        ) or gs.stickyAffinityEligible(ctx.cfg, gs.upstreamPoolForScope(ctx.cfg, .global), target)) {
             ctx.state.metricsRecordProxyCacheOutcome(.bypass);
         } else if (ga.shouldBypassProxyCache(&request.headers)) {
             ctx.state.metricsRecordProxyCacheOutcome(.bypass);

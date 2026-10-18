@@ -266,8 +266,9 @@ pub fn buildCacheKey(out: *[64]u8, parts: KeyParts) []const u8 {
 
 /// Request-side eligibility: conservative by construction (#901 contract).
 /// Any personalization signal -- built-in auth, `forward_auth`, a verified
-/// client certificate, a configured policy table, or a client-supplied
-/// `Authorization`/`Cookie` -- disqualifies the request outright rather than
+/// client certificate, a configured policy table, an already-authenticated
+/// request context, or a client-supplied `Authorization`/`Cookie` --
+/// disqualifies the request outright rather than
 /// trying to partition the cache by identity. Conditional/`Range` requests
 /// are also excluded: C1 has no validator or partial-content story.
 pub fn isCacheableRequest(
@@ -290,6 +291,9 @@ pub fn isCacheableRequest(
     }
     // The final location may be public even though an earlier rewrite hop
     // authenticated the caller and asserted origin-facing identity headers.
+    // A session/bearer identity can be established before location routing,
+    // so route-gate history alone is not sufficient here. Callers fold the
+    // request context's authenticated/identity state into this flag.
     if (encountered_identity_gate) return false;
     if (block.auth != .off) return false;
     if (block.forward_auth != null) return false;
@@ -298,6 +302,10 @@ pub fn isCacheableRequest(
     if (cfg.policy_rules_raw.len > 0 or cfg.policy_approval_routes_raw.len > 0) return false;
     if (headers.get("authorization") != null) return false;
     if (headers.get("cookie") != null) return false;
+    // `X-Session-Token` is consumed before routing and becomes an asserted
+    // upstream identity header. Reject it even if validation failed or a
+    // caller did not have a context to report.
+    if (headers.get("x-session-token") != null) return false;
     if (headers.get("range") != null) return false;
     if (headers.get("if-range") != null) return false;
     if (headers.get("if-match") != null) return false;
@@ -383,6 +391,13 @@ test "isCacheableRequest accepts a plain GET and refuses personalized signals" {
     headers = http.Headers.init(std.testing.allocator);
 
     try headers.append("Cookie", "a=b");
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+
+    // Session authentication is established before location routing and its
+    // asserted identity is origin-facing, so it can never use a shared key.
+    try headers.append("X-Session-Token", "opaque-session-token");
     try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
     headers.deinit();
     headers = http.Headers.init(std.testing.allocator);

@@ -275,8 +275,22 @@ pub fn isCacheableRequest(
     block: *const edge_config.EdgeConfig.LocationBlock,
     method: []const u8,
     headers: *const http.Headers,
+    request_has_body: bool,
+    streaming_request_body: bool,
+    encountered_identity_gate: bool,
 ) bool {
     if (!std.mem.eql(u8, method, "GET")) return false;
+    // C1 deliberately has no request-body cache key. A bodyful (or not-yet
+    // materialized streaming) GET must therefore always reach the origin.
+    if (request_has_body or streaming_request_body) return false;
+    if (headers.get("transfer-encoding") != null) return false;
+    if (headers.get("content-length")) |raw_length| {
+        const content_length = std.fmt.parseInt(usize, std.mem.trim(u8, raw_length, " \t"), 10) catch return false;
+        if (content_length != 0) return false;
+    }
+    // The final location may be public even though an earlier rewrite hop
+    // authenticated the caller and asserted origin-facing identity headers.
+    if (encountered_identity_gate) return false;
     if (block.auth != .off) return false;
     if (block.forward_auth != null) return false;
     if (!block.client_cert.isEmpty()) return false;
@@ -324,9 +338,12 @@ pub fn responseFreshness(headers: anytype, ceiling_seconds: u32) ?Freshness {
         var it = std.mem.splitScalar(u8, h.value, ',');
         while (it.next()) |raw_tok| {
             const tok = std.mem.trim(u8, raw_tok, " \t");
-            if (std.ascii.eqlIgnoreCase(tok, "no-store") or
-                std.ascii.eqlIgnoreCase(tok, "private") or
-                std.ascii.eqlIgnoreCase(tok, "no-cache")) return null;
+            const directive_name = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, tok, '=')) |eq| tok[0..eq] else tok, " \t");
+            // C1 does not strip named fields or implement field-qualified
+            // validation, so every form of these directives is unsafe.
+            if (std.ascii.eqlIgnoreCase(directive_name, "no-store") or
+                std.ascii.eqlIgnoreCase(directive_name, "private") or
+                std.ascii.eqlIgnoreCase(directive_name, "no-cache")) return null;
             if (std.ascii.startsWithIgnoreCase(tok, "s-maxage=")) {
                 s_maxage = std.fmt.parseInt(u32, std.mem.trim(u8, tok["s-maxage=".len..], " \t"), 10) catch null;
             } else if (std.ascii.startsWithIgnoreCase(tok, "max-age=")) {
@@ -356,25 +373,25 @@ test "isCacheableRequest accepts a plain GET and refuses personalized signals" {
 
     var headers = http.Headers.init(std.testing.allocator);
     defer headers.deinit();
-    try std.testing.expect(isCacheableRequest(&cfg, &block, "GET", &headers));
-    try std.testing.expect(!isCacheableRequest(&cfg, &block, "POST", &headers));
-    try std.testing.expect(!isCacheableRequest(&cfg, &block, "HEAD", &headers));
+    try std.testing.expect(isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "POST", &headers, false, false, false));
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "HEAD", &headers, false, false, false));
 
     try headers.append("Authorization", "Bearer x");
-    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers));
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
     headers.deinit();
     headers = http.Headers.init(std.testing.allocator);
 
     try headers.append("Cookie", "a=b");
-    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers));
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
     headers.deinit();
     headers = http.Headers.init(std.testing.allocator);
 
     try headers.append("Range", "bytes=0-10");
-    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers));
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
 
     block.auth = .required;
-    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &http.Headers.init(std.testing.allocator)));
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &http.Headers.init(std.testing.allocator), false, false, false));
 }
 
 test "isCacheableRequest refuses forward_auth, client-cert policy, client identity and route policy" {
@@ -391,7 +408,7 @@ test "isCacheableRequest refuses forward_auth, client-cert policy, client identi
         .action = .{ .proxy_pass = "http://127.0.0.1:1" },
         .forward_auth = .{ .url = "http://127.0.0.1:1/verify" },
     };
-    try std.testing.expect(!isCacheableRequest(&cfg, &fa_block, "GET", &empty_headers));
+    try std.testing.expect(!isCacheableRequest(&cfg, &fa_block, "GET", &empty_headers, false, false, false));
 
     var cert_block = edge_config.EdgeConfig.LocationBlock{
         .match_type = .prefix,
@@ -400,7 +417,7 @@ test "isCacheableRequest refuses forward_auth, client-cert policy, client identi
         .action = .{ .proxy_pass = "http://127.0.0.1:1" },
         .client_cert = .{ .required = true },
     };
-    try std.testing.expect(!isCacheableRequest(&cfg, &cert_block, "GET", &empty_headers));
+    try std.testing.expect(!isCacheableRequest(&cfg, &cert_block, "GET", &empty_headers, false, false, false));
 
     var plain_block = edge_config.EdgeConfig.LocationBlock{
         .match_type = .prefix,
@@ -411,10 +428,29 @@ test "isCacheableRequest refuses forward_auth, client-cert policy, client identi
     var identified_headers = http.Headers.init(std.testing.allocator);
     defer identified_headers.deinit();
     identified_headers.client_cert = .{ .fingerprint_sha256 = "ab" ** 32, .subject = "CN=alice" };
-    try std.testing.expect(!isCacheableRequest(&cfg, &plain_block, "GET", &identified_headers));
+    try std.testing.expect(!isCacheableRequest(&cfg, &plain_block, "GET", &identified_headers, false, false, false));
 
     cfg.policy_rules_raw = "GET|^/$|read|false||";
-    try std.testing.expect(!isCacheableRequest(&cfg, &plain_block, "GET", &empty_headers));
+    try std.testing.expect(!isCacheableRequest(&cfg, &plain_block, "GET", &empty_headers, false, false, false));
+}
+
+test "isCacheableRequest refuses bodyful, framed, streamed, and gated GETs" {
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.policy_rules_raw = "";
+    cfg.policy_approval_routes_raw = "";
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+    };
+    var headers = http.Headers.init(std.testing.allocator);
+    defer headers.deinit();
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, true, false, false));
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, true, false));
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, true));
+    try headers.append("Content-Length", "1");
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
 }
 
 const TestHeader = struct { name: []const u8, value: []const u8 };
@@ -440,6 +476,13 @@ test "responseFreshness requires explicit max-age, caps by ceiling and honors Ag
     }, 300));
     try std.testing.expectEqual(@as(?Freshness, null), responseFreshness(&[_]TestHeader{
         .{ .name = "Cache-Control", .value = "private, max-age=60" },
+    }, 300));
+    try std.testing.expectEqual(@as(?Freshness, null), responseFreshness(&[_]TestHeader{
+        .{ .name = "Cache-Control", .value = "max-age=60, private=\"Authorization\"" },
+    }, 300));
+    try std.testing.expectEqual(@as(?Freshness, null), responseFreshness(&[_]TestHeader{
+        .{ .name = "Cache-Control", .value = "max-age=60" },
+        .{ .name = "Cache-Control", .value = "no-cache=\"X-Secret\"" },
     }, 300));
     try std.testing.expectEqual(Freshness{ .ttl_seconds = 10, .initial_age_seconds = 0 }, responseFreshness(&[_]TestHeader{
         .{ .name = "Cache-Control", .value = "max-age=60, s-maxage=10" },

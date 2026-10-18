@@ -841,11 +841,22 @@ pub fn routeRequest(
             // location, or fall into the static root, around its gates.
             var matched = first_match;
             var hops: usize = 1;
+            // Cache eligibility is about the entire effective route, not only
+            // the final proxy location. A prior gate can assert an
+            // origin-facing identity header that a later public location would
+            // otherwise accidentally share.
+            var encountered_identity_gate = false;
             // Set when a rewrite lands back in the same location: its gates
             // must be re-run for the rewritten target, but its rewrite action
             // must not run again.
             var gate_only = false;
             while (true) {
+                encountered_identity_gate = encountered_identity_gate or
+                    matched.block.auth != .off or
+                    matched.block.forward_auth != null or
+                    !matched.block.client_cert.isEmpty() or
+                    cfg.policy_rules_raw.len > 0 or
+                    cfg.policy_approval_routes_raw.len > 0;
                 // Refusals on this hop must not carry an earlier hop's grants.
                 http.security_headers.clearRequestScope();
                 // Built-in auth checks the caller's own credentials, never an
@@ -929,6 +940,7 @@ pub fn routeRequest(
                 keep_alive,
                 client_ip,
                 streaming_request_body,
+                encountered_identity_gate,
             )) |status| {
                 return .{ .status = status, .mirror_allowed = !websocket_attempt };
             }
@@ -1269,6 +1281,7 @@ fn executeLocationAction(
     keep_alive: *bool,
     client_ip: []const u8,
     streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
+    encountered_identity_gate: bool,
 ) !?u16 {
     const writer = conn.writer();
     switch (matched.block.action) {
@@ -1303,6 +1316,7 @@ fn executeLocationAction(
                 matched.block.pattern,
                 matched.block,
                 streaming_request_body,
+                encountered_identity_gate,
                 &downstream_broken,
             );
             if (downstream_broken) keep_alive.* = false;
@@ -2966,6 +2980,7 @@ fn handleHttp3LocationProxyPass(
     forward_early_data: bool,
     /// Request headers after `forward_auth` rewrote them, when it did.
     headers_override: ?*const http.Headers,
+    encountered_identity_gate: bool,
 ) !void {
     // #901: see the matching comment in `gateway_proxy_runtime.handleLocationProxyPass`
     // (the H1/H2 counterpart); this is the H3 path's own copy because H3
@@ -2974,7 +2989,15 @@ fn handleHttp3LocationProxyPass(
     // and freshness rules (`gateway_proxy_cache.zig`) are shared.
     var response_cache_key: ?[64]u8 = null;
     if (ctx.cfg.proxy_cache_ttl_seconds > 0) {
-        if (!gpc.isCacheableRequest(ctx.cfg, matched.block, request.method, &request.headers)) {
+        if (!gpc.isCacheableRequest(
+            ctx.cfg,
+            matched.block,
+            request.method,
+            &request.headers,
+            request.body.len != 0,
+            false,
+            encountered_identity_gate,
+        )) {
             ctx.state.metricsRecordProxyCacheOutcome(.bypass);
         } else if (ga.shouldBypassProxyCache(&request.headers)) {
             ctx.state.metricsRecordProxyCacheOutcome(.bypass);
@@ -2992,7 +3015,14 @@ fn handleHttp3LocationProxyPass(
             const lookup_now_ms = http.event_loop.monotonicMs();
             var hit_arena = std.heap.ArenaAllocator.init(allocator);
             defer hit_arena.deinit();
-            if (try ctx.state.proxyResponseCacheLookup(hit_arena.allocator(), key_buf[0..], lookup_now_ms)) |hit| {
+            const cache_generation = if (ctx.cfg_lease) |lease| lease.version.generation else 0;
+            const cache_hit = blk: {
+                break :blk ctx.state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, key_buf[0..], lookup_now_ms) catch {
+                    ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+                    break :blk null;
+                };
+            };
+            if (cache_hit) |hit| {
                 ctx.state.metricsRecordProxyCacheOutcome(.hit);
                 try applyHttp3ProxyCacheHit(allocator, response, ctx.state, &hit, correlation_id);
                 return;
@@ -3092,28 +3122,10 @@ fn handleHttp3LocationProxyPass(
     }
     if (response_cache_key) |key_bytes| {
         const buffered = upstream_response.boundedBufferedForCompatibility();
-        if (buffered.status_code == 200) {
-            if (gpc.responseFreshness(buffered.headers, ctx.cfg.proxy_cache_ttl_seconds)) |freshness| {
-                const put_headers = try allocator.alloc(gpc.CacheHeaderView, buffered.headers.len);
-                defer allocator.free(put_headers);
-                var put_header_count: usize = 0;
-                for (buffered.headers) |h| {
-                    if (std.ascii.eqlIgnoreCase(h.name, "age")) continue;
-                    put_headers[put_header_count] = .{ .name = h.name, .value = h.value };
-                    put_header_count += 1;
-                }
-                ctx.state.proxyResponseCachePut(http.event_loop.monotonicMs(), key_bytes[0..], .{
-                    .status_code = buffered.status_code,
-                    .reason = buffered.reason,
-                    .headers = put_headers[0..put_header_count],
-                    .body = buffered.body,
-                    .ttl_seconds = freshness.ttl_seconds,
-                    .initial_age_seconds = freshness.initial_age_seconds,
-                }) catch {
-                    ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
-                };
-            }
-        }
+        const cache_generation = if (ctx.cfg_lease) |lease| lease.version.generation else 0;
+        gproxy_runtime.tryFillResponseCache(allocator, ctx.state, cache_generation, ctx.cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered) catch {
+            ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+        };
     }
     try applyHttp3ProxyResponse(allocator, response, ctx.state, &upstream_response, correlation_id);
 }
@@ -3814,6 +3826,9 @@ const Http3RouteState = struct {
     /// Set when a rewrite lands back in the same location: re-run its gates
     /// for the rewritten target, then fall back without re-running its action.
     gate_only: bool = false,
+    /// Sticky across rewrite hops: a verified gate or assertion on any hop
+    /// makes the request ineligible for the generic shared response cache.
+    encountered_identity_gate: bool = false,
 
     fn init(request: *const http.http3_session.StreamRequest) Http3RouteState {
         const path, const query = splitHttp3PathAndQuery(request.path);
@@ -3926,6 +3941,13 @@ fn routeHttp3Hop(
         .reload_status, .metrics, .unmatched => return .not_handled,
     };
 
+    route.encountered_identity_gate = route.encountered_identity_gate or
+        matched.block.auth != .off or
+        matched.block.forward_auth != null or
+        !matched.block.client_cert.isEmpty() or
+        ctx.cfg.policy_rules_raw.len > 0 or
+        ctx.cfg.policy_approval_routes_raw.len > 0;
+
     if (matched.block.auth == .required and !ctx.authenticated) {
         route.grants.clear();
         try rejectHttp3AuthRequiredLocation(allocator, response, ctx, correlation_id);
@@ -3947,7 +3969,7 @@ fn routeHttp3Hop(
         if (allowed) |grant| try route.grants.add(allocator, grant);
     }
     if (route.gate_only) return .not_handled;
-    return executeHttp3LocationAction(allocator, request, response, ctx, matched, request_path, route.query, correlation_id, &early_ctx, forward_early_data, if (route.headers) |*headers| headers else null);
+    return executeHttp3LocationAction(allocator, request, response, ctx, matched, request_path, route.query, correlation_id, &early_ctx, forward_early_data, if (route.headers) |*headers| headers else null, route.encountered_identity_gate);
 }
 
 fn executeHttp3LocationAction(
@@ -3962,10 +3984,11 @@ fn executeHttp3LocationAction(
     early_ctx: *http.request_context.EarlyDataContext,
     forward_early_data: bool,
     forward_auth_headers: ?*const http.Headers,
+    encountered_identity_gate: bool,
 ) !Http3LocationOutcome {
     switch (matched.block.action) {
         .proxy_pass => |target| {
-            try handleHttp3LocationProxyPass(allocator, request, response, ctx, matched, request_path, request_query, target, correlation_id, early_ctx, forward_early_data, forward_auth_headers);
+            try handleHttp3LocationProxyPass(allocator, request, response, ctx, matched, request_path, request_query, target, correlation_id, early_ctx, forward_early_data, forward_auth_headers, encountered_identity_gate);
             return .handled;
         },
         .return_response => |ret| {

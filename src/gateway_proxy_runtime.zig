@@ -40,6 +40,37 @@ const writeBufferedUpstreamResponseWithMetrics = gp.writeBufferedUpstreamRespons
 
 pub const StreamingRequestBody = gp.StreamingRequestBody;
 
+/// Best-effort cache fill shared by H1/H2-style and H3 proxy paths. Every
+/// allocation is deliberately inside this fallible helper so a cache-only OOM
+/// leaves the already-complete live upstream response deliverable.
+pub fn tryFillResponseCache(
+    scratch: std.mem.Allocator,
+    state: *GatewayState,
+    generation: u64,
+    ttl_ceiling_seconds: u32,
+    key: []const u8,
+    buffered: *const BufferedUpstreamResponse,
+) !void {
+    if (buffered.status_code != 200) return;
+    const freshness = gpc.responseFreshness(buffered.headers, ttl_ceiling_seconds) orelse return;
+    const put_headers = try scratch.alloc(gpc.CacheHeaderView, buffered.headers.len);
+    defer scratch.free(put_headers);
+    var put_header_count: usize = 0;
+    for (buffered.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "age")) continue;
+        put_headers[put_header_count] = .{ .name = h.name, .value = h.value };
+        put_header_count += 1;
+    }
+    try state.proxyResponseCachePut(http.event_loop.monotonicMs(), generation, key, .{
+        .status_code = buffered.status_code,
+        .reason = buffered.reason,
+        .headers = put_headers[0..put_header_count],
+        .body = buffered.body,
+        .ttl_seconds = freshness.ttl_seconds,
+        .initial_age_seconds = freshness.initial_age_seconds,
+    });
+}
+
 pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
     return switch (err) {
         error.OutOfMemory,
@@ -580,6 +611,10 @@ pub fn handleLocationProxyPass(
     location_id: []const u8,
     matched_block: *const edge_config.EdgeConfig.LocationBlock,
     streaming_request_body: ?StreamingRequestBody,
+    /// True when any route hop before the effective proxy location evaluated
+    /// an identity-bearing gate (auth, forward_auth, client certificate, or
+    /// policy). Such a request must never use the shared cache.
+    encountered_identity_gate: bool,
     /// Set true when a streaming upstream failure happened after the
     /// downstream response head was already committed to `writer` -- the
     /// caller must force the connection closed (never keep it alive for a
@@ -605,7 +640,15 @@ pub fn handleLocationProxyPass(
     var response_cache_key: ?[64]u8 = null;
     if (cfg.proxy_cache_ttl_seconds > 0) {
         const cache_method = request.method.toString();
-        if (!gpc.isCacheableRequest(cfg, matched_block, cache_method, &request.headers)) {
+        if (!gpc.isCacheableRequest(
+            cfg,
+            matched_block,
+            cache_method,
+            &request.headers,
+            if (request.body) |body| body.len != 0 else false,
+            streaming_request_body != null,
+            encountered_identity_gate,
+        )) {
             state.metricsRecordProxyCacheOutcome(.bypass);
         } else if (ga.shouldBypassProxyCache(&request.headers)) {
             state.metricsRecordProxyCacheOutcome(.bypass);
@@ -621,7 +664,16 @@ pub fn handleLocationProxyPass(
                 .query = request.uri.query orelse "",
             });
             const lookup_now_ms = http.event_loop.monotonicMs();
-            if (try state.proxyResponseCacheLookup(temp_allocator, key_buf[0..], lookup_now_ms)) |hit| {
+            const cache_hit = blk: {
+                break :blk state.proxyResponseCacheLookup(temp_allocator, ctx.config_generation, key_buf[0..], lookup_now_ms) catch {
+                    // The cache is an optimization: scratch allocation or an
+                    // internal cache error must not turn a live proxy request
+                    // into a gateway error.
+                    state.metricsRecordProxyCacheOutcome(.fill_error);
+                    break :blk null;
+                };
+            };
+            if (cache_hit) |hit| {
                 state.metricsRecordProxyCacheOutcome(.hit);
                 const headers_with_age = try temp_allocator.alloc(gpc.CacheHeader, hit.headers.len + 1);
                 @memcpy(headers_with_age[0..hit.headers.len], hit.headers);
@@ -995,27 +1047,9 @@ pub fn handleLocationProxyPass(
 
     if (response_cache_key) |key_bytes| {
         const buffered = upstream_response.boundedBufferedForCompatibility();
-        if (buffered.status_code == 200) {
-            if (gpc.responseFreshness(buffered.headers, cfg.proxy_cache_ttl_seconds)) |freshness| {
-                const put_headers = try temp_allocator.alloc(gpc.CacheHeaderView, buffered.headers.len);
-                var put_header_count: usize = 0;
-                for (buffered.headers) |h| {
-                    if (std.ascii.eqlIgnoreCase(h.name, "age")) continue;
-                    put_headers[put_header_count] = .{ .name = h.name, .value = h.value };
-                    put_header_count += 1;
-                }
-                state.proxyResponseCachePut(http.event_loop.monotonicMs(), key_bytes[0..], .{
-                    .status_code = buffered.status_code,
-                    .reason = buffered.reason,
-                    .headers = put_headers[0..put_header_count],
-                    .body = buffered.body,
-                    .ttl_seconds = freshness.ttl_seconds,
-                    .initial_age_seconds = freshness.initial_age_seconds,
-                }) catch {
-                    state.metricsRecordProxyCacheOutcome(.fill_error);
-                };
-            }
-        }
+        tryFillResponseCache(temp_allocator, state, ctx.config_generation, cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered) catch {
+            state.metricsRecordProxyCacheOutcome(.fill_error);
+        };
     }
 
     const transcript_redactions: []const []const u8 = if (request.headers.get("authorization")) |raw_auth|

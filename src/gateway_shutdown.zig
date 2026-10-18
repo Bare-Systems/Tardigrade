@@ -440,7 +440,7 @@ pub fn hotReloadConfig(
         }
     }
 
-    applyReloadedRuntimeConfig(cfg_ptr, state, &prepared_security);
+    applyReloadedRuntimeConfig(cfg_ptr, prepared_version.generation, state, &prepared_security);
     // Transfer ACL ownership to the generation it belongs to BEFORE publishing
     // that generation, so no lease can ever observe the new config without its
     // matching ACL.
@@ -911,6 +911,7 @@ test "applianceCredentialConfigChanged rejects plaintext-to-TLS and TLS-to-plain
 
 fn applyReloadedRuntimeConfig(
     cfg: *const edge_config.EdgeConfig,
+    cache_generation: u64,
     state: *GatewayState,
     prepared_security: *PreparedReloadSecurity,
 ) void {
@@ -955,6 +956,10 @@ fn applyReloadedRuntimeConfig(
         })
     else
         null;
+    // Publish the new cache epoch in the same critical section as the swap.
+    // A response still running on an older config lease can neither read nor
+    // fill this cache after the lock is released.
+    state.proxy_response_cache_generation = cache_generation;
     state.proxy_response_cache_mutex.unlock();
 
     // HSTS is prepared before any reload mutation and swapped only on the
@@ -1152,7 +1157,7 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
     cfg.access_control_rules = try allocator.dupe(u8, "deny 203.0.113.0/24");
     var prepared_security = try PreparedReloadSecurity.init(allocator, &cfg);
     defer prepared_security.deinit(allocator);
-    applyReloadedRuntimeConfig(&cfg, &state, &prepared_security);
+    applyReloadedRuntimeConfig(&cfg, 2, &state, &prepared_security);
     defer if (state.hsts_value.len > 0) allocator.free(state.hsts_value);
 
     // The ACL now belongs to the configuration version rather than to

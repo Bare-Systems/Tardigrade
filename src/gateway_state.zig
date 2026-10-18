@@ -526,14 +526,16 @@ pub const GatewayState = struct {
     proxy_cache_store: ?http.idempotency.IdempotencyStore, // owned; rebuilt on reload [proxy_cache_mutex]
     proxy_cache_path: []const u8, // borrowed from cfg; rebound on reload [proxy_cache_mutex]
     proxy_cache_ttl_seconds: u32, // cfg snapshot [proxy_cache_mutex]
-    proxy_response_cache_mutex: compat.Mutex = .{}, // guards proxy_response_cache
-    /// Generic `proxy_pass` GET response cache (#901). Owned; rebuilt wholesale
-    /// on every reload (never generation-tagged: a full rebuild is simpler and
-    /// still bounded). `null` when `cfg.proxy_cache_ttl_seconds == 0`, the same
+    proxy_response_cache_mutex: compat.Mutex = .{}, // guards proxy_response_cache + proxy_response_cache_generation
+    /// Generic `proxy_pass` GET response cache (#901). Owned and rebuilt on
+    /// every reload. The generation binds entries to the config lease that
+    /// created them, excluding old in-flight fills after a reload.
+    /// `null` when `cfg.proxy_cache_ttl_seconds == 0`, the same
     /// disabled-by-default convention as `proxy_cache_store`. Distinct from
     /// `proxy_cache_store`/`proxy_cache_path` above, which remain the
     /// control-plane JSON proxy's own (differently-shaped) cache. [proxy_response_cache_mutex]
     proxy_response_cache: ?gpc.ProxyResponseCache,
+    proxy_response_cache_generation: u64 = 0,
     security_headers: http.security_headers.SecurityHeaders, // cfg-derived; re-derived on reload [runtime_mutex]
     /// Owned HSTS header value. Empty when HSTS is disabled or TLS is not
     /// configured. Heap-owned; re-derived (old value freed) on reload. [runtime_mutex]
@@ -1111,9 +1113,10 @@ pub const GatewayState = struct {
     /// allocated from `scratch` (the caller's request-scoped arena), so the
     /// mutex here never needs to stay held past this call -- no cache
     /// operation here crosses network I/O.
-    pub fn proxyResponseCacheLookup(self: *GatewayState, scratch: std.mem.Allocator, key: []const u8, now_ms: u64) !?gpc.LookupResult {
+    pub fn proxyResponseCacheLookup(self: *GatewayState, scratch: std.mem.Allocator, generation: u64, key: []const u8, now_ms: u64) !?gpc.LookupResult {
         self.proxy_response_cache_mutex.lock();
         defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache_generation != generation) return null;
         if (self.proxy_response_cache) |*cache| {
             return try cache.lookup(scratch, key, now_ms);
         }
@@ -1124,14 +1127,42 @@ pub const GatewayState = struct {
     /// capacity, disabled, or allocation failure) just means the next
     /// request is a miss too -- the caller already proxied this response
     /// normally and only needs the error to count a `fill_error` metric.
-    pub fn proxyResponseCachePut(self: *GatewayState, now_ms: u64, key: []const u8, params: gpc.PutParams) !void {
+    pub fn proxyResponseCachePut(self: *GatewayState, now_ms: u64, generation: u64, key: []const u8, params: gpc.PutParams) !void {
         self.proxy_response_cache_mutex.lock();
         defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache_generation != generation) return error.ProxyResponseCacheGenerationMismatch;
         if (self.proxy_response_cache) |*cache| {
             try cache.put(now_ms, key, params);
             return;
         }
         return error.ProxyResponseCacheDisabled;
+    }
+
+    test "proxy response cache rejects a different config generation" {
+        var state: GatewayState = undefined;
+        state.allocator = std.testing.allocator;
+        state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
+            .max_object_bytes = 4096,
+            .max_entries = 4,
+            .max_total_bytes = 16 * 1024,
+        });
+        state.proxy_response_cache_generation = 7;
+        defer state.proxy_response_cache.?.deinit();
+
+        const params = gpc.PutParams{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &.{.{ .name = "Cache-Control", .value = "max-age=60" }},
+            .body = "old-generation",
+            .ttl_seconds = 60,
+        };
+        try state.proxyResponseCachePut(1_000, 7, "key", params);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 8, "key", 1_001)) == null);
+        try std.testing.expectError(error.ProxyResponseCacheGenerationMismatch, state.proxyResponseCachePut(1_001, 8, "key-2", params));
+        try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 7, "key", 1_001)) != null);
     }
 
     pub fn createSession(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8, client_ip: []const u8, device_id: ?[]const u8) ![]const u8 {

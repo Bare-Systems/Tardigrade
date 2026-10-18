@@ -103,6 +103,7 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             })
         else
             null,
+        .proxy_response_cache_generation = 1,
         .security_headers = blk: {
             var s = if (cfg.security_headers_enabled)
                 http.security_headers.SecurityHeaders.api
@@ -6734,6 +6735,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // consumes them, as the first tunnel bytes (#812).
     ctx.downstream_buffered_input = pending_buf[pending_start..][0..session.pending_len];
     ctx.config_superseded_at = config_superseded_at;
+    ctx.config_generation = if (config_lease) |lease| lease.version.generation else 0;
     ctx.response_stream_config_lease = if (config_lease) |lease| @ptrCast(lease) else null;
     ctx.tunnel_handoff_allowed = tunnel_handoff_out != null;
     errdefer if (ctx.tunnel_handoff) |raw| {

@@ -7,6 +7,7 @@ __pycache__/
 /test_cwd
 /test_fs
 dist/
+.playwright-cli/
 
 # Secrets and environment files — never commit these
 .DS_Store

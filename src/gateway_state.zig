@@ -4,6 +4,7 @@ const secrets = @import("crypto").secrets;
 const http = @import("http.zig");
 const tls_core = @import("tls_core");
 const edge_config = @import("edge_config.zig");
+const gpc = @import("gateway_proxy_cache.zig");
 
 /// Shared inbound request buffer size limit, also used as a default proxy
 /// response buffer ceiling when no explicit limit is configured.
@@ -496,6 +497,9 @@ pub const GatewayState = struct {
     //   rate_limiter_mutex — taken once per request when rate limiting enabled
     //   upstream_mutex     — taken once per proxied request for LB selection
     //   circuit_mutex      — taken once per proxied request when CB enabled
+    //   proxy_response_cache_mutex — taken once (lookup) or twice (lookup
+    //     then fill) per cacheable GET proxy_pass request, only when the
+    //     generic response cache is enabled (#901)
     //
     // WARM-PATH mutexes (taken per connection, not per request on keepalive):
     //   connection_mutex
@@ -522,6 +526,16 @@ pub const GatewayState = struct {
     proxy_cache_store: ?http.idempotency.IdempotencyStore, // owned; rebuilt on reload [proxy_cache_mutex]
     proxy_cache_path: []const u8, // borrowed from cfg; rebound on reload [proxy_cache_mutex]
     proxy_cache_ttl_seconds: u32, // cfg snapshot [proxy_cache_mutex]
+    proxy_response_cache_mutex: compat.Mutex = .{}, // guards proxy_response_cache + proxy_response_cache_generation
+    /// Generic `proxy_pass` GET response cache (#901). Owned and rebuilt on
+    /// every reload. The generation binds entries to the config lease that
+    /// created them, excluding old in-flight fills after a reload.
+    /// `null` when `cfg.proxy_cache_ttl_seconds == 0`, the same
+    /// disabled-by-default convention as `proxy_cache_store`. Distinct from
+    /// `proxy_cache_store`/`proxy_cache_path` above, which remain the
+    /// control-plane JSON proxy's own (differently-shaped) cache. [proxy_response_cache_mutex]
+    proxy_response_cache: ?gpc.ProxyResponseCache,
+    proxy_response_cache_generation: u64 = 0,
     security_headers: http.security_headers.SecurityHeaders, // cfg-derived; re-derived on reload [runtime_mutex]
     /// Owned HSTS header value. Empty when HSTS is disabled or TLS is not
     /// configured. Heap-owned; re-derived (old value freed) on reload. [runtime_mutex]
@@ -646,6 +660,7 @@ pub const GatewayState = struct {
         if (self.rate_limiter) |*rl| rl.deinit();
         if (self.idempotency_store) |*is| is.deinit();
         if (self.proxy_cache_store) |*pc| pc.deinit();
+        if (self.proxy_response_cache) |*prc| prc.deinit();
         if (self.session_store) |*ss| ss.deinit();
         self.upstream_client.deinit();
         if (self.acme_challenge_store) |*store| store.deinit();
@@ -1092,6 +1107,107 @@ pub const GatewayState = struct {
             std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(10), .awake) catch {}; // interrupt wakes are fine; loop continues immediately
         }
         return false;
+    }
+
+    /// #901: generic `proxy_pass` response-cache lookup. Returns a deep copy
+    /// allocated from `scratch` (the caller's request-scoped arena), so the
+    /// mutex here never needs to stay held past this call -- no cache
+    /// operation here crosses network I/O.
+    pub fn proxyResponseCacheLookup(self: *GatewayState, scratch: std.mem.Allocator, generation: u64, key: []const u8, now_ms: u64) !?gpc.LookupResult {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache_generation != generation) return null;
+        if (self.proxy_response_cache) |*cache| {
+            return try cache.lookup(scratch, key, now_ms);
+        }
+        return null;
+    }
+
+    /// #901: fills one entry. Fails open: every error (too large, at
+    /// capacity, disabled, or allocation failure) just means the next
+    /// request is a miss too -- the caller already proxied this response
+    /// normally and only needs the error to count a `fill_error` metric.
+    pub fn proxyResponseCachePut(self: *GatewayState, now_ms: u64, generation: u64, key: []const u8, params: gpc.PutParams) !void {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache_generation != generation) return error.ProxyResponseCacheGenerationMismatch;
+        if (self.proxy_response_cache) |*cache| {
+            try cache.put(now_ms, key, params);
+            return;
+        }
+        return error.ProxyResponseCacheDisabled;
+    }
+
+    test "proxy response cache rejects a different config generation" {
+        var state: GatewayState = undefined;
+        state.allocator = std.testing.allocator;
+        state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
+            .max_object_bytes = 4096,
+            .max_entries = 4,
+            .max_total_bytes = 16 * 1024,
+        });
+        state.proxy_response_cache_generation = 7;
+        defer state.proxy_response_cache.?.deinit();
+
+        const params = gpc.PutParams{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &.{.{ .name = "Cache-Control", .value = "max-age=60" }},
+            .body = "old-generation",
+            .ttl_seconds = 60,
+        };
+        try state.proxyResponseCachePut(1_000, 7, "key", params);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 8, "key", 1_001)) == null);
+        try std.testing.expectError(error.ProxyResponseCacheGenerationMismatch, state.proxyResponseCachePut(1_001, 8, "key-2", params));
+        try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 7, "key", 1_001)) != null);
+    }
+
+    test "proxy response cache serializes racing fills without exceeding its cap" {
+        // Two origin responses can complete at nearly the same instant.  The
+        // gateway lock must make this a one-entry store rather than a
+        // check-then-insert race that transiently exceeds the configured cap.
+        var state: GatewayState = undefined;
+        state.allocator = std.testing.allocator;
+        state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
+            .max_object_bytes = 1024,
+            .max_entries = 1,
+            .max_total_bytes = 1024,
+        });
+        state.proxy_response_cache_generation = 9;
+        defer state.proxy_response_cache.?.deinit();
+
+        const Fill = struct {
+            fn run(target: *GatewayState, body: []const u8) void {
+                target.proxyResponseCachePut(1_000, 9, "same-key", .{
+                    .status_code = 200,
+                    .reason = "OK",
+                    .headers = &.{},
+                    .body = body,
+                    .ttl_seconds = 60,
+                }) catch {};
+            }
+        };
+        const first = try std.Thread.spawn(.{}, Fill.run, .{ &state, "first-response" });
+        const second = try std.Thread.spawn(.{}, Fill.run, .{ &state, "second-response" });
+        first.join();
+        second.join();
+
+        {
+            state.proxy_response_cache_mutex.lock();
+            defer state.proxy_response_cache_mutex.unlock();
+            const cache = &state.proxy_response_cache.?;
+            try std.testing.expectEqual(@as(usize, 1), cache.map.count());
+            try std.testing.expect(cache.total_bytes <= cache.limits.max_total_bytes);
+        }
+
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const hit = (try state.proxyResponseCacheLookup(arena.allocator(), 9, "same-key", 1_001)).?;
+        try std.testing.expect(std.mem.eql(u8, hit.body, "first-response") or std.mem.eql(u8, hit.body, "second-response"));
     }
 
     pub fn createSession(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8, client_ip: []const u8, device_id: ?[]const u8) ![]const u8 {
@@ -1843,6 +1959,12 @@ pub const GatewayState = struct {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
         self.metrics.recordProxyStreamingFallback(reason);
+    }
+
+    pub fn metricsRecordProxyCacheOutcome(self: *GatewayState, outcome: http.metrics.ProxyCacheOutcome) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyCacheOutcome(outcome);
     }
 
     pub fn metricsRecordProxyBufferReservation(
@@ -3157,7 +3279,7 @@ fn stickyCookieSecret(cfg: *const edge_config.EdgeConfig) []const u8 {
     return "";
 }
 
-fn stickyAffinityEligible(cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, proxy_pass_target: []const u8) bool {
+pub fn stickyAffinityEligible(cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, proxy_pass_target: []const u8) bool {
     if (stickyCookieSecret(cfg).len == 0) return false;
     if (isAbsoluteHttpUrl(std.mem.trim(u8, proxy_pass_target, " \t\r\n"))) return false;
 
@@ -3169,6 +3291,57 @@ fn stickyAffinityEligible(cfg: *const edge_config.EdgeConfig, pool: UpstreamPool
     var upstreams: usize = pool.primary_urls.len + pool.backup_urls.len;
     if (upstreams == 0 and pool.fallback_url.len > 0) upstreams = 1;
     return upstreams > 1;
+}
+
+/// C1 cache entries are keyed by a stable effective origin. A relative
+/// `proxy_pass` backed by a pool can choose a different primary, backup, or
+/// discovery result per request, so it cannot safely use the generic cache
+/// until selection is made part of its key. Keep the cache conservative and
+/// bypass those routes rather than selecting twice or replaying one member's
+/// representation for another member.
+pub fn proxyResponseCacheHasDynamicUpstream(cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, proxy_pass_target: []const u8) bool {
+    if (isAbsoluteHttpUrl(std.mem.trim(u8, proxy_pass_target, " \t\r\n"))) return false;
+    if (pool.primary_urls.len > 1 or pool.backup_urls.len > 0) return true;
+    return pool.primary_urls.len == 0 and (cfg.upstream_srv_name.len > 0 or cfg.upstream_dns_discovery_host.len > 0);
+}
+
+test "proxy response cache bypasses dynamic relative upstream pools" {
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    const one = [_][]const u8{"http://one.example"};
+    const two = [_][]const u8{ "http://one.example", "http://two.example" };
+    const backup = [_][]const u8{"http://backup.example"};
+
+    try std.testing.expect(!proxyResponseCacheHasDynamicUpstream(&cfg, .{
+        .fallback_url = one[0],
+        .primary_urls = &one,
+        .primary_weights = &.{},
+        .backup_urls = &.{},
+    }, "/api"));
+    try std.testing.expect(proxyResponseCacheHasDynamicUpstream(&cfg, .{
+        .fallback_url = one[0],
+        .primary_urls = &two,
+        .primary_weights = &.{},
+        .backup_urls = &.{},
+    }, "/api"));
+    try std.testing.expect(proxyResponseCacheHasDynamicUpstream(&cfg, .{
+        .fallback_url = one[0],
+        .primary_urls = &one,
+        .primary_weights = &.{},
+        .backup_urls = &backup,
+    }, "/api"));
+    cfg.upstream_dns_discovery_host = "origin.example";
+    try std.testing.expect(proxyResponseCacheHasDynamicUpstream(&cfg, .{
+        .fallback_url = one[0],
+        .primary_urls = &.{},
+        .primary_weights = &.{},
+        .backup_urls = &.{},
+    }, "/api"));
+    try std.testing.expect(!proxyResponseCacheHasDynamicUpstream(&cfg, .{
+        .fallback_url = one[0],
+        .primary_urls = &two,
+        .primary_weights = &.{},
+        .backup_urls = &.{},
+    }, "http://fixed.example/api"));
 }
 
 pub fn prepareStickyAffinityRequest(

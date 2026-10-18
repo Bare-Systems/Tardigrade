@@ -434,6 +434,14 @@ pub const EdgeConfig = struct {
     proxy_cache_lock_timeout_ms: u32,
     /// Proxy cache manager maintenance interval in milliseconds.
     proxy_cache_manager_interval_ms: u64,
+    /// Generic `proxy_pass` response-cache per-object byte cap (#901). Caps
+    /// the accounted size (body + headers + overhead) of any one entry;
+    /// larger responses bypass the cache rather than being truncated.
+    proxy_response_cache_max_object_bytes: usize,
+    /// Generic `proxy_pass` response-cache entry-count cap (#901).
+    proxy_response_cache_max_entries: usize,
+    /// Generic `proxy_pass` response-cache aggregate resident-byte cap (#901).
+    proxy_response_cache_max_total_bytes: usize,
     /// Optional comma-separated ISO country codes to block (requires external country header input).
     geo_blocked_countries: [][]const u8,
     /// Header containing country code provided by external edge/CDN.
@@ -1302,6 +1310,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const proxy_cache_manager_interval_ms_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS", "30000") catch unreachable;
     defer allocator.free(proxy_cache_manager_interval_ms_str);
     const proxy_cache_manager_interval_ms = std.fmt.parseInt(u64, proxy_cache_manager_interval_ms_str, 10) catch 30_000;
+    const proxy_response_cache_max_object_bytes_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_MAX_OBJECT_BYTES", "2097152") catch unreachable;
+    defer allocator.free(proxy_response_cache_max_object_bytes_str);
+    const proxy_response_cache_max_object_bytes = std.fmt.parseInt(usize, proxy_response_cache_max_object_bytes_str, 10) catch 2 * 1024 * 1024;
+    const proxy_response_cache_max_entries_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_MAX_ENTRIES", "10000") catch unreachable;
+    defer allocator.free(proxy_response_cache_max_entries_str);
+    const proxy_response_cache_max_entries = std.fmt.parseInt(usize, proxy_response_cache_max_entries_str, 10) catch 10_000;
+    const proxy_response_cache_max_total_bytes_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_MAX_TOTAL_BYTES", "67108864") catch unreachable;
+    defer allocator.free(proxy_response_cache_max_total_bytes_str);
+    const proxy_response_cache_max_total_bytes = std.fmt.parseInt(usize, proxy_response_cache_max_total_bytes_str, 10) catch 64 * 1024 * 1024;
     const geo_blocked_countries_raw = envOrDefault(allocator, "TARDIGRADE_GEO_BLOCKED_COUNTRIES", "") catch unreachable;
     defer allocator.free(geo_blocked_countries_raw);
     const geo_blocked_countries = try parseCsvValues(allocator, geo_blocked_countries_raw);
@@ -1938,6 +1955,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .proxy_cache_stale_while_revalidate_seconds = proxy_cache_stale_while_revalidate_seconds,
         .proxy_cache_lock_timeout_ms = proxy_cache_lock_timeout_ms,
         .proxy_cache_manager_interval_ms = proxy_cache_manager_interval_ms,
+        .proxy_response_cache_max_object_bytes = proxy_response_cache_max_object_bytes,
+        .proxy_response_cache_max_entries = proxy_response_cache_max_entries,
+        .proxy_response_cache_max_total_bytes = proxy_response_cache_max_total_bytes,
         .geo_blocked_countries = geo_blocked_countries,
         .geo_country_header = geo_country_header,
         .add_headers = add_headers,
@@ -3974,6 +3994,31 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: TARDIGRADE_REAL_IP_HEADER is not a valid header name", .{});
         return error.InvalidConfigValue;
     }
+    // #901: the shipping generic proxy_pass response cache (C1) is strictly
+    // bounded in-memory only -- no disk tier and no stale-while-revalidate
+    // serving yet (those are #903/#902). TARGET_PROXY_CACHE_PATH and
+    // TARGET_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS already did nothing
+    // for the generic path before this slice (the control-plane disk-cache
+    // writer they feed has no live reader either, per #900's wiring audit),
+    // so reject them explicitly rather than let an operator believe either
+    // knob is doing something.
+    validateProxyCacheDiskPathUnsupported(cfg.proxy_cache_path) catch {
+        std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_PATH is not supported yet -- the generic proxy_pass response cache is strictly bounded in-memory only; unset this variable", .{});
+        return error.InvalidConfigValue;
+    };
+    validateProxyCacheStaleWhileRevalidateUnsupported(cfg.proxy_cache_stale_while_revalidate_seconds) catch {
+        std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS is not supported yet -- stale-while-revalidate serving ships in a later release; unset this variable", .{});
+        return error.InvalidConfigValue;
+    };
+    validateProxyResponseCacheBounds(
+        cfg.proxy_cache_ttl_seconds,
+        cfg.proxy_response_cache_max_object_bytes,
+        cfg.proxy_response_cache_max_entries,
+        cfg.proxy_response_cache_max_total_bytes,
+    ) catch {
+        std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_TTL_SECONDS is nonzero but TARDIGRADE_PROXY_CACHE_MAX_OBJECT_BYTES/_MAX_ENTRIES/_MAX_TOTAL_BYTES must all be nonzero to bound the response cache", .{});
+        return error.InvalidConfigValue;
+    };
     validateGeoTrustConfig(cfg.geo_blocked_countries.len, cfg.trust_require_upstream_identity, cfg.trusted_upstream_identities.len) catch {
         std.log.err("config validation failed: TARDIGRADE_GEO_BLOCKED_COUNTRIES requires TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true and at least one TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES entry", .{});
         return error.InvalidConfigValue;
@@ -4276,6 +4321,24 @@ fn parseTlsLimitEnv(allocator: std.mem.Allocator, key: []const u8, default_value
 
 fn validateProxyStreamBufferSize(size: usize) !void {
     if (size == 0 or size > 1024 * 1024) return error.InvalidConfigValue;
+}
+
+/// #901: `TARDIGRADE_PROXY_CACHE_PATH` has no disk tier to feed yet.
+fn validateProxyCacheDiskPathUnsupported(path: []const u8) !void {
+    if (path.len > 0) return error.InvalidConfigValue;
+}
+
+/// #901: `TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS` has no
+/// stale-while-revalidate serving to feed yet.
+fn validateProxyCacheStaleWhileRevalidateUnsupported(seconds: u32) !void {
+    if (seconds > 0) return error.InvalidConfigValue;
+}
+
+/// #901: an enabled generic response cache must be bounded on every axis.
+fn validateProxyResponseCacheBounds(ttl_seconds: u32, max_object_bytes: usize, max_entries: usize, max_total_bytes: usize) !void {
+    if (ttl_seconds > 0 and (max_object_bytes == 0 or max_entries == 0 or max_total_bytes == 0)) {
+        return error.InvalidConfigValue;
+    }
 }
 
 fn validateProxyBufferLimitsCoverRelayAllocations(limits: http.proxy_buffer_account.Limits, proxy_stream_buffer_size: usize) !void {
@@ -5363,6 +5426,29 @@ test "#512 native persistent ticket-key path requires stateless or hybrid resump
 
     allocator.free(cfg.tls_native_resumption_mode);
     cfg.tls_native_resumption_mode = try allocator.dupe(u8, "hybrid");
+    try validate(&cfg);
+}
+
+test "validate rejects the unsupported proxy cache disk path and stale-while-revalidate knobs (#901)" {
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyCacheDiskPathUnsupported("/var/cache/tardigrade/proxy"));
+    try validateProxyCacheDiskPathUnsupported("");
+
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyCacheStaleWhileRevalidateUnsupported(30));
+    try validateProxyCacheStaleWhileRevalidateUnsupported(0);
+
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyResponseCacheBounds(60, 0, 10, 10));
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyResponseCacheBounds(60, 10, 0, 10));
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyResponseCacheBounds(60, 10, 10, 0));
+    // Disabled (TTL 0): bounds are irrelevant.
+    try validateProxyResponseCacheBounds(0, 0, 0, 0);
+    // Enabled with every bound intact.
+    try validateProxyResponseCacheBounds(60, 10, 10, 10);
+
+    const allocator = std.testing.allocator;
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    try validate(&cfg);
+    cfg.proxy_cache_ttl_seconds = 60;
     try validate(&cfg);
 }
 

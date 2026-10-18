@@ -866,12 +866,15 @@ These public environment fields are consumed by CLI paths rather than
 | `TARDIGRADE_COMPRESSION_BROTLI_ENABLED` | bool | `false` | Reserved for a future native Brotli implementation; accepted today but does not load `libbrotlienc` or enable Brotli output. | `TARDIGRADE_COMPRESSION_BROTLI_ENABLED=false` |
 | `TARDIGRADE_COMPRESSION_BROTLI_QUALITY` | u32 | `5` | Reserved Brotli quality value; must be 0-11. | `TARDIGRADE_COMPRESSION_BROTLI_QUALITY=6` |
 | `TARDIGRADE_IDEMPOTENCY_TTL` | u32 seconds | `300` | Idempotency cache TTL; `0` disables. | `TARDIGRADE_IDEMPOTENCY_TTL=600` |
-| `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` | u32 seconds | `0` | Proxy response cache TTL; `0` disables. | `TARDIGRADE_PROXY_CACHE_TTL_SECONDS=60` |
-| `TARDIGRADE_PROXY_CACHE_PATH` | path | `""` | Disk-backed/tiered cache path. | `TARDIGRADE_PROXY_CACHE_PATH=/var/cache/tardigrade/proxy` |
-| `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE` | string | `method:path:payload_sha256` | Colon-separated tokens: `method`, `path`, `payload_sha256`, `identity`, `api_version`. | `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE=method:path:identity` |
-| `TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS` | u32 seconds | `0` | Serve stale while revalidating after TTL expiry. | `TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS=30` |
-| `TARDIGRADE_PROXY_CACHE_LOCK_TIMEOUT_MS` | u32 ms | `250` | Wait for another request populating same cache key. | `TARDIGRADE_PROXY_CACHE_LOCK_TIMEOUT_MS=500` |
-| `TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS` | u64 ms | `30000` | Cache manager maintenance interval. | `TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS=60000` |
+| `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` | u32 seconds | `0` | Enables (nonzero) the bounded, **in-memory-only** generic `proxy_pass` `GET` response cache (#901) and sets its freshness ceiling; `0` (default) disables it. Only a response with an explicit origin `max-age`/`s-maxage` is ever stored, capped by this value. See the Support Matrix for the full eligibility/bypass contract. | `TARDIGRADE_PROXY_CACHE_TTL_SECONDS=60` |
+| `TARDIGRADE_PROXY_CACHE_MAX_OBJECT_BYTES` | usize bytes | `2097152` | Per-entry accounted size cap (body + headers + overhead) for the generic response cache; a larger response bypasses storage. | `TARDIGRADE_PROXY_CACHE_MAX_OBJECT_BYTES=1048576` |
+| `TARDIGRADE_PROXY_CACHE_MAX_ENTRIES` | usize | `10000` | Entry-count cap for the generic response cache. | `TARDIGRADE_PROXY_CACHE_MAX_ENTRIES=5000` |
+| `TARDIGRADE_PROXY_CACHE_MAX_TOTAL_BYTES` | usize bytes | `67108864` | Aggregate resident-byte cap for the generic response cache. | `TARDIGRADE_PROXY_CACHE_MAX_TOTAL_BYTES=33554432` |
+| `TARDIGRADE_PROXY_CACHE_PATH` | path | `""` | **Not supported.** No disk tier exists yet (planned for #903); setting this to a nonempty value fails `tardi check`/startup. Must be left unset. | unset |
+| `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE` | string | `method:path:payload_sha256` | Key template for the unrelated control-plane/BearClaw JSON proxy cache helper only (`gateway_control_plane_proxy.zig`); it has no effect on the generic `proxy_pass` response cache above, which always keys on scheme/authority/method/location/upstream/path/query. | `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE=method:path:identity` |
+| `TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS` | u32 seconds | `0` | **Not supported.** No stale-while-revalidate serving exists yet (planned for #902); setting this above `0` fails `tardi check`/startup. Must be left unset. | unset |
+| `TARDIGRADE_PROXY_CACHE_LOCK_TIMEOUT_MS` | u32 ms | `250` | Wait for another request populating same cache key, in the unrelated control-plane/BearClaw JSON proxy cache helper only. | `TARDIGRADE_PROXY_CACHE_LOCK_TIMEOUT_MS=500` |
+| `TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS` | u64 ms | `30000` | Cache manager maintenance interval, in the unrelated control-plane/BearClaw JSON proxy cache helper only. | `TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS=60000` |
 
 ### Runtime, Reload, And Workers
 

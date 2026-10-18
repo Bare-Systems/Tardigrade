@@ -11,6 +11,7 @@ const edge_config = @import("edge_config.zig");
 const gp = @import("gateway_proxy.zig");
 const gc = @import("gateway_connection.zig");
 const gs = @import("gateway_state.zig");
+const gpc = @import("gateway_proxy_cache.zig");
 
 const GatewayState = gs.GatewayState;
 const WorkerContext = gs.WorkerContext;
@@ -439,7 +440,7 @@ pub fn hotReloadConfig(
         }
     }
 
-    applyReloadedRuntimeConfig(cfg_ptr, state, &prepared_security);
+    applyReloadedRuntimeConfig(cfg_ptr, prepared_version.generation, state, &prepared_security);
     // Transfer ACL ownership to the generation it belongs to BEFORE publishing
     // that generation, so no lease can ever observe the new config without its
     // matching ACL.
@@ -910,6 +911,7 @@ test "applianceCredentialConfigChanged rejects plaintext-to-TLS and TLS-to-plain
 
 fn applyReloadedRuntimeConfig(
     cfg: *const edge_config.EdgeConfig,
+    cache_generation: u64,
     state: *GatewayState,
     prepared_security: *PreparedReloadSecurity,
 ) void {
@@ -940,6 +942,25 @@ fn applyReloadedRuntimeConfig(
     state.proxy_cache_path = cfg.proxy_cache_path;
     state.proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds;
     state.proxy_cache_mutex.unlock();
+
+    // #901: wholesale rebuild, same convention as proxy_cache_store above --
+    // simpler and still bounded than trying to generation-tag entries across
+    // a reload that may have changed routing/upstreams/TLS.
+    state.proxy_response_cache_mutex.lock();
+    if (state.proxy_response_cache) |*prc| prc.deinit();
+    state.proxy_response_cache = if (cfg.proxy_cache_ttl_seconds > 0)
+        gpc.ProxyResponseCache.init(state.allocator, .{
+            .max_object_bytes = cfg.proxy_response_cache_max_object_bytes,
+            .max_entries = cfg.proxy_response_cache_max_entries,
+            .max_total_bytes = cfg.proxy_response_cache_max_total_bytes,
+        })
+    else
+        null;
+    // Publish the new cache epoch in the same critical section as the swap.
+    // A response still running on an older config lease can neither read nor
+    // fill this cache after the lock is released.
+    state.proxy_response_cache_generation = cache_generation;
+    state.proxy_response_cache_mutex.unlock();
 
     // HSTS is prepared before any reload mutation and swapped only on the
     // successful commit path, preserving the old value if parsing or allocation
@@ -1068,7 +1089,7 @@ fn publishDiscoveryMetrics(state: *GatewayState) void {
     state.metrics_mutex.unlock();
 }
 
-test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
+test "applyReloadedRuntimeConfig atomically swaps proxy cache generation and updates buffer limits" {
     const allocator = std.testing.allocator;
     var cfg = try edge_config.loadFromEnv(allocator);
     defer cfg.deinit(allocator);
@@ -1079,6 +1100,8 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
         .per_origin_hard_limit = 2 * 1024 * 1024,
         .global_hard_limit = 4 * 1024 * 1024,
     };
+    // Keep a real cache enabled across the two reload generations below.
+    cfg.proxy_cache_ttl_seconds = 60;
     cfg.tls_buffer_limits.outbound_ciphertext.high = cfg.tls_buffer_limits.outbound_ciphertext.low + 16;
 
     var state: GatewayState = undefined;
@@ -1090,6 +1113,8 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
     state.proxy_cache_store = null;
     state.proxy_cache_path = "";
     state.proxy_cache_ttl_seconds = 0;
+    state.proxy_response_cache_mutex = .{};
+    state.proxy_response_cache = null;
     state.runtime_mutex = .{};
     // `metricsToPrometheus` (called below) locks this via `muxMetricsSnapshot`
     // — left uninitialized, `.lock()` on garbage memory hangs indefinitely
@@ -1132,18 +1157,54 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
 
     allocator.free(cfg.access_control_rules);
     cfg.access_control_rules = try allocator.dupe(u8, "deny 203.0.113.0/24");
-    var prepared_security = try PreparedReloadSecurity.init(allocator, &cfg);
-    defer prepared_security.deinit(allocator);
-    applyReloadedRuntimeConfig(&cfg, &state, &prepared_security);
+    var first_security = try PreparedReloadSecurity.init(allocator, &cfg);
+    defer first_security.deinit(allocator);
+    applyReloadedRuntimeConfig(&cfg, 1, &state, &first_security);
     defer if (state.hsts_value.len > 0) allocator.free(state.hsts_value);
+    defer if (state.proxy_response_cache) |*cache| cache.deinit();
 
     // The ACL now belongs to the configuration version rather than to
     // `GatewayState`; `applyReloadedRuntimeConfig` leaves `prepared_security`
     // holding it until the new generation is installed.
     try std.testing.expectEqual(
         http.access_control.AccessResult.denied,
-        prepared_security.access_control.?.check("203.0.113.4"),
+        first_security.access_control.?.check("203.0.113.4"),
     );
+
+    // Model a response from generation A reaching its cache-fill point only
+    // after the live reload has installed generation B.  This is the exact
+    // interleaving an upstream held mid-response creates: the stale fill
+    // cannot populate B's new store, nor can a held A lease observe B's fill.
+    const cache_headers: []const gpc.CacheHeaderView = &.{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    try state.proxyResponseCachePut(1_000, 1, "same-relative-target", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = cache_headers,
+        .body = "origin-a",
+        .ttl_seconds = 60,
+    });
+    var second_security = try PreparedReloadSecurity.init(allocator, &cfg);
+    defer second_security.deinit(allocator);
+    applyReloadedRuntimeConfig(&cfg, 2, &state, &second_security);
+    try std.testing.expectError(error.ProxyResponseCacheGenerationMismatch, state.proxyResponseCachePut(1_001, 1, "same-relative-target", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = cache_headers,
+        .body = "late-origin-a",
+        .ttl_seconds = 60,
+    }));
+    try state.proxyResponseCachePut(1_002, 2, "same-relative-target", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = cache_headers,
+        .body = "origin-b",
+        .ttl_seconds = 60,
+    });
+    var cache_arena = std.heap.ArenaAllocator.init(allocator);
+    defer cache_arena.deinit();
+    try std.testing.expect((try state.proxyResponseCacheLookup(cache_arena.allocator(), 1, "same-relative-target", 1_003)) == null);
+    const generation_b = (try state.proxyResponseCacheLookup(cache_arena.allocator(), 2, "same-relative-target", 1_003)).?;
+    try std.testing.expectEqualStrings("origin-b", generation_b.body);
 
     const prom = try state.metricsToPrometheus(allocator);
     defer allocator.free(prom);

@@ -38,6 +38,7 @@ const gconn = @import("gateway_connection.zig");
 const gshutdown = @import("gateway_shutdown.zig");
 const ghandlers = @import("gateway_handlers.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
+const gproxy_cache = @import("gateway_proxy_cache.zig");
 const gprotocol_policy = @import("gateway_protocol_policy.zig");
 const gp = @import("gateway_proxy.zig");
 const gws_tunnel = @import("gateway_websocket_tunnel.zig");
@@ -94,6 +95,15 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             null,
         .proxy_cache_path = cfg.proxy_cache_path,
         .proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds,
+        .proxy_response_cache = if (cfg.proxy_cache_ttl_seconds > 0)
+            gproxy_cache.ProxyResponseCache.init(state_allocator, .{
+                .max_object_bytes = cfg.proxy_response_cache_max_object_bytes,
+                .max_entries = cfg.proxy_response_cache_max_entries,
+                .max_total_bytes = cfg.proxy_response_cache_max_total_bytes,
+            })
+        else
+            null,
+        .proxy_response_cache_generation = 1,
         .security_headers = blk: {
             var s = if (cfg.security_headers_enabled)
                 http.security_headers.SecurityHeaders.api
@@ -720,6 +730,18 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             };
             state.logger.info(null, "Proxy cache disk path enabled: {s}", .{cfg.proxy_cache_path});
         }
+    }
+    if (state.proxy_response_cache != null) {
+        state.logger.info(
+            null,
+            "Generic proxy_pass response cache enabled (conservative in-memory GET-only, #901): TTL {d}s max_object_bytes={d} max_entries={d} max_total_bytes={d}",
+            .{
+                cfg.proxy_cache_ttl_seconds,
+                cfg.proxy_response_cache_max_object_bytes,
+                cfg.proxy_response_cache_max_entries,
+                cfg.proxy_response_cache_max_total_bytes,
+            },
+        );
     }
     if (state.session_store != null) {
         state.logger.info(null, "Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });
@@ -1707,7 +1729,10 @@ const GatewayHttpRuntime = struct {
     }
 
     pub fn handleHttp2(self: *@This(), conn: anytype) !void {
-        try handleHttp2Connection(conn, self.session, self.cfg, self.ctx.state, self.connection_ip);
+        // This legacy negotiated-dispatch adapter has no retained config
+        // lease generation. Disable the optional cache rather than risk
+        // mixing it with a later reload generation.
+        try handleHttp2Connection(conn, self.session, self.cfg, self.ctx.state, self.connection_ip, 0);
     }
 };
 
@@ -2545,7 +2570,7 @@ fn advanceNativeHttp2(ctx: *WorkerContext, managed: *http.downstream_connection.
         managed.lifecycle.metrics_mutex,
         &managed.lifecycle.tls_buffer_metrics,
     );
-    handleHttp2Connection(&adapter, session, cfg, ctx.state, managed.lifecycle.connectionIp()) catch |err| {
+    handleHttp2Connection(&adapter, session, cfg, ctx.state, managed.lifecycle.connectionIp(), managed.lifecycle.config_generation) catch |err| {
         if (isBenignDisconnect(err)) {
             ctx.state.logger.debug(null, "native http/2 connection closed: {}", .{err});
         } else {
@@ -3629,6 +3654,7 @@ fn h2DispatchReadyStreamsWithWriter(
     handoff: ?*http.h2_request_handoff.Handoff,
     executor: ?*http.h2_request_executor.Executor,
     in_flight: *std.AutoHashMap(u31, void),
+    cache_generation: u64,
 ) !void {
     _ = next_server_stream_id;
     if (ready_streams.items.len == 0) return;
@@ -3670,7 +3696,7 @@ fn h2DispatchReadyStreamsWithWriter(
         // The accept/reject decision for a transport-early stream is recorded
         // by `respondHttp2Stream`, once routing has had its say (#761).
 
-        try respondHttp2Stream(conn, writer, outbound, allocator, state, cfg, sid, ps, handoff, executor, in_flight, streams, pending_responses, conn_send_window, connection_ip);
+        try respondHttp2Stream(conn, writer, outbound, allocator, state, cfg, cache_generation, sid, ps, handoff, executor, in_flight, streams, pending_responses, conn_send_window, connection_ip);
         ps.dispatch_count += 1;
         if (pending.fetchRemove(sid)) |removed| {
             var tmp = removed.value;
@@ -3705,10 +3731,10 @@ fn h2DispatchReadyStreams(
 ) !void {
     var in_flight = std.AutoHashMap(u31, void).init(allocator);
     defer in_flight.deinit();
-    return h2DispatchReadyStreamsWithWriter(conn, conn.writer(), null, allocator, state, cfg, pending, streams, pending_responses, ready_streams, next_server_stream_id, conn_send_window, buffered_request_bytes, connection_ip, null, null, &in_flight);
+    return h2DispatchReadyStreamsWithWriter(conn, conn.writer(), null, allocator, state, cfg, pending, streams, pending_responses, ready_streams, next_server_stream_id, conn_send_window, buffered_request_bytes, connection_ip, null, null, &in_flight, 0);
 }
 
-fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, connection_ip: []const u8) !void {
+fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, connection_ip: []const u8, cache_generation: u64) !void {
     _ = session;
     var preface: [HTTP2_PREFACE.len]u8 = undefined;
     try readExactConn(conn, preface[0..]);
@@ -4000,6 +4026,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             &handoff,
             executor,
             &in_flight_jobs,
+            cache_generation,
         );
 
         if (h2HasDeferredReadyStreams(&pending, &ready_streams) and !h2DownstreamHandshakeComplete(conn)) {
@@ -4022,6 +4049,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 &handoff,
                 executor,
                 &in_flight_jobs,
+                cache_generation,
             );
             if (ready_streams.items.len == 0) continue;
         }
@@ -4519,6 +4547,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             &handoff,
             executor,
             &in_flight_jobs,
+            cache_generation,
         );
         try outbound.flush(conn.writer());
     }
@@ -4570,6 +4599,7 @@ fn respondHttp2Stream(
     allocator: std.mem.Allocator,
     state: *GatewayState,
     cfg: *const edge_config.EdgeConfig,
+    cache_generation: u64,
     stream_id: u31,
     ps: *const Http2PendingStream,
     handoff: ?*http.h2_request_handoff.Handoff,
@@ -4612,7 +4642,7 @@ fn respondHttp2Stream(
     // a reason to fall back to inline execution -- that would reintroduce
     // the exact blocking this phase removes.
     if (handoff) |ho| if (executor) |ex| {
-        if (buildH2RequestJob(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, lifecycle)) |job| {
+        if (buildH2RequestJob(allocator, state, cfg, cache_generation, method, path, ps, correlation_id, connection_ip, lifecycle)) |job| {
             const submitted = submitted: {
                 ho.submit(.{ .stream_id = stream_id, .payload = job, .deinit_fn = H2RequestJob.destroyOpaque }) catch {
                     H2RequestJob.destroyOpaque(job);
@@ -4642,7 +4672,7 @@ fn respondHttp2Stream(
     var grants_owned = true;
     errdefer if (grants_owned) forward_auth_grants.deinit(allocator);
     var early_data_refused = false;
-    const result = try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle, &forward_auth_grants, &early_data_refused);
+    const result = try executeHttp2ProxyRoute(allocator, state, cfg, cache_generation, method, path, ps, correlation_id, connection_ip, &lifecycle, &forward_auth_grants, &early_data_refused);
     grants_owned = false;
     return finalizeHttp2Response(conn, writer, outbound, allocator, state, stream_id, method, correlation_id, .{ .routed = result }, forward_auth_grants, early_data_refused, ps.transport_early, streams, pending_responses, conn_send_window);
 }
@@ -4953,6 +4983,58 @@ const Http2ProxyRouteResult = union(enum) {
     static_response: Http2StaticResponse,
 };
 
+/// Turn a request-scoped cache lookup copy into the owned response shape the
+/// H2 frame finalizer expects. The cache lookup arena can then be released
+/// before this route returns, while the result remains valid until the
+/// connection thread has emitted its HEADERS/DATA frames.
+fn http2CachedProxyResponse(
+    allocator: std.mem.Allocator,
+    hit: *const gproxy_cache.LookupResult,
+) !gp.BufferedUpstreamResponse {
+    var metadata_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer metadata_arena.deinit();
+    const metadata = metadata_arena.allocator();
+    const headers = try metadata.alloc(gp.UpstreamHeader, hit.headers.len + 1);
+    for (hit.headers, 0..) |header, index| {
+        headers[index] = .{
+            .name = try metadata.dupe(u8, header.name),
+            .value = try metadata.dupe(u8, header.value),
+        };
+    }
+    var age_buf: [20]u8 = undefined;
+    const age = std.fmt.bufPrint(&age_buf, "{d}", .{hit.age_seconds}) catch unreachable;
+    headers[hit.headers.len] = .{
+        .name = try metadata.dupe(u8, "Age"),
+        .value = try metadata.dupe(u8, age),
+    };
+    const body = try allocator.dupe(u8, hit.body);
+    errdefer allocator.free(body);
+    return .{
+        .metadata_arena = metadata_arena,
+        .status_code = hit.status_code,
+        .reason = try metadata.dupe(u8, hit.reason),
+        .headers = headers,
+        .body = body,
+    };
+}
+
+test "H2 cached replay conversion is fallible before route completion" {
+    var reason = [_]u8{ 'O', 'K' };
+    var header_name = [_]u8{ 'X', '-', 'T', 'e', 's', 't' };
+    var header_value = [_]u8{'v'};
+    var body = [_]u8{ 'c', 'a', 'c', 'h', 'e', 'd' };
+    var headers = [_]gproxy_cache.CacheHeader{.{ .name = &header_name, .value = &header_value }};
+    const hit = gproxy_cache.LookupResult{
+        .status_code = 200,
+        .reason = &reason,
+        .headers = &headers,
+        .body = &body,
+        .age_seconds = 1,
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, http2CachedProxyResponse(failing.allocator(), &hit));
+}
+
 const Http2LocalRejection = struct {
     status_code: u16,
     code: []const u8,
@@ -4989,6 +5071,7 @@ fn executeHttp2ProxyRoute(
     allocator: std.mem.Allocator,
     state: *GatewayState,
     cfg: *const edge_config.EdgeConfig,
+    cache_generation: u64,
     method: []const u8,
     path: []const u8,
     ps: *const Http2PendingStream,
@@ -5071,11 +5154,16 @@ fn executeHttp2ProxyRoute(
     var client_view = ghandlers.H1ClientAuthView{};
     defer client_view.deinit(allocator);
     var hops: usize = 1;
+    var encountered_identity_gate = ctx.authenticated or ctx.identity != null;
     // Set when a rewrite lands back in the same location: its gates must be
     // re-run for the rewritten target, but its rewrite action must not run
     // again.
     var gate_only = false;
     while (true) {
+        encountered_identity_gate = encountered_identity_gate or
+            matched.block.auth != .off or
+            matched.block.forward_auth != null or
+            !matched.block.client_cert.isEmpty();
         if (matched.block.auth == .required and !ctx.authenticated and ctx.identity == null) {
             forward_auth_grants.clear();
             return .{ .local_rejection = .{
@@ -5228,6 +5316,64 @@ fn executeHttp2ProxyRoute(
         .message = "HTTP/2 proxy route requires unsupported proxy orchestration",
     } };
 
+    // H2 owns its data plane rather than calling the H1 writer, but shares
+    // the same conservative cache contract. A cache result is copied into an
+    // owned BufferedUpstreamResponse because finalization emits frames after
+    // this route function returns.
+    var response_cache_key: ?[64]u8 = null;
+    if (route_cfg.proxy_cache_ttl_seconds > 0) {
+        if (cache_generation == 0 or
+            !gproxy_cache.isCacheableRequest(
+                route_cfg,
+                matched.block,
+                request.method.toString(),
+                &request.headers,
+                if (request.body) |body| body.len != 0 else false,
+                false,
+                encountered_identity_gate,
+            ) or
+            gs.stickyAffinityEligible(route_cfg, gs.upstreamPoolForScope(route_cfg, .global), target) or
+            gs.proxyResponseCacheHasDynamicUpstream(route_cfg, gs.upstreamPoolForScope(route_cfg, .global), target) or
+            ga.shouldBypassProxyCache(&request.headers))
+        {
+            state.metricsRecordProxyCacheOutcome(.bypass);
+        } else {
+            var key_buf: [64]u8 = undefined;
+            _ = gproxy_cache.buildCacheKey(&key_buf, .{
+                .scheme = if (edge_config.hasTlsFiles(route_cfg)) "https" else "http",
+                .host = ps.authority orelse request.headers.get("host") orelse "",
+                .method = request.method.toString(),
+                .location_id = matched.block.pattern,
+                .upstream_target = target,
+                .path = request.uri.path,
+                .query = request.uri.query orelse "",
+            });
+            var hit_arena = std.heap.ArenaAllocator.init(allocator);
+            defer hit_arena.deinit();
+            const hit = blk: {
+                break :blk state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, key_buf[0..], http.event_loop.monotonicMs()) catch {
+                    state.metricsRecordProxyCacheOutcome(.fill_error);
+                    break :blk null;
+                };
+            };
+            if (hit) |value| {
+                // This copy is solely for replaying an already-cached value
+                // into H2-owned buffers. It must fail open just like cache
+                // lookup/fill: the live origin remains authoritative when a
+                // request allocator cannot service this optional copy.
+                if (http2CachedProxyResponse(allocator, &value)) |cached| {
+                    state.metricsRecordProxyCacheOutcome(.hit);
+                    ctx.setUpstreamResult(target, value.status_code, value.body.len);
+                    return .{ .response = cached };
+                } else |_| {
+                    state.metricsRecordProxyCacheOutcome(.fill_error);
+                }
+            }
+            state.metricsRecordProxyCacheOutcome(.miss);
+            response_cache_key = key_buf;
+        }
+    }
+
     const suffix_path = gproxy_runtime.proxySuffixPathForLocation(request.uri.path, matched, route_cfg.location_blocks);
     const resolved = try gp.resolveProxyTarget(allocator, route_cfg.upstream_base_url, target, suffix_path);
     defer allocator.free(resolved.url);
@@ -5262,6 +5408,11 @@ fn executeHttp2ProxyRoute(
         &state.h2_pool,
     );
     errdefer proxy_response.deinit(allocator);
+    if (response_cache_key) |key_bytes| {
+        gproxy_runtime.tryFillResponseCache(allocator, state, cache_generation, route_cfg.proxy_cache_ttl_seconds, key_bytes[0..], &proxy_response.bounded_buffered) catch {
+            state.metricsRecordProxyCacheOutcome(.fill_error);
+        };
+    }
     ctx.setUpstreamResult(resolved.upstream_host, proxy_response.statusCode(), proxy_response.bodyLen());
     state.appendTranscript(
         gs.upstreamScopeName(gs.proxyScopeForPath(request.uri.path)),
@@ -5343,6 +5494,7 @@ const H2RequestJob = struct {
     allocator: std.mem.Allocator,
     state: *GatewayState,
     cfg: *const edge_config.EdgeConfig,
+    cache_generation: u64,
     method: []u8,
     path: []u8,
     ps: Http2PendingStream,
@@ -5376,6 +5528,7 @@ fn buildH2RequestJob(
     allocator: std.mem.Allocator,
     state: *GatewayState,
     cfg: *const edge_config.EdgeConfig,
+    cache_generation: u64,
     method: []const u8,
     path: []const u8,
     ps: *const Http2PendingStream,
@@ -5388,6 +5541,7 @@ fn buildH2RequestJob(
     job.allocator = allocator;
     job.state = state;
     job.cfg = cfg;
+    job.cache_generation = cache_generation;
 
     job.method = try allocator.dupe(u8, method);
     errdefer allocator.free(job.method);
@@ -5451,6 +5605,7 @@ fn executeH2RequestJobSignal(ctx: *anyopaque, handoff: *http.h2_request_handoff.
         job.allocator,
         job.state,
         job.cfg,
+        job.cache_generation,
         job.method,
         job.path,
         &job.ps,
@@ -6713,6 +6868,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // consumes them, as the first tunnel bytes (#812).
     ctx.downstream_buffered_input = pending_buf[pending_start..][0..session.pending_len];
     ctx.config_superseded_at = config_superseded_at;
+    ctx.config_generation = if (config_lease) |lease| lease.version.generation else 0;
     ctx.response_stream_config_lease = if (config_lease) |lease| @ptrCast(lease) else null;
     ctx.tunnel_handoff_allowed = tunnel_handoff_out != null;
     errdefer if (ctx.tunnel_handoff) |raw| {
@@ -8718,6 +8874,7 @@ test "H2 request dispatched to the executor runs off the dispatch call and compl
         &handoff,
         &executor,
         &in_flight,
+        0,
     );
 
     // Dispatch handed the request to the executor and returned immediately:
@@ -8838,6 +8995,7 @@ test "H2 request dispatch rejects with 503 instead of executing inline when the 
         &handoff,
         &executor,
         &in_flight,
+        0,
     );
 
     try std.testing.expect(!in_flight.contains(1));
@@ -10325,7 +10483,7 @@ const LiveH2ServerCtx = struct {
     result: anyerror!void = undefined,
 
     fn run(self: *LiveH2ServerCtx) void {
-        self.result = handleHttp2Connection(self.adapter, self.session, self.cfg, self.state, "127.0.0.1");
+        self.result = handleHttp2Connection(self.adapter, self.session, self.cfg, self.state, "127.0.0.1", 0);
         // A server-side error must surface as client EOF rather than leave a
         // blocking client read hanging forever on a half-dead socket.
         _ = std.c.shutdown(self.adapter.inner.rawFd(), std.c.SHUT.RDWR);

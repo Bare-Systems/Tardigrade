@@ -13,6 +13,7 @@ const gp = @import("gateway_proxy.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const gpr = @import("gateway_protocols.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
+const gpc = @import("gateway_proxy_cache.zig");
 const gs = @import("gateway_state.zig");
 const tls_core_client_trust = @import("tls_core").client_trust;
 const gstatic = @import("gateway_static_runtime.zig");
@@ -682,6 +683,8 @@ fn initHttp3ProxyTestState(state: *GatewayState, allocator: std.mem.Allocator, a
     state.upstream_active_requests = std.StringHashMap(usize).init(allocator);
     state.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
     state.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+    state.proxy_response_cache_mutex = .{};
+    state.proxy_response_cache = null;
     state.proxy_buffer_limits = .{
         .per_stream_low_watermark = 256 * 1024,
         .per_stream_high_watermark = 768 * 1024,
@@ -838,11 +841,22 @@ pub fn routeRequest(
             // location, or fall into the static root, around its gates.
             var matched = first_match;
             var hops: usize = 1;
+            // Cache eligibility is about the entire effective route, not only
+            // the final proxy location. A prior gate can assert an
+            // origin-facing identity header that a later public location would
+            // otherwise accidentally share.
+            var encountered_identity_gate = false;
             // Set when a rewrite lands back in the same location: its gates
             // must be re-run for the rewritten target, but its rewrite action
             // must not run again.
             var gate_only = false;
             while (true) {
+                encountered_identity_gate = encountered_identity_gate or
+                    matched.block.auth != .off or
+                    matched.block.forward_auth != null or
+                    !matched.block.client_cert.isEmpty() or
+                    cfg.policy_rules_raw.len > 0 or
+                    cfg.policy_approval_routes_raw.len > 0;
                 // Refusals on this hop must not carry an earlier hop's grants.
                 http.security_headers.clearRequestScope();
                 // Built-in auth checks the caller's own credentials, never an
@@ -926,6 +940,7 @@ pub fn routeRequest(
                 keep_alive,
                 client_ip,
                 streaming_request_body,
+                encountered_identity_gate,
             )) |status| {
                 return .{ .status = status, .mirror_allowed = !websocket_attempt };
             }
@@ -1266,6 +1281,7 @@ fn executeLocationAction(
     keep_alive: *bool,
     client_ip: []const u8,
     streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
+    encountered_identity_gate: bool,
 ) !?u16 {
     const writer = conn.writer();
     switch (matched.block.action) {
@@ -1300,6 +1316,7 @@ fn executeLocationAction(
                 matched.block.pattern,
                 matched.block,
                 streaming_request_body,
+                encountered_identity_gate,
                 &downstream_broken,
             );
             if (downstream_broken) keep_alive.* = false;
@@ -2963,7 +2980,66 @@ fn handleHttp3LocationProxyPass(
     forward_early_data: bool,
     /// Request headers after `forward_auth` rewrote them, when it did.
     headers_override: ?*const http.Headers,
+    encountered_identity_gate: bool,
 ) !void {
+    // #901: see the matching comment in `gateway_proxy_runtime.handleLocationProxyPass`
+    // (the H1/H2 counterpart); this is the H3 path's own copy because H3
+    // builds its response into `response` rather than writing a stream
+    // directly, so the hit/fill shapes differ even though the eligibility
+    // and freshness rules (`gateway_proxy_cache.zig`) are shared.
+    var response_cache_key: ?[64]u8 = null;
+    if (ctx.cfg.proxy_cache_ttl_seconds > 0) {
+        if (!gpc.isCacheableRequest(
+            ctx.cfg,
+            matched.block,
+            request.method,
+            &request.headers,
+            request.body.len != 0,
+            false,
+            encountered_identity_gate or ctx.authenticated or ctx.identity != null,
+        ) or gs.stickyAffinityEligible(ctx.cfg, gs.upstreamPoolForScope(ctx.cfg, .global), target)) {
+            ctx.state.metricsRecordProxyCacheOutcome(.bypass);
+        } else if (gs.proxyResponseCacheHasDynamicUpstream(ctx.cfg, gs.upstreamPoolForScope(ctx.cfg, .global), target)) {
+            ctx.state.metricsRecordProxyCacheOutcome(.bypass);
+        } else if (ga.shouldBypassProxyCache(&request.headers)) {
+            ctx.state.metricsRecordProxyCacheOutcome(.bypass);
+        } else {
+            var key_buf: [64]u8 = undefined;
+            _ = gpc.buildCacheKey(&key_buf, .{
+                .scheme = if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
+                .host = request.headers.get(":authority") orelse request.headers.get("host") orelse "",
+                .method = request.method,
+                .location_id = matched.block.pattern,
+                .upstream_target = target,
+                .path = request_path,
+                .query = request_query orelse "",
+            });
+            const lookup_now_ms = http.event_loop.monotonicMs();
+            var hit_arena = std.heap.ArenaAllocator.init(allocator);
+            defer hit_arena.deinit();
+            const cache_generation = if (ctx.cfg_lease) |lease| lease.version.generation else 0;
+            const cache_hit = blk: {
+                break :blk ctx.state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, key_buf[0..], lookup_now_ms) catch {
+                    ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+                    break :blk null;
+                };
+            };
+            if (cache_hit) |hit| {
+                // A cached replay must fail open. `applyHttp3ProxyCacheHit`
+                // allocates its body before mutating `response`, so a failure
+                // here can safely fall through to the live origin request.
+                if (applyHttp3ProxyCacheHit(allocator, response, ctx.state, &hit, correlation_id)) |_| {
+                    ctx.state.metricsRecordProxyCacheOutcome(.hit);
+                    return;
+                } else |_| {
+                    ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+                }
+            }
+            ctx.state.metricsRecordProxyCacheOutcome(.miss);
+            response_cache_key = key_buf;
+        }
+    }
+
     const resolved = try resolveProxyTarget(allocator, ctx.cfg.upstream_base_url, target, proxySuffixPathForLocation(request_path, matched, ctx.cfg.location_blocks));
     defer allocator.free(resolved.url);
     var upstream_url = try appendProxyQueryString(allocator, resolved.url, request_query);
@@ -3052,7 +3128,60 @@ fn handleHttp3LocationProxyPass(
         recordHttp3ProxyOutcome(ctx.state, ctx.cfg, ctx.cfg.upstream_base_url, absolute_target, upstream_response.statusCode(), permit);
         attempt_executor.circuit_permit = null;
     }
+    if (response_cache_key) |key_bytes| {
+        const buffered = upstream_response.boundedBufferedForCompatibility();
+        const cache_generation = if (ctx.cfg_lease) |lease| lease.version.generation else 0;
+        gproxy_runtime.tryFillResponseCache(allocator, ctx.state, cache_generation, ctx.cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered) catch {
+            ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+        };
+    }
     try applyHttp3ProxyResponse(allocator, response, ctx.state, &upstream_response, correlation_id);
+}
+
+/// Replays a #901 generic proxy-cache hit the same way `applyHttp3ProxyResponse`
+/// renders a live buffered upstream response, plus a freshly computed `Age`.
+fn copyHttp3CacheReplayBody(allocator: std.mem.Allocator, hit: *const gpc.LookupResult) ![]u8 {
+    // Do this before mutating `response`: a cache-only OOM must leave the
+    // caller free to dispatch the live upstream response instead.
+    return allocator.dupe(u8, hit.body);
+}
+
+fn applyHttp3ProxyCacheHit(
+    allocator: std.mem.Allocator,
+    response: *http.Response,
+    state: *GatewayState,
+    hit: *const gpc.LookupResult,
+    correlation_id: []const u8,
+) !void {
+    const body = try copyHttp3CacheReplayBody(allocator, hit);
+    errdefer allocator.free(body);
+    _ = response
+        .setStatus(@enumFromInt(hit.status_code))
+        .setBodyOwned(body)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    for (hit.headers) |header| {
+        _ = response.setHeader(header.name, header.value);
+    }
+    var age_buf: [20]u8 = undefined;
+    const age_str = std.fmt.bufPrint(&age_buf, "{d}", .{hit.age_seconds}) catch unreachable;
+    _ = response.setHeader("Age", age_str);
+    finalizeHttp3Response(response);
+    applyResponseHeaders(state, response);
+    state.metricsRecord(hit.status_code);
+}
+
+test "H3 cache replay copies its body before mutating a response" {
+    var reason = [_]u8{ 'O', 'K' };
+    var body = [_]u8{ 'c', 'a', 'c', 'h', 'e', 'd' };
+    const hit = gpc.LookupResult{
+        .status_code = 200,
+        .reason = &reason,
+        .headers = &.{},
+        .body = &body,
+        .age_seconds = 1,
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, copyHttp3CacheReplayBody(failing.allocator(), &hit));
 }
 
 fn handleHttp3StaticLocation(
@@ -3727,6 +3856,9 @@ const Http3RouteState = struct {
     /// Set when a rewrite lands back in the same location: re-run its gates
     /// for the rewritten target, then fall back without re-running its action.
     gate_only: bool = false,
+    /// Sticky across rewrite hops: a verified gate or assertion on any hop
+    /// makes the request ineligible for the generic shared response cache.
+    encountered_identity_gate: bool = false,
 
     fn init(request: *const http.http3_session.StreamRequest) Http3RouteState {
         const path, const query = splitHttp3PathAndQuery(request.path);
@@ -3839,6 +3971,13 @@ fn routeHttp3Hop(
         .reload_status, .metrics, .unmatched => return .not_handled,
     };
 
+    route.encountered_identity_gate = route.encountered_identity_gate or
+        matched.block.auth != .off or
+        matched.block.forward_auth != null or
+        !matched.block.client_cert.isEmpty() or
+        ctx.cfg.policy_rules_raw.len > 0 or
+        ctx.cfg.policy_approval_routes_raw.len > 0;
+
     if (matched.block.auth == .required and !ctx.authenticated) {
         route.grants.clear();
         try rejectHttp3AuthRequiredLocation(allocator, response, ctx, correlation_id);
@@ -3860,7 +3999,7 @@ fn routeHttp3Hop(
         if (allowed) |grant| try route.grants.add(allocator, grant);
     }
     if (route.gate_only) return .not_handled;
-    return executeHttp3LocationAction(allocator, request, response, ctx, matched, request_path, route.query, correlation_id, &early_ctx, forward_early_data, if (route.headers) |*headers| headers else null);
+    return executeHttp3LocationAction(allocator, request, response, ctx, matched, request_path, route.query, correlation_id, &early_ctx, forward_early_data, if (route.headers) |*headers| headers else null, route.encountered_identity_gate);
 }
 
 fn executeHttp3LocationAction(
@@ -3875,10 +4014,11 @@ fn executeHttp3LocationAction(
     early_ctx: *http.request_context.EarlyDataContext,
     forward_early_data: bool,
     forward_auth_headers: ?*const http.Headers,
+    encountered_identity_gate: bool,
 ) !Http3LocationOutcome {
     switch (matched.block.action) {
         .proxy_pass => |target| {
-            try handleHttp3LocationProxyPass(allocator, request, response, ctx, matched, request_path, request_query, target, correlation_id, early_ctx, forward_early_data, forward_auth_headers);
+            try handleHttp3LocationProxyPass(allocator, request, response, ctx, matched, request_path, request_query, target, correlation_id, early_ctx, forward_early_data, forward_auth_headers, encountered_identity_gate);
             return .handled;
         },
         .return_response => |ret| {
@@ -6265,6 +6405,7 @@ test {
     _ = @import("gateway_proxy.zig");
     _ = @import("gateway_proxy_runtime.zig");
     _ = @import("gateway_control_plane_proxy.zig");
+    _ = @import("gateway_proxy_cache.zig");
 }
 
 test "H3 handler binds handshake policy to the routing config generation, closing the reload publication window (#763)" {

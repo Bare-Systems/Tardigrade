@@ -12,6 +12,8 @@ const gp = @import("gateway_proxy.zig");
 const gpt = @import("gateway_proxy_target.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const gcp = @import("gateway_control_plane_proxy.zig");
+const gpc = @import("gateway_proxy_cache.zig");
+const ga = @import("gateway_auth.zig");
 const gs = @import("gateway_state.zig");
 const gws_tunnel = @import("gateway_websocket_tunnel.zig");
 
@@ -38,6 +40,69 @@ const writeBufferedUpstreamResponseWithMetrics = gp.writeBufferedUpstreamRespons
 
 pub const StreamingRequestBody = gp.StreamingRequestBody;
 
+/// Cache-hit metadata is prepared before the H1 writer observes any part of a
+/// response.  Keeping this optional work in one fallible helper makes the
+/// fail-open boundary explicit: callers can discard an allocation failure and
+/// proceed with the normal live upstream request.
+pub const Http1CacheReplay = struct {
+    headers: []gp.UpstreamHeader,
+
+    pub fn deinit(self: *Http1CacheReplay, allocator: std.mem.Allocator) void {
+        const age_header = self.headers[self.headers.len - 1];
+        allocator.free(@constCast(age_header.name));
+        allocator.free(@constCast(age_header.value));
+        allocator.free(self.headers);
+        self.* = undefined;
+    }
+};
+
+pub fn prepareHttp1CacheReplay(allocator: std.mem.Allocator, hit: *const gpc.LookupResult) !Http1CacheReplay {
+    const headers = try allocator.alloc(gp.UpstreamHeader, hit.headers.len + 1);
+    errdefer allocator.free(headers);
+    for (hit.headers, 0..) |header, idx| {
+        headers[idx] = .{ .name = header.name, .value = header.value };
+    }
+    var age_buf: [20]u8 = undefined;
+    const age_str = std.fmt.bufPrint(&age_buf, "{d}", .{hit.age_seconds}) catch unreachable;
+    const owned_age_name = try allocator.dupe(u8, "Age");
+    errdefer allocator.free(owned_age_name);
+    const owned_age = try allocator.dupe(u8, age_str);
+    errdefer allocator.free(owned_age);
+    headers[hit.headers.len] = .{ .name = owned_age_name, .value = owned_age };
+    return .{ .headers = headers };
+}
+
+/// Best-effort cache fill shared by H1/H2-style and H3 proxy paths. Every
+/// allocation is deliberately inside this fallible helper so a cache-only OOM
+/// leaves the already-complete live upstream response deliverable.
+pub fn tryFillResponseCache(
+    scratch: std.mem.Allocator,
+    state: *GatewayState,
+    generation: u64,
+    ttl_ceiling_seconds: u32,
+    key: []const u8,
+    buffered: *const BufferedUpstreamResponse,
+) !void {
+    if (buffered.status_code != 200) return;
+    const freshness = gpc.responseFreshness(buffered.headers, ttl_ceiling_seconds) orelse return;
+    const put_headers = try scratch.alloc(gpc.CacheHeaderView, buffered.headers.len);
+    defer scratch.free(put_headers);
+    var put_header_count: usize = 0;
+    for (buffered.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "age")) continue;
+        put_headers[put_header_count] = .{ .name = h.name, .value = h.value };
+        put_header_count += 1;
+    }
+    try state.proxyResponseCachePut(http.event_loop.monotonicMs(), generation, key, .{
+        .status_code = buffered.status_code,
+        .reason = buffered.reason,
+        .headers = put_headers[0..put_header_count],
+        .body = buffered.body,
+        .ttl_seconds = freshness.ttl_seconds,
+        .initial_age_seconds = freshness.initial_age_seconds,
+    });
+}
+
 pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
     return switch (err) {
         error.OutOfMemory,
@@ -63,6 +128,26 @@ pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
         => false,
         else => true,
     };
+}
+
+test "H1 cache replay preparation fails before any cached response is written" {
+    var reason = [_]u8{ 'O', 'K' };
+    var header_name = [_]u8{ 'X', '-', 'T', 'e', 's', 't' };
+    var header_value = [_]u8{'v'};
+    var body = [_]u8{ 'c', 'a', 'c', 'h', 'e', 'd' };
+    var headers = [_]gpc.CacheHeader{.{ .name = &header_name, .value = &header_value }};
+    const hit = gpc.LookupResult{
+        .status_code = 200,
+        .reason = &reason,
+        .headers = &headers,
+        .body = &body,
+        .age_seconds = 1,
+    };
+
+    // Every replay allocation is cache-only. The caller catches this error
+    // before invoking its writer, leaving the live proxy path available.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, prepareHttp1CacheReplay(failing.allocator(), &hit));
 }
 
 pub const UpstreamErrorResponse = struct {
@@ -578,6 +663,10 @@ pub fn handleLocationProxyPass(
     location_id: []const u8,
     matched_block: *const edge_config.EdgeConfig.LocationBlock,
     streaming_request_body: ?StreamingRequestBody,
+    /// True when any route hop before the effective proxy location evaluated
+    /// an identity-bearing gate (auth, forward_auth, client certificate, or
+    /// policy). Such a request must never use the shared cache.
+    encountered_identity_gate: bool,
     /// Set true when a streaming upstream failure happened after the
     /// downstream response head was already committed to `writer` -- the
     /// caller must force the connection closed (never keep it alive for a
@@ -596,6 +685,9 @@ pub fn handleLocationProxyPass(
     defer proxy_temp_arena.deinit();
     const temp_allocator = proxy_temp_arena.allocator();
 
+    // Sticky affinity chooses an upstream and can mint a gateway-owned cookie.
+    // C1 does not partition or replay either, so establish applicability
+    // before considering a cache lookup and bypass the cache wholesale.
     var sticky_affinity = try prepareStickyAffinityRequest(
         temp_allocator,
         cfg,
@@ -605,6 +697,76 @@ pub fn handleLocationProxyPass(
         location_id,
         target,
     );
+
+    // #901: conservative, bounded GET response cache. Runs after every gate
+    // above it (auth/forward_auth/policy already settled this request) and
+    // before any upstream selection, so a hit never touches the upstream
+    // pool/circuit-breaker/retry machinery below at all.
+    var response_cache_key: ?[64]u8 = null;
+    if (cfg.proxy_cache_ttl_seconds > 0) {
+        const cache_method = request.method.toString();
+        if (!gpc.isCacheableRequest(
+            cfg,
+            matched_block,
+            cache_method,
+            &request.headers,
+            if (request.body) |body| body.len != 0 else false,
+            streaming_request_body != null,
+            encountered_identity_gate or ctx.authenticated or ctx.identity != null,
+        ) or sticky_affinity != null) {
+            state.metricsRecordProxyCacheOutcome(.bypass);
+        } else if (gs.proxyResponseCacheHasDynamicUpstream(cfg, upstream_pool, target)) {
+            state.metricsRecordProxyCacheOutcome(.bypass);
+        } else if (ga.shouldBypassProxyCache(&request.headers)) {
+            state.metricsRecordProxyCacheOutcome(.bypass);
+        } else {
+            var key_buf: [64]u8 = undefined;
+            _ = gpc.buildCacheKey(&key_buf, .{
+                .scheme = if (edge_config.hasTlsFiles(cfg)) "https" else "http",
+                .host = incoming_host orelse "",
+                .method = cache_method,
+                .location_id = location_id,
+                .upstream_target = target,
+                .path = request.uri.path,
+                .query = request.uri.query orelse "",
+            });
+            const lookup_now_ms = http.event_loop.monotonicMs();
+            const cache_hit = blk: {
+                break :blk state.proxyResponseCacheLookup(temp_allocator, ctx.config_generation, key_buf[0..], lookup_now_ms) catch {
+                    // The cache is an optimization: scratch allocation or an
+                    // internal cache error must not turn a live proxy request
+                    // into a gateway error.
+                    state.metricsRecordProxyCacheOutcome(.fill_error);
+                    break :blk null;
+                };
+            };
+            if (cache_hit) |hit| {
+                // Replay assembly is cache-only work. If it cannot allocate,
+                // leave the live upstream path available instead of turning
+                // an otherwise healthy request into an OOM response.
+                replay: {
+                    var prepared = prepareHttp1CacheReplay(temp_allocator, &hit) catch {
+                        state.metricsRecordProxyCacheOutcome(.fill_error);
+                        break :replay;
+                    };
+                    defer prepared.deinit(temp_allocator);
+                    const replay = .{
+                        .status_code = hit.status_code,
+                        .reason = hit.reason,
+                        .headers = prepared.headers,
+                        .body = hit.body,
+                    };
+                    state.metricsRecordProxyCacheOutcome(.hit);
+                    ctx.setUpstreamResult(target, hit.status_code, hit.body.len);
+                    try writeBufferedUpstreamResponseWithMetrics(writer, &replay, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, null, &state.metrics, &state.metrics_mutex);
+                    state.metricsRecord(hit.status_code);
+                    return hit.status_code;
+                }
+            }
+            state.metricsRecordProxyCacheOutcome(.miss);
+            response_cache_key = key_buf;
+        }
+    }
 
     const upstream_hash_key = if (suffix_path) |suffix| suffix else target;
     const selection: StickyUpstreamSelection = if (sticky_affinity) |*value|
@@ -941,6 +1103,13 @@ pub fn handleLocationProxyPass(
     };
     defer upstream_response.deinit(allocator);
     defer state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
+
+    if (response_cache_key) |key_bytes| {
+        const buffered = upstream_response.boundedBufferedForCompatibility();
+        tryFillResponseCache(temp_allocator, state, ctx.config_generation, cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered) catch {
+            state.metricsRecordProxyCacheOutcome(.fill_error);
+        };
+    }
 
     const transcript_redactions: []const []const u8 = if (request.headers.get("authorization")) |raw_auth|
         if (http.auth.parseBearerToken(raw_auth)) |token| &.{token} else &.{}

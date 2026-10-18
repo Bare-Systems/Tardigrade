@@ -277,6 +277,15 @@ pub fn build(b: *std.Build) void {
     tls_step.dependOn(&run_tls_core_tests.step);
     test_step.dependOn(&run_tls_core_tests.step);
 
+    // zig_compat.zig is imported as a module by many test targets above but
+    // was never itself a test root, so its own `test` blocks (connect/timeout
+    // bounding, host-name resolution, writevAllWith short-write handling,
+    // the default-SIGPIPE subprocess regression) never ran under `zig build
+    // test` or CI (#793).
+    const compat_tests = b.addTest(.{ .root_module = compat_mod });
+    const run_compat_tests = b.addRunArtifact(compat_tests);
+    test_step.dependOn(&run_compat_tests.step);
+
     // Session/PSK/ticket/resumption fuzz targets (#494, epic #326-K),
     // following the shared contract in docs/CRYPTO_FUZZ_CONTRACT.md and
     // #376's test-crypto-provider-fuzz naming pattern. The targets

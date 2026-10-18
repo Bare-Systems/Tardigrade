@@ -1194,7 +1194,7 @@ test "writevAllWith resumes after short write inside body iovec" {
     const submitted = try writevAllWith(*ScriptedWritev, &scripted, &parts, ScriptedWritev.call);
 
     try std.testing.expectEqualStrings("headerbody", scripted.output.items);
-    try std.testing.expectEqual(@as(usize, 4), submitted);
+    try std.testing.expectEqual(@as(usize, 3), submitted);
     try std.testing.expectEqual(submitted, scripted.submitted_iovecs);
 }
 

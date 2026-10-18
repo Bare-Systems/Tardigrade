@@ -1032,10 +1032,14 @@ fn gatedUpstreamThreadMain(server: *GatedUpstream) void {
         }
         if (server.stop_flag.load(.seq_cst)) return;
 
-        const body = "gated-ok";
+        // Keep this origin cacheable so callers can use the gate to hold a
+        // real cache fill across a reload.  Existing handoff tests only need
+        // the response to be a complete 200, while the reload regression
+        // below additionally needs an identifiable generation-A payload.
+        const body = "gated-origin-a";
         var out = std.array_list.Managed(u8).init(server.allocator);
         defer out.deinit();
-        out.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
+        out.print("HTTP/1.1 200 OK\r\nCache-Control: public, max-age=60\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
         conn.stream.writeAll(out.items) catch |err| {
             if (server.stop_flag.load(.seq_cst)) return;
             std.debug.print("gated upstream write failed: {}\n", .{err});
@@ -14780,6 +14784,284 @@ test "generic proxy_pass response cache bypasses native conditional and unsafe f
         try assertContains(second.body, case.second);
     }
     try std.testing.expectEqual(@as(u32, 9), origin.requestCount());
+}
+
+test "generic proxy response cache rejects an in-flight pre-reload fill (#901)" {
+    const allocator = std.testing.allocator;
+
+    // The A fixture does not answer until after generation B is published.
+    // Its `proxy_pass` target remains `/object` across the reload, so this is
+    // specifically a cache-epoch proof rather than a key-change proof.
+    var origin_a = try GatedUpstream.start(allocator);
+    defer origin_a.stop();
+    try origin_a.run();
+    const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
+    var origin_b = try UpstreamServer.start(allocator, &.{
+        .{ .body = "origin-b", .headers = fresh },
+        .{ .body = "origin-b-should-not-run", .headers = fresh },
+    });
+    defer origin_b.stop();
+    try origin_b.run();
+
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\upstream_base_url http://{s}:{d};
+        \\
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /object {{
+        \\    proxy_pass /object;
+        \\}}
+    , .{ test_host, origin_a.port() });
+    defer allocator.free(config_a);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_a,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    const InFlightResult = struct {
+        response: ?HttpResponse = null,
+        err: ?anyerror = null,
+
+        fn run(result: *@This(), port: u16) void {
+            result.response = sendRequest(std.heap.page_allocator, port, .{
+                .method = "GET",
+                .path = "/object",
+                .body = null,
+                .headers = &.{},
+            }) catch |err| {
+                result.err = err;
+                return;
+            };
+        }
+    };
+    var in_flight = InFlightResult{};
+    var request_thread: ?std.Thread = null;
+    defer {
+        origin_a.release();
+        if (request_thread) |thread| thread.join();
+    }
+    request_thread = try std.Thread.spawn(.{}, InFlightResult.run, .{ &in_flight, tardigrade.port });
+    try origin_a.waitEntered(5_000);
+
+    const config_b = try std.fmt.allocPrint(allocator,
+        \\upstream_base_url http://{s}:{d};
+        \\
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /object {{
+        \\    proxy_pass /object;
+        \\}}
+    , .{ test_host, origin_b.port() });
+    defer allocator.free(config_b);
+    try tardigrade.rewriteConfig(config_b);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    // Reload completion is observable before releasing A; polling the reload
+    // log avoids introducing a second live request that could populate B.
+    try waitForLogSubstring(allocator, tardigrade.log_path, "configuration hot-reload applied", 5_000);
+
+    // Only now can the old request complete.  Its leased generation must be
+    // rejected by the new cache rather than poisoning B's identical key.
+    origin_a.release();
+    request_thread.?.join();
+    request_thread = null;
+    if (in_flight.err) |err| return err;
+    var a_response = in_flight.response orelse return error.InvalidHttpResponse;
+    defer a_response.deinit();
+    try assertContains(a_response.body, "gated-origin-a");
+
+    var first_b = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/object", .body = null, .headers = &.{} });
+    defer first_b.deinit();
+    try assertContains(first_b.body, "origin-b");
+    try std.testing.expectEqual(@as(u32, 1), origin_b.requestCount());
+    var second_b = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/object", .body = null, .headers = &.{} });
+    defer second_b.deinit();
+    try assertContains(second_b.body, "origin-b");
+    try std.testing.expect(second_b.header("Age") != null);
+    try std.testing.expectEqual(@as(u32, 1), origin_b.requestCount());
+}
+
+test "generic proxy response cache bypasses valid session identities (#901)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "proxy-cache-sessions");
+    defer fixture.deinit();
+    const session_path = try fixture.joinAbs("sessions.json");
+    defer allocator.free(session_path);
+    const now = compat.nanoTimestamp();
+    const session_a = "a" ** 64;
+    const session_b = "b" ** 64;
+    const session_file = try std.fmt.allocPrint(
+        allocator,
+        "{{\"version\":1,\"entries\":[{{\"token\":\"{s}\",\"identity\":\"alice\",\"client_ip\":\"127.0.0.1\",\"device_id\":\"\",\"created_ns\":{d},\"last_active_ns\":{d},\"revoked\":false}},{{\"token\":\"{s}\",\"identity\":\"bob\",\"client_ip\":\"127.0.0.1\",\"device_id\":\"\",\"created_ns\":{d},\"last_active_ns\":{d},\"revoked\":false}}]}}",
+        .{ session_a, now, now, session_b, now, now },
+    );
+    defer allocator.free(session_file);
+    try fixture.writeRel("sessions.json", session_file);
+
+    const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "alice-origin", .headers = fresh },
+        .{ .body = "bob-origin", .headers = fresh },
+        .{ .body = "anonymous-origin", .headers = fresh },
+    });
+    defer origin.stop();
+    try origin.run();
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /identity {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" },
+            .{ .name = "TARDIGRADE_SESSION_STORE_PATH", .value = session_path },
+        },
+    });
+    defer tardigrade.stop();
+
+    var alice = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/identity", .body = null, .headers = &.{.{ .name = "X-Session-Token", .value = session_a }} });
+    defer alice.deinit();
+    try assertContains(alice.body, "alice-origin");
+    var bob = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/identity", .body = null, .headers = &.{.{ .name = "X-Session-Token", .value = session_b }} });
+    defer bob.deinit();
+    try assertContains(bob.body, "bob-origin");
+    var anonymous = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/identity", .body = null, .headers = &.{} });
+    defer anonymous.deinit();
+    try assertContains(anonymous.body, "anonymous-origin");
+    try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
+}
+
+test "generic proxy response cache keeps concurrent misses independent (#901)" {
+    const allocator = std.testing.allocator;
+    const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
+    // The first request remains at the origin while the second worker reaches
+    // the same cache key. Both must retain their live response ownership;
+    // only a later request may use the resulting bounded entry.
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "first-live", .headers = fresh, .delay_ms = 500 },
+        .{ .body = "second-live", .headers = fresh },
+        .{ .body = "must-not-run", .headers = fresh },
+    });
+    defer origin.stop();
+    try origin.run();
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /same {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" },
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const Result = struct {
+        response: ?HttpResponse = null,
+        err: ?anyerror = null,
+
+        fn run(result: *@This(), port: u16) void {
+            result.response = sendRequest(std.heap.page_allocator, port, .{
+                .method = "GET",
+                .path = "/same",
+                .body = null,
+                .headers = &.{},
+            }) catch |err| {
+                result.err = err;
+                return;
+            };
+        }
+    };
+    var first = Result{};
+    const first_thread = try std.Thread.spawn(.{}, Result.run, .{ &first, tardigrade.port });
+    // `requestCount == 1` means the first cache miss has escaped the gateway
+    // and is held at the origin before the second client begins.
+    try waitForUpstreamCount(&origin, 1, 5_000);
+    var second = Result{};
+    const second_thread = try std.Thread.spawn(.{}, Result.run, .{ &second, tardigrade.port });
+    first_thread.join();
+    second_thread.join();
+    if (first.err) |err| return err;
+    if (second.err) |err| return err;
+    var first_response = first.response orelse return error.InvalidHttpResponse;
+    defer first_response.deinit();
+    var second_response = second.response orelse return error.InvalidHttpResponse;
+    defer second_response.deinit();
+    try assertContains(first_response.body, "first-live");
+    try assertContains(second_response.body, "second-live");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+
+    var cached = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/same", .body = null, .headers = &.{} });
+    defer cached.deinit();
+    try std.testing.expect(cached.header("Age") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cached.body, "first-live") != null or std.mem.indexOf(u8, cached.body, "second-live") != null);
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+}
+
+test "generic proxy response cache never fills from a truncated origin response (#901)" {
+    const allocator = std.testing.allocator;
+    const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "truncated", .headers = fresh, .declared_content_length = 9, .truncate_body_after = 3 },
+        .{ .body = "complete-live", .headers = fresh },
+        .{ .body = "must-not-run", .headers = fresh },
+    });
+    defer origin.stop();
+    try origin.run();
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /object {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    var truncated = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/object", .body = null, .headers = &.{} });
+    defer truncated.deinit();
+    try std.testing.expect(truncated.status_code >= 500);
+    var live = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/object", .body = null, .headers = &.{} });
+    defer live.deinit();
+    try assertContains(live.body, "complete-live");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+    var cached = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/object", .body = null, .headers = &.{} });
+    defer cached.deinit();
+    try assertContains(cached.body, "complete-live");
+    try std.testing.expect(cached.header("Age") != null);
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
 }
 
 test "forward_auth refusals stay no-store despite global CDN cache headers over h1" {

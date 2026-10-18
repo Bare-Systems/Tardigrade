@@ -14424,6 +14424,7 @@ test "generic proxy_pass response cache serves a GET hit without a second upstre
     };
     var origin = try UpstreamServer.start(allocator, &.{
         .{ .status_code = 200, .body = "generation-one", .headers = fresh_for_one_second },
+        .{ .status_code = 200, .body = "bodyful-get", .headers = fresh_for_one_second },
         .{ .status_code = 200, .body = "generation-two", .headers = fresh_for_one_second },
     });
     defer origin.stop();
@@ -14465,6 +14466,19 @@ test "generic proxy_pass response cache serves a GET hit without a second upstre
     try std.testing.expect(second.header("Age") != null);
     try std.testing.expectEqualStrings("public, max-age=1", second.header("Cache-Control").?);
 
+    // A GET body is not represented in the cache key. It must bypass both
+    // lookup and fill: otherwise this could replay generation-one without
+    // forwarding the body, or overwrite it for a later bodyless GET.
+    var bodyful = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/public?a=1", .body = "request-body", .headers = &.{} });
+    defer bodyful.deinit();
+    try std.testing.expectEqual(@as(u16, 200), bodyful.status_code);
+    try assertContains(bodyful.body, "bodyful-get");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+    var bodyless_again = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/public?a=1", .body = null, .headers = &.{} });
+    defer bodyless_again.deinit();
+    try assertContains(bodyless_again.body, "generation-one");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+
     // After the 1-second origin freshness window elapses, the entry is no
     // longer fresh and a third GET must reach the origin again.
     compat.sleepNs(1_100 * std.time.ns_per_ms);
@@ -14472,7 +14486,7 @@ test "generic proxy_pass response cache serves a GET hit without a second upstre
     defer third.deinit();
     try std.testing.expectEqual(@as(u16, 200), third.status_code);
     try assertContains(third.body, "generation-two");
-    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+    try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
 }
 
 test "generic proxy_pass response cache isolates by query string and never shares Authorization/Set-Cookie responses (#901)" {

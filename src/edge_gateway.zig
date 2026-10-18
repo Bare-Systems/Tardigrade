@@ -9472,9 +9472,9 @@ test "H2 forward_auth grants carry across rewrites and are dropped by a later de
     try std.testing.expectEqual(@as(usize, 3), auth_server.requestCount());
 }
 
-/// Free an `H2ForwardAuthHarness`'s approvals test table, owned keys and all,
-/// without calling `ApprovalEntry.deinit` (private to `gateway_state.zig`).
-fn deinitH2ApprovalsTestMap(approvals: *std.StringHashMap(gs.ApprovalEntry), allocator: std.mem.Allocator) void {
+/// Free an approvals test table, owned keys and all, without calling
+/// `ApprovalEntry.deinit` (private to `gateway_state.zig`).
+fn deinitApprovalsTestMap(approvals: *std.StringHashMap(gs.ApprovalEntry), allocator: std.mem.Allocator) void {
     var it = approvals.iterator();
     while (it.next()) |entry| {
         allocator.free(entry.key_ptr.*);
@@ -9502,7 +9502,7 @@ test "H2 rewritten-path approval policy rejects a forward_auth-asserted token th
     h.state.approval_escalation_webhook = "";
     h.state.approval_ttl_ms = 60_000;
     h.state.approval_max_pending_per_identity = 0;
-    defer deinitH2ApprovalsTestMap(&h.state.approvals, allocator);
+    defer deinitApprovalsTestMap(&h.state.approvals, allocator);
 
     // A real, approved token for GET /guarded that the client never presented
     // -- only a (hypothetically compromised, or merely misconfigured)
@@ -9562,7 +9562,7 @@ test "H2 rewritten-path approval policy honors the client's own token despite a 
     h.state.approval_escalation_webhook = "";
     h.state.approval_ttl_ms = 60_000;
     h.state.approval_max_pending_per_identity = 0;
-    defer deinitH2ApprovalsTestMap(&h.state.approvals, allocator);
+    defer deinitApprovalsTestMap(&h.state.approvals, allocator);
 
     const minted = try h.state.approvalCreate(allocator, "GET", "/guarded", "", null);
     defer allocator.free(minted.token);
@@ -13166,6 +13166,114 @@ test "H1 later verifiers judge the caller's credential, not an earlier hop's min
     // An invalid bearer is 403 in built-in auth; the point is it is refused.
     try std.testing.expectEqual(@as(u16, 403), builtin_outcome.route_status);
     try std.testing.expect(std.mem.find(u8, builtin_conn.out.written(), "private-secret") == null);
+}
+
+test "H1 rewritten-path approval policy rejects a forward_auth-asserted token the client never presented (#887)" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.approval_mutex = .{};
+    state.approval_persist_mutex = .{};
+    state.approvals = std.StringHashMap(gs.ApprovalEntry).init(allocator);
+    state.approval_store_path = "";
+    state.approval_escalation_webhook = "";
+    state.approval_ttl_ms = 60_000;
+    state.approval_max_pending_per_identity = 0;
+    defer deinitApprovalsTestMap(&state.approvals, allocator);
+
+    // A real, approved token for GET /guarded that the client never
+    // presented. It arrives only as the earlier forward_auth service's
+    // upstream assertion.
+    const minted = try state.approvalCreate(allocator, "GET", "/guarded", "", null);
+    defer allocator.free(minted.token);
+    try std.testing.expect(state.approvalRespond(minted.token, .approve, "reviewer"));
+
+    const service_response = try std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\nX-Approval-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        .{minted.token},
+    );
+    defer allocator.free(service_response);
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{service_response});
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/old",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/guarded", .flag = .last } },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .upstream_headers = &.{"X-Approval-Token"} },
+        },
+        .{ .match_type = .exact, .pattern = "/guarded", .priority = 1, .action = .{ .return_response = .{ .status = 200, .body = "guarded-secret" } } },
+    };
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+    cfg.policy_approval_routes_raw = "GET|^/guarded$";
+
+    var effects = H1PreflightSideEffectProbe{};
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+    const outcome = try runH1ForwardAuthRequest(allocator, &cfg, "GET /old HTTP/1.1\r\nHost: example.test\r\n\r\n", &conn, &effects, &state);
+
+    const written = conn.out.written();
+    try std.testing.expectEqual(@as(u16, 403), outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, written, "Approval required") != null);
+    try std.testing.expect(std.mem.find(u8, written, "guarded-secret") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "cache-control: no-store") != null);
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+}
+
+test "H1 rewritten-path approval policy honors the client's own token despite a differing forward_auth assertion (#887)" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.approval_mutex = .{};
+    state.approval_persist_mutex = .{};
+    state.approvals = std.StringHashMap(gs.ApprovalEntry).init(allocator);
+    state.approval_store_path = "";
+    state.approval_escalation_webhook = "";
+    state.approval_ttl_ms = 60_000;
+    state.approval_max_pending_per_identity = 0;
+    defer deinitApprovalsTestMap(&state.approvals, allocator);
+
+    const minted = try state.approvalCreate(allocator, "GET", "/guarded", "", null);
+    defer allocator.free(minted.token);
+    try std.testing.expect(state.approvalRespond(minted.token, .approve, "reviewer"));
+
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nX-Approval-Token: not-a-real-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/old",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/guarded", .flag = .last } },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .upstream_headers = &.{"X-Approval-Token"} },
+        },
+        .{ .match_type = .exact, .pattern = "/guarded", .priority = 1, .action = .{ .return_response = .{ .status = 200, .body = "guarded-secret" } } },
+    };
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+    cfg.policy_approval_routes_raw = "GET|^/guarded$";
+
+    var effects = H1PreflightSideEffectProbe{};
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+    const raw_request = try std.fmt.allocPrint(allocator, "GET /old HTTP/1.1\r\nHost: example.test\r\nX-Approval-Token: {s}\r\n\r\n", .{minted.token});
+    defer allocator.free(raw_request);
+    const outcome = try runH1ForwardAuthRequest(allocator, &cfg, raw_request, &conn, &effects, &state);
+
+    try std.testing.expectEqual(@as(u16, 200), outcome.route_status);
+    try std.testing.expect(std.mem.find(u8, conn.out.written(), "guarded-secret") != null);
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
 }
 
 test "H1 forward_auth HEAD denial sends the challenge head without a body" {

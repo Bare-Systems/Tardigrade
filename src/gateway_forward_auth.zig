@@ -51,8 +51,9 @@ pub const Input = struct {
     /// streamed upload). Only consulted when `max_body_bytes > 0`.
     body: ?[]const u8,
     /// Header names earlier locations in a rewrite chain asserted upstream.
-    /// `headers` must be the client's original headers, so client copies of
-    /// these names are forged and are withheld from this verifier too.
+    /// `headers` must be the client's original headers.  Values that are
+    /// credentials remain available to later verifiers from that view, while
+    /// asserted identity headers are withheld.
     asserted_names: []const []const u8 = &.{},
 };
 
@@ -403,7 +404,13 @@ fn isConditionalOrRangeHeader(name: []const u8) bool {
 }
 
 fn isClientCredentialHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "authorization") or std.ascii.eqlIgnoreCase(name, "cookie");
+    return std.ascii.eqlIgnoreCase(name, "authorization") or
+        std.ascii.eqlIgnoreCase(name, "cookie") or
+        // Approval grants are bearer credentials supplied by the caller.
+        // A previous verifier may assert the same name for the origin, but a
+        // later verifier must receive the preserved caller credential rather
+        // than that assertion (or no credential at all).
+        std.ascii.eqlIgnoreCase(name, "x-approval-token");
 }
 
 fn isBodyHeader(name: []const u8) bool {

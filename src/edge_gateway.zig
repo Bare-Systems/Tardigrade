@@ -12796,6 +12796,11 @@ fn runH1ForwardAuthRequest(
     defer request.request.deinit();
     initForwardAuthProbeState(state);
     var ctx = http.request_context.RequestContext.init(allocator, "req-fa", "127.0.0.1");
+    // A real connection's `ctx` lives in a per-request arena; this helper
+    // uses the raw test allocator instead, so anything `setUpstreamResult`
+    // dupes onto it (reached once a test exercises `proxy_pass`) must be
+    // freed explicitly here or the leak detector flags it.
+    defer if (ctx.upstream_addr) |v| allocator.free(v);
     var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-fa", 0);
     var keep_alive = true;
     return executeH1PostPreflightOrchestration(
@@ -13274,6 +13279,294 @@ test "H1 rewritten-path approval policy honors the client's own token despite a 
     try std.testing.expectEqual(@as(u16, 200), outcome.route_status);
     try std.testing.expect(std.mem.find(u8, conn.out.written(), "guarded-secret") != null);
     try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+}
+
+test "H1 multi-hop rewritten approval always uses the caller token (#887)" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.approval_mutex = .{};
+    state.approval_persist_mutex = .{};
+    state.approvals = std.StringHashMap(gs.ApprovalEntry).init(allocator);
+    state.approval_store_path = "";
+    state.approval_escalation_webhook = "";
+    state.approval_ttl_ms = 60_000;
+    state.approval_max_pending_per_identity = 0;
+    defer deinitApprovalsTestMap(&state.approvals, allocator);
+
+    // The verifier assertion is a real approval grant, but it belongs to the
+    // origin request.  It must not become an approval credential for either
+    // rewritten policy gate.
+    const asserted = try state.approvalCreate(allocator, "GET", "/guarded", "", null);
+    defer allocator.free(asserted.token);
+    try std.testing.expect(state.approvalRespond(asserted.token, .approve, "reviewer"));
+    const caller = try state.approvalCreate(allocator, "GET", "/guarded", "", null);
+    defer allocator.free(caller.token);
+    try std.testing.expect(state.approvalRespond(caller.token, .approve, "reviewer"));
+    const service_response = try std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\nX-Approval-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        .{asserted.token},
+    );
+    defer allocator.free(service_response);
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{ service_response, service_response, service_response, service_response });
+    defer auth_server.stop();
+    try auth_server.run();
+    var url_buf: [64]u8 = undefined;
+
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/old",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/middle", .flag = .last } },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .upstream_headers = &.{"X-Approval-Token"} },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/middle",
+            .priority = 1,
+            .action = .{ .rewrite = .{ .replacement = "/guarded", .flag = .last } },
+            .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .upstream_headers = &.{"X-Approval-Token"} },
+        },
+        .{ .match_type = .exact, .pattern = "/guarded", .priority = 2, .action = .{ .return_response = .{ .status = 200, .body = "guarded-secret" } } },
+    };
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+    cfg.policy_approval_routes_raw = "GET|^/guarded$";
+    var effects = H1PreflightSideEffectProbe{};
+
+    // Neither verifier may turn its own assertion into the caller's grant.
+    var denied_conn = H2DispatchTestConn.init(allocator);
+    defer denied_conn.deinit();
+    const denied = try runH1ForwardAuthRequest(allocator, &cfg, "GET /old HTTP/1.1\r\nHost: example.test\r\n\r\n", &denied_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 403), denied.route_status);
+    try std.testing.expect(std.mem.find(u8, denied_conn.out.written(), "guarded-secret") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(denied_conn.out.written(), "cache-control: no-store") != null);
+    try std.testing.expectEqual(@as(usize, 2), auth_server.requestCount());
+
+    // A genuine caller grant traverses both rewrites, even though both
+    // verifiers assert a different real grant for the eventual origin.
+    var allowed_conn = H2DispatchTestConn.init(allocator);
+    defer allowed_conn.deinit();
+    const raw_request = try std.fmt.allocPrint(allocator, "GET /old HTTP/1.1\r\nHost: example.test\r\nX-Approval-Token: {s}\r\n\r\n", .{caller.token});
+    defer allocator.free(raw_request);
+    const allowed = try runH1ForwardAuthRequest(allocator, &cfg, raw_request, &allowed_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 200), allowed.route_status);
+    try std.testing.expect(std.mem.find(u8, allowed_conn.out.written(), "guarded-secret") != null);
+    try std.testing.expectEqual(@as(usize, 4), auth_server.requestCount());
+    try std.testing.expect(auth_server.requestContains(3, caller.token));
+    try std.testing.expect(!auth_server.requestContains(3, asserted.token));
+}
+
+test "H1 self-rewrite rechecks gates without trusting a verifier approval assertion (#887)" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.approval_mutex = .{};
+    state.approval_persist_mutex = .{};
+    state.approvals = std.StringHashMap(gs.ApprovalEntry).init(allocator);
+    state.approval_store_path = "";
+    state.approval_escalation_webhook = "";
+    state.approval_ttl_ms = 60_000;
+    state.approval_max_pending_per_identity = 0;
+    defer deinitApprovalsTestMap(&state.approvals, allocator);
+
+    const asserted = try state.approvalCreate(allocator, "GET", "/admin/guarded", "", null);
+    defer allocator.free(asserted.token);
+    try std.testing.expect(state.approvalRespond(asserted.token, .approve, "reviewer"));
+    const caller = try state.approvalCreate(allocator, "GET", "/admin/guarded", "", null);
+    defer allocator.free(caller.token);
+    try std.testing.expect(state.approvalRespond(caller.token, .approve, "reviewer"));
+    const service_response = try std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\nX-Approval-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        .{asserted.token},
+    );
+    defer allocator.free(service_response);
+    // The denied request reaches its first verifier; the allowed request
+    // reaches the same location twice, proving the gate-only hop rechecks it.
+    var auth_server = try gfa.TestAuthServer.start(allocator, &.{ service_response, service_response, service_response });
+    defer auth_server.stop();
+    try auth_server.run();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).makePath("admin");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "admin/guarded", .data = "guarded-secret" });
+    const doc_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(doc_root);
+    var url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/admin/",
+        .priority = 0,
+        .action = .{ .rewrite = .{ .replacement = "/admin/guarded", .flag = .last } },
+        .forward_auth = .{ .url = auth_server.url(&url_buf, "/verify"), .upstream_headers = &.{"X-Approval-Token"} },
+    }};
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+    cfg.doc_root = doc_root;
+    cfg.try_files = "";
+    cfg.policy_approval_routes_raw = "GET|^/admin/guarded$";
+    var effects = H1PreflightSideEffectProbe{};
+
+    var denied_conn = H2DispatchTestConn.init(allocator);
+    defer denied_conn.deinit();
+    const denied = try runH1ForwardAuthRequest(allocator, &cfg, "GET /admin/public HTTP/1.1\r\nHost: example.test\r\n\r\n", &denied_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 403), denied.route_status);
+    try std.testing.expect(std.mem.find(u8, denied_conn.out.written(), "guarded-secret") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(denied_conn.out.written(), "cache-control: no-store") != null);
+    try std.testing.expectEqual(@as(usize, 1), auth_server.requestCount());
+
+    var allowed_conn = H2DispatchTestConn.init(allocator);
+    defer allowed_conn.deinit();
+    const raw_request = try std.fmt.allocPrint(allocator, "GET /admin/public HTTP/1.1\r\nHost: example.test\r\nX-Approval-Token: {s}\r\n\r\n", .{caller.token});
+    defer allocator.free(raw_request);
+    const allowed = try runH1ForwardAuthRequest(allocator, &cfg, raw_request, &allowed_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 200), allowed.route_status);
+    try std.testing.expect(std.mem.find(u8, allowed_conn.out.written(), "guarded-secret") != null);
+    try std.testing.expectEqual(@as(usize, 3), auth_server.requestCount());
+    try std.testing.expect(auth_server.requestContains(2, "X-Forwarded-Uri: /admin/guarded"));
+    try std.testing.expect(auth_server.requestContains(2, caller.token));
+    try std.testing.expect(!auth_server.requestContains(2, asserted.token));
+}
+
+test "H1 rewrite preserves caller approval for later verifiers and the asserted grant for the origin (#887)" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.approval_mutex = .{};
+    state.approval_persist_mutex = .{};
+    state.approvals = std.StringHashMap(gs.ApprovalEntry).init(allocator);
+    state.approval_store_path = "";
+    state.approval_escalation_webhook = "";
+    state.approval_ttl_ms = 60_000;
+    state.approval_max_pending_per_identity = 0;
+    defer deinitApprovalsTestMap(&state.approvals, allocator);
+    // This is the only H1 forward_auth test whose location chain ends in a
+    // real `proxy_pass`, so (unlike its sibling tests above) it needs the
+    // upstream-dispatch state `initForwardAuthProbeState` doesn't set: that
+    // helper only covers the location-auth/forward_auth/response-writing
+    // fields exercised by `return_response`/static-file locations.
+    // Leaving these `undefined` lets the proxy path lock a garbage
+    // `circuit_mutex`/`upstream_mutex` and hang forever instead of failing.
+    state.circuit_mutex = .{};
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{});
+    state.upstream_mutex = .{};
+    state.upstream_health = std.StringHashMap(gs.UpstreamHealth).init(allocator);
+    state.upstream_active_requests = std.StringHashMap(usize).init(allocator);
+    state.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    state.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+    // No static upstream pool is configured, so `nextUpstreamBaseUrl` always
+    // consults `dns_discovery` (under its own mutex) before falling back —
+    // it must be a real `DnsDiscovery`, not `undefined`, even though
+    // discovery itself never activates here.
+    state.dns_discovery = http.dns_discovery.DnsDiscovery.init(allocator, .{});
+    state.transcript_mutex = .{};
+    state.transcript_store_path = "";
+    state.proxy_buffer_limits = .{
+        .per_stream_low_watermark = 256 * 1024,
+        .per_stream_high_watermark = 768 * 1024,
+        .per_stream_hard_limit = 1024 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    defer {
+        state.upstream_pool.deinit();
+        state.h2_pool.deinit();
+        state.dns_discovery.deinit();
+        var active_it = state.upstream_active_requests.keyIterator();
+        while (active_it.next()) |key| allocator.free(key.*);
+        state.upstream_active_requests.deinit();
+        var health_it = state.upstream_health.keyIterator();
+        while (health_it.next()) |key| allocator.free(key.*);
+        state.upstream_health.deinit();
+    }
+
+    const caller = try state.approvalCreate(allocator, "GET", "/guarded", "", null);
+    defer allocator.free(caller.token);
+    try std.testing.expect(state.approvalRespond(caller.token, .approve, "reviewer"));
+    const asserted = try state.approvalCreate(allocator, "GET", "/guarded", "", null);
+    defer allocator.free(asserted.token);
+    try std.testing.expect(state.approvalRespond(asserted.token, .approve, "reviewer"));
+    const a_response = try std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\nX-Approval-Token: {s}\r\nSet-Cookie: refreshed=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        .{asserted.token},
+    );
+    defer allocator.free(a_response);
+    var verifier_a = try gfa.TestAuthServer.start(allocator, &.{ a_response, a_response });
+    defer verifier_a.stop();
+    try verifier_a.run();
+    var verifier_b = try gfa.TestAuthServer.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    });
+    defer verifier_b.stop();
+    try verifier_b.run();
+    const public_origin = "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=600\r\nCDN-Cache-Control: public, max-age=3600\r\nCloudflare-CDN-Cache-Control: public, max-age=3600\r\nSurrogate-Control: max-age=3600\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    var origin = try gfa.TestAuthServer.start(allocator, &.{public_origin});
+    defer origin.stop();
+    try origin.run();
+
+    var a_url_buf: [64]u8 = undefined;
+    var b_url_buf: [64]u8 = undefined;
+    var origin_url_buf: [64]u8 = undefined;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/old",
+            .priority = 0,
+            .action = .{ .rewrite = .{ .replacement = "/guarded", .flag = .last } },
+            .forward_auth = .{
+                .url = verifier_a.url(&a_url_buf, "/verify"),
+                .upstream_headers = &.{"X-Approval-Token"},
+                .client_headers = &.{"Set-Cookie"},
+            },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/guarded",
+            .priority = 1,
+            .action = .{ .proxy_pass = origin.url(&origin_url_buf, "") },
+            .forward_auth = .{ .url = verifier_b.url(&b_url_buf, "/verify") },
+        },
+    };
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.location_blocks = blocks[0..];
+    cfg.policy_approval_routes_raw = "GET|^/guarded$";
+    var effects = H1PreflightSideEffectProbe{};
+
+    var granted_conn = H2DispatchTestConn.init(allocator);
+    defer granted_conn.deinit();
+    const raw_request = try std.fmt.allocPrint(allocator, "GET /old HTTP/1.1\r\nHost: example.test\r\nX-Approval-Token: {s}\r\n\r\n", .{caller.token});
+    defer allocator.free(raw_request);
+    const granted = try runH1ForwardAuthRequest(allocator, &cfg, raw_request, &granted_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 200), granted.route_status);
+    const written = granted_conn.out.written();
+    try std.testing.expect(std.mem.endsWith(u8, written, "ok"));
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "set-cookie: refreshed=1") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(written, "cache-control: no-store") != null);
+    inline for (.{ "public, max-age", "cdn-cache-control", "cloudflare-cdn-cache-control", "surrogate-control" }) |forbidden| {
+        try std.testing.expect(std.ascii.indexOfIgnoreCase(written, forbidden) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), verifier_a.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), verifier_b.requestCount());
+    try std.testing.expect(verifier_b.requestContains(0, caller.token));
+    try std.testing.expect(!verifier_b.requestContains(0, asserted.token));
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expect(origin.requestContains(0, asserted.token));
+    try std.testing.expect(!origin.requestContains(0, caller.token));
+
+    // A later request without the caller credential must not inherit either
+    // the prior response's cookie or its asserted origin-only approval.
+    var denied_conn = H2DispatchTestConn.init(allocator);
+    defer denied_conn.deinit();
+    const denied = try runH1ForwardAuthRequest(allocator, &cfg, "GET /old HTTP/1.1\r\nHost: example.test\r\n\r\n", &denied_conn, &effects, &state);
+    try std.testing.expectEqual(@as(u16, 403), denied.route_status);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(denied_conn.out.written(), "set-cookie: refreshed=1") == null);
+    try std.testing.expectEqual(@as(usize, 2), verifier_a.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), verifier_b.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
 }
 
 test "H1 forward_auth HEAD denial sends the challenge head without a body" {

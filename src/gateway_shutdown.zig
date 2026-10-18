@@ -1089,7 +1089,7 @@ fn publishDiscoveryMetrics(state: *GatewayState) void {
     state.metrics_mutex.unlock();
 }
 
-test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
+test "applyReloadedRuntimeConfig atomically swaps proxy cache generation and updates buffer limits" {
     const allocator = std.testing.allocator;
     var cfg = try edge_config.loadFromEnv(allocator);
     defer cfg.deinit(allocator);
@@ -1100,6 +1100,8 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
         .per_origin_hard_limit = 2 * 1024 * 1024,
         .global_hard_limit = 4 * 1024 * 1024,
     };
+    // Keep a real cache enabled across the two reload generations below.
+    cfg.proxy_cache_ttl_seconds = 60;
     cfg.tls_buffer_limits.outbound_ciphertext.high = cfg.tls_buffer_limits.outbound_ciphertext.low + 16;
 
     var state: GatewayState = undefined;
@@ -1155,18 +1157,54 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
 
     allocator.free(cfg.access_control_rules);
     cfg.access_control_rules = try allocator.dupe(u8, "deny 203.0.113.0/24");
-    var prepared_security = try PreparedReloadSecurity.init(allocator, &cfg);
-    defer prepared_security.deinit(allocator);
-    applyReloadedRuntimeConfig(&cfg, 2, &state, &prepared_security);
+    var first_security = try PreparedReloadSecurity.init(allocator, &cfg);
+    defer first_security.deinit(allocator);
+    applyReloadedRuntimeConfig(&cfg, 1, &state, &first_security);
     defer if (state.hsts_value.len > 0) allocator.free(state.hsts_value);
+    defer if (state.proxy_response_cache) |*cache| cache.deinit();
 
     // The ACL now belongs to the configuration version rather than to
     // `GatewayState`; `applyReloadedRuntimeConfig` leaves `prepared_security`
     // holding it until the new generation is installed.
     try std.testing.expectEqual(
         http.access_control.AccessResult.denied,
-        prepared_security.access_control.?.check("203.0.113.4"),
+        first_security.access_control.?.check("203.0.113.4"),
     );
+
+    // Model a response from generation A reaching its cache-fill point only
+    // after the live reload has installed generation B.  This is the exact
+    // interleaving an upstream held mid-response creates: the stale fill
+    // cannot populate B's new store, nor can a held A lease observe B's fill.
+    const cache_headers: []const gpc.CacheHeaderView = &.{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    try state.proxyResponseCachePut(1_000, 1, "same-relative-target", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = cache_headers,
+        .body = "origin-a",
+        .ttl_seconds = 60,
+    });
+    var second_security = try PreparedReloadSecurity.init(allocator, &cfg);
+    defer second_security.deinit(allocator);
+    applyReloadedRuntimeConfig(&cfg, 2, &state, &second_security);
+    try std.testing.expectError(error.ProxyResponseCacheGenerationMismatch, state.proxyResponseCachePut(1_001, 1, "same-relative-target", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = cache_headers,
+        .body = "late-origin-a",
+        .ttl_seconds = 60,
+    }));
+    try state.proxyResponseCachePut(1_002, 2, "same-relative-target", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = cache_headers,
+        .body = "origin-b",
+        .ttl_seconds = 60,
+    });
+    var cache_arena = std.heap.ArenaAllocator.init(allocator);
+    defer cache_arena.deinit();
+    try std.testing.expect((try state.proxyResponseCacheLookup(cache_arena.allocator(), 1, "same-relative-target", 1_003)) == null);
+    const generation_b = (try state.proxyResponseCacheLookup(cache_arena.allocator(), 2, "same-relative-target", 1_003)).?;
+    try std.testing.expectEqualStrings("origin-b", generation_b.body);
 
     const prom = try state.metricsToPrometheus(allocator);
     defer allocator.free(prom);

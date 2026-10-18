@@ -14714,6 +14714,74 @@ test "generic proxy_pass response cache never stores finite SSE responses (#901)
     try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
 }
 
+test "generic proxy_pass response cache bypasses native conditional and unsafe freshness responses (#901)" {
+    const allocator = std.testing.allocator;
+    const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
+    const no_store: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, no-store, max-age=60" }};
+    const private: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "private, max-age=60" }};
+    const vary: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "Vary", .value = "Accept-Language" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "seed", .headers = fresh },
+        .{ .body = "range-origin", .headers = fresh },
+        .{ .body = "conditional-origin", .headers = fresh },
+        .{ .body = "no-store-one", .headers = no_store },
+        .{ .body = "no-store-two", .headers = no_store },
+        .{ .body = "private-one", .headers = private },
+        .{ .body = "private-two", .headers = private },
+        .{ .body = "vary-one", .headers = vary },
+        .{ .body = "vary-two", .headers = vary },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /object {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    var seed = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/object", .body = null, .headers = &.{} });
+    defer seed.deinit();
+    try assertContains(seed.body, "seed");
+    // These must bypass the seeded entry -- C1 does not implement partial or
+    // validator semantics, so replaying a whole cached representation is unsafe.
+    var range = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/object", .body = null, .headers = &.{.{ .name = "Range", .value = "bytes=0-2" }} });
+    defer range.deinit();
+    try assertContains(range.body, "range-origin");
+    var conditional = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/object", .body = null, .headers = &.{.{ .name = "If-None-Match", .value = "\"etag\"" }} });
+    defer conditional.deinit();
+    try assertContains(conditional.body, "conditional-origin");
+
+    inline for (.{
+        .{ .path = "/object/no-store", .first = "no-store-one", .second = "no-store-two" },
+        .{ .path = "/object/private", .first = "private-one", .second = "private-two" },
+        .{ .path = "/object/vary", .first = "vary-one", .second = "vary-two" },
+    }) |case| {
+        var first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = case.path, .body = null, .headers = &.{} });
+        defer first.deinit();
+        try assertContains(first.body, case.first);
+        var second = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = case.path, .body = null, .headers = &.{} });
+        defer second.deinit();
+        try assertContains(second.body, case.second);
+    }
+    try std.testing.expectEqual(@as(u32, 9), origin.requestCount());
+}
+
 test "forward_auth refusals stay no-store despite global CDN cache headers over h1" {
     const allocator = std.testing.allocator;
 

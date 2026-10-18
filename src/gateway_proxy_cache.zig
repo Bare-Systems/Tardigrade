@@ -667,3 +667,46 @@ test "ProxyResponseCache fails open on an oversized object and a full store" {
     }));
     try std.testing.expectEqual(@as(usize, 1), small_cache.map.count());
 }
+
+test "ProxyResponseCache preserves a live entry when cache-only copies run out of memory" {
+    // Cache memory is strictly opportunistic.  A failed lookup copy must not
+    // damage the resident entry, and a failed replacement must leave the old
+    // representation available to a later request using a healthy allocator.
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 1,
+        .max_total_bytes = 4096,
+    });
+    defer cache.deinit();
+    try cache.put(0, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Cache-Control", .value = "max-age=60" }},
+        .body = "live-body",
+        .ttl_seconds = 60,
+    });
+
+    var lookup_fail = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, cache.lookup(lookup_fail.allocator(), "key", 1));
+
+    // The map has already reserved capacity for this key, so the first cache
+    // allocation is one of the replacement's owned copies.  Its failure must
+    // happen before `removeLocked` can retire the old entry.
+    var put_fail = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    cache.allocator = put_fail.allocator();
+    try std.testing.expectError(error.OutOfMemory, cache.put(1, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{},
+        .body = "replacement-body",
+        .ttl_seconds = 60,
+    }));
+    cache.allocator = allocator;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const hit = (try cache.lookup(arena.allocator(), "key", 2)).?;
+    try std.testing.expectEqualStrings("live-body", hit.body);
+    try std.testing.expectEqual(@as(usize, 1), cache.map.count());
+}

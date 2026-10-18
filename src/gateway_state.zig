@@ -1165,6 +1165,51 @@ pub const GatewayState = struct {
         try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 7, "key", 1_001)) != null);
     }
 
+    test "proxy response cache serializes racing fills without exceeding its cap" {
+        // Two origin responses can complete at nearly the same instant.  The
+        // gateway lock must make this a one-entry store rather than a
+        // check-then-insert race that transiently exceeds the configured cap.
+        var state: GatewayState = undefined;
+        state.allocator = std.testing.allocator;
+        state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
+            .max_object_bytes = 1024,
+            .max_entries = 1,
+            .max_total_bytes = 1024,
+        });
+        state.proxy_response_cache_generation = 9;
+        defer state.proxy_response_cache.?.deinit();
+
+        const Fill = struct {
+            fn run(target: *GatewayState, body: []const u8) void {
+                target.proxyResponseCachePut(1_000, 9, "same-key", .{
+                    .status_code = 200,
+                    .reason = "OK",
+                    .headers = &.{},
+                    .body = body,
+                    .ttl_seconds = 60,
+                }) catch {};
+            }
+        };
+        const first = try std.Thread.spawn(.{}, Fill.run, .{ &state, "first-response" });
+        const second = try std.Thread.spawn(.{}, Fill.run, .{ &state, "second-response" });
+        first.join();
+        second.join();
+
+        {
+            state.proxy_response_cache_mutex.lock();
+            defer state.proxy_response_cache_mutex.unlock();
+            const cache = &state.proxy_response_cache.?;
+            try std.testing.expectEqual(@as(usize, 1), cache.map.count());
+            try std.testing.expect(cache.total_bytes <= cache.limits.max_total_bytes);
+        }
+
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const hit = (try state.proxyResponseCacheLookup(arena.allocator(), 9, "same-key", 1_001)).?;
+        try std.testing.expect(std.mem.eql(u8, hit.body, "first-response") or std.mem.eql(u8, hit.body, "second-response"));
+    }
+
     pub fn createSession(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8, client_ip: []const u8, device_id: ?[]const u8) ![]const u8 {
         self.session_mutex.lock();
         defer self.session_mutex.unlock();

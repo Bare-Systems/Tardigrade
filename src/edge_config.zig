@@ -333,6 +333,11 @@ pub const EdgeConfig = struct {
     /// (docs/ACME_AUTOMATIC_HTTPS.md §8.0, #881). Startup-fixed; must differ
     /// from the main listener.
     tls_acme_http01_listen: []const u8,
+    /// `TARDIGRADE_TLS_HTTPS_REDIRECT` (directive `https_redirect`, #884,
+    /// design §8.3): optional `308` HTTP->HTTPS redirect served by the
+    /// dedicated ACME HTTP-01 listener, for managed hosts only, only once
+    /// published. Only valid with `tls_acme_enabled`.
+    tls_https_redirect: bool,
     http1_enabled: bool,
     http2_enabled: bool,
     tls_http1_no_alpn_fallback: bool,
@@ -1109,6 +1114,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     };
     const tls_acme_http01_listen = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", "", "0.0.0.0:80") catch unreachable;
     errdefer allocator.free(tls_acme_http01_listen);
+    // #884 (G8/design §8.3): naming it `TARDIGRADE_TLS_HTTPS_REDIRECT`
+    // (not `..._HTTP_REDIRECT`) keeps it consistent with the generic
+    // config-file directive alias (`https_redirect` -> `TARDIGRADE_HTTPS_REDIRECT`
+    // via `acmeDirectiveAlias`'s mechanical `TARDIGRADE_TLS_X` -> `TARDIGRADE_X`
+    // stripping); a `TLS_HTTP_REDIRECT` name would silently never match the
+    // directive-derived alias.
+    const tls_https_redirect = acmeEnvBool(allocator, "TARDIGRADE_TLS_HTTPS_REDIRECT", "", false);
     const upstream_protocol_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_PROTOCOL", "http1") catch unreachable;
     defer allocator.free(upstream_protocol_str);
     const upstream_protocol = try parseUpstreamProtocolConfig(upstream_protocol_str);
@@ -1897,6 +1909,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_acme_challenges = tls_acme_challenges,
         .tls_acme_eab_requested = tls_acme_eab_requested,
         .tls_acme_http01_listen = tls_acme_http01_listen,
+        .tls_https_redirect = tls_https_redirect,
         .http1_enabled = http1_enabled,
         .http2_enabled = http2_enabled,
         .tls_http1_no_alpn_fallback = tls_http1_no_alpn_fallback,
@@ -3844,17 +3857,25 @@ fn acmeSettingsNonDefault(cfg: *const EdgeConfig) bool {
         cfg.tls_acme_agree_tos or
         cfg.tls_acme_ca_bundle_path.len != 0 or
         !std.mem.eql(u8, cfg.tls_acme_challenges, "http-01") or
-        !std.mem.eql(u8, cfg.tls_acme_http01_listen, default_acme_http01_listen);
+        !std.mem.eql(u8, cfg.tls_acme_http01_listen, default_acme_http01_listen) or
+        cfg.tls_https_redirect;
 }
 
-/// `tardi run` has nothing that can serve or activate an ACME-managed
-/// certificate until the activation phase, so even an experimental build must
-/// not start a listener with ACME enabled. `tardi acme-account` is the only
-/// consumer of the validated configuration in this phase.
-pub fn rejectAcmeRuntime(cfg: *const EdgeConfig) !void {
+/// Design §4.7: a hostname present in both a manual SNI mapping
+/// (`TARDIGRADE_TLS_SNI_CERTS`) and `acme_domains` is a config error.
+/// Silent precedence would hide an expired manual cert or a stale managed
+/// one; the default identity (no hostname of its own) is unaffected and may
+/// freely coexist with managed names (§4.7, §7.4).
+fn validateAcmeManualOverlap(cfg: *const EdgeConfig) !void {
     if (!cfg.tls_acme_enabled) return;
-    logConfigDiagnostic("config validation failed: TARDIGRADE_TLS_AUTOMATIC_HTTPS cannot run a server yet; use `tardi acme-account` to bootstrap the ACME account (certificate issuance and activation are not implemented)", .{});
-    return error.UnsupportedNativeTlsConfiguration;
+    for (cfg.tls_sni_certs) |sni| {
+        for (cfg.tls_acme_domains) |managed| {
+            if (std.ascii.eqlIgnoreCase(sni.server_name, managed)) {
+                logConfigDiagnostic("config validation failed: '{s}' is configured both as a manual TARDIGRADE_TLS_SNI_CERTS hostname and an ACME-managed TARDIGRADE_TLS_ACME_DOMAINS hostname; see docs/ACME_AUTOMATIC_HTTPS.md §4.7", .{sni.server_name});
+                return error.InvalidConfigValue;
+            }
+        }
+    }
 }
 
 fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
@@ -3864,10 +3885,15 @@ fn validateNativeTlsBuildConfig(cfg: *const EdgeConfig) !void {
     // yet. Every check after the gate concerns behavior of an active local
     // identity and is inert without one.
     try validateAcmeConfig(cfg);
-    // The profile gate (§4.6) and the experimental gate (§4.5): until the
-    // release-gating phase, enabling ACME is only accepted by general-profile
-    // builds compiled with -Dacme-experimental, and even then `run` refuses it
-    // (see `rejectAcmeRuntime`).
+    try validateAcmeManualOverlap(cfg);
+    // The profile gate (§4.6) and the experimental gate (§4.5): enabling
+    // ACME is only accepted by general-profile builds compiled with
+    // `-Dacme-experimental`; `tardi run` activates it for real (#884) once
+    // this gate passes -- `rejectAcmeRuntime`'s blanket "not implemented
+    // yet" refusal, which previously stopped every build here regardless of
+    // this gate, is gone (the whole reason A4 existed was to lift it). The
+    // experimental gate and the release-support claim in
+    // `docs/SUPPORT_MATRIX.md` stay closed until A7 (#837).
     if (cfg.tls_acme_enabled and (!build_options.acme_experimental or is_appliance_tls_profile)) {
         logConfigDiagnostic("config validation failed: native-TLS builds do not support TARDIGRADE_TLS_ACME_ENABLED (ACME issuance/renewal is not implemented by native Tardigrade and #649 retired the only production build that ever supported it, #634)", .{});
         return error.UnsupportedNativeTlsConfiguration;
@@ -5657,8 +5683,9 @@ test "native-TLS builds reject legacy OpenSSL-only TLS settings one at a time" {
         try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(&cfg));
     }
     {
-        // A fully valid automatic-HTTPS grammar still hits the final
-        // "not supported yet" gate (#832 validates, it does not enable).
+        // A fully valid automatic-HTTPS grammar passes validation outright
+        // on an experimental general-profile build (#884); every other
+        // build still hits the final "not supported yet" gate.
         var cfg = base;
         var domains = [_][]const u8{"example.com"};
         setValidAcmeForTest(&cfg, &domains);
@@ -5679,12 +5706,11 @@ test "native-TLS builds reject legacy OpenSSL-only TLS settings one at a time" {
 }
 
 /// A valid automatic-HTTPS configuration is rejected by the support gate in
-/// ordinary builds, and accepted only by general-profile `-Dacme-experimental`
-/// builds (where `run` still refuses it).
+/// ordinary builds, and accepted (#884: including by `tardi run`, not just
+/// validation) only by general-profile `-Dacme-experimental` builds.
 fn expectAcmeGateForTest(cfg: *const EdgeConfig) !void {
     if (build_options.acme_experimental and !is_appliance_tls_profile) {
         try validateNativeTlsBuildConfig(cfg);
-        try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, rejectAcmeRuntime(cfg));
     } else {
         try std.testing.expectError(error.UnsupportedNativeTlsConfiguration, validateNativeTlsBuildConfig(cfg));
     }
@@ -5856,7 +5882,7 @@ test "automatic HTTPS grammar is validated before the support gate (#832)" {
     }
     // §4.5 step 1: with the opt-in off, every non-default ACME field is an
     // error, one field at a time; reserved EAB too.
-    for (0..12) |which| {
+    for (0..13) |which| {
         var cfg = base;
         switch (which) {
             0 => cfg.tls_acme_directory_url = "https://ca.example/dir",
@@ -5870,10 +5896,31 @@ test "automatic HTTPS grammar is validated before the support gate (#832)" {
             8 => cfg.tls_acme_ca_bundle_path = "/etc/ssl/cert.pem",
             9 => cfg.tls_acme_challenges = "tls-alpn-01",
             10 => cfg.tls_acme_eab_requested = true,
-            else => cfg.tls_acme_http01_listen = "127.0.0.1:8080",
+            11 => cfg.tls_acme_http01_listen = "127.0.0.1:8080",
+            // #884 (G8): `https_redirect` follows the same "requires
+            // automatic_https" rule as every other `acme_*` setting.
+            else => cfg.tls_https_redirect = true,
         }
         try std.testing.expectError(error.InvalidConfigValue, validateNativeTlsBuildConfig(&cfg));
     }
+}
+
+test "validateAcmeManualOverlap rejects a hostname configured both as a manual SNI cert and an ACME-managed domain (#884 §4.7)" {
+    const allocator = std.testing.allocator;
+    var base = try loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var domains = [_][]const u8{"a.example.com"};
+
+    var cfg = base;
+    setValidAcmeForTest(&cfg, &domains);
+    cfg.tls_acme_domains_spec = "a.example.com";
+    var sni_certs = [_]EdgeConfig.TlsSniCert{.{ .server_name = "A.Example.Com", .cert_path = "/tmp/a.crt", .key_path = "/tmp/a.key" }};
+    cfg.tls_sni_certs = &sni_certs;
+    try std.testing.expectError(error.InvalidConfigValue, validateNativeTlsBuildConfig(&cfg));
+
+    // An unrelated manual hostname coexists fine.
+    sni_certs[0].server_name = "manual.example.com";
+    try validateAcmeManualOverlap(&cfg);
 }
 
 test "config-file ACME directives reach EdgeConfig and validate (#832)" {

@@ -23116,6 +23116,66 @@ test "native TLS listener check rejects ACME on native builds even without crede
     try assertContains(result.stderr, "TARDIGRADE_TLS_ACME_ENABLED");
 }
 
+test "automatic HTTPS (#884, G11): a real fresh-start experimental tardi run selects native TLS, never plaintext, before any certificate is issued" {
+    if (!integration_options.acme_experimental or std.mem.eql(u8, build_options.tls_profile, "appliance")) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+
+    const state_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-acme-g11-{d}", .{compat.nanoTimestamp()});
+    defer allocator.free(state_rel);
+    try compat.cwd().makePath(state_rel);
+    defer compat.cwd().deleteTree(state_rel) catch {};
+
+    const http01_port = try findFreePort();
+    const http01_listen = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{http01_port});
+    defer allocator.free(http01_listen);
+
+    // No `TARDIGRADE_TLS_CERT_PATH`/`_KEY_PATH`: this is the ACME-only
+    // first-boot case design §7.4.1 requires TLS for, with nothing to
+    // activate yet. The directory URL is deliberately unreachable (nothing
+    // listens on port 1) so the one-shot background bootstrap issuance
+    // attempt fails fast; the main listener's TLS topology must not depend
+    // on that attempt's outcome.
+    var tardigrade = try TardigradeProcess.spawn(allocator, .{
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_AUTOMATIC_HTTPS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_AGREE_TOS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_STATE_DIR", .value = state_rel },
+            .{ .name = "TARDIGRADE_TLS_ACME_DOMAINS", .value = "example.com" },
+            .{ .name = "TARDIGRADE_TLS_ACME_DIRECTORY_URL", .value = "https://127.0.0.1:1/directory" },
+            .{ .name = "TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", .value = "src/pki/testdata/ecdsa_p256_ca.crt" },
+            .{ .name = "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", .value = http01_listen },
+        },
+    });
+    defer tardigrade.stop();
+
+    // Poll with a plain HTTP/1.1 request (never a TLS ClientHello) until the
+    // port accepts connections, then require that it never completes a
+    // plaintext HTTP response: a native TLS listener either resets the
+    // connection or answers with bytes `readHttpResponse` cannot parse as
+    // HTTP once it tries to decode the plaintext bytes as a TLS record --
+    // never a valid status line. `ConnectionRefused` just means the
+    // listener has not bound yet.
+    var attempts: usize = 0;
+    while (true) : (attempts += 1) {
+        if (sendRawRequest(allocator, tardigrade.port, "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")) |resp| {
+            var r = resp;
+            defer r.deinit();
+            return error.UnexpectedPlaintextHttpResponseOnTlsOnlyListener;
+        } else |err| {
+            if (err == error.ConnectionRefused) {
+                if (attempts >= 100) return err;
+                compat.sleepNs(50 * std.time.ns_per_ms);
+                continue;
+            }
+            // Any other failure (reset, EOF, malformed response) is the
+            // required "not plaintext HTTP" outcome.
+            break;
+        }
+    }
+}
+
 test "appliance hot reload rejects turning TLS on for a server that started plaintext" {
     try requireApplianceTlsProfile();
     try requireNativeTlsProfile();

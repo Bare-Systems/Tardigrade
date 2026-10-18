@@ -15,9 +15,13 @@ pub const transport = @import("transport.zig");
 pub const client = @import("client.zig");
 pub const activate = @import("activate.zig");
 pub const orders = @import("orders.zig");
+pub const groups = @import("groups.zig");
 
 /// Test-only fake CA (see `fake_ca.zig`); absent from non-test builds.
 pub const fake_ca = if (@import("builtin").is_test) @import("fake_ca.zig") else struct {};
+/// Test-only real-crypto certificate builder (see `test_cert_builder.zig`);
+/// absent from non-test builds.
+pub const test_cert_builder = if (@import("builtin").is_test) @import("test_cert_builder.zig") else struct {};
 
 comptime {
     if (@import("builtin").is_test) {

@@ -19,6 +19,28 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **Automatic HTTPS bootstrap, activation and HTTP→HTTPS redirect for
+  experimental builds (#884, epic #759 phase A4, child of #834).** On a
+  general-profile build compiled with `-Dacme-experimental`,
+  `TARDIGRADE_TLS_AUTOMATIC_HTTPS=true` now drives a real, running `tardi
+  run` end to end: the main listener selects native TLS from process start
+  even before any certificate exists (handshakes for managed hostnames fail
+  closed with `NoCredentialAvailable`, never plaintext, never a self-signed
+  stand-in); a restart recovers and republishes the last committed
+  generation from disk with no network access; a background bootstrap makes
+  one issuance attempt per managed group still missing a certificate,
+  verifying (§6.4: chain coherence, key binding, exact SAN match, validity
+  window) and durably persisting before ever publishing; and a new optional
+  `TARDIGRADE_TLS_HTTPS_REDIRECT` (directive `https_redirect`) serves a
+  `308` HTTP→HTTPS redirect from the dedicated HTTP-01 listener for managed
+  hosts only, only once published. A hostname configured both as a manual
+  `TARDIGRADE_TLS_SNI_CERTS` entry and an ACME-managed domain is now a
+  config error. `rejectAcmeRuntime`, the blanket `tardi run` refusal every
+  ACME-enabled config hit regardless of build flags, is gone — the
+  experimental build/general-profile gate is what is left. This is not the
+  renewal worker (#835) or TLS-ALPN-01/multi-SNI (#836): no scheduler, no
+  periodic renewal, no release/support claim (`-Dacme-experimental` stays
+  off by default and `docs/SUPPORT_MATRIX.md` is unchanged until A7, #837).
 - **Conservative in-memory `proxy_pass` response caching (#901).** Setting
   `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` above `0` now turns on a bounded,
   shared, in-memory GET response cache for the generic reverse-proxy data

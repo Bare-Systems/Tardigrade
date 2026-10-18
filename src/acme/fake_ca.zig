@@ -266,6 +266,14 @@ pub const LiveValidate = struct {
     validateFn: *const fn (ctx: ?*anyopaque, host: []const u8, token: []const u8, key_authorization: []const u8) bool,
 };
 
+/// Optional test-only issuer for an actual certificate matching the public
+/// key in the submitted CSR. The normal fake response remains deliberately
+/// malformed so negative validation coverage keeps its original behavior.
+pub const IssuedChainFactory = struct {
+    ctx: ?*anyopaque = null,
+    makeFn: *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator, csr_der: []const u8, hostnames: []const []const u8) anyerror![]u8,
+};
+
 pub const FakeCa = struct {
     allocator: std.mem.Allocator,
     base: []const u8 = "https://ca.test",
@@ -274,6 +282,7 @@ pub const FakeCa = struct {
     clock_sink: ClockSink = .{},
     /// See `LiveValidate`.
     live_validate: ?LiveValidate = null,
+    issued_chain_factory: ?IssuedChainFactory = null,
 
     nonce_seq: u64 = 0,
     valid_nonces: std.StringHashMapUnmanaged(void) = .empty,
@@ -305,11 +314,13 @@ pub const FakeCa = struct {
         rate_limited_remaining: u32,
         transient_remaining: u32,
         certificate_id: ?usize = null,
+        csr_der: ?[]u8 = null,
 
         fn deinit(self: *Order, allocator: std.mem.Allocator) void {
             for (self.identifiers.items) |id| allocator.free(id);
             self.identifiers.deinit(allocator);
             self.authz_ids.deinit(allocator);
+            if (self.csr_der) |csr_der| allocator.free(csr_der);
         }
     };
 
@@ -1168,6 +1179,18 @@ pub const FakeCa = struct {
         }
 
         var order = &self.orders.items[id - 1];
+        if (self.issued_chain_factory != null) {
+            const CsrPayload = struct { csr: []const u8 };
+            var parsed = std.json.parseFromSlice(CsrPayload, allocator, v.payload, .{ .ignore_unknown_fields = false }) catch return self.notFound(allocator, resp);
+            defer parsed.deinit();
+            const decoder = std.base64.url_safe_no_pad.Decoder;
+            const decoded_len = decoder.calcSizeForSlice(parsed.value.csr) catch return self.notFound(allocator, resp);
+            const csr_der = try allocator.alloc(u8, decoded_len);
+            errdefer allocator.free(csr_der);
+            decoder.decode(csr_der, parsed.value.csr) catch return self.notFound(allocator, resp);
+            if (order.csr_der) |old| allocator.free(old);
+            order.csr_der = csr_der;
+        }
         order.finalized = true;
         order.status = .processing;
         const status_str = b.status_override orelse "processing";
@@ -1234,7 +1257,10 @@ pub const FakeCa = struct {
             } else {
                 order.status = if (b.final_status == .valid) .valid else .invalid;
                 if (order.status == .valid) {
-                    const cert_pem = try buildFakeCertPem(self.allocator);
+                    const cert_pem = if (self.issued_chain_factory) |factory|
+                        factory.makeFn(factory.ctx, self.allocator, order.csr_der orelse return self.notFound(allocator, resp), order.identifiers.items) catch return error.OutOfMemory
+                    else
+                        try buildFakeCertPem(self.allocator);
                     try self.certificates.append(self.allocator, cert_pem);
                     order.certificate_id = self.certificates.items.len;
                 }

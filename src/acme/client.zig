@@ -655,6 +655,87 @@ pub const Session = struct {
         return session;
     }
 
+    /// Opens an account while holding the state-directory lock only around
+    /// durable reads and writes.  In particular, first-account registration
+    /// performs directory/nonce/new-account network I/O after the initial
+    /// state transaction has closed.  Long-running gateway work must use
+    /// this variant so a harmless config reload cannot be rejected merely
+    /// because an ACME endpoint is slow to register a new account.
+    ///
+    /// A second short transaction before persisting reconciles a record that
+    /// another process may have written while the CA request was in flight.
+    pub fn openUnlocked(
+        allocator: std.mem.Allocator,
+        transport: *const Transport,
+        state_dir_path: []const u8,
+        config: Config,
+        now_unix: i64,
+    ) Error!*Session {
+        const session = try allocator.create(Session);
+        errdefer allocator.destroy(session);
+        session.allocator = allocator;
+
+        var initial_record = blk: {
+            var state = try StateDir.open(state_dir_path);
+            defer state.close();
+            if (config.account_key_path.len > 0) {
+                session.key = try state_mod.loadPreprovisionedKey(config.account_key_path);
+            } else {
+                const loaded = try state_mod.loadOrCreateAccountKey(&state, allocator);
+                session.key = loaded.key;
+            }
+            break :blk state_mod.loadAccountRecord(&state, allocator, config.directory_url) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        };
+        errdefer session.key.deinit();
+
+        session.client = try Client.init(allocator, transport, &session.key, config);
+        errdefer session.client.deinit();
+
+        if (initial_record) |*record| {
+            defer record.deinit();
+            try session.installPersistedRecord(record.record());
+            return session;
+        }
+
+        const created = try session.client.registerAccount();
+        var state = try StateDir.open(state_dir_path);
+        defer state.close();
+        var record = state_mod.loadAccountRecord(&state, allocator, config.directory_url) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return session.client.fail(err),
+        };
+        if (record) |*existing| {
+            defer existing.deinit();
+            // Another process registered the same key while we were doing
+            // network I/O. Its durable record wins; never overwrite it.
+            try session.installPersistedRecord(existing.record());
+            return session;
+        }
+
+        const hash = state_mod.contactHash(if (config.contact_email.len == 0) "" else config.contact_email);
+        state_mod.saveAccountRecord(&state, allocator, .{
+            .directory = config.directory_url,
+            .kid = session.client.kid.?,
+            .key_thumbprint = &session.key.jwk().thumbprint(),
+            .created_at = now_unix,
+            .contact_hash = &hash,
+        }) catch |err| return session.client.failLocked(err);
+        if (created) session.client.diagnostics.accounts_created +|= 1 else session.client.diagnostics.accounts_reused +|= 1;
+        session.created = created;
+        return session;
+    }
+
+    fn installPersistedRecord(self: *Session, record: state_mod.AccountRecord) Error!void {
+        self.client.setKid(record.kid) catch return self.client.fail(error.CorruptState);
+        const current = self.key.jwk().thumbprint();
+        if (!std.mem.eql(u8, record.key_thumbprint, &current)) return self.client.fail(error.InconsistentState);
+        self.client.diagnostics.accounts_reused +|= 1;
+        self.created = false;
+    }
+
     pub fn close(self: *Session) void {
         const allocator = self.allocator;
         self.client.deinit();

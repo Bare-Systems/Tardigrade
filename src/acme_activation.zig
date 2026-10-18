@@ -326,16 +326,12 @@ fn runBootstrapWithDialer(ctx: *BootstrapCtx, dialer: acme.transport.Dialer) !vo
     // the potentially minutes-long HTTP-01 order/polling loop.  The session
     // retains its key/client after this scope, so routine SIGHUP reloads can
     // read the last committed managed set while issuance is in flight.
-    const session = blk: {
-        var state = try acme.state.StateDir.open(ctx.state_dir_path);
-        defer state.close();
-        break :blk try acme.client.Session.open(ctx.allocator, &transport_inst, &state, .{
-            .directory_url = ctx.issue.directory_url,
-            .contact_email = ctx.issue.contact_email,
-            .terms_of_service_agreed = ctx.issue.terms_of_service_agreed,
-            .account_key_path = ctx.issue.account_key_path,
-        }, compat.unixTimestamp());
-    };
+    const session = try acme.client.Session.openUnlocked(ctx.allocator, &transport_inst, ctx.state_dir_path, .{
+        .directory_url = ctx.issue.directory_url,
+        .contact_email = ctx.issue.contact_email,
+        .terms_of_service_agreed = ctx.issue.terms_of_service_agreed,
+        .account_key_path = ctx.issue.account_key_path,
+    }, compat.unixTimestamp());
     defer session.close();
 
     var issued_any = false;
@@ -380,6 +376,39 @@ fn publishManagedBundles(ctx: *BootstrapCtx, bundles: []const ManagedBundleSpec)
     return error.StaleManualCredentialConfig;
 }
 
+const PublishRetryTestContext = struct {
+    calls: u8 = 0,
+    stale_sni: []const SniCertSpec,
+    current_sni: []const SniCertSpec,
+
+    fn prepare(
+        raw: ?*anyopaque,
+        _: std.mem.Allocator,
+        store: *NativeCredentialStore,
+        bundles: []const ManagedBundleSpec,
+    ) anyerror!NativeCredentialStore.PreparedReload {
+        const self: *PublishRetryTestContext = @ptrCast(@alignCast(raw.?));
+        if (self.calls == 0) {
+            self.calls += 1;
+            var stale = try store.prepareReloadFromBundles("", "", self.stale_sni, bundles);
+            stale.manual_config_generation = 1;
+
+            // Model the SIGHUP commit in the narrow window after bootstrap
+            // preparation but before its commit. The returned snapshot must
+            // therefore hit publishManagedBundles' real retry branch.
+            var current = try store.prepareReloadFromFiles("", "", self.current_sni);
+            defer current.deinit();
+            current.manual_config_generation = 2;
+            try store.commitPreparedReload(&current);
+            return stale;
+        }
+        self.calls += 1;
+        var current = try store.prepareReloadFromBundles("", "", self.current_sni, bundles);
+        current.manual_config_generation = 2;
+        return current;
+    }
+};
+
 fn issueGroup(ctx: *BootstrapCtx, client: *acme.client.Client, group: acme.groups.Group) !void {
     var issued = try acme.orders.obtain(ctx.allocator, client, ctx.challenge_store, group.slice(), .{
         .cancel = .{ .ctx = &ctx.cancel, .checkFn = cancelCheck },
@@ -400,6 +429,11 @@ fn issueGroup(ctx: *BootstrapCtx, client: *acme.client.Client, group: acme.group
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+fn issueTestLeafForCsr(_: ?*anyopaque, allocator: std.mem.Allocator, csr_der: []const u8, hostnames: []const []const u8) anyerror![]u8 {
+    const now = compat.unixTimestamp();
+    return acme.test_cert_builder.leafForCsr(allocator, csr_der, hostnames, now - 3600, now + 365 * 24 * 3600);
+}
 
 test "PublishedHosts.markGroup is idempotent and isPublished only reflects marked names" {
     var published = PublishedHosts.init(testing.allocator);
@@ -500,6 +534,153 @@ test "recoverFromDisk publishes a manual SNI-only identity before ACME issuance 
         .auth_policy = .{},
     };
     try testing.expectError(error.NoCredentialAvailable, store.provider().selectCredential(&unmanaged));
+}
+
+test "publishManagedBundles retries a stale manual generation using the current credential callback (#929 review)" {
+    const allocator = testing.allocator;
+    const managed_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.crt", 256 * 1024);
+    defer allocator.free(managed_cert);
+    const managed_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.key", 256 * 1024);
+    defer secrets.secureZeroAndFree(allocator, managed_key);
+
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    const manual_a = [_]SniCertSpec{.{
+        .server_name = "manual.example.test",
+        .cert_path = "tests/fixtures/tls/native_ed25519.crt",
+        .key_path = "tests/fixtures/tls/native_ed25519.key",
+    }};
+    const manual_b = [_]SniCertSpec{.{
+        .server_name = "manual.example.test",
+        .cert_path = "tests/fixtures/tls/native_p256.crt",
+        .key_path = "tests/fixtures/tls/native_p256.key",
+    }};
+    try store.reloadFromFiles("", "", &manual_a);
+
+    const credentials = @import("tls_core").credentials;
+    var manual_selection = credentials.SelectionContext{
+        .role = .server,
+        .server_name = "manual.example.test",
+        .peer_signature_schemes = &.{ 0x0403, 0x0804 },
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    };
+    const pinned = switch (try store.provider().selectCredential(&manual_selection)) {
+        .complete => |value| value,
+        .pending => return error.TestUnexpectedPending,
+    };
+    defer pinned.release();
+    const pinned_leaf = pinned.certificateChain().leaf().?;
+
+    const managed = [_]ManagedBundleSpec{.{
+        .hostnames = &.{"managed.example.test"},
+        .chain_pem = managed_cert,
+        .key_pem = managed_key,
+    }};
+    var retry_ctx = PublishRetryTestContext{ .stale_sni = &manual_a, .current_sni = &manual_b };
+    var challenge_store = ChallengeStore.init(allocator);
+    defer challenge_store.deinit();
+    var published = PublishedHosts.init(allocator);
+    defer published.deinit();
+    const trust_anchors = try acme.transport.TrustAnchorSnapshot.load(allocator, "src/pki/testdata/ecdsa_p256_ca.crt");
+    defer trust_anchors.release();
+    var ctx = BootstrapCtx{
+        .allocator = allocator,
+        .state_dir_path = "unused-by-publication-test",
+        .default_cert_path = "",
+        .default_key_path = "",
+        .sni_certs = &manual_a,
+        .issue = .{ .directory_url = "https://ca.test/directory", .terms_of_service_agreed = true, .trust_anchors = trust_anchors },
+        .store = &store,
+        .challenge_store = &challenge_store,
+        .published = &published,
+        .prepare_current_credentials = PublishRetryTestContext.prepare,
+        .credential_config_ctx = &retry_ctx,
+        .group_list = .{},
+        .needs_issuance = @splat(false),
+        .logger = http.logger.Logger.init(.warn, "test"),
+    };
+    try publishManagedBundles(&ctx, &managed);
+    try testing.expectEqual(@as(u8, 2), retry_ctx.calls);
+
+    const current_manual = switch (try store.provider().selectCredential(&manual_selection)) {
+        .complete => |value| value,
+        .pending => return error.TestUnexpectedPending,
+    };
+    defer current_manual.release();
+    try testing.expect(!std.mem.eql(u8, pinned_leaf, current_manual.certificateChain().leaf().?));
+
+    var managed_selection = manual_selection;
+    managed_selection.server_name = "managed.example.test";
+    const managed_credential = switch (try store.provider().selectCredential(&managed_selection)) {
+        .complete => |value| value,
+        .pending => return error.TestUnexpectedPending,
+    };
+    managed_credential.release();
+    managed_selection.server_name = "unknown.example.test";
+    try testing.expectError(error.NoCredentialAvailable, store.provider().selectCredential(&managed_selection));
+    // The old selection remains pinned even after the production retry
+    // publishes the B+managed snapshot.
+    try testing.expect(std.mem.eql(u8, pinned_leaf, pinned.certificateChain().leaf().?));
+}
+
+test "runBootstrapWithDialer obtains a CSR-matched certificate and activates it for native TLS (#929 review)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const state_dir = try std.fmt.allocPrint(allocator, "{s}/state", .{tmp_abs});
+    defer allocator.free(state_dir);
+
+    var ca = acme.fake_ca.FakeCa.init(allocator);
+    defer ca.deinit();
+    ca.script.new_order.expires_override = "2099-01-01T00:00:00Z";
+    ca.issued_chain_factory = .{ .makeFn = issueTestLeafForCsr };
+    var challenge_store = ChallengeStore.init(allocator);
+    defer challenge_store.deinit();
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    var published = PublishedHosts.init(allocator);
+    defer published.deinit();
+    const trust_anchors = try acme.transport.TrustAnchorSnapshot.load(allocator, "src/pki/testdata/ecdsa_p256_ca.crt");
+    defer trust_anchors.release();
+    var ctx = BootstrapCtx{
+        .allocator = allocator,
+        .state_dir_path = state_dir,
+        .default_cert_path = "",
+        .default_key_path = "",
+        .sni_certs = &.{},
+        .issue = .{ .directory_url = "https://ca.test/directory", .terms_of_service_agreed = true, .trust_anchors = trust_anchors },
+        .store = &store,
+        .challenge_store = &challenge_store,
+        .published = &published,
+        .group_list = try acme.groups.parse("issued.example.test"),
+        .needs_issuance = @splat(false),
+        .logger = http.logger.Logger.init(.warn, "test"),
+    };
+    ctx.needs_issuance[0] = true;
+    try runBootstrapWithDialer(&ctx, ca.dialer());
+    try testing.expect(published.isPublished("issued.example.test"));
+
+    const credentials = @import("tls_core").credentials;
+    const selection = credentials.SelectionContext{
+        .role = .server,
+        .server_name = "issued.example.test",
+        .peer_signature_schemes = &.{0x0403},
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    };
+    const selected = switch (try store.provider().selectCredential(&selection)) {
+        .complete => |value| value,
+        .pending => return error.TestUnexpectedPending,
+    };
+    defer selected.release();
+    try testing.expect(selected.certificateChain().leaf() != null);
 }
 
 test "issueGroup never persists or publishes a CA-issued chain that fails §6.4 verification" {

@@ -181,6 +181,44 @@ pub fn selfSignedLeaf(allocator: std.mem.Allocator, hostnames: []const []const u
     return .{ .pem = pem, .key = key };
 }
 
+/// Builds a real leaf for the P-256 public key carried by an ACME CSR.  The
+/// test CA does not need to retain the applicant private key: TLS proves that
+/// the running gateway still owns it when it signs CertificateVerify.
+pub fn leafForCsr(allocator: std.mem.Allocator, csr_der: []const u8, hostnames: []const []const u8, not_before: i64, not_after: i64) ![]u8 {
+    var top = pki.der.Reader.init(csr_der, pki.der.default_limits);
+    var csr = try top.readSequence();
+    try top.expectEnd();
+    const tbs_elem = try csr.readElement();
+    var tbs_top = pki.der.Reader.init(tbs_elem.encoded, pki.der.default_limits);
+    var tbs = try tbs_top.readSequence();
+    _ = try tbs.readInteger();
+    var subject = try tbs.readSequence();
+    try subject.expectEnd();
+    var spki = try tbs.readSequence();
+    var algorithm = try spki.readSequence();
+    const ec_oid = try algorithm.readObjectIdentifier();
+    if (!ec_oid.eqlComponents(&pki.oid.well_known.ec_public_key)) return error.InvalidCsr;
+    const curve_oid = try algorithm.readObjectIdentifier();
+    if (!curve_oid.eqlComponents(&pki.oid.well_known.secp256r1)) return error.InvalidCsr;
+    try algorithm.expectEnd();
+    const public_bits = try spki.readBitString();
+    try spki.expectEnd();
+    if (public_bits.data.len != 65) return error.InvalidCsr;
+
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var signer_key = try account_mod.AccountKey.generate();
+    defer signer_key.deinit();
+    const name = try nameWithCn(arena, "acme-issued-leaf");
+    const validity = try validityTlv(arena, not_before, not_after);
+    const leaf_spki = try spkiEcdsaP256(arena, public_bits.data);
+    const extensions = try sanExtension(arena, hostnames);
+    const cert_tbs = try buildTbs(arena, name, validity, leaf_spki, extensions);
+    const der = try signAndBuildCertificate(arena, signer_key.key.key_pair, cert_tbs);
+    return pemEncodeCertificate(allocator, der);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

@@ -2990,6 +2990,7 @@ fn handleHttp3LocationProxyPass(
     // and freshness rules (`gateway_proxy_cache.zig`) are shared.
     var response_cache_key: ?[64]u8 = null;
     if (ctx.cfg.proxy_cache_ttl_seconds > 0) {
+        const fillable_method = std.mem.eql(u8, request.method, "GET");
         if (!gpc.isCacheableRequest(
             ctx.cfg,
             matched.block,
@@ -3006,6 +3007,9 @@ fn handleHttp3LocationProxyPass(
             ctx.state.metricsRecordProxyCacheOutcome(.bypass);
         } else {
             var key_buf: [64]u8 = undefined;
+            // Entries are always stored under "GET" -- a HEAD request reads
+            // the same primary key's metadata rather than fragmenting the
+            // cache by method.
             _ = gpc.buildCacheKey(&key_buf, .{
                 // HTTP/3 is always carried over QUIC/TLS.  Keep the
                 // effective listener predicate here as well so an
@@ -3013,35 +3017,53 @@ fn handleHttp3LocationProxyPass(
                 // after its first credential generation is installed.
                 .scheme = if (edge_config.usesNativeTls(ctx.cfg)) "https" else "http",
                 .host = request.headers.get(":authority") orelse request.headers.get("host") orelse "",
-                .method = request.method,
+                .method = "GET",
                 .location_id = matched.block.pattern,
                 .upstream_target = target,
                 .path = request_path,
                 .query = request_query orelse "",
             });
-            const lookup_now_ms = http.event_loop.monotonicMs();
-            var hit_arena = std.heap.ArenaAllocator.init(allocator);
-            defer hit_arena.deinit();
             const cache_generation = if (ctx.cfg_lease) |lease| lease.version.generation else 0;
-            const cache_hit = blk: {
-                break :blk ctx.state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, key_buf[0..], lookup_now_ms) catch {
-                    ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
-                    break :blk null;
-                };
+            const is_vary_tracked = ctx.state.proxyResponseCacheIsVaryTracked(cache_generation, key_buf[0..]);
+            var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
+            var secondary_buf: [64]u8 = undefined;
+            const effective_key: ?[]const u8 = if (!is_vary_tracked) key_buf[0..] else blk: {
+                const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, request.headers.get("accept-encoding")) orelse break :blk null;
+                break :blk gpc.buildVaryVariantKey(&secondary_buf, key_buf[0..], discriminator)[0..];
             };
-            if (cache_hit) |hit| {
-                // A cached replay must fail open. `applyHttp3ProxyCacheHit`
-                // allocates its body before mutating `response`, so a failure
-                // here can safely fall through to the live origin request.
-                if (applyHttp3ProxyCacheHit(allocator, response, ctx.state, &hit, correlation_id)) |_| {
-                    ctx.state.metricsRecordProxyCacheOutcome(.hit);
-                    return;
-                } else |_| {
-                    ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+            if (effective_key == null) {
+                ctx.state.metricsRecordProxyCacheOutcome(.bypass);
+            } else {
+                const lookup_now_ms = http.event_loop.monotonicMs();
+                var hit_arena = std.heap.ArenaAllocator.init(allocator);
+                defer hit_arena.deinit();
+                const cache_hit = blk: {
+                    break :blk ctx.state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, effective_key.?, lookup_now_ms) catch {
+                        ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+                        break :blk null;
+                    };
+                };
+                const disposition: gpc.ServeDisposition = if (cache_hit) |hit| gpc.decideCacheServe(hit.headers, &request.headers) else .require_origin;
+                if (cache_hit) |hit| {
+                    if (disposition != .require_origin) {
+                        // A cached replay must fail open. `applyHttp3ProxyCacheHit`
+                        // allocates its body before mutating `response`, so a failure
+                        // here can safely fall through to the live origin request.
+                        const include_body = fillable_method and disposition == .full;
+                        if (applyHttp3ProxyCacheHit(allocator, response, ctx.state, &hit, correlation_id, disposition, include_body)) |_| {
+                            ctx.state.metricsRecordProxyCacheOutcome(.hit);
+                            return;
+                        } else |_| {
+                            ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+                        }
+                    }
                 }
+                ctx.state.metricsRecordProxyCacheOutcome(.miss);
+                // A HEAD miss (or an unvalidatable HEAD hit) must not fill
+                // the cache -- a HEAD response has no body to store, and
+                // storing one would poison a later GET replay.
+                if (fillable_method) response_cache_key = key_buf;
             }
-            ctx.state.metricsRecordProxyCacheOutcome(.miss);
-            response_cache_key = key_buf;
         }
     }
 
@@ -3136,7 +3158,7 @@ fn handleHttp3LocationProxyPass(
     if (response_cache_key) |key_bytes| {
         const buffered = upstream_response.boundedBufferedForCompatibility();
         const cache_generation = if (ctx.cfg_lease) |lease| lease.version.generation else 0;
-        gproxy_runtime.tryFillResponseCache(allocator, ctx.state, cache_generation, ctx.cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered) catch {
+        gproxy_runtime.tryFillResponseCache(allocator, ctx.state, cache_generation, ctx.cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered, request.headers.get("accept-encoding")) catch {
             ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
         };
     }
@@ -3145,26 +3167,36 @@ fn handleHttp3LocationProxyPass(
 
 /// Replays a #901 generic proxy-cache hit the same way `applyHttp3ProxyResponse`
 /// renders a live buffered upstream response, plus a freshly computed `Age`.
-fn copyHttp3CacheReplayBody(allocator: std.mem.Allocator, hit: *const gpc.LookupResult) ![]u8 {
-    // Do this before mutating `response`: a cache-only OOM must leave the
-    // caller free to dispatch the live upstream response instead.
-    return allocator.dupe(u8, hit.body);
+/// Do this before mutating `response`: a cache-only OOM must leave the
+/// caller free to dispatch the live upstream response instead.
+fn copyHttp3CacheReplayBody(allocator: std.mem.Allocator, hit: *const gpc.LookupResult, include_body: bool) ![]u8 {
+    return if (include_body) allocator.dupe(u8, hit.body) else allocator.dupe(u8, "");
 }
 
+/// Mirrors `gateway_proxy_runtime.prepareHttp1CacheReplay`'s disposition
+/// handling: on `.not_modified`, only the RFC 9110 §15.4.5 allow-listed
+/// header fields are carried over and the body is always empty, regardless
+/// of `include_body`. `disposition` must not be `.require_origin`.
 fn applyHttp3ProxyCacheHit(
     allocator: std.mem.Allocator,
     response: *http.Response,
     state: *GatewayState,
     hit: *const gpc.LookupResult,
     correlation_id: []const u8,
+    disposition: gpc.ServeDisposition,
+    include_body: bool,
 ) !void {
-    const body = try copyHttp3CacheReplayBody(allocator, hit);
+    std.debug.assert(disposition != .require_origin);
+    const not_modified = disposition == .not_modified;
+    const status_code: u16 = if (not_modified) 304 else hit.status_code;
+    const body = try copyHttp3CacheReplayBody(allocator, hit, include_body and !not_modified);
     errdefer allocator.free(body);
     _ = response
-        .setStatus(@enumFromInt(hit.status_code))
+        .setStatus(@enumFromInt(status_code))
         .setBodyOwned(body)
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
     for (hit.headers) |header| {
+        if (not_modified and !gpc.isReplayableOn304(header.name)) continue;
         _ = response.setHeader(header.name, header.value);
     }
     var age_buf: [20]u8 = undefined;
@@ -3172,7 +3204,7 @@ fn applyHttp3ProxyCacheHit(
     _ = response.setHeader("Age", age_str);
     finalizeHttp3Response(response);
     applyResponseHeaders(state, response);
-    state.metricsRecord(hit.status_code);
+    state.metricsRecord(status_code);
 }
 
 test "H3 cache replay copies its body before mutating a response" {
@@ -3186,7 +3218,7 @@ test "H3 cache replay copies its body before mutating a response" {
         .age_seconds = 1,
     };
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, copyHttp3CacheReplayBody(failing.allocator(), &hit));
+    try std.testing.expectError(error.OutOfMemory, copyHttp3CacheReplayBody(failing.allocator(), &hit, true));
 }
 
 fn handleHttp3StaticLocation(

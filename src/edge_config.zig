@@ -447,6 +447,10 @@ pub const EdgeConfig = struct {
     proxy_response_cache_max_entries: usize,
     /// Generic `proxy_pass` response-cache aggregate resident-byte cap (#901).
     proxy_response_cache_max_total_bytes: usize,
+    /// Bounded count of distinct `Vary: Accept-Encoding` representations
+    /// retained per resource (#902), clamped to
+    /// `gateway_proxy_cache.hard_max_vary_variants`.
+    proxy_response_cache_max_vary_variants: usize,
     /// Optional comma-separated ISO country codes to block (requires external country header input).
     geo_blocked_countries: [][]const u8,
     /// Header containing country code provided by external edge/CDN.
@@ -1331,6 +1335,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const proxy_response_cache_max_total_bytes_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_MAX_TOTAL_BYTES", "67108864") catch unreachable;
     defer allocator.free(proxy_response_cache_max_total_bytes_str);
     const proxy_response_cache_max_total_bytes = std.fmt.parseInt(usize, proxy_response_cache_max_total_bytes_str, 10) catch 64 * 1024 * 1024;
+    const proxy_response_cache_max_vary_variants_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_MAX_VARY_VARIANTS", "8") catch unreachable;
+    defer allocator.free(proxy_response_cache_max_vary_variants_str);
+    const proxy_response_cache_max_vary_variants = std.fmt.parseInt(usize, proxy_response_cache_max_vary_variants_str, 10) catch 8;
     const geo_blocked_countries_raw = envOrDefault(allocator, "TARDIGRADE_GEO_BLOCKED_COUNTRIES", "") catch unreachable;
     defer allocator.free(geo_blocked_countries_raw);
     const geo_blocked_countries = try parseCsvValues(allocator, geo_blocked_countries_raw);
@@ -1971,6 +1978,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .proxy_response_cache_max_object_bytes = proxy_response_cache_max_object_bytes,
         .proxy_response_cache_max_entries = proxy_response_cache_max_entries,
         .proxy_response_cache_max_total_bytes = proxy_response_cache_max_total_bytes,
+        .proxy_response_cache_max_vary_variants = proxy_response_cache_max_vary_variants,
         .geo_blocked_countries = geo_blocked_countries,
         .geo_country_header = geo_country_header,
         .add_headers = add_headers,
@@ -4053,6 +4061,10 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_TTL_SECONDS is nonzero but TARDIGRADE_PROXY_CACHE_MAX_OBJECT_BYTES/_MAX_ENTRIES/_MAX_TOTAL_BYTES must all be nonzero to bound the response cache", .{});
         return error.InvalidConfigValue;
     };
+    validateProxyResponseCacheMaxVaryVariants(cfg.proxy_cache_ttl_seconds, cfg.proxy_response_cache_max_vary_variants) catch {
+        std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_MAX_VARY_VARIANTS must be nonzero and no greater than 16", .{});
+        return error.InvalidConfigValue;
+    };
     validateGeoTrustConfig(cfg.geo_blocked_countries.len, cfg.trust_require_upstream_identity, cfg.trusted_upstream_identities.len) catch {
         std.log.err("config validation failed: TARDIGRADE_GEO_BLOCKED_COUNTRIES requires TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true and at least one TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES entry", .{});
         return error.InvalidConfigValue;
@@ -4371,6 +4383,17 @@ fn validateProxyCacheStaleWhileRevalidateUnsupported(seconds: u32) !void {
 /// #901: an enabled generic response cache must be bounded on every axis.
 fn validateProxyResponseCacheBounds(ttl_seconds: u32, max_object_bytes: usize, max_entries: usize, max_total_bytes: usize) !void {
     if (ttl_seconds > 0 and (max_object_bytes == 0 or max_entries == 0 or max_total_bytes == 0)) {
+        return error.InvalidConfigValue;
+    }
+}
+
+/// #902: the bounded `Vary: Accept-Encoding` variant cap must itself be
+/// nonzero and no greater than `gateway_proxy_cache.hard_max_vary_variants`
+/// (kept as a literal here rather than importing that module, to avoid a
+/// config/cache import cycle for one constant).
+fn validateProxyResponseCacheMaxVaryVariants(ttl_seconds: u32, max_vary_variants: usize) !void {
+    const hard_cap: usize = 16;
+    if (ttl_seconds > 0 and (max_vary_variants == 0 or max_vary_variants > hard_cap)) {
         return error.InvalidConfigValue;
     }
 }

@@ -46,6 +46,12 @@ pub const StreamingRequestBody = gp.StreamingRequestBody;
 /// proceed with the normal live upstream request.
 pub const Http1CacheReplay = struct {
     headers: []gp.UpstreamHeader,
+    status_code: u16,
+    reason: []const u8,
+    /// Empty when the caller asked for `include_body = false` (a `HEAD`
+    /// request, or a `304 Not Modified` disposition) -- never hit's body in
+    /// that case.
+    body: []const u8,
 
     pub fn deinit(self: *Http1CacheReplay, allocator: std.mem.Allocator) void {
         const age_header = self.headers[self.headers.len - 1];
@@ -56,11 +62,26 @@ pub const Http1CacheReplay = struct {
     }
 };
 
-pub fn prepareHttp1CacheReplay(allocator: std.mem.Allocator, hit: *const gpc.LookupResult) !Http1CacheReplay {
-    const headers = try allocator.alloc(gp.UpstreamHeader, hit.headers.len + 1);
+/// Builds the exact status/headers/body an H1 cache hit replies with.
+/// `disposition` must not be `.require_origin` -- callers resolve that case
+/// before reaching here. On `.not_modified`, only the RFC 9110 §15.4.5
+/// allow-listed header fields are carried over (see `gpc.isReplayableOn304`)
+/// and the body is always empty regardless of `include_body`.
+pub fn prepareHttp1CacheReplay(allocator: std.mem.Allocator, hit: *const gpc.LookupResult, disposition: gpc.ServeDisposition, include_body: bool) !Http1CacheReplay {
+    std.debug.assert(disposition != .require_origin);
+    const not_modified = disposition == .not_modified;
+    var header_count: usize = 0;
+    for (hit.headers) |h| {
+        if (not_modified and !gpc.isReplayableOn304(h.name)) continue;
+        header_count += 1;
+    }
+    const headers = try allocator.alloc(gp.UpstreamHeader, header_count + 1);
     errdefer allocator.free(headers);
-    for (hit.headers, 0..) |header, idx| {
-        headers[idx] = .{ .name = header.name, .value = header.value };
+    var idx: usize = 0;
+    for (hit.headers) |h| {
+        if (not_modified and !gpc.isReplayableOn304(h.name)) continue;
+        headers[idx] = .{ .name = h.name, .value = h.value };
+        idx += 1;
     }
     var age_buf: [20]u8 = undefined;
     const age_str = std.fmt.bufPrint(&age_buf, "{d}", .{hit.age_seconds}) catch unreachable;
@@ -68,13 +89,23 @@ pub fn prepareHttp1CacheReplay(allocator: std.mem.Allocator, hit: *const gpc.Loo
     errdefer allocator.free(owned_age_name);
     const owned_age = try allocator.dupe(u8, age_str);
     errdefer allocator.free(owned_age);
-    headers[hit.headers.len] = .{ .name = owned_age_name, .value = owned_age };
-    return .{ .headers = headers };
+    headers[idx] = .{ .name = owned_age_name, .value = owned_age };
+    return .{
+        .headers = headers,
+        .status_code = if (not_modified) 304 else hit.status_code,
+        .reason = if (not_modified) "Not Modified" else hit.reason,
+        .body = if (not_modified or !include_body) "" else hit.body,
+    };
 }
 
 /// Best-effort cache fill shared by H1/H2-style and H3 proxy paths. Every
 /// allocation is deliberately inside this fallible helper so a cache-only OOM
-/// leaves the already-complete live upstream response deliverable.
+/// leaves the already-complete live upstream response deliverable. `key` is
+/// always the *primary* (Vary-insensitive) key; when the response carries a
+/// bounded `Vary: Accept-Encoding`, this derives and fills the secondary
+/// variant key instead, using `request_accept_encoding` (the same request
+/// this response answered). Callers must only call this for an original
+/// request method of `GET` -- a `HEAD` response has no body to store.
 pub fn tryFillResponseCache(
     scratch: std.mem.Allocator,
     state: *GatewayState,
@@ -82,6 +113,7 @@ pub fn tryFillResponseCache(
     ttl_ceiling_seconds: u32,
     key: []const u8,
     buffered: *const BufferedUpstreamResponse,
+    request_accept_encoding: ?[]const u8,
 ) !void {
     if (buffered.status_code != 200) return;
     const freshness = gpc.responseFreshness(buffered.headers, ttl_ceiling_seconds) orelse return;
@@ -93,14 +125,24 @@ pub fn tryFillResponseCache(
         put_headers[put_header_count] = .{ .name = h.name, .value = h.value };
         put_header_count += 1;
     }
-    try state.proxyResponseCachePut(http.event_loop.monotonicMs(), generation, key, .{
+    const params = gpc.PutParams{
         .status_code = buffered.status_code,
         .reason = buffered.reason,
         .headers = put_headers[0..put_header_count],
         .body = buffered.body,
         .ttl_seconds = freshness.ttl_seconds,
         .initial_age_seconds = freshness.initial_age_seconds,
-    });
+    };
+    const now_ms = http.event_loop.monotonicMs();
+    if (!freshness.vary_on_accept_encoding) {
+        try state.proxyResponseCachePut(now_ms, generation, key, params);
+        return;
+    }
+    var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
+    const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, request_accept_encoding) orelse return;
+    var secondary_buf: [64]u8 = undefined;
+    const secondary_key = gpc.buildVaryVariantKey(&secondary_buf, key, discriminator);
+    try state.proxyResponseCachePutVaryVariant(now_ms, generation, key, secondary_key, params);
 }
 
 pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
@@ -147,7 +189,42 @@ test "H1 cache replay preparation fails before any cached response is written" {
     // Every replay allocation is cache-only. The caller catches this error
     // before invoking its writer, leaving the live proxy path available.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, prepareHttp1CacheReplay(failing.allocator(), &hit));
+    try std.testing.expectError(error.OutOfMemory, prepareHttp1CacheReplay(failing.allocator(), &hit, .full, true));
+}
+
+test "prepareHttp1CacheReplay renders a 304 with only allow-listed headers and no body" {
+    const allocator = std.testing.allocator;
+    var reason = [_]u8{ 'O', 'K' };
+    var etag_name = "ETag".*;
+    var etag_value = "\"v1\"".*;
+    var ct_name = "Content-Type".*;
+    var ct_value = "text/plain".*;
+    var body = [_]u8{ 'c', 'a', 'c', 'h', 'e', 'd' };
+    var headers = [_]gpc.CacheHeader{
+        .{ .name = &etag_name, .value = &etag_value },
+        .{ .name = &ct_name, .value = &ct_value },
+    };
+    const hit = gpc.LookupResult{
+        .status_code = 200,
+        .reason = &reason,
+        .headers = &headers,
+        .body = &body,
+        .age_seconds = 1,
+    };
+    var prepared = try prepareHttp1CacheReplay(allocator, &hit, .not_modified, true);
+    defer prepared.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 304), prepared.status_code);
+    try std.testing.expectEqualStrings("Not Modified", prepared.reason);
+    try std.testing.expectEqualStrings("", prepared.body);
+    // ETag and the synthesized Age survive; Content-Type does not.
+    try std.testing.expectEqual(@as(usize, 2), prepared.headers.len);
+    try std.testing.expectEqualStrings("ETag", prepared.headers[0].name);
+
+    var full = try prepareHttp1CacheReplay(allocator, &hit, .full, false);
+    defer full.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), full.status_code);
+    try std.testing.expectEqualStrings("", full.body);
+    try std.testing.expectEqual(@as(usize, 3), full.headers.len);
 }
 
 pub const UpstreamErrorResponse = struct {
@@ -698,13 +775,14 @@ pub fn handleLocationProxyPass(
         target,
     );
 
-    // #901: conservative, bounded GET response cache. Runs after every gate
-    // above it (auth/forward_auth/policy already settled this request) and
-    // before any upstream selection, so a hit never touches the upstream
-    // pool/circuit-breaker/retry machinery below at all.
+    // #901/#902: conservative, bounded GET/HEAD response cache. Runs after
+    // every gate above it (auth/forward_auth/policy already settled this
+    // request) and before any upstream selection, so a hit never touches the
+    // upstream pool/circuit-breaker/retry machinery below at all.
     var response_cache_key: ?[64]u8 = null;
     if (cfg.proxy_cache_ttl_seconds > 0) {
         const cache_method = request.method.toString();
+        const fillable_method = std.mem.eql(u8, cache_method, "GET");
         if (!gpc.isCacheableRequest(
             cfg,
             matched_block,
@@ -721,50 +799,75 @@ pub fn handleLocationProxyPass(
             state.metricsRecordProxyCacheOutcome(.bypass);
         } else {
             var key_buf: [64]u8 = undefined;
+            // Entries are always stored under "GET" -- a HEAD request reads
+            // the same primary key's metadata rather than fragmenting the
+            // cache by method.
             _ = gpc.buildCacheKey(&key_buf, .{
                 .scheme = if (edge_config.usesNativeTls(cfg)) "https" else "http",
                 .host = incoming_host orelse "",
-                .method = cache_method,
+                .method = "GET",
                 .location_id = location_id,
                 .upstream_target = target,
                 .path = request.uri.path,
                 .query = request.uri.query orelse "",
             });
-            const lookup_now_ms = http.event_loop.monotonicMs();
-            const cache_hit = blk: {
-                break :blk state.proxyResponseCacheLookup(temp_allocator, ctx.config_generation, key_buf[0..], lookup_now_ms) catch {
-                    // The cache is an optimization: scratch allocation or an
-                    // internal cache error must not turn a live proxy request
-                    // into a gateway error.
-                    state.metricsRecordProxyCacheOutcome(.fill_error);
-                    break :blk null;
-                };
+            const is_vary_tracked = state.proxyResponseCacheIsVaryTracked(ctx.config_generation, key_buf[0..]);
+            var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
+            var secondary_buf: [64]u8 = undefined;
+            const effective_key: ?[]const u8 = if (!is_vary_tracked) key_buf[0..] else blk: {
+                // This resource varies by Accept-Encoding but this request's
+                // header cannot be represented in the bounded discriminator
+                // space -- never guess a representation for it.
+                const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, request.headers.get("accept-encoding")) orelse break :blk null;
+                break :blk gpc.buildVaryVariantKey(&secondary_buf, key_buf[0..], discriminator)[0..];
             };
-            if (cache_hit) |hit| {
-                // Replay assembly is cache-only work. If it cannot allocate,
-                // leave the live upstream path available instead of turning
-                // an otherwise healthy request into an OOM response.
-                replay: {
-                    var prepared = prepareHttp1CacheReplay(temp_allocator, &hit) catch {
+            if (effective_key == null) {
+                state.metricsRecordProxyCacheOutcome(.bypass);
+            } else {
+                const lookup_now_ms = http.event_loop.monotonicMs();
+                const cache_hit = blk: {
+                    break :blk state.proxyResponseCacheLookup(temp_allocator, ctx.config_generation, effective_key.?, lookup_now_ms) catch {
+                        // The cache is an optimization: scratch allocation or an
+                        // internal cache error must not turn a live proxy request
+                        // into a gateway error.
                         state.metricsRecordProxyCacheOutcome(.fill_error);
-                        break :replay;
+                        break :blk null;
                     };
-                    defer prepared.deinit(temp_allocator);
-                    const replay = .{
-                        .status_code = hit.status_code,
-                        .reason = hit.reason,
-                        .headers = prepared.headers,
-                        .body = hit.body,
-                    };
-                    state.metricsRecordProxyCacheOutcome(.hit);
-                    ctx.setUpstreamResult(target, hit.status_code, hit.body.len);
-                    try writeBufferedUpstreamResponseWithMetrics(writer, &replay, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, null, &state.metrics, &state.metrics_mutex);
-                    state.metricsRecord(hit.status_code);
-                    return hit.status_code;
+                };
+                const disposition: gpc.ServeDisposition = if (cache_hit) |hit| gpc.decideCacheServe(hit.headers, &request.headers) else .require_origin;
+                if (cache_hit) |hit| {
+                    if (disposition != .require_origin) {
+                        // Replay assembly is cache-only work. If it cannot
+                        // allocate, leave the live upstream path available
+                        // instead of turning an otherwise healthy request
+                        // into an OOM response.
+                        replay: {
+                            const include_body = fillable_method and disposition == .full;
+                            var prepared = prepareHttp1CacheReplay(temp_allocator, &hit, disposition, include_body) catch {
+                                state.metricsRecordProxyCacheOutcome(.fill_error);
+                                break :replay;
+                            };
+                            defer prepared.deinit(temp_allocator);
+                            const replay = .{
+                                .status_code = prepared.status_code,
+                                .reason = prepared.reason,
+                                .headers = prepared.headers,
+                                .body = prepared.body,
+                            };
+                            state.metricsRecordProxyCacheOutcome(.hit);
+                            ctx.setUpstreamResult(target, prepared.status_code, prepared.body.len);
+                            try writeBufferedUpstreamResponseWithMetrics(writer, &replay, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, null, &state.metrics, &state.metrics_mutex);
+                            state.metricsRecord(prepared.status_code);
+                            return prepared.status_code;
+                        }
+                    }
                 }
+                state.metricsRecordProxyCacheOutcome(.miss);
+                // A HEAD miss (or an unvalidatable HEAD hit) must not fill
+                // the cache -- a HEAD response has no body to store, and
+                // storing one would poison a later GET replay.
+                if (fillable_method) response_cache_key = key_buf;
             }
-            state.metricsRecordProxyCacheOutcome(.miss);
-            response_cache_key = key_buf;
         }
     }
 
@@ -1106,7 +1209,7 @@ pub fn handleLocationProxyPass(
 
     if (response_cache_key) |key_bytes| {
         const buffered = upstream_response.boundedBufferedForCompatibility();
-        tryFillResponseCache(temp_allocator, state, ctx.config_generation, cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered) catch {
+        tryFillResponseCache(temp_allocator, state, ctx.config_generation, cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered, request.headers.get("accept-encoding")) catch {
             state.metricsRecordProxyCacheOutcome(.fill_error);
         };
     }

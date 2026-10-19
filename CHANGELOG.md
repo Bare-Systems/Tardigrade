@@ -62,6 +62,24 @@ All notable user-facing changes to Tardigrade are documented here.
   serving yet) now fail `tardi check`/startup instead of silently doing
   nothing. See the Support Matrix for the full contract; `Vary`/conditional
   handling (#902) and a hardened disk tier (#903) are tracked separately.
+- **`Vary: Accept-Encoding` variants, `ETag`/`Last-Modified` conditional
+  revalidation, and `HEAD` support for the generic response cache (#902,
+  slice of #900's C2).** The cache from #901 now stores a bounded,
+  FIFO-capped set of distinct `Vary: Accept-Encoding` representations per
+  resource (new `TARDIGRADE_PROXY_CACHE_MAX_VARY_VARIANTS`, default `8`,
+  max `16`) keyed on a normalized, order/case/whitespace-insensitive, q=0
+  aware discriminator -- every other `Vary` field name, and `Vary: *`, still
+  bypass storage outright. `If-None-Match`/`If-Modified-Since` are now
+  evaluated against an already-fresh entry's retained `ETag`/`Last-Modified`
+  and answered with a `304 Not Modified` (RFC 9110 §15.4.5 allow-listed
+  headers only, no body) entirely from the cache, with no origin round trip;
+  a hit this cache cannot validate (no matching stored validator) falls
+  through to the origin exactly like a miss. `HEAD` is now served from a
+  stored `GET` entry's metadata (headers, no body) instead of bypassing
+  outright, but a `HEAD` response itself never fills the cache. Upstream-
+  initiated revalidation of a *stale* entry (the cache issuing its own
+  conditional request to the origin) and bounded single-flight fill
+  collapsing are not part of this slice; tracked in a follow-up issue.
 
 - **Native H2 `rewrite` support with `forward_auth` parity (#814).** The
   native HTTP/2 route path now runs a bounded effective-route loop for

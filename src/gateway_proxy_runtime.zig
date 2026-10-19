@@ -119,6 +119,13 @@ pub fn tryFillResponseCache(
     request_headers: *const http.Headers,
 ) !void {
     if (buffered.status_code != 200) return;
+    // The buffered body is never decoded, and `buffered.headers` can no
+    // longer say whether the upstream sent `Content-Encoding` (the H1 parser
+    // already stripped it). Replaying compressed bytes from the cache
+    // without that header would corrupt every representation this admits, so
+    // refuse admission outright rather than assume absent-here means
+    // identity bytes (#935 review).
+    if (buffered.had_content_encoding) return;
     const freshness = gpc.responseFreshness(buffered.headers, ttl_ceiling_seconds) orelse return;
     const put_headers = try scratch.alloc(gpc.CacheHeaderView, buffered.headers.len);
     defer scratch.free(put_headers);

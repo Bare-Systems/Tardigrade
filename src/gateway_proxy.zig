@@ -99,6 +99,14 @@ pub const BufferedUpstreamResponse = struct {
     /// only ever echoes a live upstream's own header text) so this cannot
     /// change any live-traffic response's behavior.
     force_content_length: ?usize = null,
+    /// Whether the live upstream response itself carried `Content-Encoding`,
+    /// captured before `shouldSkipUpstreamResponseHeader` strips that header
+    /// (the H1 path never decodes the body, so `headers` alone can no longer
+    /// answer this by the time a caller sees it). The response/proxy cache
+    /// uses this to refuse admission for any encoded representation rather
+    /// than replay compressed bytes without the header that identifies them
+    /// (#935 review).
+    had_content_encoding: bool = false,
 
     pub fn deinit(self: *BufferedUpstreamResponse, allocator: std.mem.Allocator) void {
         self.metadata_arena.deinit();
@@ -393,6 +401,12 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
 
     var resp_headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
     var representation_content_length: ?[]const u8 = null;
+    // `shouldSkipUpstreamResponseHeader` strips `Content-Encoding` below
+    // (this buffered path never decodes the body), so capture whether it was
+    // present before that happens -- callers that admit a response into the
+    // response cache need to know the representation was encoded even though
+    // the kept `headers` slice no longer says so (#935 review).
+    var had_content_encoding = false;
     var hdr_lines = std.mem.splitSequence(u8, headers_raw[status_line.header_lines_start..], "\r\n");
     while (hdr_lines.next()) |line| {
         const colon = std.mem.findScalar(u8, line, ':') orelse continue;
@@ -423,6 +437,7 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
         if (std.ascii.eqlIgnoreCase(hname, "content-length") and representation_content_length == null and !connection_nominated) {
             representation_content_length = try metadata_allocator.dupe(u8, hval);
         }
+        if (std.ascii.eqlIgnoreCase(hname, "content-encoding")) had_content_encoding = true;
         if (gph.shouldSkipUpstreamResponseHeader(hname, null)) continue;
         if (connection_nominated) continue;
         try resp_headers.append(.{
@@ -448,6 +463,7 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
         .headers = headers_owned,
         .body = body_owned,
         .representation_content_length = representation_content_length,
+        .had_content_encoding = had_content_encoding,
     };
 }
 
@@ -1645,6 +1661,7 @@ fn h2ResponseToBuffered(allocator: std.mem.Allocator, h2resp: *http.upstream_h2.
     const reason = try aa.dupe(u8, gpres.upstreamReasonPhrase(@enumFromInt(h2resp.status)));
     var headers = try aa.alloc(UpstreamHeader, h2resp.headers.len);
     var representation_content_length: ?[]const u8 = null;
+    var had_content_encoding = false;
     for (h2resp.headers, 0..) |h, i| {
         headers[i] = .{ .name = try aa.dupe(u8, h.name), .value = try aa.dupe(u8, h.value) };
         if (representation_content_length == null and
@@ -1653,6 +1670,7 @@ fn h2ResponseToBuffered(allocator: std.mem.Allocator, h2resp: *http.upstream_h2.
         {
             representation_content_length = try aa.dupe(u8, h.value);
         }
+        if (std.ascii.eqlIgnoreCase(h.name, "content-encoding")) had_content_encoding = true;
     }
     const body = try allocator.dupe(u8, h2resp.body);
     return .{
@@ -1662,6 +1680,7 @@ fn h2ResponseToBuffered(allocator: std.mem.Allocator, h2resp: *http.upstream_h2.
         .headers = headers,
         .body = body,
         .representation_content_length = representation_content_length,
+        .had_content_encoding = had_content_encoding,
     };
 }
 

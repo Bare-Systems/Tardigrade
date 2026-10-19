@@ -231,20 +231,22 @@ pub const ProxyResponseCache = struct {
             // and all bookkeeping were staged above.  Only now retire a
             // replacement/FIFO victim, preserving it on every failure path.
             if (victim_key) |key| self.removeMapEntryOnly(key);
-            if (existing_idx) |idx| {
-                index.removeAt(idx);
-            } else if (victim_key != null) {
+            // Replacing an already-indexed variant reuses its existing FIFO
+            // slot verbatim: `removeAt` would compact the array and shift
+            // every later entry down one, corrupting their positions and
+            // leaving a duplicate/orphaned key once the slot is rewritten
+            // below (#935 review). Only a genuine FIFO eviction of the
+            // oldest entry needs that compaction.
+            if (existing_idx == null and victim_key != null) {
                 index.removeAt(0);
             }
             self.map.putAssumeCapacity(prepared.key, prepared.entry);
             self.total_bytes += prepared.entry.bytes;
-            if (existing_idx == null) {
-                @memcpy(index.variant_keys[index.count][0..], secondary_key[0..64]);
-                index.count += 1;
+            if (existing_idx) |idx| {
+                // Key is unchanged; keep it in its existing FIFO position.
+                @memcpy(index.variant_keys[idx][0..], secondary_key[0..64]);
             } else {
-                // Keep replacement in its original FIFO position.
-                const replacement_idx = existing_idx.?;
-                @memcpy(index.variant_keys[replacement_idx][0..], secondary_key[0..64]);
+                @memcpy(index.variant_keys[index.count][0..], secondary_key[0..64]);
                 index.count += 1;
             }
             return;

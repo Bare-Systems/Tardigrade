@@ -15392,21 +15392,35 @@ test "generic proxy response cache never replays a Content-Encoding a request ex
     defer tardigrade.stop();
 
     // A request with no `Accept-Encoding` at all accepts every coding (RFC
-    // 9110 §12.5.3) -- the origin happens to answer with Brotli, and that
-    // gets cached under this request's own variant.
+    // 9110 §12.5.3) -- the origin happens to answer with Brotli. The buffered
+    // H1 upstream path never decodes the body, so an encoded representation
+    // must never be admitted into the cache at all (#935 review): replaying
+    // it later without its `Content-Encoding` would hand a client opaque
+    // compressed bytes labeled as plain text.
     var no_header = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{} });
     defer no_header.deinit();
     try assertContains(no_header.body, "br-variant");
     try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
 
     // A request that explicitly forbids Brotli must never be served that
-    // cached Brotli representation -- it is a distinct variant and must
-    // reach the origin, which this time answers without `Vary`/`Content-Encoding`.
+    // (never-cached) Brotli representation -- it is a distinct variant and
+    // must reach the origin, which this time answers without
+    // `Vary`/`Content-Encoding`.
     var br_rejected = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{.{ .name = "Accept-Encoding", .value = "br;q=0" }} });
     defer br_rejected.deinit();
     try assertContains(br_rejected.body, "identity-variant");
     try std.testing.expect(br_rejected.header("Content-Encoding") == null);
     try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+
+    // Repeating the exact no-header request proves the Brotli response was
+    // never stored in the first place rather than merely missed by a
+    // different variant key: the origin's response list is exhausted, so it
+    // keeps answering with the last (identity, no Content-Encoding) entry --
+    // a cache HIT here would instead replay the original "br-variant" body.
+    var no_header_again = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{} });
+    defer no_header_again.deinit();
+    try assertContains(no_header_again.body, "identity-variant");
+    try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
 }
 
 test "generic proxy response cache answers If-None-Match/If-Modified-Since from a fresh entry without an extra origin call (#902)" {

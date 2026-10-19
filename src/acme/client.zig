@@ -674,6 +674,8 @@ pub const Session = struct {
         const session = try allocator.create(Session);
         errdefer allocator.destroy(session);
         session.allocator = allocator;
+        var has_key = false;
+        errdefer if (has_key) session.key.deinit();
 
         var initial_record = blk: {
             var state = try StateDir.open(state_dir_path);
@@ -684,18 +686,18 @@ pub const Session = struct {
                 const loaded = try state_mod.loadOrCreateAccountKey(&state, allocator);
                 session.key = loaded.key;
             }
+            has_key = true;
             break :blk state_mod.loadAccountRecord(&state, allocator, config.directory_url) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
         };
-        errdefer session.key.deinit();
+        defer if (initial_record) |*record| record.deinit();
 
         session.client = try Client.init(allocator, transport, &session.key, config);
         errdefer session.client.deinit();
 
         if (initial_record) |*record| {
-            defer record.deinit();
             try session.installPersistedRecord(record.record());
             return session;
         }

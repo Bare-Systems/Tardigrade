@@ -94,23 +94,37 @@ fn versionTlv(arena: std.mem.Allocator, value: u8) ![]u8 {
     return tlv(arena, 0xa0, &.{try tlv(arena, 0x02, &.{&[_]u8{value}})});
 }
 
-fn extensionTlv(arena: std.mem.Allocator, ext_oid: []const u32, value: []const u8) ![]u8 {
-    return tlv(arena, 0x30, &.{
-        try oidTlv(arena, ext_oid),
-        try tlv(arena, 0x04, &.{value}),
-    });
+fn extensionTlv(arena: std.mem.Allocator, ext_oid: []const u32, critical: bool, value: []const u8) ![]u8 {
+    if (critical) {
+        return tlv(arena, 0x30, &.{
+            try oidTlv(arena, ext_oid),
+            try tlv(arena, 0x01, &.{&[_]u8{0xff}}),
+            try tlv(arena, 0x04, &.{value}),
+        });
+    }
+    return tlv(arena, 0x30, &.{ try oidTlv(arena, ext_oid), try tlv(arena, 0x04, &.{value}) });
 }
 
 fn sanExtension(arena: std.mem.Allocator, hostnames: []const []const u8) ![]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
     for (hostnames) |h| try parts.append(arena, try tlv(arena, 0x82, &.{h}));
     const san_value = try tlv(arena, 0x30, parts.items);
-    return try extensionTlv(arena, &pki.oid.well_known.subject_alt_name, san_value);
+    return try extensionTlv(arena, &pki.oid.well_known.subject_alt_name, false, san_value);
+}
+
+fn caExtensions(arena: std.mem.Allocator) ![]const u8 {
+    const basic_constraints = try tlv(arena, 0x30, &.{try tlv(arena, 0x01, &.{&[_]u8{0xff}})});
+    const key_usage = try tlv(arena, 0x03, &.{&[_]u8{ 0, 0x04 }});
+    return tlv(arena, 0x30, &.{
+        try extensionTlv(arena, &pki.oid.well_known.basic_constraints, true, basic_constraints),
+        try extensionTlv(arena, &pki.oid.well_known.key_usage, true, key_usage),
+    });
 }
 
 fn buildTbs(
     arena: std.mem.Allocator,
-    name: []const u8,
+    issuer: []const u8,
+    subject: []const u8,
     validity: []const u8,
     spki: []const u8,
     extensions: []const u8,
@@ -119,9 +133,9 @@ fn buildTbs(
         try versionTlv(arena, 2),
         try tlv(arena, 0x02, &.{&[_]u8{1}}),
         try algorithmEcdsaSha256(arena),
-        name,
+        issuer,
         validity,
-        name,
+        subject,
         spki,
         try tlv(arena, 0xa3, &.{try tlv(arena, 0x30, &.{extensions})}),
     });
@@ -175,16 +189,13 @@ pub fn selfSignedLeaf(allocator: std.mem.Allocator, hostnames: []const []const u
     const validity = try validityTlv(arena, not_before, not_after);
     const spki = try spkiEcdsaP256(arena, &pub_sec1);
     const extensions = try sanExtension(arena, hostnames);
-    const tbs = try buildTbs(arena, name, validity, spki, extensions);
+    const tbs = try buildTbs(arena, name, name, validity, spki, extensions);
     const der = try signAndBuildCertificate(arena, key.key.key_pair, tbs);
     const pem = try pemEncodeCertificate(allocator, der);
     return .{ .pem = pem, .key = key };
 }
 
-/// Builds a real leaf for the P-256 public key carried by an ACME CSR.  The
-/// test CA does not need to retain the applicant private key: TLS proves that
-/// the running gateway still owns it when it signs CertificateVerify.
-pub fn leafForCsr(allocator: std.mem.Allocator, csr_der: []const u8, hostnames: []const []const u8, not_before: i64, not_after: i64) ![]u8 {
+fn csrPublicKey(csr_der: []const u8) ![]const u8 {
     var top = pki.der.Reader.init(csr_der, pki.der.default_limits);
     var csr = try top.readSequence();
     try top.expectEnd();
@@ -205,18 +216,58 @@ pub fn leafForCsr(allocator: std.mem.Allocator, csr_der: []const u8, hostnames: 
     try spki.expectEnd();
     if (public_bits.data.len != 65) return error.InvalidCsr;
 
-    var arena_inst = std.heap.ArenaAllocator.init(allocator);
-    defer arena_inst.deinit();
-    const arena = arena_inst.allocator();
-    var signer_key = try account_mod.AccountKey.generate();
-    defer signer_key.deinit();
-    const name = try nameWithCn(arena, "acme-issued-leaf");
-    const validity = try validityTlv(arena, not_before, not_after);
-    const leaf_spki = try spkiEcdsaP256(arena, public_bits.data);
-    const extensions = try sanExtension(arena, hostnames);
-    const cert_tbs = try buildTbs(arena, name, validity, leaf_spki, extensions);
-    const der = try signAndBuildCertificate(arena, signer_key.key.key_pair, cert_tbs);
-    return pemEncodeCertificate(allocator, der);
+    return public_bits.data;
+}
+
+/// Persistent in-process test CA. Its leaf-first PEM output can be verified
+/// independently by trusting `certificate_pem`, unlike the old throwaway
+/// signer whose public key was discarded.
+pub const TestCa = struct {
+    key: account_mod.AccountKey,
+    certificate_pem: []u8,
+
+    pub fn init(allocator: std.mem.Allocator, not_before: i64, not_after: i64) !TestCa {
+        var key = try account_mod.AccountKey.generate();
+        errdefer key.deinit();
+        var arena_inst = std.heap.ArenaAllocator.init(allocator);
+        defer arena_inst.deinit();
+        const arena = arena_inst.allocator();
+        const name = try nameWithCn(arena, "acme-test-ca");
+        const spki = try spkiEcdsaP256(arena, &key.key.publicKeySec1());
+        const tbs = try buildTbs(arena, name, name, try validityTlv(arena, not_before, not_after), spki, try caExtensions(arena));
+        const der = try signAndBuildCertificate(arena, key.key.key_pair, tbs);
+        return .{ .key = key, .certificate_pem = try pemEncodeCertificate(allocator, der) };
+    }
+
+    pub fn deinit(self: *TestCa, allocator: std.mem.Allocator) void {
+        self.key.deinit();
+        allocator.free(self.certificate_pem);
+        self.* = undefined;
+    }
+
+    pub fn issueForCsr(self: *const TestCa, allocator: std.mem.Allocator, csr_der: []const u8, hostnames: []const []const u8, not_before: i64, not_after: i64) ![]u8 {
+        const public_bits = try csrPublicKey(csr_der);
+        var arena_inst = std.heap.ArenaAllocator.init(allocator);
+        defer arena_inst.deinit();
+        const arena = arena_inst.allocator();
+        const issuer = try nameWithCn(arena, "acme-test-ca");
+        const subject = try nameWithCn(arena, "acme-issued-leaf");
+        const leaf_spki = try spkiEcdsaP256(arena, public_bits);
+        const extensions = try sanExtension(arena, hostnames);
+        const tbs = try buildTbs(arena, issuer, subject, try validityTlv(arena, not_before, not_after), leaf_spki, extensions);
+        const der = try signAndBuildCertificate(arena, self.key.key.key_pair, tbs);
+        const leaf_pem = try pemEncodeCertificate(allocator, der);
+        defer allocator.free(leaf_pem);
+        return std.mem.concat(allocator, u8, &.{ leaf_pem, self.certificate_pem });
+    }
+};
+
+/// Builds a one-off CA-issued chain. Callers that rotate generations should
+/// retain a `TestCa` and trust its stable `certificate_pem` instead.
+pub fn leafForCsr(allocator: std.mem.Allocator, csr_der: []const u8, hostnames: []const []const u8, not_before: i64, not_after: i64) ![]u8 {
+    var ca = try TestCa.init(allocator, not_before, not_after);
+    defer ca.deinit(allocator);
+    return ca.issueForCsr(allocator, csr_der, hostnames, not_before, not_after);
 }
 
 test {

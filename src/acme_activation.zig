@@ -430,9 +430,10 @@ fn issueGroup(ctx: *BootstrapCtx, client: *acme.client.Client, group: acme.group
 
 const testing = std.testing;
 
-fn issueTestLeafForCsr(_: ?*anyopaque, allocator: std.mem.Allocator, csr_der: []const u8, hostnames: []const []const u8) anyerror![]u8 {
+fn issueTestLeafForCsr(raw: ?*anyopaque, allocator: std.mem.Allocator, csr_der: []const u8, hostnames: []const []const u8) anyerror![]u8 {
+    const ca: *const acme.test_cert_builder.TestCa = @ptrCast(@alignCast(raw.?));
     const now = compat.unixTimestamp();
-    return acme.test_cert_builder.leafForCsr(allocator, csr_der, hostnames, now - 3600, now + 365 * 24 * 3600);
+    return ca.issueForCsr(allocator, csr_der, hostnames, now - 3600, now + 365 * 24 * 3600);
 }
 
 test "PublishedHosts.markGroup is idempotent and isPublished only reflects marked names" {
@@ -527,7 +528,10 @@ test "recoverFromDisk publishes a manual SNI-only identity before ACME issuance 
     const unmanaged = credentials.SelectionContext{
         .role = .server,
         .server_name = "unmanaged.example.test",
-        .peer_signature_schemes = &.{ 0x0403, 0x0804 },
+        // Manual A is Ed25519 while the replacement manual B is P-256.
+        // Offer both algorithms so this exercises the intended stale-generation
+        // retry rather than failing during the initial pinned selection.
+        .peer_signature_schemes = &.{ 0x0807, 0x0403, 0x0804 },
         .negotiated_version = 0x0304,
         .cipher_suite = 0x1301,
         .application_protocol = null,
@@ -638,7 +642,9 @@ test "runBootstrapWithDialer obtains a CSR-matched certificate and activates it 
     var ca = acme.fake_ca.FakeCa.init(allocator);
     defer ca.deinit();
     ca.script.new_order.expires_override = "2099-01-01T00:00:00Z";
-    ca.issued_chain_factory = .{ .makeFn = issueTestLeafForCsr };
+    var issuer = try acme.test_cert_builder.TestCa.init(allocator, compat.unixTimestamp() - 3600, compat.unixTimestamp() + 365 * 24 * 3600);
+    defer issuer.deinit(allocator);
+    ca.issued_chain_factory = .{ .ctx = &issuer, .makeFn = issueTestLeafForCsr };
     var challenge_store = ChallengeStore.init(allocator);
     defer challenge_store.deinit();
     var store = NativeCredentialStore.init(allocator);

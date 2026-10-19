@@ -1146,6 +1146,38 @@ test "decideCacheServe validates If-None-Match and If-Modified-Since against sto
     try std.testing.expectEqual(ServeDisposition.not_modified, decideCacheServe(stored, &headers));
 }
 
+test "decideCacheServe applies weak If-None-Match comparison per RFC 9110 13.1.2" {
+    // Stored weak validator, client sends the strong form of the same tag.
+    const weak_stored: []const CacheHeader = &.{
+        .{ .name = @constCast("ETag"), .value = @constCast("W/\"rev1\"") },
+    };
+    var headers = http.Headers.init(std.testing.allocator);
+    defer headers.deinit();
+    try headers.append("If-None-Match", "\"rev1\"");
+    try std.testing.expectEqual(ServeDisposition.not_modified, decideCacheServe(weak_stored, &headers));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+
+    // Stored strong validator, client sends the weak form of the same tag.
+    const strong_stored: []const CacheHeader = &.{
+        .{ .name = @constCast("ETag"), .value = @constCast("\"rev1\"") },
+    };
+    try headers.append("If-None-Match", "W/\"rev1\"");
+    try std.testing.expectEqual(ServeDisposition.not_modified, decideCacheServe(strong_stored, &headers));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+
+    // Mixed list: the weak-equal tag appears alongside unrelated tags.
+    try headers.append("If-None-Match", "\"other\", W/\"rev1\", \"third\"");
+    try std.testing.expectEqual(ServeDisposition.not_modified, decideCacheServe(strong_stored, &headers));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+
+    // A genuinely nonmatching tag still misses even under weak comparison.
+    try headers.append("If-None-Match", "W/\"rev2\"");
+    try std.testing.expectEqual(ServeDisposition.full, decideCacheServe(weak_stored, &headers));
+}
+
 test "isReplayableOn304 allow-lists only validator/freshness-describing fields" {
     try std.testing.expect(isReplayableOn304("ETag"));
     try std.testing.expect(isReplayableOn304("cache-control"));

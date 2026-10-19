@@ -1070,10 +1070,20 @@ fn findStoredHeader(headers: []const CacheHeader, name: []const u8) ?[]const u8 
 /// header, or a hit this cache cannot validate at all, resolves to `.full`
 /// or `.require_origin` respectively -- see each field's doc comment.
 pub fn decideCacheServe(hit_headers: []const CacheHeader, request_headers: *const http.Headers) ServeDisposition {
-    if (request_headers.get("if-none-match")) |client_validator| {
-        const stored_etag = findStoredHeader(hit_headers, "etag") orelse return .require_origin;
-        return if (http.etag.matchesIfNoneMatch(stored_etag, client_validator)) .not_modified else .full;
+    // `If-None-Match` is a `#entity-tag` list field: RFC 9110 §5.3 lets a
+    // sender split it across repeated header line instances, and the
+    // combined list is what must be evaluated -- `Headers.get` alone would
+    // silently drop every instance after the first.
+    var seen_if_none_match = false;
+    var stored_etag: ?[]const u8 = null;
+    for (request_headers.iterator()) |header| {
+        if (!std.mem.eql(u8, header.name, "if-none-match")) continue;
+        seen_if_none_match = true;
+        if (stored_etag == null) stored_etag = findStoredHeader(hit_headers, "etag") orelse return .require_origin;
+        if (http.etag.matchesIfNoneMatch(stored_etag.?, header.value)) return .not_modified;
     }
+    if (seen_if_none_match) return .full;
+
     if (request_headers.get("if-modified-since")) |raw_client_date| {
         const stored_last_modified = findStoredHeader(hit_headers, "last-modified") orelse return .require_origin;
         // An unparsable date on either side makes the precondition
@@ -1176,6 +1186,34 @@ test "decideCacheServe applies weak If-None-Match comparison per RFC 9110 13.1.2
     // A genuinely nonmatching tag still misses even under weak comparison.
     try headers.append("If-None-Match", "W/\"rev2\"");
     try std.testing.expectEqual(ServeDisposition.full, decideCacheServe(weak_stored, &headers));
+}
+
+test "decideCacheServe evaluates every repeated If-None-Match field instance" {
+    const stored: []const CacheHeader = &.{
+        .{ .name = @constCast("ETag"), .value = @constCast("\"rev1\"") },
+    };
+
+    // A match in a later field instance must not be shadowed by an earlier
+    // non-matching instance -- `Headers.get` would only see the first.
+    var headers = http.Headers.init(std.testing.allocator);
+    defer headers.deinit();
+    try headers.append("If-None-Match", "\"other\"");
+    try headers.append("If-None-Match", "W/\"rev1\"");
+    try std.testing.expectEqual(ServeDisposition.not_modified, decideCacheServe(stored, &headers));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+
+    // Two genuinely nonmatching instances still miss.
+    try headers.append("If-None-Match", "\"other\"");
+    try headers.append("If-None-Match", "\"another\"");
+    try std.testing.expectEqual(ServeDisposition.full, decideCacheServe(stored, &headers));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+
+    // A malformed later instance must not be allowed to spuriously match.
+    try headers.append("If-None-Match", "\"other\"");
+    try headers.append("If-None-Match", "junk\"rev1\"");
+    try std.testing.expectEqual(ServeDisposition.full, decideCacheServe(stored, &headers));
 }
 
 test "isReplayableOn304 allow-lists only validator/freshness-describing fields" {

@@ -23847,6 +23847,27 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
     }
     try std.testing.expect(fingerprint_alpha_2 != null);
 
+    // Refresh the A connection after B is live, before allowing the next
+    // renewal to proceed. This makes the established-connection assertion
+    // below distinguish a credential-generation lifecycle regression from a
+    // legitimate idle keep-alive timeout while C is waiting at its barrier.
+    try pinned_h1.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: alpha-renew.example.test\r\nConnection: keep-alive\r\n\r\n");
+    const h1_a_after_b = try pinned_h1.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(h1_a_after_b);
+    try assertContains(h1_a_after_b, "HTTP/1.1 200");
+    try assertContains(h1_a_after_b, "activated");
+
+    // Pin a second H1 connection which selected B. Keeping both the A and B
+    // generations active through C proves that native publication replaces
+    // only the default for future handshakes, not existing TLS snapshots.
+    var pinned_h1_b = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", alpha);
+    defer pinned_h1_b.destroy();
+    try pinned_h1_b.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: alpha-renew.example.test\r\nConnection: keep-alive\r\n\r\n");
+    const h1_b_before_c = try pinned_h1_b.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(h1_b_before_c);
+    try assertContains(h1_b_before_c, "HTTP/1.1 200");
+    try assertContains(h1_b_before_c, "activated");
+
     // B is still deliberately near expiry, so the actual live scheduler
     // must drive a second independent renewal. The CA-side barrier proves
     // B was published before C's in-flight validation can complete.
@@ -23884,13 +23905,18 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
     defer allocator.free(fingerprint_beta_2);
     try std.testing.expectEqualStrings(fingerprint_beta_1, fingerprint_beta_2);
 
-    // The connection pinned to alpha *before* rotation remains fully usable
-    // afterward.
+    // The connections pinned to alpha before B and before C both remain
+    // fully usable afterward.
     try pinned_h1.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: alpha-renew.example.test\r\nConnection: close\r\n\r\n");
     const h1_response = try pinned_h1.readPlainToEnd(allocator, 64 * 1024, 5_000);
     defer allocator.free(h1_response);
     try assertContains(h1_response, "HTTP/1.1 200");
     try assertContains(h1_response, "activated");
+    try pinned_h1_b.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: alpha-renew.example.test\r\nConnection: close\r\n\r\n");
+    const h1_b_response = try pinned_h1_b.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(h1_b_response);
+    try assertContains(h1_b_response, "HTTP/1.1 200");
+    try assertContains(h1_b_response, "activated");
 
     // The H2 connection pinned to beta (never rotated) stays interactive at
     // the protocol level across alpha's unrelated rotation: a PING/ACK

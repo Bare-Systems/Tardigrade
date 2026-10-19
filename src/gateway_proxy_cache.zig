@@ -202,85 +202,73 @@ pub const ProxyResponseCache = struct {
     /// (the primary key's fields plus this fill's normalized discriminator)
     /// and registers it in the bounded per-resource variant index.
     pub fn putVaryVariant(self: *ProxyResponseCache, now_ms: u64, primary_key: []const u8, secondary_key: []const u8, params: PutParams) !void {
-        // A resource transitioning from a direct (non-Vary) entry into
-        // tracked-variant storage must not leave the stale direct entry
-        // permanently resident: once tracked, lookup() never looks at the
-        // primary slot again, so an orphan there would just occupy capacity
-        // until a reload wholesale-purges the cache.
-        if (!self.vary_index.contains(primary_key)) self.removeLocked(primary_key);
-
-        self.put(now_ms, secondary_key, params) catch |err| {
-            // The per-resource FIFO cap (`max_vary_variants`) guarantees this
-            // resource's own oldest representation gets evicted to admit a
-            // new one regardless of global room (`registerVaryVariant`
-            // below) -- but that eviction normally only runs *after* `put`
-            // above already succeeded, so when it is the *global*
-            // `max_entries`/`max_total_bytes` cap blocking this fill (not
-            // some unrelated resource's entries), the per-resource eviction
-            // never got a chance to free the room first. Retire this
-            // resource's own oldest sibling variant up front and retry
-            // exactly once so the FIFO guarantee holds even when the global
-            // cap, not just the per-resource one, is what is full (#935
-            // review). Any other failure (e.g. a transient OOM unrelated to
-            // capacity) still fails open like every other `put` here.
-            if (err != error.CacheAtCapacity) return err;
-            const existing = self.vary_index.getPtr(primary_key) orelse return err;
-            if (existing.count < self.max_vary_variants or existing.indexOf(secondary_key) != null) return err;
-            const victim = existing.variant_keys[0];
-            self.removeMapEntryOnly(victim[0..]);
-            existing.removeAt(0);
-            try self.put(now_ms, secondary_key, params);
-        };
-        // The representation above is already stored and reachable by any
-        // future lookup that independently recomputes the same secondary
-        // key, so a failure here (unlike the opportunistic swallow this
-        // used to be) must retire it rather than leave an unindexed entry
-        // occupying capacity outside the FIFO/budget guarantees below
-        // (#935 review).
-        self.registerVaryVariant(primary_key, secondary_key) catch |err| {
-            self.removeMapEntryOnly(secondary_key);
-            return err;
-        };
-    }
-
-    fn registerVaryVariant(self: *ProxyResponseCache, primary_key: []const u8, secondary_key: []const u8) !void {
         std.debug.assert(secondary_key.len == 64);
-        const stored = self.map.getPtr(secondary_key) orelse unreachable;
-        stored.vary_primary_key = try stored.metadata_arena.allocator().dupe(u8, primary_key);
+        var prepared = try self.prepareEntry(now_ms, secondary_key, params);
+        errdefer self.discardPrepared(&prepared);
+        // This allocation used to happen after the new secondary had been
+        // installed.  Do it while the old representation is still live, so
+        // an OOM cannot leave an unindexed secondary or destroy a valid FIFO
+        // victim (#935 review).
+        prepared.entry.vary_primary_key = try prepared.entry.metadata_arena.allocator().dupe(u8, primary_key);
 
-        if (self.vary_index.getPtr(primary_key)) |existing| {
-            self.appendOrEvictVariant(existing, secondary_key);
+        if (self.vary_index.getPtr(primary_key)) |index| {
+            const existing_idx = index.indexOf(secondary_key);
+            const victim_key: ?[]const u8 = if (existing_idx != null)
+                secondary_key
+            else if (index.count == self.max_vary_variants)
+                index.variant_keys[0][0..]
+            else
+                null;
+            const retired_bytes: usize = if (victim_key) |key|
+                (self.map.getPtr(key) orelse return error.CacheInvariantViolation).bytes
+            else
+                0;
+            const retired_count: usize = if (victim_key == null) 0 else 1;
+            if (!self.fitsAfterReplacement(retired_count, retired_bytes, prepared.entry.bytes, 0)) return error.CacheAtCapacity;
+            try self.map.ensureUnusedCapacity(1);
+
+            // No operation below allocates or otherwise fails: the candidate
+            // and all bookkeeping were staged above.  Only now retire a
+            // replacement/FIFO victim, preserving it on every failure path.
+            if (victim_key) |key| self.removeMapEntryOnly(key);
+            if (existing_idx) |idx| {
+                index.removeAt(idx);
+            } else if (victim_key != null) {
+                index.removeAt(0);
+            }
+            self.map.putAssumeCapacity(prepared.key, prepared.entry);
+            self.total_bytes += prepared.entry.bytes;
+            if (existing_idx == null) {
+                @memcpy(index.variant_keys[index.count][0..], secondary_key[0..64]);
+                index.count += 1;
+            } else {
+                // Keep replacement in its original FIFO position.
+                const replacement_idx = existing_idx.?;
+                @memcpy(index.variant_keys[replacement_idx][0..], secondary_key[0..64]);
+                index.count += 1;
+            }
             return;
         }
-        if (self.total_bytes + vary_index_entry_bytes > self.limits.max_total_bytes) return error.CacheAtCapacity;
+
+        // A direct response becoming Vary-tracked needs an index record too.
+        // Allocate both that record and the candidate before retiring the
+        // direct entry, so an OOM cannot make the old representation vanish.
+        const direct_bytes: usize = if (self.map.getPtr(primary_key)) |old| old.bytes else 0;
+        const direct_count: usize = if (self.map.contains(primary_key)) 1 else 0;
+        if (!self.fitsAfterReplacement(direct_count, direct_bytes, prepared.entry.bytes, vary_index_entry_bytes)) return error.CacheAtCapacity;
+        const owned_primary = try self.allocator.dupe(u8, primary_key);
+        errdefer self.allocator.free(owned_primary);
+        try self.map.ensureUnusedCapacity(1);
         try self.vary_index.ensureUnusedCapacity(1);
-        const owned_key = try self.allocator.dupe(u8, primary_key);
-        errdefer self.allocator.free(owned_key);
-        var fresh = VaryIndexEntry{};
-        self.appendOrEvictVariant(&fresh, secondary_key);
-        self.vary_index.putAssumeCapacity(owned_key, fresh);
-        self.total_bytes += vary_index_entry_bytes;
-    }
 
-    fn appendOrEvictVariant(self: *ProxyResponseCache, index: *VaryIndexEntry, secondary_key: []const u8) void {
-        if (index.indexOf(secondary_key) != null) return;
-        if (index.count < self.max_vary_variants) {
-            @memcpy(index.variant_keys[index.count][0..], secondary_key[0..64]);
-            index.count += 1;
-            return;
-        }
-        // Bounded FIFO: evict the oldest variant (always index 0, since
-        // every insertion appends at the tail) to admit this one rather than
-        // let a high-cardinality Accept-Encoding set grow this resource's
-        // variant storage without bound (#902). This deliberately bypasses
-        // `removeLocked`'s general index-pruning path: that path can delete
-        // this very `VaryIndexEntry` wholesale once it observes `count == 0`,
-        // which would leave `index` dangling here when `max_vary_variants ==
-        // 1` (#935 review) -- the bookkeeping below is done directly instead.
-        self.removeMapEntryOnly(index.variant_keys[0][0..]);
-        index.removeAt(0);
-        @memcpy(index.variant_keys[index.count][0..], secondary_key[0..64]);
-        index.count += 1;
+        self.removeMapEntryOnly(primary_key);
+        self.map.putAssumeCapacity(prepared.key, prepared.entry);
+        self.total_bytes += prepared.entry.bytes;
+        var fresh = VaryIndexEntry{};
+        @memcpy(fresh.variant_keys[0][0..], secondary_key[0..64]);
+        fresh.count = 1;
+        self.vary_index.putAssumeCapacity(owned_primary, fresh);
+        self.total_bytes += vary_index_entry_bytes;
     }
 
     /// Removes `key` from `map` and its accounting only -- never touches
@@ -363,27 +351,20 @@ pub const ProxyResponseCache = struct {
         return total;
     }
 
-    /// Stores (or replaces) one entry. Fails open: any error here (object
-    /// too large, store at capacity, or allocation failure) leaves the
-    /// cache exactly as it was -- the caller already proxied the response
-    /// normally and only needs this for metrics.
-    pub fn put(self: *ProxyResponseCache, now_ms: u64, key: []const u8, params: PutParams) !void {
+    const PreparedEntry = struct {
+        key: []u8,
+        entry: Entry,
+    };
+
+    fn discardPrepared(self: *ProxyResponseCache, prepared: *PreparedEntry) void {
+        self.allocator.free(prepared.key);
+        prepared.entry.deinit(self.allocator);
+    }
+
+    fn prepareEntry(self: *ProxyResponseCache, now_ms: u64, key: []const u8, params: PutParams) !PreparedEntry {
         if (params.ttl_seconds == 0 or params.initial_age_seconds >= params.ttl_seconds) return error.NotCacheable;
         const object_bytes = objectBytes(key, params);
         if (object_bytes > self.limits.max_object_bytes) return error.ObjectTooLarge;
-
-        // Reserve map capacity before taking ownership away from an existing
-        // entry. A failed reservation/allocation therefore leaves a live
-        // entry untouched even when concurrent misses race to fill one key.
-        try self.map.ensureUnusedCapacity(1);
-        const replacing = self.map.getPtr(key);
-        const prior_bytes: usize = if (replacing) |old| old.bytes else 0;
-        const retained_bytes = self.total_bytes - prior_bytes;
-        if ((replacing == null and self.map.count() >= self.limits.max_entries) or
-            object_bytes > self.limits.max_total_bytes - retained_bytes)
-        {
-            return error.CacheAtCapacity;
-        }
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
@@ -401,7 +382,7 @@ pub const ProxyResponseCache = struct {
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
 
-        const entry = Entry{
+        return .{ .key = owned_key, .entry = .{
             .metadata_arena = arena,
             .status_code = params.status_code,
             .reason = owned_reason,
@@ -411,19 +392,45 @@ pub const ProxyResponseCache = struct {
             .expires_at_ms = now_ms + @as(u64, params.ttl_seconds - params.initial_age_seconds) * 1000,
             .initial_age_seconds = params.initial_age_seconds,
             .bytes = object_bytes,
-        };
+        } };
+    }
 
-        // A direct fill at a key the Vary index currently routes through
-        // means this resource just stopped varying by Accept-Encoding (or
-        // started varying by something else #902 cannot track): every
-        // previously stored representation is now both unreachable (future
-        // lookups would otherwise keep deriving a secondary key and never
-        // see this fresh direct entry) and stale (it answered a selection
-        // rule that no longer applies), so retire the whole index subtree
-        // now that this replacement has finished allocating -- a failure
-        // above this point leaves it untouched (#935 review). `key` only
-        // ever collides with a `putVaryVariant` secondary key via an
-        // astronomically unlikely SHA-256 collision.
+    fn fitsAfterReplacement(self: *const ProxyResponseCache, retired_count: usize, retired_bytes: usize, candidate_bytes: usize, extra_bytes: usize) bool {
+        std.debug.assert(retired_count <= self.map.count());
+        std.debug.assert(retired_bytes <= self.total_bytes);
+        const retained_count = self.map.count() - retired_count;
+        const retained_bytes = self.total_bytes - retired_bytes;
+        if (retained_count >= self.limits.max_entries) return false;
+        if (retained_bytes > self.limits.max_total_bytes) return false;
+        if (candidate_bytes > self.limits.max_total_bytes - retained_bytes) return false;
+        const after_candidate = retained_bytes + candidate_bytes;
+        return extra_bytes <= self.limits.max_total_bytes - after_candidate;
+    }
+
+    /// Stores (or replaces) an unvaried entry. A Vary-to-unvaried transition
+    /// treats the whole old variant subtree as replaceable capacity and stages
+    /// the new object before retiring it; this keeps a full cache transition
+    /// atomic and preserves old variants on allocation failure (#935 review).
+    pub fn put(self: *ProxyResponseCache, now_ms: u64, key: []const u8, params: PutParams) !void {
+        var prepared = try self.prepareEntry(now_ms, key, params);
+        errdefer self.discardPrepared(&prepared);
+
+        var retired_count: usize = 0;
+        var retired_bytes: usize = 0;
+        if (self.vary_index.getPtr(key)) |index| {
+            retired_bytes += vary_index_entry_bytes;
+            for (index.variant_keys[0..index.count]) |secondary| {
+                const old = self.map.getPtr(secondary[0..]) orelse return error.CacheInvariantViolation;
+                retired_count += 1;
+                retired_bytes += old.bytes;
+            }
+        } else if (self.map.getPtr(key)) |old| {
+            retired_count = 1;
+            retired_bytes = old.bytes;
+        }
+        if (!self.fitsAfterReplacement(retired_count, retired_bytes, prepared.entry.bytes, 0)) return error.CacheAtCapacity;
+        try self.map.ensureUnusedCapacity(1);
+
         if (self.vary_index.fetchRemove(key)) |removed| {
             self.allocator.free(removed.key);
             self.total_bytes -= vary_index_entry_bytes;
@@ -433,8 +440,8 @@ pub const ProxyResponseCache = struct {
         }
 
         self.removeLocked(key);
-        self.map.putAssumeCapacity(owned_key, entry);
-        self.total_bytes += object_bytes;
+        self.map.putAssumeCapacity(prepared.key, prepared.entry);
+        self.total_bytes += prepared.entry.bytes;
     }
 };
 
@@ -575,25 +582,38 @@ fn lessThanDiscriminatorToken(_: void, a: DiscriminatorToken, b: DiscriminatorTo
 /// forbids exactly one encoding this cache might otherwise serve) would
 /// collapse onto the same empty-token-list key, letting a client that
 /// explicitly rejected a coding be served a cached response stored in it.
+/// A request carrying *more than one* `Accept-Encoding` field instance also
+/// returns `null`: `gateway_proxy_headers.appendProxyRequestHeaders` forwards
+/// every instance to the origin, but this discriminator can only canonicalize
+/// one field's value, so folding onto just the first instance could key a
+/// representation a later instance actually excluded (or vice versa) (#935
+/// review).
 ///
-/// Within a present header, every token's accept/exclude verdict
+/// Within a present (singular) header, every token's accept/exclude verdict
 /// (`CodingQuality.zero` vs. `.default`/`.one`) is preserved rather than
 /// dropped, lowercased, deduped by exact (name, verdict) match, and sorted
 /// by name so order/case/whitespace differences still collapse onto the
-/// same representation. A coding carrying any other relative-preference
-/// weight (`CodingQuality.other`), an unparsable/out-of-range `q=`, a
-/// coding named twice with conflicting verdicts, more codings than
+/// same representation. Each token is written as its verdict digit (`0`
+/// excluded, `1` accepted) followed by `:` and the lowercased name -- `:` is
+/// not a valid RFC 9110 `tchar`, so an excluded `br` (`0:br`) can never
+/// collide with a literal extension coding named `!br` the way a bare `!`
+/// prefix would (#935 review). A coding carrying any other relative-
+/// preference weight (`CodingQuality.other`), an unparsable/out-of-range
+/// `q=`, a coding named twice with conflicting verdicts, more codings than
 /// `max_vary_tokens`, or anything overflowing the output buffer all make
 /// this return `null` -- the caller must treat that as unrepresentable
 /// (bypass the cache for this request), never collapse it into a guessed
 /// key.
-pub fn varyAcceptEncodingDiscriminator(buf: *[max_vary_discriminator_bytes]u8, accept_encoding: ?[]const u8) ?[]const u8 {
+pub fn varyAcceptEncodingDiscriminator(buf: *[max_vary_discriminator_bytes]u8, headers: *const http.Headers) ?[]const u8 {
     var stream = compat.fixedBufferStream(buf);
     const writer = stream.writer();
-    const raw = accept_encoding orelse {
+    const header_count = headers.countByName("accept-encoding");
+    if (header_count == 0) {
         writer.writeByte('0') catch return null;
         return stream.getWritten();
-    };
+    }
+    if (header_count > 1) return null;
+    const raw = headers.get("accept-encoding").?;
 
     var tokens: [max_vary_tokens]DiscriminatorToken = undefined;
     var count: usize = 0;
@@ -635,7 +655,8 @@ pub fn varyAcceptEncodingDiscriminator(buf: *[max_vary_discriminator_bytes]u8, a
     writer.writeByte('1') catch return null;
     for (tokens[0..count]) |tok| {
         writer.writeByte(',') catch return null;
-        if (tok.excluded) writer.writeByte('!') catch return null;
+        writer.writeByte(if (tok.excluded) '0' else '1') catch return null;
+        writer.writeByte(':') catch return null;
         writer.writeAll(tok.name) catch return null;
     }
     return stream.getWritten();
@@ -1135,37 +1156,55 @@ test "isReplayableOn304 allow-lists only validator/freshness-describing fields" 
     try std.testing.expect(!isReplayableOn304("Content-Encoding"));
 }
 
+fn discriminatorFor(buf: *[max_vary_discriminator_bytes]u8, values: []const []const u8) ?[]const u8 {
+    var headers = http.Headers.init(std.testing.allocator);
+    defer headers.deinit();
+    for (values) |v| headers.append("Accept-Encoding", v) catch unreachable;
+    return varyAcceptEncodingDiscriminator(buf, &headers);
+}
+
 test "varyAcceptEncodingDiscriminator normalizes order, case and whitespace but preserves q=0 exclusions" {
     var buf: [max_vary_discriminator_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings("1,br,gzip", varyAcceptEncodingDiscriminator(&buf, "gzip, br").?);
-    try std.testing.expectEqualStrings("1,br,gzip", varyAcceptEncodingDiscriminator(&buf, "BR;q=1.0, GZIP;q=1").?);
-    try std.testing.expectEqualStrings("1,br,gzip", varyAcceptEncodingDiscriminator(&buf, "  br ,gzip  ").?);
+    try std.testing.expectEqualStrings("1,1:br,1:gzip", discriminatorFor(&buf, &.{"gzip, br"}).?);
+    try std.testing.expectEqualStrings("1,1:br,1:gzip", discriminatorFor(&buf, &.{"BR;q=1.0, GZIP;q=1"}).?);
+    try std.testing.expectEqualStrings("1,1:br,1:gzip", discriminatorFor(&buf, &.{"  br ,gzip  "}).?);
     // No header at all gets a distinct marker from any present header (#935
     // review): RFC 9110 says every coding is acceptable, so it must never
     // collapse onto a present header whose codings all happen to be
     // excluded.
-    try std.testing.expectEqualStrings("0", varyAcceptEncodingDiscriminator(&buf, null).?);
+    try std.testing.expectEqualStrings("0", discriminatorFor(&buf, &.{}).?);
     // An explicit q=0 exclusion is preserved, not dropped -- distinct from
     // both "no header" and from accepting that coding.
-    try std.testing.expectEqualStrings("1,!br,gzip", varyAcceptEncodingDiscriminator(&buf, "gzip, br;q=0").?);
-    try std.testing.expect(!std.mem.eql(u8, varyAcceptEncodingDiscriminator(&buf, "gzip, br;q=0").?, varyAcceptEncodingDiscriminator(&buf, "gzip").?));
-    try std.testing.expect(!std.mem.eql(u8, varyAcceptEncodingDiscriminator(&buf, null).?, varyAcceptEncodingDiscriminator(&buf, "br;q=0").?));
+    try std.testing.expectEqualStrings("1,0:br,1:gzip", discriminatorFor(&buf, &.{"gzip, br;q=0"}).?);
+    var buf2: [max_vary_discriminator_bytes]u8 = undefined;
+    try std.testing.expect(!std.mem.eql(u8, discriminatorFor(&buf, &.{"gzip, br;q=0"}).?, discriminatorFor(&buf2, &.{"gzip"}).?));
+    try std.testing.expect(!std.mem.eql(u8, discriminatorFor(&buf, &.{}).?, discriminatorFor(&buf2, &.{"br;q=0"}).?));
     // Duplicate coding names with an agreeing verdict collapse.
-    try std.testing.expectEqualStrings("1,gzip", varyAcceptEncodingDiscriminator(&buf, "gzip, gzip;q=1").?);
+    try std.testing.expectEqualStrings("1,1:gzip", discriminatorFor(&buf, &.{"gzip, gzip;q=1"}).?);
     // Duplicate coding names with conflicting verdicts are ambiguous.
-    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip, gzip;q=0"));
+    try std.testing.expectEqual(@as(?[]const u8, null), discriminatorFor(&buf, &.{"gzip, gzip;q=0"}));
     // A relative-preference weight (anything other than q=0/q=1/default) is
     // not representable -- two requests differing only in weight order
     // could make the origin pick different representations, so this must
     // bypass rather than silently alias them onto the same key.
-    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip;q=0.5"));
-    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip;q=1,br;q=0.1"));
-    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip;q=0.1,br;q=1"));
+    try std.testing.expectEqual(@as(?[]const u8, null), discriminatorFor(&buf, &.{"gzip;q=0.5"}));
+    try std.testing.expectEqual(@as(?[]const u8, null), discriminatorFor(&buf, &.{"gzip;q=1,br;q=0.1"}));
+    try std.testing.expectEqual(@as(?[]const u8, null), discriminatorFor(&buf, &.{"gzip;q=0.1,br;q=1"}));
     // A malformed or out-of-range q= value bypasses rather than guessing.
-    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip;q=not-a-number"));
-    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip;q=2"));
+    try std.testing.expectEqual(@as(?[]const u8, null), discriminatorFor(&buf, &.{"gzip;q=not-a-number"}));
+    try std.testing.expectEqual(@as(?[]const u8, null), discriminatorFor(&buf, &.{"gzip;q=2"}));
     // More codings than the bounded cap: unrepresentable.
-    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "a,b,c,d,e,f,g,h,i"));
+    try std.testing.expectEqual(@as(?[]const u8, null), discriminatorFor(&buf, &.{"a,b,c,d,e,f,g,h,i"}));
+    // Two distinct `Accept-Encoding` field instances forward both to the
+    // origin (gateway_proxy_headers.appendProxyRequestHeaders), but this
+    // discriminator cannot canonicalize more than one field -- bypass rather
+    // than key off only the first instance (#935 review).
+    try std.testing.expectEqual(@as(?[]const u8, null), discriminatorFor(&buf, &.{ "gzip", "br" }));
+    // A literal extension coding token named `!br` must never collide with
+    // an excluded `br` (`br;q=0`): the exclusion marker is tagged with `:`,
+    // which is not a valid RFC 9110 `tchar`, so it can never appear inside a
+    // real token name (#935 review).
+    try std.testing.expect(!std.mem.eql(u8, discriminatorFor(&buf, &.{"!br"}).?, discriminatorFor(&buf2, &.{"br;q=0"}).?));
 }
 
 test "ProxyResponseCache stores and isolates Vary: Accept-Encoding variants without crossing representations" {
@@ -1206,7 +1245,7 @@ test "ProxyResponseCache stores and isolates Vary: Accept-Encoding variants with
         .status_code = 200,
         .reason = "OK",
         .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
-        .body = "gzip-body",
+        .body = "variant-01",
         .ttl_seconds = 60,
     });
     try std.testing.expect(cache.isVaryTracked(primary));
@@ -1217,16 +1256,16 @@ test "ProxyResponseCache stores and isolates Vary: Accept-Encoding variants with
         .status_code = 200,
         .reason = "OK",
         .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
-        .body = "identity-body",
+        .body = "variant-02",
         .ttl_seconds = 60,
     });
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const gzip_hit = (try cache.lookup(arena.allocator(), gzip_key, 1_000)).?;
-    try std.testing.expectEqualStrings("gzip-body", gzip_hit.body);
+    try std.testing.expectEqualStrings("variant-01", gzip_hit.body);
     const identity_hit = (try cache.lookup(arena.allocator(), identity_key, 1_000)).?;
-    try std.testing.expectEqualStrings("identity-body", identity_hit.body);
+    try std.testing.expectEqualStrings("variant-02", identity_hit.body);
 
     // A third distinct variant, with `max_vary_variants = 2`, evicts the
     // oldest (gzip) rather than growing without bound.
@@ -1388,7 +1427,7 @@ test "ProxyResponseCache evicts a sibling variant to admit a new one even when t
         .status_code = 200,
         .reason = "OK",
         .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
-        .body = "gzip-body",
+        .body = "variant-01",
         .ttl_seconds = 60,
     });
     var identity_buf: [64]u8 = undefined;
@@ -1397,12 +1436,17 @@ test "ProxyResponseCache evicts a sibling variant to admit a new one even when t
         .status_code = 200,
         .reason = "OK",
         .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
-        .body = "identity-body",
+        .body = "variant-02",
         .ttl_seconds = 60,
     });
     // `max_entries == max_vary_variants == 2`: the cache is now at its
     // *global* entry cap purely from this one resource's own variants.
     try std.testing.expectEqual(@as(usize, 2), cache.map.count());
+
+    // Tighten the aggregate byte budget to exactly the resident size. The
+    // third equally-sized object can only be admitted if its FIFO victim is
+    // counted as replaceable capacity before the admission decision.
+    cache.limits.max_total_bytes = cache.total_bytes;
 
     var br_buf: [64]u8 = undefined;
     const br_key = varyKeyFor(&br_buf, primary, "br");
@@ -1414,7 +1458,7 @@ test "ProxyResponseCache evicts a sibling variant to admit a new one even when t
         .status_code = 200,
         .reason = "OK",
         .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
-        .body = "br-body",
+        .body = "variant-03",
         .ttl_seconds = 60,
     });
 
@@ -1423,9 +1467,115 @@ test "ProxyResponseCache evicts a sibling variant to admit a new one even when t
     try std.testing.expectEqual(@as(usize, 2), cache.map.count());
     try std.testing.expectEqual(@as(?LookupResult, null), try cache.lookup(arena.allocator(), gzip_key, 1_000));
     const identity_hit = (try cache.lookup(arena.allocator(), identity_key, 1_000)).?;
-    try std.testing.expectEqualStrings("identity-body", identity_hit.body);
+    try std.testing.expectEqualStrings("variant-02", identity_hit.body);
     const br_hit = (try cache.lookup(arena.allocator(), br_key, 1_000)).?;
-    try std.testing.expectEqualStrings("br-body", br_hit.body);
+    try std.testing.expectEqualStrings("variant-03", br_hit.body);
+}
+
+test "ProxyResponseCache preserves a live FIFO variant when staging its replacement OOMs (#935 review)" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 1,
+        .max_total_bytes = 16 * 1024,
+        .max_vary_variants = 1,
+    });
+    defer cache.deinit();
+
+    var primary_buf: [64]u8 = undefined;
+    const primary = buildCacheKey(&primary_buf, .{
+        .scheme = "http",
+        .host = "a",
+        .method = "GET",
+        .location_id = "/",
+        .upstream_target = "http://up",
+        .path = "/asset",
+        .query = "",
+    });
+    var gzip_buf: [64]u8 = undefined;
+    const gzip_key = varyKeyFor(&gzip_buf, primary, "gzip");
+    try cache.putVaryVariant(0, primary, gzip_key, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
+        .body = "gzip-body",
+        .ttl_seconds = 60,
+    });
+
+    var br_buf: [64]u8 = undefined;
+    const br_key = varyKeyFor(&br_buf, primary, "br");
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    cache.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, cache.putVaryVariant(1, primary, br_key, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
+        .body = "br-body",
+        .ttl_seconds = 60,
+    }));
+    cache.allocator = allocator;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const old_hit = (try cache.lookup(arena.allocator(), gzip_key, 1_000)).?;
+    try std.testing.expectEqualStrings("gzip-body", old_hit.body);
+    try std.testing.expectEqual(@as(?LookupResult, null), try cache.lookup(arena.allocator(), br_key, 1_000));
+    try std.testing.expect(cache.isVaryTracked(primary));
+}
+
+test "ProxyResponseCache transitions Vary to unvaried at a one-entry global cap (#935 review)" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 1,
+        .max_total_bytes = 16 * 1024,
+        .max_vary_variants = 1,
+    });
+    defer cache.deinit();
+
+    var primary_buf: [64]u8 = undefined;
+    const primary = buildCacheKey(&primary_buf, .{
+        .scheme = "http",
+        .host = "a",
+        .method = "GET",
+        .location_id = "/",
+        .upstream_target = "http://up",
+        .path = "/asset",
+        .query = "",
+    });
+    var gzip_buf: [64]u8 = undefined;
+    const gzip_key = varyKeyFor(&gzip_buf, primary, "gzip");
+    try cache.putVaryVariant(0, primary, gzip_key, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
+        .body = "gzip-body",
+        .ttl_seconds = 60,
+    });
+    // The cache is full in both count and, after this assignment, bytes.
+    // The fresh direct representation has the same object footprint and is
+    // only admissible when the tracked subtree is replaceable atomically.
+    cache.limits.max_total_bytes = cache.total_bytes - vary_index_entry_bytes + ProxyResponseCache.objectBytes(primary, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{},
+        .body = "direct-bdy",
+        .ttl_seconds = 60,
+    });
+    try cache.put(1, primary, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{},
+        .body = "direct-bdy",
+        .ttl_seconds = 60,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(!cache.isVaryTracked(primary));
+    try std.testing.expectEqual(@as(?LookupResult, null), try cache.lookup(arena.allocator(), gzip_key, 1_000));
+    const direct_hit = (try cache.lookup(arena.allocator(), primary, 1_000)).?;
+    try std.testing.expectEqualStrings("direct-bdy", direct_hit.body);
 }
 
 test "ProxyResponseCache retires stale Vary variants and their index when a resource stops varying (#935 review)" {

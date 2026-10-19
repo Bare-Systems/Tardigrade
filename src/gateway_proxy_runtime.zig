@@ -103,9 +103,12 @@ pub fn prepareHttp1CacheReplay(allocator: std.mem.Allocator, hit: *const gpc.Loo
 /// leaves the already-complete live upstream response deliverable. `key` is
 /// always the *primary* (Vary-insensitive) key; when the response carries a
 /// bounded `Vary: Accept-Encoding`, this derives and fills the secondary
-/// variant key instead, using `request_accept_encoding` (the same request
-/// this response answered). Callers must only call this for an original
-/// request method of `GET` -- a `HEAD` response has no body to store.
+/// variant key instead, using `request_headers` (the same request this
+/// response answered) -- passed as the full header set rather than an
+/// already-extracted value so the discriminator can detect and bypass a
+/// request carrying more than one `Accept-Encoding` field instance (#935
+/// review). Callers must only call this for an original request method of
+/// `GET` -- a `HEAD` response has no body to store.
 pub fn tryFillResponseCache(
     scratch: std.mem.Allocator,
     state: *GatewayState,
@@ -113,7 +116,7 @@ pub fn tryFillResponseCache(
     ttl_ceiling_seconds: u32,
     key: []const u8,
     buffered: *const BufferedUpstreamResponse,
-    request_accept_encoding: ?[]const u8,
+    request_headers: *const http.Headers,
 ) !void {
     if (buffered.status_code != 200) return;
     const freshness = gpc.responseFreshness(buffered.headers, ttl_ceiling_seconds) orelse return;
@@ -139,7 +142,7 @@ pub fn tryFillResponseCache(
         return;
     }
     var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
-    const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, request_accept_encoding) orelse return;
+    const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, request_headers) orelse return;
     var secondary_buf: [64]u8 = undefined;
     const secondary_key = gpc.buildVaryVariantKey(&secondary_buf, key, discriminator);
     try state.proxyResponseCachePutVaryVariant(now_ms, generation, key, secondary_key, params);
@@ -818,7 +821,7 @@ pub fn handleLocationProxyPass(
                 // This resource varies by Accept-Encoding but this request's
                 // header cannot be represented in the bounded discriminator
                 // space -- never guess a representation for it.
-                const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, request.headers.get("accept-encoding")) orelse break :blk null;
+                const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, &request.headers) orelse break :blk null;
                 break :blk gpc.buildVaryVariantKey(&secondary_buf, key_buf[0..], discriminator)[0..];
             };
             if (effective_key == null) {
@@ -1216,7 +1219,7 @@ pub fn handleLocationProxyPass(
 
     if (response_cache_key) |key_bytes| {
         const buffered = upstream_response.boundedBufferedForCompatibility();
-        tryFillResponseCache(temp_allocator, state, ctx.config_generation, cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered, request.headers.get("accept-encoding")) catch {
+        tryFillResponseCache(temp_allocator, state, ctx.config_generation, cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered, &request.headers) catch {
             state.metricsRecordProxyCacheOutcome(.fill_error);
         };
     }

@@ -2427,9 +2427,18 @@ fn finalizeHttp3Response(response: *http.Response) void {
     } else if (response.headers.get("x-correlation-id")) |correlation_id| {
         _ = response.setHeader(http.correlation.REQUEST_HEADER_NAME, correlation_id);
     }
-    _ = response
-        .setHeader("server", http.SERVER_NAME)
-        .setContentLength(if (response.body) |body| body.len else 0);
+    _ = response.setHeader("server", http.SERVER_NAME);
+    // `setHeader` always appends rather than replacing, so a caller that
+    // already declared an authoritative `Content-Length` (a cached HEAD/304
+    // replay reporting the stored GET representation's length even though
+    // the wire body is empty, #935 review) must not get a second,
+    // contradictory field from this computed-from-body-length default: H3
+    // serializes every header instance into QPACK, unlike H1's
+    // first-match-only `buildHeaderBytes`, so two conflicting fields would
+    // actually reach the peer.
+    if (response.headers.get("content-length") == null) {
+        _ = response.setContentLength(if (response.body) |body| body.len else 0);
+    }
 }
 
 fn rejectHttp3ProxyError(
@@ -3028,7 +3037,7 @@ fn handleHttp3LocationProxyPass(
             var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
             var secondary_buf: [64]u8 = undefined;
             const effective_key: ?[]const u8 = if (!is_vary_tracked) key_buf[0..] else blk: {
-                const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, request.headers.get("accept-encoding")) orelse break :blk null;
+                const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, &request.headers) orelse break :blk null;
                 break :blk gpc.buildVaryVariantKey(&secondary_buf, key_buf[0..], discriminator)[0..];
             };
             if (effective_key == null) {
@@ -3158,7 +3167,7 @@ fn handleHttp3LocationProxyPass(
     if (response_cache_key) |key_bytes| {
         const buffered = upstream_response.boundedBufferedForCompatibility();
         const cache_generation = if (ctx.cfg_lease) |lease| lease.version.generation else 0;
-        gproxy_runtime.tryFillResponseCache(allocator, ctx.state, cache_generation, ctx.cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered, request.headers.get("accept-encoding")) catch {
+        gproxy_runtime.tryFillResponseCache(allocator, ctx.state, cache_generation, ctx.cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered, &request.headers) catch {
             ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
         };
     }
@@ -3198,10 +3207,16 @@ fn applyHttp3ProxyCacheHit(
         // The wire body above is empty on `HEAD`/`304`, but the declared
         // `Content-Length` must still describe the cached GET
         // representation's actual size, never `0` (RFC 9110 §8.6 / §15.4.5,
-        // #935 review). `write()`/`buildHeaderBytes()` prefer an explicitly
-        // set header over `body.len`, so this is never overridden below.
+        // #935 review). `finalizeHttp3Response` below only fills in a
+        // body-length default when no `Content-Length` is already present,
+        // so this value is never duplicated or overridden.
         .setContentLength(hit.body.len);
     for (hit.headers) |header| {
+        // The cached origin metadata can itself include Content-Length. The
+        // cache-replay declaration above is authoritative (especially for a
+        // bodiless HEAD/304), and H3 writes every stored field, so copying it
+        // would create a second field even when its value happens to agree.
+        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
         if (not_modified and !gpc.isReplayableOn304(header.name)) continue;
         _ = response.setHeader(header.name, header.value);
     }
@@ -3235,10 +3250,16 @@ test "applyHttp3ProxyCacheHit declares the cached representation's actual length
 
     var reason = [_]u8{ 'O', 'K' };
     var body_buf = "cached-representation".*;
+    var content_length_name = "Content-Length".*;
+    var content_length_value = "21".*;
+    var cached_headers = [_]gpc.CacheHeader{.{
+        .name = content_length_name[0..],
+        .value = content_length_value[0..],
+    }};
     const hit = gpc.LookupResult{
         .status_code = 200,
         .reason = &reason,
-        .headers = &.{},
+        .headers = &cached_headers,
         .body = body_buf[0..],
         .age_seconds = 1,
     };
@@ -3249,6 +3270,11 @@ test "applyHttp3ProxyCacheHit declares the cached representation's actual length
     const head_body: []const u8 = head_response.body orelse "";
     try std.testing.expectEqual(@as(usize, 0), head_body.len);
     try std.testing.expectEqualStrings("21", head_response.headers.get("content-length") orelse "");
+    // `finalizeHttp3Response` must not append a second, contradictory
+    // `Content-Length: 0` -- H3 serializes every header instance into QPACK
+    // (unlike H1's first-match-only renderer), so a duplicate would actually
+    // reach the peer (#935 review).
+    try std.testing.expectEqual(@as(usize, 1), head_response.headers.countByName("content-length"));
 
     var not_modified_response = http.Response.init(allocator);
     defer not_modified_response.deinit();
@@ -3257,6 +3283,7 @@ test "applyHttp3ProxyCacheHit declares the cached representation's actual length
     const not_modified_body: []const u8 = not_modified_response.body orelse "";
     try std.testing.expectEqual(@as(usize, 0), not_modified_body.len);
     try std.testing.expectEqualStrings("21", not_modified_response.headers.get("content-length") orelse "");
+    try std.testing.expectEqual(@as(usize, 1), not_modified_response.headers.countByName("content-length"));
 }
 
 fn handleHttp3StaticLocation(

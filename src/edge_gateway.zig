@@ -5524,7 +5524,7 @@ fn executeHttp2ProxyRoute(
             var discriminator_buf: [gproxy_cache.max_vary_discriminator_bytes]u8 = undefined;
             var secondary_buf: [64]u8 = undefined;
             const effective_key: ?[]const u8 = if (!is_vary_tracked) key_buf[0..] else blk: {
-                const discriminator = gproxy_cache.varyAcceptEncodingDiscriminator(&discriminator_buf, request.headers.get("accept-encoding")) orelse break :blk null;
+                const discriminator = gproxy_cache.varyAcceptEncodingDiscriminator(&discriminator_buf, &request.headers) orelse break :blk null;
                 break :blk gproxy_cache.buildVaryVariantKey(&secondary_buf, key_buf[0..], discriminator)[0..];
             };
             if (effective_key == null) {
@@ -5600,7 +5600,7 @@ fn executeHttp2ProxyRoute(
     );
     errdefer proxy_response.deinit(allocator);
     if (response_cache_key) |key_bytes| {
-        gproxy_runtime.tryFillResponseCache(allocator, state, cache_generation, route_cfg.proxy_cache_ttl_seconds, key_bytes[0..], &proxy_response.bounded_buffered, request.headers.get("accept-encoding")) catch {
+        gproxy_runtime.tryFillResponseCache(allocator, state, cache_generation, route_cfg.proxy_cache_ttl_seconds, key_bytes[0..], &proxy_response.bounded_buffered, &request.headers) catch {
             state.metricsRecordProxyCacheOutcome(.fill_error);
         };
     }

@@ -20,6 +20,8 @@ pub const groups = @import("groups.zig");
 pub const renewal_policy = @import("renewal_policy.zig");
 /// Durable per-group renewal retry state (#835).
 pub const renewal_state = @import("renewal_state.zig");
+/// Bounded TLS-ALPN-01 authorization selection state (#932).
+pub const tls_alpn_challenges = @import("tls_alpn_challenges.zig");
 
 /// Test-only fake CA (see `fake_ca.zig`); absent from non-test builds.
 pub const fake_ca = if (@import("builtin").is_test) @import("fake_ca.zig") else struct {};

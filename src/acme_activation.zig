@@ -528,10 +528,7 @@ test "recoverFromDisk publishes a manual SNI-only identity before ACME issuance 
     const unmanaged = credentials.SelectionContext{
         .role = .server,
         .server_name = "unmanaged.example.test",
-        // Manual A is Ed25519 while the replacement manual B is P-256.
-        // Offer both algorithms so this exercises the intended stale-generation
-        // retry rather than failing during the initial pinned selection.
-        .peer_signature_schemes = &.{ 0x0807, 0x0403, 0x0804 },
+        .peer_signature_schemes = &.{ 0x0403, 0x0804 },
         .negotiated_version = 0x0304,
         .cipher_suite = 0x1301,
         .application_protocol = null,
@@ -565,7 +562,10 @@ test "publishManagedBundles retries a stale manual generation using the current 
     var manual_selection = credentials.SelectionContext{
         .role = .server,
         .server_name = "manual.example.test",
-        .peer_signature_schemes = &.{ 0x0403, 0x0804 },
+        // Manual A is Ed25519 while the replacement manual B is P-256.
+        // Offer both algorithms so this exercises the intended stale-generation
+        // retry rather than failing during the initial pinned selection.
+        .peer_signature_schemes = &.{ 0x0807, 0x0403, 0x0804 },
         .negotiated_version = 0x0304,
         .cipher_suite = 0x1301,
         .application_protocol = null,

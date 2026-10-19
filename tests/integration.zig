@@ -3101,6 +3101,58 @@ fn opensslPresentedSubject(allocator: std.mem.Allocator, port: u16, servername: 
     return error.OpensslFailed;
 }
 
+/// The ACME test issuer intentionally keeps its subject stable across
+/// generations.  The SHA-256 leaf fingerprint is therefore the externally
+/// observable identity used by the live rotation acceptance test below.
+fn opensslPresentedFingerprint(allocator: std.mem.Allocator, port: u16, servername: []const u8) ![]u8 {
+    const connect_arg = try opensslConnectArg(allocator, port);
+    defer allocator.free(connect_arg);
+
+    for (0..20) |attempt| {
+        var s_client = try bounded_process.run(allocator, .{
+            .argv = &.{
+                "openssl", "s_client", "-connect",   connect_arg, "-servername", servername,
+                "-alpn",   "http/1.1", "-showcerts",
+            },
+            .stdin = "",
+            .stdout_limit = 1024 * 1024,
+            .stderr_limit = 1024 * 1024,
+            .deadline_ms = 5_000,
+            .accepted_exit_codes = &.{ 0, 1 },
+        });
+
+        if (std.meta.activeTag(s_client.outcome) == .normal_exit) {
+            const cert_begin = std.mem.indexOf(u8, s_client.stdout, "-----BEGIN CERTIFICATE-----");
+            const cert_end_start = std.mem.indexOf(u8, s_client.stdout, "-----END CERTIFICATE-----");
+            if (cert_begin != null and cert_end_start != null and cert_end_start.? >= cert_begin.?) {
+                const cert_end = cert_end_start.? + "-----END CERTIFICATE-----".len;
+                var x509 = try bounded_process.run(allocator, .{
+                    .argv = &.{ "openssl", "x509", "-noout", "-fingerprint", "-sha256" },
+                    .stdin = s_client.stdout[cert_begin.?..cert_end],
+                    .stdout_limit = 1024 * 1024,
+                    .stderr_limit = 1024 * 1024,
+                    .deadline_ms = 5_000,
+                });
+                if (std.meta.activeTag(x509.outcome) == .normal_exit and x509.outcome.normal_exit == 0) {
+                    const fingerprint = allocator.dupe(u8, x509.stdout) catch |err| {
+                        x509.deinit(allocator);
+                        s_client.deinit(allocator);
+                        return err;
+                    };
+                    x509.deinit(allocator);
+                    s_client.deinit(allocator);
+                    return fingerprint;
+                }
+                x509.deinit(allocator);
+            }
+        }
+
+        s_client.deinit(allocator);
+        if (attempt + 1 < 20) compat.sleepNs(100 * std.time.ns_per_ms);
+    }
+    return error.OpensslFailed;
+}
+
 fn parseStatusCode(raw: []const u8) !u16 {
     const status_end = std.mem.find(u8, raw, "\r\n") orelse return error.InvalidHttpResponse;
     const status_line = raw[0..status_end];
@@ -23203,12 +23255,13 @@ test "automatic HTTPS (#884): a live HTTP-01 issuance activates a CA-verified TL
     }
     const allocator = std.testing.allocator;
     const hostname = "issued.example.test";
+    const hostnames = [_][]const u8{hostname};
 
     const Factory = struct {
-        fn issue(raw: ?*anyopaque, alloc: std.mem.Allocator, csr_der: []const u8, hostnames: []const []const u8) anyerror![]u8 {
+        fn issue(raw: ?*anyopaque, alloc: std.mem.Allocator, csr_der: []const u8, requested_hostnames: []const []const u8) anyerror![]u8 {
             const issuer: *const acme_test_ca.TestCa = @ptrCast(@alignCast(raw.?));
             const now = compat.unixTimestamp();
-            return issuer.issueForCsr(alloc, csr_der, hostnames, now - 3600, now + 365 * 24 * 3600);
+            return issuer.issueForCsr(alloc, csr_der, requested_hostnames, now - 3600, now + 365 * 24 * 3600);
         }
     };
     const Validation = struct {
@@ -23304,7 +23357,8 @@ test "automatic HTTPS (#884): a live HTTP-01 issuance activates a CA-verified TL
             .{ .name = "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", .value = http01_listen },
         },
     });
-    defer tardigrade.stop();
+    var tardigrade_running = true;
+    defer if (tardigrade_running) tardigrade.stop();
     // Registered after `stop`, so Zig's LIFO defer order releases a blocked
     // CA validation request before shutdown tries to join the issuer thread.
     defer release_validation.store(true, .release);
@@ -23350,6 +23404,128 @@ test "automatic HTTPS (#884): a live HTTP-01 issuance activates a CA-verified TL
         compat.sleepNs(50 * std.time.ns_per_ms);
     }
     try std.testing.expect(attempts < 80);
+
+    // A is now live through the complete HTTP-01 -> durable activation ->
+    // native listener path. Keep a real TLS connection that selected A open
+    // while the next generation is persisted and reloaded.
+    const fingerprint_a = try opensslPresentedFingerprint(allocator, tardigrade.port, hostname);
+    defer allocator.free(fingerprint_a);
+    var old_client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", hostname);
+    defer old_client.destroy();
+
+    // A rejected replacement must leave A current before the successful B
+    // rotation. This goes through the same durable activation API the order
+    // worker uses, rather than corrupting files behind its invariants.
+    {
+        var rejected = try acme_test_support.csr.issue(allocator, &hostnames);
+        defer rejected.deinit(allocator);
+        var acme_state = try acme_test_support.state.StateDir.open(state_rel);
+        defer acme_state.close();
+        var group_id_buf: [acme_test_support.groups.group_id_len]u8 = undefined;
+        const group_id = acme_test_support.groups.groupId(&group_id_buf, &hostnames);
+        try std.testing.expectError(error.EmptyChain, acme_test_support.activate.verifyAndPersist(
+            allocator,
+            &acme_state,
+            group_id,
+            &rejected.key,
+            "",
+            .{ .hostnames = &hostnames, .now = compat.unixTimestamp() },
+        ));
+    }
+    const fingerprint_after_rejection = try opensslPresentedFingerprint(allocator, tardigrade.port, hostname);
+    defer allocator.free(fingerprint_after_rejection);
+    try std.testing.expectEqualStrings(fingerprint_a, fingerprint_after_rejection);
+
+    // Persist a distinct, CA-signed B generation, then ask the running
+    // process to rebuild its complete managed bundle set from durable state.
+    // This is a controlled A4 publication, not an A5 renewal scheduler.
+    var issued_b = try acme_test_support.csr.issue(allocator, &hostnames);
+    defer issued_b.deinit(allocator);
+    const chain_b = try issuer.issueForCsr(allocator, issued_b.csr_der, &hostnames, compat.unixTimestamp() - 3600, compat.unixTimestamp() + 365 * 24 * 3600);
+    defer allocator.free(chain_b);
+    {
+        var acme_state = try acme_test_support.state.StateDir.open(state_rel);
+        defer acme_state.close();
+        var group_id_buf: [acme_test_support.groups.group_id_len]u8 = undefined;
+        const group_id = acme_test_support.groups.groupId(&group_id_buf, &hostnames);
+        _ = try acme_test_support.activate.verifyAndPersist(allocator, &acme_state, group_id, &issued_b.key, chain_b, .{
+            .hostnames = &hostnames,
+            .now = compat.unixTimestamp(),
+        });
+    }
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "configuration hot-reload applied", 5_000);
+
+    // The old TLS handle selected A at handshake time and must remain usable
+    // after B becomes the active identity for new handshakes.
+    try old_client.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: issued.example.test\r\nConnection: close\r\n\r\n");
+    const old_response = try old_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(old_response);
+    try assertContains(old_response, "HTTP/1.1 200");
+    try assertContains(old_response, "activated");
+
+    attempts = 0;
+    while (attempts < 80) : (attempts += 1) {
+        var result = try runCurl(allocator, tardigrade.port, .{
+            .host = hostname,
+            .resolve_to = test_host,
+            .path = "/healthz",
+            .cacert = client_ca_rel,
+            .tls_v1_3_only = builtin.os.tag != .macos,
+            .tls_max = if (builtin.os.tag == .macos) null else "1.3",
+        });
+        defer result.deinit();
+        if (result.term == .exited and result.term.exited == 0 and
+            std.mem.indexOf(u8, result.stdout, "HTTP/1.1 200") != null and
+            std.mem.indexOf(u8, result.stdout, "activated") != null) break;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(attempts < 80);
+    const fingerprint_b = try opensslPresentedFingerprint(allocator, tardigrade.port, hostname);
+    defer allocator.free(fingerprint_b);
+    try std.testing.expect(!std.mem.eql(u8, fingerprint_a, fingerprint_b));
+
+    // A process restart with a deliberately unreachable CA must recover B
+    // synchronously from state before its one-shot bootstrap can fail.
+    tardigrade.stop();
+    tardigrade_running = false;
+    var recovered = try TardigradeProcess.spawn(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 activated;
+        \\}
+        ,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_AUTOMATIC_HTTPS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_AGREE_TOS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_STATE_DIR", .value = state_rel },
+            .{ .name = "TARDIGRADE_TLS_ACME_DOMAINS", .value = hostname },
+            .{ .name = "TARDIGRADE_TLS_ACME_DIRECTORY_URL", .value = "https://127.0.0.1:1/directory" },
+            .{ .name = "TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", .value = acme_live_ca.default_ca_bundle_path },
+            .{ .name = "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", .value = http01_listen },
+        },
+    });
+    defer recovered.stop();
+    attempts = 0;
+    while (attempts < 80) : (attempts += 1) {
+        var result = try runCurl(allocator, recovered.port, .{
+            .host = hostname,
+            .resolve_to = test_host,
+            .path = "/healthz",
+            .cacert = client_ca_rel,
+            .tls_v1_3_only = builtin.os.tag != .macos,
+            .tls_max = if (builtin.os.tag == .macos) null else "1.3",
+        });
+        defer result.deinit();
+        if (result.term == .exited and result.term.exited == 0 and
+            std.mem.indexOf(u8, result.stdout, "HTTP/1.1 200") != null and
+            std.mem.indexOf(u8, result.stdout, "activated") != null) break;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(attempts < 80);
+    const recovered_fingerprint = try opensslPresentedFingerprint(allocator, recovered.port, hostname);
+    defer allocator.free(recovered_fingerprint);
+    try std.testing.expectEqualStrings(fingerprint_b, recovered_fingerprint);
 }
 
 test "automatic HTTPS validates ACME-only native listener protocol and TLS restrictions (#929 review)" {

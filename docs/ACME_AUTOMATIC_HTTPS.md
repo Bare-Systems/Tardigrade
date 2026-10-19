@@ -5,11 +5,15 @@ specifies how Tardigrade will obtain and renew certificates with ACME
 (RFC 8555) on the native, pure-Zig TLS stack. It implements nothing.
 
 > **Status: not supported.** `TARDIGRADE_TLS_ACME_ENABLED=true` is still
-> rejected at config validation in every profile
-> (`validateNativeTlsBuildConfig`, `src/edge_config.zig`), and
-> `acme_client.runOnce()` still fails closed. Nothing in this document is a
-> support claim. Support is advertised only when A7 (interop and release
-> gating) lands and `docs/SUPPORT_MATRIX.md` is updated by that PR.
+> rejected at config validation (`validateNativeTlsBuildConfig`,
+> `src/edge_config.zig`) on the appliance profile and on every build not
+> compiled with `-Dacme-experimental` (off by default, never set for release
+> artifacts). An experimental general-profile build now does drive real
+> issuance, activation and serving end to end (A4, #884) -- that is a test
+> capability for this repository's own CI and interop work, not an
+> operator-facing support claim. Nothing in this document is a support
+> claim. Support is advertised only when A7 (interop and release gating)
+> lands and `docs/SUPPORT_MATRIX.md` is updated by that PR.
 
 Contents: [1 History](#1-history-and-reuse-rule) ·
 [2 Audit](#2-audit-of-current-code) ·
@@ -160,7 +164,7 @@ muscle memory keep working.
 | `TARDIGRADE_TLS_ACME_CHALLENGES` | `acme_challenges` | enum CSV | `http-01` | `http-01`; `tls-alpn-01` is accepted only after A6. |
 | `TARDIGRADE_TLS_ACME_EAB_KID` / `_EAB_HMAC_KEY_PATH` | `acme_eab_*` | | unset | External account binding. **Out of scope for A2–A7**; reserved so the grammar does not change later. Set → config error until implemented. |
 | `TARDIGRADE_TLS_ACME_HTTP01_LISTEN` | `acme_http01_listen` | `host:port` | `0.0.0.0:80` | Dedicated challenge listener (§8.0). Required when `http-01` is configured; cannot equal the main listener. Startup-fixed. |
-| `TARDIGRADE_TLS_HTTP_REDIRECT` | `https_redirect` | bool | `false` | Optional HTTP→HTTPS redirect (§8.3). Only valid with `automatic_https`. |
+| `TARDIGRADE_TLS_HTTPS_REDIRECT` | `https_redirect` | bool | `false` | Optional HTTP→HTTPS redirect (§8.3). Only valid with `automatic_https`. |
 
 The default directory URL is production on purpose: it matches the existing
 documented default. Safety comes from opt-in plus the validation below, not
@@ -879,13 +883,13 @@ wiring proof are documented separately below.
 
 Behavior worth knowing:
 
-- This is still reached by nothing in production: `edge_config.rejectAcmeRuntime`
-  (unconditional on `tls_acme_enabled`, called from `main.zig`'s `tardi run`
-  path, not from `validateNativeTlsBuildConfig`) still refuses to start a
-  server with ACME enabled in every build, so the new bind code in
-  `edge_gateway.zig` is exercised only by tests that construct a validated
-  ACME-enabled config directly (bypassing the CLI gate), not by any reachable
-  `tardi run` invocation. Activation (A4, #884) is what lifts that gate.
+- As of A4 (#884) this bind code *is* reached by `tardi run` on an
+  experimental general-profile build: `edge_config.rejectAcmeRuntime`, which
+  used to refuse to start any server with ACME enabled regardless of
+  `validateNativeTlsBuildConfig`'s own gate, is gone -- A4 was the phase that
+  existed to lift it, and `validateNativeTlsBuildConfig`'s experimental/
+  profile check is now the only gate `tardi run` has left to pass. See
+  §10.4.
 - The listener's own tests in `acme_http01_listener.zig` bind a real
   ephemeral-port socket and drive it with real TCP connections (not just
   `ChallengeStore` calls directly): correct host/token serving for GET and
@@ -966,6 +970,61 @@ it on every exit (success, CA failure, timeout, or cancellation).
     file through the same import `live_http01_tests.zig` already had);
     expect every test above to pass with no real network beyond loopback
     and no activation, same as the rest of this section.
+
+### 10.4 A4 as implemented (#884)
+
+A4 is the product-integration phase: it does not add a new verification or
+publication primitive (#879 and #880 already own those), it wires what
+existed into something `tardi run` can actually serve, and closes the one
+remaining `NativeCredentialStore` gap #880 left open for exactly this phase.
+
+| File | What it provides |
+| --- | --- |
+| `src/edge_gateway.zig` | §7.4.1 (G11): the native-TLS-provider branch condition becomes `hasTlsFiles(cfg) or cfg.tls_acme_enabled`, so `automatic_https` alone makes the main listener TLS from process start; when no manual cert/key is configured, `NativeCredentialStore.init` is never followed by a `reloadFromFiles` call, so the provider's `ReloadableProvider` never has an installed snapshot and every selection fails `NoCredentialAvailable` (fail-closed, never plaintext, never self-signed). Also runs the §5.5 "Restart" recovery (`acme_activation.recoverFromDisk`, synchronous, no network) before spawning the one-shot background bootstrap thread (`acme_activation.BootstrapCtx`) that drives exactly one `obtain()`+`verifyAndPersist()` attempt per managed group still missing a valid generation, then republishes the complete managed set. |
+| `src/acme_activation.zig` | The A4 glue: `PublishedHosts` (which managed hosts have ever been published, for §8.3's redirect gate), `loadManagedBundleSet` (rebuilds the complete current managed bundle set from disk via `activate.loadCommitted`, shared by the bootstrap and by `gateway_shutdown`'s reload path below), `recoverFromDisk` (restart recovery) and `BootstrapCtx`/`runBootstrapOnce` (the one-shot issuance attempt; explicitly not a scheduler -- no periodic wake-up, no cross-restart backoff, that is #835/A5). |
+| `src/acme/groups.zig` | Re-splits an already-`names.validate`d `tls_acme_domains_spec` into its `;`/`,` order groups (which `names.validate` itself only counts, not keeps) and derives each group's durable `groupId` (§4.4: lowercase hex SHA-256 of the sorted name list, truncated to 16 bytes) -- the identifier `activate.verifyAndPersist`/`loadCommitted` key every generation under. |
+| `src/http/native_tls_connection.zig` | G11's other half: `prepareReloadFromFilesAndBundles` no longer unconditionally loads a default identity -- `default_cert_path`/`_key_path` both empty means no default bundle at all (not "empty paths that happen to load"), and `SnapshotOptions`' absent/unknown-SNI policy becomes `fail_handshake` rather than `use_default*` when there is no default to fall back to, so `Snapshot.build` never demands a default bundle nobody asked for. |
+| `src/gateway_shutdown.zig` | Closes the file-only-reload gap `NativeCredentialStore.has_managed_bundles`'s doc comment flagged since #880: `hotReloadConfig` now calls `reloadAcmeManagedCredentials` (rebuild the complete managed set via `acme_activation.loadManagedBundleSet`, publish via `prepareReloadFromBundles`) instead of `prepareReloadFromFiles` whenever `cfg.tls_acme_enabled`, so a routine SIGHUP reload and an active managed generation no longer have to choose between silently dropping every ACME-issued identity or rejecting the reload outright. `acmeHttp01ListenerConfigChanged` already covered rejecting a toggled `automatic_https` as restart-required (it compares `tls_acme_enabled`), so no new topology-change check was needed there. |
+| `src/http/acme_http01_listener.zig` | G8/§8.3: `Options.https_redirect: ?HttpsRedirectOptions`, carrying a `PublishedCheck` ctx/fn-pointer callback (the same seam `orders.Cancel`/`orders.Waiter` use, so this leaf `http/` module stays free of a dependency on `acme_activation.zig`) and the HTTPS port. `dispatch` tries a redirect only on the branch that already means "not the challenge path"; a managed-but-unpublished or unmanaged host still falls through to the existing `404`/`421` behavior unchanged. |
+| `src/edge_config.zig` | `tls_https_redirect` (`TARDIGRADE_TLS_HTTPS_REDIRECT`, directive `https_redirect`, §4.1 -- named to match the config-file directive's mechanical `TARDIGRADE_TLS_X` -> `TARDIGRADE_X` alias, not the doc's earlier `_HTTP_REDIRECT` typo), gated by the same "requires `automatic_https`" rule as every other `acme_*` setting; `validateAcmeManualOverlap` (§4.7): a hostname configured both as a manual `TARDIGRADE_TLS_SNI_CERTS` entry and an ACME-managed domain is a config error. `rejectAcmeRuntime` (the blanket "not implemented yet" `tardi run` refusal, independent of the experimental/profile gate) is deleted -- lifting it was A4's reason to exist. |
+
+Behavior worth knowing:
+
+- §9.3's "model a: preloaded owner" is honored: `edge_gateway.run()` loads
+  the `acme.transport.TrustAnchorSnapshot` once, before
+  `applyRuntimeIdentity`'s privilege drop/chroot, and hands the background
+  bootstrap thread the already-loaded, refcounted snapshot rather than a
+  `ca_bundle_path` string -- that thread (which starts after the drop) never
+  touches the CA bundle path on the filesystem itself.
+- Still not a renewal worker: a group whose generation is due for renewal
+  (within `renew_days_before_expiry` of `not_after`) is not re-issued by
+  anything here. A4 obtains a certificate for a group that has none yet (or
+  recovers one that already exists); #835 owns deciding a *valid* generation
+  is due and re-running the same `issueGroup` step on a schedule.
+- The bootstrap thread's own failures (CA unreachable, an authorization that
+  never validates, a `MalformedChain`/SAN-mismatch response) are logged and
+  swallowed, never propagated out of `edge_gateway.run()`: a first boot
+  against an unreachable CA still serves (fails closed) on the TLS listener
+  and still answers ordinary HTTP/3-or-not traffic on every other route: only
+  the managed hostnames' handshakes are affected.
+- §6.4 verification is not bypassed for a CA-returned chain just because it
+  came from a real network round trip: `fake_ca.zig`'s own certificate
+  response is a scripted placeholder, not a parseable X.509 structure (#883's
+  tests only ever assert its PEM header), so `issueGroup` calling
+  `activate.verifyAndPersist` on it is expected to fail typed
+  (`MalformedChain`) -- exactly the untrusted-CA-response defense §6.4 exists
+  for, verified as its own test in `acme_activation.zig`.
+  `src/acme/test_cert_builder.zig` (test-only, mirrors
+  `activate_tests.zig`'s builder) produces a real, verifiable P-256 chain for
+  the tests that need one for a reason other than exercising that CA-returns-
+  garbage path.
+- Run with `zig build test-acme` or `zig build test` (`acme_activation.zig`
+  and `groups.zig` are both reached from `main.zig`'s/`acme/root.zig`'s test
+  imports); `tests/integration.zig`'s "G11" test spawns the real `tardi`
+  binary with ACME enabled and no manual cert against an unreachable CA
+  directory, confirming a real, independently-dialed plaintext HTTP request
+  against the main port never completes a plaintext HTTP response (requires
+  `-Dacme-experimental`, skipped otherwise).
 
 ## 11. Test plan
 

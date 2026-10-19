@@ -1156,7 +1156,7 @@ fn enforceLocationForwardAuth(
         .method = request.method.toString(),
         .uri = target,
         .host = request.headers.get("host"),
-        .proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http",
+        .proto = if (edge_config.usesNativeTls(cfg)) "https" else "http",
         .client_ip = client_ip,
         .correlation_id = correlation_id,
         .headers = client_view.headers(request),
@@ -3006,7 +3006,11 @@ fn handleHttp3LocationProxyPass(
         } else {
             var key_buf: [64]u8 = undefined;
             _ = gpc.buildCacheKey(&key_buf, .{
-                .scheme = if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
+                // HTTP/3 is always carried over QUIC/TLS.  Keep the
+                // effective listener predicate here as well so an
+                // ACME-only gateway reports the same origin scheme as H1/H2
+                // after its first credential generation is installed.
+                .scheme = if (edge_config.usesNativeTls(ctx.cfg)) "https" else "http",
                 .host = request.headers.get(":authority") orelse request.headers.get("host") orelse "",
                 .method = request.method,
                 .location_id = matched.block.pattern,
@@ -3080,7 +3084,7 @@ fn handleHttp3LocationProxyPass(
         .body = request.body,
         .correlation_id = correlation_id,
         .client_ip = ctx.client_ip,
-        .forwarded_proto = if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
+        .forwarded_proto = if (edge_config.usesNativeTls(ctx.cfg)) "https" else "http",
         .incoming_host = request.headers.get(":authority") orelse request.headers.get("host"),
         .proxy_set_headers = matched.block.proxy_set_headers,
         .selection_base_url = ctx.cfg.upstream_base_url,

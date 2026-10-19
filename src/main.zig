@@ -1010,7 +1010,6 @@ fn prepareRunPlan(allocator: std.mem.Allocator, args: []const []const u8, option
     var cfg = try edge_config.loadFromEnv(allocator);
     errdefer cfg.deinit(allocator);
     try edge_config.validate(&cfg);
-    try edge_config.rejectAcmeRuntime(&cfg);
     try preflightApplianceCredentials(allocator, &cfg);
     edge_config.warnRiskyConfig(&cfg);
 
@@ -1595,6 +1594,7 @@ test {
     _ = @import("gateway_protocol_policy.zig");
     _ = @import("config_reference.zig");
     _ = @import("acme_account_cmd.zig");
+    _ = @import("acme_activation.zig");
 }
 
 test "rotateLogFiles shifts generations" {

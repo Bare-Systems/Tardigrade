@@ -12,6 +12,7 @@ const gp = @import("gateway_proxy.zig");
 const gc = @import("gateway_connection.zig");
 const gs = @import("gateway_state.zig");
 const gpc = @import("gateway_proxy_cache.zig");
+const acme_activation = @import("acme_activation.zig");
 
 const GatewayState = gs.GatewayState;
 const WorkerContext = gs.WorkerContext;
@@ -307,7 +308,7 @@ pub fn hotReloadConfig(
     // this guard is the generic-native owner of the rule.)
     {
         var current_lease = worker_ctx.config_store.acquire();
-        const tls_topology_changed = edge_config.hasTlsFiles(current_lease.cfg) != edge_config.hasTlsFiles(cfg_ptr);
+        const tls_topology_changed = edge_config.usesNativeTls(current_lease.cfg) != edge_config.usesNativeTls(cfg_ptr);
         current_lease.release();
         if (tls_topology_changed) {
             worker_ctx.config_store.destroyVersion(prepared_version);
@@ -346,18 +347,56 @@ pub fn hotReloadConfig(
         for (cfg_ptr.tls_sni_certs, 0..) |sc, i| {
             sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
         }
-        prepared_native_credentials = store.prepareReloadFromFiles(cfg_ptr.tls_cert_path, cfg_ptr.tls_key_path, sni_specs) catch |err| {
-            worker_ctx.config_store.destroyVersion(prepared_version);
-            const msg = std.fmt.bufPrint(&state.last_reload_error, "native TLS credential reload failed: {}", .{err}) catch "native TLS credential reload failed";
-            state.reload_mutex.lock();
-            state.last_reload_ok = false;
-            state.last_reload_at_ms = now_ms;
-            state.last_reload_error_len = msg.len;
-            state.reload_mutex.unlock();
-            state.metricsRecordReloadFailure();
-            state.logger.warn(null, "config reload rejected by native TLS credential reload: {}", .{err});
-            return;
-        };
+        // #884: an ACME-enabled process must never reload through the
+        // file-only path -- `prepareReloadFromFiles` carries no managed
+        // bundle at all, and `commitPreparedReload` would then have to
+        // choose between silently dropping every ACME-issued identity or
+        // rejecting every routine reload outright
+        // (`native_tls_connection.NativeCredentialStore.has_managed_bundles`).
+        // Rebuilding the complete current managed set from disk and
+        // republishing through `prepareReloadFromBundles` instead means an
+        // ordinary SIGHUP reload (e.g. a changed header rule) and an ACME
+        // publish compose correctly no matter which one happens to run
+        // first.
+        if (cfg_ptr.tls_acme_enabled) {
+            if (reloadAcmeManagedCredentials(allocator, store, cfg_ptr, sni_specs)) |prepared| {
+                prepared_native_credentials = prepared;
+            } else |err| {
+                // During an ACME-only first boot there is intentionally no
+                // provider snapshot yet.  Do not turn an unrelated SIGHUP
+                // into `EmptyCredentialSet`: retain that uninstalled
+                // provider so TLS still fails closed, and let the bootstrap
+                // worker publish a complete generation later using its lease
+                // on the newly installed configuration.
+                if (err == error.NoActiveCredentialSet) {
+                    // Nothing to prepare or commit is the correct result.
+                } else {
+                    worker_ctx.config_store.destroyVersion(prepared_version);
+                    const msg = std.fmt.bufPrint(&state.last_reload_error, "ACME-managed native TLS credential reload failed: {}", .{err}) catch "ACME-managed native TLS credential reload failed";
+                    state.reload_mutex.lock();
+                    state.last_reload_ok = false;
+                    state.last_reload_at_ms = now_ms;
+                    state.last_reload_error_len = msg.len;
+                    state.reload_mutex.unlock();
+                    state.metricsRecordReloadFailure();
+                    state.logger.warn(null, "config reload rejected by ACME-managed native TLS credential reload: {}", .{err});
+                    return;
+                }
+            }
+        } else {
+            prepared_native_credentials = store.prepareReloadFromFiles(cfg_ptr.tls_cert_path, cfg_ptr.tls_key_path, sni_specs) catch |err| {
+                worker_ctx.config_store.destroyVersion(prepared_version);
+                const msg = std.fmt.bufPrint(&state.last_reload_error, "native TLS credential reload failed: {}", .{err}) catch "native TLS credential reload failed";
+                state.reload_mutex.lock();
+                state.last_reload_ok = false;
+                state.last_reload_at_ms = now_ms;
+                state.last_reload_error_len = msg.len;
+                state.reload_mutex.unlock();
+                state.metricsRecordReloadFailure();
+                state.logger.warn(null, "config reload rejected by native TLS credential reload: {}", .{err});
+                return;
+            };
+        }
     }
     // #763: rotate downstream client trust anchors with the same
     // prepare-then-publish discipline as the server identity. A bundle that
@@ -414,6 +453,9 @@ pub fn hotReloadConfig(
     }
     if (worker_ctx.native_credentials) |store| {
         if (prepared_native_credentials) |*prepared| {
+            // The ACME bootstrap worker compares this stamp before it can
+            // publish a snapshot assembled from an older manual mapping.
+            prepared.manual_config_generation = prepared_version.generation;
             store.commitPreparedReload(prepared) catch |err| {
                 worker_ctx.config_store.destroyVersion(prepared_version);
                 const msg = std.fmt.bufPrint(&state.last_reload_error, "native TLS credential publish failed: {}", .{err}) catch "native TLS credential publish failed";
@@ -464,6 +506,117 @@ pub fn hotReloadConfig(
     state.reload_mutex.unlock();
     state.metricsRecordReloadSuccess();
     state.logger.info(null, "configuration hot-reload applied", .{});
+}
+
+/// Rebuilds the complete current managed (ACME) bundle set from disk and
+/// prepares a bytes-based reload carrying it alongside `cfg_ptr`'s manual
+/// default/SNI credentials (#884, design §7.1: "the managed bundle set is
+/// rebuilt from all groups every publish"). Used in place of
+/// `prepareReloadFromFiles` for every reload while `cfg_ptr.tls_acme_enabled`
+/// is true, so an ordinary file-only-looking reload never has to contend
+/// with `NativeCredentialStore.has_managed_bundles`'s file-only rejection.
+fn reloadAcmeManagedCredentials(
+    allocator: std.mem.Allocator,
+    store: *http.native_tls_connection.NativeCredentialStore,
+    cfg_ptr: *const edge_config.EdgeConfig,
+    sni_specs: []const http.native_tls_connection.SniCertSpec,
+) !http.native_tls_connection.NativeCredentialStore.PreparedReload {
+    const group_list = http.acme.groups.parse(cfg_ptr.tls_acme_domains_spec) catch return error.InvalidAcmeDomains;
+    var acme_state = try http.acme.state.StateDir.open(cfg_ptr.tls_acme_cert_dir);
+    defer acme_state.close();
+    var bundles = try acme_activation.loadManagedBundleSet(allocator, &acme_state, &group_list, compat.unixTimestamp());
+    defer bundles.deinit();
+    if (cfg_ptr.tls_cert_path.len == 0 and cfg_ptr.tls_key_path.len == 0 and sni_specs.len == 0 and bundles.slice().len == 0 and !store.hasActiveCredentials()) {
+        return error.NoActiveCredentialSet;
+    }
+    return store.prepareReloadFromBundles(cfg_ptr.tls_cert_path, cfg_ptr.tls_key_path, sni_specs, bundles.slice());
+}
+
+test "reloadAcmeManagedCredentials republishes an active managed generation that prepareReloadFromFiles would reject outright (#884)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const state_dir = try std.fmt.allocPrint(allocator, "{s}/state", .{tmp_abs});
+    defer allocator.free(state_dir);
+
+    const hostnames = [_][]const u8{"a.example.test"};
+    var leaf = try http.acme.test_cert_builder.selfSignedLeaf(allocator, &hostnames, compat.unixTimestamp() - 3600, compat.unixTimestamp() + 365 * 24 * 3600);
+    defer allocator.free(leaf.pem);
+    defer leaf.key.deinit();
+
+    var store = http.native_tls_connection.NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    {
+        var acme_state = try http.acme.state.StateDir.open(state_dir);
+        defer acme_state.close();
+        var id_buf: [http.acme.groups.group_id_len]u8 = undefined;
+        const group_id = http.acme.groups.groupId(&id_buf, &hostnames);
+        _ = try http.acme.activate.verifyAndPersist(allocator, &acme_state, group_id, &leaf.key, leaf.pem, .{
+            .hostnames = &hostnames,
+            .now = compat.unixTimestamp(),
+        });
+    }
+    // Install it so `store.has_managed_bundles` is true, exactly the state
+    // a running process would already be in by the time an unrelated
+    // reload (e.g. a changed header rule) comes in.
+    const leaf_key_pem = try leaf.key.toPkcs8Pem(allocator);
+    defer @import("crypto").secrets.secureZeroAndFree(allocator, leaf_key_pem);
+    try store.reloadFromBundles("", "", &.{}, &.{.{ .hostnames = &hostnames, .chain_pem = leaf.pem, .key_pem = leaf_key_pem }});
+
+    var cfg = try edge_config.loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    cfg.tls_acme_enabled = true;
+    allocator.free(cfg.tls_acme_cert_dir);
+    cfg.tls_acme_cert_dir = try allocator.dupe(u8, state_dir);
+    allocator.free(cfg.tls_acme_domains_spec);
+    cfg.tls_acme_domains_spec = try allocator.dupe(u8, "a.example.test");
+
+    // The file-only path a non-ACME reload uses rejects this outright: it
+    // never carries a managed bundle and the active generation already has
+    // one (`NativeCredentialStore.has_managed_bundles`).
+    try std.testing.expectError(error.ManagedCredentialsActive, store.prepareReloadFromFiles("", "", &.{}));
+
+    // The ACME-aware path rebuilds the complete managed set from disk and
+    // republishes it instead, succeeding where the file-only path cannot.
+    var prepared = try reloadAcmeManagedCredentials(allocator, &store, &cfg, &.{});
+    defer prepared.deinit();
+    try store.commitPreparedReload(&prepared);
+}
+
+test "reloadAcmeManagedCredentials permits an unrelated reload before the first ACME identity exists" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const state_dir = try std.fmt.allocPrint(allocator, "{s}/state", .{tmp_abs});
+    defer allocator.free(state_dir);
+
+    var cfg = try edge_config.loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    cfg.tls_acme_enabled = true;
+    allocator.free(cfg.tls_acme_cert_dir);
+    cfg.tls_acme_cert_dir = try allocator.dupe(u8, state_dir);
+    allocator.free(cfg.tls_acme_domains_spec);
+    cfg.tls_acme_domains_spec = try allocator.dupe(u8, "a.example.test");
+
+    var store = http.native_tls_connection.NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    try std.testing.expect(!store.hasActiveCredentials());
+    try std.testing.expectError(error.NoActiveCredentialSet, reloadAcmeManagedCredentials(allocator, &store, &cfg, &.{}));
+    // The uninstalled provider remains deliberately fail-closed; the caller
+    // can publish the non-credential configuration generation independently.
+    try std.testing.expectError(error.NoCredentialAvailable, store.provider().selectCredential(&.{
+        .role = .server,
+        .server_name = "a.example.test",
+        .peer_signature_schemes = &.{0x0403},
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    }));
 }
 
 /// True when a proposed configuration changes any input that feeds the
@@ -581,6 +734,7 @@ pub fn acmeHttp01ListenerConfigChanged(
     return current.tls_acme_enabled != proposed.tls_acme_enabled or
         !std.mem.eql(u8, current.tls_acme_http01_listen, proposed.tls_acme_http01_listen) or
         !std.mem.eql(u8, current.tls_acme_domains_spec, proposed.tls_acme_domains_spec) or
+        current.tls_https_redirect != proposed.tls_https_redirect or
         (current.tls_acme_enabled and
             current.max_connections_per_ip != proposed.max_connections_per_ip);
 }
@@ -619,6 +773,24 @@ test "acmeHttp01ListenerConfigChanged detects an enabled-flag change (#897 revie
     defer proposed.deinit(allocator);
 
     proposed.tls_acme_enabled = !base.tls_acme_enabled;
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+}
+
+test "acmeHttp01ListenerConfigChanged rejects either redirect transition (#929 review)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    base.tls_acme_enabled = true;
+    proposed.tls_acme_enabled = true;
+    base.tls_https_redirect = false;
+    proposed.tls_https_redirect = true;
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+
+    base.tls_https_redirect = true;
+    proposed.tls_https_redirect = false;
     try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
 }
 

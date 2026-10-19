@@ -31,6 +31,35 @@ pub const default_total_deadline_ms: u32 = 10_000;
 
 pub const challenge_prefix = "/.well-known/acme-challenge/";
 
+/// Injectable "has this managed host ever been published" query (#884,
+/// design §8.3), the same ctx/fn-pointer seam `orders.Cancel`/`orders.Waiter`
+/// use. Kept this narrow (rather than importing the top-level ACME
+/// activation module directly) so this listener stays a leaf `http/`
+/// module with no dependency on it -- `edge_gateway.zig`, which already
+/// depends on both, supplies the real implementation.
+pub const PublishedCheck = struct {
+    ctx: ?*anyopaque = null,
+    isPublishedFn: *const fn (ctx: ?*anyopaque, host: []const u8) bool = alwaysUnpublished,
+
+    fn alwaysUnpublished(_: ?*anyopaque, _: []const u8) bool {
+        return false;
+    }
+
+    pub fn isPublished(self: PublishedCheck, host: []const u8) bool {
+        return self.isPublishedFn(self.ctx, host);
+    }
+};
+
+/// Design §8.3: optional HTTP->HTTPS redirect, served by this listener for
+/// managed hosts only, only once published (never for a first-run
+/// deployment whose certificate does not exist yet).
+pub const HttpsRedirectOptions = struct {
+    published: PublishedCheck,
+    /// The main listener's HTTPS port; the redirect target rewrites the
+    /// validated Host's port to this one.
+    https_port: u16,
+};
+
 pub const Options = struct {
     /// Already-canonical-lowercase managed hostnames (`acme/names.zig`'s
     /// output shape); borrowed for the listener's lifetime.
@@ -45,6 +74,8 @@ pub const Options = struct {
     max_connections_per_ip: u32 = 0,
     head_read_deadline_ms: u32 = default_head_read_deadline_ms,
     total_deadline_ms: u32 = default_total_deadline_ms,
+    /// `null` (the default): never redirect, exactly today's behavior.
+    https_redirect: ?HttpsRedirectOptions = null,
 };
 
 /// A peer's raw address bytes, family-tagged, for per-IP admission counting.
@@ -104,6 +135,7 @@ pub const Listener = struct {
     max_connections_per_ip: u32,
     head_read_deadline_ms: u32,
     total_deadline_ms: u32,
+    https_redirect: ?HttpsRedirectOptions,
     stopping: std.atomic.Value(bool) = .init(false),
     slots_mutex: compat.Mutex = .{},
     slots: [default_max_connections]ConnSlot = @splat(.{}),
@@ -135,6 +167,7 @@ pub const Listener = struct {
             .max_connections_per_ip = options.max_connections_per_ip,
             .head_read_deadline_ms = options.head_read_deadline_ms,
             .total_deadline_ms = options.total_deadline_ms,
+            .https_redirect = options.https_redirect,
         };
         self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
     }
@@ -418,6 +451,18 @@ pub const Listener = struct {
             return;
         }
         if (!std.mem.startsWith(u8, req.uri.path, challenge_prefix)) {
+            // Design §8.3: the challenge path itself is exempt from the
+            // redirect (handled above, before this branch is ever
+            // reached); only non-challenge requests for an already-managed,
+            // already-published host are redirected.
+            if (self.https_redirect) |redirect| {
+                if (matchManagedHost(self.managed_hosts, req.host())) |managed_host| {
+                    if (redirect.published.isPublished(managed_host)) {
+                        respondRedirect(self.allocator, fd, total_deadline_ns, managed_host, redirect.https_port, req.uri.path, req.uri.query);
+                        return;
+                    }
+                }
+            }
             respondStatus(self.allocator, fd, total_deadline_ns, .not_found);
             return;
         }
@@ -462,6 +507,37 @@ fn respondStatus(allocator: std.mem.Allocator, fd: std.posix.fd_t, total_deadlin
     var resp = response_mod.Response.init(allocator);
     defer resp.deinit();
     _ = resp.setStatus(code).setConnection(false);
+    writeResponseBeforeDeadline(allocator, fd, total_deadline_ns, &resp, "");
+}
+
+/// Design §8.3: `host` is always the *canonical* `managed_hosts` entry the
+/// caller already matched (`matchManagedHost`'s return value, never the raw
+/// `Host` header), and `path`/`query` come from the already-parsed request
+/// line, so none of these three can carry CRLF or otherwise inject into the
+/// response. A `host`/`path`/`query` combination too long for `buf` fails
+/// closed to a plain `404` rather than truncating a Location header.
+fn respondRedirect(
+    allocator: std.mem.Allocator,
+    fd: std.posix.fd_t,
+    total_deadline_ns: i128,
+    host: []const u8,
+    https_port: u16,
+    path: []const u8,
+    query: ?[]const u8,
+) void {
+    var buf: [1536]u8 = undefined;
+    const location = (if (https_port == 443)
+        if (query) |q| std.fmt.bufPrint(&buf, "https://{s}{s}?{s}", .{ host, path, q }) else std.fmt.bufPrint(&buf, "https://{s}{s}", .{ host, path })
+    else if (query) |q|
+        std.fmt.bufPrint(&buf, "https://{s}:{d}{s}?{s}", .{ host, https_port, path, q })
+    else
+        std.fmt.bufPrint(&buf, "https://{s}:{d}{s}", .{ host, https_port, path })) catch {
+        respondStatus(allocator, fd, total_deadline_ns, .not_found);
+        return;
+    };
+    var resp = response_mod.Response.redirect(allocator, location, .permanent_redirect);
+    defer resp.deinit();
+    _ = resp.setConnection(false);
     writeResponseBeforeDeadline(allocator, fd, total_deadline_ns, &resp, "");
 }
 
@@ -785,6 +861,98 @@ test "Listener serves a managed host's live challenge for GET and HEAD, fails cl
         try sendAndRecv(allocator, p, "GET /.well-known/acme-challenge/abcdefghijklmnop HTTP/1.1\r\nHost: a.example.com\r\nContent-Length: 4\r\n\r\nabcd", &out);
         try testing.expect(std.mem.startsWith(u8, out.items, "HTTP/1.1 400"));
     }
+}
+
+const TestPublished = struct {
+    hosts: []const []const u8,
+
+    fn isPublished(ctx: ?*anyopaque, host: []const u8) bool {
+        const self: *const TestPublished = @ptrCast(@alignCast(ctx.?));
+        for (self.hosts) |h| {
+            if (std.mem.eql(u8, h, host)) return true;
+        }
+        return false;
+    }
+
+    fn check(self: *const TestPublished) PublishedCheck {
+        return .{ .ctx = @constCast(self), .isPublishedFn = isPublished };
+    }
+};
+
+test "Listener's optional https_redirect (#884, design §8.3) redirects only a managed, published host, never the challenge path or an unmanaged/unpublished host" {
+    const allocator = testing.allocator;
+    var store = ChallengeStore.init(allocator);
+    defer store.deinit();
+    const now = compat.unixTimestamp();
+    try store.put(now, "a.example.com", "abcdefghijklmnop", "abcdefghijklmnop.thumb", now + 600);
+
+    const managed = [_][]const u8{ "a.example.com", "b.example.com" };
+    const published = TestPublished{ .hosts = &.{"a.example.com"} };
+    var listener: Listener = undefined;
+    try listener.start(allocator, "127.0.0.1", 0, .{
+        .managed_hosts = &managed,
+        .store = &store,
+        .https_redirect = .{ .published = published.check(), .https_port = 443 },
+    });
+    defer listener.deinit();
+    const p = listener.port();
+
+    // Published managed host, non-challenge path with a query string: 308
+    // to the HTTPS equivalent, port omitted because it is the default 443.
+    {
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(allocator);
+        try sendAndRecv(allocator, p, "GET /some/path?q=1 HTTP/1.1\r\nHost: a.example.com\r\n\r\n", &out);
+        try testing.expect(std.mem.startsWith(u8, out.items, "HTTP/1.1 308"));
+        try testing.expect(std.mem.indexOf(u8, out.items, "location: https://a.example.com/some/path?q=1\r\n") != null);
+    }
+
+    // The challenge path itself is exempt even for a published host: it
+    // still answers the challenge, not a redirect.
+    {
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(allocator);
+        try sendAndRecv(allocator, p, "GET /.well-known/acme-challenge/abcdefghijklmnop HTTP/1.1\r\nHost: a.example.com\r\n\r\n", &out);
+        try testing.expect(std.mem.startsWith(u8, out.items, "HTTP/1.1 200"));
+    }
+
+    // Managed but not yet published: no redirect, no door to a certificate
+    // that does not exist yet (design §8.3).
+    {
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(allocator);
+        try sendAndRecv(allocator, p, "GET / HTTP/1.1\r\nHost: b.example.com\r\n\r\n", &out);
+        try testing.expect(std.mem.startsWith(u8, out.items, "HTTP/1.1 404"));
+    }
+
+    // Unmanaged host: never redirected regardless of `https_redirect`.
+    {
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(allocator);
+        try sendAndRecv(allocator, p, "GET / HTTP/1.1\r\nHost: evil.example.com\r\n\r\n", &out);
+        try testing.expect(std.mem.startsWith(u8, out.items, "HTTP/1.1 404"));
+    }
+}
+
+test "Listener's https_redirect includes a non-default HTTPS port in the Location" {
+    const allocator = testing.allocator;
+    var store = ChallengeStore.init(allocator);
+    defer store.deinit();
+    const managed = [_][]const u8{"a.example.com"};
+    const published = TestPublished{ .hosts = &managed };
+    var listener: Listener = undefined;
+    try listener.start(allocator, "127.0.0.1", 0, .{
+        .managed_hosts = &managed,
+        .store = &store,
+        .https_redirect = .{ .published = published.check(), .https_port = 8443 },
+    });
+    defer listener.deinit();
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try sendAndRecv(allocator, listener.port(), "GET /x HTTP/1.1\r\nHost: a.example.com\r\n\r\n", &out);
+    try testing.expect(std.mem.startsWith(u8, out.items, "HTTP/1.1 308"));
+    try testing.expect(std.mem.indexOf(u8, out.items, "location: https://a.example.com:8443/x\r\n") != null);
 }
 
 test "Listener admission cap accepts up to the configured bound and rejects beyond it" {

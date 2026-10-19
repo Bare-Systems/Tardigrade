@@ -722,7 +722,7 @@ pub fn handleLocationProxyPass(
         } else {
             var key_buf: [64]u8 = undefined;
             _ = gpc.buildCacheKey(&key_buf, .{
-                .scheme = if (edge_config.hasTlsFiles(cfg)) "https" else "http",
+                .scheme = if (edge_config.usesNativeTls(cfg)) "https" else "http",
                 .host = incoming_host orelse "",
                 .method = cache_method,
                 .location_id = location_id,
@@ -786,7 +786,7 @@ pub fn handleLocationProxyPass(
         try buildStickySetCookieHeader(temp_allocator, cfg, value, selection.base_url)
     else
         null;
-    const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
+    const forwarded_proto = if (edge_config.usesNativeTls(cfg)) "https" else "http";
     const method_str = request.method.toString();
 
     // Determine retry budget. Non-idempotent methods are not retried when the
@@ -1256,7 +1256,7 @@ pub fn handleLocationWebSocketProxyPass(
             .request_headers = &request.headers,
             .correlation_id = correlation_id,
             .client_ip = client_ip,
-            .forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http",
+            .forwarded_proto = if (edge_config.usesNativeTls(cfg)) "https" else "http",
             .incoming_host = incoming_host,
             .proxy_set_headers = matched_block.proxy_set_headers,
             .auth_identity = ctx.identity,

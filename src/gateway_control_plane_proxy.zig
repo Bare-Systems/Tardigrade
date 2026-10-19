@@ -492,7 +492,7 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
     defer forwarded_for.deinit(allocator);
 
     const forwarded_host = incoming_host orelse "";
-    const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
+    const forwarded_proto = if (edge_config.usesNativeTls(cfg)) "https" else "http";
     const upstream_host = resolved_target.upstream_host;
     if (cfg.trust_require_upstream_identity and cfg.trust_shared_secret.len == 0) return error.UpstreamUntrusted;
     if (!isTrustedUpstream(cfg, upstream_host)) return error.UpstreamUntrusted;

@@ -7,6 +7,7 @@ const runtime_allocator = @import("runtime_allocator.zig");
 const build_options = @import("build_options");
 const tls_core = @import("tls_core");
 const http3_wire = @import("http3");
+const acme_activation = @import("acme_activation.zig");
 
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
@@ -63,6 +64,38 @@ const MuxResumeState = gs.MuxResumeState;
 
 const ActiveDrivePollRemoveFn = *const fn (*anyopaque, std.posix.fd_t) anyerror!void;
 const ActiveDrivePollSubmitFn = *const fn (*anyopaque, std.posix.fd_t) anyerror!void;
+
+/// `http.acme_http01_listener.PublishedCheck.isPublishedFn` implementation
+/// (#884): the listener's leaf `http/` module has no dependency on
+/// `acme_activation.zig`, so it calls back through this ctx/fn-pointer
+/// seam instead.
+fn acmePublishedHostCheck(ctx: ?*anyopaque, host: []const u8) bool {
+    const published: *acme_activation.PublishedHosts = @ptrCast(@alignCast(ctx.?));
+    return published.isPublished(host);
+}
+
+/// Prepares an ACME publication using a lease on the current configuration.
+/// The generation stamp makes a concurrently completed SIGHUP win over a
+/// bootstrap worker that began with older manual certificate paths.
+fn prepareCurrentAcmeCredentials(
+    raw_store: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    store: *http.native_tls_connection.NativeCredentialStore,
+    bundles: []const http.native_tls_connection.ManagedBundleSpec,
+) !http.native_tls_connection.NativeCredentialStore.PreparedReload {
+    const config_store: *ReloadableConfigStore = @ptrCast(@alignCast(raw_store.?));
+    var lease = config_store.acquire();
+    defer lease.release();
+    const cfg = lease.cfg;
+    var sni_specs = try allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
+    defer allocator.free(sni_specs);
+    for (cfg.tls_sni_certs, 0..) |spec, i| {
+        sni_specs[i] = .{ .server_name = spec.server_name, .cert_path = spec.cert_path, .key_path = spec.key_path };
+    }
+    var prepared = try store.prepareReloadFromBundles(cfg.tls_cert_path, cfg.tls_key_path, sni_specs, bundles);
+    prepared.manual_config_generation = lease.version.generation;
+    return prepared;
+}
 
 /// Takes a mutable config because the startup generation publishes its parsed
 /// ACL back onto it (`EdgeConfig.parsed_access_control`), which is what pairs
@@ -332,10 +365,21 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     // on `cfg.tls_acme_enabled`, which the validated config guarantees
     // implies a non-empty `cfg.tls_acme_domains` and therefore a non-null
     // `state.acme_challenge_store` (`validateAcmeConfig`, `acme/names.zig`).
+    // #884 (G8, design §8.3): declared ahead of the listener below (not
+    // just ahead of the bootstrap wiring further down) because the
+    // listener's `https_redirect` option borrows a pointer to it; the
+    // listener's accept thread only ever reads it later, at request-dispatch
+    // time, so it is fine for `recoverFromDisk`/the bootstrap thread
+    // (further down, once `native_credentials` exists) to populate it after
+    // the listener has already started.
+    var published_hosts: ?acme_activation.PublishedHosts = null;
+    defer if (published_hosts) |*p| p.deinit();
+
     var acme_http01_listener: http.acme_http01_listener.Listener = undefined;
     var acme_http01_listener_active = false;
     defer if (acme_http01_listener_active) acme_http01_listener.deinit();
     if (cfg.tls_acme_enabled) {
+        published_hosts = acme_activation.PublishedHosts.init(state_allocator);
         const http01_addr = try edge_config.parseAcmeHttp01Listen(cfg.tls_acme_http01_listen);
         acme_http01_listener.start(state_allocator, http01_addr.host, http01_addr.port, .{
             .managed_hosts = cfg.tls_acme_domains,
@@ -345,11 +389,33 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             // listener's per-IP cap, enforced independently in this
             // listener's own small bounded pool.
             .max_connections_per_ip = cfg.max_connections_per_ip,
+            .https_redirect = if (cfg.tls_https_redirect) .{
+                .published = .{ .ctx = &published_hosts.?, .isPublishedFn = acmePublishedHostCheck },
+                .https_port = cfg.listen_port,
+            } else null,
         }) catch |err| {
             state.logger.err(null, "failed to bind ACME HTTP-01 challenge listener on {s}:{d}: {}", .{ http01_addr.host, http01_addr.port, err });
             return err;
         };
         acme_http01_listener_active = true;
+    }
+
+    // #884 (design §9.3 "model a: preloaded owner"): the ACME CA trust
+    // anchors are loaded once here, *before* the privilege drop/chroot
+    // below, exactly like `appliance_identity` above -- the bootstrap
+    // thread spawned further down (after the drop) must never touch
+    // `cfg.tls_acme_ca_bundle_path` on the filesystem itself, since a
+    // chrooted or privilege-dropped process may no longer be able to read
+    // it by the time that thread starts. `acme_trust_anchors` holds the
+    // one long-lived reference for `run()`'s lifetime; the bootstrap
+    // thread's own `TlsDialer` retains and releases its own on top of it.
+    var acme_trust_anchors: ?*http.acme.transport.TrustAnchorSnapshot = null;
+    defer if (acme_trust_anchors) |snapshot| snapshot.release();
+    if (cfg.tls_acme_enabled) {
+        acme_trust_anchors = http.acme.transport.TrustAnchorSnapshot.load(state_allocator, cfg.tls_acme_ca_bundle_path) catch |err| {
+            state.logger.err(null, "ACME CA trust anchors unavailable ({s}); refusing to start", .{@errorName(err)});
+            return err;
+        };
     }
 
     applyRuntimeIdentity(cfg, &state.logger) catch |err| {
@@ -451,27 +517,99 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     };
     var native_tls_provider: ?tls_core.credentials.CredentialProvider = null;
     var h3_credential_provider: ?tls_core.credentials.CredentialProvider = null;
-    if (edge_config.hasTlsFiles(cfg)) {
+    // Hoisted out of the branch below (and kept alive for the rest of
+    // `run()`, not just this block) because the ACME bootstrap wiring
+    // further down also needs it every time it rebuilds and republishes
+    // the complete credential set (design §7.1).
+    var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
+    defer state_allocator.free(native_sni_specs);
+    for (cfg.tls_sni_certs, 0..) |sc, i| {
+        native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+    }
+    // #884 (G11, design §7.4.1): `automatic_https` itself makes the main
+    // listener TLS from process start, even before any certificate exists
+    // -- not only when manual cert/key files are configured. The store is
+    // still constructed with no bundle installed at all in that case (no
+    // `reloadFromFiles` call below, so `provider_state` never has a
+    // snapshot): an uninstalled `sni_provider.ReloadableProvider` fails
+    // every selection closed (`NoCredentialAvailable`), which is exactly
+    // the "no accidental plaintext, no self-signed downgrade" bootstrap
+    // state the design requires. The ACME bootstrap wiring further down
+    // installs the first real snapshot once something is actually
+    // available to publish (a restart-recovered or freshly issued
+    // generation, or a manually configured default/SNI cert alongside it).
+    if (edge_config.hasTlsFiles(cfg) or cfg.tls_acme_enabled) {
         if (edge_config.is_appliance_tls_profile) {
             // Appliance profile: the strict owner is the only credential
             // source for both native TCP TLS and HTTP/3. There is no
             // fallback through the permissive generic identity loader.
+            // ACME can never be enabled on this profile (validated), so
+            // this branch is only ever reached via `hasTlsFiles`.
             const owner = &appliance_identity.?;
             native_tls_provider = owner.provider();
             h3_credential_provider = owner.provider();
         } else {
-            var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
-            defer state_allocator.free(native_sni_specs);
-            for (cfg.tls_sni_certs, 0..) |sc, i| {
-                native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
-            }
             native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
-            try native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs);
+            // A manual SNI-only deployment has no default certificate, but
+            // still needs a first snapshot before the ACME worker obtains a
+            // managed group.  Otherwise a transient CA outage would take an
+            // unrelated, valid manual hostname offline.
+            if (edge_config.hasTlsFiles(cfg) or native_sni_specs.len != 0) {
+                try native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs);
+            }
             native_tls_provider = native_credentials.?.provider();
             h3_credential_provider = native_credentials.?.provider();
         }
     }
     defer if (native_credentials) |*store| store.deinit();
+    // #884: restart recovery (design §5.5) runs synchronously here, before
+    // any network access, so a restart during a CA outage still serves
+    // whatever was already durably issued; a background bootstrap thread
+    // then makes exactly one issuance attempt per managed group still
+    // missing a valid generation. This is not the renewal worker (#835):
+    // there is no scheduler, no periodic wake-up, no cross-restart backoff
+    // here, only the one-shot bootstrap A4 owns.
+    var acme_bootstrap: ?acme_activation.BootstrapCtx = null;
+    defer if (acme_bootstrap) |*ctx| ctx.stopAndJoin();
+    if (cfg.tls_acme_enabled) {
+        const recovered = acme_activation.recoverFromDisk(
+            state_allocator,
+            cfg.tls_acme_domains_spec,
+            cfg.tls_acme_cert_dir,
+            cfg.tls_cert_path,
+            cfg.tls_key_path,
+            native_sni_specs,
+            &native_credentials.?,
+            &published_hosts.?,
+            compat.unixTimestamp(),
+        ) catch |err| {
+            state.logger.err(null, "ACME state directory rejected at startup ({s}); refusing to start", .{@errorName(err)});
+            return err;
+        };
+        acme_bootstrap = acme_activation.BootstrapCtx{
+            .allocator = state_allocator,
+            .state_dir_path = cfg.tls_acme_cert_dir,
+            .default_cert_path = cfg.tls_cert_path,
+            .default_key_path = cfg.tls_key_path,
+            .sni_certs = native_sni_specs,
+            .issue = .{
+                .directory_url = cfg.tls_acme_directory_url,
+                .contact_email = cfg.tls_acme_email,
+                .terms_of_service_agreed = cfg.tls_acme_agree_tos,
+                .account_key_path = cfg.tls_acme_account_key_path,
+                .trust_anchors = acme_trust_anchors.?,
+            },
+            .store = &native_credentials.?,
+            .challenge_store = &state.acme_challenge_store.?,
+            .published = &published_hosts.?,
+            .prepare_current_credentials = prepareCurrentAcmeCredentials,
+            .credential_config_ctx = &config_store,
+            .group_list = recovered.group_list,
+            .needs_issuance = recovered.needs_issuance,
+            .logger = state.logger,
+        };
+        try acme_bootstrap.?.start();
+    }
     // #763: downstream mTLS trust anchors. Loaded eagerly so a bad bundle
     // fails startup rather than the first handshake; never falls back to the
     // system trust store.
@@ -526,8 +664,8 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         ).early_data_replay_gate;
     }
     if (cfg.http3_enabled) {
-        if (!edge_config.hasTlsFiles(cfg)) {
-            state.logger.warn(null, "HTTP/3 requested without TLS cert/key; QUIC bootstrap will remain incomplete", .{});
+        if (!edge_config.usesNativeTls(cfg)) {
+            state.logger.warn(null, "HTTP/3 requested without native TLS; QUIC bootstrap will remain incomplete", .{});
         }
         if (cfg.http3_qlog_dir.len > 0 or cfg.http3_keylog_path.len > 0) {
             http3_observability_artifacts = http.http3_runtime.ObservabilityArtifacts.initWithLogger(
@@ -711,8 +849,8 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
 
     state.logger.info(null, "Tardigrade edge listening on {s}:{d}", .{ cfg.listen_host, cfg.listen_port });
     state.logger.info(null, "Event loop initialized with backend: {s}", .{event_loop.backendName()});
-    if (!edge_config.hasTlsFiles(cfg)) {
-        state.logger.warn(null, "TLS cert/key not set; serving HTTP only", .{});
+    if (!edge_config.usesNativeTls(cfg)) {
+        state.logger.warn(null, "TLS credentials not set; serving HTTP only", .{});
     } else {
         state.logger.info(null, "TLS termination enabled with cert/key at {s} and {s}", .{ cfg.tls_cert_path, cfg.tls_key_path });
     }
@@ -5207,7 +5345,7 @@ fn executeHttp2ProxyRoute(
                 .method = method,
                 .uri = target,
                 .host = ps.authority orelse request.headers.get("host"),
-                .proto = if (edge_config.hasTlsFiles(route_cfg)) "https" else "http",
+                .proto = if (edge_config.usesNativeTls(route_cfg)) "https" else "http",
                 .client_ip = ctx.client_ip,
                 .correlation_id = correlation_id,
                 .headers = client_view.headers(request),
@@ -5340,7 +5478,7 @@ fn executeHttp2ProxyRoute(
         } else {
             var key_buf: [64]u8 = undefined;
             _ = gproxy_cache.buildCacheKey(&key_buf, .{
-                .scheme = if (edge_config.hasTlsFiles(route_cfg)) "https" else "http",
+                .scheme = if (edge_config.usesNativeTls(route_cfg)) "https" else "http",
                 .host = ps.authority orelse request.headers.get("host") orelse "",
                 .method = request.method.toString(),
                 .location_id = matched.block.pattern,
@@ -5380,7 +5518,7 @@ fn executeHttp2ProxyRoute(
     var upstream_url = try gp.appendProxyQueryString(allocator, resolved.url, request.uri.query);
     defer upstream_url.deinit(allocator);
 
-    const forwarded_proto = if (edge_config.hasTlsFiles(route_cfg)) "https" else "http";
+    const forwarded_proto = if (edge_config.usesNativeTls(route_cfg)) "https" else "http";
     var proxy_response = try gproxy_runtime.executeBufferedDataPlaneProxyRequest(
         allocator,
         route_cfg,

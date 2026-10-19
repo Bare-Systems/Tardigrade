@@ -410,16 +410,28 @@ test "TLS-ALPN registry concurrent lookup, retirement, and reactivation stay gen
     };
 
     var shared = Shared{ .registry = &registry };
-    var readers: [3]std.Thread = undefined;
-    readers[0] = try std.Thread.spawn(.{}, Shared.reader, .{ &shared, "a.example.test" });
-    readers[1] = try std.Thread.spawn(.{}, Shared.reader, .{ &shared, "a.example.test" });
-    readers[2] = try std.Thread.spawn(.{}, Shared.reader, .{ &shared, "b.example.test" });
-    const owner = try std.Thread.spawn(.{}, Shared.owner, .{&shared});
-    const expirer = try std.Thread.spawn(.{}, Shared.expirer, .{&shared});
-    owner.join();
-    expirer.join();
-    shared.done.store(true, .release);
-    for (readers) |t| t.join();
+    {
+        // Partial thread start-up must always unwind: finite workers finish
+        // first, then every launched reader is stopped and joined before the
+        // registry can be torn down.
+        var readers: [3]std.Thread = undefined;
+        var launched: usize = 0;
+        var owner: ?std.Thread = null;
+        var expirer: ?std.Thread = null;
+        defer {
+            if (owner) |t| t.join();
+            if (expirer) |t| t.join();
+            shared.done.store(true, .release);
+            for (readers[0..launched]) |t| t.join();
+        }
+        const hosts = [_][]const u8{ "a.example.test", "a.example.test", "b.example.test" };
+        for (hosts, 0..) |host, i| {
+            readers[i] = try std.Thread.spawn(.{}, Shared.reader, .{ &shared, host });
+            launched += 1;
+        }
+        owner = try std.Thread.spawn(.{}, Shared.owner, .{&shared});
+        expirer = try std.Thread.spawn(.{}, Shared.expirer, .{&shared});
+    }
 
     try testing.expectEqual(@as(u32, 0), shared.failures.load(.monotonic));
     try testing.expectEqual(@as(usize, 0), registry.slots.items.len);

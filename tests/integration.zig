@@ -5332,6 +5332,22 @@ test "interop.h2.generic proxy response cache replays a bounded public GET (#901
     try assertContains(second.body, "h2-cache-first");
     try std.testing.expect(second.header("Age") != null);
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    // RFC 9110 §8.6: a cached HEAD replay's `content-length` must describe
+    // the cached GET representation's actual size (`"h2-cache-first".len`),
+    // never `0` for a nonempty representation (#935 review).
+    const head_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "HEAD" },
+        .{ .name = ":path", .value = "/h2-cache?public=1" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    var head = try pureZigH2GetResponse(allocator, tardigrade.port, head_headers[0..]);
+    defer head.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), head.status);
+    try std.testing.expectEqual(@as(usize, 0), head.body.len);
+    try std.testing.expectEqualStrings("14", head.header("content-length").?);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
 test "interop.openssl.h2.auth_required_proxy_fails_closed" {
@@ -15275,7 +15291,7 @@ test "generic proxy response cache isolates Vary: Accept-Encoding variants and n
     var origin = try UpstreamServer.start(allocator, &.{
         .{ .body = "gzip-variant", .headers = vary_fresh },
         .{ .body = "identity-variant", .headers = vary_fresh },
-        .{ .body = "should-not-run", .headers = vary_fresh },
+        .{ .body = "gzip-except-br-variant", .headers = vary_fresh },
     });
     defer origin.stop();
     try origin.run();
@@ -15321,12 +15337,75 @@ test "generic proxy response cache isolates Vary: Accept-Encoding variants and n
     try assertContains(identity_second.body, "identity-variant");
     try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
 
-    // A request listing an excluded (q=0) coding alongside "gzip" normalizes
-    // to the same discriminator as plain "gzip" -- still a HIT, no new
-    // origin call.
-    var gzip_equivalent = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{.{ .name = "Accept-Encoding", .value = "gzip, br;q=0" }} });
-    defer gzip_equivalent.deinit();
-    try assertContains(gzip_equivalent.body, "gzip-variant");
+    // A request that additionally, explicitly forbids "br" (`br;q=0`) is a
+    // distinct acceptability set from plain "gzip", even though both would
+    // currently resolve to the same gzip representation -- it must MISS
+    // rather than silently alias onto the plain-"gzip" variant (#935
+    // review: dropping an explicit `q=0` exclusion could otherwise serve a
+    // future Brotli-encoded fill to a client that rejected Brotli).
+    var gzip_except_br_first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{.{ .name = "Accept-Encoding", .value = "gzip, br;q=0" }} });
+    defer gzip_except_br_first.deinit();
+    try assertContains(gzip_except_br_first.body, "gzip-except-br-variant");
+    try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
+
+    // The same exclusion repeated now HITs its own distinct variant.
+    var gzip_except_br_second = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{.{ .name = "Accept-Encoding", .value = "gzip, br;q=0" }} });
+    defer gzip_except_br_second.deinit();
+    try assertContains(gzip_except_br_second.body, "gzip-except-br-variant");
+    try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
+}
+
+test "generic proxy response cache never replays a Content-Encoding a request explicitly rejected (#935 review)" {
+    const allocator = std.testing.allocator;
+    const vary_fresh: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "Vary", .value = "Accept-Encoding" },
+        .{ .name = "Content-Encoding", .value = "br" },
+    };
+    const identity_fresh: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "Vary", .value = "Accept-Encoding" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "br-variant", .headers = vary_fresh },
+        .{ .body = "identity-variant", .headers = identity_fresh },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /asset {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    // A request with no `Accept-Encoding` at all accepts every coding (RFC
+    // 9110 §12.5.3) -- the origin happens to answer with Brotli, and that
+    // gets cached under this request's own variant.
+    var no_header = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{} });
+    defer no_header.deinit();
+    try assertContains(no_header.body, "br-variant");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    // A request that explicitly forbids Brotli must never be served that
+    // cached Brotli representation -- it is a distinct variant and must
+    // reach the origin, which this time answers without `Vary`/`Content-Encoding`.
+    var br_rejected = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{.{ .name = "Accept-Encoding", .value = "br;q=0" }} });
+    defer br_rejected.deinit();
+    try assertContains(br_rejected.body, "identity-variant");
+    try std.testing.expect(br_rejected.header("Content-Encoding") == null);
     try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
 }
 
@@ -15371,6 +15450,10 @@ test "generic proxy response cache answers If-None-Match/If-Modified-Since from 
     defer matching_etag.deinit();
     try std.testing.expectEqual(@as(u16, 304), matching_etag.status_code);
     try std.testing.expectEqual(@as(usize, 0), matching_etag.body.len);
+    // RFC 9110 §15.4.5: `304` sends no body, but a declared `Content-Length`
+    // must never misstate the validated representation's actual size as `0`
+    // (#935 review).
+    try std.testing.expectEqualStrings("14", matching_etag.header("Content-Length").?);
     try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
 
     var stale_etag = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/etag", .body = null, .headers = &.{.{ .name = "If-None-Match", .value = "\"stale\"" }} });
@@ -15423,11 +15506,10 @@ test "generic proxy response cache serves HEAD from a stored GET entry's metadat
     defer head.deinit();
     try std.testing.expectEqual(@as(u16, 200), head.status_code);
     try std.testing.expectEqual(@as(usize, 0), head.body.len);
-    // The buffered H1 proxy writer always synthesizes `Content-Length` from
-    // the bytes actually sent (`writeBufferedUpstreamResponseHead`), the
-    // same convention a live (uncached) HEAD proxy_pass already follows --
-    // this cache replay does not regress that.
-    try std.testing.expectEqualStrings("0", head.header("Content-Length").?);
+    // RFC 9110 §8.6: a `HEAD` reply may declare `Content-Length`, but only
+    // the size the corresponding `GET` would have sent -- never `0` for a
+    // nonempty representation (#935 review).
+    try std.testing.expectEqualStrings("18", head.header("Content-Length").?);
     try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
 }
 

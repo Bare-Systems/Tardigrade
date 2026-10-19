@@ -441,6 +441,25 @@ fn buildBufferedUpstreamResponseHeadBounded(
     return .{ .bytes = stream.getWritten() };
 }
 
+/// `upstream_response`'s declared wire `Content-Length`, when it carries a
+/// `wire_content_length_override` field (only the proxy-cache HEAD/304
+/// replay shape does, via `prepareHttp1CacheReplay`) -- `null` otherwise, so
+/// ordinary live `BufferedUpstreamResponse` values are completely unaffected
+/// and fall back to `upstream_response.body.len` exactly as before. A cache
+/// replay's wire body can legitimately be empty (`HEAD`, `304 Not Modified`)
+/// while the representation it describes is not, and RFC 9110 §8.6
+/// forbids a `Content-Length` that misstates that representation's actual
+/// size (#935 review).
+fn wireContentLengthOverride(upstream_response: anytype) ?usize {
+    const Response = @TypeOf(upstream_response);
+    const Unwrapped = switch (@typeInfo(Response)) {
+        .pointer => |info| info.child,
+        else => Response,
+    };
+    if (!@hasField(Unwrapped, "wire_content_length_override")) return null;
+    return upstream_response.wire_content_length_override;
+}
+
 pub fn writeBufferedUpstreamResponseHead(
     writer: anytype,
     upstream_response: anytype,
@@ -458,7 +477,7 @@ pub fn writeBufferedUpstreamResponseHead(
     try writer.print("HTTP/1.1 {d} {s}\r\n", .{ upstream_response.status_code, phrase });
     try writer.print("Server: {s}\r\n", .{http.SERVER_NAME});
     try writer.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
-    try writer.print("Content-Length: {d}\r\n", .{upstream_response.body.len});
+    try writer.print("Content-Length: {d}\r\n", .{wireContentLengthOverride(upstream_response) orelse upstream_response.body.len});
     try gph.writeRequestIdHeaders(writer, correlation_id);
     for (upstream_response.headers) |header| {
         // Defense-in-depth: skip any upstream header that should not be

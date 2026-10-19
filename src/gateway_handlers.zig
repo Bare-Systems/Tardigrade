@@ -3194,7 +3194,13 @@ fn applyHttp3ProxyCacheHit(
     _ = response
         .setStatus(@enumFromInt(status_code))
         .setBodyOwned(body)
-        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        .setHeader(http.correlation.HEADER_NAME, correlation_id)
+        // The wire body above is empty on `HEAD`/`304`, but the declared
+        // `Content-Length` must still describe the cached GET
+        // representation's actual size, never `0` (RFC 9110 §8.6 / §15.4.5,
+        // #935 review). `write()`/`buildHeaderBytes()` prefer an explicitly
+        // set header over `body.len`, so this is never overridden below.
+        .setContentLength(hit.body.len);
     for (hit.headers) |header| {
         if (not_modified and !gpc.isReplayableOn304(header.name)) continue;
         _ = response.setHeader(header.name, header.value);
@@ -3219,6 +3225,38 @@ test "H3 cache replay copies its body before mutating a response" {
     };
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, copyHttp3CacheReplayBody(failing.allocator(), &hit, true));
+}
+
+test "applyHttp3ProxyCacheHit declares the cached representation's actual length on HEAD/304, never 0 (#935 review)" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+
+    var reason = [_]u8{ 'O', 'K' };
+    var body_buf = "cached-representation".*;
+    const hit = gpc.LookupResult{
+        .status_code = 200,
+        .reason = &reason,
+        .headers = &.{},
+        .body = body_buf[0..],
+        .age_seconds = 1,
+    };
+
+    var head_response = http.Response.init(allocator);
+    defer head_response.deinit();
+    try applyHttp3ProxyCacheHit(allocator, &head_response, &state, &hit, "req-head", .full, false);
+    const head_body: []const u8 = head_response.body orelse "";
+    try std.testing.expectEqual(@as(usize, 0), head_body.len);
+    try std.testing.expectEqualStrings("21", head_response.headers.get("content-length") orelse "");
+
+    var not_modified_response = http.Response.init(allocator);
+    defer not_modified_response.deinit();
+    try applyHttp3ProxyCacheHit(allocator, &not_modified_response, &state, &hit, "req-304", .not_modified, true);
+    try std.testing.expectEqual(@as(u16, 304), @intFromEnum(not_modified_response.status));
+    const not_modified_body: []const u8 = not_modified_response.body orelse "";
+    try std.testing.expectEqual(@as(usize, 0), not_modified_body.len);
+    try std.testing.expectEqualStrings("21", not_modified_response.headers.get("content-length") orelse "");
 }
 
 fn handleHttp3StaticLocation(

@@ -853,6 +853,13 @@ pub fn handleLocationProxyPass(
                                 .reason = prepared.reason,
                                 .headers = prepared.headers,
                                 .body = prepared.body,
+                                // The wire body omits the representation on
+                                // `HEAD`/`304` (`prepared.body` is `""`), but
+                                // the declared `Content-Length` must still
+                                // describe the cached GET representation's
+                                // actual size, never the transmitted body's
+                                // (#935 review).
+                                .wire_content_length_override = hit.body.len,
                             };
                             state.metricsRecordProxyCacheOutcome(.hit);
                             ctx.setUpstreamResult(target, prepared.status_code, prepared.body.len);

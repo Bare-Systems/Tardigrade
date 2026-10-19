@@ -4890,7 +4890,7 @@ fn finalizeHttp2Response(
                 status_code = response.status_code;
                 body_alloc = try allocator.dupe(u8, response.body);
                 body = body_alloc.?;
-                try appendHttp2UpstreamResponseHeaders(allocator, &response_headers, &lowered_names, &owned_header_values, &response, std.mem.eql(u8, method, "HEAD"));
+                try appendHttp2UpstreamResponseHeaders(allocator, &response_headers, &lowered_names, &owned_header_values, &response, std.mem.eql(u8, method, "HEAD") or response.force_content_length != null);
             },
             .local_rejection => |rejection| {
                 status_code = rejection.status_code;
@@ -5177,6 +5177,11 @@ fn http2CachedProxyResponse(
         .reason = try metadata.dupe(u8, if (not_modified) "Not Modified" else hit.reason),
         .headers = headers,
         .body = body,
+        // The wire body above is empty on `HEAD`/`304`, but the declared
+        // `Content-Length` must still describe the cached GET
+        // representation's actual size, never `0` (RFC 9110 §8.6 / §15.4.5,
+        // #935 review).
+        .force_content_length = hit.body.len,
     };
 }
 
@@ -6207,7 +6212,15 @@ fn appendHttp2UpstreamResponseHeaders(
     preserve_content_length: bool,
 ) !void {
     if (preserve_content_length) {
-        if (response.representation_content_length) |value| {
+        if (response.force_content_length) |len| {
+            // A #935 cache HEAD/304 replay's authoritative length always
+            // wins over any live-traffic `representation_content_length`
+            // text (the two are never both set -- see `BufferedUpstreamResponse`).
+            const owned = try std.fmt.allocPrint(allocator, "{d}", .{len});
+            errdefer allocator.free(owned);
+            try owned_values.append(owned);
+            try headers.append(.{ .name = "content-length", .value = owned });
+        } else if (response.representation_content_length) |value| {
             // `value` is owned by `response.metadata_arena`, which the caller
             // deinitializes at the end of the `.response` switch prong -- before
             // `headers` is HPACK-encoded later in `respondHttp2Stream`. Duplicate

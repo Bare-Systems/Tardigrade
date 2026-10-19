@@ -91,6 +91,14 @@ pub const BufferedUpstreamResponse = struct {
     headers: []UpstreamHeader,
     body: []u8,
     representation_content_length: ?[]const u8 = null,
+    /// Set only by a #902/#935 proxy-cache HEAD/304 replay
+    /// (`http2CachedProxyResponse`), never by a live upstream response: the
+    /// cached GET representation's actual byte length, which the H2
+    /// finalizer must declare instead of this (possibly empty) wire body's
+    /// length. Kept distinct from `representation_content_length` (which
+    /// only ever echoes a live upstream's own header text) so this cannot
+    /// change any live-traffic response's behavior.
+    force_content_length: ?usize = null,
 
     pub fn deinit(self: *BufferedUpstreamResponse, allocator: std.mem.Allocator) void {
         self.metadata_arena.deinit();

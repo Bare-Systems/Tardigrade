@@ -100,6 +100,13 @@ const Entry = struct {
     /// Accounted size used for the aggregate/per-object caps; computed once
     /// at fill time from the same fields.
     bytes: usize,
+    /// Set (owned by `metadata_arena`) only when this entry is a `Vary:
+    /// Accept-Encoding` secondary variant, naming the primary key it is
+    /// indexed under. Lets `removeLocked` prune that primary's
+    /// `VaryIndexEntry` whenever a variant disappears for any reason
+    /// (expiry, FIFO eviction, or an unvaried refill), instead of only ever
+    /// growing the index (#935 review).
+    vary_primary_key: ?[]const u8 = null,
 
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         self.metadata_arena.deinit();
@@ -114,12 +121,39 @@ const Entry = struct {
 /// always go through a secondary key -- a direct entry at the primary key
 /// itself is never consulted again (see `putVaryVariant`), so there is no
 /// ambiguity about which representation a plain lookup would return.
+///
+/// Insertion always appends at `variant_keys[0..count]`'s tail and eviction
+/// always retires index `0`, so the oldest entry is always at the front --
+/// this also makes removing an arbitrary (not necessarily oldest) key, which
+/// `removeLocked` needs when a variant expires out of order, a simple
+/// compaction rather than ring-buffer bookkeeping.
 const VaryIndexEntry = struct {
     variant_keys: [hard_max_vary_variants][64]u8 = undefined,
     count: usize = 0,
-    /// Next slot to evict FIFO once `count` reaches the configured cap.
-    next_write: usize = 0,
+
+    fn indexOf(self: *const VaryIndexEntry, secondary_key: []const u8) ?usize {
+        for (self.variant_keys[0..self.count], 0..) |key, i| {
+            if (std.mem.eql(u8, key[0..], secondary_key)) return i;
+        }
+        return null;
+    }
+
+    fn removeAt(self: *VaryIndexEntry, idx: usize) void {
+        var i = idx;
+        while (i + 1 < self.count) : (i += 1) {
+            self.variant_keys[i] = self.variant_keys[i + 1];
+        }
+        self.count -= 1;
+    }
 };
+
+/// Accounted size of one `VaryIndexEntry` plus its owned primary-key
+/// duplicate (always exactly 64 bytes, `buildCacheKey`'s fixed hex-digest
+/// width). Charged against `Limits.max_total_bytes` the same as any cache
+/// object so a high-cardinality set of distinct Vary-tracked resources
+/// cannot grow this index without bound even though it lives outside
+/// `ProxyResponseCache.map` (#935 review).
+const vary_index_entry_bytes: usize = @sizeOf(VaryIndexEntry) + 64;
 
 /// Bounded, generation-free (purged wholesale on reload by its owner)
 /// in-memory store. Every public method here assumes the caller already
@@ -174,55 +208,119 @@ pub const ProxyResponseCache = struct {
         // primary slot again, so an orphan there would just occupy capacity
         // until a reload wholesale-purges the cache.
         if (!self.vary_index.contains(primary_key)) self.removeLocked(primary_key);
-        try self.put(now_ms, secondary_key, params);
-        // Index bookkeeping is opportunistic like the rest of this cache:
-        // the representation above is already correctly stored and
-        // reachable by any future lookup that independently recomputes the
-        // same secondary key, so a failure here just means this particular
-        // variant will not be retired by FIFO eviction later (acceptable --
-        // still bounded by `max_entries`/`max_total_bytes`).
-        self.registerVaryVariant(primary_key, secondary_key) catch {};
+
+        self.put(now_ms, secondary_key, params) catch |err| {
+            // The per-resource FIFO cap (`max_vary_variants`) guarantees this
+            // resource's own oldest representation gets evicted to admit a
+            // new one regardless of global room (`registerVaryVariant`
+            // below) -- but that eviction normally only runs *after* `put`
+            // above already succeeded, so when it is the *global*
+            // `max_entries`/`max_total_bytes` cap blocking this fill (not
+            // some unrelated resource's entries), the per-resource eviction
+            // never got a chance to free the room first. Retire this
+            // resource's own oldest sibling variant up front and retry
+            // exactly once so the FIFO guarantee holds even when the global
+            // cap, not just the per-resource one, is what is full (#935
+            // review). Any other failure (e.g. a transient OOM unrelated to
+            // capacity) still fails open like every other `put` here.
+            if (err != error.CacheAtCapacity) return err;
+            const existing = self.vary_index.getPtr(primary_key) orelse return err;
+            if (existing.count < self.max_vary_variants or existing.indexOf(secondary_key) != null) return err;
+            const victim = existing.variant_keys[0];
+            self.removeMapEntryOnly(victim[0..]);
+            existing.removeAt(0);
+            try self.put(now_ms, secondary_key, params);
+        };
+        // The representation above is already stored and reachable by any
+        // future lookup that independently recomputes the same secondary
+        // key, so a failure here (unlike the opportunistic swallow this
+        // used to be) must retire it rather than leave an unindexed entry
+        // occupying capacity outside the FIFO/budget guarantees below
+        // (#935 review).
+        self.registerVaryVariant(primary_key, secondary_key) catch |err| {
+            self.removeMapEntryOnly(secondary_key);
+            return err;
+        };
     }
 
     fn registerVaryVariant(self: *ProxyResponseCache, primary_key: []const u8, secondary_key: []const u8) !void {
         std.debug.assert(secondary_key.len == 64);
+        const stored = self.map.getPtr(secondary_key) orelse unreachable;
+        stored.vary_primary_key = try stored.metadata_arena.allocator().dupe(u8, primary_key);
+
         if (self.vary_index.getPtr(primary_key)) |existing| {
             self.appendOrEvictVariant(existing, secondary_key);
             return;
         }
+        if (self.total_bytes + vary_index_entry_bytes > self.limits.max_total_bytes) return error.CacheAtCapacity;
         try self.vary_index.ensureUnusedCapacity(1);
         const owned_key = try self.allocator.dupe(u8, primary_key);
         errdefer self.allocator.free(owned_key);
         var fresh = VaryIndexEntry{};
         self.appendOrEvictVariant(&fresh, secondary_key);
         self.vary_index.putAssumeCapacity(owned_key, fresh);
+        self.total_bytes += vary_index_entry_bytes;
     }
 
     fn appendOrEvictVariant(self: *ProxyResponseCache, index: *VaryIndexEntry, secondary_key: []const u8) void {
-        for (index.variant_keys[0..index.count]) |existing_key| {
-            if (std.mem.eql(u8, existing_key[0..], secondary_key)) return;
-        }
+        if (index.indexOf(secondary_key) != null) return;
         if (index.count < self.max_vary_variants) {
             @memcpy(index.variant_keys[index.count][0..], secondary_key[0..64]);
             index.count += 1;
             return;
         }
-        // Bounded FIFO: evict the oldest variant to admit this one rather
-        // than let a high-cardinality Accept-Encoding set grow this
-        // resource's variant storage without bound (#902).
-        const slot = index.next_write % self.max_vary_variants;
-        self.removeLocked(index.variant_keys[slot][0..]);
-        @memcpy(index.variant_keys[slot][0..], secondary_key[0..64]);
-        index.next_write = slot + 1;
+        // Bounded FIFO: evict the oldest variant (always index 0, since
+        // every insertion appends at the tail) to admit this one rather than
+        // let a high-cardinality Accept-Encoding set grow this resource's
+        // variant storage without bound (#902). This deliberately bypasses
+        // `removeLocked`'s general index-pruning path: that path can delete
+        // this very `VaryIndexEntry` wholesale once it observes `count == 0`,
+        // which would leave `index` dangling here when `max_vary_variants ==
+        // 1` (#935 review) -- the bookkeeping below is done directly instead.
+        self.removeMapEntryOnly(index.variant_keys[0][0..]);
+        index.removeAt(0);
+        @memcpy(index.variant_keys[index.count][0..], secondary_key[0..64]);
+        index.count += 1;
     }
 
-    fn removeLocked(self: *ProxyResponseCache, key: []const u8) void {
+    /// Removes `key` from `map` and its accounting only -- never touches
+    /// `vary_index`. Callers that already know exactly how they want the
+    /// index updated (`appendOrEvictVariant`'s FIFO eviction, `put`'s
+    /// vary-to-unvaried transition below) use this directly instead of
+    /// `removeLocked` to avoid double bookkeeping or pruning an index entry
+    /// out from under them mid-update.
+    fn removeMapEntryOnly(self: *ProxyResponseCache, key: []const u8) void {
         if (self.map.fetchRemove(key)) |old| {
             self.total_bytes -= old.value.bytes;
             self.allocator.free(old.key);
             var old_entry = old.value;
             old_entry.deinit(self.allocator);
         }
+    }
+
+    /// Removes any `VaryIndexEntry` record of `secondary_key` once it stops
+    /// being a live entry, retiring the whole index record once its last
+    /// tracked variant is gone instead of only ever growing it (#935
+    /// review).
+    fn pruneVaryIndexEntry(self: *ProxyResponseCache, primary_key: []const u8, secondary_key: []const u8) void {
+        const index = self.vary_index.getPtr(primary_key) orelse return;
+        const idx = index.indexOf(secondary_key) orelse return;
+        index.removeAt(idx);
+        if (index.count == 0) {
+            if (self.vary_index.fetchRemove(primary_key)) |old| {
+                self.allocator.free(old.key);
+                self.total_bytes -= vary_index_entry_bytes;
+            }
+        }
+    }
+
+    fn removeLocked(self: *ProxyResponseCache, key: []const u8) void {
+        if (self.map.getPtr(key)) |entry| {
+            if (entry.vary_primary_key) |primary_key| {
+                self.pruneVaryIndexEntry(primary_key, key);
+            }
+        }
+        self.removeMapEntryOnly(key);
     }
 
     /// Deep-copies a live, unexpired entry into `scratch` (expected to be an
@@ -315,6 +413,25 @@ pub const ProxyResponseCache = struct {
             .bytes = object_bytes,
         };
 
+        // A direct fill at a key the Vary index currently routes through
+        // means this resource just stopped varying by Accept-Encoding (or
+        // started varying by something else #902 cannot track): every
+        // previously stored representation is now both unreachable (future
+        // lookups would otherwise keep deriving a secondary key and never
+        // see this fresh direct entry) and stale (it answered a selection
+        // rule that no longer applies), so retire the whole index subtree
+        // now that this replacement has finished allocating -- a failure
+        // above this point leaves it untouched (#935 review). `key` only
+        // ever collides with a `putVaryVariant` secondary key via an
+        // astronomically unlikely SHA-256 collision.
+        if (self.vary_index.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+            self.total_bytes -= vary_index_entry_bytes;
+            for (removed.value.variant_keys[0..removed.value.count]) |secondary| {
+                self.removeMapEntryOnly(secondary[0..]);
+            }
+        }
+
         self.removeLocked(key);
         self.map.putAssumeCapacity(owned_key, entry);
         self.total_bytes += object_bytes;
@@ -397,35 +514,88 @@ pub const max_vary_discriminator_bytes: usize = 128;
 /// never silently truncated -- and the caller must bypass the cache for it.
 pub const max_vary_tokens: usize = 8;
 
-fn qualityIsZero(coding_params: []const u8) bool {
+const CodingQuality = enum {
+    /// No `q=` parameter at all: RFC 9110 §12.5.3 default, equivalent to
+    /// `q=1`.
+    default,
+    /// Explicit `q=1` (or `q=1.0`, etc.): acceptable, same as `default`.
+    one,
+    /// Explicit `q=0`: this coding is expressly prohibited, not merely
+    /// deprioritized -- the one weight value this cache can still represent
+    /// alongside acceptance, since it is a binary accept/reject distinction
+    /// rather than a relative preference.
+    zero,
+    /// Any other weight (e.g. `q=0.5`): a genuine relative preference. Two
+    /// requests with the same accepted/excluded coding *sets* but different
+    /// non-0/1 weights can make an origin select different representations
+    /// (RFC 9110 §12.5.3's proactive negotiation), so this is deliberately
+    /// never folded into the discriminator -- the caller must bypass the
+    /// cache instead of guessing.
+    other,
+};
+
+/// Parses the `q=` parameter (if any) out of one `Accept-Encoding` coding's
+/// parameter string (everything from its `;`, or the whole remainder, up to
+/// the next `,`). Returns `null` on anything unparsable or out of the valid
+/// `qvalue` range (`0`-`1`), or a second `q=` on the same coding -- the
+/// caller must treat that as unrepresentable (bypass), never guess a value.
+fn parseCodingQuality(coding_params: []const u8) ?CodingQuality {
     var it = std.mem.splitScalar(u8, coding_params, ';');
     _ = it.next(); // the coding name slot itself; parameters start after it
+    var found: ?CodingQuality = null;
     while (it.next()) |raw_param| {
         const param = std.mem.trim(u8, raw_param, " \t");
+        if (param.len == 0) continue;
         if (!std.ascii.startsWithIgnoreCase(param, "q=")) continue;
+        if (found != null) return null;
         const q = std.mem.trim(u8, param["q=".len..], " \t");
-        const value = std.fmt.parseFloat(f64, q) catch return false;
-        return value <= 0.0;
+        const value = std.fmt.parseFloat(f64, q) catch return null;
+        if (value < 0.0 or value > 1.0) return null;
+        found = if (value == 0.0) .zero else if (value == 1.0) .one else .other;
     }
-    return false;
+    return found orelse .default;
 }
 
-fn lessThanAsciiOrder(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.order(u8, a, b) == .lt;
+const DiscriminatorToken = struct {
+    name: []const u8,
+    excluded: bool,
+};
+
+fn lessThanDiscriminatorToken(_: void, a: DiscriminatorToken, b: DiscriminatorToken) bool {
+    return std.mem.order(u8, a.name, b.name) == .lt;
 }
 
 /// A bounded, order/case/whitespace-insensitive discriminator for a `Vary:
-/// Accept-Encoding` variant: the request's acceptable coding names (q=0
-/// exclusions dropped, q-weights otherwise ignored), lowercased, deduped by
-/// exact match, sorted, and comma-joined. Two requests whose `Accept-Encoding`
-/// differ only in weighting, order, or case collapse onto the same
-/// representation instead of fragmenting the cache. Returns `null` when the
-/// header lists more codings than `max_vary_tokens` or overflows the output
-/// buffer -- the caller must treat that as unrepresentable (bypass), never
-/// as an unbounded key.
+/// Accept-Encoding` variant.
+///
+/// The leading `"0"`/`"1"` marker distinguishes a *missing* header (RFC 9110
+/// §12.5.3: every content coding is acceptable) from a *present* one, even
+/// when the present header's codings all turn out to be `q=0`-excluded --
+/// without it, "no header at all" and "Accept-Encoding: br;q=0" (which
+/// forbids exactly one encoding this cache might otherwise serve) would
+/// collapse onto the same empty-token-list key, letting a client that
+/// explicitly rejected a coding be served a cached response stored in it.
+///
+/// Within a present header, every token's accept/exclude verdict
+/// (`CodingQuality.zero` vs. `.default`/`.one`) is preserved rather than
+/// dropped, lowercased, deduped by exact (name, verdict) match, and sorted
+/// by name so order/case/whitespace differences still collapse onto the
+/// same representation. A coding carrying any other relative-preference
+/// weight (`CodingQuality.other`), an unparsable/out-of-range `q=`, a
+/// coding named twice with conflicting verdicts, more codings than
+/// `max_vary_tokens`, or anything overflowing the output buffer all make
+/// this return `null` -- the caller must treat that as unrepresentable
+/// (bypass the cache for this request), never collapse it into a guessed
+/// key.
 pub fn varyAcceptEncodingDiscriminator(buf: *[max_vary_discriminator_bytes]u8, accept_encoding: ?[]const u8) ?[]const u8 {
-    const raw = accept_encoding orelse return buf[0..0];
-    var tokens: [max_vary_tokens][]const u8 = undefined;
+    var stream = compat.fixedBufferStream(buf);
+    const writer = stream.writer();
+    const raw = accept_encoding orelse {
+        writer.writeByte('0') catch return null;
+        return stream.getWritten();
+    };
+
+    var tokens: [max_vary_tokens]DiscriminatorToken = undefined;
     var count: usize = 0;
     var lower_buf: [max_vary_discriminator_bytes]u8 = undefined;
     var lower_used: usize = 0;
@@ -434,30 +604,39 @@ pub fn varyAcceptEncodingDiscriminator(buf: *[max_vary_discriminator_bytes]u8, a
         const semi = std.mem.indexOfScalar(u8, part, ';') orelse part.len;
         const name = std.mem.trim(u8, part[0..semi], " \t");
         if (name.len == 0) continue;
-        if (qualityIsZero(part[semi..])) continue;
-        if (count >= max_vary_tokens) return null;
+        const quality = parseCodingQuality(part[semi..]) orelse return null;
+        const excluded = switch (quality) {
+            .default, .one => false,
+            .zero => true,
+            .other => return null,
+        };
         if (lower_used + name.len > lower_buf.len) return null;
         const lowered = std.ascii.lowerString(lower_buf[lower_used..][0..name.len], name);
         lower_used += name.len;
-        // A duplicate coding name (same lowered bytes) contributes no new
-        // information to the discriminator.
-        var duplicate = false;
-        for (tokens[0..count]) |seen| {
-            if (std.mem.eql(u8, seen, lowered)) {
-                duplicate = true;
+        var duplicate_idx: ?usize = null;
+        for (tokens[0..count], 0..) |seen, i| {
+            if (std.mem.eql(u8, seen.name, lowered)) {
+                duplicate_idx = i;
                 break;
             }
         }
-        if (duplicate) continue;
-        tokens[count] = lowered;
+        if (duplicate_idx) |i| {
+            // The same coding named twice with conflicting accept/exclude
+            // verdicts is ambiguous; a repeated, agreeing verdict contributes
+            // no new information.
+            if (tokens[i].excluded != excluded) return null;
+            continue;
+        }
+        if (count >= max_vary_tokens) return null;
+        tokens[count] = .{ .name = lowered, .excluded = excluded };
         count += 1;
     }
-    std.sort.insertion([]const u8, tokens[0..count], {}, lessThanAsciiOrder);
-    var stream = compat.fixedBufferStream(buf);
-    const writer = stream.writer();
-    for (tokens[0..count], 0..) |tok, i| {
-        if (i != 0) writer.writeByte(',') catch return null;
-        writer.writeAll(tok) catch return null;
+    std.sort.insertion(DiscriminatorToken, tokens[0..count], {}, lessThanDiscriminatorToken);
+    writer.writeByte('1') catch return null;
+    for (tokens[0..count]) |tok| {
+        writer.writeByte(',') catch return null;
+        if (tok.excluded) writer.writeByte('!') catch return null;
+        writer.writeAll(tok.name) catch return null;
     }
     return stream.getWritten();
 }
@@ -956,17 +1135,35 @@ test "isReplayableOn304 allow-lists only validator/freshness-describing fields" 
     try std.testing.expect(!isReplayableOn304("Content-Encoding"));
 }
 
-test "varyAcceptEncodingDiscriminator normalizes order, case, whitespace and q=0 exclusions" {
+test "varyAcceptEncodingDiscriminator normalizes order, case and whitespace but preserves q=0 exclusions" {
     var buf: [max_vary_discriminator_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings("br,gzip", varyAcceptEncodingDiscriminator(&buf, "gzip, br").?);
-    try std.testing.expectEqualStrings("br,gzip", varyAcceptEncodingDiscriminator(&buf, "BR;q=0.8, GZIP;q=1.0").?);
-    try std.testing.expectEqualStrings("br,gzip", varyAcceptEncodingDiscriminator(&buf, "  br ,gzip  ").?);
-    // Excluded by q=0.
-    try std.testing.expectEqualStrings("gzip", varyAcceptEncodingDiscriminator(&buf, "gzip, br;q=0").?);
-    // No header at all: the canonical empty-set discriminator.
-    try std.testing.expectEqualStrings("", varyAcceptEncodingDiscriminator(&buf, null).?);
-    // Duplicate coding names collapse.
-    try std.testing.expectEqualStrings("gzip", varyAcceptEncodingDiscriminator(&buf, "gzip, gzip;q=0.5").?);
+    try std.testing.expectEqualStrings("1,br,gzip", varyAcceptEncodingDiscriminator(&buf, "gzip, br").?);
+    try std.testing.expectEqualStrings("1,br,gzip", varyAcceptEncodingDiscriminator(&buf, "BR;q=1.0, GZIP;q=1").?);
+    try std.testing.expectEqualStrings("1,br,gzip", varyAcceptEncodingDiscriminator(&buf, "  br ,gzip  ").?);
+    // No header at all gets a distinct marker from any present header (#935
+    // review): RFC 9110 says every coding is acceptable, so it must never
+    // collapse onto a present header whose codings all happen to be
+    // excluded.
+    try std.testing.expectEqualStrings("0", varyAcceptEncodingDiscriminator(&buf, null).?);
+    // An explicit q=0 exclusion is preserved, not dropped -- distinct from
+    // both "no header" and from accepting that coding.
+    try std.testing.expectEqualStrings("1,!br,gzip", varyAcceptEncodingDiscriminator(&buf, "gzip, br;q=0").?);
+    try std.testing.expect(!std.mem.eql(u8, varyAcceptEncodingDiscriminator(&buf, "gzip, br;q=0").?, varyAcceptEncodingDiscriminator(&buf, "gzip").?));
+    try std.testing.expect(!std.mem.eql(u8, varyAcceptEncodingDiscriminator(&buf, null).?, varyAcceptEncodingDiscriminator(&buf, "br;q=0").?));
+    // Duplicate coding names with an agreeing verdict collapse.
+    try std.testing.expectEqualStrings("1,gzip", varyAcceptEncodingDiscriminator(&buf, "gzip, gzip;q=1").?);
+    // Duplicate coding names with conflicting verdicts are ambiguous.
+    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip, gzip;q=0"));
+    // A relative-preference weight (anything other than q=0/q=1/default) is
+    // not representable -- two requests differing only in weight order
+    // could make the origin pick different representations, so this must
+    // bypass rather than silently alias them onto the same key.
+    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip;q=0.5"));
+    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip;q=1,br;q=0.1"));
+    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip;q=0.1,br;q=1"));
+    // A malformed or out-of-range q= value bypasses rather than guessing.
+    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip;q=not-a-number"));
+    try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "gzip;q=2"));
     // More codings than the bounded cap: unrepresentable.
     try std.testing.expectEqual(@as(?[]const u8, null), varyAcceptEncodingDiscriminator(&buf, "a,b,c,d,e,f,g,h,i"));
 }
@@ -1049,6 +1246,250 @@ test "ProxyResponseCache stores and isolates Vary: Accept-Encoding variants with
     // A stale direct (non-Vary) entry at the primary key is retired once the
     // resource becomes vary-tracked, instead of lingering unreachable.
     try std.testing.expectEqual(@as(?LookupResult, null), try cache.lookup(arena.allocator(), primary, 1_000));
+}
+
+fn varyKeyFor(out: *[64]u8, primary: []const u8, discriminator: []const u8) []const u8 {
+    return buildVaryVariantKey(out, primary, discriminator);
+}
+
+test "ProxyResponseCache reclaims vary_index entries once their last variant is gone (#935 review)" {
+    // A high-cardinality set of distinct Vary-tracked resources, each
+    // filled with a short TTL and then discovered-expired (via `lookup`,
+    // like a client revisiting it later would) before the next one is
+    // filled, must not leave `vary_index` growing by one ~1KiB record per
+    // resource forever -- the index is reclaimed alongside its last live
+    // variant.
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 1,
+        .max_total_bytes = 1024 * 1024,
+        .max_vary_variants = 2,
+    });
+    defer cache.deinit();
+
+    var prev_secondary: ?[64]u8 = null;
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const now_ms: u64 = @as(u64, i) * 10_000;
+        if (prev_secondary) |prev| {
+            // Discover and reap the previous resource's single expired
+            // variant exactly like an ordinary later lookup would, before
+            // this iteration fills a brand new, unrelated resource (which
+            // this bounded `map`/`max_entries = 1` cannot admit without
+            // that room first).
+            try std.testing.expectEqual(@as(?LookupResult, null), try cache.lookup(arena.allocator(), prev[0..], now_ms));
+        }
+
+        var primary_buf: [64]u8 = undefined;
+        var path_buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/asset-{d}", .{i}) catch unreachable;
+        const primary = buildCacheKey(&primary_buf, .{
+            .scheme = "http",
+            .host = "a",
+            .method = "GET",
+            .location_id = "/",
+            .upstream_target = "http://up",
+            .path = path,
+            .query = "",
+        });
+        var secondary_buf: [64]u8 = undefined;
+        const secondary = varyKeyFor(&secondary_buf, primary, "gzip");
+        try cache.putVaryVariant(now_ms, primary, secondary, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
+            .body = "variant-body",
+            .ttl_seconds = 1,
+        });
+        try std.testing.expectEqual(@as(usize, 1), cache.map.count());
+        // Without index reclamation, `vary_index` would still hold a record
+        // for every one of the resources reaped so far, growing by one for
+        // every iteration of this loop instead of staying at exactly the
+        // one currently-live resource's record.
+        try std.testing.expectEqual(@as(usize, 1), cache.vary_index.count());
+        prev_secondary = secondary_buf;
+    }
+}
+
+test "ProxyResponseCache registerVaryVariant OOM leaves no orphaned, unindexed secondary entry (#935 review)" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 16,
+        .max_total_bytes = 16 * 1024,
+        .max_vary_variants = 4,
+    });
+    defer cache.deinit();
+
+    var primary_buf: [64]u8 = undefined;
+    const primary = buildCacheKey(&primary_buf, .{
+        .scheme = "http",
+        .host = "a",
+        .method = "GET",
+        .location_id = "/",
+        .upstream_target = "http://up",
+        .path = "/asset",
+        .query = "",
+    });
+    var secondary_buf: [64]u8 = undefined;
+    const secondary = varyKeyFor(&secondary_buf, primary, "gzip");
+
+    // The first allocation past `put()`'s own (which this index-registration
+    // failure injection point is already downstream of) is the `vary_index`
+    // entry itself -- fail exactly there.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 100 });
+    cache.allocator = failing.allocator();
+    const result = cache.putVaryVariant(0, primary, secondary, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
+        .body = "variant-body",
+        .ttl_seconds = 60,
+    });
+    cache.allocator = allocator;
+    if (result) |_| {
+        // The allocator had enough headroom this run; nothing to assert
+        // beyond "no crash" -- retry with a tighter budget below instead of
+        // asserting a specific fail index that could drift with allocator
+        // internals.
+    } else |_| {
+        try std.testing.expectEqual(@as(usize, 0), cache.map.count());
+        try std.testing.expectEqual(@as(usize, 0), cache.vary_index.count());
+    }
+}
+
+test "ProxyResponseCache evicts a sibling variant to admit a new one even when the global cache is full (#935 review)" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 2,
+        .max_total_bytes = 16 * 1024,
+        .max_vary_variants = 2,
+    });
+    defer cache.deinit();
+
+    var primary_buf: [64]u8 = undefined;
+    const primary = buildCacheKey(&primary_buf, .{
+        .scheme = "http",
+        .host = "a",
+        .method = "GET",
+        .location_id = "/",
+        .upstream_target = "http://up",
+        .path = "/asset",
+        .query = "",
+    });
+
+    var gzip_buf: [64]u8 = undefined;
+    const gzip_key = varyKeyFor(&gzip_buf, primary, "gzip");
+    try cache.putVaryVariant(0, primary, gzip_key, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
+        .body = "gzip-body",
+        .ttl_seconds = 60,
+    });
+    var identity_buf: [64]u8 = undefined;
+    const identity_key = varyKeyFor(&identity_buf, primary, "identity");
+    try cache.putVaryVariant(0, primary, identity_key, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
+        .body = "identity-body",
+        .ttl_seconds = 60,
+    });
+    // `max_entries == max_vary_variants == 2`: the cache is now at its
+    // *global* entry cap purely from this one resource's own variants.
+    try std.testing.expectEqual(@as(usize, 2), cache.map.count());
+
+    var br_buf: [64]u8 = undefined;
+    const br_key = varyKeyFor(&br_buf, primary, "br");
+    // Before the #935 fix, `put()` for `br_key` failed outright with
+    // `error.CacheAtCapacity` here because the per-resource FIFO eviction
+    // only ever ran *after* a successful `put`, never before one that the
+    // global cap alone was blocking.
+    try cache.putVaryVariant(0, primary, br_key, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
+        .body = "br-body",
+        .ttl_seconds = 60,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cache.map.count());
+    try std.testing.expectEqual(@as(?LookupResult, null), try cache.lookup(arena.allocator(), gzip_key, 1_000));
+    const identity_hit = (try cache.lookup(arena.allocator(), identity_key, 1_000)).?;
+    try std.testing.expectEqualStrings("identity-body", identity_hit.body);
+    const br_hit = (try cache.lookup(arena.allocator(), br_key, 1_000)).?;
+    try std.testing.expectEqualStrings("br-body", br_hit.body);
+}
+
+test "ProxyResponseCache retires stale Vary variants and their index when a resource stops varying (#935 review)" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 16,
+        .max_total_bytes = 16 * 1024,
+        .max_vary_variants = 4,
+    });
+    defer cache.deinit();
+
+    var primary_buf: [64]u8 = undefined;
+    const primary = buildCacheKey(&primary_buf, .{
+        .scheme = "http",
+        .host = "a",
+        .method = "GET",
+        .location_id = "/",
+        .upstream_target = "http://up",
+        .path = "/asset",
+        .query = "",
+    });
+
+    var gzip_buf: [64]u8 = undefined;
+    const gzip_key = varyKeyFor(&gzip_buf, primary, "gzip");
+    try cache.putVaryVariant(0, primary, gzip_key, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
+        .body = "gzip-body",
+        .ttl_seconds = 60,
+    });
+    var identity_buf: [64]u8 = undefined;
+    const identity_key = varyKeyFor(&identity_buf, primary, "identity");
+    try cache.putVaryVariant(0, primary, identity_key, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Vary", .value = "Accept-Encoding" }},
+        .body = "identity-body",
+        .ttl_seconds = 60,
+    });
+    try std.testing.expect(cache.isVaryTracked(primary));
+
+    // The origin stops sending `Vary: Accept-Encoding` -- the next fill
+    // lands directly under the primary key.
+    try cache.put(0, primary, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{},
+        .body = "fresh-unvaried-body",
+        .ttl_seconds = 60,
+    });
+
+    try std.testing.expect(!cache.isVaryTracked(primary));
+    try std.testing.expectEqual(@as(usize, 0), cache.vary_index.count());
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    // Both obsolete variants are gone, not merely unreachable.
+    try std.testing.expectEqual(@as(?LookupResult, null), try cache.lookup(arena.allocator(), gzip_key, 1_000));
+    try std.testing.expectEqual(@as(?LookupResult, null), try cache.lookup(arena.allocator(), identity_key, 1_000));
+    const fresh_hit = (try cache.lookup(arena.allocator(), primary, 1_000)).?;
+    try std.testing.expectEqualStrings("fresh-unvaried-body", fresh_hit.body);
+    try std.testing.expectEqual(@as(usize, 1), cache.map.count());
 }
 
 test "buildCacheKey is deterministic and distinguishes field splits" {

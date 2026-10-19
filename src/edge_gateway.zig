@@ -8,6 +8,7 @@ const build_options = @import("build_options");
 const tls_core = @import("tls_core");
 const http3_wire = @import("http3");
 const acme_activation = @import("acme_activation.zig");
+const acme_renewal = @import("acme_renewal.zig");
 
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
@@ -564,13 +565,14 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     defer if (native_credentials) |*store| store.deinit();
     // #884: restart recovery (design §5.5) runs synchronously here, before
     // any network access, so a restart during a CA outage still serves
-    // whatever was already durably issued; a background bootstrap thread
-    // then makes exactly one issuance attempt per managed group still
-    // missing a valid generation. This is not the renewal worker (#835):
-    // there is no scheduler, no periodic wake-up, no cross-restart backoff
-    // here, only the one-shot bootstrap A4 owns.
-    var acme_bootstrap: ?acme_activation.BootstrapCtx = null;
-    defer if (acme_bootstrap) |*ctx| ctx.stopAndJoin();
+    // whatever was already durably issued. #835 (A5): the renewal worker
+    // started below then owns every managed group's issuance *and* ongoing
+    // renewal for the rest of the process lifetime -- there is no separate
+    // one-shot bootstrap thread anymore; the worker's own first pass
+    // recomputes which groups still need a certificate from the same
+    // on-disk state `recoverFromDisk` just read.
+    var acme_renewal_worker: ?acme_renewal.Worker = null;
+    defer if (acme_renewal_worker) |*worker| worker.stopAndJoin();
     if (cfg.tls_acme_enabled) {
         const recovered = acme_activation.recoverFromDisk(
             state_allocator,
@@ -586,7 +588,7 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             state.logger.err(null, "ACME state directory rejected at startup ({s}); refusing to start", .{@errorName(err)});
             return err;
         };
-        acme_bootstrap = acme_activation.BootstrapCtx{
+        acme_renewal_worker = acme_renewal.Worker{
             .allocator = state_allocator,
             .state_dir_path = cfg.tls_acme_cert_dir,
             .default_cert_path = cfg.tls_cert_path,
@@ -605,10 +607,10 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             .prepare_current_credentials = prepareCurrentAcmeCredentials,
             .credential_config_ctx = &config_store,
             .group_list = recovered.group_list,
-            .needs_issuance = recovered.needs_issuance,
+            .renew_days_before_expiry = cfg.tls_acme_renew_days_before_expiry,
             .logger = state.logger,
         };
-        try acme_bootstrap.?.start();
+        try acme_renewal_worker.?.start();
     }
     // #763: downstream mTLS trust anchors. Loaded eagerly so a bad bundle
     // fails startup rather than the first handshake; never falls back to the

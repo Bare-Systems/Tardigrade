@@ -18,6 +18,8 @@ pub const orders = @import("orders.zig");
 pub const groups = @import("groups.zig");
 /// Pure A5 renewal deadlines and bounded retry policy (#835).
 pub const renewal_policy = @import("renewal_policy.zig");
+/// Durable per-group renewal retry state (#835).
+pub const renewal_state = @import("renewal_state.zig");
 
 /// Test-only fake CA (see `fake_ca.zig`); absent from non-test builds.
 pub const fake_ca = if (@import("builtin").is_test) @import("fake_ca.zig") else struct {};

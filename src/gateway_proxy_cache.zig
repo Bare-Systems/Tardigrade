@@ -1073,16 +1073,25 @@ pub fn decideCacheServe(hit_headers: []const CacheHeader, request_headers: *cons
     // `If-None-Match` is a `#entity-tag` list field: RFC 9110 §5.3 lets a
     // sender split it across repeated header line instances, and the
     // combined list is what must be evaluated -- `Headers.get` alone would
-    // silently drop every instance after the first.
+    // silently drop every instance after the first. The decision can only be
+    // made once *every* instance has been checked: a match in an earlier
+    // instance must not short-circuit past a later instance that makes the
+    // combined logical list syntactically invalid, since that invalidates
+    // the whole condition, not just that one instance.
     var seen_if_none_match = false;
     var stored_etag: ?[]const u8 = null;
+    var matched = false;
     for (request_headers.iterator()) |header| {
         if (!std.mem.eql(u8, header.name, "if-none-match")) continue;
         seen_if_none_match = true;
         if (stored_etag == null) stored_etag = findStoredHeader(hit_headers, "etag") orelse return .require_origin;
-        if (http.etag.matchesIfNoneMatch(stored_etag.?, header.value)) return .not_modified;
+        switch (http.etag.evaluateIfNoneMatch(stored_etag.?, header.value)) {
+            .invalid => return .require_origin,
+            .match => matched = true,
+            .no_match => {},
+        }
     }
-    if (seen_if_none_match) return .full;
+    if (seen_if_none_match) return if (matched) .not_modified else .full;
 
     if (request_headers.get("if-modified-since")) |raw_client_date| {
         const stored_last_modified = findStoredHeader(hit_headers, "last-modified") orelse return .require_origin;
@@ -1210,10 +1219,29 @@ test "decideCacheServe evaluates every repeated If-None-Match field instance" {
     headers.deinit();
     headers = http.Headers.init(std.testing.allocator);
 
-    // A malformed later instance must not be allowed to spuriously match.
+    // A malformed later instance invalidates the combined list rather than
+    // being ignored because an earlier instance already resolved to a
+    // nonmatch: the cache cannot trust this condition either way, so it
+    // defers to the origin instead of guessing.
     try headers.append("If-None-Match", "\"other\"");
     try headers.append("If-None-Match", "junk\"rev1\"");
-    try std.testing.expectEqual(ServeDisposition.full, decideCacheServe(stored, &headers));
+    try std.testing.expectEqual(ServeDisposition.require_origin, decideCacheServe(stored, &headers));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+
+    // A malformed instance must invalidate the combined list even when an
+    // earlier instance already matched -- a match must not short-circuit
+    // past a later syntax violation (#935 review).
+    try headers.append("If-None-Match", "\"rev1\"");
+    try headers.append("If-None-Match", "junk\"oops\"");
+    try std.testing.expectEqual(ServeDisposition.require_origin, decideCacheServe(stored, &headers));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+
+    // Same, with the malformed instance first and the match second.
+    try headers.append("If-None-Match", "junk\"oops\"");
+    try headers.append("If-None-Match", "\"rev1\"");
+    try std.testing.expectEqual(ServeDisposition.require_origin, decideCacheServe(stored, &headers));
 }
 
 test "isReplayableOn304 allow-lists only validator/freshness-describing fields" {

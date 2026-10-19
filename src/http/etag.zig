@@ -24,6 +24,14 @@ fn skipOws(header: []const u8, start: usize) usize {
     return i;
 }
 
+/// Result of evaluating one `If-None-Match` field-value against a stored
+/// validator. Kept distinct from a plain `bool` so a caller combining several
+/// repeated header instances (RFC 9110 §5.3) can tell "no match in this
+/// instance" apart from "this instance is not valid `#entity-tag` syntax" --
+/// the latter must invalidate the whole combined list even if an earlier
+/// instance already matched.
+pub const EntityTagMatch = enum { invalid, no_match, match };
+
 /// RFC 9110 §13.1.2 requires weak comparison for `If-None-Match` on GET/HEAD:
 /// entity-tags match if their opaque-tag is identical once any `W/` prefix is
 /// stripped from both sides, regardless of which side (if either) was weak.
@@ -35,34 +43,41 @@ fn skipOws(header: []const u8, start: usize) usize {
 /// otherwise-malformed text (e.g. `garbage"rev1"`, or a match followed by
 /// trailing junk) as if the client had actually sent that validator; any
 /// syntax violation instead makes the whole field indeterminate and this
-/// returns `false`, even if a valid-looking tag was found before the
+/// returns `.invalid`, even if a valid-looking tag was found before the
 /// violation.
-pub fn matchesIfNoneMatch(etag: []const u8, header: []const u8) bool {
-    if (std.mem.eql(u8, std.mem.trim(u8, header, " \t"), "*")) return true;
+pub fn evaluateIfNoneMatch(etag: []const u8, header: []const u8) EntityTagMatch {
+    if (std.mem.eql(u8, std.mem.trim(u8, header, " \t"), "*")) return .match;
 
     const target = stripWeakPrefix(etag);
     var cursor: usize = skipOws(header, 0);
     var found = false;
     while (cursor < header.len) {
         if (std.mem.startsWith(u8, header[cursor..], "W/")) cursor += 2;
-        if (cursor >= header.len or header[cursor] != '"') return false;
+        if (cursor >= header.len or header[cursor] != '"') return .invalid;
         const quote_start = cursor;
         cursor += 1;
         while (cursor < header.len and header[cursor] != '"') {
-            if (!isEtagc(header[cursor])) return false;
+            if (!isEtagc(header[cursor])) return .invalid;
             cursor += 1;
         }
-        if (cursor >= header.len) return false; // unterminated quoted-string
+        if (cursor >= header.len) return .invalid; // unterminated quoted-string
         const candidate = header[quote_start .. cursor + 1];
         cursor += 1;
         if (!found and std.mem.eql(u8, candidate, target)) found = true;
 
         cursor = skipOws(header, cursor);
         if (cursor >= header.len) break;
-        if (header[cursor] != ',') return false;
+        if (header[cursor] != ',') return .invalid;
         cursor = skipOws(header, cursor + 1);
     }
-    return found;
+    return if (found) .match else .no_match;
+}
+
+/// Convenience wrapper over `evaluateIfNoneMatch` for single-field callers
+/// that only need a match/no-match answer (`.invalid` and `.no_match` both
+/// read as "do not serve 304").
+pub fn matchesIfNoneMatch(etag: []const u8, header: []const u8) bool {
+    return evaluateIfNoneMatch(etag, header) == .match;
 }
 
 test "generateETag produces quoted hex size-mtime format" {
@@ -147,4 +162,11 @@ test "matchesIfNoneMatch rejects a tag followed by a later malformed token" {
 
 test "matchesIfNoneMatch still matches a valid mixed strong/weak list after fix" {
     try std.testing.expect(matchesIfNoneMatch("W/\"rev1\"", "\"a-1\", W/\"rev1\", \"c-3\""));
+}
+
+test "evaluateIfNoneMatch distinguishes invalid syntax from a valid nonmatch" {
+    try std.testing.expectEqual(EntityTagMatch.match, evaluateIfNoneMatch("\"rev1\"", "\"rev1\""));
+    try std.testing.expectEqual(EntityTagMatch.no_match, evaluateIfNoneMatch("\"rev1\"", "\"other\""));
+    try std.testing.expectEqual(EntityTagMatch.invalid, evaluateIfNoneMatch("\"rev1\"", "junk\"rev1\""));
+    try std.testing.expectEqual(EntityTagMatch.invalid, evaluateIfNoneMatch("\"rev1\"", "\"rev1\", junk\"oops\""));
 }

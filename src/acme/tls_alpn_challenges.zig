@@ -144,12 +144,18 @@ pub const Registry = struct {
         };
     }
 
-    /// Cancels a pending authorization. A previously returned lease remains
-    /// valid because it owns a copy, while every later lookup fails closed.
-    pub fn remove(self: *Registry, host: []const u8) CloseOutcome {
+    /// Cancels a pending authorization, but only if it is still owned by
+    /// `expected_binding`. The comparison happens under the same lock as the
+    /// removal, so a delayed cancellation from a retired order can never
+    /// destroy a replacement order's live challenge for the same host. A
+    /// previously returned lease remains valid because it owns a copy, while
+    /// every later lookup fails closed.
+    pub fn remove(self: *Registry, host: []const u8, expected_binding: Binding) CloseOutcome {
         self.mutex.lock();
         defer self.mutex.unlock();
         const index = self.findIndex(host) orelse return .not_found;
+        if (!std.mem.eql(u8, self.slots.items[index].binding[0..], expected_binding[0..]))
+            return .not_found;
         var removed = self.slots.swapRemove(index);
         self.freeSlot(&removed);
         return .closed;
@@ -223,13 +229,13 @@ test "TLS-ALPN registry expiry, cancellation, and leases are independent" {
     try registry.put(0, "a.example.test", binding_a, "first", 600);
     var lease = (try registry.lookup(testing.allocator, 1, "a.example.test", &challenge_alpn)).?;
     defer lease.deinit();
-    try testing.expectEqual(.closed, registry.remove("a.example.test"));
+    try testing.expectEqual(.closed, registry.remove("a.example.test", binding_a));
     try testing.expect((try registry.lookup(testing.allocator, 1, "a.example.test", &challenge_alpn)) == null);
     try testing.expectEqualStrings("first", lease.material);
 
     try registry.put(0, "a.example.test", binding_b, "second", 2);
     try testing.expect((try registry.lookup(testing.allocator, 2, "a.example.test", &challenge_alpn)) == null);
-    try testing.expectEqual(.not_found, registry.remove("a.example.test"));
+    try testing.expectEqual(.not_found, registry.remove("a.example.test", binding_b));
 }
 
 test "TLS-ALPN registry rejects conflicting, malformed, and excessive challenges" {
@@ -241,11 +247,180 @@ test "TLS-ALPN registry rejects conflicting, malformed, and excessive challenges
     try registry.put(0, "a.example.test", binding_a, "value", 1);
     try testing.expectError(error.DuplicateHost, registry.put(0, "a.example.test", binding_b, "other", 1));
 
-    _ = registry.remove("a.example.test");
+    _ = registry.remove("a.example.test", binding_a);
     var host_buf: [64]u8 = undefined;
     for (0..max_entries) |index| {
         const host = try std.fmt.bufPrint(&host_buf, "h{d}.example.test", .{index});
         try registry.put(0, host, binding_a, "value", 1);
     }
     try testing.expectError(error.StoreFull, registry.put(0, "overflow.example.test", binding_a, "value", 1));
+}
+
+test "TLS-ALPN registry cancellation is scoped to the owning binding" {
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    const challenge_alpn = [_][]const u8{protocol};
+
+    // A mismatched binding cannot cancel an active challenge.
+    try registry.put(0, "a.example.test", binding_a, "first", 600);
+    try testing.expectEqual(.not_found, registry.remove("a.example.test", binding_b));
+    {
+        var lease = (try registry.lookup(testing.allocator, 1, "a.example.test", &challenge_alpn)).?;
+        defer lease.deinit();
+        try testing.expectEqual(binding_a, lease.binding);
+        try testing.expectEqualStrings("first", lease.material);
+    }
+
+    // The owning binding cancels it.
+    try testing.expectEqual(.closed, registry.remove("a.example.test", binding_a));
+
+    // Stale cancellation from the retired order cannot retire its replacement.
+    try registry.put(0, "a.example.test", binding_b, "second", 600);
+    try testing.expectEqual(.not_found, registry.remove("a.example.test", binding_a));
+    var lease = (try registry.lookup(testing.allocator, 1, "a.example.test", &challenge_alpn)).?;
+    defer lease.deinit();
+    try testing.expectEqual(binding_b, lease.binding);
+    try testing.expectEqualStrings("second", lease.material);
+}
+
+test "TLS-ALPN registry wipes secret material on remove, expire, deinit, and lease release" {
+    var detector = crypto.secrets.CredentialWipeDetector.init(testing.allocator);
+    const allocator = detector.allocator();
+    const challenge_alpn = [_][]const u8{protocol};
+
+    var registry = Registry.init(allocator);
+    try registry.put(0, "a.example.test", binding_a, "remove-secret", 600);
+    try registry.put(0, "b.example.test", binding_a, "expire-secret", 5);
+    try registry.put(0, "c.example.test", binding_a, "deinit-secret", 600);
+    for (registry.slots.items) |slot| detector.watch(slot.material);
+
+    var lease = (try registry.lookup(allocator, 1, "c.example.test", &challenge_alpn)).?;
+    detector.watch(lease.material);
+
+    try testing.expectEqual(.closed, registry.remove("a.example.test", binding_a));
+    registry.expire(5);
+    try testing.expectEqual(@as(usize, 1), registry.slots.items.len);
+    registry.deinit();
+    lease.deinit();
+    try testing.expect(detector.allWatchedWiped());
+}
+
+test "TLS-ALPN registry rolls back cleanly on allocator failure" {
+    const challenge_alpn = [_][]const u8{protocol};
+
+    // put allocates host, material, then the slot list entry.
+    for (0..3) |fail_index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var registry = Registry.init(failing.allocator());
+        defer registry.deinit();
+        try testing.expectError(error.OutOfMemory, registry.put(0, "a.example.test", binding_a, "value", 600));
+        try testing.expectEqual(@as(usize, 0), registry.slots.items.len);
+    }
+
+    // lookup allocates host then material; neither failure leaks or mutates.
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.put(0, "a.example.test", binding_a, "value", 600);
+    for (0..2) |fail_index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        try testing.expectError(
+            error.OutOfMemory,
+            registry.lookup(failing.allocator(), 1, "a.example.test", &challenge_alpn),
+        );
+        try testing.expectEqual(@as(usize, 1), registry.slots.items.len);
+    }
+}
+
+test "TLS-ALPN registry concurrent lookup, retirement, and reactivation stay generation-consistent" {
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+
+    const generations: u8 = 200;
+
+    // Each generation's binding and material are the same repeated byte, so a
+    // lease mixing two generations is detectable.
+    const Shared = struct {
+        registry: *Registry,
+        failures: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn fail(self: *@This()) void {
+            _ = self.failures.fetchAdd(1, .monotonic);
+        }
+
+        fn reader(self: *@This(), host: []const u8) void {
+            const challenge_alpn = [_][]const u8{protocol};
+            while (!self.done.load(.acquire)) {
+                const maybe = self.registry.lookup(testing.allocator, 1, host, &challenge_alpn) catch {
+                    self.fail();
+                    return;
+                };
+                var lease = maybe orelse continue;
+                defer lease.deinit();
+                const gen = lease.binding[0];
+                for (lease.binding) |byte| if (byte != gen) self.fail();
+                if (lease.material.len != 32) self.fail();
+                for (lease.material) |byte| if (byte != gen) self.fail();
+                if (!std.mem.eql(u8, lease.host, host)) self.fail();
+            }
+        }
+
+        // Sole owner of host a: retire/replace generations, and issue stale
+        // cancellations from the previous generation after each replacement.
+        fn owner(self: *@This()) void {
+            var previous: Binding = @splat(0);
+            var gen: u8 = 1;
+            while (gen <= generations) : (gen += 1) {
+                const binding: Binding = @splat(gen);
+                const material: [32]u8 = @splat(gen);
+                self.registry.put(0, "a.example.test", binding, &material, 600) catch {
+                    self.fail();
+                    return;
+                };
+                if (gen > 1 and self.registry.remove("a.example.test", previous) != .not_found) self.fail();
+                if (self.registry.remove("a.example.test", @as(Binding, @splat(0))) != .not_found) self.fail();
+                const challenge_alpn = [_][]const u8{protocol};
+                const check = self.registry.lookup(testing.allocator, 1, "a.example.test", &challenge_alpn) catch {
+                    self.fail();
+                    return;
+                };
+                if (check) |c| {
+                    var lease = c;
+                    defer lease.deinit();
+                    if (!std.mem.eql(u8, &lease.binding, &binding)) self.fail();
+                } else self.fail();
+                if (self.registry.remove("a.example.test", binding) != .closed) self.fail();
+                previous = binding;
+            }
+        }
+
+        // Host b challenges are retired by expiry rather than cancellation.
+        fn expirer(self: *@This()) void {
+            var now: i64 = 0;
+            while (now < generations) : (now += 1) {
+                const gen: u8 = @intCast(now + 1);
+                const material: [32]u8 = @splat(gen);
+                self.registry.put(now, "b.example.test", @as(Binding, @splat(gen)), &material, now + 1) catch {
+                    self.fail();
+                    return;
+                };
+                self.registry.expire(now + 1);
+            }
+        }
+    };
+
+    var shared = Shared{ .registry = &registry };
+    var readers: [3]std.Thread = undefined;
+    readers[0] = try std.Thread.spawn(.{}, Shared.reader, .{ &shared, "a.example.test" });
+    readers[1] = try std.Thread.spawn(.{}, Shared.reader, .{ &shared, "a.example.test" });
+    readers[2] = try std.Thread.spawn(.{}, Shared.reader, .{ &shared, "b.example.test" });
+    const owner = try std.Thread.spawn(.{}, Shared.owner, .{&shared});
+    const expirer = try std.Thread.spawn(.{}, Shared.expirer, .{&shared});
+    owner.join();
+    expirer.join();
+    shared.done.store(true, .release);
+    for (readers) |t| t.join();
+
+    try testing.expectEqual(@as(u32, 0), shared.failures.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), registry.slots.items.len);
 }

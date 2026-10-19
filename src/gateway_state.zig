@@ -2448,6 +2448,7 @@ pub const GatewayState = struct {
                 .next_attempt_at = statuses[i].next_attempt_at,
                 .consecutive_failures = statuses[i].consecutive_failures,
                 .last_failure_class = if (statuses[i].last_failure_class) |c| @as(u8, @intFromEnum(c)) else null,
+                .activation_pending = statuses[i].activation_pending,
             };
         }
         metrics_snapshot.setAcmeRenewalStatus(rendered[0..n]);

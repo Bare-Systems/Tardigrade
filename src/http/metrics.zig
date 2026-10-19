@@ -258,6 +258,11 @@ pub const AcmeRenewalGroupStatus = struct {
     consecutive_failures: u32 = 0,
     /// Index into `acme_failure_class_labels`, or `null` for "no failure".
     last_failure_class: ?u8 = null,
+    /// A fresh issuance was durably persisted but has not yet been
+    /// republished to the live TLS provider: `consecutive_failures`/
+    /// `last_failure_class` above still describe the attempt *before* this
+    /// one, not a currently-healthy renewal.
+    activation_pending: bool = false,
 };
 
 pub const Metrics = struct {
@@ -1870,6 +1875,8 @@ pub const Metrics = struct {
                 \\# TYPE tardigrade_acme_renewal_consecutive_failures gauge
                 \\# HELP tardigrade_acme_renewal_last_failure Whether the group's most recent attempt failed, by group and closed failure-class label
                 \\# TYPE tardigrade_acme_renewal_last_failure gauge
+                \\# HELP tardigrade_acme_renewal_activation_pending A fresh issuance is durably persisted but not yet live on the TLS provider, by group
+                \\# TYPE tardigrade_acme_renewal_activation_pending gauge
                 \\
             , .{});
             for (0..n) |i| {
@@ -1883,6 +1890,7 @@ pub const Metrics = struct {
                     const active = if (group.last_failure_class) |c| @as(usize, c) == class_index else false;
                     try out.print("tardigrade_acme_renewal_last_failure{{group=\"{s}\",class=\"{s}\"}} {d}\n", .{ group.group_id, label, @intFromBool(active) });
                 }
+                try out.print("tardigrade_acme_renewal_activation_pending{{group=\"{s}\"}} {d}\n", .{ group.group_id, @intFromBool(group.activation_pending) });
             }
         }
 

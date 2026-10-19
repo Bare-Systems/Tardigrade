@@ -94,6 +94,12 @@ pub const GroupStatus = struct {
     next_attempt_at: i64 = 0,
     consecutive_failures: u32 = 0,
     last_failure_class: ?acme.client.FailureClass = null,
+    /// Mirrors `Worker.pending_success[i]`: true once a fresh issuance has
+    /// been durably persisted but the live provider has not yet been
+    /// republished with it, so `consecutive_failures`/`last_failure_class`
+    /// above still reflect whatever failure record predates this attempt
+    /// rather than the attempt that is still pending activation.
+    activation_pending: bool = false,
 };
 
 /// Production randomness is bounded to `acme.renewal_policy`'s accepted
@@ -166,6 +172,18 @@ pub const Worker = struct {
     /// whatever is committed at every startup regardless of this flag's
     /// value in whatever process came before.
     pending_publish: bool = false,
+    /// Set, index-aligned with `group_list.slice()`, when a group's issuance
+    /// succeeded this process's lifetime but the durable `acme.renewal_state`
+    /// success record (`failures=0`) has not yet been written, because the
+    /// live-activation half of that success (the following republish) has
+    /// not yet succeeded. Resetting the failure record before activation
+    /// actually lands would let `tick`'s decision and the operator-facing
+    /// status/metrics advertise a clean renewal while the live provider may
+    /// still be serving a stale or absent credential. Resolved (the record
+    /// written, the flag cleared) only once `republishManagedSet` actually
+    /// succeeds -- which may be several passes later than the issuance that
+    /// set it, exactly tracking `pending_publish`'s own lifetime.
+    pending_success: [acme.groups.max_groups]bool = @splat(false),
     /// Bounded wait before retrying a `.Locked` collision with a short-lived
     /// concurrent writer (a routine SIGHUP reload or another in-flight
     /// durable-state transition), distinct from `acme.renewal_policy`'s
@@ -178,6 +196,12 @@ pub const Worker = struct {
     /// (`acme.renewal_state.loadOrConservativeDefault`'s `corrupt_since`),
     /// index-aligned with `group_list.slice()`.
     corrupt_anchor: [acme.groups.max_groups]?i64 = @splat(null),
+    /// Test-only: substituted for the production TLS dialer in
+    /// `attemptDueGroups`, the one call site `runLoop` itself uses. Lets a
+    /// test exercise `runLoop`'s own scheduling/backoff decisions against a
+    /// fake CA end-to-end instead of only the lower-level
+    /// `attemptDueGroupsWithDialer` it wraps.
+    dialer_override: ?acme.transport.Dialer = null,
 
     pub fn start(self: *Worker) !void {
         self.thread = try std.Thread.spawn(.{}, runThread, .{self});
@@ -252,6 +276,21 @@ fn runLoop(worker: *Worker) !void {
                 if (err == error.Locked) {
                     worker.logger.warn(null, "ACME renewal: state directory busy during an issuance/publish pass (transient lock contention); retrying shortly", .{});
                     scheduled.earliest_next = @min(scheduled.earliest_next, worker.unix_clock.now() + worker.lock_retry_wait_seconds);
+                    break :handled;
+                }
+                if (err == error.RetryStateNotPersisted) {
+                    // A per-group failure happened *and* the durable retry
+                    // record for it could not be written (disk full,
+                    // permissions, a stuck lock): without this floor, the
+                    // next pass would recompute the identical unmodified
+                    // due record and re-contact the CA immediately, with no
+                    // backoff at all. Not escalated to a permanent stop --
+                    // unlike a corrupt/mismatched account record, a failed
+                    // state write may well be writable again on the very
+                    // next pass, and serving continues on the last live
+                    // credential either way.
+                    worker.logger.err(null, "ACME renewal: a per-group retry record failed to persist; applying a conservative retry floor to avoid hammering the CA", .{});
+                    scheduled.earliest_next = @max(scheduled.earliest_next, worker.unix_clock.now() + acme.renewal_policy.retry_floor_seconds);
                     break :handled;
                 }
                 const class = acme.client.classify(err);
@@ -363,6 +402,7 @@ fn tick(worker: *Worker) !Scheduled {
             .next_attempt_at = decision.next_attempt_at,
             .consecutive_failures = record.failures,
             .last_failure_class = record.last_failure_class,
+            .activation_pending = worker.pending_success[i],
         });
 
         if (decision.next_attempt_at <= now) {
@@ -386,6 +426,11 @@ fn tick(worker: *Worker) !Scheduled {
 /// moot, or a failure to republish (`worker.pending_publish` is left set
 /// either way, for the next pass to retry without reissuing).
 fn attemptDueGroups(worker: *Worker, scheduled: Scheduled) !void {
+    // Test-only seam: `runLoop`'s own catch/floor logic otherwise has no
+    // way to be exercised end-to-end, since every other call in this file
+    // routes through `attemptDueGroupsWithDialer` directly rather than
+    // `runLoop`. Production `Worker`s never set this.
+    if (worker.dialer_override) |d| return attemptDueGroupsWithDialer(worker, scheduled, d);
     var dialer_inst = http.acme_tls_dialer.TlsDialer.init(worker.issue.trust_anchors);
     defer dialer_inst.deinit();
     try attemptDueGroupsWithDialer(worker, scheduled, dialer_inst.dialer());
@@ -409,6 +454,7 @@ fn attemptDueGroupsWithDialer(worker: *Worker, scheduled: Scheduled, dialer: acm
     }
 
     var issued_any = false;
+    var unrecorded_failure = false;
     if (any_due) {
         var transport_inst = acme.transport.Transport{ .allocator = worker.allocator, .dialer = dialer };
         // StateDir's advisory lock protects short durable-state transitions,
@@ -416,12 +462,14 @@ fn attemptDueGroupsWithDialer(worker: *Worker, scheduled: Scheduled, dialer: acm
         // session retains its key/client after this scope, so a routine
         // SIGHUP reload can read the last committed managed set while a
         // renewal is in flight.
+        const client_cancel: acme.client.Cancel = .{ .ctx = &worker.cancel, .checkFn = cancelCheck };
         const session = acme.client.Session.openUnlocked(worker.allocator, &transport_inst, worker.state_dir_path, .{
             .directory_url = worker.issue.directory_url,
             .contact_email = worker.issue.contact_email,
             .terms_of_service_agreed = worker.issue.terms_of_service_agreed,
             .account_key_path = worker.issue.account_key_path,
-        }, worker.unix_clock.now()) catch |err| {
+        }, worker.unix_clock.now(), client_cancel) catch |err| {
+            if (err == error.Cancelled) return err;
             // The CA/account setup failure makes every due group's attempt
             // moot, but it must not look like "never attempted" on a crash
             // or restart immediately afterward: persist a bounded failure
@@ -435,11 +483,31 @@ fn attemptDueGroupsWithDialer(worker: *Worker, scheduled: Scheduled, dialer: acm
         for (worker.group_list.slice(), 0..) |group, i| {
             if (worker.cancel.load(.acquire)) break;
             if (!scheduled.due[i]) continue;
-            if (attemptAndRecord(worker, &session.client, group, scheduled.prior_failures[i])) issued_any = true;
+            switch (attemptAndRecord(worker, &session.client, group, i, scheduled.prior_failures[i])) {
+                .issued => issued_any = true,
+                .failed => {},
+                .failed_unrecorded => unrecorded_failure = true,
+            }
         }
     }
-    if (!issued_any and !worker.pending_publish) return;
-    try republishManagedSet(worker);
+    if (issued_any or worker.pending_publish) {
+        try republishManagedSet(worker);
+        // The republish above either returned an error (propagated by
+        // `try`, leaving `pending_success` untouched for the next pass to
+        // resolve) or succeeded, in which case every group still carrying a
+        // pending success from this or an earlier pass is now actually
+        // live: write its durable success record for the first time.
+        const now = worker.unix_clock.now();
+        for (worker.group_list.slice(), 0..) |group, i| {
+            if (!worker.pending_success[i]) continue;
+            recordSuccess(worker, group, now) catch |rec_err| {
+                worker.logger.err(null, "ACME renewal: failed to persist the success record for a managed group (error={s})", .{@errorName(rec_err)});
+                continue;
+            };
+            worker.pending_success[i] = false;
+        }
+    }
+    if (unrecorded_failure) return error.RetryStateNotPersisted;
 }
 
 /// Persist a bounded failure record for every group `tick` marked due, used
@@ -498,29 +566,43 @@ fn republishManagedSet(worker: *Worker) !void {
     worker.pending_publish = false;
 }
 
-/// Attempts one group and durably records the outcome. Returns whether a
-/// fresh generation was persisted (not yet published). A cancellation
-/// mid-attempt is dropped silently: the worker is already shutting down,
-/// and the next process start recomputes the schedule fresh from committed
-/// certificate validity alone, so there is nothing useful to persist.
-fn attemptAndRecord(worker: *Worker, client: *acme.client.Client, group: acme.groups.Group, prior_failures: u32) bool {
+/// The three distinguishable outcomes of one group's attempt:
+///  - `.issued`: the CA issued a fresh generation, durably persisted as
+///    `current`. `Worker.pending_success[index]` is set so the record of
+///    this success is written only once the following republish actually
+///    makes it live (see `attemptDueGroupsWithDialer`).
+///  - `.failed`: the attempt failed and the durable failure record was
+///    written, so `acme.renewal_policy`'s backoff governs the next attempt.
+///  - `.failed_unrecorded`: the attempt failed *and* the durable failure
+///    record itself could not be written (disk full, permissions, a stuck
+///    lock). Without a distinct outcome here, the caller would recompute an
+///    unmodified due record on its very next pass and re-contact the CA
+///    immediately, forever, with no backoff at all.
+const AttemptOutcome = enum { issued, failed, failed_unrecorded };
+
+/// Attempts one group and durably records the outcome. `index` is the
+/// group's position in `worker.group_list.slice()`, used to set
+/// `Worker.pending_success`. A cancellation mid-attempt is dropped silently:
+/// the worker is already shutting down, and the next process start
+/// recomputes the schedule fresh from committed certificate validity alone,
+/// so there is nothing useful to persist.
+fn attemptAndRecord(worker: *Worker, client: *acme.client.Client, group: acme.groups.Group, index: usize, prior_failures: u32) AttemptOutcome {
     const now = worker.unix_clock.now();
     issueGroup(worker, client, group) catch |err| {
         if (err == error.Cancelled) {
             worker.logger.info(null, "ACME renewal attempt cancelled by shutdown for a managed group", .{});
-            return false;
+            return .failed;
         }
         const class = acme.client.classify(err);
         worker.logger.warn(null, "ACME renewal attempt failed for a managed group (class={s}, error={s})", .{ @tagName(class), @errorName(err) });
         recordFailure(worker, group, now, class, prior_failures, client.diagnostics.last_retry_after_s) catch |rec_err| {
             worker.logger.err(null, "ACME renewal: failed to persist the retry record for a managed group (error={s})", .{@errorName(rec_err)});
+            return .failed_unrecorded;
         };
-        return false;
+        return .failed;
     };
-    recordSuccess(worker, group, now) catch |rec_err| {
-        worker.logger.err(null, "ACME renewal: failed to persist the success record for a managed group (error={s})", .{@errorName(rec_err)});
-    };
-    return true;
+    worker.pending_success[index] = true;
+    return .issued;
 }
 
 fn openGroupStateDir(worker: *Worker, group_id: []const u8) !struct { state: acme.state.StateDir, groups: acme.state.SubDir, group: acme.state.SubDir } {
@@ -550,6 +632,12 @@ fn recordFailure(worker: *Worker, group: acme.groups.Group, now: i64, class: acm
 }
 
 fn recordSuccess(worker: *Worker, group: acme.groups.Group, now: i64) !void {
+    // `last_attempt_at` is the persisted *failure* backoff anchor. A fresh
+    // published generation must clear it: renewal_policy intentionally
+    // ignores old failure state after success, and retaining `now` here
+    // would impose its five-minute failure floor even when the new
+    // certificate is already inside the configured renewal window.
+    _ = now;
     var id_buf: [acme.groups.group_id_len]u8 = undefined;
     const group_id = acme.groups.groupId(&id_buf, group.slice());
     var opened = try openGroupStateDir(worker, group_id);
@@ -557,7 +645,7 @@ fn recordSuccess(worker: *Worker, group: acme.groups.Group, now: i64) !void {
     defer opened.groups.close();
     defer opened.state.close();
 
-    try acme.renewal_state.save(worker.allocator, &opened.group, .{ .last_attempt_at = now, .failures = 0, .last_failure_class = null, .retry_after_at = null });
+    try acme.renewal_state.save(worker.allocator, &opened.group, .{ .last_attempt_at = 0, .failures = 0, .last_failure_class = null, .retry_after_at = null });
 }
 
 fn issueGroup(worker: *Worker, client: *acme.client.Client, group: acme.groups.Group) !void {
@@ -1079,7 +1167,7 @@ test "Worker.snapshotStatus never exposes more than the bounded, secret-free sta
     // token or nonce field would be a type error here, not a runtime leak
     // caught by a string search.
     const info = @typeInfo(GroupStatus).@"struct";
-    try testing.expectEqual(@as(usize, 4), info.fields.len);
+    try testing.expectEqual(@as(usize, 5), info.fields.len);
 }
 
 const PublishFailureCtx = struct {
@@ -1144,13 +1232,33 @@ test "attemptDueGroupsWithDialer: a failed publish after a successful issuance r
         loaded.deinit(allocator);
     }
 
-    // The success record was already reset before publication was
-    // attempted, so `tick` alone sees a far-future due time from cert
-    // validity -- it is `pending_publish`, not per-group `due`, that must
-    // drive the retry (design: the publish rebuild spans every group, not
-    // just the one that happened to issue).
+    // `tick` sees a far-future due time from the committed generation's own
+    // validity regardless -- it is `pending_publish`, not per-group `due`,
+    // that must drive the retry (design: the publish rebuild spans every
+    // group, not just the one that happened to issue).
     const after_failure = try tick(&worker);
     try testing.expect(!after_failure.due[0]);
+
+    // The durable success record must *not* exist yet: publication has not
+    // actually landed, so writing `failures=0` now would tell both
+    // `tick`'s own next-attempt decision and operator-facing metrics that
+    // this renewal is already healthy while the live TLS provider may
+    // still be serving a stale or absent credential. `activation_pending`
+    // is how that in-between state is surfaced instead.
+    {
+        var id_buf: [acme.groups.group_id_len]u8 = undefined;
+        const group_id = acme.groups.groupId(&id_buf, &hostnames);
+        var state = try acme.state.StateDir.open(dirs.state_dir);
+        defer state.close();
+        var groups_dir = try state.openOrCreateSubdir(acme.activate.groups_dir_name);
+        defer groups_dir.close();
+        var group_dir = try groups_dir.openOrCreateSubdir(group_id);
+        defer group_dir.close();
+        try testing.expect((try acme.renewal_state.load(allocator, &group_dir)) == null);
+    }
+    var statuses_pending: [1]GroupStatus = undefined;
+    worker.snapshotStatus(&statuses_pending);
+    try testing.expect(statuses_pending[0].activation_pending);
 
     // A pass with nothing newly due must still retry the pending publish
     // without any further CA contact: `after_failure.due` is all-false, so
@@ -1159,6 +1267,27 @@ test "attemptDueGroupsWithDialer: a failed publish after a successful issuance r
     try testing.expect(!worker.pending_publish);
     try testing.expect(published.isPublished("publish-retry.example.test"));
     try testing.expectEqual(@as(u32, 2), pub_ctx.calls);
+
+    // Now that activation actually landed, the durable success record is
+    // written for the first time and the pending status clears.
+    {
+        var id_buf: [acme.groups.group_id_len]u8 = undefined;
+        const group_id = acme.groups.groupId(&id_buf, &hostnames);
+        var state = try acme.state.StateDir.open(dirs.state_dir);
+        defer state.close();
+        var groups_dir = try state.openOrCreateSubdir(acme.activate.groups_dir_name);
+        defer groups_dir.close();
+        var group_dir = try groups_dir.openOrCreateSubdir(group_id);
+        defer group_dir.close();
+        const record = (try acme.renewal_state.load(allocator, &group_dir)).?;
+        try testing.expectEqual(@as(u32, 0), record.failures);
+    }
+    // `tick`'s own `setStatus` call is what refreshes the snapshot; nothing
+    // else does.
+    _ = try tick(&worker);
+    var statuses_resolved: [1]GroupStatus = undefined;
+    worker.snapshotStatus(&statuses_resolved);
+    try testing.expect(!statuses_resolved[0].activation_pending);
 }
 
 test "runLoop: a transient state-directory lock collision retries instead of permanently stopping the worker" {
@@ -1344,6 +1473,142 @@ test "attemptDueGroupsWithDialer: a CA/account setup failure persists a durable 
     const scheduled_after = try tick(&worker);
     try testing.expect(!scheduled_after.due[0]);
     try testing.expectEqual(now + acme.renewal_policy.retry_floor_seconds, scheduled_after.earliest_next);
+}
+
+test "attemptDueGroupsWithDialer: a failed attempt whose own retry record cannot be written surfaces RetryStateNotPersisted" {
+    const allocator = testing.allocator;
+    var dirs = try TestDirs.init(allocator);
+    defer dirs.deinit(allocator);
+    const now: i64 = 1_700_000_000;
+
+    var ca = acme.fake_ca.FakeCa.init(allocator);
+    defer ca.deinit();
+    // The fake CA's default scripted certificate is not a verifiable X.509
+    // chain (the same untrusted-CA-response case the "verification
+    // failure" test above exercises), so every attempt reaches
+    // `attemptAndRecord`'s failure branch.
+    ca.script.new_order.expires_override = "2099-01-01T00:00:00Z";
+
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    var challenge_store = ChallengeStore.init(allocator);
+    defer challenge_store.deinit();
+    var published = PublishedHosts.init(allocator);
+    defer published.deinit();
+    const trust_anchors = try testTrustAnchors(allocator);
+    defer trust_anchors.release();
+
+    const hostnames = [_][]const u8{"record-write-fails.example.test"};
+    var worker = newTestWorker(allocator, &dirs, try acme.groups.parse(hostnames[0]), &store, &challenge_store, &published, trust_anchors);
+
+    // Running as root bypasses the directory-permission enforcement this
+    // test relies on (`StateDir.open`'s own "ACME state: refuses ...
+    // group-writable directories" test skips the analogous owner check for
+    // the same reason).
+    if (compat.effectiveUid() == 0) return error.SkipZigTest;
+
+    var id_buf: [acme.groups.group_id_len]u8 = undefined;
+    const group_id = acme.groups.groupId(&id_buf, &hostnames);
+    const group_dir_path = try std.fmt.allocPrint(allocator, "{s}/groups/{s}", .{ dirs.state_dir, group_id });
+    defer allocator.free(group_dir_path);
+    {
+        var state = try acme.state.StateDir.open(dirs.state_dir);
+        defer state.close();
+        var groups_dir = try state.openOrCreateSubdir(acme.activate.groups_dir_name);
+        defer groups_dir.close();
+        var group_dir = try groups_dir.openOrCreateSubdir(group_id);
+        defer group_dir.close();
+    }
+    // Read+execute only: `recordFailure`'s atomic write inside this
+    // directory must now fail exactly like a disk-full or
+    // permissions-changed state volume would.
+    try compat.chmodPath(group_dir_path, 0o500);
+    defer compat.chmodPath(group_dir_path, 0o700) catch {};
+
+    var scheduled = Scheduled{ .earliest_next = now };
+    scheduled.due[0] = true;
+    // Before the fix, this call would swallow the record-write failure and
+    // return successfully, leaving the caller (`runLoop`) with no signal
+    // that the usual durable backoff never actually landed.
+    try testing.expectError(error.RetryStateNotPersisted, attemptDueGroupsWithDialer(&worker, scheduled, ca.dialer()));
+    try testing.expect(!published.isPublished(hostnames[0]));
+}
+
+test "runLoop: a per-group retry-record write failure applies a bounded floor instead of hammering the CA" {
+    const allocator = testing.allocator;
+    var dirs = try TestDirs.init(allocator);
+    defer dirs.deinit(allocator);
+    const now: i64 = 1_700_000_000;
+
+    var ca = acme.fake_ca.FakeCa.init(allocator);
+    defer ca.deinit();
+    ca.script.new_order.expires_override = "2099-01-01T00:00:00Z";
+
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    var challenge_store = ChallengeStore.init(allocator);
+    defer challenge_store.deinit();
+    var published = PublishedHosts.init(allocator);
+    defer published.deinit();
+    const trust_anchors = try testTrustAnchors(allocator);
+    defer trust_anchors.release();
+
+    if (compat.effectiveUid() == 0) return error.SkipZigTest;
+
+    const hostnames = [_][]const u8{"record-write-fails-loop.example.test"};
+    var worker = newTestWorker(allocator, &dirs, try acme.groups.parse(hostnames[0]), &store, &challenge_store, &published, trust_anchors);
+    worker.dialer_override = ca.dialer();
+    worker.unix_clock = .{ .ctx = @constCast(&now), .nowFn = struct {
+        fn f(ctx: ?*anyopaque) i64 {
+            const n: *const i64 = @ptrCast(@alignCast(ctx.?));
+            return n.*;
+        }
+    }.f };
+
+    var id_buf: [acme.groups.group_id_len]u8 = undefined;
+    const group_id = acme.groups.groupId(&id_buf, &hostnames);
+    const group_dir_path = try std.fmt.allocPrint(allocator, "{s}/groups/{s}", .{ dirs.state_dir, group_id });
+    defer allocator.free(group_dir_path);
+    {
+        var state = try acme.state.StateDir.open(dirs.state_dir);
+        defer state.close();
+        var groups_dir = try state.openOrCreateSubdir(acme.activate.groups_dir_name);
+        defer groups_dir.close();
+        var group_dir = try groups_dir.openOrCreateSubdir(group_id);
+        defer group_dir.close();
+    }
+    try compat.chmodPath(group_dir_path, 0o500);
+    defer compat.chmodPath(group_dir_path, 0o700) catch {};
+
+    var stopped = std.atomic.Value(bool).init(false);
+    const Runner = struct {
+        fn run(w: *Worker, s: *std.atomic.Value(bool)) void {
+            runLoop(w) catch {
+                s.store(true, .release);
+            };
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &worker, &stopped });
+    compat.sleepNs(300 * std.time.ns_per_ms);
+
+    // Not a fatal persistence stop for the *process* (a failed state write
+    // may well be writable again on the next pass; serving continues on
+    // whatever was last published either way) -- just a conservative floor
+    // on the CA contact rate.
+    try testing.expect(!stopped.load(.acquire));
+    const posts_after_first_window = ca.countPosts();
+    try testing.expect(posts_after_first_window > 0);
+
+    // The old bug (silently swallowing the record-write failure) would have
+    // let every subsequent pass recompute the identical unmodified due
+    // record and re-contact the CA again immediately, forever; this window
+    // must see no further CA traffic at all.
+    compat.sleepNs(300 * std.time.ns_per_ms);
+    try testing.expectEqual(posts_after_first_window, ca.countPosts());
+
+    worker.cancel.store(true, .release);
+    thread.join();
+    try testing.expect(!stopped.load(.acquire));
 }
 
 test {

@@ -23589,6 +23589,548 @@ test "automatic HTTPS validates ACME-only native listener protocol and TLS restr
     try assertContains(version.stderr, "TLS 1.3-only");
 }
 
+test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotates a managed group with no manual trigger, surviving a SIGHUP overlap, with pinned H1/H2 connections kept alive, while a second group is left untouched" {
+    if (!integration_options.acme_experimental or std.mem.eql(u8, build_options.tls_profile, "appliance")) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    const alpha = "alpha-renew.example.test";
+    const beta = "beta-renew.example.test";
+
+    // `Factory`/`Validation` below are called synchronously from the live
+    // CA server's single accept-loop thread (`live_ca_server.zig` serves
+    // one connection at a time), so their own per-call counters need no
+    // atomics; only the two flags the test thread also touches do.
+    const Factory = struct {
+        issuer: *const acme_test_ca.TestCa,
+        alpha_calls: u32 = 0,
+
+        fn issue(raw: ?*anyopaque, alloc: std.mem.Allocator, csr_der: []const u8, hostnames: []const []const u8) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const now = compat.unixTimestamp();
+            if (hostnames.len == 1 and std.mem.eql(u8, hostnames[0], alpha)) {
+                self.alpha_calls += 1;
+                if (self.alpha_calls == 1) {
+                    // Deliberately short-lived: with
+                    // It began two days ago and has 26 hours left: it clears
+                    // activation's one-day minimum while already sitting
+                    // inside the two-day renewal window. Thus the live
+                    // scheduler's own `tick` must renew it immediately,
+                    // with no manual `verifyAndPersist`/SIGHUP trigger.
+                    return self.issuer.issueForCsr(alloc, csr_der, hostnames, now - 2 * 24 * 60 * 60, now + 26 * 60 * 60);
+                }
+            }
+            return self.issuer.issueForCsr(alloc, csr_der, hostnames, now - 3600, now + 365 * 24 * 3600);
+        }
+    };
+
+    const Validation = struct {
+        http01_port: u16,
+        release_alpha_renewal: *const std.atomic.Value(bool),
+        alpha_renewal_reached: *std.atomic.Value(bool),
+        alpha_calls: u32 = 0,
+        deadline_ms: i64,
+
+        fn validate(raw: ?*anyopaque, host: []const u8, token: []const u8, key_authorization: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.mem.eql(u8, host, alpha)) {
+                self.alpha_calls += 1;
+                if (self.alpha_calls >= 2) {
+                    // The live scheduler's own renewal attempt has reached
+                    // CA-side validation: hold it here, genuinely in
+                    // flight, until the test has proven the SIGHUP overlap.
+                    self.alpha_renewal_reached.store(true, .release);
+                    while (!self.release_alpha_renewal.load(.acquire)) {
+                        if (compat.milliTimestamp() >= self.deadline_ms) return false;
+                        compat.sleepNs(5 * std.time.ns_per_ms);
+                    }
+                }
+            }
+
+            var stream = compat.tcpConnectToHost(std.heap.page_allocator, test_host, self.http01_port) catch return false;
+            defer stream.close();
+            var request_buf: [1024]u8 = undefined;
+            const request = std.fmt.bufPrint(
+                &request_buf,
+                "GET /.well-known/acme-challenge/{s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n",
+                .{ token, host },
+            ) catch return false;
+            stream.writeAll(request) catch return false;
+
+            var response: [8192]u8 = undefined;
+            var used: usize = 0;
+            while (used < response.len) {
+                const n = stream.read(response[used..]) catch return false;
+                if (n == 0) break;
+                used += n;
+            }
+            const raw_response = response[0..used];
+            const body_at = std.mem.indexOf(u8, raw_response, "\r\n\r\n") orelse return false;
+            return std.mem.startsWith(u8, raw_response, "HTTP/1.1 200") and
+                std.mem.eql(u8, raw_response[body_at + 4 ..], key_authorization);
+        }
+    };
+
+    const state_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-acme-renewal-live-{d}", .{compat.nanoTimestamp()});
+    defer allocator.free(state_rel);
+    try compat.cwd().makePath(state_rel);
+    defer compat.cwd().deleteTree(state_rel) catch {};
+    const client_ca_rel = try std.fmt.allocPrint(allocator, "{s}/issued-ca.crt", .{state_rel});
+    defer allocator.free(client_ca_rel);
+
+    var fake_ca_inst = acme_fake.FakeCa.init(allocator);
+    defer fake_ca_inst.deinit();
+    fake_ca_inst.script.new_order.expires_override = "2099-01-01T00:00:00Z";
+    var issuer = try acme_test_ca.TestCa.init(allocator, compat.unixTimestamp() - 3600, compat.unixTimestamp() + 365 * 24 * 3600);
+    defer issuer.deinit(allocator);
+    try compat.cwd().writeFile(.{ .sub_path = client_ca_rel, .data = issuer.certificate_pem });
+    var factory = Factory{ .issuer = &issuer };
+    fake_ca_inst.issued_chain_factory = .{ .ctx = &factory, .makeFn = Factory.issue };
+
+    var ca_server: acme_live_ca.Server = .{};
+    try ca_server.start(allocator, &fake_ca_inst);
+    defer ca_server.deinit();
+    const ca_base = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}", .{ca_server.port()});
+    defer allocator.free(ca_base);
+    fake_ca_inst.base = ca_base;
+
+    const http01_port = try findFreePort();
+    const http01_listen = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{http01_port});
+    defer allocator.free(http01_listen);
+
+    var release_alpha_renewal = std.atomic.Value(bool).init(false);
+    var alpha_renewal_reached = std.atomic.Value(bool).init(false);
+    var validation = Validation{
+        .http01_port = http01_port,
+        .release_alpha_renewal = &release_alpha_renewal,
+        .alpha_renewal_reached = &alpha_renewal_reached,
+        .deadline_ms = compat.milliTimestamp() + 90_000,
+    };
+    fake_ca_inst.live_validate = .{ .ctx = &validation, .validateFn = Validation.validate };
+
+    const directory_url = try std.fmt.allocPrint(allocator, "{s}/directory", .{ca_base});
+    defer allocator.free(directory_url);
+    var tardigrade = try TardigradeProcess.spawn(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 activated;
+        \\}
+        ,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_AUTOMATIC_HTTPS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_AGREE_TOS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_STATE_DIR", .value = state_rel },
+            .{ .name = "TARDIGRADE_TLS_ACME_DOMAINS", .value = alpha ++ ";" ++ beta },
+            .{ .name = "TARDIGRADE_TLS_ACME_DIRECTORY_URL", .value = directory_url },
+            .{ .name = "TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", .value = acme_live_ca.default_ca_bundle_path },
+            .{ .name = "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", .value = http01_listen },
+            .{ .name = "TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY", .value = "2" },
+            // Keep the intentionally idle pinned H1/H2 clients alive while
+            // the test waits for and overlaps the background renewal.
+            .{ .name = "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", .value = "120000" },
+            .{ .name = "TARDIGRADE_HEADER_TIMEOUT_MS", .value = "120000" },
+            // Two pinned protocol connections plus fresh verification
+            // handshakes need independent serving capacity.
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" },
+        },
+    });
+    var tardigrade_running = true;
+    defer if (tardigrade_running) tardigrade.stop();
+    defer release_alpha_renewal.store(true, .release);
+
+    var failed_closed = false;
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "http/1.1", alpha) catch |err| {
+            if (err == error.ConnectionRefused) {
+                compat.sleepNs(25 * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
+        failed_closed = true;
+        break;
+    }
+    try std.testing.expect(failed_closed);
+
+    for ([_][]const u8{ alpha, beta }) |hostname| {
+        attempts = 0;
+        while (attempts < 80) : (attempts += 1) {
+            var result = try runCurl(allocator, tardigrade.port, .{
+                .host = hostname,
+                .resolve_to = test_host,
+                .path = "/healthz",
+                .cacert = client_ca_rel,
+                .tls_v1_3_only = builtin.os.tag != .macos,
+                .tls_max = if (builtin.os.tag == .macos) null else "1.3",
+            });
+            defer result.deinit();
+            if (result.term == .exited and result.term.exited == 0 and
+                std.mem.indexOf(u8, result.stdout, "HTTP/1.1 200") != null and
+                std.mem.indexOf(u8, result.stdout, "activated") != null) break;
+            compat.sleepNs(50 * std.time.ns_per_ms);
+        }
+        try std.testing.expect(attempts < 80);
+    }
+
+    const fingerprint_alpha_1 = try opensslPresentedFingerprint(allocator, tardigrade.port, alpha);
+    defer allocator.free(fingerprint_alpha_1);
+    const fingerprint_beta_1 = try opensslPresentedFingerprint(allocator, tardigrade.port, beta);
+    defer allocator.free(fingerprint_beta_1);
+
+    // Pin an H1 connection to alpha and an H2 connection to beta before the
+    // automatic rotation: both a publish for one group dropping another,
+    // and a credential swap tearing down an unrelated live connection,
+    // would be design §5.5/§7.1 regressions.
+    var pinned_h1 = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", alpha);
+    defer pinned_h1.destroy();
+    var pinned_h2 = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "h2", beta);
+    defer pinned_h2.destroy();
+    try pinned_h2.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try pinned_h2.writeHttp2Frame(0x4, 0, 0, &.{});
+    try completeH2SettingsHandshake(pinned_h2, allocator);
+
+    // Wait for the live scheduler's own clock-driven tick to actually reach
+    // alpha's renewal -- no manual call anywhere above drives this.
+    var reached = false;
+    attempts = 0;
+    while (attempts < 600) : (attempts += 1) {
+        if (alpha_renewal_reached.load(.acquire)) {
+            reached = true;
+            break;
+        }
+        compat.sleepNs(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(reached);
+
+    // The renewal is now genuinely in flight (blocked at the CA-side
+    // validation barrier). An ordinary SIGHUP must still succeed.
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "configuration hot-reload applied", 5_000);
+
+    // Beta must be completely undisturbed by alpha's in-flight renewal and
+    // the concurrent SIGHUP.
+    const fingerprint_beta_during = try opensslPresentedFingerprint(allocator, tardigrade.port, beta);
+    defer allocator.free(fingerprint_beta_during);
+    try std.testing.expectEqualStrings(fingerprint_beta_1, fingerprint_beta_during);
+
+    release_alpha_renewal.store(true, .release);
+
+    attempts = 0;
+    var fingerprint_alpha_2: ?[]u8 = null;
+    defer if (fingerprint_alpha_2) |f| allocator.free(f);
+    while (attempts < 200) : (attempts += 1) {
+        const fp = try opensslPresentedFingerprint(allocator, tardigrade.port, alpha);
+        if (!std.mem.eql(u8, fp, fingerprint_alpha_1)) {
+            fingerprint_alpha_2 = fp;
+            break;
+        }
+        allocator.free(fp);
+        compat.sleepNs(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(fingerprint_alpha_2 != null);
+
+    // Beta's own certificate was never touched by alpha's rotation.
+    const fingerprint_beta_2 = try opensslPresentedFingerprint(allocator, tardigrade.port, beta);
+    defer allocator.free(fingerprint_beta_2);
+    try std.testing.expectEqualStrings(fingerprint_beta_1, fingerprint_beta_2);
+
+    // The connection pinned to alpha *before* rotation remains fully usable
+    // afterward.
+    try pinned_h1.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: alpha-renew.example.test\r\nConnection: close\r\n\r\n");
+    const h1_response = try pinned_h1.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(h1_response);
+    try assertContains(h1_response, "HTTP/1.1 200");
+    try assertContains(h1_response, "activated");
+
+    // The H2 connection pinned to beta (never rotated) stays interactive at
+    // the protocol level across alpha's unrelated rotation: a PING/ACK
+    // round trip, not just an open TCP socket.
+    var ping_payload: [8]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try pinned_h2.writeHttp2Frame(0x6, 0x0, 0, &ping_payload);
+    var saw_ping_ack = false;
+    var frame_count: usize = 0;
+    while (frame_count < 16 and !saw_ping_ack) : (frame_count += 1) {
+        var frame = try pinned_h2.readHttp2Frame(allocator, 4096, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x6 and (frame.flags & 0x1) != 0 and std.mem.eql(u8, frame.payload, &ping_payload)) {
+            saw_ping_ack = true;
+        }
+    }
+    try std.testing.expect(saw_ping_ack);
+
+    // Nothing else is due for a long time after alpha's rotation (its new
+    // generation is long-lived, and beta was never touched): the scheduler
+    // must settle, not keep contacting the CA.
+    const posts_after_rotation = fake_ca_inst.countPosts();
+    compat.sleepNs(500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(posts_after_rotation, fake_ca_inst.countPosts());
+
+    // Restart with the CA now unreachable: both generations recover from
+    // durable state alone, with no new CA contact.
+    tardigrade.stop();
+    tardigrade_running = false;
+    var recovered = try TardigradeProcess.spawn(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 activated;
+        \\}
+        ,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_AUTOMATIC_HTTPS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_AGREE_TOS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_STATE_DIR", .value = state_rel },
+            .{ .name = "TARDIGRADE_TLS_ACME_DOMAINS", .value = alpha ++ ";" ++ beta },
+            .{ .name = "TARDIGRADE_TLS_ACME_DIRECTORY_URL", .value = "https://127.0.0.1:1/directory" },
+            .{ .name = "TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", .value = acme_live_ca.default_ca_bundle_path },
+            .{ .name = "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", .value = http01_listen },
+            .{ .name = "TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY", .value = "2" },
+        },
+    });
+    defer recovered.stop();
+    for ([_]struct { host: []const u8, want: []const u8 }{
+        .{ .host = alpha, .want = fingerprint_alpha_2.? },
+        .{ .host = beta, .want = fingerprint_beta_1 },
+    }) |case| {
+        attempts = 0;
+        while (attempts < 80) : (attempts += 1) {
+            var result = try runCurl(allocator, recovered.port, .{
+                .host = case.host,
+                .resolve_to = test_host,
+                .path = "/healthz",
+                .cacert = client_ca_rel,
+                .tls_v1_3_only = builtin.os.tag != .macos,
+                .tls_max = if (builtin.os.tag == .macos) null else "1.3",
+            });
+            defer result.deinit();
+            if (result.term == .exited and result.term.exited == 0 and
+                std.mem.indexOf(u8, result.stdout, "HTTP/1.1 200") != null and
+                std.mem.indexOf(u8, result.stdout, "activated") != null) break;
+            compat.sleepNs(50 * std.time.ns_per_ms);
+        }
+        try std.testing.expect(attempts < 80);
+        const recovered_fingerprint = try opensslPresentedFingerprint(allocator, recovered.port, case.host);
+        defer allocator.free(recovered_fingerprint);
+        try std.testing.expectEqualStrings(case.want, recovered_fingerprint);
+    }
+}
+
+test "ACME automatic renewal scheduler (#835 A5): a CA rate limit on an automatic renewal preserves the old certificate, applies a bounded floor, and the floor survives a restart" {
+    if (!integration_options.acme_experimental or std.mem.eql(u8, build_options.tls_profile, "appliance")) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    const hostname = "ratelimited-renew.example.test";
+
+    const Factory = struct {
+        issuer: *const acme_test_ca.TestCa,
+        calls: u32 = 0,
+
+        fn issue(raw: ?*anyopaque, alloc: std.mem.Allocator, csr_der: []const u8, requested_hostnames: []const []const u8) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            const now = compat.unixTimestamp();
+            if (self.calls == 1) {
+                // Short-lived: due again almost immediately, so the second
+                // (automatic) attempt is the one the fake CA rate-limits.
+                // It is valid for activation (over 24h remaining) and is
+                // already due inside the configured two-day renewal window.
+                return self.issuer.issueForCsr(alloc, csr_der, requested_hostnames, now - 2 * 24 * 60 * 60, now + 26 * 60 * 60);
+            }
+            return self.issuer.issueForCsr(alloc, csr_der, requested_hostnames, now - 3600, now + 365 * 24 * 3600);
+        }
+    };
+
+    const state_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-acme-renewal-429-{d}", .{compat.nanoTimestamp()});
+    defer allocator.free(state_rel);
+    try compat.cwd().makePath(state_rel);
+    defer compat.cwd().deleteTree(state_rel) catch {};
+    const client_ca_rel = try std.fmt.allocPrint(allocator, "{s}/issued-ca.crt", .{state_rel});
+    defer allocator.free(client_ca_rel);
+
+    var fake_ca_inst = acme_fake.FakeCa.init(allocator);
+    defer fake_ca_inst.deinit();
+    fake_ca_inst.script.new_order.expires_override = "2099-01-01T00:00:00Z";
+    // Succeeds for the first order (the initial issuance); every order from
+    // the second one onward (the automatic renewal, and any immediate
+    // retry a hammering bug would cause) is rate-limited.
+    fake_ca_inst.script.new_order.rate_limited_after = 1;
+    var issuer = try acme_test_ca.TestCa.init(allocator, compat.unixTimestamp() - 3600, compat.unixTimestamp() + 365 * 24 * 3600);
+    defer issuer.deinit(allocator);
+    try compat.cwd().writeFile(.{ .sub_path = client_ca_rel, .data = issuer.certificate_pem });
+    var factory = Factory{ .issuer = &issuer };
+    fake_ca_inst.issued_chain_factory = .{ .ctx = &factory, .makeFn = Factory.issue };
+
+    var ca_server: acme_live_ca.Server = .{};
+    try ca_server.start(allocator, &fake_ca_inst);
+    defer ca_server.deinit();
+    const ca_base = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}", .{ca_server.port()});
+    defer allocator.free(ca_base);
+    fake_ca_inst.base = ca_base;
+
+    const http01_port = try findFreePort();
+    const http01_listen = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{http01_port});
+    defer allocator.free(http01_listen);
+    var release_validation = std.atomic.Value(bool).init(true);
+    const Validation = struct {
+        http01_port: u16,
+        release: *const std.atomic.Value(bool),
+        deadline_ms: i64,
+
+        fn validate(raw: ?*anyopaque, host: []const u8, token: []const u8, key_authorization: []const u8) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            while (!self.release.load(.acquire)) {
+                if (compat.milliTimestamp() >= self.deadline_ms) return false;
+                compat.sleepNs(5 * std.time.ns_per_ms);
+            }
+            var stream = compat.tcpConnectToHost(std.heap.page_allocator, test_host, self.http01_port) catch return false;
+            defer stream.close();
+            var request_buf: [1024]u8 = undefined;
+            const request = std.fmt.bufPrint(
+                &request_buf,
+                "GET /.well-known/acme-challenge/{s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n",
+                .{ token, host },
+            ) catch return false;
+            stream.writeAll(request) catch return false;
+            var response: [8192]u8 = undefined;
+            var used: usize = 0;
+            while (used < response.len) {
+                const n = stream.read(response[used..]) catch return false;
+                if (n == 0) break;
+                used += n;
+            }
+            const raw_response = response[0..used];
+            const body_at = std.mem.indexOf(u8, raw_response, "\r\n\r\n") orelse return false;
+            return std.mem.startsWith(u8, raw_response, "HTTP/1.1 200") and
+                std.mem.eql(u8, raw_response[body_at + 4 ..], key_authorization);
+        }
+    };
+    var validation = Validation{ .http01_port = http01_port, .release = &release_validation, .deadline_ms = compat.milliTimestamp() + 30_000 };
+    fake_ca_inst.live_validate = .{ .ctx = &validation, .validateFn = Validation.validate };
+
+    const directory_url = try std.fmt.allocPrint(allocator, "{s}/directory", .{ca_base});
+    defer allocator.free(directory_url);
+    var tardigrade = try TardigradeProcess.spawn(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 activated;
+        \\}
+        ,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_AUTOMATIC_HTTPS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_AGREE_TOS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_STATE_DIR", .value = state_rel },
+            .{ .name = "TARDIGRADE_TLS_ACME_DOMAINS", .value = hostname },
+            .{ .name = "TARDIGRADE_TLS_ACME_DIRECTORY_URL", .value = directory_url },
+            .{ .name = "TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", .value = acme_live_ca.default_ca_bundle_path },
+            .{ .name = "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", .value = http01_listen },
+            .{ .name = "TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY", .value = "2" },
+        },
+    });
+    var tardigrade_running = true;
+    defer if (tardigrade_running) tardigrade.stop();
+
+    var failed_closed = false;
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "http/1.1", hostname) catch |err| {
+            if (err == error.ConnectionRefused) {
+                compat.sleepNs(25 * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
+        failed_closed = true;
+        break;
+    }
+    try std.testing.expect(failed_closed);
+
+    attempts = 0;
+    while (attempts < 80) : (attempts += 1) {
+        var result = try runCurl(allocator, tardigrade.port, .{
+            .host = hostname,
+            .resolve_to = test_host,
+            .path = "/healthz",
+            .cacert = client_ca_rel,
+            .tls_v1_3_only = builtin.os.tag != .macos,
+            .tls_max = if (builtin.os.tag == .macos) null else "1.3",
+        });
+        defer result.deinit();
+        if (result.term == .exited and result.term.exited == 0 and
+            std.mem.indexOf(u8, result.stdout, "HTTP/1.1 200") != null and
+            std.mem.indexOf(u8, result.stdout, "activated") != null) break;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(attempts < 80);
+    const fingerprint_1 = try opensslPresentedFingerprint(allocator, tardigrade.port, hostname);
+    defer allocator.free(fingerprint_1);
+
+    // Wait for the automatic renewal attempt to hit the fake CA's scripted
+    // 429 -- the worker's own scheduler, not this test, decides when.
+    try waitForLogSubstring(allocator, tardigrade.log_path, "RateLimited", 60_000);
+
+    // The old, still-valid certificate must remain exactly what is served;
+    // a failed renewal must never touch it.
+    const fingerprint_after_failure = try opensslPresentedFingerprint(allocator, tardigrade.port, hostname);
+    defer allocator.free(fingerprint_after_failure);
+    try std.testing.expectEqualStrings(fingerprint_1, fingerprint_after_failure);
+
+    // No hammering: a short window right after the failure must see no
+    // further CA contact at all (the real bound is #835's 5-minute floor;
+    // this only proves the absence of an immediate, unbounded retry loop).
+    const posts_after_failure = fake_ca_inst.countPosts();
+    compat.sleepNs(1_500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(posts_after_failure, fake_ca_inst.countPosts());
+
+    // Restart against the *same still-rate-limiting* live CA: the durable
+    // cross-restart floor (not just the in-process one above) must hold,
+    // or this would immediately show up as a fresh CA request.
+    tardigrade.stop();
+    tardigrade_running = false;
+    var restarted = try TardigradeProcess.spawn(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 activated;
+        \\}
+        ,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_AUTOMATIC_HTTPS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_AGREE_TOS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_STATE_DIR", .value = state_rel },
+            .{ .name = "TARDIGRADE_TLS_ACME_DOMAINS", .value = hostname },
+            .{ .name = "TARDIGRADE_TLS_ACME_DIRECTORY_URL", .value = directory_url },
+            .{ .name = "TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", .value = acme_live_ca.default_ca_bundle_path },
+            .{ .name = "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", .value = http01_listen },
+            .{ .name = "TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY", .value = "2" },
+        },
+    });
+    defer restarted.stop();
+    attempts = 0;
+    while (attempts < 80) : (attempts += 1) {
+        var result = try runCurl(allocator, restarted.port, .{
+            .host = hostname,
+            .resolve_to = test_host,
+            .path = "/healthz",
+            .cacert = client_ca_rel,
+            .tls_v1_3_only = builtin.os.tag != .macos,
+            .tls_max = if (builtin.os.tag == .macos) null else "1.3",
+        });
+        defer result.deinit();
+        if (result.term == .exited and result.term.exited == 0 and
+            std.mem.indexOf(u8, result.stdout, "HTTP/1.1 200") != null and
+            std.mem.indexOf(u8, result.stdout, "activated") != null) break;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(attempts < 80);
+    const fingerprint_after_restart = try opensslPresentedFingerprint(allocator, restarted.port, hostname);
+    defer allocator.free(fingerprint_after_restart);
+    try std.testing.expectEqualStrings(fingerprint_1, fingerprint_after_restart);
+
+    const posts_after_restart = fake_ca_inst.countPosts();
+    compat.sleepNs(1_500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(posts_after_restart, fake_ca_inst.countPosts());
+}
+
 test "appliance hot reload rejects turning TLS on for a server that started plaintext" {
     try requireApplianceTlsProfile();
     try requireNativeTlsProfile();

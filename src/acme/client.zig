@@ -54,7 +54,28 @@ pub const ProtocolError = error{
     JwsFailed,
 };
 
-pub const Error = ProtocolError || transport_mod.Error || url_mod.Error || state_mod.Error;
+pub const Error = ProtocolError || transport_mod.Error || url_mod.Error || state_mod.Error || error{Cancelled};
+
+/// Cooperative cancellation for `Session.openUnlocked`'s account-registration
+/// network path, checked between its discrete steps (directory fetch, then
+/// the signed newAccount POST) the same way `acme.orders.Cancel` is checked
+/// between its own calls -- duplicated here, rather than imported, because
+/// `orders.zig` imports this module for `Client`/`Session` and importing
+/// back would cycle. This bounds added shutdown latency to whichever single
+/// step is currently in flight, not the sum of every remaining step; it does
+/// not abort a request that has already started.
+pub const Cancel = struct {
+    ctx: ?*anyopaque = null,
+    checkFn: *const fn (ctx: ?*anyopaque) bool = alwaysFalse,
+
+    fn alwaysFalse(_: ?*anyopaque) bool {
+        return false;
+    }
+
+    pub fn isCancelled(self: Cancel) bool {
+        return self.checkFn(self.ctx);
+    }
+};
 
 pub const FailureClass = enum {
     /// Could not reach / talk to the CA at the byte level (dial, TLS, timeout,
@@ -529,8 +550,13 @@ pub const Client = struct {
     /// newAccount (RFC 8555 §7.3). Idempotent per key: a CA that already knows
     /// the key answers 200 with the existing account URL, which is how a lost
     /// local record is rediscovered. Returns whether the account is new.
-    fn registerAccount(self: *Client) Error!bool {
+    /// `cancel` is checked before the directory fetch and again before the
+    /// signed POST -- the two discrete network steps this makes -- so a
+    /// cancellation that arrives between them does not also wait out the
+    /// other; see `Cancel`'s own doc comment for what this does not cover.
+    fn registerAccount(self: *Client, cancel: Cancel) Error!bool {
         if (!self.config.terms_of_service_agreed) return self.failLocked(error.TermsNotAgreed);
+        if (cancel.isCancelled()) return self.failLocked(error.Cancelled);
         var payload_buf: [512]u8 = undefined;
         const payload = self.buildNewAccountPayload(&payload_buf) catch |err| return self.failLocked(err);
 
@@ -542,6 +568,7 @@ pub const Client = struct {
         };
         defer self.allocator.free(url);
 
+        if (cancel.isCancelled()) return self.failLocked(error.Cancelled);
         var resp = try self.signedPost(url, payload, .jwk);
         defer resp.deinit();
         const created = switch (resp.status) {
@@ -641,7 +668,7 @@ pub const Session = struct {
             return session;
         }
 
-        const created = try session.client.registerAccount();
+        const created = try session.client.registerAccount(.{});
         const hash = state_mod.contactHash(if (config.contact_email.len == 0) "" else config.contact_email);
         state_mod.saveAccountRecord(state, allocator, .{
             .directory = config.directory_url,
@@ -664,12 +691,16 @@ pub const Session = struct {
     ///
     /// A second short transaction before persisting reconciles a record that
     /// another process may have written while the CA request was in flight.
+    /// `cancel` bounds first-registration shutdown latency to whichever of
+    /// `registerAccount`'s own steps is currently in flight -- see its own
+    /// and `Cancel`'s doc comments.
     pub fn openUnlocked(
         allocator: std.mem.Allocator,
         transport: *const Transport,
         state_dir_path: []const u8,
         config: Config,
         now_unix: i64,
+        cancel: Cancel,
     ) Error!*Session {
         const session = try allocator.create(Session);
         errdefer allocator.destroy(session);
@@ -702,7 +733,8 @@ pub const Session = struct {
             return session;
         }
 
-        const created = try session.client.registerAccount();
+        if (cancel.isCancelled()) return session.client.failLocked(error.Cancelled);
+        const created = try session.client.registerAccount(cancel);
         var state = try StateDir.open(state_dir_path);
         defer state.close();
         var record = state_mod.loadAccountRecord(&state, allocator, config.directory_url) catch |err| switch (err) {

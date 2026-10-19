@@ -112,6 +112,55 @@ test "ACME client: creates an account with signed requests and persists it" {
     try testing.expectEqual(@as(?client_mod.FailureClass, null), diag.last_failure);
 }
 
+/// Checked-call-count cancellation: returns true starting on the call
+/// *after* `trigger_after`, letting a test place cancellation precisely
+/// between two of `registerAccount`'s discrete steps instead of only
+/// before the first or (indistinguishably) forever.
+const CancelAfterCalls = struct {
+    calls: u32 = 0,
+    trigger_after: u32,
+
+    fn check(ctx: ?*anyopaque) bool {
+        const self: *CancelAfterCalls = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        return self.calls > self.trigger_after;
+    }
+};
+
+test "ACME client Session.openUnlocked: already-cancelled before first registration contacts no CA endpoint at all" {
+    var env = try Env.init();
+    defer env.deinit();
+    const cfg = env.config();
+    const t = env.transport();
+
+    const cancel: client_mod.Cancel = .{ .ctx = null, .checkFn = struct {
+        fn f(_: ?*anyopaque) bool {
+            return true;
+        }
+    }.f };
+    try testing.expectError(error.Cancelled, Session.openUnlocked(testing.allocator, t, env.path, cfg, 1_700_000_000, cancel));
+    try testing.expectEqual(@as(usize, 0), env.ca.log.items.len);
+    try testing.expect(!try env.recordExists());
+}
+
+test "ACME client Session.openUnlocked: cancellation after the directory fetch skips the signed newAccount POST" {
+    var env = try Env.init();
+    defer env.deinit();
+    const cfg = env.config();
+    const t = env.transport();
+
+    // Lets `openUnlocked`'s own pre-flight check and `registerAccount`'s
+    // entry check both pass (the directory fetch happens), then cancels on
+    // the third check -- `registerAccount`'s own, immediately before the
+    // signed POST -- rather than waiting through it.
+    var cancel_state = CancelAfterCalls{ .trigger_after = 2 };
+    const cancel: client_mod.Cancel = .{ .ctx = &cancel_state, .checkFn = CancelAfterCalls.check };
+    try testing.expectError(error.Cancelled, Session.openUnlocked(testing.allocator, t, env.path, cfg, 1_700_000_000, cancel));
+    try testing.expectEqual(@as(usize, 1), env.ca.countRequests(.GET, "/directory"));
+    try testing.expectEqual(@as(usize, 0), env.ca.countPosts());
+    try testing.expect(!try env.recordExists());
+}
+
 test "ACME client: restart reuses the persisted account without any network I/O" {
     var env = try Env.init();
     defer env.deinit();

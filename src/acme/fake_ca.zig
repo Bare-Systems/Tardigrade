@@ -1186,8 +1186,13 @@ pub const FakeCa = struct {
             const decoder = std.base64.url_safe_no_pad.Decoder;
             const decoded_len = decoder.calcSizeForSlice(parsed.value.csr) catch return self.notFound(allocator, resp);
             const csr_der = try allocator.alloc(u8, decoded_len);
-            errdefer allocator.free(csr_der);
-            decoder.decode(csr_der, parsed.value.csr) catch return self.notFound(allocator, resp);
+            decoder.decode(csr_der, parsed.value.csr) catch {
+                // `notFound` is a successful response return, so an
+                // `errdefer` would not run here.  Keep this allocation local
+                // until decode succeeds and ownership transfers to `order`.
+                allocator.free(csr_der);
+                return self.notFound(allocator, resp);
+            };
             if (order.csr_der) |old| allocator.free(old);
             order.csr_der = csr_der;
         }

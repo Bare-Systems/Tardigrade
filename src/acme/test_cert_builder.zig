@@ -114,8 +114,13 @@ fn sanExtension(arena: std.mem.Allocator, hostnames: []const []const u8) ![]cons
 
 fn caExtensions(arena: std.mem.Allocator) ![]const u8 {
     const basic_constraints = try tlv(arena, 0x30, &.{try tlv(arena, 0x01, &.{&[_]u8{0xff}})});
-    const key_usage = try tlv(arena, 0x03, &.{&[_]u8{ 0, 0x04 }});
-    return tlv(arena, 0x30, &.{
+    // keyCertSign is named bit 5. The 0x04 representation has two trailing
+    // unused bits in DER's MSB-first named-bit encoding.
+    const key_usage = try tlv(arena, 0x03, &.{&[_]u8{ 2, 0x04 }});
+    // `buildTbs` supplies the enclosing Extensions SEQUENCE. Return its
+    // Extension entries directly; wrapping them here adds a second sequence
+    // and makes the CA certificate's extension list unparseable.
+    return std.mem.concat(arena, u8, &.{
         try extensionTlv(arena, &pki.oid.well_known.basic_constraints, true, basic_constraints),
         try extensionTlv(arena, &pki.oid.well_known.key_usage, true, key_usage),
     });

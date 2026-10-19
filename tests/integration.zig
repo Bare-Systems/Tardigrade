@@ -6,6 +6,10 @@ const compat = @import("zig_compat");
 const hpack = @import("hpack");
 const tls_core = @import("tls_core");
 const bounded_process = @import("bounded_process.zig");
+const acme_test_support = @import("acme_test_support");
+const acme_fake = acme_test_support.fake;
+const acme_live_ca = acme_test_support.live_ca;
+const acme_test_ca = acme_test_support.test_ca;
 
 const test_host = "127.0.0.1";
 const valid_bearer_token = "integration-token";
@@ -2751,6 +2755,10 @@ fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !
 const CurlRequestSpec = struct {
     method: []const u8 = "GET",
     scheme: []const u8 = "https",
+    /// URL authority to use for certificate/SNI verification. `resolve_to`
+    /// pins that authority to loopback for local-CA tests.
+    host: []const u8 = test_host,
+    resolve_to: ?[]const u8 = null,
     path: []const u8,
     body: ?[]const u8 = null,
     headers: []const RequestHeader = &.{},
@@ -2794,10 +2802,18 @@ fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !Curl
     try argv.append(spec.method);
     try argv.append("-D");
     try argv.append("-");
+    try argv.append("--noproxy");
+    try argv.append("*");
     if (spec.insecure) try argv.append("-k");
     if (spec.cacert) |cacert| {
         try argv.append("--cacert");
         try argv.append(cacert);
+    }
+    if (spec.resolve_to) |target| {
+        const mapping = try std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ spec.host, port, target });
+        try owned_args.append(mapping);
+        try argv.append("--resolve");
+        try argv.append(mapping);
     }
     for (spec.headers) |header| {
         const line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ header.name, header.value });
@@ -2828,7 +2844,7 @@ fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !Curl
         try argv.append("--tls-max");
         try argv.append(v);
     }
-    const url = try std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ spec.scheme, test_host, port, spec.path });
+    const url = try std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ spec.scheme, spec.host, port, spec.path });
     defer allocator.free(url);
     try argv.append(url);
 
@@ -23174,6 +23190,139 @@ test "automatic HTTPS (#884, G11): a real fresh-start experimental tardi run sel
             break;
         }
     }
+}
+
+test "automatic HTTPS (#884): a live HTTP-01 issuance activates a CA-verified TLS listener" {
+    if (!integration_options.acme_experimental or std.mem.eql(u8, build_options.tls_profile, "appliance")) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    const hostname = "issued.example.test";
+
+    const Factory = struct {
+        fn issue(raw: ?*anyopaque, alloc: std.mem.Allocator, csr_der: []const u8, hostnames: []const []const u8) anyerror![]u8 {
+            const issuer: *const acme_test_ca.TestCa = @ptrCast(@alignCast(raw.?));
+            const now = compat.unixTimestamp();
+            return issuer.issueForCsr(alloc, csr_der, hostnames, now - 3600, now + 365 * 24 * 3600);
+        }
+    };
+    const Validation = struct {
+        http01_port: u16,
+        release: *const std.atomic.Value(bool),
+
+        fn validate(raw: ?*anyopaque, host: []const u8, token: []const u8, key_authorization: []const u8) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            // Hold the CA at the authorization boundary so the test can
+            // prove the main listener fails closed before publication.
+            while (!self.release.load(.acquire)) compat.sleepNs(5 * std.time.ns_per_ms);
+
+            var stream = compat.tcpConnectToHost(std.heap.page_allocator, test_host, self.http01_port) catch return false;
+            defer stream.close();
+            var request_buf: [1024]u8 = undefined;
+            const request = std.fmt.bufPrint(
+                &request_buf,
+                "GET /.well-known/acme-challenge/{s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n",
+                .{ token, host },
+            ) catch return false;
+            stream.writeAll(request) catch return false;
+
+            var response: [8192]u8 = undefined;
+            var used: usize = 0;
+            while (used < response.len) {
+                const n = stream.read(response[used..]) catch return false;
+                if (n == 0) break;
+                used += n;
+            }
+            const raw_response = response[0..used];
+            const body_at = std.mem.indexOf(u8, raw_response, "\r\n\r\n") orelse return false;
+            return std.mem.startsWith(u8, raw_response, "HTTP/1.1 200") and
+                std.mem.eql(u8, raw_response[body_at + 4 ..], key_authorization);
+        }
+    };
+
+    const state_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-acme-live-{d}", .{compat.nanoTimestamp()});
+    defer allocator.free(state_rel);
+    try compat.cwd().makePath(state_rel);
+    defer compat.cwd().deleteTree(state_rel) catch {};
+    const client_ca_rel = try std.fmt.allocPrint(allocator, "{s}/issued-ca.crt", .{state_rel});
+    defer allocator.free(client_ca_rel);
+
+    var fake_ca = acme_fake.FakeCa.init(allocator);
+    defer fake_ca.deinit();
+    fake_ca.script.new_order.expires_override = "2099-01-01T00:00:00Z";
+    var issuer = try acme_test_ca.TestCa.init(allocator, compat.unixTimestamp() - 3600, compat.unixTimestamp() + 365 * 24 * 3600);
+    defer issuer.deinit(allocator);
+    try compat.cwd().writeFile(.{ .sub_path = client_ca_rel, .data = issuer.certificate_pem });
+    fake_ca.issued_chain_factory = .{ .ctx = &issuer, .makeFn = Factory.issue };
+
+    var ca_server: acme_live_ca.Server = .{};
+    try ca_server.start(allocator, &fake_ca);
+    defer ca_server.deinit();
+    const ca_base = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}", .{ca_server.port()});
+    defer allocator.free(ca_base);
+    fake_ca.base = ca_base;
+
+    const http01_port = try findFreePort();
+    const http01_listen = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{http01_port});
+    defer allocator.free(http01_listen);
+    var release_validation = std.atomic.Value(bool).init(false);
+    var validation = Validation{ .http01_port = http01_port, .release = &release_validation };
+    fake_ca.live_validate = .{ .ctx = &validation, .validateFn = Validation.validate };
+
+    const directory_url = try std.fmt.allocPrint(allocator, "{s}/directory", .{ca_base});
+    defer allocator.free(directory_url);
+    var tardigrade = try TardigradeProcess.spawn(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 activated;
+        \\}
+        ,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_AUTOMATIC_HTTPS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_AGREE_TOS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_STATE_DIR", .value = state_rel },
+            .{ .name = "TARDIGRADE_TLS_ACME_DOMAINS", .value = hostname },
+            .{ .name = "TARDIGRADE_TLS_ACME_DIRECTORY_URL", .value = directory_url },
+            .{ .name = "TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", .value = acme_live_ca.default_ca_bundle_path },
+            .{ .name = "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", .value = http01_listen },
+        },
+    });
+    defer tardigrade.stop();
+
+    var failed_closed = false;
+    var attempts: usize = 0;
+    while (attempts < 40) : (attempts += 1) {
+        PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "http/1.1", hostname) catch |err| {
+            if (err == error.ConnectionRefused) {
+                compat.sleepNs(25 * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
+        failed_closed = true;
+        break;
+    }
+    try std.testing.expect(failed_closed);
+
+    // The CA's real TCP HTTP-01 request may now complete. The external curl
+    // client trusts only this test CA, uses matching SNI, and verifies the
+    // actual certificate chain served by the running gateway.
+    release_validation.store(true, .release);
+    attempts = 0;
+    while (attempts < 80) : (attempts += 1) {
+        var result = try runCurl(allocator, tardigrade.port, .{
+            .host = hostname,
+            .resolve_to = test_host,
+            .path = "/healthz",
+            .cacert = client_ca_rel,
+        });
+        defer result.deinit();
+        if (result.term == .exited and result.term.exited == 0 and
+            std.mem.indexOf(u8, result.stdout, "HTTP/1.1 200") != null and
+            std.mem.indexOf(u8, result.stdout, "activated") != null) break;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(attempts < 80);
 }
 
 test "automatic HTTPS validates ACME-only native listener protocol and TLS restrictions (#929 review)" {

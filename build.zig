@@ -124,6 +124,21 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // These two leaf modules are also used by the real-process ACME
+    // integration harness below, so construct them before that harness's
+    // module graph is declared.
+    const crypto_mod = b.createModule(.{
+        .root_source_file = b.path("src/crypto/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crypto_mod.addImport("crypto_secrets", crypto_secrets_mod);
+    const pki_mod = b.createModule(.{
+        .root_source_file = b.path("src/pki/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pki_mod.addImport("crypto", crypto_mod);
     const tls_core_mod = b.createModule(.{
         .root_source_file = b.path("src/tls/root.zig"),
         .target = target,
@@ -356,6 +371,18 @@ pub fn build(b: *std.Build) void {
 
     integration_options.addOption(bool, "acme_experimental", acme_experimental);
 
+    const acme_integration_support_mod = b.createModule(.{
+        .root_source_file = b.path("src/acme_integration_support.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    acme_integration_support_mod.addImport("crypto", crypto_mod);
+    acme_integration_support_mod.addImport("zig_compat", compat_mod);
+    acme_integration_support_mod.addImport("tls_core", tls_core_mod);
+    acme_integration_support_mod.addImport("pki", pki_mod);
+    acme_integration_support_mod.addImport("build_options", build_options.createModule());
+
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration.zig"),
         .target = target,
@@ -367,6 +394,7 @@ pub fn build(b: *std.Build) void {
     integration_mod.addImport("hpack_huffman", hpack_huffman_mod);
     integration_mod.addImport("hpack", hpack_mod);
     integration_mod.addImport("tls_core", tls_core_mod);
+    integration_mod.addImport("acme_test_support", acme_integration_support_mod);
 
     const integration_tests = b.addTest(.{
         .root_module = integration_mod,
@@ -515,12 +543,6 @@ pub fn build(b: *std.Build) void {
     // Pure-Zig cryptographic-provider package (#370, epic #327): the stable
     // provider boundary plus its first backend. Standalone test target and part
     // of the default `zig build test`. No system libraries.
-    const crypto_mod = b.createModule(.{
-        .root_source_file = b.path("src/crypto/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    crypto_mod.addImport("crypto_secrets", crypto_secrets_mod);
     quic_mod.addImport("crypto", crypto_mod);
     quic_test_mod.addImport("crypto", crypto_mod);
     tls_core_mod.addImport("crypto", crypto_mod);
@@ -985,12 +1007,6 @@ pub fn build(b: *std.Build) void {
 
     // Pure-Zig PKI foundation (#339): no system libraries. Consumes the
     // crypto-provider seam for certificate signature verification (#343).
-    const pki_mod = b.createModule(.{
-        .root_source_file = b.path("src/pki/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    pki_mod.addImport("crypto", crypto_mod);
     const pki_test_mod = b.createModule(.{
         .root_source_file = b.path("src/pki/root.zig"),
         .target = target,

@@ -161,6 +161,25 @@ test "ACME client Session.openUnlocked: cancellation after the directory fetch s
     try testing.expect(!try env.recordExists());
 }
 
+test "ACME client Session.openUnlocked: cancellation after nonce fetch skips the signed newAccount POST" {
+    var env = try Env.init();
+    defer env.deinit();
+    const cfg = env.config();
+    const t = env.transport();
+
+    // Let registration reach its signed-request path and consume a nonce,
+    // then cancel at the check immediately before the JWS POST. This covers
+    // the cancellation boundary inside signedPostLockedUntil rather than
+    // only registerAccount's outer preflight check.
+    var cancel_state = CancelAfterCalls{ .trigger_after = 5 };
+    const cancel: client_mod.Cancel = .{ .ctx = &cancel_state, .checkFn = CancelAfterCalls.check };
+    try testing.expectError(error.Cancelled, Session.openUnlocked(testing.allocator, t, env.path, cfg, 1_700_000_000, cancel));
+    try testing.expectEqual(@as(usize, 1), env.ca.countRequests(.GET, "/directory"));
+    try testing.expectEqual(@as(usize, 1), env.ca.countRequests(.HEAD, "/new-nonce"));
+    try testing.expectEqual(@as(usize, 0), env.ca.countPosts());
+    try testing.expect(!try env.recordExists());
+}
+
 test "ACME client: restart reuses the persisted account without any network I/O" {
     var env = try Env.init();
     defer env.deinit();

@@ -23610,7 +23610,7 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
             const now = compat.unixTimestamp();
             if (hostnames.len == 1 and std.mem.eql(u8, hostnames[0], alpha)) {
                 self.alpha_calls += 1;
-                if (self.alpha_calls == 1) {
+                if (self.alpha_calls <= 2) {
                     // Deliberately short-lived: with
                     // It began two days ago and has 26 hours left: it clears
                     // activation's one-day minimum while already sitting
@@ -23626,8 +23626,10 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
 
     const Validation = struct {
         http01_port: u16,
-        release_alpha_renewal: *const std.atomic.Value(bool),
-        alpha_renewal_reached: *std.atomic.Value(bool),
+        release_alpha_b: *const std.atomic.Value(bool),
+        alpha_b_reached: *std.atomic.Value(bool),
+        release_alpha_c: *const std.atomic.Value(bool),
+        alpha_c_reached: *std.atomic.Value(bool),
         alpha_calls: u32 = 0,
         deadline_ms: i64,
 
@@ -23635,12 +23637,22 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             if (std.mem.eql(u8, host, alpha)) {
                 self.alpha_calls += 1;
-                if (self.alpha_calls >= 2) {
+                if (self.alpha_calls == 2) {
                     // The live scheduler's own renewal attempt has reached
                     // CA-side validation: hold it here, genuinely in
                     // flight, until the test has proven the SIGHUP overlap.
-                    self.alpha_renewal_reached.store(true, .release);
-                    while (!self.release_alpha_renewal.load(.acquire)) {
+                    self.alpha_b_reached.store(true, .release);
+                    while (!self.release_alpha_b.load(.acquire)) {
+                        if (compat.milliTimestamp() >= self.deadline_ms) return false;
+                        compat.sleepNs(5 * std.time.ns_per_ms);
+                    }
+                } else if (self.alpha_calls == 3) {
+                    // B is intentionally still inside the renewal window.
+                    // Holding its validation gives the test a stable live
+                    // B generation before the scheduler automatically
+                    // rotates it again to C.
+                    self.alpha_c_reached.store(true, .release);
+                    while (!self.release_alpha_c.load(.acquire)) {
                         if (compat.milliTimestamp() >= self.deadline_ms) return false;
                         compat.sleepNs(5 * std.time.ns_per_ms);
                     }
@@ -23698,12 +23710,16 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
     const http01_listen = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{http01_port});
     defer allocator.free(http01_listen);
 
-    var release_alpha_renewal = std.atomic.Value(bool).init(false);
-    var alpha_renewal_reached = std.atomic.Value(bool).init(false);
+    var release_alpha_b = std.atomic.Value(bool).init(false);
+    var alpha_b_reached = std.atomic.Value(bool).init(false);
+    var release_alpha_c = std.atomic.Value(bool).init(false);
+    var alpha_c_reached = std.atomic.Value(bool).init(false);
     var validation = Validation{
         .http01_port = http01_port,
-        .release_alpha_renewal = &release_alpha_renewal,
-        .alpha_renewal_reached = &alpha_renewal_reached,
+        .release_alpha_b = &release_alpha_b,
+        .alpha_b_reached = &alpha_b_reached,
+        .release_alpha_c = &release_alpha_c,
+        .alpha_c_reached = &alpha_c_reached,
         .deadline_ms = compat.milliTimestamp() + 90_000,
     };
     fake_ca_inst.live_validate = .{ .ctx = &validation, .validateFn = Validation.validate };
@@ -23736,7 +23752,8 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
     });
     var tardigrade_running = true;
     defer if (tardigrade_running) tardigrade.stop();
-    defer release_alpha_renewal.store(true, .release);
+    defer release_alpha_b.store(true, .release);
+    defer release_alpha_c.store(true, .release);
 
     var failed_closed = false;
     var attempts: usize = 0;
@@ -23795,7 +23812,7 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
     var reached = false;
     attempts = 0;
     while (attempts < 600) : (attempts += 1) {
-        if (alpha_renewal_reached.load(.acquire)) {
+        if (alpha_b_reached.load(.acquire)) {
             reached = true;
             break;
         }
@@ -23814,7 +23831,7 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
     defer allocator.free(fingerprint_beta_during);
     try std.testing.expectEqualStrings(fingerprint_beta_1, fingerprint_beta_during);
 
-    release_alpha_renewal.store(true, .release);
+    release_alpha_b.store(true, .release);
 
     attempts = 0;
     var fingerprint_alpha_2: ?[]u8 = null;
@@ -23829,6 +23846,38 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
         compat.sleepNs(100 * std.time.ns_per_ms);
     }
     try std.testing.expect(fingerprint_alpha_2 != null);
+
+    // B is still deliberately near expiry, so the actual live scheduler
+    // must drive a second independent renewal. The CA-side barrier proves
+    // B was published before C's in-flight validation can complete.
+    reached = false;
+    attempts = 0;
+    while (attempts < 600) : (attempts += 1) {
+        if (alpha_c_reached.load(.acquire)) {
+            reached = true;
+            break;
+        }
+        compat.sleepNs(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(reached);
+    const fingerprint_alpha_b = try opensslPresentedFingerprint(allocator, tardigrade.port, alpha);
+    defer allocator.free(fingerprint_alpha_b);
+    try std.testing.expectEqualStrings(fingerprint_alpha_2.?, fingerprint_alpha_b);
+
+    release_alpha_c.store(true, .release);
+    attempts = 0;
+    var fingerprint_alpha_3: ?[]u8 = null;
+    defer if (fingerprint_alpha_3) |f| allocator.free(f);
+    while (attempts < 200) : (attempts += 1) {
+        const fp = try opensslPresentedFingerprint(allocator, tardigrade.port, alpha);
+        if (!std.mem.eql(u8, fp, fingerprint_alpha_2.?)) {
+            fingerprint_alpha_3 = fp;
+            break;
+        }
+        allocator.free(fp);
+        compat.sleepNs(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(fingerprint_alpha_3 != null);
 
     // Beta's own certificate was never touched by alpha's rotation.
     const fingerprint_beta_2 = try opensslPresentedFingerprint(allocator, tardigrade.port, beta);
@@ -23859,7 +23908,7 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
     }
     try std.testing.expect(saw_ping_ack);
 
-    // Nothing else is due for a long time after alpha's rotation (its new
+    // Nothing else is due for a long time after alpha's second rotation (its new
     // generation is long-lived, and beta was never touched): the scheduler
     // must settle, not keep contacting the CA.
     const posts_after_rotation = fake_ca_inst.countPosts();
@@ -23889,7 +23938,7 @@ test "ACME automatic renewal scheduler (#835 A5): the live scheduler auto-rotate
     });
     defer recovered.stop();
     for ([_]struct { host: []const u8, want: []const u8 }{
-        .{ .host = alpha, .want = fingerprint_alpha_2.? },
+        .{ .host = alpha, .want = fingerprint_alpha_3.? },
         .{ .host = beta, .want = fingerprint_beta_1 },
     }) |case| {
         attempts = 0;

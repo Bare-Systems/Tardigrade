@@ -140,6 +140,10 @@ pub const Worker = struct {
         []const ManagedBundleSpec,
     ) anyerror!NativeCredentialStore.PreparedReload = null,
     credential_config_ctx: ?*anyopaque = null,
+    /// Test seam for the final durable-success transition. Production leaves
+    /// this null and calls `recordSuccess` directly.
+    record_success_override: ?*const fn (?*anyopaque, *Worker, acme.groups.Group, i64) anyerror!void = null,
+    record_success_ctx: ?*anyopaque = null,
     group_list: acme.groups.GroupList,
     /// Validated elsewhere (`edge_config.validateAcmeConfig`) to 1..60.
     renew_days_before_expiry: u32 = 30,
@@ -500,8 +504,15 @@ fn attemptDueGroupsWithDialer(worker: *Worker, scheduled: Scheduled, dialer: acm
         const now = worker.unix_clock.now();
         for (worker.group_list.slice(), 0..) |group, i| {
             if (!worker.pending_success[i]) continue;
-            recordSuccess(worker, group, now) catch |rec_err| {
+            saveSuccessRecord(worker, group, now) catch |rec_err| {
                 worker.logger.err(null, "ACME renewal: failed to persist the success record for a managed group (error={s})", .{@errorName(rec_err)});
+                // The credential is live, but its durable retry/status
+                // record is still stale. Re-arm the no-CA republish path so
+                // the next bounded pass retries this write even though the
+                // newly committed certificate is not otherwise due for a
+                // long time. `pending_success[i]` remains set until the
+                // save actually lands, keeping operator status honest.
+                worker.pending_publish = true;
                 continue;
             };
             worker.pending_success[i] = false;
@@ -646,6 +657,11 @@ fn recordSuccess(worker: *Worker, group: acme.groups.Group, now: i64) !void {
     defer opened.state.close();
 
     try acme.renewal_state.save(worker.allocator, &opened.group, .{ .last_attempt_at = 0, .failures = 0, .last_failure_class = null, .retry_after_at = null });
+}
+
+fn saveSuccessRecord(worker: *Worker, group: acme.groups.Group, now: i64) !void {
+    if (worker.record_success_override) |save| return save(worker.record_success_ctx, worker, group, now);
+    return recordSuccess(worker, group, now);
 }
 
 fn issueGroup(worker: *Worker, client: *acme.client.Client, group: acme.groups.Group) !void {
@@ -1290,6 +1306,64 @@ test "attemptDueGroupsWithDialer: a failed publish after a successful issuance r
     try testing.expect(!statuses_resolved[0].activation_pending);
 }
 
+const SuccessRecordFailureCtx = struct {
+    calls: u32 = 0,
+};
+
+fn failOnceThenSaveSuccess(ctx_opt: ?*anyopaque, worker: *Worker, group: acme.groups.Group, now: i64) anyerror!void {
+    const ctx: *SuccessRecordFailureCtx = @ptrCast(@alignCast(ctx_opt.?));
+    ctx.calls += 1;
+    if (ctx.calls == 1) return error.InjectedSuccessRecordFailure;
+    return recordSuccess(worker, group, now);
+}
+
+test "attemptDueGroupsWithDialer: a failed success-record save retries without issuing again" {
+    const allocator = testing.allocator;
+    var dirs = try TestDirs.init(allocator);
+    defer dirs.deinit(allocator);
+    const now: i64 = 1_700_000_000;
+
+    var ca = acme.fake_ca.FakeCa.init(allocator);
+    defer ca.deinit();
+    ca.script.new_order.expires_override = "2099-01-01T00:00:00Z";
+    var issuer = try acme.test_cert_builder.TestCa.init(allocator, now - 3600, now + 365 * 24 * 3600);
+    defer issuer.deinit(allocator);
+    ca.issued_chain_factory = .{ .ctx = &issuer, .makeFn = issueTestLeafForCsr };
+
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    var challenge_store = ChallengeStore.init(allocator);
+    defer challenge_store.deinit();
+    var published = PublishedHosts.init(allocator);
+    defer published.deinit();
+    const trust_anchors = try testTrustAnchors(allocator);
+    defer trust_anchors.release();
+
+    const hostname = "success-record-retry.example.test";
+    var worker = newTestWorker(allocator, &dirs, try acme.groups.parse(hostname), &store, &challenge_store, &published, trust_anchors);
+    var record_ctx = SuccessRecordFailureCtx{};
+    worker.record_success_override = failOnceThenSaveSuccess;
+    worker.record_success_ctx = &record_ctx;
+
+    var scheduled = Scheduled{ .earliest_next = now };
+    scheduled.due[0] = true;
+    try attemptDueGroupsWithDialer(&worker, scheduled, ca.dialer());
+    try testing.expect(worker.pending_publish);
+    try testing.expect(worker.pending_success[0]);
+    const posts_after_issue = ca.countPosts();
+
+    // The new credential is already live and long-valid, so retrying the
+    // stale success record must take the publish-only path and never open a
+    // fresh CA session/order.
+    const not_due = try tick(&worker);
+    try testing.expect(!not_due.due[0]);
+    try attemptDueGroupsWithDialer(&worker, not_due, ca.dialer());
+    try testing.expectEqual(posts_after_issue, ca.countPosts());
+    try testing.expectEqual(@as(u32, 2), record_ctx.calls);
+    try testing.expect(!worker.pending_publish);
+    try testing.expect(!worker.pending_success[0]);
+}
+
 test "runLoop: a transient state-directory lock collision retries instead of permanently stopping the worker" {
     const allocator = testing.allocator;
     var dirs = try TestDirs.init(allocator);
@@ -1588,26 +1662,55 @@ test "runLoop: a per-group retry-record write failure applies a bounded floor in
             };
         }
     };
+    const WaitFloorCtx = struct {
+        entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        wait_ms: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+        fn wait(ctx: ?*anyopaque, ms: u32, cancel: acme.orders.Cancel) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.wait_ms.store(ms, .release);
+            self.entered.store(true, .release);
+            while (!cancel.isCancelled()) compat.sleepNs(std.time.ns_per_ms);
+            return true;
+        }
+    };
+    var wait_ctx = WaitFloorCtx{};
+    worker.waiter = .{ .ctx = &wait_ctx, .waitFn = WaitFloorCtx.wait };
     const thread = try std.Thread.spawn(.{}, Runner.run, .{ &worker, &stopped });
-    compat.sleepNs(300 * std.time.ns_per_ms);
+    var joined = false;
+    defer if (!joined) {
+        worker.cancel.store(true, .release);
+        thread.join();
+    };
+
+    // Wait until the first order has fully completed and runLoop is about
+    // to sleep. Sampling POSTs earlier races later requests belonging to
+    // that same order (authorization/finalize/poll), which made this test
+    // both flaky and unsafe on assertion failure.
+    var spins: usize = 0;
+    while (!wait_ctx.entered.load(.acquire) and spins < 5_000) : (spins += 1) {
+        compat.sleepNs(std.time.ns_per_ms);
+    }
+    try testing.expect(wait_ctx.entered.load(.acquire));
 
     // Not a fatal persistence stop for the *process* (a failed state write
     // may well be writable again on the next pass; serving continues on
     // whatever was last published either way) -- just a conservative floor
     // on the CA contact rate.
     try testing.expect(!stopped.load(.acquire));
-    const posts_after_first_window = ca.countPosts();
-    try testing.expect(posts_after_first_window > 0);
+    try testing.expect(wait_ctx.wait_ms.load(.acquire) >= acme.renewal_policy.retry_floor_seconds * 1000);
+    const posts_after_first_attempt = ca.countPosts();
+    try testing.expect(posts_after_first_attempt > 0);
 
-    // The old bug (silently swallowing the record-write failure) would have
-    // let every subsequent pass recompute the identical unmodified due
-    // record and re-contact the CA again immediately, forever; this window
-    // must see no further CA traffic at all.
-    compat.sleepNs(300 * std.time.ns_per_ms);
-    try testing.expectEqual(posts_after_first_window, ca.countPosts());
+    // The controlled waiter pins the worker precisely at the computed
+    // backoff boundary. The old swallowed-write path reached it with zero
+    // milliseconds; a second order cannot begin before this floor expires.
+    compat.sleepNs(25 * std.time.ns_per_ms);
+    try testing.expectEqual(posts_after_first_attempt, ca.countPosts());
 
     worker.cancel.store(true, .release);
     thread.join();
+    joined = true;
     try testing.expect(!stopped.load(.acquire));
 }
 

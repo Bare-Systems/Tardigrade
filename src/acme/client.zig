@@ -57,13 +57,12 @@ pub const ProtocolError = error{
 pub const Error = ProtocolError || transport_mod.Error || url_mod.Error || state_mod.Error || error{Cancelled};
 
 /// Cooperative cancellation for `Session.openUnlocked`'s account-registration
-/// network path, checked between its discrete steps (directory fetch, then
-/// the signed newAccount POST) the same way `acme.orders.Cancel` is checked
-/// between its own calls -- duplicated here, rather than imported, because
-/// `orders.zig` imports this module for `Client`/`Session` and importing
-/// back would cycle. This bounds added shutdown latency to whichever single
-/// step is currently in flight, not the sum of every remaining step; it does
-/// not abort a request that has already started.
+/// network path. It is checked between the directory, nonce, signed POST and
+/// bad-nonce retry steps; all of those steps share one absolute registration
+/// deadline, so cancellation can never extend shutdown through a sequence of
+/// independent request budgets. This deliberately duplicates the shape of
+/// `acme.orders.Cancel`: importing it here would cycle because `orders.zig`
+/// already imports this module for `Client`/`Session`.
 pub const Cancel = struct {
     ctx: ?*anyopaque = null,
     checkFn: *const fn (ctx: ?*anyopaque) bool = alwaysFalse,
@@ -429,19 +428,34 @@ pub const Client = struct {
         accept: transport_mod.Accept,
         deadline_cap_ms: ?u32,
     ) Error!transport_mod.Response {
-        const target = try url_mod.requireCaOrigin(url, self.directory_origin, self.config.allow_cross_host_urls);
-        // `deadline_cap_ms`, when given, is the remaining budget for this
-        // whole logical call -- not just the final POST -- so it becomes one
-        // fixed absolute deadline here and every sub-request (directory,
-        // nonce, the POST itself, each badNonce retry) recomputes what is
-        // left of it instead of each getting an independent fresh cap.
         const deadline: ?i64 = if (deadline_cap_ms) |cap| self.transport.nowMs() + @as(i64, cap) else null;
+        return self.signedPostLockedUntil(url, payload, auth, max_body_bytes, accept, deadline, null);
+    }
+
+    /// The internal form accepts an already-established absolute deadline so
+    /// account registration can share it with its preceding directory GET.
+    /// `cancel` is optional because ordinary order calls have their own
+    /// cancellation seam; registration needs one between every subrequest.
+    fn signedPostLockedUntil(
+        self: *Client,
+        url: []const u8,
+        payload: ?[]const u8,
+        auth: account_mod.Auth,
+        max_body_bytes: usize,
+        accept: transport_mod.Accept,
+        deadline: ?i64,
+        cancel: ?Cancel,
+    ) Error!transport_mod.Response {
+        const target = try url_mod.requireCaOrigin(url, self.directory_origin, self.config.allow_cross_host_urls);
+        if (if (cancel) |c| c.isCancelled() else false) return error.Cancelled;
         try self.ensureDirectoryLocked(deadline);
 
         var retries: u8 = 0;
         while (true) {
+            if (if (cancel) |c| c.isCancelled() else false) return error.Cancelled;
             var nonce_storage: [account_mod.max_nonce_len]u8 = undefined;
             const nonce = try self.takeNonceLocked(&nonce_storage, deadline);
+            if (if (cancel) |c| c.isCancelled() else false) return error.Cancelled;
             const jws = account_mod.signJws(self.allocator, self.key, .{ .url = url, .nonce = nonce, .auth = auth }, payload) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.JwsFailed,
@@ -465,6 +479,7 @@ pub const Client = struct {
                 retries += 1;
                 self.diagnostics.bad_nonce_retries +|= 1;
                 resp.deinit();
+                if (if (cancel) |c| c.isCancelled() else false) return error.Cancelled;
                 continue;
             }
             const failure: Error = switch (problem) {
@@ -550,26 +565,33 @@ pub const Client = struct {
     /// newAccount (RFC 8555 §7.3). Idempotent per key: a CA that already knows
     /// the key answers 200 with the existing account URL, which is how a lost
     /// local record is rediscovered. Returns whether the account is new.
-    /// `cancel` is checked before the directory fetch and again before the
-    /// signed POST -- the two discrete network steps this makes -- so a
-    /// cancellation that arrives between them does not also wait out the
-    /// other; see `Cancel`'s own doc comment for what this does not cover.
+    /// Registration has one absolute deadline across directory discovery,
+    /// nonce fetch, signed POST and any bad-nonce retry. `cancel` is checked
+    /// before each of those discrete stages, so shutdown cannot accumulate a
+    /// fresh transport deadline for every stage.
     fn registerAccount(self: *Client, cancel: Cancel) Error!bool {
         if (!self.config.terms_of_service_agreed) return self.failLocked(error.TermsNotAgreed);
         if (cancel.isCancelled()) return self.failLocked(error.Cancelled);
         var payload_buf: [512]u8 = undefined;
         const payload = self.buildNewAccountPayload(&payload_buf) catch |err| return self.failLocked(err);
 
+        const deadline = self.transport.nowMs() + @as(i64, self.transport.limits.request_deadline_ms);
         self.mutex.lock();
         const url = blk: {
             defer self.mutex.unlock();
-            self.ensureDirectoryLocked(null) catch |err| return self.fail(err);
+            self.ensureDirectoryLocked(deadline) catch |err| return self.fail(err);
             break :blk self.allocator.dupe(u8, self.directory.?.new_account) catch return self.fail(error.OutOfMemory);
         };
         defer self.allocator.free(url);
 
         if (cancel.isCancelled()) return self.failLocked(error.Cancelled);
-        var resp = try self.signedPost(url, payload, .jwk);
+        self.mutex.lock();
+        var resp = self.signedPostLockedUntil(url, payload, .jwk, self.transport.limits.max_body_bytes, .json, deadline, cancel) catch |err| {
+            const failure = self.fail(err);
+            self.mutex.unlock();
+            return failure;
+        };
+        self.mutex.unlock();
         defer resp.deinit();
         const created = switch (resp.status) {
             201 => true,

@@ -2769,6 +2769,10 @@ const CurlRequestSpec = struct {
     http3_only: bool = false,
     ssl_sessions_path: ?[]const u8 = null,
     tls_earlydata: bool = false,
+    /// Require TLS 1.3 exactly. This is intentionally separate from
+    /// `tls_max`: callers that need a protocol-level acceptance proof must
+    /// not accidentally accept a lower negotiated version.
+    tls_v1_3_only: bool = false,
     /// Cap the client's maximum TLS version (curl `--tls-max`), e.g. "1.1" to
     /// verify the server rejects a below-minimum handshake.
     tls_max: ?[]const u8 = null,
@@ -2840,6 +2844,7 @@ fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !Curl
     if (spec.tls_earlydata) {
         try argv.append("--tls-earlydata");
     }
+    if (spec.tls_v1_3_only) try argv.append("--tlsv1.3");
     if (spec.tls_max) |v| {
         try argv.append("--tls-max");
         try argv.append(v);
@@ -23209,12 +23214,20 @@ test "automatic HTTPS (#884): a live HTTP-01 issuance activates a CA-verified TL
     const Validation = struct {
         http01_port: u16,
         release: *const std.atomic.Value(bool),
+        deadline_ms: i64,
 
         fn validate(raw: ?*anyopaque, host: []const u8, token: []const u8, key_authorization: []const u8) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw.?));
             // Hold the CA at the authorization boundary so the test can
             // prove the main listener fails closed before publication.
-            while (!self.release.load(.acquire)) compat.sleepNs(5 * std.time.ns_per_ms);
+            while (!self.release.load(.acquire)) {
+                // This is a test-only safety valve. The scope cleanup below
+                // normally releases the barrier, but a deadline also ensures
+                // a setup failure cannot strand the synchronous fake-CA
+                // handler (and its server join) indefinitely.
+                if (compat.milliTimestamp() >= self.deadline_ms) return false;
+                compat.sleepNs(5 * std.time.ns_per_ms);
+            }
 
             var stream = compat.tcpConnectToHost(std.heap.page_allocator, test_host, self.http01_port) catch return false;
             defer stream.close();
@@ -23266,7 +23279,11 @@ test "automatic HTTPS (#884): a live HTTP-01 issuance activates a CA-verified TL
     const http01_listen = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{http01_port});
     defer allocator.free(http01_listen);
     var release_validation = std.atomic.Value(bool).init(false);
-    var validation = Validation{ .http01_port = http01_port, .release = &release_validation };
+    var validation = Validation{
+        .http01_port = http01_port,
+        .release = &release_validation,
+        .deadline_ms = compat.milliTimestamp() + 15_000,
+    };
     fake_ca.live_validate = .{ .ctx = &validation, .validateFn = Validation.validate };
 
     const directory_url = try std.fmt.allocPrint(allocator, "{s}/directory", .{ca_base});
@@ -23288,6 +23305,9 @@ test "automatic HTTPS (#884): a live HTTP-01 issuance activates a CA-verified TL
         },
     });
     defer tardigrade.stop();
+    // Registered after `stop`, so Zig's LIFO defer order releases a blocked
+    // CA validation request before shutdown tries to join the issuer thread.
+    defer release_validation.store(true, .release);
 
     var failed_closed = false;
     var attempts: usize = 0;
@@ -23315,6 +23335,13 @@ test "automatic HTTPS (#884): a live HTTP-01 issuance activates a CA-verified TL
             .resolve_to = test_host,
             .path = "/healthz",
             .cacert = client_ca_rel,
+            // CI's Linux curl uses OpenSSL and is pinned to TLS 1.3. The
+            // macOS developer curl is linked to SecureTransport, whose
+            // `--tlsv1.3` flag cannot drive this native test listener; keep
+            // that local compatibility path while the mandatory CI evidence
+            // remains an exact TLS 1.3 handshake.
+            .tls_v1_3_only = builtin.os.tag != .macos,
+            .tls_max = if (builtin.os.tag == .macos) null else "1.3",
         });
         defer result.deinit();
         if (result.term == .exited and result.term.exited == 0 and

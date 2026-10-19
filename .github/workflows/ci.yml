@@ -1164,6 +1164,30 @@ jobs:
       - name: Run integration tests
         run: zig build test-integration --summary all
 
+  # #884's automatic-HTTPS path is intentionally experimental and disabled
+  # in release builds, so the default integration leg correctly skips it.
+  # Keep a dedicated required leg that enables the opt-in and executes the
+  # real HTTP-01 -> TLS 1.3 listener acceptance test on every PR.
+  acme-experimental-integration:
+    name: ACME experimental integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Run experimental ACME unit tests
+        run: zig build test-acme -Dacme-experimental --summary all --error-style verbose
+
+      - name: Run experimental ACME integration tests
+        run: zig build test-integration -Dacme-experimental --summary all --error-style verbose
+
   # ── Required result ───────────────────────────────────────────────────────────
   # The ONE check to require in branch protection ("CI result"). It passes only
   # when every job required for the selected mode succeeded; full-only jobs are
@@ -1195,6 +1219,7 @@ jobs:
       - h3-resumption-interop
       - tls-conformance-matrix
       - integration-test
+      - acme-experimental-integration
       - h3-mtls-interop
       - h1-h2-mtls-interop
       - linux-release-smoke
@@ -1213,7 +1238,7 @@ jobs:
           MODE: ${{ needs.mode.outputs.mode }}
           SMOKE_JOBS: >-
             mode format lint dependency-audit test websocket-reactor test-general-native-tls
-            examples security integration-test h3-mtls-interop h1-h2-mtls-interop
+            examples security integration-test acme-experimental-integration h3-mtls-interop h1-h2-mtls-interop
           # Dependency review is required on PRs and skipped by design elsewhere.
           OPTIONAL_JOBS: dependency-review
           PR_JOBS: dependency-review

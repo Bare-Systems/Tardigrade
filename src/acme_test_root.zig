@@ -5,6 +5,7 @@ const std = @import("std");
 
 test {
     _ = @import("acme/root.zig");
+    _ = @import("acme/renewal_policy.zig");
     _ = @import("acme/csr.zig");
     _ = @import("http/acme_tls_dialer.zig");
     _ = @import("http/acme_challenge_store.zig");

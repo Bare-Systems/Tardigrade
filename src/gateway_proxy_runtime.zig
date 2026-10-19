@@ -1847,6 +1847,7 @@ test "ProductionBufferedProxyAttemptExecutor keeps absolute target failures out 
     var state: GatewayState = undefined;
     state.allocator = allocator;
     state.tunnel_reactor = null;
+    state.acme_renewal_worker = null;
     state.upstream_mutex = .{};
     state.circuit_mutex = .{};
     state.metrics_mutex = .{};
@@ -1898,6 +1899,7 @@ test "streaming absolute target local capacity abort releases circuit permit fir
     var state: GatewayState = undefined;
     state.allocator = allocator;
     state.tunnel_reactor = null;
+    state.acme_renewal_worker = null;
     state.upstream_mutex = .{};
     state.circuit_mutex = .{};
     state.metrics_mutex = .{};
@@ -1938,6 +1940,7 @@ test "streaming downstream abort after known 500 records outcome then propagates
     var state: GatewayState = undefined;
     state.allocator = allocator;
     state.tunnel_reactor = null;
+    state.acme_renewal_worker = null;
     state.upstream_mutex = .{};
     state.circuit_mutex = .{};
     state.metrics_mutex = .{};

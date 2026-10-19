@@ -86,6 +86,12 @@ pub const Script = struct {
 pub const NewOrderBehavior = struct {
     status_500: bool = false,
     rate_limited: bool = false,
+    /// 429 + `Retry-After` once `self.orders.items.len` (orders already
+    /// created before this call) reaches this count, succeeding normally
+    /// before then. Lets a test script "the Nth renewal attempt onward is
+    /// rate-limited" deterministically, without mutating `script` from a
+    /// second thread while a live CA server's accept loop is running.
+    rate_limited_after: ?u32 = null,
     malformed_json: bool = false,
     /// The response lists one more `dns` identifier than was requested.
     extra_identifier: bool = false,
@@ -888,7 +894,7 @@ pub const FakeCa = struct {
             resp.nonce = try self.freshNonce(allocator);
             return;
         }
-        if (b.rate_limited) {
+        if (b.rate_limited or (b.rate_limited_after != null and self.orders.items.len >= b.rate_limited_after.?)) {
             resp.status = 429;
             resp.retry_after = "60";
             try resp.problem(allocator, "urn:ietf:params:acme:error:rateLimited");

@@ -5,6 +5,7 @@ const http = @import("http.zig");
 const tls_core = @import("tls_core");
 const edge_config = @import("edge_config.zig");
 const gpc = @import("gateway_proxy_cache.zig");
+const acme_renewal = @import("acme_renewal.zig");
 
 /// Shared inbound request buffer size limit, also used as a default proxy
 /// response buffer ceiling when no explicit limit is configured.
@@ -586,6 +587,12 @@ pub const GatewayState = struct {
     /// hold a worker thread each. Null in unit tests and when a tunnel must
     /// run inline. Set once at startup; outlives every worker.
     tunnel_reactor: ?*http.tunnel_reactor.Reactor = null,
+    /// The process-lifetime ACME renewal worker (#835, A5), when
+    /// `tls_acme_enabled`. Set once at startup; outlives every worker. Used
+    /// only to pull a bounded, secret-free status snapshot at metrics scrape
+    /// time (`overlayAcmeRenewalStatus`) -- the renewal thread itself never
+    /// touches `GatewayState`.
+    acme_renewal_worker: ?*acme_renewal.Worker = null,
     /// Process-wide, bounded worker pool that executes finite HTTP/2 request
     /// jobs off each connection's frame-reader loop (#866). Null in unit
     /// tests and when disabled; `respondHttp2Stream` falls back to inline
@@ -2412,6 +2419,41 @@ pub const GatewayState = struct {
         });
     }
 
+    /// Bounded, secret-free ACME renewal status (#835 A5's observability
+    /// criterion: next attempt, expiry, failure class per managed group),
+    /// read from the live worker's own mutex-guarded snapshot at scrape
+    /// time -- the renewal thread itself never touches `GatewayState`.
+    /// Labeled by `acme.groups.groupId`, never a hostname or CA URL.
+    fn overlayAcmeRenewalStatus(self: *GatewayState, metrics_snapshot: *http.metrics.Metrics) void {
+        comptime {
+            // `http/metrics.zig` cannot import `acme/groups.zig` directly (it
+            // is reachable from module roots that do not include `acme/`),
+            // so its bounds are a duplicated local constant; catch any drift
+            // here instead of silently truncating a scrape.
+            if (http.metrics.max_acme_renewal_groups != http.acme.groups.max_groups) @compileError("http.metrics.max_acme_renewal_groups must match acme.groups.max_groups");
+            if (http.metrics.acme_renewal_group_id_len != http.acme.groups.group_id_len) @compileError("http.metrics.acme_renewal_group_id_len must match acme.groups.group_id_len");
+        }
+        const worker = self.acme_renewal_worker orelse return;
+        const n = @min(worker.group_list.len, http.metrics.max_acme_renewal_groups);
+        var statuses: [http.metrics.max_acme_renewal_groups]acme_renewal.GroupStatus = undefined;
+        worker.snapshotStatus(statuses[0..n]);
+
+        var rendered: [http.metrics.max_acme_renewal_groups]http.metrics.AcmeRenewalGroupStatus = undefined;
+        for (worker.group_list.slice()[0..n], 0..) |group, i| {
+            var id_buf: [http.acme.groups.group_id_len]u8 = undefined;
+            _ = http.acme.groups.groupId(&id_buf, group.slice());
+            rendered[i] = .{
+                .group_id = id_buf,
+                .not_after = statuses[i].not_after,
+                .next_attempt_at = statuses[i].next_attempt_at,
+                .consecutive_failures = statuses[i].consecutive_failures,
+                .last_failure_class = if (statuses[i].last_failure_class) |c| @as(u8, @intFromEnum(c)) else null,
+                .activation_pending = statuses[i].activation_pending,
+            };
+        }
+        metrics_snapshot.setAcmeRenewalStatus(rendered[0..n]);
+    }
+
     pub fn metricsToPrometheus(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
         const mux_snapshot = try self.muxMetricsSnapshot(allocator);
         defer deinitMuxMetricsSnapshot(allocator, mux_snapshot.device_counts);
@@ -2422,6 +2464,7 @@ pub const GatewayState = struct {
         self.overlayUpstreamPoolStats(&metrics_snapshot);
         self.overlayQuicTransportSnapshot(&metrics_snapshot);
         self.overlayWebSocketReactorStats(&metrics_snapshot);
+        self.overlayAcmeRenewalStatus(&metrics_snapshot);
 
         const base = try metrics_snapshot.toPrometheus(allocator);
         defer allocator.free(base);
@@ -4217,6 +4260,7 @@ test "reloadable config store retires old config after last lease" {
 fn initSlotTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.allocator = allocator;
     gs.tunnel_reactor = null;
+    gs.acme_renewal_worker = null;
     gs.h2_request_executor = null;
     gs.connection_mutex = .{};
     gs.metrics_mutex = .{};
@@ -4375,6 +4419,7 @@ test "in-flight request slot is unlimited and release is a no-op when disabled" 
 fn initUpstreamTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.allocator = allocator;
     gs.tunnel_reactor = null;
+    gs.acme_renewal_worker = null;
     gs.h2_request_executor = null;
     gs.upstream_mutex = .{};
     gs.circuit_mutex = .{};
@@ -4529,6 +4574,7 @@ test "gateway proxy outcome accounting drives live circuit breaker" {
 fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.allocator = allocator;
     gs.tunnel_reactor = null;
+    gs.acme_renewal_worker = null;
     gs.h2_request_executor = null;
     gs.connection_mutex = .{};
     gs.metrics_mutex = .{};
@@ -4611,6 +4657,68 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_effective_state{state=\"disabled\"} 1\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_mux_device_channels{device_id=\"device\\\"}\\\\metric=\\\"forged\"} 3\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "metric=\"forged\"") == null);
+}
+
+test "served Prometheus metrics expose bounded ACME renewal status labeled by group-id digest, never a hostname" {
+    // `overlayAcmeRenewalStatus` only ever touches `group_list`/`statuses`
+    // (through `snapshotStatus`'s own mutex), so a worker built from
+    // `undefined` with just those fields set is a faithful, minimal stand-in
+    // for the live renewal thread this test never needs to start.
+    var worker: acme_renewal.Worker = undefined;
+    worker.allocator = std.testing.allocator;
+    worker.group_list = try http.acme.groups.parse("alpha.example.test;beta.example.test");
+    worker.status_mutex = .{};
+    worker.statuses = @splat(.{});
+    worker.statuses[0] = .{ .not_after = 1_700_100_000, .next_attempt_at = 1_700_050_000, .consecutive_failures = 2, .last_failure_class = .transport };
+    worker.statuses[1] = .{ .not_after = null, .next_attempt_at = 1_700_000_500, .consecutive_failures = 0, .last_failure_class = null };
+
+    var gs: GatewayState = undefined;
+    initMetricsJsonTestState(&gs, std.testing.allocator);
+    defer gs.h2_pool.deinit();
+    defer gs.upstream_pool.deinit();
+    defer gs.mux_subscriptions_by_device.deinit();
+    gs.acme_renewal_worker = &worker;
+
+    const prom = try gs.metricsToPrometheus(std.testing.allocator);
+    defer std.testing.allocator.free(prom);
+
+    var id_buf_a: [http.acme.groups.group_id_len]u8 = undefined;
+    const group_a = http.acme.groups.groupId(&id_buf_a, &.{"alpha.example.test"});
+    var id_buf_b: [http.acme.groups.group_id_len]u8 = undefined;
+    const group_b = http.acme.groups.groupId(&id_buf_b, &.{"beta.example.test"});
+
+    const line_a_not_after = try std.fmt.allocPrint(std.testing.allocator, "tardigrade_acme_renewal_not_after_seconds{{group=\"{s}\"}} 1700100000\n", .{group_a});
+    defer std.testing.allocator.free(line_a_not_after);
+    try std.testing.expect(std.mem.find(u8, prom, line_a_not_after) != null);
+    const line_a_next = try std.fmt.allocPrint(std.testing.allocator, "tardigrade_acme_renewal_next_attempt_timestamp_seconds{{group=\"{s}\"}} 1700050000\n", .{group_a});
+    defer std.testing.allocator.free(line_a_next);
+    try std.testing.expect(std.mem.find(u8, prom, line_a_next) != null);
+    const line_a_failures = try std.fmt.allocPrint(std.testing.allocator, "tardigrade_acme_renewal_consecutive_failures{{group=\"{s}\"}} 2\n", .{group_a});
+    defer std.testing.allocator.free(line_a_failures);
+    try std.testing.expect(std.mem.find(u8, prom, line_a_failures) != null);
+    const line_a_class = try std.fmt.allocPrint(std.testing.allocator, "tardigrade_acme_renewal_last_failure{{group=\"{s}\",class=\"transport\"}} 1\n", .{group_a});
+    defer std.testing.allocator.free(line_a_class);
+    try std.testing.expect(std.mem.find(u8, prom, line_a_class) != null);
+    const line_a_no_class = try std.fmt.allocPrint(std.testing.allocator, "tardigrade_acme_renewal_last_failure{{group=\"{s}\",class=\"persistence\"}} 0\n", .{group_a});
+    defer std.testing.allocator.free(line_a_no_class);
+    try std.testing.expect(std.mem.find(u8, prom, line_a_no_class) != null);
+
+    // `beta.example.test`'s absent `not_after` (no committed certificate
+    // yet) must never render a bogus zero/sentinel gauge value.
+    const missing_not_after = try std.fmt.allocPrint(std.testing.allocator, "tardigrade_acme_renewal_not_after_seconds{{group=\"{s}\"}}", .{group_b});
+    defer std.testing.allocator.free(missing_not_after);
+    try std.testing.expect(std.mem.find(u8, prom, missing_not_after) == null);
+    const line_b_next = try std.fmt.allocPrint(std.testing.allocator, "tardigrade_acme_renewal_next_attempt_timestamp_seconds{{group=\"{s}\"}} 1700000500\n", .{group_b});
+    defer std.testing.allocator.free(line_b_next);
+    try std.testing.expect(std.mem.find(u8, prom, line_b_next) != null);
+    const line_b_no_failure = try std.fmt.allocPrint(std.testing.allocator, "tardigrade_acme_renewal_last_failure{{group=\"{s}\",class=\"transport\"}} 0\n", .{group_b});
+    defer std.testing.allocator.free(line_b_no_failure);
+    try std.testing.expect(std.mem.find(u8, prom, line_b_no_failure) != null);
+
+    // Never the raw hostname, never a CA URL -- only the bounded group-id
+    // digest label (design §9.4).
+    try std.testing.expect(std.mem.find(u8, prom, "alpha.example.test") == null);
+    try std.testing.expect(std.mem.find(u8, prom, "beta.example.test") == null);
 }
 
 fn deinitCommandLifecycleTestMap(gs: *GatewayState) void {
@@ -4784,6 +4892,7 @@ test "command lifecycle creation releases every partial allocation on OOM" {
             var gs: GatewayState = undefined;
             gs.allocator = allocator;
             gs.tunnel_reactor = null;
+            gs.acme_renewal_worker = null;
             gs.h2_request_executor = null;
             gs.command_mutex = .{};
             gs.command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(allocator);
@@ -4799,6 +4908,7 @@ test "approval creation releases every partial allocation on OOM" {
             var gs: GatewayState = undefined;
             gs.allocator = allocator;
             gs.tunnel_reactor = null;
+            gs.acme_renewal_worker = null;
             gs.h2_request_executor = null;
             gs.approval_mutex = .{};
             gs.approval_persist_mutex = .{};
@@ -4918,6 +5028,7 @@ test "served Prometheus metrics reflect updated proxy buffer limit snapshot" {
 fn initApprovalTestState(gs: *GatewayState, allocator: std.mem.Allocator, store_path: []const u8) void {
     gs.allocator = allocator;
     gs.tunnel_reactor = null;
+    gs.acme_renewal_worker = null;
     gs.h2_request_executor = null;
     gs.approval_mutex = .{};
     gs.approval_persist_mutex = .{};

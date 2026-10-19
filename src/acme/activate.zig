@@ -63,7 +63,10 @@ pub const default_not_before_skew_seconds: i64 = 5 * 60;
 pub const default_min_remaining_seconds: i64 = 24 * 60 * 60;
 pub const default_max_validity_seconds: i64 = 400 * 24 * 60 * 60;
 
-const groups_dir_name = "groups";
+/// Exported so `acme_renewal.zig` (A5) can open the same per-group directory
+/// to read/write `acme/renewal_state.zig`'s sibling `renewal.json`, without
+/// duplicating the on-disk layout string.
+pub const groups_dir_name = "groups";
 const generations_dir_name = "generations";
 const generation_file_leaf_key = "leaf.key";
 const generation_file_chain = "chain.pem";
@@ -567,7 +570,14 @@ fn softNotFoundToNull(err: Error) Error!?LoadedGeneration {
     return if (err == error.NotFound) null else err;
 }
 
-fn isHardError(err: Error) bool {
+/// Environment/security failures (ownership, symlink, lock contention, I/O,
+/// memory) that say nothing about whether the committed certificate itself
+/// is usable, as opposed to `error.CorruptState` and friends, which this
+/// module already resolves to "no certificate" by falling back a generation
+/// or returning `null`. Exported so `acme_renewal.zig` can apply the same
+/// hard/soft split to a `loadCommitted` failure it cannot itself recover
+/// from (a corrupt top-level `current` pointer propagates here unmodified).
+pub fn isHardError(err: Error) bool {
     return switch (err) {
         error.OutOfMemory,
         error.UnsafeFileType,

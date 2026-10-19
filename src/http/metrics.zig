@@ -228,6 +228,43 @@ pub const DiscoveryStats = struct {
     changes_total: u64 = 0,
 };
 
+/// Closed, low-cardinality labels matching `acme.client.FailureClass`'s tag
+/// names -- defined here (rather than importing that enum) so this module
+/// never needs to know about ACME failure *handling*, only the four label
+/// strings an operator-visible gauge renders.
+pub const acme_failure_class_labels = [_][]const u8{ "transport", "protocol", "persistence", "resource" };
+
+/// Deliberately a local constant, not `acme.groups.max_groups`: some narrower
+/// build-graph modules that embed this file (e.g. the HTTP/3 runtime's own
+/// test module) do not have the `acme/` directory within their module root,
+/// and this file otherwise has no reason to depend on ACME's internal types
+/// at all. The caller (`GatewayState.overlayAcmeRenewalStatus`) is
+/// responsible for never overrunning this bound.
+pub const max_acme_renewal_groups = 64;
+/// Matches `acme.groups.group_id_len` (16 bytes of SHA-256, hex-encoded).
+pub const acme_renewal_group_id_len = 32;
+
+/// Bounded per-managed-ACME-group renewal status (#835 A5's observability
+/// criterion), overlaid from the live `acme_renewal.Worker` at scrape time
+/// the same way `GatewayState.overlayWebSocketReactorStats` reads the
+/// tunnel reactor's own live state -- never pushed in from the renewal
+/// thread, so no cross-thread synchronization is needed in this struct.
+/// `group_id` is the group's own `acme.groups.groupId` digest (design §9.4:
+/// never a hostname or CA URL, to stay low-cardinality and secret-free).
+pub const AcmeRenewalGroupStatus = struct {
+    group_id: [acme_renewal_group_id_len]u8 = @splat('0'),
+    not_after: ?i64 = null,
+    next_attempt_at: i64 = 0,
+    consecutive_failures: u32 = 0,
+    /// Index into `acme_failure_class_labels`, or `null` for "no failure".
+    last_failure_class: ?u8 = null,
+    /// A fresh issuance was durably persisted but has not yet been
+    /// republished to the live TLS provider: `consecutive_failures`/
+    /// `last_failure_class` above still describe the attempt *before* this
+    /// one, not a currently-healthy renewal.
+    activation_pending: bool = false,
+};
+
 pub const Metrics = struct {
     discovery: DiscoveryStats = .{},
     /// Total requests processed.
@@ -506,6 +543,11 @@ pub const Metrics = struct {
     accept_batch_size_count: [max_listener_shards]std.atomic.Value(u64),
     accept_batches_total: [max_listener_shards]std.atomic.Value(u64),
     accept_fairness_yields_total: [max_listener_shards]std.atomic.Value(u64),
+    /// Live count of `acme_renewal_status` entries actually in use this
+    /// scrape (`<= max_acme_renewal_groups`); overlaid at scrape time, zero
+    /// when ACME is disabled or no worker is running.
+    acme_renewal_groups_configured: usize,
+    acme_renewal_status: [max_acme_renewal_groups]AcmeRenewalGroupStatus,
     /// Server start time (nanoseconds since boot).
     started_ns: i128,
 
@@ -704,6 +746,8 @@ pub const Metrics = struct {
             .accept_batch_size_count = zeroAtomicShardCounters(),
             .accept_batches_total = zeroAtomicShardCounters(),
             .accept_fairness_yields_total = zeroAtomicShardCounters(),
+            .acme_renewal_groups_configured = 0,
+            .acme_renewal_status = @splat(.{}),
             .started_ns = compat.nanoTimestamp(),
         };
     }
@@ -808,6 +852,16 @@ pub const Metrics = struct {
 
     pub fn setWebSocketReactorStats(self: *Metrics, stats: WebSocketReactorStats) void {
         self.websocket_reactor = stats;
+    }
+
+    /// `groups` may be shorter than `max_acme_renewal_groups`; anything
+    /// beyond it is left at whatever this snapshot copy already had (the
+    /// caller always passes a freshly bounded snapshot, never a partial
+    /// update of a live value).
+    pub fn setAcmeRenewalStatus(self: *Metrics, groups: []const AcmeRenewalGroupStatus) void {
+        const n = @min(groups.len, max_acme_renewal_groups);
+        self.acme_renewal_groups_configured = n;
+        @memcpy(self.acme_renewal_status[0..n], groups[0..n]);
     }
 
     pub fn recordWebSocketTunnelClosed(self: *Metrics, reason: WebSocketCloseReason, client_to_upstream: u64, upstream_to_client: u64, duration_ms: u64) void {
@@ -1809,6 +1863,36 @@ pub const Metrics = struct {
             self.discovery.failures_total,
             self.discovery.changes_total,
         });
+
+        {
+            const n = @min(self.acme_renewal_groups_configured, max_acme_renewal_groups);
+            try out.print(
+                \\# HELP tardigrade_acme_renewal_not_after_seconds Committed managed-certificate expiry, by group
+                \\# TYPE tardigrade_acme_renewal_not_after_seconds gauge
+                \\# HELP tardigrade_acme_renewal_next_attempt_timestamp_seconds Earliest permissible next renewal attempt, by group
+                \\# TYPE tardigrade_acme_renewal_next_attempt_timestamp_seconds gauge
+                \\# HELP tardigrade_acme_renewal_consecutive_failures Consecutive renewal failures since the last successful publish, by group
+                \\# TYPE tardigrade_acme_renewal_consecutive_failures gauge
+                \\# HELP tardigrade_acme_renewal_last_failure Whether the group's most recent attempt failed, by group and closed failure-class label
+                \\# TYPE tardigrade_acme_renewal_last_failure gauge
+                \\# HELP tardigrade_acme_renewal_activation_pending A fresh issuance is durably persisted but not yet live on the TLS provider, by group
+                \\# TYPE tardigrade_acme_renewal_activation_pending gauge
+                \\
+            , .{});
+            for (0..n) |i| {
+                const group = self.acme_renewal_status[i];
+                if (group.not_after) |not_after| {
+                    try out.print("tardigrade_acme_renewal_not_after_seconds{{group=\"{s}\"}} {d}\n", .{ group.group_id, not_after });
+                }
+                try out.print("tardigrade_acme_renewal_next_attempt_timestamp_seconds{{group=\"{s}\"}} {d}\n", .{ group.group_id, group.next_attempt_at });
+                try out.print("tardigrade_acme_renewal_consecutive_failures{{group=\"{s}\"}} {d}\n", .{ group.group_id, group.consecutive_failures });
+                for (acme_failure_class_labels, 0..) |label, class_index| {
+                    const active = if (group.last_failure_class) |c| @as(usize, c) == class_index else false;
+                    try out.print("tardigrade_acme_renewal_last_failure{{group=\"{s}\",class=\"{s}\"}} {d}\n", .{ group.group_id, label, @intFromBool(active) });
+                }
+                try out.print("tardigrade_acme_renewal_activation_pending{{group=\"{s}\"}} {d}\n", .{ group.group_id, @intFromBool(group.activation_pending) });
+            }
+        }
 
         return out.toOwnedSlice();
     }

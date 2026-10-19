@@ -289,6 +289,7 @@ const AcceptLoopTestHarness = struct {
         self.* = .{ .allocator = allocator };
         self.state.allocator = allocator;
         self.state.tunnel_reactor = null;
+        self.state.acme_renewal_worker = null;
         self.state.connection_mutex = .{};
         self.state.metrics_mutex = .{};
         self.state.runtime_mutex = .{};

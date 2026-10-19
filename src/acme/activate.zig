@@ -570,7 +570,14 @@ fn softNotFoundToNull(err: Error) Error!?LoadedGeneration {
     return if (err == error.NotFound) null else err;
 }
 
-fn isHardError(err: Error) bool {
+/// Environment/security failures (ownership, symlink, lock contention, I/O,
+/// memory) that say nothing about whether the committed certificate itself
+/// is usable, as opposed to `error.CorruptState` and friends, which this
+/// module already resolves to "no certificate" by falling back a generation
+/// or returning `null`. Exported so `acme_renewal.zig` can apply the same
+/// hard/soft split to a `loadCommitted` failure it cannot itself recover
+/// from (a corrupt top-level `current` pointer propagates here unmodified).
+pub fn isHardError(err: Error) bool {
     return switch (err) {
         error.OutOfMemory,
         error.UnsafeFileType,

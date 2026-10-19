@@ -585,6 +585,7 @@ test "planDirectResponse preserves configured rewrite return behavior" {
 fn initHandlerTestState(state: *GatewayState, allocator: std.mem.Allocator, add_headers: []const edge_config.EdgeConfig.HeaderPair) void {
     state.allocator = allocator;
     state.tunnel_reactor = null;
+    state.acme_renewal_worker = null;
     state.metrics_mutex = .{};
     state.session_mutex = .{};
     state.metrics = http.metrics.Metrics.init();

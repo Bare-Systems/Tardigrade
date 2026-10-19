@@ -727,6 +727,18 @@ pub fn circuitBreakerConfigChanged(
 /// challenge listener kept silently admitting up to the old one (and a raise
 /// would leave it artificially under-limited) -- so a cap change while ACME
 /// is enabled is restart-required too.
+///
+/// `acme_renewal.Worker` (#835, A5) is the same story: every renewal/CA/
+/// state-directory field it holds (`renew_days_before_expiry`, `issue.*`,
+/// `state_dir_path`) is captured once from the startup `cfg` when the
+/// worker is constructed and never re-read, because the worker owns the
+/// process-lifetime renewal thread and has no in-place field-rebuild path
+/// (unlike `applyReloadedRuntimeConfig`'s simple copies). Accepting one of
+/// these changes as "reload applied" while the worker keeps using the old
+/// value would silently desynchronize the two -- most dangerously for
+/// `tls_acme_cert_dir`/`tls_acme_directory_url`, where the worker could keep
+/// issuing against a CA/state directory the rest of the process no longer
+/// believes is authoritative.
 pub fn acmeHttp01ListenerConfigChanged(
     current: *const edge_config.EdgeConfig,
     proposed: *const edge_config.EdgeConfig,
@@ -736,7 +748,16 @@ pub fn acmeHttp01ListenerConfigChanged(
         !std.mem.eql(u8, current.tls_acme_domains_spec, proposed.tls_acme_domains_spec) or
         current.tls_https_redirect != proposed.tls_https_redirect or
         (current.tls_acme_enabled and
-            current.max_connections_per_ip != proposed.max_connections_per_ip);
+            (current.max_connections_per_ip != proposed.max_connections_per_ip or
+                current.tls_acme_renew_days_before_expiry != proposed.tls_acme_renew_days_before_expiry or
+                current.tls_acme_agree_tos != proposed.tls_acme_agree_tos or
+                current.tls_acme_eab_requested != proposed.tls_acme_eab_requested or
+                !std.mem.eql(u8, current.tls_acme_directory_url, proposed.tls_acme_directory_url) or
+                !std.mem.eql(u8, current.tls_acme_cert_dir, proposed.tls_acme_cert_dir) or
+                !std.mem.eql(u8, current.tls_acme_account_key_path, proposed.tls_acme_account_key_path) or
+                !std.mem.eql(u8, current.tls_acme_email, proposed.tls_acme_email) or
+                !std.mem.eql(u8, current.tls_acme_ca_bundle_path, proposed.tls_acme_ca_bundle_path) or
+                !std.mem.eql(u8, current.tls_acme_challenges, proposed.tls_acme_challenges)));
 }
 
 test "acmeHttp01ListenerConfigChanged detects an address change (#881)" {
@@ -813,6 +834,40 @@ test "acmeHttp01ListenerConfigChanged rejects a per-IP cap change while ACME is 
 
     // The same cap change is irrelevant when ACME is not enabled: there is
     // no dedicated listener holding a stale value to diverge from.
+    base.tls_acme_enabled = false;
+    proposed.tls_acme_enabled = false;
+    try std.testing.expect(!acmeHttp01ListenerConfigChanged(&base, &proposed));
+}
+
+test "acmeHttp01ListenerConfigChanged rejects a renewal-worker-owned field change while ACME is enabled, but not while disabled (#931 review)" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    base.tls_acme_enabled = true;
+    proposed.tls_acme_enabled = true;
+
+    // `acme_renewal.Worker` captures `renew_days_before_expiry` once at
+    // startup and never re-reads it: accepting a SIGHUP that silently
+    // changes the renewal window would make the reported config and the
+    // worker's actual behavior diverge.
+    base.tls_acme_renew_days_before_expiry = 30;
+    proposed.tls_acme_renew_days_before_expiry = 7;
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+    proposed.tls_acme_renew_days_before_expiry = 30;
+
+    // The CA/account/state-directory settings are even more dangerous to
+    // silently diverge: the worker would keep issuing against a CA or
+    // state directory the rest of the process no longer believes is
+    // authoritative.
+    allocator.free(proposed.tls_acme_cert_dir);
+    proposed.tls_acme_cert_dir = try allocator.dupe(u8, "/tmp/other-acme-state");
+    try std.testing.expect(acmeHttp01ListenerConfigChanged(&base, &proposed));
+
+    // The same changes are irrelevant when ACME is not enabled: there is no
+    // running worker holding a stale value to diverge from.
     base.tls_acme_enabled = false;
     proposed.tls_acme_enabled = false;
     try std.testing.expect(!acmeHttp01ListenerConfigChanged(&base, &proposed));
@@ -1279,6 +1334,7 @@ test "applyReloadedRuntimeConfig atomically swaps proxy cache generation and upd
     var state: GatewayState = undefined;
     state.allocator = allocator;
     state.tunnel_reactor = null;
+    state.acme_renewal_worker = null;
     state.rate_limiter_mutex = .{};
     state.rate_limiter = null;
     state.proxy_cache_mutex = .{};

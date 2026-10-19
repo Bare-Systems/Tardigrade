@@ -610,6 +610,10 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             .renew_days_before_expiry = cfg.tls_acme_renew_days_before_expiry,
             .logger = state.logger,
         };
+        // Read-only: the metrics scrape path pulls a bounded status
+        // snapshot through this pointer (`GatewayState.overlayAcmeRenewalStatus`);
+        // the renewal thread itself never touches `state`.
+        state.acme_renewal_worker = &acme_renewal_worker.?;
         try acme_renewal_worker.?.start();
     }
     // #763: downstream mTLS trust anchors. Loaded eagerly so a bad bundle

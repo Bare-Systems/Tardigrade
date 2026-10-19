@@ -88,14 +88,30 @@ pub fn load(allocator: std.mem.Allocator, group: *state_mod.SubDir) Error!?Recor
 
 /// Load the durable record, converting a missing record into the empty
 /// default (no prior attempt -- never applies a floor) and a corrupt one
-/// into a conservative one-failure record dated `now` (applies the normal
-/// failure floor rather than permitting an immediate retry). Hard errors
-/// (permissions, ownership, I/O, memory) still propagate.
-pub fn loadOrConservativeDefault(allocator: std.mem.Allocator, group: *state_mod.SubDir, now: i64) Error!Record {
-    return load(allocator, group) catch |err| switch (err) {
-        error.CorruptState => Record{ .last_attempt_at = now, .failures = 1 },
+/// into a conservative one-failure record (applies the normal failure floor
+/// rather than permitting an immediate retry). Hard errors (permissions,
+/// ownership, I/O, memory) still propagate.
+///
+/// `corrupt_since` anchors the synthetic failure's `last_attempt_at` to the
+/// *first* call that observed corruption, not to each call's own `now`: a
+/// still-corrupt file read repeatedly (the worker wakes every pass) must
+/// count down to its retry floor from one fixed point, or the floor would
+/// recompute as `now + retry_floor_seconds` forever and never arrive — a
+/// cooldown that never expires is indistinguishable from "never retry at
+/// all" (design: "a conservative cooldown rather than ... a renewal
+/// storm", not a permanent stall). Cleared back to `null` the moment the
+/// file reads clean (repaired by an operator, or replaced by a fresh
+/// `save`), so a later unrelated corruption gets its own fresh anchor.
+pub fn loadOrConservativeDefault(allocator: std.mem.Allocator, group: *state_mod.SubDir, now: i64, corrupt_since: *?i64) Error!Record {
+    const loaded = load(allocator, group) catch |err| switch (err) {
+        error.CorruptState => {
+            if (corrupt_since.* == null) corrupt_since.* = now;
+            return Record{ .last_attempt_at = corrupt_since.*.?, .failures = 1 };
+        },
         else => return err,
-    } orelse Record{};
+    };
+    corrupt_since.* = null;
+    return loaded orelse Record{};
 }
 
 /// Persist `record` atomically (`0600`). Never touches `current` or any
@@ -140,7 +156,8 @@ test "ACME renewal state: absent record loads as null and the conservative defau
     defer group.close();
 
     try testing.expect((try load(testing.allocator, &group)) == null);
-    const default = try loadOrConservativeDefault(testing.allocator, &group, 1_700_000_000);
+    var anchor: ?i64 = null;
+    const default = try loadOrConservativeDefault(testing.allocator, &group, 1_700_000_000, &anchor);
     try testing.expectEqual(@as(i64, 0), default.last_attempt_at);
     try testing.expectEqual(@as(u32, 0), default.failures);
     try testing.expect(default.last_failure_class == null);
@@ -193,6 +210,7 @@ test "ACME renewal state: a malformed record is corrupt, never silently treated 
     var group = try openTestGroupDir(&state);
     defer group.close();
 
+    var anchor: ?i64 = null;
     for ([_][]const u8{
         "not json",
         "{}",
@@ -202,13 +220,51 @@ test "ACME renewal state: a malformed record is corrupt, never silently treated 
     }) |content| {
         try group.writeFileAtomic(file_name, content, 0o600);
         try testing.expectError(error.CorruptState, load(testing.allocator, &group));
-        const fallback = try loadOrConservativeDefault(testing.allocator, &group, 1_700_000_000);
+        const fallback = try loadOrConservativeDefault(testing.allocator, &group, 1_700_000_000, &anchor);
         try testing.expectEqual(@as(i64, 1_700_000_000), fallback.last_attempt_at);
         try testing.expectEqual(@as(u32, 1), fallback.failures);
     }
 
     try group.writeFileAtomic(file_name, "{\"version\":1,\"last_attempt_at\":1,\"failures\":1,\"last_failure_class\":\"\",\"retry_after_at\":0}", 0o640);
     try testing.expectError(error.InsecurePermissions, load(testing.allocator, &group));
+}
+
+test "ACME renewal state: a corrupt record's cooldown anchor is stable across repeated reads, not reset to each call's own now" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(@import("zig_compat").io(), &buf);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/state", .{buf[0..n]});
+    defer testing.allocator.free(path);
+
+    var state = try state_mod.StateDir.open(path);
+    defer state.close();
+    var group = try openTestGroupDir(&state);
+    defer group.close();
+    try group.writeFileAtomic(file_name, "not json", 0o600);
+
+    var anchor: ?i64 = null;
+    const first = try loadOrConservativeDefault(testing.allocator, &group, 1_700_000_000, &anchor);
+    try testing.expectEqual(@as(i64, 1_700_000_000), first.last_attempt_at);
+
+    // The file is still corrupt an hour later; without a stable anchor this
+    // would synthesize a fresh `last_attempt_at` every call and the
+    // computed retry floor would recompute as "now + floor" forever,
+    // perpetually postponing renewal rather than ever expiring.
+    const second = try loadOrConservativeDefault(testing.allocator, &group, 1_700_003_600, &anchor);
+    try testing.expectEqual(@as(i64, 1_700_000_000), second.last_attempt_at);
+    try testing.expectEqual(@as(u32, 1), second.failures);
+
+    // Once the file reads clean again, the anchor clears: a later, distinct
+    // corruption must get its own fresh anchor rather than reusing this one.
+    try save(testing.allocator, &group, .{ .last_attempt_at = 1_700_003_600, .failures = 0 });
+    const clean = try loadOrConservativeDefault(testing.allocator, &group, 1_700_003_600, &anchor);
+    try testing.expectEqual(@as(i64, 1_700_003_600), clean.last_attempt_at);
+    try testing.expectEqual(@as(u32, 0), clean.failures);
+
+    try group.writeFileAtomic(file_name, "not json", 0o600);
+    const fresh = try loadOrConservativeDefault(testing.allocator, &group, 1_700_010_000, &anchor);
+    try testing.expectEqual(@as(i64, 1_700_010_000), fresh.last_attempt_at);
 }
 
 test {

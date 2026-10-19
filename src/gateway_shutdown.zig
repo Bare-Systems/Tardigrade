@@ -1180,6 +1180,7 @@ fn applyReloadedRuntimeConfig(
             .max_object_bytes = cfg.proxy_response_cache_max_object_bytes,
             .max_entries = cfg.proxy_response_cache_max_entries,
             .max_total_bytes = cfg.proxy_response_cache_max_total_bytes,
+            .max_vary_variants = cfg.proxy_response_cache_max_vary_variants,
         })
     else
         null;

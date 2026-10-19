@@ -134,6 +134,7 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
                 .max_object_bytes = cfg.proxy_response_cache_max_object_bytes,
                 .max_entries = cfg.proxy_response_cache_max_entries,
                 .max_total_bytes = cfg.proxy_response_cache_max_total_bytes,
+                .max_vary_variants = cfg.proxy_response_cache_max_vary_variants,
             })
         else
             null,
@@ -878,12 +879,13 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     if (state.proxy_response_cache != null) {
         state.logger.info(
             null,
-            "Generic proxy_pass response cache enabled (conservative in-memory GET-only, #901): TTL {d}s max_object_bytes={d} max_entries={d} max_total_bytes={d}",
+            "Generic proxy_pass response cache enabled (bounded in-memory GET/HEAD, #901/#902): TTL {d}s max_object_bytes={d} max_entries={d} max_total_bytes={d} max_vary_variants={d}",
             .{
                 cfg.proxy_cache_ttl_seconds,
                 cfg.proxy_response_cache_max_object_bytes,
                 cfg.proxy_response_cache_max_entries,
                 cfg.proxy_response_cache_max_total_bytes,
+                cfg.proxy_response_cache_max_vary_variants,
             },
         );
     }
@@ -4888,7 +4890,7 @@ fn finalizeHttp2Response(
                 status_code = response.status_code;
                 body_alloc = try allocator.dupe(u8, response.body);
                 body = body_alloc.?;
-                try appendHttp2UpstreamResponseHeaders(allocator, &response_headers, &lowered_names, &owned_header_values, &response, std.mem.eql(u8, method, "HEAD"));
+                try appendHttp2UpstreamResponseHeaders(allocator, &response_headers, &lowered_names, &owned_header_values, &response, std.mem.eql(u8, method, "HEAD") or response.force_content_length != null);
             },
             .local_rejection => |rejection| {
                 status_code = rejection.status_code;
@@ -5131,34 +5133,55 @@ const Http2ProxyRouteResult = union(enum) {
 /// H2 frame finalizer expects. The cache lookup arena can then be released
 /// before this route returns, while the result remains valid until the
 /// connection thread has emitted its HEADERS/DATA frames.
+/// Mirrors `gateway_proxy_runtime.prepareHttp1CacheReplay`'s disposition
+/// handling: on `.not_modified`, only the RFC 9110 §15.4.5 allow-listed
+/// header fields are carried over and the body is always empty, regardless
+/// of `include_body`. `disposition` must not be `.require_origin`.
 fn http2CachedProxyResponse(
     allocator: std.mem.Allocator,
     hit: *const gproxy_cache.LookupResult,
+    disposition: gproxy_cache.ServeDisposition,
+    include_body: bool,
 ) !gp.BufferedUpstreamResponse {
+    std.debug.assert(disposition != .require_origin);
+    const not_modified = disposition == .not_modified;
     var metadata_arena = std.heap.ArenaAllocator.init(allocator);
     errdefer metadata_arena.deinit();
     const metadata = metadata_arena.allocator();
-    const headers = try metadata.alloc(gp.UpstreamHeader, hit.headers.len + 1);
-    for (hit.headers, 0..) |header, index| {
-        headers[index] = .{
+    var header_count: usize = 0;
+    for (hit.headers) |h| {
+        if (not_modified and !gproxy_cache.isReplayableOn304(h.name)) continue;
+        header_count += 1;
+    }
+    const headers = try metadata.alloc(gp.UpstreamHeader, header_count + 1);
+    var idx: usize = 0;
+    for (hit.headers) |header| {
+        if (not_modified and !gproxy_cache.isReplayableOn304(header.name)) continue;
+        headers[idx] = .{
             .name = try metadata.dupe(u8, header.name),
             .value = try metadata.dupe(u8, header.value),
         };
+        idx += 1;
     }
     var age_buf: [20]u8 = undefined;
     const age = std.fmt.bufPrint(&age_buf, "{d}", .{hit.age_seconds}) catch unreachable;
-    headers[hit.headers.len] = .{
+    headers[idx] = .{
         .name = try metadata.dupe(u8, "Age"),
         .value = try metadata.dupe(u8, age),
     };
-    const body = try allocator.dupe(u8, hit.body);
+    const body = if (not_modified or !include_body) try allocator.dupe(u8, "") else try allocator.dupe(u8, hit.body);
     errdefer allocator.free(body);
     return .{
         .metadata_arena = metadata_arena,
-        .status_code = hit.status_code,
-        .reason = try metadata.dupe(u8, hit.reason),
+        .status_code = if (not_modified) 304 else hit.status_code,
+        .reason = try metadata.dupe(u8, if (not_modified) "Not Modified" else hit.reason),
         .headers = headers,
         .body = body,
+        // The wire body above is empty on `HEAD`/`304`, but the declared
+        // `Content-Length` must still describe the cached GET
+        // representation's actual size, never `0` (RFC 9110 §8.6 / §15.4.5,
+        // #935 review).
+        .force_content_length = hit.body.len,
     };
 }
 
@@ -5176,7 +5199,7 @@ test "H2 cached replay conversion is fallible before route completion" {
         .age_seconds = 1,
     };
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, http2CachedProxyResponse(failing.allocator(), &hit));
+    try std.testing.expectError(error.OutOfMemory, http2CachedProxyResponse(failing.allocator(), &hit, .full, true));
 }
 
 const Http2LocalRejection = struct {
@@ -5466,11 +5489,13 @@ fn executeHttp2ProxyRoute(
     // this route function returns.
     var response_cache_key: ?[64]u8 = null;
     if (route_cfg.proxy_cache_ttl_seconds > 0) {
+        const cache_method = request.method.toString();
+        const fillable_method = std.mem.eql(u8, cache_method, "GET");
         if (cache_generation == 0 or
             !gproxy_cache.isCacheableRequest(
                 route_cfg,
                 matched.block,
-                request.method.toString(),
+                cache_method,
                 &request.headers,
                 if (request.body) |body| body.len != 0 else false,
                 false,
@@ -5483,38 +5508,60 @@ fn executeHttp2ProxyRoute(
             state.metricsRecordProxyCacheOutcome(.bypass);
         } else {
             var key_buf: [64]u8 = undefined;
+            // Entries are always stored under "GET" -- a HEAD request reads
+            // the same primary key's metadata rather than fragmenting the
+            // cache by method.
             _ = gproxy_cache.buildCacheKey(&key_buf, .{
                 .scheme = if (edge_config.usesNativeTls(route_cfg)) "https" else "http",
                 .host = ps.authority orelse request.headers.get("host") orelse "",
-                .method = request.method.toString(),
+                .method = "GET",
                 .location_id = matched.block.pattern,
                 .upstream_target = target,
                 .path = request.uri.path,
                 .query = request.uri.query orelse "",
             });
-            var hit_arena = std.heap.ArenaAllocator.init(allocator);
-            defer hit_arena.deinit();
-            const hit = blk: {
-                break :blk state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, key_buf[0..], http.event_loop.monotonicMs()) catch {
-                    state.metricsRecordProxyCacheOutcome(.fill_error);
-                    break :blk null;
-                };
+            const is_vary_tracked = state.proxyResponseCacheIsVaryTracked(cache_generation, key_buf[0..]);
+            var discriminator_buf: [gproxy_cache.max_vary_discriminator_bytes]u8 = undefined;
+            var secondary_buf: [64]u8 = undefined;
+            const effective_key: ?[]const u8 = if (!is_vary_tracked) key_buf[0..] else blk: {
+                const discriminator = gproxy_cache.varyAcceptEncodingDiscriminator(&discriminator_buf, &request.headers) orelse break :blk null;
+                break :blk gproxy_cache.buildVaryVariantKey(&secondary_buf, key_buf[0..], discriminator)[0..];
             };
-            if (hit) |value| {
-                // This copy is solely for replaying an already-cached value
-                // into H2-owned buffers. It must fail open just like cache
-                // lookup/fill: the live origin remains authoritative when a
-                // request allocator cannot service this optional copy.
-                if (http2CachedProxyResponse(allocator, &value)) |cached| {
-                    state.metricsRecordProxyCacheOutcome(.hit);
-                    ctx.setUpstreamResult(target, value.status_code, value.body.len);
-                    return .{ .response = cached };
-                } else |_| {
-                    state.metricsRecordProxyCacheOutcome(.fill_error);
+            if (effective_key == null) {
+                state.metricsRecordProxyCacheOutcome(.bypass);
+            } else {
+                var hit_arena = std.heap.ArenaAllocator.init(allocator);
+                defer hit_arena.deinit();
+                const hit = blk: {
+                    break :blk state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, effective_key.?, http.event_loop.monotonicMs()) catch {
+                        state.metricsRecordProxyCacheOutcome(.fill_error);
+                        break :blk null;
+                    };
+                };
+                const disposition: gproxy_cache.ServeDisposition = if (hit) |value| gproxy_cache.decideCacheServe(value.headers, &request.headers) else .require_origin;
+                if (hit) |value| {
+                    if (disposition != .require_origin) {
+                        // This copy is solely for replaying an already-cached
+                        // value into H2-owned buffers. It must fail open just
+                        // like cache lookup/fill: the live origin remains
+                        // authoritative when a request allocator cannot
+                        // service this optional copy.
+                        const include_body = fillable_method and disposition == .full;
+                        if (http2CachedProxyResponse(allocator, &value, disposition, include_body)) |cached| {
+                            state.metricsRecordProxyCacheOutcome(.hit);
+                            ctx.setUpstreamResult(target, cached.status_code, cached.body.len);
+                            return .{ .response = cached };
+                        } else |_| {
+                            state.metricsRecordProxyCacheOutcome(.fill_error);
+                        }
+                    }
                 }
+                state.metricsRecordProxyCacheOutcome(.miss);
+                // A HEAD miss (or an unvalidatable HEAD hit) must not fill
+                // the cache -- a HEAD response has no body to store, and
+                // storing one would poison a later GET replay.
+                if (fillable_method) response_cache_key = key_buf;
             }
-            state.metricsRecordProxyCacheOutcome(.miss);
-            response_cache_key = key_buf;
         }
     }
 
@@ -5553,7 +5600,7 @@ fn executeHttp2ProxyRoute(
     );
     errdefer proxy_response.deinit(allocator);
     if (response_cache_key) |key_bytes| {
-        gproxy_runtime.tryFillResponseCache(allocator, state, cache_generation, route_cfg.proxy_cache_ttl_seconds, key_bytes[0..], &proxy_response.bounded_buffered) catch {
+        gproxy_runtime.tryFillResponseCache(allocator, state, cache_generation, route_cfg.proxy_cache_ttl_seconds, key_bytes[0..], &proxy_response.bounded_buffered, &request.headers) catch {
             state.metricsRecordProxyCacheOutcome(.fill_error);
         };
     }
@@ -6165,7 +6212,15 @@ fn appendHttp2UpstreamResponseHeaders(
     preserve_content_length: bool,
 ) !void {
     if (preserve_content_length) {
-        if (response.representation_content_length) |value| {
+        if (response.force_content_length) |len| {
+            // A #935 cache HEAD/304 replay's authoritative length always
+            // wins over any live-traffic `representation_content_length`
+            // text (the two are never both set -- see `BufferedUpstreamResponse`).
+            const owned = try std.fmt.allocPrint(allocator, "{d}", .{len});
+            errdefer allocator.free(owned);
+            try owned_values.append(owned);
+            try headers.append(.{ .name = "content-length", .value = owned });
+        } else if (response.representation_content_length) |value| {
             // `value` is owned by `response.metadata_arena`, which the caller
             // deinitializes at the end of the `.response` switch prong -- before
             // `headers` is HPACK-encoded later in `respondHttp2Stream`. Duplicate

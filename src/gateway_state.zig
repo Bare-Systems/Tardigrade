@@ -1145,6 +1145,32 @@ pub const GatewayState = struct {
         return error.ProxyResponseCacheDisabled;
     }
 
+    /// #902: whether `primary_key` currently resolves through the bounded
+    /// `Vary: Accept-Encoding` variant index rather than a direct entry.
+    /// Consulted before building the effective lookup/fill key for a
+    /// request, so a lock-only read that never crosses network I/O.
+    pub fn proxyResponseCacheIsVaryTracked(self: *GatewayState, generation: u64, primary_key: []const u8) bool {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache_generation != generation) return false;
+        if (self.proxy_response_cache) |*cache| return cache.isVaryTracked(primary_key);
+        return false;
+    }
+
+    /// #902: fills one `Vary: Accept-Encoding` variant and registers it in
+    /// the bounded per-resource variant index. Same fail-open contract as
+    /// `proxyResponseCachePut`.
+    pub fn proxyResponseCachePutVaryVariant(self: *GatewayState, now_ms: u64, generation: u64, primary_key: []const u8, secondary_key: []const u8, params: gpc.PutParams) !void {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache_generation != generation) return error.ProxyResponseCacheGenerationMismatch;
+        if (self.proxy_response_cache) |*cache| {
+            try cache.putVaryVariant(now_ms, primary_key, secondary_key, params);
+            return;
+        }
+        return error.ProxyResponseCacheDisabled;
+    }
+
     test "proxy response cache rejects a different config generation" {
         var state: GatewayState = undefined;
         state.allocator = std.testing.allocator;

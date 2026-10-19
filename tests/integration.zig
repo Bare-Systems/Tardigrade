@@ -5332,6 +5332,22 @@ test "interop.h2.generic proxy response cache replays a bounded public GET (#901
     try assertContains(second.body, "h2-cache-first");
     try std.testing.expect(second.header("Age") != null);
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    // RFC 9110 §8.6: a cached HEAD replay's `content-length` must describe
+    // the cached GET representation's actual size (`"h2-cache-first".len`),
+    // never `0` for a nonempty representation (#935 review).
+    const head_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "HEAD" },
+        .{ .name = ":path", .value = "/h2-cache?public=1" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    var head = try pureZigH2GetResponse(allocator, tardigrade.port, head_headers[0..]);
+    defer head.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), head.status);
+    try std.testing.expectEqual(@as(usize, 0), head.body.len);
+    try std.testing.expectEqualStrings("14", head.header("content-length").?);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
 test "interop.openssl.h2.auth_required_proxy_fails_closed" {
@@ -15264,6 +15280,251 @@ test "generic proxy response cache never fills from a truncated origin response 
     try assertContains(cached.body, "complete-live");
     try std.testing.expect(cached.header("Age") != null);
     try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+}
+
+test "generic proxy response cache isolates Vary: Accept-Encoding variants and normalizes equivalent request headers (#902)" {
+    const allocator = std.testing.allocator;
+    const vary_fresh: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "Vary", .value = "Accept-Encoding" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "gzip-variant", .headers = vary_fresh },
+        .{ .body = "identity-variant", .headers = vary_fresh },
+        .{ .body = "gzip-except-br-variant", .headers = vary_fresh },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /asset {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    var gzip_first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{.{ .name = "Accept-Encoding", .value = "gzip" }} });
+    defer gzip_first.deinit();
+    try assertContains(gzip_first.body, "gzip-variant");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    var gzip_second = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{.{ .name = "Accept-Encoding", .value = "gzip" }} });
+    defer gzip_second.deinit();
+    try assertContains(gzip_second.body, "gzip-variant");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+    try std.testing.expect(gzip_second.header("Age") != null);
+
+    // No Accept-Encoding at all is a distinct variant from "gzip" -- must not
+    // cross representation boundaries.
+    var identity_first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{} });
+    defer identity_first.deinit();
+    try assertContains(identity_first.body, "identity-variant");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+
+    var identity_second = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{} });
+    defer identity_second.deinit();
+    try assertContains(identity_second.body, "identity-variant");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+
+    // A request that additionally, explicitly forbids "br" (`br;q=0`) is a
+    // distinct acceptability set from plain "gzip", even though both would
+    // currently resolve to the same gzip representation -- it must MISS
+    // rather than silently alias onto the plain-"gzip" variant (#935
+    // review: dropping an explicit `q=0` exclusion could otherwise serve a
+    // future Brotli-encoded fill to a client that rejected Brotli).
+    var gzip_except_br_first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{.{ .name = "Accept-Encoding", .value = "gzip, br;q=0" }} });
+    defer gzip_except_br_first.deinit();
+    try assertContains(gzip_except_br_first.body, "gzip-except-br-variant");
+    try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
+
+    // The same exclusion repeated now HITs its own distinct variant.
+    var gzip_except_br_second = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{.{ .name = "Accept-Encoding", .value = "gzip, br;q=0" }} });
+    defer gzip_except_br_second.deinit();
+    try assertContains(gzip_except_br_second.body, "gzip-except-br-variant");
+    try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
+}
+
+test "generic proxy response cache never replays a Content-Encoding a request explicitly rejected (#935 review)" {
+    const allocator = std.testing.allocator;
+    const vary_fresh: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "Vary", .value = "Accept-Encoding" },
+        .{ .name = "Content-Encoding", .value = "br" },
+    };
+    const identity_fresh: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "Vary", .value = "Accept-Encoding" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "br-variant", .headers = vary_fresh },
+        .{ .body = "identity-variant", .headers = identity_fresh },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /asset {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    // A request with no `Accept-Encoding` at all accepts every coding (RFC
+    // 9110 §12.5.3) -- the origin happens to answer with Brotli. The buffered
+    // H1 upstream path never decodes the body, so an encoded representation
+    // must never be admitted into the cache at all (#935 review): replaying
+    // it later without its `Content-Encoding` would hand a client opaque
+    // compressed bytes labeled as plain text.
+    var no_header = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{} });
+    defer no_header.deinit();
+    try assertContains(no_header.body, "br-variant");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    // A request that explicitly forbids Brotli must never be served that
+    // (never-cached) Brotli representation -- it is a distinct variant and
+    // must reach the origin, which this time answers without
+    // `Vary`/`Content-Encoding`.
+    var br_rejected = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{.{ .name = "Accept-Encoding", .value = "br;q=0" }} });
+    defer br_rejected.deinit();
+    try assertContains(br_rejected.body, "identity-variant");
+    try std.testing.expect(br_rejected.header("Content-Encoding") == null);
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+
+    // Repeating the exact no-header request proves the Brotli response was
+    // never stored in the first place rather than merely missed by a
+    // different variant key: the origin's response list is exhausted, so it
+    // keeps answering with the last (identity, no Content-Encoding) entry --
+    // a cache HIT here would instead replay the original "br-variant" body.
+    var no_header_again = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/asset", .body = null, .headers = &.{} });
+    defer no_header_again.deinit();
+    try assertContains(no_header_again.body, "identity-variant");
+    try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
+}
+
+test "generic proxy response cache answers If-None-Match/If-Modified-Since from a fresh entry without an extra origin call (#902)" {
+    const allocator = std.testing.allocator;
+    const validated: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "ETag", .value = "\"v1\"" },
+        .{ .name = "Last-Modified", .value = "Wed, 21 Oct 2015 07:28:00 GMT" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "validated-body", .headers = validated },
+        .{ .body = "should-not-run", .headers = validated },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /etag {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    var seed = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/etag", .body = null, .headers = &.{} });
+    defer seed.deinit();
+    try assertContains(seed.body, "validated-body");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    var matching_etag = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/etag", .body = null, .headers = &.{.{ .name = "If-None-Match", .value = "\"v1\"" }} });
+    defer matching_etag.deinit();
+    try std.testing.expectEqual(@as(u16, 304), matching_etag.status_code);
+    try std.testing.expectEqual(@as(usize, 0), matching_etag.body.len);
+    // RFC 9110 §15.4.5: `304` sends no body, but a declared `Content-Length`
+    // must never misstate the validated representation's actual size as `0`
+    // (#935 review).
+    try std.testing.expectEqualStrings("14", matching_etag.header("Content-Length").?);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    var stale_etag = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/etag", .body = null, .headers = &.{.{ .name = "If-None-Match", .value = "\"stale\"" }} });
+    defer stale_etag.deinit();
+    try std.testing.expectEqual(@as(u16, 200), stale_etag.status_code);
+    try assertContains(stale_etag.body, "validated-body");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    var matching_date = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/etag", .body = null, .headers = &.{.{ .name = "If-Modified-Since", .value = "Thu, 22 Oct 2015 07:28:00 GMT" }} });
+    defer matching_date.deinit();
+    try std.testing.expectEqual(@as(u16, 304), matching_date.status_code);
+    try std.testing.expectEqual(@as(usize, 0), matching_date.body.len);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+}
+
+test "generic proxy response cache serves HEAD from a stored GET entry's metadata without an origin call (#902)" {
+    const allocator = std.testing.allocator;
+    const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "head-metadata-body", .headers = fresh },
+        .{ .body = "should-not-run", .headers = fresh },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /head-test {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    var get_first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/head-test", .body = null, .headers = &.{} });
+    defer get_first.deinit();
+    try assertContains(get_first.body, "head-metadata-body");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    var head = try sendRequest(allocator, tardigrade.port, .{ .method = "HEAD", .path = "/head-test", .body = null, .headers = &.{} });
+    defer head.deinit();
+    try std.testing.expectEqual(@as(u16, 200), head.status_code);
+    try std.testing.expectEqual(@as(usize, 0), head.body.len);
+    // RFC 9110 §8.6: a `HEAD` reply may declare `Content-Length`, but only
+    // the size the corresponding `GET` would have sent -- never `0` for a
+    // nonempty representation (#935 review).
+    try std.testing.expectEqualStrings("18", head.header("Content-Length").?);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
 }
 
 test "forward_auth refusals stay no-store despite global CDN cache headers over h1" {

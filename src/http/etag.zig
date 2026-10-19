@@ -29,8 +29,12 @@ fn skipOws(header: []const u8, start: usize) usize {
 /// repeated header instances (RFC 9110 §5.3) can tell "no match in this
 /// instance" apart from "this instance is not valid `#entity-tag` syntax" --
 /// the latter must invalidate the whole combined list even if an earlier
-/// instance already matched.
-pub const EntityTagMatch = enum { invalid, no_match, match };
+/// instance already matched. `wildcard` is likewise kept distinct from
+/// `match`: `If-None-Match = "*" / 1#entity-tag` makes `*` an alternative to
+/// an entity-tag list, not a member of one, so a caller must reject a
+/// combined value that mixes a `*` instance with any other instance even
+/// though each instance is independently valid.
+pub const EntityTagMatch = enum { invalid, no_match, match, wildcard };
 
 /// RFC 9110 §13.1.2 requires weak comparison for `If-None-Match` on GET/HEAD:
 /// entity-tags match if their opaque-tag is identical once any `W/` prefix is
@@ -46,7 +50,7 @@ pub const EntityTagMatch = enum { invalid, no_match, match };
 /// returns `.invalid`, even if a valid-looking tag was found before the
 /// violation.
 pub fn evaluateIfNoneMatch(etag: []const u8, header: []const u8) EntityTagMatch {
-    if (std.mem.eql(u8, std.mem.trim(u8, header, " \t"), "*")) return .match;
+    if (std.mem.eql(u8, std.mem.trim(u8, header, " \t"), "*")) return .wildcard;
 
     const target = stripWeakPrefix(etag);
     var cursor: usize = skipOws(header, 0);
@@ -75,9 +79,13 @@ pub fn evaluateIfNoneMatch(etag: []const u8, header: []const u8) EntityTagMatch 
 
 /// Convenience wrapper over `evaluateIfNoneMatch` for single-field callers
 /// that only need a match/no-match answer (`.invalid` and `.no_match` both
-/// read as "do not serve 304").
+/// read as "do not serve 304"). A lone `*` field is a valid match here since
+/// there is no second instance it could conflict with.
 pub fn matchesIfNoneMatch(etag: []const u8, header: []const u8) bool {
-    return evaluateIfNoneMatch(etag, header) == .match;
+    return switch (evaluateIfNoneMatch(etag, header)) {
+        .match, .wildcard => true,
+        .invalid, .no_match => false,
+    };
 }
 
 test "generateETag produces quoted hex size-mtime format" {

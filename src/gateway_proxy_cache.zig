@@ -1078,20 +1078,33 @@ pub fn decideCacheServe(hit_headers: []const CacheHeader, request_headers: *cons
     // instance must not short-circuit past a later instance that makes the
     // combined logical list syntactically invalid, since that invalidates
     // the whole condition, not just that one instance.
-    var seen_if_none_match = false;
+    var field_count: usize = 0;
     var stored_etag: ?[]const u8 = null;
     var matched = false;
+    var wildcard_seen = false;
     for (request_headers.iterator()) |header| {
         if (!std.mem.eql(u8, header.name, "if-none-match")) continue;
-        seen_if_none_match = true;
+        field_count += 1;
         if (stored_etag == null) stored_etag = findStoredHeader(hit_headers, "etag") orelse return .require_origin;
         switch (http.etag.evaluateIfNoneMatch(stored_etag.?, header.value)) {
             .invalid => return .require_origin,
             .match => matched = true,
+            .wildcard => {
+                wildcard_seen = true;
+                matched = true;
+            },
             .no_match => {},
         }
     }
-    if (seen_if_none_match) return if (matched) .not_modified else .full;
+    if (field_count > 0) {
+        // `If-None-Match = "*" / 1#entity-tag` makes `*` an alternative to an
+        // entity-tag list, not a member of one: a `*` instance combined with
+        // any other instance (another `*`, or an entity-tag list) is not a
+        // valid combined field value, even though each instance parses fine
+        // on its own.
+        if (wildcard_seen and field_count != 1) return .require_origin;
+        return if (matched) .not_modified else .full;
+    }
 
     if (request_headers.get("if-modified-since")) |raw_client_date| {
         const stored_last_modified = findStoredHeader(hit_headers, "last-modified") orelse return .require_origin;
@@ -1242,6 +1255,42 @@ test "decideCacheServe evaluates every repeated If-None-Match field instance" {
     try headers.append("If-None-Match", "junk\"oops\"");
     try headers.append("If-None-Match", "\"rev1\"");
     try std.testing.expectEqual(ServeDisposition.require_origin, decideCacheServe(stored, &headers));
+}
+
+test "decideCacheServe rejects a wildcard If-None-Match field combined with any other field instance" {
+    const stored: []const CacheHeader = &.{
+        .{ .name = @constCast("ETag"), .value = @constCast("\"rev1\"") },
+    };
+
+    // A lone `*` field is a valid, unambiguous wildcard match.
+    var headers = http.Headers.init(std.testing.allocator);
+    defer headers.deinit();
+    try headers.append("If-None-Match", "*");
+    try std.testing.expectEqual(ServeDisposition.not_modified, decideCacheServe(stored, &headers));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+
+    // `If-None-Match = "*" / 1#entity-tag` makes `*` an alternative to an
+    // entity-tag list, not a member of one: splitting `"other", *` across two
+    // field instances must not be treated as if it were a valid combined
+    // value just because each instance parses on its own (#935 review).
+    try headers.append("If-None-Match", "\"other\"");
+    try headers.append("If-None-Match", "*");
+    try std.testing.expectEqual(ServeDisposition.require_origin, decideCacheServe(stored, &headers));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+
+    // Same with the wildcard first.
+    try headers.append("If-None-Match", "*");
+    try headers.append("If-None-Match", "\"other\"");
+    try std.testing.expectEqual(ServeDisposition.require_origin, decideCacheServe(stored, &headers));
+    headers.deinit();
+    headers = http.Headers.init(std.testing.allocator);
+
+    // A non-wildcard multi-instance list still matches as before.
+    try headers.append("If-None-Match", "\"other\"");
+    try headers.append("If-None-Match", "W/\"rev1\"");
+    try std.testing.expectEqual(ServeDisposition.not_modified, decideCacheServe(stored, &headers));
 }
 
 test "isReplayableOn304 allow-lists only validator/freshness-describing fields" {

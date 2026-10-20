@@ -155,10 +155,14 @@ that gets no optimization in a Debug build:
 These are genuine correctness regressions, not spins or bugs, so they are not
 deleted. `zig build test-fast` sets `TARDIGRADE_TEST_FAST=1`, which the first
 two tests above check (via `std.c.getenv`, matching the existing
-`TARDIGRADE_SOAK_HEAVY` convention in `tests/http3_soak.zig`) to skip just
-themselves; every other invocation -- `zig build test`, `zig build
+`TARDIGRADE_SOAK_HEAVY` convention in `tests/http3_soak.zig`) to skip
+themselves entirely; every other invocation -- `zig build test`, `zig build
 test-crypto`, `zig build test-tls`, CI -- leaves the variable unset and still
-runs them. `test-fast` also omits, entirely (each already has its own
+runs them. The third, smaller test above checks the same variable but does
+not skip itself: it instead runs only its first mutation case (still proving
+a malformed CRT relationship is rejected) instead of all seven, so a
+representative negative-security regression stays in `test-fast` rather than
+being dropped outright. `test-fast` also omits, entirely (each already has its own
 dedicated/standalone step, unaffected, and the default `test` step still runs
 all four):
 

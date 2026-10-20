@@ -1136,13 +1136,12 @@ test "RSA private-key DER rejects a wrong version, malformed integers, and out-o
 }
 
 test "RSA private-key DER rejects every component mutation that breaks a required relationship" {
-    if (skipInTestFastMode()) return error.SkipZigTest;
     // Each offset is the last (least-significant) byte of the named field in
     // the fixture's PKCS#1 encoding — flipping it keeps the field the same
     // length, still nonzero, and still less than the modulus (all range
     // checks parsePrivateKeyDer already enforces stay satisfied), so only
     // `validateComponentRelationships`'s mathematical checks can catch it.
-    const mutations = [_]struct { name: []const u8, offset: usize }{
+    const all_mutations = [_]struct { name: []const u8, offset: usize }{
         .{ .name = "n (breaks n = p*q)", .offset = 267 },
         .{ .name = "d (breaks dP/dQ/e*d relations)", .offset = 532 },
         .{ .name = "p (breaks n = p*q)", .offset = 664 },
@@ -1151,6 +1150,11 @@ test "RSA private-key DER rejects every component mutation that breaks a require
         .{ .name = "dq (breaks dQ = d mod (q-1))", .offset = 1060 },
         .{ .name = "qinv (breaks qInv*q = 1 mod p)", .offset = 1191 },
     };
+    // #944 fast mode keeps one representative mutation (still proving a
+    // malformed CRT relationship is rejected) instead of skipping this
+    // negative security test outright; the full seven-mutation sweep still
+    // runs under the default/full `zig build test`.
+    const mutations = if (skipInTestFastMode()) all_mutations[0..1] else all_mutations[0..];
     for (mutations) |case| {
         var buf = testdata.private_key_pkcs1_bytes;
         buf[case.offset] ^= 0x01;

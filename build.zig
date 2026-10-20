@@ -1248,16 +1248,26 @@ pub fn build(b: *std.Build) void {
     // silently running (or silently skipping) everything, and a filter that
     // matches zero named tests fails via `check_exe_test_filter_matches`
     // instead of silently passing on the always-present unnamed
-    // `refAllDecls` smoke test (see that tool's doc comment).
+    // `refAllDecls` smoke test (see that tool's doc comment). An empty
+    // string is a distinct, realistic misuse (e.g. an unset shell variable
+    // in `-Dexe-test-filter="$TEST_NAME"`): Zig's own `.filters = &.{""}`
+    // matches every test name via empty-substring semantics, so it is
+    // rejected the same way as an omitted filter rather than silently
+    // running the whole population.
     const test_exe_filtered_step = b.step("test-exe-filtered", "Run exactly the exe_unit_tests named by -Dexe-test-filter=<substring>, without running the whole src/main.zig test population (#944)");
     if (exe_test_filter) |filter| {
-        const filter_check = b.addRunArtifact(exe_test_filter_check_exe);
-        filter_check.addArgs(&.{ "src/main.zig", filter });
-        filter_check.setCwd(b.path("."));
-        const exe_test_filtered = b.addTest(.{ .root_module = exe_test_mod, .filters = &.{filter} });
-        const run_exe_test_filtered = b.addRunArtifact(exe_test_filtered);
-        test_exe_filtered_step.dependOn(&filter_check.step);
-        test_exe_filtered_step.dependOn(&run_exe_test_filtered.step);
+        if (std.mem.trim(u8, filter, " \t\r\n").len == 0) {
+            const empty_exe_test_filter = b.addFail("test-exe-filtered requires a non-empty -Dexe-test-filter=<substring>; an empty filter would match every exe_unit_tests name instead of naming the test(s) to run");
+            test_exe_filtered_step.dependOn(&empty_exe_test_filter.step);
+        } else {
+            const filter_check = b.addRunArtifact(exe_test_filter_check_exe);
+            filter_check.addArgs(&.{ "src/main.zig", filter });
+            filter_check.setCwd(b.path("."));
+            const exe_test_filtered = b.addTest(.{ .root_module = exe_test_mod, .filters = &.{filter} });
+            const run_exe_test_filtered = b.addRunArtifact(exe_test_filtered);
+            test_exe_filtered_step.dependOn(&filter_check.step);
+            test_exe_filtered_step.dependOn(&run_exe_test_filtered.step);
+        }
     } else {
         const missing_exe_test_filter = b.addFail("test-exe-filtered requires -Dexe-test-filter=<substring> naming the test(s) to run (e.g. `zig build test-exe-filtered -Dexe-test-filter=\"jwt\"`); omitting it would otherwise have to either run the entire population or silently skip it");
         test_exe_filtered_step.dependOn(&missing_exe_test_filter.step);
@@ -1274,9 +1284,13 @@ pub fn build(b: *std.Build) void {
     //      `TARDIGRADE_TEST_FAST=1` set, which skips exactly the two
     //      large-RSA-3072/4096-keygen cases that otherwise dominate this
     //      run's wall time in a Debug build's unoptimized bigint modexp
-    //      (~45s of the ~120s warm-cache baseline, combined). The default
-    //      `test`/`test-crypto`/`test-tls` steps leave the variable unset
-    //      and still exercise both tests every time.
+    //      (~45s of the ~120s warm-cache baseline, combined). The same
+    //      variable also trims a third, smaller `crypto/rsa.zig` negative
+    //      test down to one representative mutation case instead of seven,
+    //      rather than skipping it outright -- a malformed-key rejection
+    //      stays covered in `test-fast`. The default `test`/`test-crypto`/
+    //      `test-tls` steps leave the variable unset and still exercise
+    //      every case every time.
     //   2. Four targets are omitted outright, each for a reason already
     //      documented at its own definition above and each still reachable
     //      through its existing dedicated/standalone step and the default

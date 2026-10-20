@@ -17,12 +17,12 @@
 //! requested substring.
 //!
 //! A narrow static approximation, not a semantic replacement for Zig's own
-//! test collection: a string that happens to read `test "..."` inside a
-//! comment or an unrelated string literal could in principle produce a false
-//! match (over-counting, the safe direction -- it can only make this check
-//! pass when it should have failed in that one adversarial case, never the
-//! reverse). It does not understand `@import` aliasing, conditional
-//! compilation, or comptime-generated test names.
+//! test collection: it does not understand `@import` aliasing, conditional
+//! compilation, or comptime-generated test names. It does, however, mask out
+//! line comments, multiline-string-literal lines, and unrelated string/char
+//! literals before scanning (see `maskNonSemanticText`), so a `test "..."`
+//! mentioned only in a comment or an embedded string cannot be counted as a
+//! real declaration.
 
 const std = @import("std");
 const compat = @import("zig_compat");
@@ -31,28 +31,105 @@ fn isRelativeImport(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".zig");
 }
 
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+}
+
+/// Returns a copy of `contents` with line comments (`//` to end of line),
+/// multiline-string-literal lines (`\\` to end of line), and char literals
+/// replaced with spaces, and with every `"`-delimited string literal
+/// replaced with spaces *except* the two forms this tool actually needs to
+/// read verbatim: an `@import("...")` path argument and a `test "..."`
+/// declaration's name argument. This stops a `test "..."` sequence written
+/// inside a comment or an unrelated string literal (e.g. a doc fixture, or a
+/// deleted test still mentioned in prose) from being mistaken for a real
+/// test declaration -- the exact false-green #944 prohibits.
+fn maskNonSemanticText(allocator: std.mem.Allocator, contents: []const u8) ![]u8 {
+    const out = try allocator.dupe(u8, contents);
+    var i: usize = 0;
+    while (i < out.len) {
+        const c = out[i];
+        if (c == '/' and i + 1 < out.len and out[i + 1] == '/') {
+            while (i < out.len and out[i] != '\n') : (i += 1) out[i] = ' ';
+            continue;
+        }
+        if (c == '\\' and i + 1 < out.len and out[i + 1] == '\\') {
+            while (i < out.len and out[i] != '\n') : (i += 1) out[i] = ' ';
+            continue;
+        }
+        if (c == '\'') {
+            i += 1;
+            while (i < out.len and out[i] != '\'') : (i += 1) {
+                if (out[i] == '\\' and i + 1 < out.len) i += 1;
+            }
+            if (i < out.len) i += 1;
+            continue;
+        }
+        if (c == '"') {
+            var before = i;
+            while (before > 0 and (out[before - 1] == ' ' or out[before - 1] == '\t')) before -= 1;
+            const preceded_by_paren = before >= 1 and out[before - 1] == '(';
+
+            var is_import_path = false;
+            if (preceded_by_paren) {
+                const paren_pos = before - 1;
+                const needle = "@import";
+                if (paren_pos >= needle.len and std.mem.eql(u8, out[paren_pos - needle.len .. paren_pos], needle)) {
+                    is_import_path = true;
+                }
+            }
+            var is_test_name = false;
+            if (!preceded_by_paren) {
+                var word_start = before;
+                while (word_start > 0 and isIdentChar(out[word_start - 1])) word_start -= 1;
+                if (std.mem.eql(u8, out[word_start..before], "test")) is_test_name = true;
+            }
+
+            const start = i;
+            i += 1;
+            while (i < out.len and out[i] != '"') : (i += 1) {
+                if (out[i] == '\\' and i + 1 < out.len) i += 1;
+            }
+            if (i < out.len) i += 1; // closing quote
+            if (!is_import_path and !is_test_name) {
+                for (out[start..i]) |*b| b.* = ' ';
+            }
+            continue;
+        }
+        i += 1;
+    }
+    return out;
+}
+
 /// Every `@import("<path>")` argument found in `contents`.
 fn collectImports(allocator: std.mem.Allocator, contents: []const u8, out: *std.ArrayList([]const u8)) !void {
+    const masked = try maskNonSemanticText(allocator, contents);
+    defer allocator.free(masked);
     const needle = "@import(\"";
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, contents, i, needle)) |start| {
+    while (std.mem.indexOfPos(u8, masked, i, needle)) |start| {
         const path_start = start + needle.len;
-        const end = std.mem.indexOfScalarPos(u8, contents, path_start, '"') orelse break;
-        try out.append(allocator, try allocator.dupe(u8, contents[path_start..end]));
+        const end = std.mem.indexOfScalarPos(u8, masked, path_start, '"') orelse break;
+        try out.append(allocator, try allocator.dupe(u8, masked[path_start..end]));
         i = end + 1;
     }
 }
 
 /// Every named `test "<name>"` declaration's name found in `contents`.
 /// Unnamed `test { ... }` blocks are intentionally not collected: they carry
-/// no name for a substring filter to match in the first place.
+/// no name for a substring filter to match in the first place. Scans
+/// `contents` through `maskNonSemanticText` so a `test "..."`-shaped
+/// sequence inside a comment or an unrelated string literal is not
+/// mistaken for a real declaration.
 fn collectTestNames(allocator: std.mem.Allocator, contents: []const u8, out: *std.ArrayList([]const u8)) !void {
+    const masked = try maskNonSemanticText(allocator, contents);
+    defer allocator.free(masked);
     const needle = "test \"";
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, contents, i, needle)) |start| {
+    while (std.mem.indexOfPos(u8, masked, i, needle)) |start| {
         const name_start = start + needle.len;
-        const end = std.mem.indexOfScalarPos(u8, contents, name_start, '"') orelse break;
-        try out.append(allocator, try allocator.dupe(u8, contents[name_start..end]));
+        const end = std.mem.indexOfScalarPos(u8, masked, name_start, '"') orelse break;
+        try out.append(allocator, try allocator.dupe(u8, masked[name_start..end]));
         i = end + 1;
     }
 }
@@ -152,6 +229,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try stderr.print("usage: check_exe_test_filter_matches <root-relative-file> <filter-substring>\n", .{});
         std.process.exit(2);
     };
+
+    if (std.mem.trim(u8, filter, " \t\r\n").len == 0) {
+        var stderr_buf: [512]u8 = undefined;
+        var stderr = compat.stderrWriter(&stderr_buf);
+        try stderr.print("filter-substring must not be empty: an empty filter matches every named test, defeating the named/fast selection this check exists to enforce\n", .{});
+        std.process.exit(2);
+    }
 
     const root = compat.cwd();
     const count = try countMatches(allocator, root, root_relative_path, filter);
@@ -275,6 +359,57 @@ test "countMatches collapses .. in a nested import cycle instead of growing the 
     });
 
     try testing.expectEqual(@as(usize, 2), try countMatches(allocator, root, "main.zig", "smoke"));
+}
+
+test "countMatches does not count a test name mentioned only in a line comment" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = compat.wrapDir(tmp.dir);
+
+    // A deleted test still mentioned in a comment, plus the always-present
+    // unnamed refAllDecls smoke test Zig's own runner would still pass on.
+    try root.writeFile(.{ .sub_path = "main.zig", .data =
+        \\// test "removed_cache_regression" {}
+        \\test { @import("std").testing.refAllDecls(@This()); }
+    });
+
+    try testing.expectEqual(@as(usize, 0), try countMatches(allocator, root, "main.zig", "removed_cache_regression"));
+}
+
+test "countMatches does not count a test name mentioned only inside an unrelated string literal" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = compat.wrapDir(tmp.dir);
+
+    try root.writeFile(.{ .sub_path = "main.zig", .data =
+        \\const msg = "see also: test \"removed_cache_regression\" above";
+        \\test { @import("std").testing.refAllDecls(@This()); }
+    });
+
+    try testing.expectEqual(@as(usize, 0), try countMatches(allocator, root, "main.zig", "removed_cache_regression"));
+}
+
+test "countMatches still finds a real test declaration alongside an unrelated comment and string" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = compat.wrapDir(tmp.dir);
+
+    try root.writeFile(.{ .sub_path = "main.zig", .data =
+        \\// test "removed_cache_regression" {}
+        \\const msg = "test \"not a real test\"";
+        \\const helper = @import("helper.zig");
+        \\test "cache_regression_still_covered" {}
+    });
+    try root.writeFile(.{ .sub_path = "helper.zig", .data =
+        \\test "helper still reachable" {}
+    });
+
+    try testing.expectEqual(@as(usize, 0), try countMatches(allocator, root, "main.zig", "removed_cache_regression"));
+    try testing.expectEqual(@as(usize, 1), try countMatches(allocator, root, "main.zig", "cache_regression_still_covered"));
+    try testing.expectEqual(@as(usize, 1), try countMatches(allocator, root, "main.zig", "helper still reachable"));
 }
 
 test "countMatches skips an unreadable resolved import instead of failing" {

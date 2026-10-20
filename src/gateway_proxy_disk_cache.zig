@@ -245,6 +245,19 @@ pub const DiskCache = struct {
     /// false, every public call retries the write so a fault that clears
     /// before the next restart still ends with the marker on disk.
     poison_write_confirmed: bool = false,
+    /// Claimed by whichever thread is currently retrying the poison write,
+    /// so concurrent callers coalesce onto one attempt instead of each
+    /// queuing their own durable write behind `self.mutex`.
+    poison_retry_inflight: bool = false,
+    /// Independent of `self.mutex`: guards `active_transitions` so the
+    /// durable `transition_guard_name` file reflects how many concurrent
+    /// Vary->direct transitions (for distinct primaries, on distinct I/O
+    /// lanes) are currently relying on it, not just the most recent one to
+    /// begin or end. Without this, one primary's transition finishing can
+    /// remove the only guard while another primary's transition is still
+    /// mid-flight and unprotected.
+    transition_mutex: compat.Mutex = .{},
+    active_transitions: usize = 0,
     test_write_barrier: ?*TestWriteBarrier = null,
     test_read_barrier: ?*TestIoBarrier = null,
     /// Test-only wall-clock override for reboot/clock-epoch simulations.
@@ -253,6 +266,17 @@ pub const DiskCache = struct {
     /// letting a test re-arm a one-shot `state_dir.fault` that an earlier,
     /// unrelated write already consumed.
     test_before_poison_write: ?*const fn (*DiskCache) void = null,
+    /// Test-only pause point, keyed by primary, between a successful
+    /// `beginTransitionGuard` and the fence write that follows it --
+    /// proving a concurrent, differently-laned primary's own transition can
+    /// begin, publish its fence, retire its family and end its own guard
+    /// reference while this one is still durably held active.
+    test_before_fence_write: ?*TestIoBarrier = null,
+    /// Test-only pause point inside the actual poison-marker write,
+    /// reached only after `retryPoisonLocked` has already released
+    /// `self.mutex` -- proving an unrelated key's `get`/`put`/`isVaryTracked`
+    /// is never queued behind one key's stalled retry.
+    test_poison_write_barrier: ?*TestIoBarrier = null,
 
     /// Opens (creating as `0700` if absent) and validates `root_path`,
     /// refusing a symlink, a path owned by another user, or one with
@@ -308,6 +332,15 @@ pub const DiskCache = struct {
 
     const PoisonCheck = enum { absent, confirmed, indeterminate };
 
+    /// `.not_needed`: no Vary family exists for the primary, so there is
+    /// nothing to guard and the caller may proceed without ever calling
+    /// `endPolicyTransition`. `.admitted`: a durable guard was established
+    /// (or an already-active one was joined) and must be released with
+    /// `endPolicyTransition` once the caller's own transition concludes.
+    /// `.refused`: a family exists but the guard could not be durably
+    /// written; the caller must not publish a conflicting representation.
+    pub const TransitionAdmission = enum { not_needed, admitted, refused };
+
     /// Fail-safe: only a confirmed `NotFound` counts as "not poisoned". Any
     /// other error (unsafe file type, I/O failure, oversized/corrupt marker)
     /// cannot prove the marker is absent, so the namespace is still treated
@@ -329,6 +362,7 @@ pub const DiskCache = struct {
     /// up durably recorded once the underlying filesystem issue clears.
     fn poisonDurableBestEffort(self: *DiskCache) bool {
         if (self.test_before_poison_write) |hook| hook(self);
+        if (self.test_poison_write_barrier) |barrier| barrier.pauseIfMatched(poison_name);
         self.state_dir.writeFileAtomicLimit(poison_name, &poison_marker, 0o600, poison_marker.len) catch return false;
         return true;
     }
@@ -352,18 +386,63 @@ pub const DiskCache = struct {
     /// the attempt -- unlike the fence write or `disableLocked`'s poison
     /// write, there is nothing yet for a crash right after this call to
     /// leave half-done.
+    ///
+    /// Reference-counted under `transition_mutex`, independent of
+    /// `self.mutex`: distinct primaries use distinct I/O lanes and can have
+    /// concurrent transitions in flight, so the durable file is only
+    /// written on the 0->1 edge and only removed (by `endTransitionGuard`)
+    /// on the matching 1->0 edge. Without this, one primary's transition
+    /// finishing first could remove the only guard while another primary's
+    /// transition is still unprotected mid-flight.
     fn beginTransitionGuard(self: *DiskCache) bool {
-        self.state_dir.writeFileAtomicLimit(transition_guard_name, &transition_guard_marker, 0o600, transition_guard_marker.len) catch return false;
+        self.transition_mutex.lock();
+        defer self.transition_mutex.unlock();
+        if (self.active_transitions == 0) {
+            self.state_dir.writeFileAtomicLimit(transition_guard_name, &transition_guard_marker, 0o600, transition_guard_marker.len) catch return false;
+        }
+        self.active_transitions += 1;
         return true;
     }
 
     /// Best-effort cleanup once the transition it guarded no longer needs
     /// it (a durable fence was published, or the family was fully retired).
-    /// A failure here just leaves inert debris: the next restart only
-    /// disables on a leftover guard when nothing else already proved the
-    /// transition finished safely.
+    /// Only removes the durable file once every concurrently active
+    /// transition has ended; a failure here just leaves inert debris: the
+    /// next restart only disables on a leftover guard when nothing else
+    /// already proved every transition it covered finished safely.
     fn endTransitionGuard(self: *DiskCache) void {
-        self.state_dir.removeFileDurable(transition_guard_name) catch {};
+        self.transition_mutex.lock();
+        defer self.transition_mutex.unlock();
+        self.active_transitions -= 1;
+        if (self.active_transitions == 0) {
+            self.state_dir.removeFileDurable(transition_guard_name) catch {};
+        }
+    }
+
+    /// Admission check for a representation-policy transition that would
+    /// displace an existing Vary family (a direct fill or refresh under
+    /// `primary`): returns whether the caller may proceed, and if so,
+    /// whether it must balance the call with `endPolicyTransition`. Must be
+    /// called -- and, if `.admitted`, paired with `endPolicyTransition` --
+    /// strictly before any RAM representation switch is published, so a
+    /// durable guard failure can still prevent the RAM tier from committing
+    /// a representation disk cannot yet prove is safe to serve after a
+    /// restart.
+    pub fn beginPolicyTransitionIfVaryTracked(self: *DiskCache, primary: []const u8) TransitionAdmission {
+        self.mutex.lock();
+        self.retryPoisonLocked();
+        if (self.disabled) {
+            self.mutex.unlock();
+            return .not_needed;
+        }
+        const tracked = self.vary_index.contains(primary) and !self.isFencedLocked(primary);
+        self.mutex.unlock();
+        if (!tracked) return .not_needed;
+        return if (self.beginTransitionGuard()) .admitted else .refused;
+    }
+
+    pub fn endPolicyTransition(self: *DiskCache, admission: TransitionAdmission) void {
+        if (admission == .admitted) self.endTransitionGuard();
     }
 
     /// Retried under `self.mutex` at the top of every public call while
@@ -371,10 +450,21 @@ pub const DiskCache = struct {
     /// same underlying fault that forced the disable -- still lands once
     /// that fault clears, without waiting for a restart that would otherwise
     /// resurrect whatever this process could not durably retire.
+    ///
+    /// The actual durable write happens with `self.mutex` released: only one
+    /// thread at a time claims `poison_retry_inflight` and performs it, so a
+    /// degraded filesystem's slow or faulted writes never serialize unrelated
+    /// keys behind this global lock. Every other caller sees the claim and
+    /// returns immediately, falling through to the ordinary disabled-miss
+    /// path below without waiting on that I/O.
     fn retryPoisonLocked(self: *DiskCache) void {
-        if (self.disabled and !self.poison_write_confirmed) {
-            self.poison_write_confirmed = self.poisonDurableBestEffort();
-        }
+        if (!self.disabled or self.poison_write_confirmed or self.poison_retry_inflight) return;
+        self.poison_retry_inflight = true;
+        self.mutex.unlock();
+        const confirmed = self.poisonDurableBestEffort();
+        self.mutex.lock();
+        self.poison_retry_inflight = false;
+        if (confirmed) self.poison_write_confirmed = true;
     }
 
     const IoGuard = struct {
@@ -698,6 +788,7 @@ pub const DiskCache = struct {
             // without touching the fence or any sibling: nothing has
             // changed on disk yet.
             if (!self.beginTransitionGuard()) return false;
+            if (self.test_before_fence_write) |barrier| barrier.pauseIfMatched(primary);
 
             var marker: [tombstone_bytes]u8 = undefined;
             encodeFence(&marker, primary, self.fingerprint);
@@ -2816,5 +2907,207 @@ test "DiskCache poison write failing at the post-rename directory fsync is retri
     try std.testing.expect(!cache.poison_write_confirmed);
 
     try std.testing.expect(!cache.isVaryTracked("b" ** 64));
+    try std.testing.expect(cache.poison_write_confirmed);
+}
+
+test "DiskCache transition guard protects one still-active primary while a concurrent primary ends its own guard reference" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
+
+    // Four mutually distinct I/O lanes: A's primary/sibling pair and B's
+    // primary/sibling pair must never collide with each other, or the
+    // scenario this test proves -- two unrelated primaries transitioning
+    // concurrently -- would instead just be one serialized behind the
+    // other's held lane.
+    const candidates = [_][]const u8{
+        "0" ** 64, "1" ** 64, "2" ** 64, "3" ** 64, "4" ** 64, "5" ** 64,
+        "6" ** 64, "7" ** 64, "8" ** 64, "9" ** 64, "a" ** 64, "b" ** 64,
+        "c" ** 64, "d" ** 64, "e" ** 64, "f" ** 64,
+    };
+    var picked: [4][]const u8 = undefined;
+    var picked_count: usize = 0;
+    outer: for (candidates) |candidate| {
+        const lane = DiskCache.ioLane(candidate);
+        for (picked[0..picked_count]) |already| {
+            if (DiskCache.ioLane(already) == lane) continue :outer;
+        }
+        picked[picked_count] = candidate;
+        picked_count += 1;
+        if (picked_count == 4) break;
+    }
+    try std.testing.expectEqual(@as(usize, 4), picked_count);
+    const primary_a = picked[0];
+    const sibling_a = picked[1];
+    const primary_b = picked[2];
+    const sibling_b = picked[3];
+
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    const record = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "variant",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    };
+
+    const RearmPoisonFault = struct {
+        fn hook(target: *DiskCache) void {
+            target.state_dir.fault = .write;
+            target.state_dir.fault_file = poison_name;
+        }
+    };
+
+    {
+        var cache = try DiskCache.init(allocator, root_path, limits, 99);
+        defer cache.deinit();
+        var variant = record;
+        variant.vary_primary_key = primary_a;
+        cache.put(sibling_a, variant, 0);
+        variant.vary_primary_key = primary_b;
+        cache.put(sibling_b, variant, 0);
+
+        // Pause A immediately after its own successful beginTransitionGuard
+        // and before its primary fence write.
+        var barrier = TestIoBarrier{ .key = primary_a };
+        cache.test_before_fence_write = &barrier;
+        const Putter = struct {
+            fn run(target: *DiskCache, primary: []const u8, rec: PutRecord, now_ms: u64) void {
+                target.put(primary, rec, now_ms);
+            }
+        };
+        var direct_a = record;
+        direct_a.body = "direct-a";
+        const thread = try std.Thread.spawn(.{}, Putter.run, .{ &cache, primary_a, direct_a, 1 });
+        barrier.waitUntilReached();
+
+        // While A is still mid-transition, B's own independent transition
+        // (a distinct I/O lane) must still be admitted, fence its family,
+        // retire it, and end its own guard reference.
+        var direct_b = record;
+        direct_b.body = "direct-b";
+        cache.put(primary_b, direct_b, 1);
+        try std.testing.expect(!cache.isVaryTracked(primary_b));
+
+        // The regression this test exists for: B ending its own guard
+        // reference must not remove the only durable guard file while A's
+        // transition is still active.
+        try std.testing.expect(cache.isTransitionGuardOnDisk());
+
+        // Resume A: its own fence write fails, a surviving sibling lane is
+        // held busy, and the poison write that follows also fails. It
+        // crashes -- no further calls -- without ever reaching
+        // endTransitionGuard for its own reference.
+        cache.io_lanes[DiskCache.ioLane(sibling_a)].lock();
+        cache.state_dir.fault = .write;
+        cache.state_dir.fault_file = primary_a;
+        cache.test_before_poison_write = &RearmPoisonFault.hook;
+        barrier.release();
+        thread.join();
+        cache.io_lanes[DiskCache.ioLane(sibling_a)].unlock();
+        cache.test_before_fence_write = null;
+        cache.test_before_poison_write = null;
+
+        try std.testing.expect(cache.disabled);
+        // Deliberately no further get/put/isVaryTracked call: the crash
+        // window under test is the one between here and process exit.
+    }
+
+    // Restart: A's still-active guard reference (never ended) keeps the
+    // durable file on disk even though B's own transition finished and
+    // cleanly ended its reference, so the next process must not trust
+    // either primary's stale siblings.
+    var reopened = try DiskCache.init(allocator, root_path, limits, 99);
+    defer reopened.deinit();
+    try std.testing.expect(reopened.disabled);
+    try std.testing.expect(!reopened.isVaryTracked(primary_a));
+    try std.testing.expect(!reopened.isVaryTracked(primary_b));
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(reopened.get(arena.allocator(), sibling_a, 2) == null);
+    try std.testing.expect(reopened.get(arena.allocator(), sibling_b, 2) == null);
+    try std.testing.expect(reopened.get(arena.allocator(), primary_a, 2) == null);
+    try std.testing.expect(reopened.get(arena.allocator(), primary_b, 2) == null);
+}
+
+test "DiskCache poison retry releases the index mutex so an unrelated key's lookup is not queued behind it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
+
+    var cache = try DiskCache.init(allocator, root_path, limits, 50);
+    defer cache.deinit();
+
+    // Disable with the poison write's own first attempt faulted, so the
+    // retry below still has work to do.
+    cache.state_dir.fault = .fsync_dir;
+    cache.state_dir.fault_file = poison_name;
+    cache.mutex.lock();
+    cache.disableLocked();
+    cache.mutex.unlock();
+    try std.testing.expect(cache.disabled);
+    try std.testing.expect(!cache.poison_write_confirmed);
+
+    const key_a = "1" ** 64;
+    const candidates = [_][]const u8{ "2" ** 64, "3" ** 64, "4" ** 64, "5" ** 64 };
+    var key_b = candidates[0];
+    for (candidates) |candidate| {
+        if (DiskCache.ioLane(candidate) != DiskCache.ioLane(key_a)) {
+            key_b = candidate;
+            break;
+        }
+    }
+    try std.testing.expect(DiskCache.ioLane(key_a) != DiskCache.ioLane(key_b));
+
+    var barrier = TestIoBarrier{ .key = poison_name };
+    cache.test_poison_write_barrier = &barrier;
+
+    const Getter = struct {
+        fn run(target: *DiskCache, key: []const u8, started: *std.atomic.Value(bool), done: *std.atomic.Value(bool), saw_miss: *bool) void {
+            started.store(true, .release);
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            saw_miss.* = target.get(arena.allocator(), key, 2) == null;
+            done.store(true, .release);
+        }
+    };
+    var a_started = std.atomic.Value(bool).init(false);
+    var a_done = std.atomic.Value(bool).init(false);
+    var a_saw_miss = false;
+    const stalled = try std.Thread.spawn(.{}, Getter.run, .{ &cache, key_a, &a_started, &a_done, &a_saw_miss });
+    while (!a_started.load(.acquire)) std.atomic.spinLoopHint();
+    barrier.waitUntilReached();
+
+    // The retry is stalled mid-write with `self.mutex` already released
+    // (the regression this test exists for: the old code held it across
+    // this exact write). An unrelated key's lookup must still complete
+    // rather than queue behind it.
+    var b_started = std.atomic.Value(bool).init(false);
+    var b_done = std.atomic.Value(bool).init(false);
+    var b_saw_miss = false;
+    const unrelated = try std.Thread.spawn(.{}, Getter.run, .{ &cache, key_b, &b_started, &b_done, &b_saw_miss });
+    while (!b_started.load(.acquire)) std.atomic.spinLoopHint();
+    var attempts: usize = 0;
+    while (!b_done.load(.acquire) and attempts < 100) : (attempts += 1) {
+        std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    const unrelated_completed = b_done.load(.acquire);
+    barrier.release();
+    stalled.join();
+    unrelated.join();
+    cache.test_poison_write_barrier = null;
+
+    try std.testing.expect(unrelated_completed);
+    try std.testing.expect(b_saw_miss);
+    try std.testing.expect(a_saw_miss);
     try std.testing.expect(cache.poison_write_confirmed);
 }

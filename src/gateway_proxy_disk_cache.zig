@@ -58,6 +58,10 @@ const max_reason_bytes: usize = 256;
 
 const record_magic = "TPDC3\x00\x00\x00".*;
 const tombstone_magic = "TPDCTMB3".*;
+/// Marks a primary whose Vary family has been superseded by a direct
+/// response. Unlike a tombstone (a transient direct->Vary guard), a fence
+/// masks every variant of its primary on restart.
+const fence_magic = "TPDCFNC3".*;
 const tombstone_bytes = tombstone_magic.len + @sizeOf(u64) + key_len + @sizeOf(u64);
 const io_lane_count: usize = 64;
 
@@ -151,6 +155,9 @@ const IndexValue = struct {
     vary_primary_key: ?[key_len]u8 = null,
     pending_write: bool = false,
     tombstone: bool = false,
+    /// A direct-policy fence (implies `tombstone`): masks the primary's
+    /// Vary family in-process and across restart until it is retired.
+    fence: bool = false,
 };
 
 const VaryIndexEntry = struct {
@@ -220,6 +227,7 @@ pub const DiskCache = struct {
             .max_vary_variants = @max(1, @min(limits.max_vary_variants, gpc.hard_max_vary_variants)),
         };
         self.reconcileFromDisk(root_path);
+        self.applyFencesAtStartup();
         self.evictToFitLocked();
         return self;
     }
@@ -334,6 +342,11 @@ pub const DiskCache = struct {
                 gop.value_ptr.tombstone = true;
                 continue;
             }
+            if (isFence(raw, entry.name, self.fingerprint)) {
+                gop.value_ptr.tombstone = true;
+                gop.value_ptr.fence = true;
+                continue;
+            }
             const decoded = decodeRecord(arena.allocator(), raw) catch {
                 self.disableLocked();
                 return;
@@ -411,6 +424,8 @@ pub const DiskCache = struct {
         while (it.next()) |kv| {
             if (except) |key| if (std.mem.eql(u8, kv.key_ptr.*, key)) continue;
             if (kv.value_ptr.pending_write) continue;
+            // A fence is the only thing masking its primary's variants.
+            if (kv.value_ptr.fence) continue;
             if (skipListContains(skip, kv.key_ptr.*)) continue;
             if (kv.value_ptr.last_used_ms < oldest_ms or
                 (kv.value_ptr.last_used_ms == oldest_ms and (oldest_key == null or std.mem.order(u8, kv.key_ptr.*, oldest_key.?) == .lt)))
@@ -420,6 +435,142 @@ pub const DiskCache = struct {
             }
         }
         return oldest_key;
+    }
+
+    /// Startup-only: every durable direct-policy fence masks its primary's
+    /// Vary family. Variants are unlinked durably and the fence itself is
+    /// then retired; any failure disables the tier rather than serving a
+    /// superseded representation.
+    fn applyFencesAtStartup(self: *DiskCache) void {
+        if (self.disabled) return;
+        var fences: std.ArrayList([key_len]u8) = .empty;
+        defer fences.deinit(self.allocator);
+        var it = self.index.iterator();
+        while (it.next()) |kv| {
+            if (!kv.value_ptr.fence) continue;
+            var buf: [key_len]u8 = undefined;
+            @memcpy(buf[0..], kv.key_ptr.*);
+            fences.append(self.allocator, buf) catch {
+                self.disableLocked();
+                return;
+            };
+        }
+        for (fences.items) |*primary| {
+            while (self.vary_index.getPtr(primary)) |family| {
+                if (family.count == 0) {
+                    self.pruneVariantLocked(primary, family.variant_keys[0][0..]);
+                    break;
+                }
+                const sibling = family.variant_keys[0];
+                const owned = self.detachLocked(sibling[0..]) orelse {
+                    self.pruneVariantLocked(primary, sibling[0..]);
+                    continue;
+                };
+                defer self.allocator.free(owned);
+                self.state_dir.removeFileDurable(owned) catch {
+                    self.disableLocked();
+                    return;
+                };
+            }
+            self.state_dir.removeFileDurable(primary) catch {
+                self.disableLocked();
+                return;
+            };
+            if (self.detachLocked(primary)) |owned| self.allocator.free(owned);
+        }
+    }
+
+    fn isFencedLocked(self: *DiskCache, primary: []const u8) bool {
+        return if (self.index.get(primary)) |marker| marker.fence else false;
+    }
+
+    /// Retires every tracked variant of `primary` once, each under its own
+    /// I/O lane. Returns true only when the whole family is gone.
+    fn retireFamilyWithIoHeld(self: *DiskCache, guard: IoGuard, primary: []const u8) bool {
+        self.mutex.lock();
+        if (self.disabled) {
+            self.mutex.unlock();
+            return false;
+        }
+        const snapshot: VaryIndexEntry = if (self.vary_index.get(primary)) |family| family else {
+            self.mutex.unlock();
+            return true;
+        };
+        self.mutex.unlock();
+        var complete = true;
+        for (snapshot.variant_keys[0..snapshot.count]) |*sibling| {
+            switch (self.retireVictimWithLanes(guard, sibling, primary)) {
+                .retired, .gone => {},
+                .busy => complete = false,
+                .failed => return false,
+            }
+        }
+        return complete;
+    }
+
+    /// Vary -> direct. A single durable fence at the primary is written
+    /// before any sibling is retired, so a busy lane or a crash between
+    /// sibling unlinks can only leave variants that restart masks. Returns
+    /// true when the family is fully retired and the direct record may
+    /// replace the fence.
+    fn fenceAndRetireFamilyWithIoHeld(self: *DiskCache, guard: IoGuard, primary: []const u8, now_ms: u64) bool {
+        self.mutex.lock();
+        if (self.disabled) {
+            self.mutex.unlock();
+            return false;
+        }
+        if (!self.vary_index.contains(primary)) {
+            self.mutex.unlock();
+            return true;
+        }
+        const fenced = self.isFencedLocked(primary);
+        self.mutex.unlock();
+
+        var fence_failed = false;
+        if (!fenced) {
+            var marker: [tombstone_bytes]u8 = undefined;
+            encodeFence(&marker, primary, self.fingerprint);
+            if (self.state_dir.writeFileAtomicLimit(primary, &marker, 0o600, tombstone_bytes)) |_| {
+                if (!self.publishFence(primary, now_ms)) return false;
+            } else |_| {
+                fence_failed = true;
+            }
+        }
+        const complete = self.retireFamilyWithIoHeld(guard, primary);
+        if (!complete and fence_failed) {
+            // No durable fence and the family could not be fully retired:
+            // stop trusting the disk tier rather than risk a stale replay.
+            self.mutex.lock();
+            self.disableLocked();
+            self.mutex.unlock();
+        }
+        return complete;
+    }
+
+    fn publishFence(self: *DiskCache, primary: []const u8, now_ms: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.disabled) return false;
+        if (self.index.getPtr(primary)) |existing| {
+            self.total_bytes -= existing.bytes;
+            existing.* = .{ .bytes = tombstone_bytes, .last_used_ms = now_ms, .tombstone = true, .fence = true };
+            self.total_bytes += tombstone_bytes;
+            return true;
+        }
+        const owned = self.allocator.dupe(u8, primary) catch {
+            self.disableLocked();
+            return false;
+        };
+        // Same capacity protocol as put(): leave room for every outstanding
+        // reservation plus this insertion.
+        self.index.ensureUnusedCapacity(@intCast(self.reserved_entries + 1)) catch {
+            self.allocator.free(owned);
+            self.disableLocked();
+            return false;
+        };
+        self.index.putAssumeCapacity(owned, .{ .bytes = tombstone_bytes, .last_used_ms = now_ms, .tombstone = true, .fence = true });
+        self.total_bytes += tombstone_bytes;
+        return true;
     }
 
     const RetireResult = enum { retired, gone, busy, failed };
@@ -643,29 +794,16 @@ pub const DiskCache = struct {
         // the process crashes, restart observes a safe miss instead of an
         // old unvaried/varied representation under the new policy.
         if (record.vary_primary_key) |primary| {
+            // A fenced family is obsolete: it must be gone before the
+            // primary may become varied again.
+            self.mutex.lock();
+            const fenced = self.isFencedLocked(primary);
+            self.mutex.unlock();
+            if (fenced and !self.retireFamilyWithIoHeld(io_guard, primary)) return;
             if (!self.installTombstoneWithIoHeld(primary, now_ms)) return;
             tombstone_primary = primary;
-        } else {
-            while (true) {
-                self.mutex.lock();
-                if (self.disabled) {
-                    self.mutex.unlock();
-                    return;
-                }
-                const victim: ?[key_len]u8 = if (self.vary_index.getPtr(key)) |index| blk: {
-                    if (index.count == 0) break :blk null;
-                    break :blk index.variant_keys[0];
-                } else null;
-                if (victim == null) {
-                    self.mutex.unlock();
-                    break;
-                }
-                self.mutex.unlock();
-                switch (self.retireVictimWithLanes(io_guard, &victim.?, key)) {
-                    .retired, .gone => {},
-                    .busy, .failed => return,
-                }
-            }
+        } else if (!self.fenceAndRetireFamilyWithIoHeld(io_guard, key, now_ms)) {
+            return;
         }
 
         // The policy fence above has already run, so every refusal below
@@ -904,7 +1042,9 @@ pub const DiskCache = struct {
     pub fn isVaryTracked(self: *DiskCache, primary_key: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return !self.disabled and self.vary_index.contains(primary_key);
+        if (self.disabled) return false;
+        if (self.index.get(primary_key)) |marker| if (marker.fence) return false;
+        return self.vary_index.contains(primary_key);
     }
 };
 
@@ -973,7 +1113,15 @@ fn encodeRecord(
 }
 
 fn encodeTombstone(out: *[tombstone_bytes]u8, key: []const u8, fingerprint: u64) void {
-    @memcpy(out[0..tombstone_magic.len], &tombstone_magic);
+    encodeMarker(out, tombstone_magic, key, fingerprint);
+}
+
+fn encodeFence(out: *[tombstone_bytes]u8, key: []const u8, fingerprint: u64) void {
+    encodeMarker(out, fence_magic, key, fingerprint);
+}
+
+fn encodeMarker(out: *[tombstone_bytes]u8, magic: [tombstone_magic.len]u8, key: []const u8, fingerprint: u64) void {
+    @memcpy(out[0..tombstone_magic.len], &magic);
     std.mem.writeInt(u64, out[tombstone_magic.len..][0..8], fingerprint, .little);
     const key_offset = tombstone_magic.len + 8;
     @memcpy(out[key_offset..][0..key_len], key);
@@ -983,8 +1131,16 @@ fn encodeTombstone(out: *[tombstone_bytes]u8, key: []const u8, fingerprint: u64)
 }
 
 fn isTombstone(raw: []const u8, key: []const u8, fingerprint: u64) bool {
+    return isMarker(raw, tombstone_magic, key, fingerprint);
+}
+
+fn isFence(raw: []const u8, key: []const u8, fingerprint: u64) bool {
+    return isMarker(raw, fence_magic, key, fingerprint);
+}
+
+fn isMarker(raw: []const u8, magic: [tombstone_magic.len]u8, key: []const u8, fingerprint: u64) bool {
     if (raw.len != tombstone_bytes) return false;
-    if (!std.mem.eql(u8, raw[0..tombstone_magic.len], &tombstone_magic)) return false;
+    if (!std.mem.eql(u8, raw[0..tombstone_magic.len], &magic)) return false;
     const stored_fingerprint = std.mem.readInt(u64, raw[tombstone_magic.len..][0..8], .little);
     if (stored_fingerprint != fingerprint) return false;
     const key_offset = tombstone_magic.len + 8;
@@ -2108,7 +2264,7 @@ test "DiskCache quota eviction fails closed when the victim cannot be durably un
     try std.testing.expect(cache.get(arena.allocator(), new_key, 2) == null);
 }
 
-test "DiskCache Vary-to-direct transition does not unlink a sibling whose lane is busy" {
+test "DiskCache Vary-to-direct fences the family durably when a sibling lane is busy" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2116,15 +2272,17 @@ test "DiskCache Vary-to-direct transition does not unlink a sibling whose lane i
     defer allocator.free(root_path);
     const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
     const primary = "c" ** 64;
-    const candidates = [_][]const u8{ "d" ** 64, "e" ** 64, "f" ** 64, "a" ** 64, "b" ** 64 };
-    var secondary = candidates[0];
+    const candidates = [_][]const u8{ "d" ** 64, "e" ** 64, "f" ** 64, "a" ** 64, "b" ** 64, "9" ** 64 };
+    var siblings: [2][]const u8 = undefined;
+    var found: usize = 0;
     for (candidates) |candidate| {
-        if (DiskCache.ioLane(candidate) != DiskCache.ioLane(primary)) {
-            secondary = candidate;
-            break;
-        }
+        if (DiskCache.ioLane(candidate) == DiskCache.ioLane(primary)) continue;
+        if (found == 1 and DiskCache.ioLane(candidate) == DiskCache.ioLane(siblings[0])) continue;
+        siblings[found] = candidate;
+        found += 1;
+        if (found == 2) break;
     }
-    try std.testing.expect(DiskCache.ioLane(secondary) != DiskCache.ioLane(primary));
+    try std.testing.expectEqual(@as(usize, 2), found);
     const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
     const record = PutRecord{
         .status_code = 200,
@@ -2136,23 +2294,76 @@ test "DiskCache Vary-to-direct transition does not unlink a sibling whose lane i
         .swr_until_ms = 60_000,
         .initial_age_seconds = 0,
     };
-    var cache = try DiskCache.init(allocator, root_path, limits, 96);
+    {
+        var cache = try DiskCache.init(allocator, root_path, limits, 96);
+        defer cache.deinit();
+        var variant = record;
+        variant.vary_primary_key = primary;
+        cache.put(siblings[0], variant, 0);
+        cache.put(siblings[1], variant, 0);
+
+        // Another operation owns the second sibling's lane: the transition
+        // retires the first, cannot retire the second, and must not publish
+        // the direct record. The in-process family is masked.
+        cache.io_lanes[DiskCache.ioLane(siblings[1])].lock();
+        var direct = record;
+        direct.body = "direct";
+        cache.put(primary, direct, 1);
+        cache.io_lanes[DiskCache.ioLane(siblings[1])].unlock();
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        try std.testing.expect(!cache.isVaryTracked(primary));
+        try std.testing.expect(cache.get(arena.allocator(), siblings[0], 2) == null);
+        try std.testing.expect(cache.get(arena.allocator(), primary, 2) == null);
+    }
+    // Restart: the durable fence masks the surviving sibling.
+    var reopened = try DiskCache.init(allocator, root_path, limits, 96);
+    defer reopened.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(!reopened.isVaryTracked(primary));
+    try std.testing.expect(reopened.get(arena.allocator(), siblings[0], 2) == null);
+    try std.testing.expect(reopened.get(arena.allocator(), siblings[1], 2) == null);
+    try std.testing.expect(reopened.get(arena.allocator(), primary, 2) == null);
+}
+
+test "DiskCache failed fence write with a busy sibling disables the tier" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
+    const primary = "c" ** 64;
+    const candidates = [_][]const u8{ "d" ** 64, "e" ** 64, "f" ** 64, "a" ** 64 };
+    var secondary = candidates[0];
+    for (candidates) |candidate| {
+        if (DiskCache.ioLane(candidate) != DiskCache.ioLane(primary)) {
+            secondary = candidate;
+            break;
+        }
+    }
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    const record = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "variant",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    };
+    var cache = try DiskCache.init(allocator, root_path, limits, 97);
     defer cache.deinit();
     var variant = record;
     variant.vary_primary_key = primary;
     cache.put(secondary, variant, 0);
-
-    // Another operation owns the sibling's lane: the transition must not
-    // delete the sibling out from under it, and must not publish the direct
-    // record either (safe miss).
+    cache.state_dir.fault = .write;
+    cache.state_dir.fault_file = primary;
     cache.io_lanes[DiskCache.ioLane(secondary)].lock();
-    var direct = record;
-    direct.body = "direct";
-    cache.put(primary, direct, 1);
+    cache.put(primary, record, 1);
     cache.io_lanes[DiskCache.ioLane(secondary)].unlock();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    try std.testing.expect(cache.get(arena.allocator(), secondary, 2) != null);
-    try std.testing.expect(cache.get(arena.allocator(), primary, 2) == null);
+    try std.testing.expect(cache.disabled);
 }

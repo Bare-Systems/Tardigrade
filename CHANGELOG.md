@@ -387,6 +387,21 @@ All notable user-facing changes to Tardigrade are documented here.
   `mode=full` dispatch) runs the complete suite. Require the single `CI result`
   check in branch protection; see `docs/CI.md`.
 
+- **Bounded `zig build test-fast` developer/agent gate (#944).** Profiled
+  the default `zig build test`'s 28 run artifacts and found its wall time
+  dominated by two single RSA-3072/4096 keygen/sign test cases (~21s each in
+  a Debug build's unoptimized bigint modexp) plus a handful of real-socket/
+  subprocess/benchmark targets. `test-fast` skips just those two cases (via
+  a new `TARDIGRADE_TEST_FAST` env var the full suite and CI leave unset)
+  and omits the real-socket QUIC/H3 UDP smoke, the H3 soak, the OpenSSL
+  differential, and the benchmark correctness smoke — each still reachable
+  through its own existing step and the unmodified default `test`. New
+  `-Dexe-test-filter=<substring>`/`test-exe-filtered` selects one named test
+  out of the ~2000-case `exe_unit_tests` population without running the rest,
+  guarded by a small static check against a filter matching zero tests
+  (Zig's own test filtering has no such failure mode on its own). See
+  CONTRIBUTING.md's "Test performance" section for the measured baseline.
+
 - **WebSocket tunnels no longer hold a request worker each (#818).** A
   worker still runs the handshake and every admission check (auth,
   `forward_auth`, rate limits, Origin, 0-RTT, tunnel cap), then hands the

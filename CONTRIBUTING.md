@@ -186,10 +186,11 @@ zig build test-exe-filtered -Dexe-test-filter="jwt"
 
 `-Dexe-test-filter` is required for this step -- omitting it fails the build
 rather than silently running (or silently skipping) everything. A filter that
-matches zero named tests also fails the build, via a small checked-in static
-check (`scripts/check_exe_test_filter_matches.zig`): Zig's own test filtering
-has no "zero tests matched" failure mode on its own (`src/main.zig`'s always-
-present unnamed `refAllDecls` smoke test still runs and still reports
+matches zero named tests also fails the build, via a small checked-in guard
+(`scripts/count_named_exe_test_matches.zig`) that queries the compiler's own
+post-filter test inventory for the real compilation: Zig's own test
+filtering has no "zero tests matched" failure mode on its own (`src/main.zig`'s
+always-present unnamed `refAllDecls` smoke test still runs and still reports
 success), so a stale or typo'd filter would otherwise pass silently.
 
 ## Failure-mode harness

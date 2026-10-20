@@ -639,25 +639,45 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_crypto_boundary_audit_tests.step);
     test_step.dependOn(&crypto_boundary_audit.step);
 
-    // #944: static zero-match guard for the new `-Dexe-test-filter`/
-    // `test-exe-filtered` step below. Same host-executable shape as
-    // `audit_crypto_boundary` just above and for the same reason (a
-    // dependency-free checked-in Zig program beats shelling out to an
-    // ambient tool, and it must run on the build host regardless of
-    // `-Dtarget`).
-    const exe_test_filter_check_mod = b.createModule(.{
-        .root_source_file = b.path("scripts/check_exe_test_filter_matches.zig"),
+    // #944: compiled-test-inventory zero-match guard for the new
+    // `-Dexe-test-filter`/`test-exe-filtered` step below. See that tool's
+    // doc comment for why this queries the compiler's own post-filter test
+    // inventory for the exact `exe_test_mod` compilation `test-exe-filtered`
+    // runs, rather than approximating it by walking source text.
+    const exe_test_filter_guard_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/count_named_exe_test_matches.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
-    exe_test_filter_check_mod.addImport("zig_compat", host_compat_mod);
-    const exe_test_filter_check_exe = b.addExecutable(.{
-        .name = "check_exe_test_filter_matches",
-        .root_module = exe_test_filter_check_mod,
+    const exe_test_filter_guard_tests = b.addTest(.{ .root_module = exe_test_filter_guard_mod });
+    const run_exe_test_filter_guard_tests = b.addRunArtifact(exe_test_filter_guard_tests);
+    test_step.dependOn(&run_exe_test_filter_guard_tests.step);
+
+    // End-to-end regression for the guard above: spawns the real `zig`
+    // compiler against fixture files to prove it rejects a filter that only
+    // reaches a comptime-unselected branch, accepts one that reaches a real
+    // named test, and that an ordinary failing selected test still fails on
+    // its own. See tests/exe_test_filter_guard_integration.zig.
+    const exe_test_filter_guard_integration_options = b.addOptions();
+    exe_test_filter_guard_integration_options.addOption([]const u8, "zig_exe_path", b.graph.zig_exe);
+    exe_test_filter_guard_integration_options.addOption(
+        []const u8,
+        "count_named_exe_test_matches_path",
+        b.pathFromRoot("scripts/count_named_exe_test_matches.zig"),
+    );
+    const exe_test_filter_guard_integration_mod = b.createModule(.{
+        .root_source_file = b.path("tests/exe_test_filter_guard_integration.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
     });
-    const exe_test_filter_check_tests = b.addTest(.{ .root_module = exe_test_filter_check_mod });
-    const run_exe_test_filter_check_tests = b.addRunArtifact(exe_test_filter_check_tests);
-    test_step.dependOn(&run_exe_test_filter_check_tests.step);
+    exe_test_filter_guard_integration_mod.addImport("zig_compat", host_compat_mod);
+    exe_test_filter_guard_integration_mod.addImport(
+        "exe_test_filter_guard_integration_options",
+        exe_test_filter_guard_integration_options.createModule(),
+    );
+    const exe_test_filter_guard_integration_tests = b.addTest(.{ .root_module = exe_test_filter_guard_integration_mod });
+    const run_exe_test_filter_guard_integration_tests = b.addRunArtifact(exe_test_filter_guard_integration_tests);
+    test_step.dependOn(&run_exe_test_filter_guard_integration_tests.step);
 
     // Bounded session-resumption cache (#364/#365). Kept as a standalone
     // test target for focused cache/persistence coverage, while also exported
@@ -1242,15 +1262,16 @@ pub fn build(b: *std.Build) void {
 
     // #944: run a single named subsystem/test out of the ~2000-case
     // exe_unit_tests population (`src/main.zig`'s test tree) without
-    // compiling a second test runner and without executing the whole
-    // population at runtime. `-Dexe-test-filter` is required: an omitted
-    // filter fails the build via `missing_exe_test_filter` instead of
-    // silently running (or silently skipping) everything, and a filter that
-    // matches zero named tests fails via `check_exe_test_filter_matches`
-    // instead of silently passing on the always-present unnamed
-    // `refAllDecls` smoke test (see that tool's doc comment). An empty
-    // string is a distinct, realistic misuse (e.g. an unset shell variable
-    // in `-Dexe-test-filter="$TEST_NAME"`): Zig's own `.filters = &.{""}`
+    // executing the whole population at runtime. `-Dexe-test-filter` is
+    // required: an omitted filter fails the build via
+    // `missing_exe_test_filter` instead of silently running (or silently
+    // skipping) everything, and a filter that matches zero named tests
+    // fails via the compiled-test-inventory guard built from
+    // `scripts/count_named_exe_test_matches.zig` instead of silently
+    // passing on the always-present unnamed `refAllDecls` smoke test (see
+    // that tool's doc comment). An empty string is a distinct, realistic
+    // misuse (e.g. an unset shell variable in
+    // `-Dexe-test-filter="$TEST_NAME"`): Zig's own `.filters = &.{""}`
     // matches every test name via empty-substring semantics, so it is
     // rejected the same way as an omitted filter rather than silently
     // running the whole population.
@@ -1260,12 +1281,18 @@ pub fn build(b: *std.Build) void {
             const empty_exe_test_filter = b.addFail("test-exe-filtered requires a non-empty -Dexe-test-filter=<substring>; an empty filter would match every exe_unit_tests name instead of naming the test(s) to run");
             test_exe_filtered_step.dependOn(&empty_exe_test_filter.step);
         } else {
-            const filter_check = b.addRunArtifact(exe_test_filter_check_exe);
-            filter_check.addArgs(&.{ "src/main.zig", filter });
-            filter_check.setCwd(b.path("."));
+            const exe_test_filter_probe = b.addTest(.{
+                .root_module = exe_test_mod,
+                .filters = &.{filter},
+                .test_runner = .{
+                    .path = b.path("scripts/count_named_exe_test_matches.zig"),
+                    .mode = .simple,
+                },
+            });
+            const run_exe_test_filter_probe = b.addRunArtifact(exe_test_filter_probe);
             const exe_test_filtered = b.addTest(.{ .root_module = exe_test_mod, .filters = &.{filter} });
             const run_exe_test_filtered = b.addRunArtifact(exe_test_filtered);
-            test_exe_filtered_step.dependOn(&filter_check.step);
+            test_exe_filtered_step.dependOn(&run_exe_test_filter_probe.step);
             test_exe_filtered_step.dependOn(&run_exe_test_filtered.step);
         }
     } else {
@@ -1318,7 +1345,7 @@ pub fn build(b: *std.Build) void {
     test_fast_step.dependOn(&run_crypto_secret_tests.step);
     test_fast_step.dependOn(&run_crypto_boundary_audit_tests.step);
     test_fast_step.dependOn(&crypto_boundary_audit.step);
-    test_fast_step.dependOn(&run_exe_test_filter_check_tests.step);
+    test_fast_step.dependOn(&run_exe_test_filter_guard_tests.step);
     test_fast_step.dependOn(&run_session_cache_tests.step);
     test_fast_step.dependOn(&run_session_cache_persistence_tests.step);
     test_fast_step.dependOn(&run_crypto_vector_tests.step);

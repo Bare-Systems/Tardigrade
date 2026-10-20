@@ -1464,6 +1464,23 @@ pub fn unlinkAt(dir_fd: std.posix.fd_t, name: []const u8) void {
     _ = std.c.unlinkat(dir_fd, z, 0);
 }
 
+/// Checked unlink relative to a directory descriptor. Returns false when the
+/// target is already absent; callers that need crash durability must fsync
+/// the parent descriptor after a true result.
+pub fn unlinkAtChecked(dir_fd: std.posix.fd_t, name: []const u8) StateFileError!bool {
+    var buf: [256]u8 = undefined;
+    const z = try cString(&buf, name);
+    while (true) {
+        const rc = std.c.unlinkat(dir_fd, z, 0);
+        switch (std.c.errno(rc)) {
+            .SUCCESS => return true,
+            .INTR => continue,
+            .NOENT => return false,
+            else => return error.IoFailure,
+        }
+    }
+}
+
 /// Path-based helpers for tests that need to tamper with state on disk.
 pub fn chmodPath(path: []const u8, mode: u32) StateFileError!void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;

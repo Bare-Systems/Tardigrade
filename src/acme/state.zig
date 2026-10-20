@@ -171,6 +171,25 @@ pub const StateDir = struct {
         return openSubdirRaw(self.dir_fd, &self.fault, &self.fault_file, name, false);
     }
 
+    /// Best-effort unlink; a missing file is not an error. Same contract as
+    /// `SubDir.removeFile`, for callers that store entries directly in the
+    /// top-level state directory rather than a nested subdirectory (#903).
+    pub fn removeFile(self: *StateDir, name: []const u8) void {
+        if (!validName(name)) return;
+        zig_compat.unlinkAt(self.dir_fd, name);
+    }
+
+    /// Durably unlink one top-level state file. A successful return means
+    /// both the directory mutation and its parent-directory fsync completed;
+    /// callers can therefore rely on the deletion across a power loss.
+    pub fn removeFileDurable(self: *StateDir, name: []const u8) Error!void {
+        if (!validName(name)) return error.InvalidPath;
+        const removed = zig_compat.unlinkAtChecked(self.dir_fd, name) catch return error.IoFailure;
+        if (!removed) return;
+        try hitFault(&self.fault, &self.fault_file, name, .fsync_dir);
+        zig_compat.fsyncFd(self.dir_fd) catch return error.IoFailure;
+    }
+
     /// Remove `.<name>.tmp-*` leftovers from a crashed writer. We hold the
     /// lock, so no live writer owns them. Best effort: failure to clean up
     /// must not block startup, and a leftover is mode `0600` anyway.

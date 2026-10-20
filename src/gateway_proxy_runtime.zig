@@ -109,50 +109,341 @@ pub fn prepareHttp1CacheReplay(allocator: std.mem.Allocator, hit: *const gpc.Loo
 /// request carrying more than one `Accept-Encoding` field instance (#935
 /// review). Callers must only call this for an original request method of
 /// `GET` -- a `HEAD` response has no body to store.
-pub fn tryFillResponseCache(
+const PreparedResponseCacheFill = struct {
+    freshness: gpc.Freshness,
+    owned_headers: []gpc.CacheHeaderView,
+    params: gpc.PutParams,
+};
+
+fn prepareResponseCacheFill(
     scratch: std.mem.Allocator,
-    state: *GatewayState,
-    generation: u64,
     ttl_ceiling_seconds: u32,
-    key: []const u8,
+    swr_ceiling_seconds: u32,
     buffered: *const BufferedUpstreamResponse,
-    request_headers: *const http.Headers,
-) !void {
-    if (buffered.status_code != 200) return;
-    // The buffered body is never decoded, and `buffered.headers` can no
-    // longer say whether the upstream sent `Content-Encoding` (the H1 parser
-    // already stripped it). Replaying compressed bytes from the cache
-    // without that header would corrupt every representation this admits, so
-    // refuse admission outright rather than assume absent-here means
-    // identity bytes (#935 review).
-    if (buffered.had_content_encoding) return;
-    const freshness = gpc.responseFreshness(buffered.headers, ttl_ceiling_seconds) orelse return;
+) !?PreparedResponseCacheFill {
+    if (buffered.status_code != 200 or buffered.had_content_encoding) return null;
+    const freshness = gpc.responseFreshness(buffered.headers, ttl_ceiling_seconds) orelse return null;
     const put_headers = try scratch.alloc(gpc.CacheHeaderView, buffered.headers.len);
-    defer scratch.free(put_headers);
     var put_header_count: usize = 0;
     for (buffered.headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "age")) continue;
         put_headers[put_header_count] = .{ .name = h.name, .value = h.value };
         put_header_count += 1;
     }
-    const params = gpc.PutParams{
-        .status_code = buffered.status_code,
-        .reason = buffered.reason,
-        .headers = put_headers[0..put_header_count],
-        .body = buffered.body,
-        .ttl_seconds = freshness.ttl_seconds,
-        .initial_age_seconds = freshness.initial_age_seconds,
+    return .{
+        .freshness = freshness,
+        .owned_headers = put_headers,
+        .params = .{
+            .status_code = buffered.status_code,
+            .reason = buffered.reason,
+            .headers = put_headers[0..put_header_count],
+            .body = buffered.body,
+            .ttl_seconds = freshness.ttl_seconds,
+            .initial_age_seconds = freshness.initial_age_seconds,
+            .swr_seconds = gpc.staleWhileRevalidateSeconds(freshness, swr_ceiling_seconds),
+        },
     };
+}
+
+pub fn tryFillResponseCache(
+    scratch: std.mem.Allocator,
+    state: *GatewayState,
+    generation: u64,
+    ttl_ceiling_seconds: u32,
+    swr_ceiling_seconds: u32,
+    key: []const u8,
+    buffered: *const BufferedUpstreamResponse,
+    request_headers: *const http.Headers,
+) !void {
+    const prepared = (try prepareResponseCacheFill(scratch, ttl_ceiling_seconds, swr_ceiling_seconds, buffered)) orelse return;
+    defer scratch.free(prepared.owned_headers);
     const now_ms = http.event_loop.monotonicMs();
-    if (!freshness.vary_on_accept_encoding) {
-        try state.proxyResponseCachePut(now_ms, generation, key, params);
+    if (!prepared.freshness.vary_on_accept_encoding) {
+        try state.proxyResponseCachePut(now_ms, generation, key, prepared.params);
         return;
     }
     var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
     const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, request_headers) orelse return;
     var secondary_buf: [64]u8 = undefined;
     const secondary_key = gpc.buildVaryVariantKey(&secondary_buf, key, discriminator);
-    try state.proxyResponseCachePutVaryVariant(now_ms, generation, key, secondary_key, params);
+    try state.proxyResponseCachePutVaryVariant(now_ms, generation, key, secondary_key, prepared.params);
+}
+
+fn findCacheHeaderValue(headers: []const gpc.CacheHeader, name: []const u8) ?[]const u8 {
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
+}
+
+/// Owns every allocation a detached background revalidation needs, on its
+/// own arena so cleanup (success or failure) is always exactly one
+/// `arena.deinit()` -- never a hand-matched chain of individual frees.
+const ProxyResponseCacheRevalidationTask = struct {
+    arena: std.heap.ArenaAllocator,
+    state: *GatewayState,
+    config_lease: gs.ConfigLease,
+    generation: u64,
+    primary_key: []const u8,
+    effective_key: []const u8,
+    revision: u64,
+    etag: ?[]const u8,
+    last_modified: ?[]const u8,
+    accept_encoding: ?[]const u8,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]const u8,
+    query: ?[]const u8,
+    incoming_host: ?[]const u8,
+    client_ip: []const u8,
+    proxy_set_headers: []const http.location_router.ProxySetHeader,
+};
+
+fn buildProxyResponseCacheRevalidationTask(
+    task: *ProxyResponseCacheRevalidationTask,
+    state: *GatewayState,
+    config_lease: *gs.ConfigLease,
+    generation: u64,
+    primary_key: []const u8,
+    effective_key: []const u8,
+    revision: u64,
+    hit_headers: []const gpc.CacheHeader,
+    accept_encoding: ?[]const u8,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]const u8,
+    query: ?[]const u8,
+    incoming_host: ?[]const u8,
+    client_ip: []const u8,
+    proxy_set_headers: []const http.location_router.ProxySetHeader,
+) !void {
+    task.arena = std.heap.ArenaAllocator.init(state.allocator);
+    errdefer task.arena.deinit();
+    const a = task.arena.allocator();
+    task.state = state;
+    task.config_lease = config_lease.retain();
+    errdefer task.config_lease.release();
+    task.generation = generation;
+    task.primary_key = try a.dupe(u8, primary_key);
+    task.effective_key = try a.dupe(u8, effective_key);
+    task.revision = revision;
+    task.etag = if (findCacheHeaderValue(hit_headers, "etag")) |v| try a.dupe(u8, v) else null;
+    task.last_modified = if (findCacheHeaderValue(hit_headers, "last-modified")) |v| try a.dupe(u8, v) else null;
+    task.accept_encoding = if (accept_encoding) |v| try a.dupe(u8, v) else null;
+    task.proxy_pass_target = try a.dupe(u8, proxy_pass_target);
+    task.suffix_path = if (suffix_path) |v| try a.dupe(u8, v) else null;
+    task.query = if (query) |v| try a.dupe(u8, v) else null;
+    task.incoming_host = if (incoming_host) |v| try a.dupe(u8, v) else null;
+    task.client_ip = try a.dupe(u8, client_ip);
+    task.proxy_set_headers = proxy_set_headers;
+}
+
+/// Performs the actual upstream GET (with conditional validators reused from
+/// the stale hit, never a blind re-fetch) and refills the cache on a fresh
+/// `200`. A successful `304` atomically renews the exact representation that
+/// supplied the validators while retaining its body. Other statuses and
+/// transport errors leave the stale entry to expire normally.
+fn proxyResponseCacheRevalidationThread(task: *ProxyResponseCacheRevalidationTask) void {
+    var succeeded = false;
+    defer {
+        const state = task.state;
+        const allocator = state.allocator;
+        if (!succeeded) state.proxyResponseCacheRecordRevalidationFailure(
+            task.generation,
+            task.effective_key,
+            task.revision,
+            http.event_loop.monotonicMs(),
+        );
+        state.proxyResponseCacheUnlockRevalidation(task.primary_key);
+        task.config_lease.release();
+        task.arena.deinit();
+        allocator.destroy(task);
+        // Last access to `state`: reload/shutdown may proceed as soon as this
+        // publishes the final completion.
+        state.proxyResponseCacheRevalidationFinished();
+    }
+
+    if (task.state.proxy_response_cache_revalidation_cancel.isStopped()) return;
+
+    const cfg = task.config_lease.cfg;
+    var headers = http.Headers.init(task.arena.allocator());
+    if (task.incoming_host) |h| headers.append("Host", h) catch return;
+    if (task.accept_encoding) |v| headers.append("Accept-Encoding", v) catch return;
+    if (task.etag) |v| headers.append("If-None-Match", v) catch return;
+    if (task.last_modified) |v| headers.append("If-Modified-Since", v) catch return;
+
+    const upstream_pool = upstreamPoolForScope(cfg, .global);
+    const selected_base_url = task.state.nextUpstreamBaseUrl(cfg, upstream_pool, task.client_ip, task.proxy_pass_target);
+    const resolved = resolveProxyTarget(task.arena.allocator(), selected_base_url, task.proxy_pass_target, task.suffix_path) catch return;
+    const upstream_url = appendProxyQueryString(task.arena.allocator(), resolved.url, task.query) catch return;
+    const forwarded_proto = if (edge_config.usesNativeTls(cfg)) "https" else "http";
+
+    const buffered = executeBoundedBufferedHttpProxyRequest(
+        task.arena.allocator(),
+        cfg,
+        upstream_url.value,
+        resolved.unix_socket_path,
+        "GET",
+        &headers,
+        "",
+        "proxy-cache-revalidate",
+        task.client_ip,
+        forwarded_proto,
+        task.incoming_host,
+        null,
+        task.proxy_set_headers,
+        null,
+        null,
+        null,
+        null,
+        false,
+        cfg.upstream_timeout_ms,
+        cfg.upstream_connect_timeout_ms,
+        cfg.upstream_response_timeout_ms,
+        &task.state.proxy_response_cache_revalidation_cancel,
+        &task.state.upstream_pool,
+        &task.state.h2_pool,
+    ) catch return;
+
+    if (buffered.status_code == 304) {
+        const metadata = task.arena.allocator().alloc(gpc.CacheHeaderView, buffered.headers.len) catch return;
+        for (buffered.headers, 0..) |header, i| metadata[i] = .{ .name = header.name, .value = header.value };
+        task.state.proxyResponseCacheRefreshNotModified(
+            task.arena.allocator(),
+            http.event_loop.monotonicMs(),
+            task.generation,
+            task.primary_key,
+            task.effective_key,
+            task.revision,
+            metadata,
+            cfg.proxy_cache_ttl_seconds,
+            cfg.proxy_cache_stale_while_revalidate_seconds,
+        ) catch |err| {
+            if (err == error.NotCacheable or err == error.VaryMismatch) {
+                task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision);
+                succeeded = true;
+            } else if (err == error.CacheRevisionMismatch) {
+                succeeded = true;
+            }
+            return;
+        };
+        succeeded = true;
+        return;
+    }
+    if (buffered.status_code != 200) return;
+    const prepared = (prepareResponseCacheFill(
+        task.arena.allocator(),
+        cfg.proxy_cache_ttl_seconds,
+        cfg.proxy_cache_stale_while_revalidate_seconds,
+        &buffered,
+    ) catch return) orelse {
+        task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision);
+        succeeded = true;
+        return;
+    };
+    defer task.arena.allocator().free(prepared.owned_headers);
+
+    var secondary_buf: [64]u8 = undefined;
+    const secondary_key: ?[]const u8 = if (!prepared.freshness.vary_on_accept_encoding)
+        null
+    else blk: {
+        var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
+        const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, &headers) orelse {
+            task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision);
+            succeeded = true;
+            return;
+        };
+        break :blk gpc.buildVaryVariantKey(&secondary_buf, task.primary_key, discriminator);
+    };
+    task.state.proxyResponseCacheReplaceRevalidated(
+        http.event_loop.monotonicMs(),
+        task.generation,
+        task.primary_key,
+        task.effective_key,
+        task.revision,
+        secondary_key,
+        prepared.params,
+    ) catch |err| {
+        if (err == error.CacheRevisionMismatch) succeeded = true;
+        return;
+    };
+    succeeded = true;
+}
+
+/// Triggers, at most, one bounded single-flight background revalidation for
+/// `primary_key` (#903). Best-effort and silent on every bail-out path: the
+/// caller has already served the stale hit to its own client regardless of
+/// whether this spawns anything. Admission, generation, per-key cooldown,
+/// the global concurrency cap, and the single-flight key are committed
+/// together under the cache mutex so reload cannot pass its drain barrier
+/// while an old request is between those checks and registration.
+pub fn maybeSpawnProxyResponseCacheRevalidation(
+    state: *GatewayState,
+    config_lease: *gs.ConfigLease,
+    generation: u64,
+    primary_key: []const u8,
+    effective_key: []const u8,
+    revision: u64,
+    hit_headers: []const gpc.CacheHeader,
+    accept_encoding: ?[]const u8,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]const u8,
+    query: ?[]const u8,
+    incoming_host: ?[]const u8,
+    client_ip: []const u8,
+    proxy_set_headers: []const http.location_router.ProxySetHeader,
+) void {
+    switch (state.proxyResponseCacheTryRegisterRevalidation(
+        generation,
+        primary_key,
+        effective_key,
+        revision,
+        http.event_loop.monotonicMs(),
+    ) catch return) {
+        .admitted => {},
+        .concurrency => {
+            state.metricsRecordProxyCacheOutcome(.revalidation_skipped_concurrency);
+            return;
+        },
+        .unavailable => return,
+    }
+
+    const task = state.allocator.create(ProxyResponseCacheRevalidationTask) catch {
+        state.proxyResponseCacheUnlockRevalidation(primary_key);
+        state.proxyResponseCacheRevalidationFinished();
+        return;
+    };
+    buildProxyResponseCacheRevalidationTask(
+        task,
+        state,
+        config_lease,
+        generation,
+        primary_key,
+        effective_key,
+        revision,
+        hit_headers,
+        accept_encoding,
+        proxy_pass_target,
+        suffix_path,
+        query,
+        incoming_host,
+        client_ip,
+        proxy_set_headers,
+    ) catch {
+        state.allocator.destroy(task);
+        state.proxyResponseCacheUnlockRevalidation(primary_key);
+        state.proxyResponseCacheRevalidationFinished();
+        return;
+    };
+    state.metricsRecordProxyCacheOutcome(.revalidation_spawned);
+    const thread = std.Thread.spawn(.{}, proxyResponseCacheRevalidationThread, .{task}) catch {
+        var lease = task.config_lease;
+        lease.release();
+        task.arena.deinit();
+        state.allocator.destroy(task);
+        state.proxyResponseCacheUnlockRevalidation(primary_key);
+        state.proxyResponseCacheRevalidationFinished();
+        return;
+    };
+    thread.detach();
 }
 
 pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
@@ -836,7 +1127,7 @@ pub fn handleLocationProxyPass(
             } else {
                 const lookup_now_ms = http.event_loop.monotonicMs();
                 const cache_hit = blk: {
-                    break :blk state.proxyResponseCacheLookup(temp_allocator, ctx.config_generation, effective_key.?, lookup_now_ms) catch {
+                    break :blk state.proxyResponseCacheLookup(temp_allocator, ctx.config_generation, key_buf[0..], effective_key.?, lookup_now_ms) catch {
                         // The cache is an optimization: scratch allocation or an
                         // internal cache error must not turn a live proxy request
                         // into a gateway error.
@@ -844,7 +1135,7 @@ pub fn handleLocationProxyPass(
                         break :blk null;
                     };
                 };
-                const disposition: gpc.ServeDisposition = if (cache_hit) |hit| gpc.decideCacheServe(hit.headers, &request.headers) else .require_origin;
+                const disposition: gpc.ServeDisposition = if (cache_hit) |hit| gpc.decideLookupServe(&hit, &request.headers) else .require_origin;
                 if (cache_hit) |hit| {
                     if (disposition != .require_origin) {
                         // Replay assembly is cache-only work. If it cannot
@@ -871,10 +1162,33 @@ pub fn handleLocationProxyPass(
                                 // (#935 review).
                                 .wire_content_length_override = hit.body.len,
                             };
-                            state.metricsRecordProxyCacheOutcome(.hit);
+                            state.metricsRecordProxyCacheOutcome(if (hit.stale) .stale else .hit);
                             ctx.setUpstreamResult(target, prepared.status_code, prepared.body.len);
                             try writeBufferedUpstreamResponseWithMetrics(writer, &replay, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, null, &state.metrics, &state.metrics_mutex);
                             state.metricsRecord(prepared.status_code);
+                            // #903: the client already has its answer; a
+                            // bounded, single-flight background refresh
+                            // runs independently of this response.
+                            if (hit.stale) {
+                                if (ctx.response_stream_config_lease) |raw_lease| {
+                                    maybeSpawnProxyResponseCacheRevalidation(
+                                        state,
+                                        @ptrCast(@alignCast(raw_lease)),
+                                        ctx.config_generation,
+                                        key_buf[0..],
+                                        effective_key.?,
+                                        hit.revision,
+                                        hit.headers,
+                                        request.headers.get("accept-encoding"),
+                                        target,
+                                        suffix_path,
+                                        request.uri.query,
+                                        incoming_host,
+                                        client_ip,
+                                        matched_block.proxy_set_headers,
+                                    );
+                                }
+                            }
                             return prepared.status_code;
                         }
                     }
@@ -1226,7 +1540,7 @@ pub fn handleLocationProxyPass(
 
     if (response_cache_key) |key_bytes| {
         const buffered = upstream_response.boundedBufferedForCompatibility();
-        tryFillResponseCache(temp_allocator, state, ctx.config_generation, cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered, &request.headers) catch {
+        tryFillResponseCache(temp_allocator, state, ctx.config_generation, cfg.proxy_cache_ttl_seconds, cfg.proxy_cache_stale_while_revalidate_seconds, key_bytes[0..], buffered, &request.headers) catch {
             state.metricsRecordProxyCacheOutcome(.fill_error);
         };
     }

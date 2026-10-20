@@ -1,5 +1,10 @@
-//! Conservative, bounded, in-memory GET response cache for the generic
-//! `proxy_pass` data plane (#901 C1, extended by #902 C2).
+//! Bounded, in-memory GET response cache for the generic `proxy_pass` data
+//! plane (#901 C1, extended by #902 C2 and #903 C3). The disk tier itself
+//! lives in `gateway_proxy_disk_cache.zig`, wired in via `GatewayState`
+//! (`gateway_state.zig`) rather than here -- this module owns eligibility,
+//! freshness/stale-while-revalidate windowing, variant/validator handling,
+//! and the bounded in-memory store that both a direct lookup and a disk
+//! hydration fill into.
 //!
 //! C1 is a deliberately narrow slice: only complete, buffered, successful
 //! `GET` responses with explicit origin freshness (`max-age`/`s-maxage`) are
@@ -7,8 +12,7 @@
 //! (`Authorization`, `Cookie`, verified client certificate, built-in auth,
 //! `forward_auth`, or any configured policy rule). `Set-Cookie` and
 //! `no-store`/`private`/`no-cache` responses are never stored, and neither is
-//! a response carrying any `Vary` value this cache does not understand. No
-//! disk tier here -- that is #903.
+//! a response carrying any `Vary` value this cache does not understand.
 //!
 //! C2 adds, on top of that conservative base: a bounded, FIFO-capped
 //! `Vary: Accept-Encoding` variant store (every other `Vary` field name, and
@@ -16,14 +20,20 @@
 //! per-header variant space); `ETag`/`Last-Modified` validator-based
 //! conditional responses answered entirely from an already-fresh cache entry
 //! (`If-None-Match`/`If-Modified-Since` -> `304`); and serving `HEAD` from a
-//! stored `GET` entry's metadata. Upstream-initiated revalidation of a
-//! *stale* entry (the cache itself issuing a conditional request to the
-//! origin and refreshing metadata on a `304`) and bounded single-flight fill
-//! collapsing are not implemented here; see the C2 follow-up issue. The entry
-//! representation below is intentionally separate from
-//! `http.idempotency.IdempotencyStore`, which only models
-//! `status/body/content_type` and is not a fit for replaying arbitrary
-//! response headers with a correct `Age`.
+//! stored `GET` entry's metadata.
+//!
+//! C3 adds a bounded stale-while-revalidate window (`swr_seconds`/
+//! `swr_until_ms`): a hit past `expires_at_ms` but before `swr_until_ms` is
+//! returned with `LookupResult.stale = true` rather than evicted outright,
+//! and is never extended for a response carrying `must-revalidate`/
+//! `proxy-revalidate` (`Freshness.forbids_stale`). Triggering the actual
+//! bounded, single-flight background refresh for a stale hit is the
+//! caller's job (`gateway_proxy_runtime.maybeSpawnProxyResponseCacheRevalidation`),
+//! not this module's. Bounded simultaneous-miss fill collapsing is not
+//! implemented here; see the open follow-up issue. The entry representation
+//! below is intentionally separate from `http.idempotency.IdempotencyStore`,
+//! which only models `status/body/content_type` and is not a fit for
+//! replaying arbitrary response headers with a correct `Age`.
 
 const std = @import("std");
 const compat = @import("zig_compat");
@@ -74,6 +84,22 @@ pub const PutParams = struct {
     /// separately from resident time so replay emits the RFC-correct current
     /// age even if the process monotonic clock started after the origin did.
     initial_age_seconds: u32 = 0,
+    /// Bounded stale-while-revalidate window (#903), already capped by the
+    /// operator ceiling and zeroed by the caller whenever the response
+    /// forbids stale serving (`must-revalidate`/`proxy-revalidate`) or the
+    /// feature is disabled. `0` means this entry is evicted outright at
+    /// `ttl_seconds`, the same as before #903.
+    swr_seconds: u32 = 0,
+    /// Exact persisted timing used only when hydrating a disk record. This
+    /// avoids rounding a sub-second remaining lifetime up to a fresh second
+    /// and preserves the original Age basis across process restarts.
+    absolute_timing: ?AbsoluteTiming = null,
+
+    pub const AbsoluteTiming = struct {
+        stored_at_ms: u64,
+        expires_at_ms: u64,
+        swr_until_ms: u64,
+    };
 };
 
 pub const LookupResult = struct {
@@ -82,6 +108,28 @@ pub const LookupResult = struct {
     headers: []CacheHeader,
     body: []u8,
     age_seconds: u32,
+    /// Set when this hit is past its `ttl_seconds` freshness lifetime but
+    /// still inside its `swr_seconds` stale-serving window (#903). A caller
+    /// that serves a stale hit is responsible for triggering (bounded,
+    /// single-flight) background revalidation; `lookup`/lookup-equivalents
+    /// never do this themselves.
+    stale: bool = false,
+    /// Changes every time this exact key is replaced or refreshed. A
+    /// background 304 must still match this revision before it can renew the
+    /// representation it originally validated.
+    revision: u64 = 0,
+};
+
+pub const PersistenceSnapshot = struct {
+    status_code: u16,
+    reason: []const u8,
+    headers: []CacheHeaderView,
+    body: []const u8,
+    stored_at_ms: u64,
+    expires_at_ms: u64,
+    swr_until_ms: u64,
+    initial_age_seconds: u32,
+    vary_primary_key: ?[]const u8,
 };
 
 const Entry = struct {
@@ -96,6 +144,11 @@ const Entry = struct {
     body: []u8,
     stored_at_ms: u64,
     expires_at_ms: u64,
+    /// `expires_at_ms + swr_seconds * 1000` (#903); equal to `expires_at_ms`
+    /// when this entry has no stale-serving window. `lookup` evicts at this
+    /// deadline instead of `expires_at_ms`, reporting `LookupResult.stale`
+    /// for anything served past `expires_at_ms` but before this.
+    swr_until_ms: u64,
     initial_age_seconds: u32,
     /// Accounted size used for the aggregate/per-object caps; computed once
     /// at fill time from the same fields.
@@ -107,6 +160,9 @@ const Entry = struct {
     /// (expiry, FIFO eviction, or an unvaried refill), instead of only ever
     /// growing the index (#935 review).
     vary_primary_key: ?[]const u8 = null,
+    revision: u64,
+    revalidation_failures: u8 = 0,
+    revalidation_retry_at_ms: u64 = 0,
 
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         self.metadata_arena.deinit();
@@ -167,6 +223,7 @@ pub const ProxyResponseCache = struct {
     limits: Limits,
     vary_index: std.StringHashMap(VaryIndexEntry),
     max_vary_variants: usize,
+    next_revision: u64 = 1,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) ProxyResponseCache {
         return .{
@@ -318,10 +375,11 @@ pub const ProxyResponseCache = struct {
     /// `null` on a miss or an expired entry (which this also evicts).
     pub fn lookup(self: *ProxyResponseCache, scratch: std.mem.Allocator, key: []const u8, now_ms: u64) !?LookupResult {
         const entry = self.map.getPtr(key) orelse return null;
-        if (now_ms >= entry.expires_at_ms) {
+        if (now_ms >= entry.swr_until_ms) {
             self.removeLocked(key);
             return null;
         }
+        const stale = now_ms >= entry.expires_at_ms;
         const reason_copy = try scratch.dupe(u8, entry.reason);
         const headers_copy = try scratch.alloc(CacheHeader, entry.headers.len);
         for (entry.headers, 0..) |h, i| {
@@ -344,6 +402,134 @@ pub const ProxyResponseCache = struct {
             .headers = headers_copy,
             .body = body_copy,
             .age_seconds = age_seconds,
+            .stale = stale,
+            .revision = entry.revision,
+        };
+    }
+
+    /// These are called only while GatewayState holds the cache mutex.
+    /// Keeping cooldown state on the bounded entry avoids a second,
+    /// independently growing per-key map, and replacement resets it.
+    pub fn canRevalidate(self: *const ProxyResponseCache, key: []const u8, revision: u64, now_ms: u64) bool {
+        const entry = self.map.get(key) orelse return false;
+        return entry.revision == revision and now_ms >= entry.revalidation_retry_at_ms;
+    }
+
+    pub fn entryRevision(self: *const ProxyResponseCache, key: []const u8) ?u64 {
+        return if (self.map.get(key)) |entry| entry.revision else null;
+    }
+
+    pub fn recordRevalidationFailure(self: *ProxyResponseCache, key: []const u8, revision: u64, now_ms: u64) void {
+        const entry = self.map.getPtr(key) orelse return;
+        if (entry.revision != revision) return;
+        entry.revalidation_failures +|= 1;
+        const shift: u6 = @intCast(@min(entry.revalidation_failures - 1, 5));
+        const delay_ms: u64 = @min(@as(u64, 1_000) << shift, 30_000);
+        entry.revalidation_retry_at_ms = now_ms +| delay_ms;
+    }
+
+    fn refreshable304Header(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, "age") or
+            std.ascii.eqlIgnoreCase(name, "cache-control") or
+            std.ascii.eqlIgnoreCase(name, "content-location") or
+            std.ascii.eqlIgnoreCase(name, "date") or
+            std.ascii.eqlIgnoreCase(name, "etag") or
+            std.ascii.eqlIgnoreCase(name, "expires") or
+            std.ascii.eqlIgnoreCase(name, "last-modified") or
+            std.ascii.eqlIgnoreCase(name, "vary") or
+            std.ascii.eqlIgnoreCase(name, "warning");
+    }
+
+    fn containsHeaderNamed(headers: []const CacheHeaderView, name: []const u8) bool {
+        for (headers) |header| if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
+        return false;
+    }
+
+    /// Apply a successful conditional 304 to the exact representation that
+    /// supplied its validators. The body/status are retained; only RFC cache
+    /// metadata is merged, and a changed `Vary` shape is rejected.
+    pub fn refreshNotModified(
+        self: *ProxyResponseCache,
+        now_ms: u64,
+        primary_key: []const u8,
+        effective_key: []const u8,
+        expected_revision: u64,
+        response_headers: []const CacheHeaderView,
+        ttl_ceiling_seconds: u32,
+        swr_ceiling_seconds: u32,
+    ) !void {
+        const entry = self.map.getPtr(effective_key) orelse return error.CacheMiss;
+        if (entry.revision != expected_revision) return error.CacheRevisionMismatch;
+        // A 304 can carry extension fields that are not eligible for the
+        // metadata merge below. Reject the response before filtering so a
+        // token-bearing field still invalidates the shared representation
+        // instead of silently renewing it.
+        if (hasUnpersistableResponseHeaders(response_headers)) return error.NotCacheable;
+        const is_variant = entry.vary_primary_key != null;
+        if (entry.vary_primary_key) |stored_primary| {
+            if (!std.mem.eql(u8, stored_primary, primary_key)) return error.VaryMismatch;
+        } else if (!std.mem.eql(u8, primary_key, effective_key)) {
+            return error.VaryMismatch;
+        }
+
+        var merged: std.ArrayList(CacheHeaderView) = .empty;
+        defer merged.deinit(self.allocator);
+        for (entry.headers) |header| {
+            if (refreshable304Header(header.name) and containsHeaderNamed(response_headers, header.name)) continue;
+            try merged.append(self.allocator, .{ .name = header.name, .value = header.value });
+        }
+        for (response_headers) |header| {
+            if (!refreshable304Header(header.name)) continue;
+            try merged.append(self.allocator, header);
+        }
+
+        const freshness = responseFreshness(merged.items, ttl_ceiling_seconds) orelse return error.NotCacheable;
+        if (freshness.vary_on_accept_encoding != is_variant) return error.VaryMismatch;
+
+        var stored_headers: std.ArrayList(CacheHeaderView) = .empty;
+        defer stored_headers.deinit(self.allocator);
+        for (merged.items) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "age")) continue;
+            try stored_headers.append(self.allocator, header);
+        }
+        const params = PutParams{
+            .status_code = entry.status_code,
+            .reason = entry.reason,
+            .headers = stored_headers.items,
+            .body = entry.body,
+            .ttl_seconds = freshness.ttl_seconds,
+            .initial_age_seconds = freshness.initial_age_seconds,
+            .swr_seconds = staleWhileRevalidateSeconds(freshness, swr_ceiling_seconds),
+        };
+        if (is_variant) {
+            try self.putVaryVariant(now_ms, primary_key, effective_key, params);
+        } else {
+            try self.put(now_ms, effective_key, params);
+        }
+    }
+
+    /// Deep-copy one live entry for best-effort disk persistence after an
+    /// in-memory metadata-only refresh.
+    pub fn persistenceSnapshot(self: *const ProxyResponseCache, scratch: std.mem.Allocator, key: []const u8) !?PersistenceSnapshot {
+        const entry = self.map.get(key) orelse return null;
+        const reason = try scratch.dupe(u8, entry.reason);
+        const headers = try scratch.alloc(CacheHeaderView, entry.headers.len);
+        for (entry.headers, 0..) |header, i| {
+            headers[i] = .{
+                .name = try scratch.dupe(u8, header.name),
+                .value = try scratch.dupe(u8, header.value),
+            };
+        }
+        return .{
+            .status_code = entry.status_code,
+            .reason = reason,
+            .headers = headers,
+            .body = try scratch.dupe(u8, entry.body),
+            .stored_at_ms = entry.stored_at_ms,
+            .expires_at_ms = entry.expires_at_ms,
+            .swr_until_ms = entry.swr_until_ms,
+            .initial_age_seconds = entry.initial_age_seconds,
+            .vary_primary_key = if (entry.vary_primary_key) |primary| try scratch.dupe(u8, primary) else null,
         };
     }
 
@@ -364,7 +550,10 @@ pub const ProxyResponseCache = struct {
     }
 
     fn prepareEntry(self: *ProxyResponseCache, now_ms: u64, key: []const u8, params: PutParams) !PreparedEntry {
-        if (params.ttl_seconds == 0 or params.initial_age_seconds >= params.ttl_seconds) return error.NotCacheable;
+        if (params.absolute_timing == null and (params.ttl_seconds == 0 or params.initial_age_seconds >= params.ttl_seconds)) return error.NotCacheable;
+        if (params.absolute_timing) |timing| {
+            if (timing.swr_until_ms <= now_ms or timing.swr_until_ms < timing.expires_at_ms or timing.stored_at_ms > now_ms) return error.NotCacheable;
+        }
         const object_bytes = objectBytes(key, params);
         if (object_bytes > self.limits.max_object_bytes) return error.ObjectTooLarge;
 
@@ -384,16 +573,30 @@ pub const ProxyResponseCache = struct {
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
 
+        const stored_at_ms = if (params.absolute_timing) |timing| timing.stored_at_ms else now_ms;
+        const expires_at_ms = if (params.absolute_timing) |timing|
+            timing.expires_at_ms
+        else
+            now_ms + @as(u64, params.ttl_seconds - params.initial_age_seconds) * 1000;
+        const swr_until_ms = if (params.absolute_timing) |timing|
+            timing.swr_until_ms
+        else
+            expires_at_ms + @as(u64, params.swr_seconds) * 1000;
+        const revision = self.next_revision;
+        self.next_revision +%= 1;
+        if (self.next_revision == 0) self.next_revision = 1;
         return .{ .key = owned_key, .entry = .{
             .metadata_arena = arena,
             .status_code = params.status_code,
             .reason = owned_reason,
             .headers = owned_headers,
             .body = owned_body,
-            .stored_at_ms = now_ms,
-            .expires_at_ms = now_ms + @as(u64, params.ttl_seconds - params.initial_age_seconds) * 1000,
+            .stored_at_ms = stored_at_ms,
+            .expires_at_ms = expires_at_ms,
+            .swr_until_ms = swr_until_ms,
             .initial_age_seconds = params.initial_age_seconds,
             .bytes = object_bytes,
+            .revision = revision,
         } };
     }
 
@@ -444,6 +647,17 @@ pub const ProxyResponseCache = struct {
         self.removeLocked(key);
         self.map.putAssumeCapacity(prepared.key, prepared.entry);
         self.total_bytes += prepared.entry.bytes;
+    }
+
+    pub fn remove(self: *ProxyResponseCache, key: []const u8) void {
+        self.removeLocked(key);
+    }
+
+    pub fn removeIfRevision(self: *ProxyResponseCache, key: []const u8, expected_revision: u64) bool {
+        const entry = self.map.get(key) orelse return false;
+        if (entry.revision != expected_revision) return false;
+        self.removeLocked(key);
+        return true;
     }
 };
 
@@ -677,6 +891,33 @@ pub fn varyAcceptEncodingDiscriminator(buf: *[max_vary_discriminator_bytes]u8, h
 /// (no stored validator). `If-Match`/`If-Unmodified-Since` remain excluded:
 /// their semantics are for conditional mutation, not GET freshness, and this
 /// cache does not implement them.
+/// A client asking for end-to-end validation (`no-cache`, `max-age=0`) or
+/// refusing storage (`no-store`, legacy `Pragma: no-cache`) must reach the
+/// origin: neither a fresh nor a stale shared hit may answer it. This is a
+/// conservative bypass, not a full request-directive parser; an unparseable
+/// `max-age` also bypasses.
+fn requestForcesOrigin(headers: *const http.Headers) bool {
+    for (headers.iterator()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "pragma") and
+            std.ascii.indexOfIgnoreCase(h.value, "no-cache") != null) return true;
+        if (!std.ascii.eqlIgnoreCase(h.name, "cache-control")) continue;
+        var parts = std.mem.splitScalar(u8, h.value, ',');
+        while (parts.next()) |raw| {
+            const directive = std.mem.trim(u8, raw, " \t");
+            const eq = std.mem.indexOfScalar(u8, directive, '=');
+            const name = std.mem.trim(u8, directive[0 .. eq orelse directive.len], " \t");
+            if (std.ascii.eqlIgnoreCase(name, "no-cache") or
+                std.ascii.eqlIgnoreCase(name, "no-store")) return true;
+            if (std.ascii.eqlIgnoreCase(name, "max-age")) {
+                const value = std.mem.trim(u8, directive[(eq orelse return true) + 1 ..], " \t\"");
+                const seconds = std.fmt.parseInt(u64, value, 10) catch return true;
+                if (seconds == 0) return true;
+            }
+        }
+    }
+    return false;
+}
+
 pub fn isCacheableRequest(
     cfg: *const edge_config.EdgeConfig,
     block: *const edge_config.EdgeConfig.LocationBlock,
@@ -690,6 +931,7 @@ pub fn isCacheableRequest(
     // (never filled from a HEAD response itself -- callers gate fill on the
     // original method being GET).
     if (!std.mem.eql(u8, method, "GET") and !std.mem.eql(u8, method, "HEAD")) return false;
+    if (requestForcesOrigin(headers)) return false;
     // C1 deliberately has no request-body cache key. A bodyful (or not-yet
     // materialized streaming) GET must therefore always reach the origin.
     if (request_has_body or streaming_request_body) return false;
@@ -741,6 +983,10 @@ pub const Freshness = struct {
     /// than refusing outright. Every other `Vary` content, including `*` or
     /// any additional field name, still makes this function return `null`.
     vary_on_accept_encoding: bool = false,
+    /// Set when `Cache-Control` carries `must-revalidate` or
+    /// `proxy-revalidate` (#903): this representation must never be served
+    /// stale, regardless of any configured stale-while-revalidate window.
+    forbids_stale: bool = false,
 };
 
 /// Match an HTTP media type while ignoring case, surrounding whitespace, and
@@ -752,6 +998,39 @@ fn hasEventStreamMediaType(value: []const u8) bool {
         const media_type = std.mem.trim(u8, raw_value[0 .. std.mem.indexOfScalar(u8, raw_value, ';') orelse raw_value.len], " \t");
         if (std.ascii.eqlIgnoreCase(media_type, "text/event-stream")) return true;
     }
+    return false;
+}
+
+/// Strict shared-cache persistence boundary for origin response metadata.
+/// Application-defined fields cannot be classified as non-secret by name,
+/// so only the representation/freshness fields the cache understands are
+/// admitted. Rejected fields still pass through on the live response; they
+/// merely make that response ineligible for shared RAM/disk storage.
+pub fn isPersistableResponseHeaderName(name: []const u8) bool {
+    inline for (.{
+        "accept-ranges",
+        "age",
+        "cache-control",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-location",
+        "content-type",
+        "date",
+        "etag",
+        "expires",
+        "last-modified",
+        "location",
+        "vary",
+        "warning",
+    }) |allowed| {
+        if (std.ascii.eqlIgnoreCase(name, allowed)) return true;
+    }
+    return false;
+}
+
+pub fn hasUnpersistableResponseHeaders(headers: anytype) bool {
+    for (headers) |header| if (!isPersistableResponseHeaderName(header.name)) return true;
     return false;
 }
 
@@ -768,13 +1047,14 @@ fn hasEventStreamMediaType(value: []const u8) bool {
 /// copy.
 pub fn responseFreshness(headers: anytype, ceiling_seconds: u32) ?Freshness {
     if (ceiling_seconds == 0) return null;
+    if (hasUnpersistableResponseHeaders(headers)) return null;
     var max_age: ?u32 = null;
     var s_maxage: ?u32 = null;
     var response_age: ?u32 = null;
     var saw_vary = false;
     var vary_is_only_accept_encoding = true;
+    var forbids_stale = false;
     for (headers) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "set-cookie")) return null;
         if (std.ascii.eqlIgnoreCase(h.name, "vary")) {
             saw_vary = true;
             var vary_it = std.mem.splitScalar(u8, h.value, ',');
@@ -804,6 +1084,8 @@ pub fn responseFreshness(headers: anytype, ceiling_seconds: u32) ?Freshness {
                 s_maxage = std.fmt.parseInt(u32, std.mem.trim(u8, tok["s-maxage=".len..], " \t"), 10) catch null;
             } else if (std.ascii.startsWithIgnoreCase(tok, "max-age=")) {
                 max_age = std.fmt.parseInt(u32, std.mem.trim(u8, tok["max-age=".len..], " \t"), 10) catch null;
+            } else if (std.ascii.eqlIgnoreCase(directive_name, "must-revalidate") or std.ascii.eqlIgnoreCase(directive_name, "proxy-revalidate")) {
+                forbids_stale = true;
             }
         }
     }
@@ -819,7 +1101,17 @@ pub fn responseFreshness(headers: anytype, ceiling_seconds: u32) ?Freshness {
         .ttl_seconds = ttl_seconds,
         .initial_age_seconds = initial_age_seconds,
         .vary_on_accept_encoding = saw_vary and vary_is_only_accept_encoding,
+        .forbids_stale = forbids_stale,
     };
+}
+
+/// The bounded stale-while-revalidate window for one fill, given the
+/// operator's configured ceiling and this response's own freshness (#903).
+/// `0` (no stale serving) whenever the feature is off or the response
+/// forbids it.
+pub fn staleWhileRevalidateSeconds(freshness: Freshness, ceiling_seconds: u32) u32 {
+    if (ceiling_seconds == 0 or freshness.forbids_stale) return 0;
+    return ceiling_seconds;
 }
 
 test "isCacheableRequest accepts a plain GET and refuses personalized signals" {
@@ -862,6 +1154,42 @@ test "isCacheableRequest accepts a plain GET and refuses personalized signals" {
 
     block.auth = .required;
     try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &http.Headers.init(std.testing.allocator), false, false, false));
+}
+
+test "isCacheableRequest bypasses the cache for client no-cache, max-age=0, no-store and Pragma" {
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.policy_rules_raw = "";
+    cfg.policy_approval_routes_raw = "";
+    var block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+    };
+    const forcing = [_][2][]const u8{
+        .{ "Cache-Control", "no-cache" },
+        .{ "Cache-Control", "max-age=0" },
+        .{ "Cache-Control", "no-store" },
+        .{ "Cache-Control", "max-age=60, No-Cache" },
+        .{ "Cache-Control", "max-age=bogus" },
+        .{ "Pragma", "no-cache" },
+    };
+    for (forcing) |pair| {
+        var headers = http.Headers.init(std.testing.allocator);
+        defer headers.deinit();
+        try headers.append(pair[0], pair[1]);
+        try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
+    }
+    // A repeated field instance still forces the origin.
+    var repeated = http.Headers.init(std.testing.allocator);
+    defer repeated.deinit();
+    try repeated.append("Cache-Control", "max-age=60");
+    try repeated.append("Cache-Control", "no-cache");
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &repeated, false, false, false));
+    var permissive = http.Headers.init(std.testing.allocator);
+    defer permissive.deinit();
+    try permissive.append("Cache-Control", "max-age=60");
+    try std.testing.expect(isCacheableRequest(&cfg, &block, "GET", &permissive, false, false, false));
 }
 
 test "isCacheableRequest refuses forward_auth, client-cert policy, client identity and route policy" {
@@ -970,6 +1298,32 @@ test "isCacheableRequest refuses Range/If-Range/If-Match/If-Unmodified-Since but
 }
 
 const TestHeader = struct { name: []const u8, value: []const u8 };
+
+test "response cache admits only explicitly supported representation headers" {
+    inline for (.{
+        "Authorization",
+        "Proxy-Authorization",
+        "Set-Cookie",
+        "X-Session-Token",
+        "X-Api-Key",
+        "X-Application-Secret",
+        "X-Credential-Id",
+        "X-Auth",
+        "X-Access-Key",
+        "X-Request-Id",
+    }) |name| {
+        try std.testing.expectEqual(@as(?Freshness, null), responseFreshness(&[_]TestHeader{
+            .{ .name = "Cache-Control", .value = "public, max-age=60" },
+            .{ .name = name, .value = "must-never-be-persisted" },
+        }, 300));
+    }
+    inline for (.{ "Content-Type", "ETag", "Last-Modified", "Content-Language", "Location" }) |name| {
+        try std.testing.expect(responseFreshness(&[_]TestHeader{
+            .{ .name = "Cache-Control", .value = "public, max-age=60" },
+            .{ .name = name, .value = "safe-representation-metadata" },
+        }, 300) != null);
+    }
+}
 
 test "responseFreshness requires explicit max-age, caps by ceiling and honors Age" {
     try std.testing.expectEqual(@as(?Freshness, null), responseFreshness(&[_]TestHeader{}, 300));
@@ -1118,6 +1472,14 @@ pub fn decideCacheServe(hit_headers: []const CacheHeader, request_headers: *cons
     return .full;
 }
 
+/// A local conditional 304 is valid only for an already-fresh hit. A stale
+/// validator must be sent to the origin synchronously before the client can
+/// be told its representation is still current.
+pub fn decideLookupServe(hit: *const LookupResult, request_headers: *const http.Headers) ServeDisposition {
+    const decided = decideCacheServe(hit.headers, request_headers);
+    return if (hit.stale and decided == .not_modified) .require_origin else decided;
+}
+
 /// RFC 9110 §15.4.5: a `304` reply may repeat any of these header fields
 /// from the `200` it is validating, and must not carry anything that
 /// describes a representation body (`Content-Type`/`Content-Length`/content
@@ -1176,6 +1538,26 @@ test "decideCacheServe validates If-None-Match and If-Modified-Since against sto
     try headers.append("If-None-Match", "\"v1\"");
     try headers.append("If-Modified-Since", "Tue, 20 Oct 2015 07:28:00 GMT");
     try std.testing.expectEqual(ServeDisposition.not_modified, decideCacheServe(stored, &headers));
+}
+
+test "decideLookupServe never emits a local 304 from a stale validator" {
+    var headers = http.Headers.init(std.testing.allocator);
+    defer headers.deinit();
+    try headers.append("If-None-Match", "\"v1\"");
+    const stored_headers: []CacheHeader = @constCast(&[_]CacheHeader{
+        .{ .name = @constCast("ETag"), .value = @constCast("\"v1\"") },
+    });
+    const fresh = LookupResult{
+        .status_code = 200,
+        .reason = @constCast("OK"),
+        .headers = stored_headers,
+        .body = @constCast("body"),
+        .age_seconds = 0,
+    };
+    var stale = fresh;
+    stale.stale = true;
+    try std.testing.expectEqual(ServeDisposition.not_modified, decideLookupServe(&fresh, &headers));
+    try std.testing.expectEqual(ServeDisposition.require_origin, decideLookupServe(&stale, &headers));
 }
 
 test "decideCacheServe applies weak If-None-Match comparison per RFC 9110 13.1.2" {
@@ -1789,6 +2171,188 @@ test "ProxyResponseCache retires stale Vary variants and their index when a reso
     const fresh_hit = (try cache.lookup(arena.allocator(), primary, 1_000)).?;
     try std.testing.expectEqualStrings("fresh-unvaried-body", fresh_hit.body);
     try std.testing.expectEqual(@as(usize, 1), cache.map.count());
+}
+
+test "ProxyResponseCache 304 refresh keeps the body and renews metadata" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(0, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{
+            .{ .name = "Cache-Control", .value = "max-age=1" },
+            .{ .name = "ETag", .value = "\"v1\"" },
+            .{ .name = "Content-Type", .value = "text/plain" },
+        },
+        .body = "retained body",
+        .ttl_seconds = 1,
+        .swr_seconds = 10,
+    });
+
+    const original_revision = cache.entryRevision("key").?;
+    try cache.refreshNotModified(1_500, "key", "key", original_revision, &.{
+        .{ .name = "Cache-Control", .value = "max-age=30" },
+        .{ .name = "ETag", .value = "\"v2\"" },
+    }, 60, 10);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const hit = (try cache.lookup(arena.allocator(), "key", 2_000)).?;
+    try std.testing.expect(!hit.stale);
+    try std.testing.expectEqualStrings("retained body", hit.body);
+    try std.testing.expectEqualStrings("\"v2\"", findStoredHeader(hit.headers, "etag").?);
+    try std.testing.expectEqualStrings("text/plain", findStoredHeader(hit.headers, "content-type").?);
+}
+
+test "ProxyResponseCache rejects token-bearing 304 metadata" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(0, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{
+            .{ .name = "Cache-Control", .value = "max-age=1" },
+            .{ .name = "ETag", .value = "\"v1\"" },
+        },
+        .body = "must not be renewed",
+        .ttl_seconds = 1,
+        .swr_seconds = 10,
+    });
+
+    const revision = cache.entryRevision("key").?;
+    try std.testing.expectError(error.NotCacheable, cache.refreshNotModified(1_500, "key", "key", revision, &.{
+        .{ .name = "Cache-Control", .value = "max-age=30" },
+        .{ .name = "X-Session-Token", .value = "must-never-be-persisted" },
+    }, 60, 10));
+    try std.testing.expectEqual(revision, cache.entryRevision("key").?);
+}
+
+test "ProxyResponseCache rejects a delayed 304 for a replaced revision" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(0, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{ .{ .name = "Cache-Control", .value = "max-age=1" }, .{ .name = "ETag", .value = "\"v1\"" } },
+        .body = "v1 body",
+        .ttl_seconds = 1,
+        .swr_seconds = 10,
+    });
+    const v1_revision = cache.entryRevision("key").?;
+    try cache.put(1_100, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{ .{ .name = "Cache-Control", .value = "max-age=30" }, .{ .name = "ETag", .value = "\"v2\"" } },
+        .body = "v2 body",
+        .ttl_seconds = 30,
+    });
+
+    try std.testing.expectError(error.CacheRevisionMismatch, cache.refreshNotModified(1_200, "key", "key", v1_revision, &.{
+        .{ .name = "Cache-Control", .value = "max-age=60" },
+    }, 60, 10));
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const hit = (try cache.lookup(arena.allocator(), "key", 1_300)).?;
+    try std.testing.expectEqualStrings("v2 body", hit.body);
+    try std.testing.expectEqualStrings("\"v2\"", findStoredHeader(hit.headers, "etag").?);
+}
+
+test "ProxyResponseCache applies bounded exponential revalidation backoff" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(0, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Cache-Control", .value = "max-age=1" }},
+        .body = "body",
+        .ttl_seconds = 1,
+        .swr_seconds = 30,
+    });
+    const revision = cache.entryRevision("key").?;
+    try std.testing.expect(cache.canRevalidate("key", revision, 1_500));
+    cache.recordRevalidationFailure("key", revision, 1_500);
+    try std.testing.expect(!cache.canRevalidate("key", revision, 2_499));
+    try std.testing.expect(cache.canRevalidate("key", revision, 2_500));
+    cache.recordRevalidationFailure("key", revision, 2_500);
+    try std.testing.expect(!cache.canRevalidate("key", revision, 4_499));
+    try std.testing.expect(cache.canRevalidate("key", revision, 4_500));
+}
+
+test "ProxyResponseCache disk hydration preserves exact deadlines and Age basis" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(10_250, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{},
+        .body = "hydrated",
+        .ttl_seconds = 0,
+        .initial_age_seconds = 7,
+        .absolute_timing = .{
+            .stored_at_ms = 9_000,
+            .expires_at_ms = 10_500,
+            .swr_until_ms = 10_500,
+        },
+    });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const hit = (try cache.lookup(arena.allocator(), "key", 10_499)).?;
+    try std.testing.expectEqual(@as(u32, 8), hit.age_seconds);
+    try std.testing.expect((try cache.lookup(arena.allocator(), "key", 10_500)) == null);
+}
+
+test "ProxyResponseCache hydrates an absolute stale-while-revalidate record" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(15_000, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Cache-Control", .value = "max-age=10" }},
+        .body = "stale disk body",
+        .ttl_seconds = 0,
+        .absolute_timing = .{
+            .stored_at_ms = 0,
+            .expires_at_ms = 10_000,
+            .swr_until_ms = 20_000,
+        },
+    });
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const hit = (try cache.lookup(arena.allocator(), "key", 15_000)).?;
+    try std.testing.expect(hit.stale);
+    try std.testing.expect(hit.revision != 0);
 }
 
 test "buildCacheKey is deterministic and distinguishes field splits" {

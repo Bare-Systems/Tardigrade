@@ -131,6 +131,11 @@ const PersistedRecord = struct {
     vary_primary_key: ?[]const u8,
 };
 
+fn skipListContains(skip: []const [key_len]u8, key: []const u8) bool {
+    for (skip) |entry| if (std.mem.eql(u8, entry[0..], key)) return true;
+    return false;
+}
+
 fn isHexLowerKey(key: []const u8) bool {
     if (key.len != key_len) return false;
     for (key) |c| {
@@ -399,13 +404,14 @@ pub const DiskCache = struct {
         return removed.key;
     }
 
-    fn oldestKeyLocked(self: *DiskCache, except: ?[]const u8) ?[]const u8 {
+    fn oldestKeyLocked(self: *DiskCache, except: ?[]const u8, skip: []const [key_len]u8) ?[]const u8 {
         var oldest_key: ?[]const u8 = null;
         var oldest_ms: u64 = std.math.maxInt(u64);
         var it = self.index.iterator();
         while (it.next()) |kv| {
             if (except) |key| if (std.mem.eql(u8, kv.key_ptr.*, key)) continue;
             if (kv.value_ptr.pending_write) continue;
+            if (skipListContains(skip, kv.key_ptr.*)) continue;
             if (kv.value_ptr.last_used_ms < oldest_ms or
                 (kv.value_ptr.last_used_ms == oldest_ms and (oldest_key == null or std.mem.order(u8, kv.key_ptr.*, oldest_key.?) == .lt)))
             {
@@ -416,13 +422,61 @@ pub const DiskCache = struct {
         return oldest_key;
     }
 
+    const RetireResult = enum { retired, gone, busy, failed };
+
+    /// Retires one tracked victim while the caller already holds the I/O
+    /// lanes in `held`. The victim's own lane is acquired with `tryLock`
+    /// (never a blocking nested acquire, which could deadlock against a
+    /// writer holding the victim's lane and waiting on ours), and the entry
+    /// is re-validated under the index mutex once the lane is owned. Because
+    /// the lane is held across detach and unlink, a concurrent writer of the
+    /// victim cannot publish a newer file that this unlink would then delete.
+    fn retireVictimWithLanes(self: *DiskCache, held: IoGuard, victim: *const [key_len]u8, vary_primary: ?[]const u8, durable: bool) RetireResult {
+        const lane = ioLane(victim);
+        const own_lane = lane == held.first or (held.second != null and lane == held.second.?);
+        if (!own_lane and !self.io_lanes[lane].tryLock()) return .busy;
+        defer if (!own_lane) self.io_lanes[lane].unlock();
+
+        self.mutex.lock();
+        if (self.disabled) {
+            self.mutex.unlock();
+            return .failed;
+        }
+        const tracked = self.index.getPtr(victim) orelse {
+            if (vary_primary) |primary| self.pruneVariantLocked(primary, victim);
+            self.mutex.unlock();
+            return .gone;
+        };
+        if (tracked.pending_write) {
+            self.mutex.unlock();
+            return .busy;
+        }
+        const owned = self.detachLocked(victim) orelse {
+            self.mutex.unlock();
+            return .gone;
+        };
+        self.mutex.unlock();
+        defer self.allocator.free(owned);
+        if (durable) {
+            self.state_dir.removeFileDurable(owned) catch {
+                self.mutex.lock();
+                self.disableLocked();
+                self.mutex.unlock();
+                return .failed;
+            };
+        } else {
+            self.state_dir.removeFile(owned);
+        }
+        return .retired;
+    }
+
     /// Startup-only quota reconciliation. No other thread can observe this
     /// object yet, so filesystem cleanup does not need the runtime mutex.
     fn evictToFitLocked(self: *DiskCache) void {
         var guard: usize = 0;
         while ((self.index.count() > self.limits.max_entries or self.total_bytes > self.limits.max_total_bytes) and guard < self.limits.max_entries + 1) {
             guard += 1;
-            const victim = self.oldestKeyLocked(null) orelse break;
+            const victim = self.oldestKeyLocked(null, &.{}) orelse break;
             const owned = self.detachLocked(victim) orelse continue;
             self.state_dir.removeFile(owned);
             self.allocator.free(owned);
@@ -478,8 +532,16 @@ pub const DiskCache = struct {
         var marker: [tombstone_bytes]u8 = undefined;
         encodeTombstone(&marker, key, self.fingerprint);
         self.state_dir.writeFileAtomicLimit(key, &marker, 0o600, tombstone_bytes) catch {
+            // The marker never replaced the old direct file, so a restart
+            // would recover it under the stale policy. Retire that file
+            // durably instead; only if even that fails is the tier disabled.
+            const retired = self.state_dir.removeFileDurable(key);
             self.mutex.lock();
-            self.disableLocked();
+            if (retired) |_| {
+                if (self.detachLocked(key)) |owned| self.allocator.free(owned);
+            } else |_| {
+                self.disableLocked();
+            }
             self.mutex.unlock();
             return false;
         };
@@ -625,11 +687,13 @@ pub const DiskCache = struct {
                     self.mutex.unlock();
                     break;
                 }
-                const retired_variant = self.detachLocked(victim.?[0..]);
                 self.mutex.unlock();
-                if (retired_variant) |owned| {
-                    self.state_dir.removeFile(owned);
-                    self.allocator.free(owned);
+                // The FIFO victim is a different key with its own I/O lane;
+                // retire it under that lane with a durable unlink. If its
+                // lane is busy the new variant is simply not persisted.
+                switch (self.retireVictimWithLanes(io_guard, &victim.?, primary, true)) {
+                    .retired, .gone => {},
+                    .busy, .failed => return,
                 }
             }
         }
@@ -643,6 +707,8 @@ pub const DiskCache = struct {
         var reserved_entry: usize = 0;
         var reserved_growth: usize = 0;
         var reserved_vary_primary: usize = 0;
+        var skipped: [8][key_len]u8 = undefined;
+        var skipped_count: usize = 0;
         while (true) {
             self.mutex.lock();
             if (self.disabled) {
@@ -677,15 +743,25 @@ pub const DiskCache = struct {
                 break;
             }
 
-            const victim = self.oldestKeyLocked(key);
-            const retired = if (victim) |victim_key| self.detachLocked(victim_key) else null;
+            const victim_ptr = self.oldestKeyLocked(key, skipped[0..skipped_count]) orelse {
+                self.mutex.unlock();
+                return;
+            };
+            var victim: [key_len]u8 = undefined;
+            @memcpy(victim[0..], victim_ptr);
             self.mutex.unlock();
-            if (retired) |owned| {
-                self.state_dir.removeFile(owned);
-                self.allocator.free(owned);
-                continue;
+            switch (self.retireVictimWithLanes(io_guard, &victim, null, false)) {
+                .retired, .gone => continue,
+                .busy => {
+                    // Another writer owns that victim's lane right now;
+                    // look for a different one rather than waiting.
+                    if (skipped_count == skipped.len) return;
+                    skipped[skipped_count] = victim;
+                    skipped_count += 1;
+                    continue;
+                },
+                .failed => return,
             }
-            return;
         }
 
         if (self.test_write_barrier) |barrier| barrier.pauseIfMatched(key);
@@ -1726,4 +1802,150 @@ test "DiskCache restart quota shrink evicts equal-recency keys deterministically
         try std.testing.expect(reopened.get(arena.allocator(), "2" ** 64, 1) != null);
         try std.testing.expect(reopened.get(arena.allocator(), "3" ** 64, 1) != null);
     }
+}
+
+test "DiskCache failed tombstone write retires the direct record so restart cannot revive it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
+    const primary = "c" ** 64;
+    const secondary = "d" ** 64;
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    {
+        var cache = try DiskCache.init(allocator, root_path, limits, 89);
+        defer cache.deinit();
+        cache.put(primary, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &headers,
+            .body = "old direct",
+            .stored_at_ms = 0,
+            .expires_at_ms = 60_000,
+            .swr_until_ms = 60_000,
+            .initial_age_seconds = 0,
+        }, 0);
+        // The tombstone write itself fails before rename.
+        cache.state_dir.fault = .write;
+        cache.state_dir.fault_file = primary;
+        cache.put(secondary, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &headers,
+            .body = "new variant",
+            .stored_at_ms = 1,
+            .expires_at_ms = 60_000,
+            .swr_until_ms = 60_000,
+            .initial_age_seconds = 0,
+            .vary_primary_key = primary,
+        }, 1);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        try std.testing.expect(cache.get(arena.allocator(), primary, 2) == null);
+    }
+
+    var reopened = try DiskCache.init(allocator, root_path, limits, 89);
+    defer reopened.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(reopened.get(arena.allocator(), primary, 2) == null);
+}
+
+test "DiskCache Vary FIFO eviction is durable across restart" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20, .max_vary_variants = 1 };
+    const primary = "c" ** 64;
+    const first = "d" ** 64;
+    const second = "e" ** 64;
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    const record = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "variant",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+        .vary_primary_key = primary,
+    };
+    {
+        var cache = try DiskCache.init(allocator, root_path, limits, 90);
+        defer cache.deinit();
+        cache.put(first, record, 0);
+        cache.put(second, record, 1);
+    }
+    var reopened = try DiskCache.init(allocator, root_path, limits, 90);
+    defer reopened.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(reopened.get(arena.allocator(), first, 2) == null);
+    try std.testing.expect(reopened.get(arena.allocator(), second, 2) != null);
+}
+
+test "DiskCache quota eviction never unlinks a victim that a concurrent writer is replacing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 2, .max_total_bytes = 1 << 20 };
+    const key_b = "1" ** 64;
+    const key_c = "2" ** 64;
+    const key_a = "3" ** 64;
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    var record = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "old-b",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    };
+    {
+        var cache = try DiskCache.init(allocator, root_path, limits, 91);
+        defer cache.deinit();
+        cache.put(key_b, record, 0);
+        record.body = "c";
+        cache.put(key_c, record, 5);
+
+        var barrier = TestWriteBarrier{ .key = key_b };
+        cache.test_write_barrier = &barrier;
+        const PutWorker = struct {
+            fn run(target: *DiskCache, key: []const u8, value: PutRecord, now: u64) void {
+                target.put(key, value, now);
+            }
+        };
+        var new_b = record;
+        new_b.body = "new-b";
+        const writer = try std.Thread.spawn(.{}, PutWorker.run, .{ &cache, key_b, new_b, 6 });
+        barrier.waitUntilReached();
+
+        // B is the oldest entry but mid-replacement: eviction must skip it
+        // and take C, leaving B's lane and file to its writer.
+        record.body = "a";
+        cache.put(key_a, record, 7);
+        barrier.release();
+        writer.join();
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const loaded = cache.get(arena.allocator(), key_b, 8) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("new-b", loaded.body);
+        try std.testing.expect(cache.get(arena.allocator(), key_c, 8) == null);
+    }
+    var reopened = try DiskCache.init(allocator, root_path, limits, 91);
+    defer reopened.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const loaded = reopened.get(arena.allocator(), key_b, 9) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("new-b", loaded.body);
 }

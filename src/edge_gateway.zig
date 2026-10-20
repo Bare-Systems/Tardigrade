@@ -5561,7 +5561,7 @@ fn executeHttp2ProxyRoute(
                 var hit_arena = std.heap.ArenaAllocator.init(allocator);
                 defer hit_arena.deinit();
                 const hit = blk: {
-                    break :blk state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, effective_key.?, http.event_loop.monotonicMs()) catch {
+                    break :blk state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, key_buf[0..], effective_key.?, http.event_loop.monotonicMs()) catch {
                         state.metricsRecordProxyCacheOutcome(.fill_error);
                         break :blk null;
                     };

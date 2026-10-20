@@ -464,7 +464,7 @@ pub const ProxyResponseCache = struct {
         // metadata merge below. Reject the response before filtering so a
         // token-bearing field still invalidates the shared representation
         // instead of silently renewing it.
-        if (hasSensitiveResponseHeaders(response_headers)) return error.NotCacheable;
+        if (hasUnpersistableResponseHeaders(response_headers)) return error.NotCacheable;
         const is_variant = entry.vary_primary_key != null;
         if (entry.vary_primary_key) |stored_primary| {
             if (!std.mem.eql(u8, stored_primary, primary_key)) return error.VaryMismatch;
@@ -973,25 +973,36 @@ fn hasEventStreamMediaType(value: []const u8) bool {
     return false;
 }
 
-/// Conservative persistence boundary for origin response metadata. These
-/// names either directly carry credentials or conventionally carry
-/// application session/token material; a response containing one is not
-/// admitted at all, so the value can neither reach shared RAM nor disk.
-pub fn isSensitiveResponseHeaderName(name: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(name, "authorization") or
-        std.ascii.eqlIgnoreCase(name, "proxy-authorization") or
-        std.ascii.eqlIgnoreCase(name, "set-cookie") or
-        std.ascii.eqlIgnoreCase(name, "set-cookie2")) return true;
-    return std.ascii.indexOfIgnoreCase(name, "token") != null or
-        std.ascii.indexOfIgnoreCase(name, "secret") != null or
-        std.ascii.indexOfIgnoreCase(name, "session") != null or
-        std.ascii.indexOfIgnoreCase(name, "credential") != null or
-        std.ascii.indexOfIgnoreCase(name, "api-key") != null or
-        std.ascii.indexOfIgnoreCase(name, "apikey") != null;
+/// Strict shared-cache persistence boundary for origin response metadata.
+/// Application-defined fields cannot be classified as non-secret by name,
+/// so only the representation/freshness fields the cache understands are
+/// admitted. Rejected fields still pass through on the live response; they
+/// merely make that response ineligible for shared RAM/disk storage.
+pub fn isPersistableResponseHeaderName(name: []const u8) bool {
+    inline for (.{
+        "accept-ranges",
+        "age",
+        "cache-control",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-location",
+        "content-type",
+        "date",
+        "etag",
+        "expires",
+        "last-modified",
+        "location",
+        "vary",
+        "warning",
+    }) |allowed| {
+        if (std.ascii.eqlIgnoreCase(name, allowed)) return true;
+    }
+    return false;
 }
 
-pub fn hasSensitiveResponseHeaders(headers: anytype) bool {
-    for (headers) |header| if (isSensitiveResponseHeaderName(header.name)) return true;
+pub fn hasUnpersistableResponseHeaders(headers: anytype) bool {
+    for (headers) |header| if (!isPersistableResponseHeaderName(header.name)) return true;
     return false;
 }
 
@@ -1008,7 +1019,7 @@ pub fn hasSensitiveResponseHeaders(headers: anytype) bool {
 /// copy.
 pub fn responseFreshness(headers: anytype, ceiling_seconds: u32) ?Freshness {
     if (ceiling_seconds == 0) return null;
-    if (hasSensitiveResponseHeaders(headers)) return null;
+    if (hasUnpersistableResponseHeaders(headers)) return null;
     var max_age: ?u32 = null;
     var s_maxage: ?u32 = null;
     var response_age: ?u32 = null;
@@ -1224,7 +1235,7 @@ test "isCacheableRequest refuses Range/If-Range/If-Match/If-Unmodified-Since but
 
 const TestHeader = struct { name: []const u8, value: []const u8 };
 
-test "response cache rejects credential and application-token response headers" {
+test "response cache admits only explicitly supported representation headers" {
     inline for (.{
         "Authorization",
         "Proxy-Authorization",
@@ -1233,16 +1244,21 @@ test "response cache rejects credential and application-token response headers" 
         "X-Api-Key",
         "X-Application-Secret",
         "X-Credential-Id",
+        "X-Auth",
+        "X-Access-Key",
+        "X-Request-Id",
     }) |name| {
         try std.testing.expectEqual(@as(?Freshness, null), responseFreshness(&[_]TestHeader{
             .{ .name = "Cache-Control", .value = "public, max-age=60" },
             .{ .name = name, .value = "must-never-be-persisted" },
         }, 300));
     }
-    try std.testing.expect(responseFreshness(&[_]TestHeader{
-        .{ .name = "Cache-Control", .value = "public, max-age=60" },
-        .{ .name = "X-Request-Id", .value = "safe-metadata" },
-    }, 300) != null);
+    inline for (.{ "Content-Type", "ETag", "Last-Modified", "Content-Language", "Location" }) |name| {
+        try std.testing.expect(responseFreshness(&[_]TestHeader{
+            .{ .name = "Cache-Control", .value = "public, max-age=60" },
+            .{ .name = name, .value = "safe-representation-metadata" },
+        }, 300) != null);
+    }
 }
 
 test "responseFreshness requires explicit max-age, caps by ceiling and honors Age" {

@@ -1127,7 +1127,7 @@ pub fn handleLocationProxyPass(
             } else {
                 const lookup_now_ms = http.event_loop.monotonicMs();
                 const cache_hit = blk: {
-                    break :blk state.proxyResponseCacheLookup(temp_allocator, ctx.config_generation, effective_key.?, lookup_now_ms) catch {
+                    break :blk state.proxyResponseCacheLookup(temp_allocator, ctx.config_generation, key_buf[0..], effective_key.?, lookup_now_ms) catch {
                         // The cache is an optimization: scratch allocation or an
                         // internal cache error must not turn a live proxy request
                         // into a gateway error.

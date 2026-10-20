@@ -15182,6 +15182,14 @@ test "shipping cache never persists or replays token-bearing origin response hea
         .{ .name = "Cache-Control", .value = "public, max-age=60" },
         .{ .name = "X-Api-Key", .value = "origin-api-secret" },
     };
+    const x_auth_header: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "X-Auth", .value = "Bearer origin-x-auth-secret" },
+    };
+    const access_key_header: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "X-Access-Key", .value = "origin-access-key-secret" },
+    };
     var origin = try UpstreamServer.start(allocator, &.{
         .{ .body = "auth-one", .headers = auth_header },
         .{ .body = "auth-two", .headers = auth_header },
@@ -15191,6 +15199,10 @@ test "shipping cache never persists or replays token-bearing origin response hea
         .{ .body = "session-two", .headers = session_header },
         .{ .body = "token-one", .headers = app_token_header },
         .{ .body = "token-two", .headers = app_token_header },
+        .{ .body = "x-auth-one", .headers = x_auth_header },
+        .{ .body = "x-auth-two", .headers = x_auth_header },
+        .{ .body = "access-one", .headers = access_key_header },
+        .{ .body = "access-two", .headers = access_key_header },
     });
     defer origin.stop();
     try origin.run();
@@ -15227,6 +15239,8 @@ test "shipping cache never persists or replays token-bearing origin response hea
             .{ .path = "/secret/proxy", .first = "proxy-one", .second = "proxy-two" },
             .{ .path = "/secret/session", .first = "session-one", .second = "session-two" },
             .{ .path = "/secret/token", .first = "token-one", .second = "token-two" },
+            .{ .path = "/secret/x-auth", .first = "x-auth-one", .second = "x-auth-two" },
+            .{ .path = "/secret/access", .first = "access-one", .second = "access-two" },
         }) |case| {
             var first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = case.path, .body = null, .headers = &.{} });
             defer first.deinit();
@@ -15235,7 +15249,7 @@ test "shipping cache never persists or replays token-bearing origin response hea
             defer second.deinit();
             try assertContains(second.body, case.second);
         }
-        try std.testing.expectEqual(@as(u32, 8), origin.requestCount());
+        try std.testing.expectEqual(@as(u32, 12), origin.requestCount());
     }
 
     var cache_dir = try compat.wrapDir(tmp.dir).openDir("proxy-cache", .{ .iterate = true });
@@ -15245,7 +15259,7 @@ test "shipping cache never persists or replays token-bearing origin response hea
         if (entry.kind != .file) continue;
         const bytes = try cache_dir.readFileAlloc(allocator, entry.name, 1024 * 1024);
         defer allocator.free(bytes);
-        inline for (.{ "origin-auth-secret", "origin-proxy-secret", "origin-session-secret", "origin-api-secret" }) |secret| {
+        inline for (.{ "origin-auth-secret", "origin-proxy-secret", "origin-session-secret", "origin-api-secret", "origin-x-auth-secret", "origin-access-key-secret" }) |secret| {
             try std.testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
         }
     }

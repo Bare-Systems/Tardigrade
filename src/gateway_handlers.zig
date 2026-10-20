@@ -3047,7 +3047,7 @@ fn handleHttp3LocationProxyPass(
                 var hit_arena = std.heap.ArenaAllocator.init(allocator);
                 defer hit_arena.deinit();
                 const cache_hit = blk: {
-                    break :blk ctx.state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, effective_key.?, lookup_now_ms) catch {
+                    break :blk ctx.state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, key_buf[0..], effective_key.?, lookup_now_ms) catch {
                         ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
                         break :blk null;
                     };

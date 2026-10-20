@@ -56,32 +56,34 @@ const max_header_name_bytes: usize = 256;
 const max_header_value_bytes: usize = 8192;
 const max_reason_bytes: usize = 256;
 
-const record_magic = "TPDC2\x00\x00\x00".*;
+const record_magic = "TPDC3\x00\x00\x00".*;
+const tombstone_magic = "TPDCTMB3".*;
+const tombstone_bytes = tombstone_magic.len + @sizeOf(u64) + key_len + @sizeOf(u64);
 const io_lane_count: usize = 64;
 
 /// Test-only pause point for proving that unrelated keys remain responsive
 /// while one durable write is stalled. The pointer is null in production.
-pub const TestWriteBarrier = struct {
+pub const TestIoBarrier = struct {
     key: []const u8,
     mutex: compat.Mutex = .{},
     condition: compat.Condition = .{},
     reached: bool = false,
     released: bool = false,
 
-    pub fn waitUntilReached(self: *TestWriteBarrier) void {
+    pub fn waitUntilReached(self: *TestIoBarrier) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (!self.reached) self.condition.wait(&self.mutex);
     }
 
-    pub fn release(self: *TestWriteBarrier) void {
+    pub fn release(self: *TestIoBarrier) void {
         self.mutex.lock();
         self.released = true;
         self.condition.broadcast();
         self.mutex.unlock();
     }
 
-    fn pauseIfMatched(self: *TestWriteBarrier, key: []const u8) void {
+    fn pauseIfMatched(self: *TestIoBarrier, key: []const u8) void {
         if (!std.mem.eql(u8, self.key, key)) return;
         self.mutex.lock();
         self.reached = true;
@@ -90,6 +92,8 @@ pub const TestWriteBarrier = struct {
         self.mutex.unlock();
     }
 };
+
+pub const TestWriteBarrier = TestIoBarrier;
 
 pub const PutRecord = struct {
     status_code: u16,
@@ -115,6 +119,18 @@ pub const LoadedRecord = struct {
     vary_primary_key: ?[]const u8,
 };
 
+const PersistedRecord = struct {
+    status_code: u16,
+    reason: []const u8,
+    headers: []gpc.CacheHeader,
+    body: []const u8,
+    stored_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    swr_until_unix_ms: u64,
+    initial_age_seconds: u32,
+    vary_primary_key: ?[]const u8,
+};
+
 fn isHexLowerKey(key: []const u8) bool {
     if (key.len != key_len) return false;
     for (key) |c| {
@@ -129,6 +145,7 @@ const IndexValue = struct {
     last_used_ms: u64,
     vary_primary_key: ?[key_len]u8 = null,
     pending_write: bool = false,
+    tombstone: bool = false,
 };
 
 const VaryIndexEntry = struct {
@@ -172,9 +189,13 @@ pub const DiskCache = struct {
     total_bytes: usize = 0,
     reserved_entries: usize = 0,
     reserved_bytes: usize = 0,
+    reserved_vary_primaries: usize = 0,
     max_vary_variants: usize,
     disabled: bool = false,
     test_write_barrier: ?*TestWriteBarrier = null,
+    test_read_barrier: ?*TestIoBarrier = null,
+    /// Test-only wall-clock override for reboot/clock-epoch simulations.
+    test_unix_now_ms: ?u64 = null,
 
     /// Opens (creating as `0700` if absent) and validates `root_path`,
     /// refusing a symlink, a path owned by another user, or one with
@@ -225,6 +246,13 @@ pub const DiskCache = struct {
         self.io_lanes[first].lock();
         if (second != first) self.io_lanes[second].lock();
         return .{ .cache = self, .first = first, .second = if (second == first) null else second };
+    }
+
+    fn unixNowMs(self: *const DiskCache) ?u64 {
+        if (self.test_unix_now_ms) |now| return now;
+        const now = compat.milliTimestamp();
+        if (now < 0) return null;
+        return @intCast(now);
     }
 
     pub fn deinit(self: *DiskCache) void {
@@ -297,6 +325,10 @@ pub const DiskCache = struct {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const raw = self.state_dir.readFileAlloc(arena.allocator(), entry.name, self.limits.max_object_bytes + record_overhead_bytes, false) catch continue;
+            if (isTombstone(raw, entry.name, self.fingerprint)) {
+                gop.value_ptr.tombstone = true;
+                continue;
+            }
             const decoded = decodeRecord(arena.allocator(), raw) catch {
                 self.disableLocked();
                 return;
@@ -422,6 +454,85 @@ pub const DiskCache = struct {
         if (owned) |removed_key| self.allocator.free(removed_key);
     }
 
+    /// Replace an obsolete direct representation with a small durable marker
+    /// before attempting a Vary variant write. A crash or failed candidate
+    /// write can therefore yield only a miss, never resurrect the direct
+    /// response under a different Accept-Encoding policy.
+    fn installTombstoneWithIoHeld(self: *DiskCache, key: []const u8, now_ms: u64) bool {
+        self.mutex.lock();
+        if (self.disabled) {
+            self.mutex.unlock();
+            return false;
+        }
+        const existing = self.index.getPtr(key) orelse {
+            self.mutex.unlock();
+            return true;
+        };
+        if (existing.tombstone or existing.vary_primary_key != null) {
+            self.mutex.unlock();
+            return true;
+        }
+        existing.pending_write = true;
+        self.mutex.unlock();
+
+        var marker: [tombstone_bytes]u8 = undefined;
+        encodeTombstone(&marker, key, self.fingerprint);
+        self.state_dir.writeFileAtomicLimit(key, &marker, 0o600, tombstone_bytes) catch {
+            self.mutex.lock();
+            self.disableLocked();
+            self.mutex.unlock();
+            return false;
+        };
+
+        self.mutex.lock();
+        if (self.disabled) {
+            self.mutex.unlock();
+            return false;
+        }
+        if (self.index.fetchRemove(key)) |removed| {
+            self.total_bytes -= removed.value.bytes;
+            if (removed.value.vary_primary_key) |primary| self.pruneVariantLocked(primary[0..], removed.key);
+            self.index.putAssumeCapacity(removed.key, .{
+                .bytes = tombstone_bytes,
+                .last_used_ms = now_ms,
+                .pending_write = true,
+                .tombstone = true,
+            });
+            self.total_bytes += tombstone_bytes;
+        }
+        self.mutex.unlock();
+        return true;
+    }
+
+    fn releaseTombstonePendingWithIoHeld(self: *DiskCache, key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.index.getPtr(key)) |value| {
+            if (value.tombstone) value.pending_write = false;
+        }
+    }
+
+    /// Once at least one replacement variant is durable, the marker is no
+    /// longer needed. Its unlink is directory-fsynced before index accounting
+    /// is released; on failure the tier disables instead of admitting writes
+    /// against an unprovable disk footprint.
+    fn retireTombstoneWithIoHeld(self: *DiskCache, key: []const u8) void {
+        self.mutex.lock();
+        const tracked = if (self.index.get(key)) |value| value.tombstone else false;
+        self.mutex.unlock();
+        if (!tracked) return;
+        self.state_dir.removeFileDurable(key) catch {
+            self.mutex.lock();
+            self.disableLocked();
+            self.mutex.unlock();
+            return;
+        };
+        self.mutex.lock();
+        const owned = if (self.index.get(key)) |value| if (value.tombstone) self.detachLocked(key) else null else null;
+        self.mutex.unlock();
+        if (owned) |removed| self.allocator.free(removed);
+    }
+
     fn recordBytes(key: []const u8, record: PutRecord) usize {
         var total: usize = key.len + record.reason.len + record.body.len + record_overhead_bytes;
         for (record.headers) |h| total += h.name.len + h.value.len;
@@ -446,24 +557,26 @@ pub const DiskCache = struct {
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
-        encodeRecord(self.allocator, &buf, key, record, self.fingerprint) catch return;
+        const now_unix_ms = self.unixNowMs() orelse return;
+        encodeRecord(self.allocator, &buf, key, record, self.fingerprint, now_ms, now_unix_ms) catch return;
         const io_guard = self.lockIo(key, record.vary_primary_key);
         defer io_guard.unlock();
+        var tombstone_primary: ?[]const u8 = null;
+        var retire_tombstone = false;
+        defer if (tombstone_primary) |primary| {
+            if (retire_tombstone)
+                self.retireTombstoneWithIoHeld(primary)
+            else
+                self.releaseTombstonePendingWithIoHeld(primary);
+        };
 
         // A representation-policy transition retires the incompatible disk
         // shape before attempting the new write. If the write then fails or
         // the process crashes, restart observes a safe miss instead of an
         // old unvaried/varied representation under the new policy.
         if (record.vary_primary_key) |primary| {
-            self.mutex.lock();
-            if (self.disabled) {
-                self.mutex.unlock();
-                return;
-            }
-            const retired_primary = self.detachLocked(primary);
-            self.mutex.unlock();
-            self.state_dir.removeFile(retired_primary orelse primary);
-            if (retired_primary) |owned| self.allocator.free(owned);
+            if (!self.installTombstoneWithIoHeld(primary, now_ms)) return;
+            tombstone_primary = primary;
         } else {
             while (true) {
                 self.mutex.lock();
@@ -482,7 +595,13 @@ pub const DiskCache = struct {
                 const retired_variant = self.detachLocked(victim.?[0..]);
                 self.mutex.unlock();
                 if (retired_variant) |owned| {
-                    self.state_dir.removeFile(owned);
+                    self.state_dir.removeFileDurable(owned) catch {
+                        self.allocator.free(owned);
+                        self.mutex.lock();
+                        self.disableLocked();
+                        self.mutex.unlock();
+                        return;
+                    };
                     self.allocator.free(owned);
                 }
             }
@@ -523,6 +642,7 @@ pub const DiskCache = struct {
 
         var reserved_entry: usize = 0;
         var reserved_growth: usize = 0;
+        var reserved_vary_primary: usize = 0;
         while (true) {
             self.mutex.lock();
             if (self.disabled) {
@@ -536,21 +656,23 @@ pub const DiskCache = struct {
             const entries_fit = self.reserved_entries + reserved_entry <= self.limits.max_entries -| self.index.count();
             const bytes_fit = self.reserved_bytes + reserved_growth <= self.limits.max_total_bytes -| self.total_bytes;
             if (entries_fit and bytes_fit) {
-                if (existing == null) self.index.ensureUnusedCapacity(1) catch {
+                if (existing == null) self.index.ensureUnusedCapacity(@intCast(self.reserved_entries + reserved_entry)) catch {
                     self.mutex.unlock();
                     return;
                 } else if (self.index.getPtr(key)) |value| {
                     value.pending_write = true;
                 }
-                if (record.vary_primary_key) |primary| if (!self.vary_index.contains(primary)) {
-                    self.vary_index.ensureUnusedCapacity(1) catch {
+                if (record.vary_primary_key != null) {
+                    reserved_vary_primary = 1;
+                    self.vary_index.ensureUnusedCapacity(@intCast(self.reserved_vary_primaries + reserved_vary_primary)) catch {
                         if (self.index.getPtr(key)) |value| value.pending_write = false;
                         self.mutex.unlock();
                         return;
                     };
-                };
+                }
                 self.reserved_entries += reserved_entry;
                 self.reserved_bytes += reserved_growth;
+                self.reserved_vary_primaries += reserved_vary_primary;
                 self.mutex.unlock();
                 break;
             }
@@ -575,6 +697,7 @@ pub const DiskCache = struct {
         self.mutex.lock();
         self.reserved_entries -= reserved_entry;
         self.reserved_bytes -= reserved_growth;
+        self.reserved_vary_primaries -= reserved_vary_primary;
         if (!write_succeeded or self.disabled) {
             if (self.index.getPtr(key)) |value| value.pending_write = false;
             self.mutex.unlock();
@@ -620,6 +743,7 @@ pub const DiskCache = struct {
             }
         }
         self.mutex.unlock();
+        retire_tombstone = record.vary_primary_key != null;
     }
 
     /// Reads, validates and decodes `key`. `scratch` must outlive the
@@ -640,13 +764,15 @@ pub const DiskCache = struct {
             return null;
         }
         const tracked = self.index.contains(key);
+        const tombstone = if (self.index.get(key)) |value| value.tombstone else false;
         self.mutex.unlock();
-        if (!tracked) return null;
+        if (!tracked or tombstone) return null;
 
         const raw = self.state_dir.readFileAlloc(scratch, key, self.limits.max_object_bytes + record_overhead_bytes, false) catch {
             self.removeWithIoHeld(key);
             return null;
         };
+        if (self.test_read_barrier) |barrier| barrier.pauseIfMatched(key);
         const maybe_decoded = decodeRecord(scratch, raw) catch return null;
         const decoded = maybe_decoded orelse {
             self.removeWithIoHeld(key);
@@ -656,15 +782,34 @@ pub const DiskCache = struct {
             self.removeWithIoHeld(key);
             return null;
         }
-        if (now_ms >= decoded.record.swr_until_ms) {
+        const now_unix_ms = self.unixNowMs() orelse return null;
+        // A backward wall-clock jump is treated as an unprovable age and a
+        // safe miss. Forward jumps only expire records sooner. Persisted
+        // freshness can therefore never become valid again when the host's
+        // monotonic epoch resets across a reboot.
+        if (now_unix_ms < decoded.record.stored_at_unix_ms or now_unix_ms >= decoded.record.swr_until_unix_ms) {
             self.removeWithIoHeld(key);
             return null;
         }
 
+        const resident_seconds = (now_unix_ms - decoded.record.stored_at_unix_ms) / 1000;
+        const age_seconds: u32 = @intCast(@min(@as(u64, decoded.record.initial_age_seconds) + resident_seconds, std.math.maxInt(u32)));
+        const loaded = LoadedRecord{
+            .status_code = decoded.record.status_code,
+            .reason = decoded.record.reason,
+            .headers = decoded.record.headers,
+            .body = decoded.record.body,
+            .stored_at_ms = now_ms,
+            .expires_at_ms = unixToMonotonic(decoded.record.expires_at_unix_ms, now_unix_ms, now_ms),
+            .swr_until_ms = unixToMonotonic(decoded.record.swr_until_unix_ms, now_unix_ms, now_ms),
+            .initial_age_seconds = age_seconds,
+            .vary_primary_key = decoded.record.vary_primary_key,
+        };
+
         self.mutex.lock();
         if (self.index.getPtr(key)) |value| value.last_used_ms = now_ms;
         self.mutex.unlock();
-        return decoded.record;
+        return loaded;
     }
 
     pub fn isVaryTracked(self: *DiskCache, primary_key: []const u8) bool {
@@ -681,7 +826,29 @@ fn writeLenPrefixed(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, compt
     try buf.appendSlice(allocator, bytes);
 }
 
-fn encodeRecord(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), key: []const u8, record: PutRecord, fingerprint: u64) !void {
+fn monotonicToUnix(monotonic_ms: u64, now_ms: u64, now_unix_ms: u64) u64 {
+    return if (monotonic_ms >= now_ms)
+        now_unix_ms +| (monotonic_ms - now_ms)
+    else
+        now_unix_ms -| (now_ms - monotonic_ms);
+}
+
+fn unixToMonotonic(unix_ms: u64, now_unix_ms: u64, now_ms: u64) u64 {
+    return if (unix_ms >= now_unix_ms)
+        now_ms +| (unix_ms - now_unix_ms)
+    else
+        now_ms -| (now_unix_ms - unix_ms);
+}
+
+fn encodeRecord(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    key: []const u8,
+    record: PutRecord,
+    fingerprint: u64,
+    now_ms: u64,
+    now_unix_ms: u64,
+) !void {
     try buf.appendSlice(allocator, &record_magic);
     var u64_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &u64_buf, fingerprint, .little);
@@ -689,11 +856,11 @@ fn encodeRecord(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), key: []co
     var u16_buf: [2]u8 = undefined;
     std.mem.writeInt(u16, &u16_buf, record.status_code, .little);
     try buf.appendSlice(allocator, &u16_buf);
-    std.mem.writeInt(u64, &u64_buf, record.stored_at_ms, .little);
+    std.mem.writeInt(u64, &u64_buf, monotonicToUnix(record.stored_at_ms, now_ms, now_unix_ms), .little);
     try buf.appendSlice(allocator, &u64_buf);
-    std.mem.writeInt(u64, &u64_buf, record.expires_at_ms, .little);
+    std.mem.writeInt(u64, &u64_buf, monotonicToUnix(record.expires_at_ms, now_ms, now_unix_ms), .little);
     try buf.appendSlice(allocator, &u64_buf);
-    std.mem.writeInt(u64, &u64_buf, record.swr_until_ms, .little);
+    std.mem.writeInt(u64, &u64_buf, monotonicToUnix(record.swr_until_ms, now_ms, now_unix_ms), .little);
     try buf.appendSlice(allocator, &u64_buf);
     var u32_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &u32_buf, record.initial_age_seconds, .little);
@@ -716,10 +883,32 @@ fn encodeRecord(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), key: []co
     try buf.appendSlice(allocator, &u64_buf);
 }
 
+fn encodeTombstone(out: *[tombstone_bytes]u8, key: []const u8, fingerprint: u64) void {
+    @memcpy(out[0..tombstone_magic.len], &tombstone_magic);
+    std.mem.writeInt(u64, out[tombstone_magic.len..][0..8], fingerprint, .little);
+    const key_offset = tombstone_magic.len + 8;
+    @memcpy(out[key_offset..][0..key_len], key);
+    const checksum_offset = key_offset + key_len;
+    const checksum = std.hash.Wyhash.hash(0x544f_4d42_5354, out[0..checksum_offset]);
+    std.mem.writeInt(u64, out[checksum_offset..][0..8], checksum, .little);
+}
+
+fn isTombstone(raw: []const u8, key: []const u8, fingerprint: u64) bool {
+    if (raw.len != tombstone_bytes) return false;
+    if (!std.mem.eql(u8, raw[0..tombstone_magic.len], &tombstone_magic)) return false;
+    const stored_fingerprint = std.mem.readInt(u64, raw[tombstone_magic.len..][0..8], .little);
+    if (stored_fingerprint != fingerprint) return false;
+    const key_offset = tombstone_magic.len + 8;
+    if (!std.mem.eql(u8, raw[key_offset..][0..key_len], key)) return false;
+    const checksum_offset = key_offset + key_len;
+    const expected = std.mem.readInt(u64, raw[checksum_offset..][0..8], .little);
+    return expected == std.hash.Wyhash.hash(0x544f_4d42_5354, raw[0..checksum_offset]);
+}
+
 const Decoded = struct {
     fingerprint: u64,
     key: []const u8,
-    record: LoadedRecord,
+    record: PersistedRecord,
 };
 
 /// Zero-copy decode: every slice in the returned value borrows directly
@@ -742,9 +931,9 @@ fn decodeRecord(scratch: std.mem.Allocator, raw: []const u8) !?Decoded {
 
     const fingerprint = r.readU64() orelse return null;
     const status_code = r.readU16() orelse return null;
-    const stored_at_ms = r.readU64() orelse return null;
-    const expires_at_ms = r.readU64() orelse return null;
-    const swr_until_ms = r.readU64() orelse return null;
+    const stored_at_unix_ms = r.readU64() orelse return null;
+    const expires_at_unix_ms = r.readU64() orelse return null;
+    const swr_until_unix_ms = r.readU64() orelse return null;
     const initial_age_seconds = r.readU32() orelse return null;
 
     const key = r.readLenPrefixed(u16, key_len) orelse return null;
@@ -755,15 +944,18 @@ fn decodeRecord(scratch: std.mem.Allocator, raw: []const u8) !?Decoded {
 
     const header_count = r.readU16() orelse return null;
     if (header_count > max_headers) return null;
-    const headers = try scratch.alloc(gpc.CacheHeader, header_count);
+    var header_buf: [max_headers]gpc.CacheHeader = undefined;
     var i: usize = 0;
     while (i < header_count) : (i += 1) {
         const name = r.readLenPrefixed(u16, max_header_name_bytes) orelse return null;
         const value = r.readLenPrefixed(u32, max_header_value_bytes) orelse return null;
-        headers[i] = .{ .name = @constCast(name), .value = @constCast(value) };
+        if (!gpc.isPersistableResponseHeaderName(name)) return null;
+        header_buf[i] = .{ .name = @constCast(name), .value = @constCast(value) };
     }
     const body = r.readLenPrefixed(u32, std.math.maxInt(u32)) orelse return null;
     if (!r.atEnd()) return null;
+    const headers = try scratch.alloc(gpc.CacheHeader, header_count);
+    @memcpy(headers, header_buf[0..header_count]);
 
     return .{
         .fingerprint = fingerprint,
@@ -773,9 +965,9 @@ fn decodeRecord(scratch: std.mem.Allocator, raw: []const u8) !?Decoded {
             .reason = reason,
             .headers = headers,
             .body = body,
-            .stored_at_ms = stored_at_ms,
-            .expires_at_ms = expires_at_ms,
-            .swr_until_ms = swr_until_ms,
+            .stored_at_unix_ms = stored_at_unix_ms,
+            .expires_at_unix_ms = expires_at_unix_ms,
+            .swr_until_unix_ms = swr_until_unix_ms,
             .initial_age_seconds = initial_age_seconds,
             .vary_primary_key = vary_primary_key,
         },
@@ -823,6 +1015,12 @@ const Reader = struct {
     }
 };
 
+fn testHexKey(out: *[key_len]u8, value: u64) []const u8 {
+    @memset(out, '0');
+    _ = std.fmt.bufPrint(out[key_len - 16 ..], "{x:0>16}", .{value}) catch unreachable;
+    return out[0..];
+}
+
 test "isHexLowerKey accepts exactly 64 lowercase hex chars" {
     try std.testing.expect(isHexLowerKey("a" ** 64));
     try std.testing.expect(!isHexLowerKey("A" ** 64));
@@ -852,7 +1050,7 @@ test "encodeRecord/decodeRecord round-trips every field and rejects a flipped by
     };
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try encodeRecord(allocator, &buf, key, record, 0xABCD);
+    try encodeRecord(allocator, &buf, key, record, 0xABCD, 1_000, 1_700_000_000_000);
 
     const decoded = (try decodeRecord(arena.allocator(), buf.items)).?;
     try std.testing.expectEqual(@as(u64, 0xABCD), decoded.fingerprint);
@@ -862,8 +1060,8 @@ test "encodeRecord/decodeRecord round-trips every field and rejects a flipped by
     try std.testing.expectEqual(@as(usize, 2), decoded.record.headers.len);
     try std.testing.expectEqualStrings("Content-Type", decoded.record.headers[0].name);
     try std.testing.expectEqualStrings("hello disk cache", decoded.record.body);
-    try std.testing.expectEqual(@as(u64, 61_000), decoded.record.expires_at_ms);
-    try std.testing.expectEqual(@as(u64, 121_000), decoded.record.swr_until_ms);
+    try std.testing.expectEqual(@as(u64, 1_700_000_060_000), decoded.record.expires_at_unix_ms);
+    try std.testing.expectEqual(@as(u64, 1_700_000_120_000), decoded.record.swr_until_unix_ms);
 
     // Flipping any single byte must fail the checksum, never silently
     // decode a corrupted field.
@@ -881,6 +1079,27 @@ test "decodeRecord rejects a bad magic and an empty buffer" {
     try std.testing.expectEqual(@as(?Decoded, null), try decodeRecord(std.testing.allocator, "not a cache record at all"));
 }
 
+test "decodeRecord rejects a checksummed record containing a forbidden response header" {
+    const allocator = std.testing.allocator;
+    const key = "f" ** 64;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encodeRecord(allocator, &buf, key, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{
+            .{ .name = "Cache-Control", .value = "public, max-age=60" },
+            .{ .name = "X-Auth", .value = "Bearer forbidden-on-disk" },
+        },
+        .body = "body",
+        .stored_at_ms = 1_000,
+        .expires_at_ms = 61_000,
+        .swr_until_ms = 61_000,
+        .initial_age_seconds = 0,
+    }, 7, 1_000, 1_700_000_000_000);
+    try std.testing.expectEqual(@as(?Decoded, null), try decodeRecord(allocator, buf.items));
+}
+
 test "DiskCache put/get round-trips, enforces the config fingerprint and evicts past the stale-while-revalidate deadline" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -890,6 +1109,7 @@ test "DiskCache put/get round-trips, enforces the config fingerprint and evicts 
 
     var cache = try DiskCache.init(allocator, root_path, .{ .max_object_bytes = 4096, .max_entries = 4, .max_total_bytes = 1 << 20 }, 111);
     defer cache.deinit();
+    cache.test_unix_now_ms = 10_000;
 
     const key = "c" ** 64;
     const headers = [_]gpc.CacheHeaderView{.{ .name = "Content-Type", .value = "text/plain" }};
@@ -906,6 +1126,7 @@ test "DiskCache put/get round-trips, enforces the config fingerprint and evicts 
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+    cache.test_unix_now_ms = 10_500;
     const hit = cache.get(arena.allocator(), key, 500) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("cached body", hit.body);
 
@@ -914,15 +1135,18 @@ test "DiskCache put/get round-trips, enforces the config fingerprint and evicts 
     // refuse this -- freshness-vs-staleness classification is the caller's
     // job (`gateway_proxy_cache.zig`/`GatewayState`), same split as the
     // in-memory cache.
+    cache.test_unix_now_ms = 11_500;
     const stale_hit = cache.get(arena.allocator(), key, 1_500) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("cached body", stale_hit.body);
 
     // Past the stale-while-revalidate deadline: a safe miss, and the file is
     // gone so a fresh process would not find it either.
+    cache.test_unix_now_ms = 12_500;
     try std.testing.expectEqual(@as(?LoadedRecord, null), cache.get(arena.allocator(), key, 2_500));
 
     // A different config fingerprint never sees a hit, even immediately
     // after a fresh write under the matching one.
+    cache.test_unix_now_ms = 20_000;
     cache.put(key, .{
         .status_code = 200,
         .reason = "OK",
@@ -1078,6 +1302,42 @@ test "DiskCache survives a reopen (restart) and reconciles pre-existing entries"
     try std.testing.expectEqualStrings("persisted across restart", hit.body);
 }
 
+test "DiskCache wall-clock expiry cannot resurrect when the monotonic epoch repeats after reboot" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 4, .max_total_bytes = 1 << 20 };
+    const key = "0" ** 64;
+    const old_uptime_ms: u64 = 10 * 60 * 60 * 1000;
+    const old_unix_ms: u64 = 1_700_000_000_000;
+    {
+        var cache = try DiskCache.init(allocator, root_path, limits, 43);
+        defer cache.deinit();
+        cache.test_unix_now_ms = old_unix_ms;
+        cache.put(key, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &.{.{ .name = "Cache-Control", .value = "max-age=60" }},
+            .body = "old-boot-body",
+            .stored_at_ms = old_uptime_ms,
+            .expires_at_ms = old_uptime_ms + 60_000,
+            .swr_until_ms = old_uptime_ms + 60_000,
+            .initial_age_seconds = 0,
+        }, old_uptime_ms);
+    }
+
+    var rebooted = try DiskCache.init(allocator, root_path, limits, 43);
+    defer rebooted.deinit();
+    // Wall time is well beyond expiry, while the new boot's monotonic clock
+    // has reached the exact old uptime that previously made this entry fresh.
+    rebooted.test_unix_now_ms = old_unix_ms + 24 * 60 * 60 * 1000;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(rebooted.get(arena.allocator(), key, old_uptime_ms + 30_000) == null);
+}
+
 test "DiskCache evicts the least-recently-used entry once max_entries is exceeded" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1229,6 +1489,159 @@ test "DiskCache stalled write does not block a disjoint write or Vary metadata l
     try std.testing.expect(a_done.load(.acquire));
 }
 
+test "DiskCache reserves hash-map capacity for every concurrent unpublished entry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    var cache = try DiskCache.init(allocator, root_path, .{ .max_object_bytes = 4096, .max_entries = 256, .max_total_bytes = 1 << 20 }, 56);
+    defer cache.deinit();
+    const record = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Cache-Control", .value = "max-age=60" }},
+        .body = "body",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    };
+
+    var next: u64 = 1;
+    while (cache.index.capacity() == 0 or cache.index.count() + 1 < (cache.index.capacity() * std.hash_map.default_max_load_percentage) / 100) : (next += 1) {
+        var key_buf: [key_len]u8 = undefined;
+        cache.put(testHexKey(&key_buf, next), record, 0);
+    }
+    const index_load_limit = (cache.index.capacity() * std.hash_map.default_max_load_percentage) / 100;
+    try std.testing.expectEqual(index_load_limit - 1, cache.index.count());
+
+    var key_a_buf: [key_len]u8 = undefined;
+    const key_a = testHexKey(&key_a_buf, 10_000);
+    var key_b_buf: [key_len]u8 = undefined;
+    var candidate: u64 = 20_000;
+    var key_b = testHexKey(&key_b_buf, candidate);
+    while (DiskCache.keysShareIoLane(key_a, key_b)) : (candidate += 1) key_b = testHexKey(&key_b_buf, candidate);
+
+    var barrier = TestWriteBarrier{ .key = key_a };
+    cache.test_write_barrier = &barrier;
+    const Worker = struct {
+        fn run(target: *DiskCache, key: []const u8, value: PutRecord, done: *std.atomic.Value(bool)) void {
+            target.put(key, value, 1);
+            done.store(true, .release);
+        }
+    };
+    var a_done = std.atomic.Value(bool).init(false);
+    const a = try std.Thread.spawn(.{}, Worker.run, .{ &cache, key_a, record, &a_done });
+    barrier.waitUntilReached();
+    var b_done = std.atomic.Value(bool).init(false);
+    const b = std.Thread.spawn(.{}, Worker.run, .{ &cache, key_b, record, &b_done }) catch |err| {
+        barrier.release();
+        a.join();
+        return err;
+    };
+    var attempts: usize = 0;
+    while (!b_done.load(.acquire) and attempts < 100) : (attempts += 1) {
+        std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    const b_published_while_a_reserved = b_done.load(.acquire);
+    barrier.release();
+    a.join();
+    b.join();
+    cache.test_write_barrier = null;
+
+    try std.testing.expect(b_published_while_a_reserved);
+    try std.testing.expect(a_done.load(.acquire));
+    try std.testing.expect(cache.index.contains(key_a));
+    try std.testing.expect(cache.index.contains(key_b));
+}
+
+test "DiskCache reserves Vary-index capacity for every concurrent unpublished primary" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    var cache = try DiskCache.init(allocator, root_path, .{ .max_object_bytes = 4096, .max_entries = 512, .max_total_bytes = 1 << 20 }, 57);
+    defer cache.deinit();
+    const base = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{
+            .{ .name = "Cache-Control", .value = "max-age=60" },
+            .{ .name = "Vary", .value = "Accept-Encoding" },
+        },
+        .body = "variant",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    };
+
+    var next: u64 = 1;
+    while (cache.vary_index.capacity() == 0 or cache.vary_index.count() + 1 < (cache.vary_index.capacity() * std.hash_map.default_max_load_percentage) / 100) : (next += 1) {
+        var primary_buf: [key_len]u8 = undefined;
+        var secondary_buf: [key_len]u8 = undefined;
+        var record = base;
+        record.vary_primary_key = testHexKey(&primary_buf, next * 2);
+        cache.put(testHexKey(&secondary_buf, next * 2 + 1), record, 0);
+    }
+    const vary_load_limit = (cache.vary_index.capacity() * std.hash_map.default_max_load_percentage) / 100;
+    try std.testing.expectEqual(vary_load_limit - 1, cache.vary_index.count());
+
+    var primary_a_buf: [key_len]u8 = undefined;
+    var secondary_a_buf: [key_len]u8 = undefined;
+    const primary_a = testHexKey(&primary_a_buf, 50_000);
+    const secondary_a = testHexKey(&secondary_a_buf, 50_001);
+    var primary_b_buf: [key_len]u8 = undefined;
+    var secondary_b_buf: [key_len]u8 = undefined;
+    var candidate: u64 = 60_000;
+    var primary_b = testHexKey(&primary_b_buf, candidate);
+    var secondary_b = testHexKey(&secondary_b_buf, candidate + 1);
+    while (DiskCache.keysShareIoLane(primary_a, primary_b) or
+        DiskCache.keysShareIoLane(primary_a, secondary_b) or
+        DiskCache.keysShareIoLane(secondary_a, primary_b) or
+        DiskCache.keysShareIoLane(secondary_a, secondary_b)) : (candidate += 2)
+    {
+        primary_b = testHexKey(&primary_b_buf, candidate);
+        secondary_b = testHexKey(&secondary_b_buf, candidate + 1);
+    }
+
+    var barrier = TestWriteBarrier{ .key = secondary_a };
+    cache.test_write_barrier = &barrier;
+    const Worker = struct {
+        fn run(target: *DiskCache, key: []const u8, primary: []const u8, value: PutRecord, done: *std.atomic.Value(bool)) void {
+            var variant = value;
+            variant.vary_primary_key = primary;
+            target.put(key, variant, 1);
+            done.store(true, .release);
+        }
+    };
+    var a_done = std.atomic.Value(bool).init(false);
+    const a = try std.Thread.spawn(.{}, Worker.run, .{ &cache, secondary_a, primary_a, base, &a_done });
+    barrier.waitUntilReached();
+    var b_done = std.atomic.Value(bool).init(false);
+    const b = std.Thread.spawn(.{}, Worker.run, .{ &cache, secondary_b, primary_b, base, &b_done }) catch |err| {
+        barrier.release();
+        a.join();
+        return err;
+    };
+    var attempts: usize = 0;
+    while (!b_done.load(.acquire) and attempts < 100) : (attempts += 1) {
+        std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    const b_published_while_a_reserved = b_done.load(.acquire);
+    barrier.release();
+    a.join();
+    b.join();
+    cache.test_write_barrier = null;
+
+    try std.testing.expect(b_published_while_a_reserved);
+    try std.testing.expect(a_done.load(.acquire));
+    try std.testing.expect(cache.isVaryTracked(primary_a));
+    try std.testing.expect(cache.isVaryTracked(primary_b));
+}
+
 test "DiskCache failed direct-to-Vary transition cannot revive the direct record after restart" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1265,6 +1678,10 @@ test "DiskCache failed direct-to-Vary transition cannot revive the direct record
             .initial_age_seconds = 0,
             .vary_primary_key = primary,
         }, 1);
+        var marker_arena = std.heap.ArenaAllocator.init(allocator);
+        defer marker_arena.deinit();
+        const marker = try cache.state_dir.readFileAlloc(marker_arena.allocator(), primary, tombstone_bytes, false);
+        try std.testing.expect(isTombstone(marker, primary, 88));
     }
 
     var reopened = try DiskCache.init(allocator, root_path, limits, 88);

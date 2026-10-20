@@ -1221,16 +1221,35 @@ pub const GatewayState = struct {
     /// revision token before conditional background revalidation can be
     /// admitted. If promotion fails, this fails open as a cache miss and the
     /// request reaches the origin synchronously.
-    pub fn proxyResponseCacheLookup(self: *GatewayState, scratch: std.mem.Allocator, generation: u64, key: []const u8, now_ms: u64) !?gpc.LookupResult {
+    fn proxyResponseCacheLookupMemory(
+        cache: *gpc.ProxyResponseCache,
+        scratch: std.mem.Allocator,
+        primary_key: []const u8,
+        effective_key: []const u8,
+        now_ms: u64,
+    ) !?gpc.LookupResult {
+        if (try cache.lookup(scratch, effective_key, now_ms)) |hit| return hit;
+        if (!std.mem.eql(u8, primary_key, effective_key)) return try cache.lookup(scratch, primary_key, now_ms);
+        return null;
+    }
+
+    pub fn proxyResponseCacheLookup(
+        self: *GatewayState,
+        scratch: std.mem.Allocator,
+        generation: u64,
+        primary_key: []const u8,
+        effective_key: []const u8,
+        now_ms: u64,
+    ) !?gpc.LookupResult {
         {
             self.proxy_response_cache_mutex.lock();
             defer self.proxy_response_cache_mutex.unlock();
             if (self.proxy_response_cache_generation != generation) return null;
             if (self.proxy_response_cache) |*cache| {
-                if (try cache.lookup(scratch, key, now_ms)) |hit| return hit;
+                if (try proxyResponseCacheLookupMemory(cache, scratch, primary_key, effective_key, now_ms)) |hit| return hit;
             }
         }
-        return self.proxyResponseCacheDiskLookup(scratch, generation, key, now_ms);
+        return self.proxyResponseCacheDiskLookup(scratch, generation, primary_key, effective_key, now_ms);
     }
 
     fn proxyResponseCacheAcquireDisk(self: *GatewayState, generation: u64) ?*gpdc.DiskCache {
@@ -1251,8 +1270,15 @@ pub const GatewayState = struct {
         if (self.proxy_response_cache_disk_inflight == 0) self.proxy_response_cache_condition.broadcast();
     }
 
-    fn proxyResponseCacheDiskLookup(self: *GatewayState, scratch: std.mem.Allocator, generation: u64, key: []const u8, now_ms: u64) !?gpc.LookupResult {
-        const mutation_guard = self.lockProxyResponseCacheMutations(&.{key});
+    fn proxyResponseCacheDiskLookup(
+        self: *GatewayState,
+        scratch: std.mem.Allocator,
+        generation: u64,
+        primary_key: []const u8,
+        effective_key: []const u8,
+        now_ms: u64,
+    ) !?gpc.LookupResult {
+        const mutation_guard = self.lockProxyResponseCacheMutations(&.{ primary_key, effective_key });
         defer mutation_guard.unlock();
 
         // A live fill may have won after the caller's initial RAM miss but
@@ -1263,12 +1289,12 @@ pub const GatewayState = struct {
             defer self.proxy_response_cache_mutex.unlock();
             if (self.proxy_response_cache_generation != generation) return null;
             if (self.proxy_response_cache) |*cache| {
-                if (try cache.lookup(scratch, key, now_ms)) |hit| return hit;
+                if (try proxyResponseCacheLookupMemory(cache, scratch, primary_key, effective_key, now_ms)) |hit| return hit;
             }
         }
 
         const disk = self.proxyResponseCacheAcquireDisk(generation) orelse return null;
-        const loaded = disk.get(scratch, key, now_ms) orelse {
+        const loaded = disk.get(scratch, effective_key, now_ms) orelse {
             self.proxyResponseCacheReleaseDisk();
             return null;
         };
@@ -1277,6 +1303,12 @@ pub const GatewayState = struct {
         // leases while holding that mutex; carrying the lease into hydration
         // would invert the lock order and deadlock.
         self.proxyResponseCacheReleaseDisk();
+
+        if (loaded.vary_primary_key) |stored_primary| {
+            if (!std.mem.eql(u8, stored_primary, primary_key)) return null;
+        } else if (!std.mem.eql(u8, primary_key, effective_key)) {
+            return null;
+        }
 
         const stale = now_ms >= loaded.expires_at_ms;
         const resident_seconds = (now_ms -| loaded.stored_at_ms) / 1000;
@@ -1295,6 +1327,11 @@ pub const GatewayState = struct {
         defer self.proxy_response_cache_mutex.unlock();
         if (self.proxy_response_cache_generation != generation) return null;
         const cache = if (self.proxy_response_cache) |*value| value else return null;
+        // The primary lane is held through disk read and promotion. This
+        // second check handles a fill that won before lane acquisition and
+        // prevents an old secondary snapshot from changing a newer direct
+        // primary back to Vary.
+        if (try proxyResponseCacheLookupMemory(cache, scratch, primary_key, effective_key, now_ms)) |hit| return hit;
         const params = gpc.PutParams{
             .status_code = loaded.status_code,
             .reason = loaded.reason,
@@ -1309,11 +1346,11 @@ pub const GatewayState = struct {
             },
         };
         if (loaded.vary_primary_key) |primary| {
-            cache.putVaryVariant(now_ms, primary, key, params) catch return null;
+            cache.putVaryVariant(now_ms, primary, effective_key, params) catch return null;
         } else {
-            cache.put(now_ms, key, params) catch return null;
+            cache.put(now_ms, effective_key, params) catch return null;
         }
-        result.revision = cache.entryRevision(key) orelse return null;
+        result.revision = cache.entryRevision(effective_key) orelse return null;
         return result;
     }
 
@@ -1668,9 +1705,9 @@ pub const GatewayState = struct {
         try state.proxyResponseCachePut(1_000, 7, "key", params);
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 8, "key", 1_001)) == null);
+        try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 8, "key", "key", 1_001)) == null);
         try std.testing.expectError(error.ProxyResponseCacheGenerationMismatch, state.proxyResponseCachePut(1_001, 8, "key-2", params));
-        try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 7, "key", 1_001)) != null);
+        try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 7, "key", "key", 1_001)) != null);
     }
 
     test "stale background mutations cannot replace or invalidate a newer revision" {
@@ -1719,12 +1756,12 @@ pub const GatewayState = struct {
 
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        const hit = (try state.proxyResponseCacheLookup(arena.allocator(), 3, "key", 1_300)).?;
+        const hit = (try state.proxyResponseCacheLookup(arena.allocator(), 3, "key", "key", 1_300)).?;
         try std.testing.expectEqualStrings("v2", hit.body);
         try std.testing.expectEqual(v2_revision, hit.revision);
 
         state.proxyResponseCacheInvalidate(3, "key", v2_revision);
-        try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 3, "key", 1_301)) == null);
+        try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 3, "key", "key", 1_301)) == null);
     }
 
     test "disk promotion prefers a newer RAM fill for direct and Vary keys" {
@@ -1799,8 +1836,8 @@ pub const GatewayState = struct {
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        const direct = (try state.proxyResponseCacheDiskLookup(arena.allocator(), 5, direct_key, 1_001)).?;
-        const variant = (try state.proxyResponseCacheDiskLookup(arena.allocator(), 5, secondary_key, 1_001)).?;
+        const direct = (try state.proxyResponseCacheDiskLookup(arena.allocator(), 5, direct_key, direct_key, 1_001)).?;
+        const variant = (try state.proxyResponseCacheDiskLookup(arena.allocator(), 5, primary_key, secondary_key, 1_001)).?;
         try std.testing.expectEqualStrings("ram-v2", direct.body);
         try std.testing.expectEqualStrings("ram-vary-v2", variant.body);
 
@@ -1854,9 +1891,122 @@ pub const GatewayState = struct {
 
         var no_memory: [0]u8 = .{};
         var failing = std.heap.FixedBufferAllocator.init(&no_memory);
-        try std.testing.expectError(error.OutOfMemory, state.proxyResponseCacheLookup(failing.allocator(), 4, "key", 1));
+        try std.testing.expectError(error.OutOfMemory, state.proxyResponseCacheLookup(failing.allocator(), 4, "key", "key", 1));
         try std.testing.expect(state.proxy_response_cache_mutex.tryLock());
         state.proxy_response_cache_mutex.unlock();
+    }
+
+    test "disk variant promotion holds the primary lane across read and hydration" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+        defer allocator.free(root_path);
+
+        var state: GatewayState = undefined;
+        state.allocator = allocator;
+        state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache_mutation_lanes = @splat(.{});
+        state.proxy_response_cache = gpc.ProxyResponseCache.init(allocator, .{
+            .max_object_bytes = 4096,
+            .max_entries = 8,
+            .max_total_bytes = 32 * 1024,
+            .max_vary_variants = 4,
+        });
+        defer state.proxy_response_cache.?.deinit();
+        state.proxy_response_cache_disk = try gpdc.DiskCache.init(allocator, root_path, .{
+            .max_object_bytes = 4096,
+            .max_entries = 8,
+            .max_total_bytes = 1 << 20,
+            .max_vary_variants = 4,
+        }, 100);
+        defer state.proxy_response_cache_disk.?.deinit();
+        state.proxy_response_cache_disk_accepting = true;
+        state.proxy_response_cache_disk_inflight = 0;
+        state.proxy_response_cache_condition = .{};
+        state.proxy_response_cache_generation = 6;
+
+        const primary = "1" ** 64;
+        const candidates = [_][]const u8{ "2" ** 64, "3" ** 64, "4" ** 64, "5" ** 64, "6" ** 64 };
+        var secondary = candidates[0];
+        for (candidates) |candidate| {
+            if (proxyResponseCacheMutationLane(primary) != proxyResponseCacheMutationLane(candidate) and
+                !gpdc.DiskCache.keysShareIoLane(primary, candidate))
+            {
+                secondary = candidate;
+                break;
+            }
+        }
+        try std.testing.expect(proxyResponseCacheMutationLane(primary) != proxyResponseCacheMutationLane(secondary));
+        try std.testing.expect(!gpdc.DiskCache.keysShareIoLane(primary, secondary));
+        const headers = [_]gpc.CacheHeaderView{
+            .{ .name = "Cache-Control", .value = "max-age=60" },
+            .{ .name = "Vary", .value = "Accept-Encoding" },
+        };
+        state.proxy_response_cache_disk.?.put(secondary, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &headers,
+            .body = "disk-variant-v1",
+            .stored_at_ms = 0,
+            .expires_at_ms = 60_000,
+            .swr_until_ms = 60_000,
+            .initial_age_seconds = 0,
+            .vary_primary_key = primary,
+        }, 0);
+
+        var read_barrier = gpdc.TestIoBarrier{ .key = secondary };
+        state.proxy_response_cache_disk.?.test_read_barrier = &read_barrier;
+        const Lookup = struct {
+            fn run(target: *GatewayState, primary_key: []const u8, effective_key: []const u8, saw_variant: *std.atomic.Value(bool)) void {
+                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena.deinit();
+                const hit = target.proxyResponseCacheLookup(arena.allocator(), 6, primary_key, effective_key, 1) catch null;
+                if (hit) |value| saw_variant.store(std.mem.eql(u8, value.body, "disk-variant-v1"), .release);
+            }
+        };
+        var saw_variant = std.atomic.Value(bool).init(false);
+        const lookup = try std.Thread.spawn(.{}, Lookup.run, .{ &state, primary, secondary, &saw_variant });
+        read_barrier.waitUntilReached();
+
+        const Fill = struct {
+            fn run(target: *GatewayState, primary_key: []const u8, done: *std.atomic.Value(bool)) void {
+                target.proxyResponseCachePut(2, 6, primary_key, .{
+                    .status_code = 200,
+                    .reason = "OK",
+                    .headers = &.{.{ .name = "Cache-Control", .value = "max-age=60" }},
+                    .body = "direct-v2",
+                    .ttl_seconds = 60,
+                }) catch {};
+                done.store(true, .release);
+            }
+        };
+        var fill_done = std.atomic.Value(bool).init(false);
+        const fill = std.Thread.spawn(.{}, Fill.run, .{ &state, primary, &fill_done }) catch |err| {
+            read_barrier.release();
+            lookup.join();
+            return err;
+        };
+        var attempts: usize = 0;
+        while (!fill_done.load(.acquire) and attempts < 50) : (attempts += 1) {
+            std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        }
+        state.proxy_response_cache_mutex.lock();
+        const direct_committed_while_promotion_blocked = state.proxy_response_cache.?.entryRevision(primary) != null;
+        state.proxy_response_cache_mutex.unlock();
+        read_barrier.release();
+        lookup.join();
+        fill.join();
+        state.proxy_response_cache_disk.?.test_read_barrier = null;
+
+        try std.testing.expect(!direct_committed_while_promotion_blocked);
+        try std.testing.expect(saw_variant.load(.acquire));
+        try std.testing.expect(fill_done.load(.acquire));
+        state.proxy_response_cache_mutex.lock();
+        defer state.proxy_response_cache_mutex.unlock();
+        try std.testing.expect(state.proxy_response_cache.?.entryRevision(primary) != null);
+        try std.testing.expect(state.proxy_response_cache.?.entryRevision(secondary) == null);
+        try std.testing.expect(!state.proxy_response_cache.?.isVaryTracked(primary));
     }
 
     test "proxy response cache serializes racing fills without exceeding its cap" {
@@ -1905,7 +2055,7 @@ pub const GatewayState = struct {
 
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        const hit = (try state.proxyResponseCacheLookup(arena.allocator(), 9, "same-key", 1_001)).?;
+        const hit = (try state.proxyResponseCacheLookup(arena.allocator(), 9, "same-key", "same-key", 1_001)).?;
         try std.testing.expect(std.mem.eql(u8, hit.body, "first-response") or std.mem.eql(u8, hit.body, "second-response"));
     }
 
@@ -1979,7 +2129,7 @@ pub const GatewayState = struct {
 
         var memory_arena = std.heap.ArenaAllocator.init(allocator);
         defer memory_arena.deinit();
-        const memory_hit = (try state.proxyResponseCacheLookup(memory_arena.allocator(), 11, key, 1_001)).?;
+        const memory_hit = (try state.proxyResponseCacheLookup(memory_arena.allocator(), 11, key, key, 1_001)).?;
         var disk_arena = std.heap.ArenaAllocator.init(allocator);
         defer disk_arena.deinit();
         const disk_hit = state.proxy_response_cache_disk.?.get(disk_arena.allocator(), key, 1_001).?;
@@ -2060,7 +2210,7 @@ pub const GatewayState = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const b_hit = if (b_completed_while_a_blocked)
-            try state.proxyResponseCacheLookup(arena.allocator(), 12, key_b, 1_001)
+            try state.proxyResponseCacheLookup(arena.allocator(), 12, key_b, key_b, 1_001)
         else
             null;
         barrier.release();

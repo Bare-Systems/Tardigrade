@@ -1463,8 +1463,8 @@ test "applyReloadedRuntimeConfig atomically swaps proxy cache generation and upd
     });
     var cache_arena = std.heap.ArenaAllocator.init(allocator);
     defer cache_arena.deinit();
-    try std.testing.expect((try state.proxyResponseCacheLookup(cache_arena.allocator(), 1, "same-relative-target", 1_003)) == null);
-    const generation_b = (try state.proxyResponseCacheLookup(cache_arena.allocator(), 2, "same-relative-target", 1_003)).?;
+    try std.testing.expect((try state.proxyResponseCacheLookup(cache_arena.allocator(), 1, "same-relative-target", "same-relative-target", 1_003)) == null);
+    const generation_b = (try state.proxyResponseCacheLookup(cache_arena.allocator(), 2, "same-relative-target", "same-relative-target", 1_003)).?;
     try std.testing.expectEqualStrings("origin-b", generation_b.body);
 
     const prom = try state.metricsToPrometheus(allocator);

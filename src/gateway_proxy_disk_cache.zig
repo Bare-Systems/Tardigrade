@@ -405,6 +405,11 @@ pub const DiskCache = struct {
 
         self.state_dir.writeFileAtomicLimit(key, buf.items, 0o600, self.limits.max_object_bytes + record_overhead_bytes) catch return;
 
+        // The first Vary representation supersedes any direct record stored
+        // at its primary key. Mirror the in-memory transition so restart
+        // reconciliation cannot retain an unreachable stale direct file.
+        if (record.vary_primary_key) |primary| self.removeLocked(primary);
+
         var final_key: ?[]const u8 = owned_key;
         if (self.index.fetchRemove(key)) |removed| {
             self.total_bytes -= removed.value.bytes;

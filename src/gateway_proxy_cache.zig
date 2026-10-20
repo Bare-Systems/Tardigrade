@@ -647,6 +647,13 @@ pub const ProxyResponseCache = struct {
     pub fn remove(self: *ProxyResponseCache, key: []const u8) void {
         self.removeLocked(key);
     }
+
+    pub fn removeIfRevision(self: *ProxyResponseCache, key: []const u8, expected_revision: u64) bool {
+        const entry = self.map.get(key) orelse return false;
+        if (entry.revision != expected_revision) return false;
+        self.removeLocked(key);
+        return true;
+    }
 };
 
 pub const KeyParts = struct {

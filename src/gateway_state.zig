@@ -535,6 +535,10 @@ pub const GatewayState = struct {
     proxy_cache_path: []const u8, // borrowed from cfg; rebound on reload [proxy_cache_mutex]
     proxy_cache_ttl_seconds: u32, // cfg snapshot [proxy_cache_mutex]
     proxy_response_cache_mutex: compat.Mutex = .{}, // guards proxy_response_cache + proxy_response_cache_generation
+    /// Orders cache mutations from their RAM commit through best-effort disk
+    /// persistence without making ordinary memory hits wait for filesystem
+    /// I/O. This is deliberately separate from `proxy_response_cache_mutex`.
+    proxy_response_cache_mutation_mutex: compat.Mutex = .{},
     /// Generic `proxy_pass` GET response cache (#901). Owned and rebuilt on
     /// every reload. The generation binds entries to the config lease that
     /// created them, excluding old in-flight fills after a reload.
@@ -1201,6 +1205,21 @@ pub const GatewayState = struct {
     }
 
     fn proxyResponseCacheDiskLookup(self: *GatewayState, scratch: std.mem.Allocator, generation: u64, key: []const u8, now_ms: u64) !?gpc.LookupResult {
+        self.proxy_response_cache_mutation_mutex.lock();
+        defer self.proxy_response_cache_mutation_mutex.unlock();
+
+        // A live fill may have won after the caller's initial RAM miss but
+        // before this ordered disk promotion began. Prefer that newer RAM
+        // representation and never replace it with the older snapshot.
+        {
+            self.proxy_response_cache_mutex.lock();
+            defer self.proxy_response_cache_mutex.unlock();
+            if (self.proxy_response_cache_generation != generation) return null;
+            if (self.proxy_response_cache) |*cache| {
+                if (try cache.lookup(scratch, key, now_ms)) |hit| return hit;
+            }
+        }
+
         const disk = self.proxyResponseCacheAcquireDisk(generation) orelse return null;
         const loaded = disk.get(scratch, key, now_ms) orelse {
             self.proxyResponseCacheReleaseDisk();
@@ -1259,6 +1278,8 @@ pub const GatewayState = struct {
     /// `proxy_response_cache_mutex` -- disk I/O never happens while that
     /// lock is held).
     pub fn proxyResponseCachePut(self: *GatewayState, now_ms: u64, generation: u64, key: []const u8, params: gpc.PutParams) !void {
+        self.proxy_response_cache_mutation_mutex.lock();
+        defer self.proxy_response_cache_mutation_mutex.unlock();
         self.proxy_response_cache_mutex.lock();
         if (self.proxy_response_cache_generation != generation) {
             self.proxy_response_cache_mutex.unlock();
@@ -1324,14 +1345,17 @@ pub const GatewayState = struct {
     /// Remove one obsolete representation from both tiers. The disk lease
     /// keeps reload from destroying the tier while unlinking outside the
     /// global memory-cache mutex.
-    pub fn proxyResponseCacheInvalidate(self: *GatewayState, generation: u64, key: []const u8) void {
+    pub fn proxyResponseCacheInvalidate(self: *GatewayState, generation: u64, key: []const u8, expected_revision: u64) void {
+        self.proxy_response_cache_mutation_mutex.lock();
+        defer self.proxy_response_cache_mutation_mutex.unlock();
         self.proxy_response_cache_mutex.lock();
         if (self.proxy_response_cache_generation != generation) {
             self.proxy_response_cache_mutex.unlock();
             return;
         }
-        if (self.proxy_response_cache) |*cache| cache.remove(key);
+        const removed = if (self.proxy_response_cache) |*cache| cache.removeIfRevision(key, expected_revision) else false;
         self.proxy_response_cache_mutex.unlock();
+        if (!removed) return;
         const disk = self.proxyResponseCacheAcquireDisk(generation) orelse return;
         defer self.proxyResponseCacheReleaseDisk();
         disk.remove(key);
@@ -1361,22 +1385,29 @@ pub const GatewayState = struct {
     /// #902: whether `primary_key` currently resolves through the bounded
     /// `Vary: Accept-Encoding` variant index rather than a direct entry.
     /// Consulted before building the effective lookup/fill key for a
-    /// request, so a lock-only read that never crosses network I/O.
+    /// request. The memory check releases the global cache mutex before a
+    /// generation-leased disk metadata lookup can wait on the disk mutex.
     pub fn proxyResponseCacheIsVaryTracked(self: *GatewayState, generation: u64, primary_key: []const u8) bool {
         self.proxy_response_cache_mutex.lock();
-        defer self.proxy_response_cache_mutex.unlock();
-        if (self.proxy_response_cache_generation != generation) return false;
-        if (self.proxy_response_cache) |*cache| if (cache.isVaryTracked(primary_key)) return true;
-        if (self.proxy_response_cache_disk_accepting) {
-            if (self.proxy_response_cache_disk) |*disk| return disk.isVaryTracked(primary_key);
+        if (self.proxy_response_cache_generation != generation) {
+            self.proxy_response_cache_mutex.unlock();
+            return false;
         }
-        return false;
+        const memory_tracked = if (self.proxy_response_cache) |*cache| cache.isVaryTracked(primary_key) else false;
+        self.proxy_response_cache_mutex.unlock();
+        if (memory_tracked) return true;
+
+        const disk = self.proxyResponseCacheAcquireDisk(generation) orelse return false;
+        defer self.proxyResponseCacheReleaseDisk();
+        return disk.isVaryTracked(primary_key);
     }
 
     /// #902: fills one `Vary: Accept-Encoding` variant and registers it in
     /// the bounded per-resource variant index. Same fail-open contract as
     /// `proxyResponseCachePut`.
     pub fn proxyResponseCachePutVaryVariant(self: *GatewayState, now_ms: u64, generation: u64, primary_key: []const u8, secondary_key: []const u8, params: gpc.PutParams) !void {
+        self.proxy_response_cache_mutation_mutex.lock();
+        defer self.proxy_response_cache_mutation_mutex.unlock();
         self.proxy_response_cache_mutex.lock();
         if (self.proxy_response_cache_generation != generation) {
             self.proxy_response_cache_mutex.unlock();
@@ -1395,6 +1426,56 @@ pub const GatewayState = struct {
         return error.ProxyResponseCacheDisabled;
     }
 
+    /// Replace the exact representation that launched a background 200
+    /// refresh. The expected revision is checked in the same ordered
+    /// mutation that commits RAM and persists disk, so a delayed worker can
+    /// neither overwrite nor durably outlive a newer foreground fill.
+    pub fn proxyResponseCacheReplaceRevalidated(
+        self: *GatewayState,
+        now_ms: u64,
+        generation: u64,
+        primary_key: []const u8,
+        effective_key: []const u8,
+        expected_revision: u64,
+        secondary_key: ?[]const u8,
+        params: gpc.PutParams,
+    ) !void {
+        self.proxy_response_cache_mutation_mutex.lock();
+        defer self.proxy_response_cache_mutation_mutex.unlock();
+
+        self.proxy_response_cache_mutex.lock();
+        if (self.proxy_response_cache_generation != generation) {
+            self.proxy_response_cache_mutex.unlock();
+            return error.ProxyResponseCacheGenerationMismatch;
+        }
+        const cache = if (self.proxy_response_cache) |*value| value else {
+            self.proxy_response_cache_mutex.unlock();
+            return error.ProxyResponseCacheDisabled;
+        };
+        if (cache.entryRevision(effective_key) != expected_revision) {
+            self.proxy_response_cache_mutex.unlock();
+            return error.CacheRevisionMismatch;
+        }
+        if (secondary_key) |secondary| {
+            cache.putVaryVariant(now_ms, primary_key, secondary, params) catch |err| {
+                self.proxy_response_cache_mutex.unlock();
+                return err;
+            };
+        } else {
+            cache.put(now_ms, primary_key, params) catch |err| {
+                self.proxy_response_cache_mutex.unlock();
+                return err;
+            };
+        }
+        self.proxy_response_cache_mutex.unlock();
+
+        if (secondary_key) |secondary| {
+            self.proxyResponseCacheDiskPut(now_ms, generation, secondary, primary_key, params);
+        } else {
+            self.proxyResponseCacheDiskPut(now_ms, generation, primary_key, null, params);
+        }
+    }
+
     pub fn proxyResponseCacheRefreshNotModified(
         self: *GatewayState,
         scratch: std.mem.Allocator,
@@ -1407,6 +1488,8 @@ pub const GatewayState = struct {
         ttl_ceiling_seconds: u32,
         swr_ceiling_seconds: u32,
     ) !void {
+        self.proxy_response_cache_mutation_mutex.lock();
+        defer self.proxy_response_cache_mutation_mutex.unlock();
         const snapshot = blk: {
             self.proxy_response_cache_mutex.lock();
             defer self.proxy_response_cache_mutex.unlock();
@@ -1466,6 +1549,7 @@ pub const GatewayState = struct {
         var state: GatewayState = undefined;
         state.allocator = std.testing.allocator;
         state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache_mutation_mutex = .{};
         state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
             .max_object_bytes = 4096,
             .max_entries = 4,
@@ -1511,6 +1595,7 @@ pub const GatewayState = struct {
         var state: GatewayState = undefined;
         state.allocator = std.testing.allocator;
         state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache_mutation_mutex = .{};
         state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
             .max_object_bytes = 4096,
             .max_entries = 4,
@@ -1538,10 +1623,166 @@ pub const GatewayState = struct {
         try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 7, "key", 1_001)) != null);
     }
 
+    test "stale background mutations cannot replace or invalidate a newer revision" {
+        var state: GatewayState = undefined;
+        state.allocator = std.testing.allocator;
+        state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache_mutation_mutex = .{};
+        state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
+            .max_object_bytes = 4096,
+            .max_entries = 4,
+            .max_total_bytes = 16 * 1024,
+        });
+        defer state.proxy_response_cache.?.deinit();
+        state.proxy_response_cache_disk = null;
+        state.proxy_response_cache_disk_accepting = true;
+        state.proxy_response_cache_disk_inflight = 0;
+        state.proxy_response_cache_condition = .{};
+        state.proxy_response_cache_generation = 3;
+
+        try state.proxyResponseCachePut(0, 3, "key", .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &.{.{ .name = "Cache-Control", .value = "max-age=1" }},
+            .body = "v1",
+            .ttl_seconds = 1,
+            .swr_seconds = 30,
+        });
+        const v1_revision = state.proxy_response_cache.?.entryRevision("key").?;
+        try state.proxyResponseCachePut(1_100, 3, "key", .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &.{.{ .name = "Cache-Control", .value = "max-age=30" }},
+            .body = "v2",
+            .ttl_seconds = 30,
+        });
+        const v2_revision = state.proxy_response_cache.?.entryRevision("key").?;
+
+        try std.testing.expectError(error.CacheRevisionMismatch, state.proxyResponseCacheReplaceRevalidated(1_200, 3, "key", "key", v1_revision, null, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &.{.{ .name = "Cache-Control", .value = "max-age=30" }},
+            .body = "delayed-v1",
+            .ttl_seconds = 30,
+        }));
+        state.proxyResponseCacheInvalidate(3, "key", v1_revision);
+
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const hit = (try state.proxyResponseCacheLookup(arena.allocator(), 3, "key", 1_300)).?;
+        try std.testing.expectEqualStrings("v2", hit.body);
+        try std.testing.expectEqual(v2_revision, hit.revision);
+
+        state.proxyResponseCacheInvalidate(3, "key", v2_revision);
+        try std.testing.expect((try state.proxyResponseCacheLookup(arena.allocator(), 3, "key", 1_301)) == null);
+    }
+
+    test "disk promotion prefers a newer RAM fill for direct and Vary keys" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+        defer allocator.free(root_path);
+
+        var state: GatewayState = undefined;
+        state.allocator = allocator;
+        state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache_mutation_mutex = .{};
+        state.proxy_response_cache = gpc.ProxyResponseCache.init(allocator, .{
+            .max_object_bytes = 4096,
+            .max_entries = 4,
+            .max_total_bytes = 16 * 1024,
+            .max_vary_variants = 4,
+        });
+        defer state.proxy_response_cache.?.deinit();
+        state.proxy_response_cache_disk = try gpdc.DiskCache.init(allocator, root_path, .{
+            .max_object_bytes = 4096,
+            .max_entries = 4,
+            .max_total_bytes = 1 << 20,
+            .max_vary_variants = 4,
+        }, 99);
+        defer state.proxy_response_cache_disk.?.deinit();
+        state.proxy_response_cache_disk_accepting = true;
+        state.proxy_response_cache_disk_inflight = 0;
+        state.proxy_response_cache_condition = .{};
+        state.proxy_response_cache_generation = 5;
+
+        const direct_key = "a" ** 64;
+        const primary_key = "b" ** 64;
+        const secondary_key = "c" ** 64;
+        const disk_headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=30" }};
+        state.proxy_response_cache_disk.?.put(direct_key, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &disk_headers,
+            .body = "disk-v1",
+            .stored_at_ms = 0,
+            .expires_at_ms = 30_000,
+            .swr_until_ms = 30_000,
+            .initial_age_seconds = 0,
+        }, 0);
+        state.proxy_response_cache_disk.?.put(secondary_key, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &disk_headers,
+            .body = "disk-vary-v1",
+            .stored_at_ms = 0,
+            .expires_at_ms = 30_000,
+            .swr_until_ms = 30_000,
+            .initial_age_seconds = 0,
+            .vary_primary_key = primary_key,
+        }, 0);
+        try state.proxy_response_cache.?.put(1_000, direct_key, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &disk_headers,
+            .body = "ram-v2",
+            .ttl_seconds = 30,
+        });
+        try state.proxy_response_cache.?.putVaryVariant(1_000, primary_key, secondary_key, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &disk_headers,
+            .body = "ram-vary-v2",
+            .ttl_seconds = 30,
+        });
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const direct = (try state.proxyResponseCacheDiskLookup(arena.allocator(), 5, direct_key, 1_001)).?;
+        const variant = (try state.proxyResponseCacheDiskLookup(arena.allocator(), 5, secondary_key, 1_001)).?;
+        try std.testing.expectEqualStrings("ram-v2", direct.body);
+        try std.testing.expectEqualStrings("ram-vary-v2", variant.body);
+
+        // A disk metadata waiter must not carry the global RAM-cache mutex.
+        // Hold the disk mutex to make the wait deterministic, then prove an
+        // unrelated memory operation can still acquire its lock.
+        const unknown_primary = "d" ** 64;
+        var started = std.atomic.Value(bool).init(false);
+        var tracked = true;
+        const Check = struct {
+            fn run(target: *GatewayState, key: []const u8, signal: *std.atomic.Value(bool), result: *bool) void {
+                signal.store(true, .release);
+                result.* = target.proxyResponseCacheIsVaryTracked(5, key);
+            }
+        };
+        state.proxy_response_cache_disk.?.mutex.lock();
+        const waiter = try std.Thread.spawn(.{}, Check.run, .{ &state, unknown_primary, &started, &tracked });
+        while (!started.load(.acquire)) std.atomic.spinLoopHint();
+        std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+        const memory_lock_available = state.proxy_response_cache_mutex.tryLock();
+        if (memory_lock_available) state.proxy_response_cache_mutex.unlock();
+        state.proxy_response_cache_disk.?.mutex.unlock();
+        waiter.join();
+        try std.testing.expect(memory_lock_available);
+        try std.testing.expect(!tracked);
+    }
+
     test "proxy response cache lookup releases mutex when scratch allocation fails" {
         var state: GatewayState = undefined;
         state.allocator = std.testing.allocator;
         state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache_mutation_mutex = .{};
         state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
             .max_object_bytes = 4096,
             .max_entries = 4,
@@ -1575,12 +1816,14 @@ pub const GatewayState = struct {
         var state: GatewayState = undefined;
         state.allocator = std.testing.allocator;
         state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache_mutation_mutex = .{};
         state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
             .max_object_bytes = 1024,
             .max_entries = 1,
             .max_total_bytes = 1024,
         });
         state.proxy_response_cache_disk = null;
+        state.proxy_response_cache_disk_accepting = true;
         state.proxy_response_cache_disk_inflight = 0;
         state.proxy_response_cache_condition = .{};
         state.proxy_response_cache_generation = 9;
@@ -1614,6 +1857,84 @@ pub const GatewayState = struct {
         defer arena.deinit();
         const hit = (try state.proxyResponseCacheLookup(arena.allocator(), 9, "same-key", 1_001)).?;
         try std.testing.expect(std.mem.eql(u8, hit.body, "first-response") or std.mem.eql(u8, hit.body, "second-response"));
+    }
+
+    test "racing same-key fills leave RAM and disk in the same commit order" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+        defer allocator.free(root_path);
+
+        var state: GatewayState = undefined;
+        state.allocator = allocator;
+        state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache_mutation_mutex = .{};
+        state.proxy_response_cache = gpc.ProxyResponseCache.init(allocator, .{
+            .max_object_bytes = 4096,
+            .max_entries = 4,
+            .max_total_bytes = 16 * 1024,
+        });
+        defer state.proxy_response_cache.?.deinit();
+        state.proxy_response_cache_disk = try gpdc.DiskCache.init(allocator, root_path, .{
+            .max_object_bytes = 4096,
+            .max_entries = 4,
+            .max_total_bytes = 1 << 20,
+        }, 71);
+        defer state.proxy_response_cache_disk.?.deinit();
+        state.proxy_response_cache_disk_accepting = true;
+        state.proxy_response_cache_disk_inflight = 0;
+        state.proxy_response_cache_condition = .{};
+        state.proxy_response_cache_generation = 11;
+
+        const key = "e" ** 64;
+        var second_started = std.atomic.Value(bool).init(false);
+        const Fill = struct {
+            fn run(target: *GatewayState, cache_key: []const u8, body: []const u8, started: ?*std.atomic.Value(bool)) void {
+                if (started) |signal| signal.store(true, .release);
+                target.proxyResponseCachePut(1_000, 11, cache_key, .{
+                    .status_code = 200,
+                    .reason = "OK",
+                    .headers = &.{.{ .name = "Cache-Control", .value = "max-age=60" }},
+                    .body = body,
+                    .ttl_seconds = 60,
+                }) catch {};
+            }
+        };
+
+        // Freeze v1 after its RAM commit but before its disk write. A second
+        // fill then reaches the mutation barrier. Releasing the disk must
+        // persist v1 first and v2 second, matching their RAM commit order.
+        state.proxy_response_cache_disk.?.mutex.lock();
+        const first = std.Thread.spawn(.{}, Fill.run, .{ &state, key, "first", null }) catch |err| {
+            state.proxy_response_cache_disk.?.mutex.unlock();
+            return err;
+        };
+        while (true) {
+            state.proxy_response_cache_mutex.lock();
+            const committed = state.proxy_response_cache.?.entryRevision(key) != null;
+            state.proxy_response_cache_mutex.unlock();
+            if (committed) break;
+            std.atomic.spinLoopHint();
+        }
+        const second = std.Thread.spawn(.{}, Fill.run, .{ &state, key, "second", &second_started }) catch |err| {
+            state.proxy_response_cache_disk.?.mutex.unlock();
+            first.join();
+            return err;
+        };
+        while (!second_started.load(.acquire)) std.atomic.spinLoopHint();
+        state.proxy_response_cache_disk.?.mutex.unlock();
+        first.join();
+        second.join();
+
+        var memory_arena = std.heap.ArenaAllocator.init(allocator);
+        defer memory_arena.deinit();
+        const memory_hit = (try state.proxyResponseCacheLookup(memory_arena.allocator(), 11, key, 1_001)).?;
+        var disk_arena = std.heap.ArenaAllocator.init(allocator);
+        defer disk_arena.deinit();
+        const disk_hit = state.proxy_response_cache_disk.?.get(disk_arena.allocator(), key, 1_001).?;
+        try std.testing.expectEqualStrings("second", memory_hit.body);
+        try std.testing.expectEqualStrings("second", disk_hit.body);
     }
 
     pub fn createSession(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8, client_ip: []const u8, device_id: ?[]const u8) ![]const u8 {

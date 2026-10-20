@@ -109,6 +109,42 @@ pub fn prepareHttp1CacheReplay(allocator: std.mem.Allocator, hit: *const gpc.Loo
 /// request carrying more than one `Accept-Encoding` field instance (#935
 /// review). Callers must only call this for an original request method of
 /// `GET` -- a `HEAD` response has no body to store.
+const PreparedResponseCacheFill = struct {
+    freshness: gpc.Freshness,
+    owned_headers: []gpc.CacheHeaderView,
+    params: gpc.PutParams,
+};
+
+fn prepareResponseCacheFill(
+    scratch: std.mem.Allocator,
+    ttl_ceiling_seconds: u32,
+    swr_ceiling_seconds: u32,
+    buffered: *const BufferedUpstreamResponse,
+) !?PreparedResponseCacheFill {
+    if (buffered.status_code != 200 or buffered.had_content_encoding) return null;
+    const freshness = gpc.responseFreshness(buffered.headers, ttl_ceiling_seconds) orelse return null;
+    const put_headers = try scratch.alloc(gpc.CacheHeaderView, buffered.headers.len);
+    var put_header_count: usize = 0;
+    for (buffered.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "age")) continue;
+        put_headers[put_header_count] = .{ .name = h.name, .value = h.value };
+        put_header_count += 1;
+    }
+    return .{
+        .freshness = freshness,
+        .owned_headers = put_headers,
+        .params = .{
+            .status_code = buffered.status_code,
+            .reason = buffered.reason,
+            .headers = put_headers[0..put_header_count],
+            .body = buffered.body,
+            .ttl_seconds = freshness.ttl_seconds,
+            .initial_age_seconds = freshness.initial_age_seconds,
+            .swr_seconds = gpc.staleWhileRevalidateSeconds(freshness, swr_ceiling_seconds),
+        },
+    };
+}
+
 pub fn tryFillResponseCache(
     scratch: std.mem.Allocator,
     state: *GatewayState,
@@ -119,42 +155,18 @@ pub fn tryFillResponseCache(
     buffered: *const BufferedUpstreamResponse,
     request_headers: *const http.Headers,
 ) !void {
-    if (buffered.status_code != 200) return;
-    // The buffered body is never decoded, and `buffered.headers` can no
-    // longer say whether the upstream sent `Content-Encoding` (the H1 parser
-    // already stripped it). Replaying compressed bytes from the cache
-    // without that header would corrupt every representation this admits, so
-    // refuse admission outright rather than assume absent-here means
-    // identity bytes (#935 review).
-    if (buffered.had_content_encoding) return;
-    const freshness = gpc.responseFreshness(buffered.headers, ttl_ceiling_seconds) orelse return;
-    const put_headers = try scratch.alloc(gpc.CacheHeaderView, buffered.headers.len);
-    defer scratch.free(put_headers);
-    var put_header_count: usize = 0;
-    for (buffered.headers) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "age")) continue;
-        put_headers[put_header_count] = .{ .name = h.name, .value = h.value };
-        put_header_count += 1;
-    }
-    const params = gpc.PutParams{
-        .status_code = buffered.status_code,
-        .reason = buffered.reason,
-        .headers = put_headers[0..put_header_count],
-        .body = buffered.body,
-        .ttl_seconds = freshness.ttl_seconds,
-        .initial_age_seconds = freshness.initial_age_seconds,
-        .swr_seconds = gpc.staleWhileRevalidateSeconds(freshness, swr_ceiling_seconds),
-    };
+    const prepared = (try prepareResponseCacheFill(scratch, ttl_ceiling_seconds, swr_ceiling_seconds, buffered)) orelse return;
+    defer scratch.free(prepared.owned_headers);
     const now_ms = http.event_loop.monotonicMs();
-    if (!freshness.vary_on_accept_encoding) {
-        try state.proxyResponseCachePut(now_ms, generation, key, params);
+    if (!prepared.freshness.vary_on_accept_encoding) {
+        try state.proxyResponseCachePut(now_ms, generation, key, prepared.params);
         return;
     }
     var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
     const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, request_headers) orelse return;
     var secondary_buf: [64]u8 = undefined;
     const secondary_key = gpc.buildVaryVariantKey(&secondary_buf, key, discriminator);
-    try state.proxyResponseCachePutVaryVariant(now_ms, generation, key, secondary_key, params);
+    try state.proxyResponseCachePutVaryVariant(now_ms, generation, key, secondary_key, prepared.params);
 }
 
 fn findCacheHeaderValue(headers: []const gpc.CacheHeader, name: []const u8) ?[]const u8 {
@@ -306,7 +318,9 @@ fn proxyResponseCacheRevalidationThread(task: *ProxyResponseCacheRevalidationTas
             cfg.proxy_cache_stale_while_revalidate_seconds,
         ) catch |err| {
             if (err == error.NotCacheable or err == error.VaryMismatch) {
-                task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key);
+                task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision);
+                succeeded = true;
+            } else if (err == error.CacheRevisionMismatch) {
                 succeeded = true;
             }
             return;
@@ -315,21 +329,42 @@ fn proxyResponseCacheRevalidationThread(task: *ProxyResponseCacheRevalidationTas
         return;
     }
     if (buffered.status_code != 200) return;
-    if (buffered.had_content_encoding or gpc.responseFreshness(buffered.headers, cfg.proxy_cache_ttl_seconds) == null) {
-        task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key);
-        succeeded = true;
-        return;
-    }
-    tryFillResponseCache(
+    const prepared = (prepareResponseCacheFill(
         task.arena.allocator(),
-        task.state,
-        task.generation,
         cfg.proxy_cache_ttl_seconds,
         cfg.proxy_cache_stale_while_revalidate_seconds,
-        task.primary_key,
         &buffered,
-        &headers,
-    ) catch return;
+    ) catch return) orelse {
+        task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision);
+        succeeded = true;
+        return;
+    };
+    defer task.arena.allocator().free(prepared.owned_headers);
+
+    var secondary_buf: [64]u8 = undefined;
+    const secondary_key: ?[]const u8 = if (!prepared.freshness.vary_on_accept_encoding)
+        null
+    else blk: {
+        var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
+        const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, &headers) orelse {
+            task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision);
+            succeeded = true;
+            return;
+        };
+        break :blk gpc.buildVaryVariantKey(&secondary_buf, task.primary_key, discriminator);
+    };
+    task.state.proxyResponseCacheReplaceRevalidated(
+        http.event_loop.monotonicMs(),
+        task.generation,
+        task.primary_key,
+        task.effective_key,
+        task.revision,
+        secondary_key,
+        prepared.params,
+    ) catch |err| {
+        if (err == error.CacheRevisionMismatch) succeeded = true;
+        return;
+    };
     succeeded = true;
 }
 

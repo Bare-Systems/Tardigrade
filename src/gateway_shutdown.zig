@@ -1364,6 +1364,7 @@ test "applyReloadedRuntimeConfig atomically swaps proxy cache generation and upd
     state.proxy_cache_path = "";
     state.proxy_cache_ttl_seconds = 0;
     state.proxy_response_cache_mutex = .{};
+    state.proxy_response_cache_mutation_mutex = .{};
     state.proxy_response_cache = null;
     state.proxy_response_cache_disk = null;
     state.proxy_response_cache_disk_accepting = true;

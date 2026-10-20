@@ -30,7 +30,12 @@
 //! this process could not fully account for, and bytes left behind can look
 //! like a perfectly ordinary, reconcilable directory to a fresh scan -- so
 //! once disabled, the namespace requires an operator to purge the directory
-//! before the disk tier will serve from it again.
+//! before the disk tier will serve from it again. The marker write itself can
+//! fail for the same underlying fault that forced the disable; every public
+//! call retries it while disabled so a transient fault that clears before
+//! the next restart still ends with the marker durably on disk, rather than
+//! leaving a mid-transition directory that a fresh scan cannot tell apart
+//! from an ordinary one.
 
 const std = @import("std");
 const compat = @import("zig_compat");
@@ -221,10 +226,21 @@ pub const DiskCache = struct {
     reserved_vary_primaries: usize = 0,
     max_vary_variants: usize,
     disabled: bool = false,
+    /// True once `poison_name` is confirmed durably written. `disableLocked`
+    /// can be reached precisely when the filesystem is already failing (a
+    /// faulted fence write, a truncated scan, an unprovable unlink), so its
+    /// own marker write can fail for that same reason. While this stays
+    /// false, every public call retries the write so a fault that clears
+    /// before the next restart still ends with the marker on disk.
+    poison_write_confirmed: bool = false,
     test_write_barrier: ?*TestWriteBarrier = null,
     test_read_barrier: ?*TestIoBarrier = null,
     /// Test-only wall-clock override for reboot/clock-epoch simulations.
     test_unix_now_ms: ?u64 = null,
+    /// Test-only: invoked immediately before the poison marker's own write,
+    /// letting a test re-arm a one-shot `state_dir.fault` that an earlier,
+    /// unrelated write already consumed.
+    test_before_poison_write: ?*const fn (*DiskCache) void = null,
 
     /// Opens (creating as `0700` if absent) and validates `root_path`,
     /// refusing a symlink, a path owned by another user, or one with
@@ -251,9 +267,17 @@ pub const DiskCache = struct {
         // process could no longer account for. The durable marker makes
         // "disabled" permanent until an operator purges the directory,
         // rather than merely in-process.
-        if (self.isPoisonedOnDisk()) {
-            self.disabled = true;
-            return self;
+        switch (self.isPoisonedOnDisk()) {
+            .absent => {},
+            .confirmed => {
+                self.disabled = true;
+                self.poison_write_confirmed = true;
+                return self;
+            },
+            .indeterminate => {
+                self.disabled = true;
+                return self;
+            },
         }
         self.reconcileFromDisk(root_path);
         self.applyFencesAtStartup();
@@ -261,24 +285,42 @@ pub const DiskCache = struct {
         return self;
     }
 
+    const PoisonCheck = enum { absent, confirmed, indeterminate };
+
     /// Fail-safe: only a confirmed `NotFound` counts as "not poisoned". Any
     /// other error (unsafe file type, I/O failure, oversized/corrupt marker)
     /// cannot prove the marker is absent, so the namespace is still treated
-    /// as untrustworthy.
-    fn isPoisonedOnDisk(self: *DiskCache) bool {
+    /// as untrustworthy, but -- unlike an actually-read marker -- is not
+    /// proof the marker is durably written either.
+    fn isPoisonedOnDisk(self: *DiskCache) PoisonCheck {
         var buf: [poison_marker.len]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&buf);
         _ = self.state_dir.readFileAlloc(fba.allocator(), poison_name, poison_marker.len, false) catch |err| {
-            return err != error.NotFound;
+            return if (err == error.NotFound) .absent else .indeterminate;
         };
+        return .confirmed;
+    }
+
+    /// Best-effort: a failure here leaves `poison_write_confirmed` false, so
+    /// every subsequent public call retries this same write until either it
+    /// succeeds or the process exits -- the only way a fault that caused the
+    /// original disable (and may have also broken this write) can still end
+    /// up durably recorded once the underlying filesystem issue clears.
+    fn poisonDurableBestEffort(self: *DiskCache) bool {
+        if (self.test_before_poison_write) |hook| hook(self);
+        self.state_dir.writeFileAtomicLimit(poison_name, &poison_marker, 0o600, poison_marker.len) catch return false;
         return true;
     }
 
-    /// Best-effort: if even this write fails, a restart falls back to
-    /// whatever `reconcileFromDisk` can determine on its own (which already
-    /// fails closed on a truncated scan).
-    fn poisonDurableBestEffort(self: *DiskCache) void {
-        self.state_dir.writeFileAtomicLimit(poison_name, &poison_marker, 0o600, poison_marker.len) catch {};
+    /// Retried under `self.mutex` at the top of every public call while
+    /// disabled, so `disableLocked`'s marker write -- which can fail for the
+    /// same underlying fault that forced the disable -- still lands once
+    /// that fault clears, without waiting for a restart that would otherwise
+    /// resurrect whatever this process could not durably retire.
+    fn retryPoisonLocked(self: *DiskCache) void {
+        if (self.disabled and !self.poison_write_confirmed) {
+            self.poison_write_confirmed = self.poisonDurableBestEffort();
+        }
     }
 
     const IoGuard = struct {
@@ -430,7 +472,7 @@ pub const DiskCache = struct {
         self.vary_index.clearRetainingCapacity();
         self.total_bytes = 0;
         self.disabled = true;
-        self.poisonDurableBestEffort();
+        self.poison_write_confirmed = self.poisonDurableBestEffort();
     }
 
     fn trackVariantLocked(self: *DiskCache, primary_key: []const u8, secondary_key: []const u8) !void {
@@ -723,6 +765,7 @@ pub const DiskCache = struct {
 
     fn removeWithIoHeld(self: *DiskCache, key: []const u8) void {
         self.mutex.lock();
+        self.retryPoisonLocked();
         if (self.disabled) {
             self.mutex.unlock();
             return;
@@ -845,6 +888,9 @@ pub const DiskCache = struct {
         if (record.vary_primary_key) |primary| if (!isHexLowerKey(primary)) return;
         const io_guard = self.lockIo(key, record.vary_primary_key);
         defer io_guard.unlock();
+        self.mutex.lock();
+        self.retryPoisonLocked();
+        self.mutex.unlock();
         var tombstone_primary: ?[]const u8 = null;
         var retire_tombstone = false;
         defer if (tombstone_primary) |primary| {
@@ -1051,6 +1097,7 @@ pub const DiskCache = struct {
         const io_guard = self.lockIo(key, null);
         defer io_guard.unlock();
         self.mutex.lock();
+        self.retryPoisonLocked();
         if (self.disabled) {
             self.mutex.unlock();
             return null;
@@ -1114,6 +1161,7 @@ pub const DiskCache = struct {
     pub fn isVaryTracked(self: *DiskCache, primary_key: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.retryPoisonLocked();
         if (self.disabled) return false;
         if (self.index.get(primary_key)) |marker| if (marker.fence) return false;
         return self.vary_index.contains(primary_key);
@@ -2522,4 +2570,111 @@ test "DiskCache failed fence write with a busy sibling disables the tier" {
     defer arena.deinit();
     try std.testing.expect(reopened.get(arena.allocator(), secondary, 2) == null);
     try std.testing.expect(reopened.get(arena.allocator(), primary, 2) == null);
+}
+
+test "DiskCache retries a failed poison write after a double fault until it durably lands" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
+    const primary = "c" ** 64;
+    const candidates = [_][]const u8{ "d" ** 64, "e" ** 64, "f" ** 64, "a" ** 64 };
+    var secondary = candidates[0];
+    for (candidates) |candidate| {
+        if (DiskCache.ioLane(candidate) != DiskCache.ioLane(primary)) {
+            secondary = candidate;
+            break;
+        }
+    }
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    const record = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "variant",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    };
+
+    // The fence write's own one-shot fault is consumed before the poison
+    // write even starts, so proving the real #937 P0-B double fault needs a
+    // second, independently-armed fault that fires only once the first has
+    // already been spent.
+    const RearmPoisonFault = struct {
+        fn hook(target: *DiskCache) void {
+            target.state_dir.fault = .write;
+            target.state_dir.fault_file = poison_name;
+        }
+    };
+
+    {
+        var cache = try DiskCache.init(allocator, root_path, limits, 97);
+        defer cache.deinit();
+        var variant = record;
+        variant.vary_primary_key = primary;
+        cache.put(secondary, variant, 0);
+
+        cache.state_dir.fault = .write;
+        cache.state_dir.fault_file = primary;
+        cache.test_before_poison_write = &RearmPoisonFault.hook;
+        cache.io_lanes[DiskCache.ioLane(secondary)].lock();
+        cache.put(primary, record, 1);
+        cache.io_lanes[DiskCache.ioLane(secondary)].unlock();
+        cache.test_before_poison_write = null;
+
+        // Both the fence write and the marker write that followed it failed:
+        // nothing durable yet distinguishes this directory from an ordinary,
+        // reconcilable Vary family.
+        try std.testing.expect(cache.disabled);
+        try std.testing.expect(!cache.poison_write_confirmed);
+
+        // The underlying fault has already cleared (both one-shot faults
+        // fired and reset); ordinary traffic against the disabled tier must
+        // still retry the marker write until it lands, rather than leaving
+        // the gap open indefinitely until a restart that may never come.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        try std.testing.expect(cache.get(arena.allocator(), secondary, 2) == null);
+        try std.testing.expect(cache.poison_write_confirmed);
+    }
+
+    var reopened = try DiskCache.init(allocator, root_path, limits, 97);
+    defer reopened.deinit();
+    try std.testing.expect(reopened.disabled);
+    try std.testing.expect(!reopened.isVaryTracked(primary));
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(reopened.get(arena.allocator(), secondary, 2) == null);
+    try std.testing.expect(reopened.get(arena.allocator(), primary, 2) == null);
+}
+
+test "DiskCache poison write failing at the post-rename directory fsync is retried until durable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
+
+    var cache = try DiskCache.init(allocator, root_path, limits, 11);
+    defer cache.deinit();
+
+    // The rename is already visible to a directory scan at this point; only
+    // the trailing directory fsync -- the step that makes it survive a
+    // crash -- fails, exactly the "poison-marker directory-fsync failure
+    // after rename" case called out in review.
+    cache.state_dir.fault = .fsync_dir;
+    cache.state_dir.fault_file = poison_name;
+    cache.mutex.lock();
+    cache.disableLocked();
+    cache.mutex.unlock();
+    try std.testing.expect(cache.disabled);
+    try std.testing.expect(!cache.poison_write_confirmed);
+
+    try std.testing.expect(!cache.isVaryTracked("b" ** 64));
+    try std.testing.expect(cache.poison_write_confirmed);
 }

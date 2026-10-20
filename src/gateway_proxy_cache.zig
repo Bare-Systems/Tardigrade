@@ -90,6 +90,16 @@ pub const PutParams = struct {
     /// feature is disabled. `0` means this entry is evicted outright at
     /// `ttl_seconds`, the same as before #903.
     swr_seconds: u32 = 0,
+    /// Exact persisted timing used only when hydrating a disk record. This
+    /// avoids rounding a sub-second remaining lifetime up to a fresh second
+    /// and preserves the original Age basis across process restarts.
+    absolute_timing: ?AbsoluteTiming = null,
+
+    pub const AbsoluteTiming = struct {
+        stored_at_ms: u64,
+        expires_at_ms: u64,
+        swr_until_ms: u64,
+    };
 };
 
 pub const LookupResult = struct {
@@ -104,6 +114,18 @@ pub const LookupResult = struct {
     /// single-flight) background revalidation; `lookup`/lookup-equivalents
     /// never do this themselves.
     stale: bool = false,
+};
+
+pub const PersistenceSnapshot = struct {
+    status_code: u16,
+    reason: []const u8,
+    headers: []CacheHeaderView,
+    body: []const u8,
+    stored_at_ms: u64,
+    expires_at_ms: u64,
+    swr_until_ms: u64,
+    initial_age_seconds: u32,
+    vary_primary_key: ?[]const u8,
 };
 
 const Entry = struct {
@@ -376,6 +398,104 @@ pub const ProxyResponseCache = struct {
         };
     }
 
+    fn refreshable304Header(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, "age") or
+            std.ascii.eqlIgnoreCase(name, "cache-control") or
+            std.ascii.eqlIgnoreCase(name, "content-location") or
+            std.ascii.eqlIgnoreCase(name, "date") or
+            std.ascii.eqlIgnoreCase(name, "etag") or
+            std.ascii.eqlIgnoreCase(name, "expires") or
+            std.ascii.eqlIgnoreCase(name, "last-modified") or
+            std.ascii.eqlIgnoreCase(name, "vary") or
+            std.ascii.eqlIgnoreCase(name, "warning");
+    }
+
+    fn containsHeaderNamed(headers: []const CacheHeaderView, name: []const u8) bool {
+        for (headers) |header| if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
+        return false;
+    }
+
+    /// Apply a successful conditional 304 to the exact representation that
+    /// supplied its validators. The body/status are retained; only RFC cache
+    /// metadata is merged, and a changed `Vary` shape is rejected.
+    pub fn refreshNotModified(
+        self: *ProxyResponseCache,
+        now_ms: u64,
+        primary_key: []const u8,
+        effective_key: []const u8,
+        response_headers: []const CacheHeaderView,
+        ttl_ceiling_seconds: u32,
+        swr_ceiling_seconds: u32,
+    ) !void {
+        const entry = self.map.getPtr(effective_key) orelse return error.CacheMiss;
+        const is_variant = entry.vary_primary_key != null;
+        if (entry.vary_primary_key) |stored_primary| {
+            if (!std.mem.eql(u8, stored_primary, primary_key)) return error.VaryMismatch;
+        } else if (!std.mem.eql(u8, primary_key, effective_key)) {
+            return error.VaryMismatch;
+        }
+
+        var merged: std.ArrayList(CacheHeaderView) = .empty;
+        defer merged.deinit(self.allocator);
+        for (entry.headers) |header| {
+            if (refreshable304Header(header.name) and containsHeaderNamed(response_headers, header.name)) continue;
+            try merged.append(self.allocator, .{ .name = header.name, .value = header.value });
+        }
+        for (response_headers) |header| {
+            if (!refreshable304Header(header.name)) continue;
+            try merged.append(self.allocator, header);
+        }
+
+        const freshness = responseFreshness(merged.items, ttl_ceiling_seconds) orelse return error.NotCacheable;
+        if (freshness.vary_on_accept_encoding != is_variant) return error.VaryMismatch;
+
+        var stored_headers: std.ArrayList(CacheHeaderView) = .empty;
+        defer stored_headers.deinit(self.allocator);
+        for (merged.items) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "age")) continue;
+            try stored_headers.append(self.allocator, header);
+        }
+        const params = PutParams{
+            .status_code = entry.status_code,
+            .reason = entry.reason,
+            .headers = stored_headers.items,
+            .body = entry.body,
+            .ttl_seconds = freshness.ttl_seconds,
+            .initial_age_seconds = freshness.initial_age_seconds,
+            .swr_seconds = staleWhileRevalidateSeconds(freshness, swr_ceiling_seconds),
+        };
+        if (is_variant) {
+            try self.putVaryVariant(now_ms, primary_key, effective_key, params);
+        } else {
+            try self.put(now_ms, effective_key, params);
+        }
+    }
+
+    /// Deep-copy one live entry for best-effort disk persistence after an
+    /// in-memory metadata-only refresh.
+    pub fn persistenceSnapshot(self: *const ProxyResponseCache, scratch: std.mem.Allocator, key: []const u8) !?PersistenceSnapshot {
+        const entry = self.map.get(key) orelse return null;
+        const reason = try scratch.dupe(u8, entry.reason);
+        const headers = try scratch.alloc(CacheHeaderView, entry.headers.len);
+        for (entry.headers, 0..) |header, i| {
+            headers[i] = .{
+                .name = try scratch.dupe(u8, header.name),
+                .value = try scratch.dupe(u8, header.value),
+            };
+        }
+        return .{
+            .status_code = entry.status_code,
+            .reason = reason,
+            .headers = headers,
+            .body = try scratch.dupe(u8, entry.body),
+            .stored_at_ms = entry.stored_at_ms,
+            .expires_at_ms = entry.expires_at_ms,
+            .swr_until_ms = entry.swr_until_ms,
+            .initial_age_seconds = entry.initial_age_seconds,
+            .vary_primary_key = if (entry.vary_primary_key) |primary| try scratch.dupe(u8, primary) else null,
+        };
+    }
+
     fn objectBytes(key: []const u8, params: PutParams) usize {
         var total: usize = key.len + params.reason.len + params.body.len + 64;
         for (params.headers) |h| total += h.name.len + h.value.len + 2;
@@ -393,7 +513,10 @@ pub const ProxyResponseCache = struct {
     }
 
     fn prepareEntry(self: *ProxyResponseCache, now_ms: u64, key: []const u8, params: PutParams) !PreparedEntry {
-        if (params.ttl_seconds == 0 or params.initial_age_seconds >= params.ttl_seconds) return error.NotCacheable;
+        if (params.absolute_timing == null and (params.ttl_seconds == 0 or params.initial_age_seconds >= params.ttl_seconds)) return error.NotCacheable;
+        if (params.absolute_timing) |timing| {
+            if (timing.expires_at_ms <= now_ms or timing.swr_until_ms < timing.expires_at_ms or timing.stored_at_ms > now_ms) return error.NotCacheable;
+        }
         const object_bytes = objectBytes(key, params);
         if (object_bytes > self.limits.max_object_bytes) return error.ObjectTooLarge;
 
@@ -413,16 +536,24 @@ pub const ProxyResponseCache = struct {
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
 
-        const expires_at_ms = now_ms + @as(u64, params.ttl_seconds - params.initial_age_seconds) * 1000;
+        const stored_at_ms = if (params.absolute_timing) |timing| timing.stored_at_ms else now_ms;
+        const expires_at_ms = if (params.absolute_timing) |timing|
+            timing.expires_at_ms
+        else
+            now_ms + @as(u64, params.ttl_seconds - params.initial_age_seconds) * 1000;
+        const swr_until_ms = if (params.absolute_timing) |timing|
+            timing.swr_until_ms
+        else
+            expires_at_ms + @as(u64, params.swr_seconds) * 1000;
         return .{ .key = owned_key, .entry = .{
             .metadata_arena = arena,
             .status_code = params.status_code,
             .reason = owned_reason,
             .headers = owned_headers,
             .body = owned_body,
-            .stored_at_ms = now_ms,
+            .stored_at_ms = stored_at_ms,
             .expires_at_ms = expires_at_ms,
-            .swr_until_ms = expires_at_ms + @as(u64, params.swr_seconds) * 1000,
+            .swr_until_ms = swr_until_ms,
             .initial_age_seconds = params.initial_age_seconds,
             .bytes = object_bytes,
         } };
@@ -1837,6 +1968,70 @@ test "ProxyResponseCache retires stale Vary variants and their index when a reso
     const fresh_hit = (try cache.lookup(arena.allocator(), primary, 1_000)).?;
     try std.testing.expectEqualStrings("fresh-unvaried-body", fresh_hit.body);
     try std.testing.expectEqual(@as(usize, 1), cache.map.count());
+}
+
+test "ProxyResponseCache 304 refresh keeps the body and renews metadata" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(0, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{
+            .{ .name = "Cache-Control", .value = "max-age=1" },
+            .{ .name = "ETag", .value = "\"v1\"" },
+            .{ .name = "Content-Type", .value = "text/plain" },
+        },
+        .body = "retained body",
+        .ttl_seconds = 1,
+        .swr_seconds = 10,
+    });
+
+    try cache.refreshNotModified(1_500, "key", "key", &.{
+        .{ .name = "Cache-Control", .value = "max-age=30" },
+        .{ .name = "ETag", .value = "\"v2\"" },
+    }, 60, 10);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const hit = (try cache.lookup(arena.allocator(), "key", 2_000)).?;
+    try std.testing.expect(!hit.stale);
+    try std.testing.expectEqualStrings("retained body", hit.body);
+    try std.testing.expectEqualStrings("\"v2\"", findStoredHeader(hit.headers, "etag").?);
+    try std.testing.expectEqualStrings("text/plain", findStoredHeader(hit.headers, "content-type").?);
+}
+
+test "ProxyResponseCache disk hydration preserves exact deadlines and Age basis" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(10_250, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{},
+        .body = "hydrated",
+        .ttl_seconds = 0,
+        .initial_age_seconds = 7,
+        .absolute_timing = .{
+            .stored_at_ms = 9_000,
+            .expires_at_ms = 10_500,
+            .swr_until_ms = 10_500,
+        },
+    });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const hit = (try cache.lookup(arena.allocator(), "key", 10_499)).?;
+    try std.testing.expectEqual(@as(u32, 8), hit.age_seconds);
+    try std.testing.expect((try cache.lookup(arena.allocator(), "key", 10_500)) == null);
 }
 
 test "buildCacheKey is deterministic and distinguishes field splits" {

@@ -3071,12 +3071,15 @@ fn handleHttp3LocationProxyPass(
                                         lease,
                                         cache_generation,
                                         key_buf[0..],
+                                        effective_key.?,
                                         hit.headers,
                                         request.headers.get("accept-encoding"),
                                         target,
                                         proxySuffixPathForLocation(request_path, matched, ctx.cfg.location_blocks),
+                                        request_query,
                                         request.headers.get(":authority") orelse request.headers.get("host"),
                                         ctx.client_ip,
+                                        matched.block.proxy_set_headers,
                                     );
                                 }
                             }

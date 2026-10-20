@@ -1170,12 +1170,23 @@ fn applyReloadedRuntimeConfig(
     state.proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds;
     state.proxy_cache_mutex.unlock();
 
+    // Stop and join stale-while-revalidate workers and drain disk leases
+    // before replacing either tier. Publishing the new generation first
+    // prevents old requests from acquiring another disk lease while reload
+    // waits.
+    state.proxyResponseCachePrepareReload(cache_generation);
+
     // #901: wholesale rebuild, same convention as proxy_cache_store above --
     // simpler and still bounded than trying to generation-tag entries across
     // a reload that may have changed routing/upstreams/TLS.
     state.proxy_response_cache_mutex.lock();
     if (state.proxy_response_cache) |*prc| prc.deinit();
-    state.proxy_response_cache = if (cfg.proxy_cache_ttl_seconds > 0)
+    state.proxy_response_cache = null;
+    if (state.proxy_response_cache_disk) |*disk| disk.deinit();
+    state.proxy_response_cache_disk = null;
+    state.proxy_response_cache_mutex.unlock();
+
+    const replacement_memory_cache: ?gpc.ProxyResponseCache = if (cfg.proxy_cache_ttl_seconds > 0)
         gpc.ProxyResponseCache.init(state.allocator, .{
             .max_object_bytes = cfg.proxy_response_cache_max_object_bytes,
             .max_entries = cfg.proxy_response_cache_max_entries,
@@ -1184,12 +1195,15 @@ fn applyReloadedRuntimeConfig(
         })
     else
         null;
-    // #903: same wholesale-rebuild convention as the in-memory cache above.
-    // The old `DiskCache` is closed (releasing its advisory directory lock)
-    // before the new one opens the same path, so a reload never holds two
-    // conflicting locks on one directory.
-    if (state.proxy_response_cache_disk) |*disk| disk.deinit();
-    state.proxy_response_cache_disk = gs.openProxyResponseCacheDisk(state.allocator, cfg);
+    // Open/reconcile outside the memory-cache mutex: startup directory I/O
+    // cannot stall ordinary in-memory lookups.
+    const replacement_disk_cache = gs.openProxyResponseCacheDisk(state.allocator, cfg);
+
+    state.proxy_response_cache_mutex.lock();
+    state.proxy_response_cache = replacement_memory_cache;
+    state.proxy_response_cache_disk = replacement_disk_cache;
+    state.proxy_response_cache_disk_accepting = true;
+    state.proxy_response_cache_revalidation_cancel = http.cancellation.CancellationToken.init(0);
     state.proxy_response_cache_revalidation_max_concurrency.store(cfg.proxy_response_cache_revalidation_max_concurrency, .release);
     // Publish the new cache epoch in the same critical section as the swap.
     // A response still running on an older config lease can neither read nor
@@ -1352,10 +1366,14 @@ test "applyReloadedRuntimeConfig atomically swaps proxy cache generation and upd
     state.proxy_response_cache_mutex = .{};
     state.proxy_response_cache = null;
     state.proxy_response_cache_disk = null;
+    state.proxy_response_cache_disk_accepting = true;
+    state.proxy_response_cache_disk_inflight = 0;
+    state.proxy_response_cache_condition = .{};
     state.proxy_response_cache_revalidation_locks = std.StringHashMap(void).init(allocator);
     defer state.proxy_response_cache_revalidation_locks.deinit();
     state.proxy_response_cache_revalidation_inflight = std.atomic.Value(u32).init(0);
     state.proxy_response_cache_revalidation_max_concurrency = std.atomic.Value(u32).init(0);
+    state.proxy_response_cache_revalidation_cancel = http.cancellation.CancellationToken.init(0);
     state.runtime_mutex = .{};
     // `metricsToPrometheus` (called below) locks this via `muxMetricsSnapshot`
     // — left uninitialized, `.lock()` on garbage memory hangs indefinitely

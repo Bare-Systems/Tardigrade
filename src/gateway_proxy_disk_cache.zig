@@ -57,6 +57,39 @@ const max_header_value_bytes: usize = 8192;
 const max_reason_bytes: usize = 256;
 
 const record_magic = "TPDC2\x00\x00\x00".*;
+const io_lane_count: usize = 64;
+
+/// Test-only pause point for proving that unrelated keys remain responsive
+/// while one durable write is stalled. The pointer is null in production.
+pub const TestWriteBarrier = struct {
+    key: []const u8,
+    mutex: compat.Mutex = .{},
+    condition: compat.Condition = .{},
+    reached: bool = false,
+    released: bool = false,
+
+    pub fn waitUntilReached(self: *TestWriteBarrier) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.reached) self.condition.wait(&self.mutex);
+    }
+
+    pub fn release(self: *TestWriteBarrier) void {
+        self.mutex.lock();
+        self.released = true;
+        self.condition.broadcast();
+        self.mutex.unlock();
+    }
+
+    fn pauseIfMatched(self: *TestWriteBarrier, key: []const u8) void {
+        if (!std.mem.eql(u8, self.key, key)) return;
+        self.mutex.lock();
+        self.reached = true;
+        self.condition.broadcast();
+        while (!self.released) self.condition.wait(&self.mutex);
+        self.mutex.unlock();
+    }
+};
 
 pub const PutRecord = struct {
     status_code: u16,
@@ -95,6 +128,7 @@ const IndexValue = struct {
     bytes: usize,
     last_used_ms: u64,
     vary_primary_key: ?[key_len]u8 = null,
+    pending_write: bool = false,
 };
 
 const VaryIndexEntry = struct {
@@ -130,11 +164,17 @@ pub const DiskCache = struct {
     /// served, even though the bytes on disk are otherwise well-formed.
     fingerprint: u64,
     mutex: compat.Mutex = .{},
+    /// Fixed striped lanes serialize same-key durable mutations without
+    /// carrying the global index mutex across filesystem I/O.
+    io_lanes: [io_lane_count]compat.Mutex = @splat(.{}),
     index: std.StringHashMap(IndexValue),
     vary_index: std.StringHashMap(VaryIndexEntry),
     total_bytes: usize = 0,
+    reserved_entries: usize = 0,
+    reserved_bytes: usize = 0,
     max_vary_variants: usize,
     disabled: bool = false,
+    test_write_barrier: ?*TestWriteBarrier = null,
 
     /// Opens (creating as `0700` if absent) and validates `root_path`,
     /// refusing a symlink, a path owned by another user, or one with
@@ -156,6 +196,35 @@ pub const DiskCache = struct {
         self.reconcileFromDisk(root_path);
         self.evictToFitLocked();
         return self;
+    }
+
+    const IoGuard = struct {
+        cache: *DiskCache,
+        first: usize,
+        second: ?usize,
+
+        fn unlock(self: IoGuard) void {
+            if (self.second) |idx| self.cache.io_lanes[idx].unlock();
+            self.cache.io_lanes[self.first].unlock();
+        }
+    };
+
+    fn ioLane(key: []const u8) usize {
+        return @intCast(std.hash.Wyhash.hash(0x5444_4349_4f, key) % io_lane_count);
+    }
+
+    pub fn keysShareIoLane(a: []const u8, b: []const u8) bool {
+        return ioLane(a) == ioLane(b);
+    }
+
+    fn lockIo(self: *DiskCache, key: []const u8, related_key: ?[]const u8) IoGuard {
+        const key_lane = ioLane(key);
+        const related_lane = if (related_key) |related| ioLane(related) else key_lane;
+        const first = @min(key_lane, related_lane);
+        const second = @max(key_lane, related_lane);
+        self.io_lanes[first].lock();
+        if (second != first) self.io_lanes[second].lock();
+        return .{ .cache = self, .first = first, .second = if (second == first) null else second };
     }
 
     pub fn deinit(self: *DiskCache) void {
@@ -289,43 +358,42 @@ pub const DiskCache = struct {
         }
     }
 
-    /// Deletes the single oldest (`last_used_ms`) tracked entry. Called only
-    /// while `self.mutex` is held.
-    fn evictOneLocked(self: *DiskCache) void {
-        _ = self.evictOneLockedExcept(null);
+    /// Detaches one tracked entry from the in-memory index. The caller owns
+    /// the returned key and must unlink/free it after releasing `self.mutex`.
+    fn detachLocked(self: *DiskCache, key: []const u8) ?[]const u8 {
+        const removed = self.index.fetchRemove(key) orelse return null;
+        self.total_bytes -= removed.value.bytes;
+        if (removed.value.vary_primary_key) |primary| self.pruneVariantLocked(primary[0..], removed.key);
+        return removed.key;
     }
 
-    fn evictOneLockedExcept(self: *DiskCache, except: ?[]const u8) bool {
+    fn oldestKeyLocked(self: *DiskCache, except: ?[]const u8) ?[]const u8 {
         var oldest_key: ?[]const u8 = null;
         var oldest_ms: u64 = std.math.maxInt(u64);
         var it = self.index.iterator();
         while (it.next()) |kv| {
             if (except) |key| if (std.mem.eql(u8, kv.key_ptr.*, key)) continue;
-            if (kv.value_ptr.last_used_ms < oldest_ms) {
+            if (kv.value_ptr.pending_write) continue;
+            if (kv.value_ptr.last_used_ms < oldest_ms or
+                (kv.value_ptr.last_used_ms == oldest_ms and (oldest_key == null or std.mem.order(u8, kv.key_ptr.*, oldest_key.?) == .lt)))
+            {
                 oldest_ms = kv.value_ptr.last_used_ms;
                 oldest_key = kv.key_ptr.*;
             }
         }
-        const victim = oldest_key orelse return false;
-        self.removeLocked(victim);
-        return true;
+        return oldest_key;
     }
 
+    /// Startup-only quota reconciliation. No other thread can observe this
+    /// object yet, so filesystem cleanup does not need the runtime mutex.
     fn evictToFitLocked(self: *DiskCache) void {
         var guard: usize = 0;
         while ((self.index.count() > self.limits.max_entries or self.total_bytes > self.limits.max_total_bytes) and guard < self.limits.max_entries + 1) {
             guard += 1;
-            self.evictOneLocked();
-        }
-    }
-
-    fn removeLocked(self: *DiskCache, key: []const u8) void {
-        if (self.index.fetchRemove(key)) |removed| {
-            // `key` may alias `removed.key`; unlink before releasing it.
-            self.state_dir.removeFile(removed.key);
-            self.total_bytes -= removed.value.bytes;
-            if (removed.value.vary_primary_key) |primary| self.pruneVariantLocked(primary[0..], removed.key);
-            self.allocator.free(removed.key);
+            const victim = self.oldestKeyLocked(null) orelse break;
+            const owned = self.detachLocked(victim) orelse continue;
+            self.state_dir.removeFile(owned);
+            self.allocator.free(owned);
         }
     }
 
@@ -334,13 +402,24 @@ pub const DiskCache = struct {
     /// scan truncated by `scan_cap`, or never have been written at all).
     pub fn remove(self: *DiskCache, key: []const u8) void {
         if (!isHexLowerKey(key)) return;
+        const io_guard = self.lockIo(key, null);
+        defer io_guard.unlock();
+        self.removeWithIoHeld(key);
+    }
+
+    fn removeWithIoHeld(self: *DiskCache, key: []const u8) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.disabled) return;
-        self.removeLocked(key);
+        if (self.disabled) {
+            self.mutex.unlock();
+            return;
+        }
+        const owned = self.detachLocked(key);
+        self.mutex.unlock();
         // Also remove a valid but untracked file (for example, one left by a
-        // failed process between rename and index publication).
-        if (!self.index.contains(key)) self.state_dir.removeFile(key);
+        // failed process between rename and index publication). No global
+        // index mutex is held while touching the filesystem.
+        self.state_dir.removeFile(owned orelse key);
+        if (owned) |removed_key| self.allocator.free(removed_key);
     }
 
     fn recordBytes(key: []const u8, record: PutRecord) usize {
@@ -356,6 +435,7 @@ pub const DiskCache = struct {
     /// unavailable".
     pub fn put(self: *DiskCache, key: []const u8, record: PutRecord, now_ms: u64) void {
         if (!isHexLowerKey(key)) return;
+        if (record.vary_primary_key) |primary| if (!isHexLowerKey(primary)) return;
         if (record.reason.len > max_reason_bytes) return;
         if (record.headers.len > max_headers) return;
         for (record.headers) |h| {
@@ -367,50 +447,142 @@ pub const DiskCache = struct {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
         encodeRecord(self.allocator, &buf, key, record, self.fingerprint) catch return;
+        const io_guard = self.lockIo(key, record.vary_primary_key);
+        defer io_guard.unlock();
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.disabled) return;
-
-        const existing = self.index.get(key);
-        const retired_count: usize = if (existing == null) 0 else 1;
-        const retired_bytes: usize = if (existing) |value| value.bytes else 0;
-        if (existing == null) self.index.ensureUnusedCapacity(1) catch return;
-        var owned_key = if (existing == null) self.allocator.dupe(u8, key) catch return else null;
-        defer if (owned_key) |owned| self.allocator.free(owned);
-
-        var owned_primary: ?[]u8 = null;
+        // A representation-policy transition retires the incompatible disk
+        // shape before attempting the new write. If the write then fails or
+        // the process crashes, restart observes a safe miss instead of an
+        // old unvaried/varied representation under the new policy.
         if (record.vary_primary_key) |primary| {
-            if (!isHexLowerKey(primary)) return;
-            if (!self.vary_index.contains(primary)) {
-                self.vary_index.ensureUnusedCapacity(1) catch return;
-                owned_primary = self.allocator.dupe(u8, primary) catch return;
+            self.mutex.lock();
+            if (self.disabled) {
+                self.mutex.unlock();
+                return;
+            }
+            const retired_primary = self.detachLocked(primary);
+            self.mutex.unlock();
+            self.state_dir.removeFile(retired_primary orelse primary);
+            if (retired_primary) |owned| self.allocator.free(owned);
+        } else {
+            while (true) {
+                self.mutex.lock();
+                if (self.disabled) {
+                    self.mutex.unlock();
+                    return;
+                }
+                const victim: ?[key_len]u8 = if (self.vary_index.getPtr(key)) |index| blk: {
+                    if (index.count == 0) break :blk null;
+                    break :blk index.variant_keys[0];
+                } else null;
+                if (victim == null) {
+                    self.mutex.unlock();
+                    break;
+                }
+                const retired_variant = self.detachLocked(victim.?[0..]);
+                self.mutex.unlock();
+                if (retired_variant) |owned| {
+                    self.state_dir.removeFile(owned);
+                    self.allocator.free(owned);
+                }
             }
         }
-        defer if (owned_primary) |owned| self.allocator.free(owned);
+
+        // Keep each primary's variant set bounded before reserving the new
+        // record. The primary I/O lane prevents another variant writer from
+        // changing this set while the filesystem operation is in flight.
+        if (record.vary_primary_key) |primary| {
+            while (true) {
+                self.mutex.lock();
+                if (self.disabled) {
+                    self.mutex.unlock();
+                    return;
+                }
+                const victim: ?[key_len]u8 = if (self.vary_index.getPtr(primary)) |index| blk: {
+                    if (index.indexOf(key) != null or index.count < self.max_vary_variants) break :blk null;
+                    break :blk index.variant_keys[0];
+                } else null;
+                if (victim == null) {
+                    self.mutex.unlock();
+                    break;
+                }
+                const retired_variant = self.detachLocked(victim.?[0..]);
+                self.mutex.unlock();
+                if (retired_variant) |owned| {
+                    self.state_dir.removeFile(owned);
+                    self.allocator.free(owned);
+                }
+            }
+        }
 
         const candidate_bytes = buf.items.len;
-        var guard: usize = 0;
-        while (((self.index.count() - retired_count) >= self.limits.max_entries or
-            (self.total_bytes - retired_bytes) + candidate_bytes > self.limits.max_total_bytes) and guard < self.limits.max_entries + 1)
-        {
-            guard += 1;
-            if (!self.evictOneLockedExcept(key)) break;
+        var owned_key: ?[]u8 = self.allocator.dupe(u8, key) catch return;
+        defer if (owned_key) |owned| self.allocator.free(owned);
+        var owned_primary: ?[]u8 = if (record.vary_primary_key) |primary| self.allocator.dupe(u8, primary) catch return else null;
+        defer if (owned_primary) |owned| self.allocator.free(owned);
+
+        var reserved_entry: usize = 0;
+        var reserved_growth: usize = 0;
+        while (true) {
+            self.mutex.lock();
+            if (self.disabled) {
+                self.mutex.unlock();
+                return;
+            }
+            const existing = self.index.get(key);
+            reserved_entry = if (existing == null) 1 else 0;
+            const existing_bytes = if (existing) |value| value.bytes else 0;
+            reserved_growth = candidate_bytes -| existing_bytes;
+            const entries_fit = self.reserved_entries + reserved_entry <= self.limits.max_entries -| self.index.count();
+            const bytes_fit = self.reserved_bytes + reserved_growth <= self.limits.max_total_bytes -| self.total_bytes;
+            if (entries_fit and bytes_fit) {
+                if (existing == null) self.index.ensureUnusedCapacity(1) catch {
+                    self.mutex.unlock();
+                    return;
+                } else if (self.index.getPtr(key)) |value| {
+                    value.pending_write = true;
+                }
+                if (record.vary_primary_key) |primary| if (!self.vary_index.contains(primary)) {
+                    self.vary_index.ensureUnusedCapacity(1) catch {
+                        if (self.index.getPtr(key)) |value| value.pending_write = false;
+                        self.mutex.unlock();
+                        return;
+                    };
+                };
+                self.reserved_entries += reserved_entry;
+                self.reserved_bytes += reserved_growth;
+                self.mutex.unlock();
+                break;
+            }
+
+            const victim = self.oldestKeyLocked(key);
+            const retired = if (victim) |victim_key| self.detachLocked(victim_key) else null;
+            self.mutex.unlock();
+            if (retired) |owned| {
+                self.state_dir.removeFile(owned);
+                self.allocator.free(owned);
+                continue;
+            }
+            return;
         }
-        const refreshed = self.index.get(key);
-        const refreshed_count: usize = if (refreshed == null) 0 else 1;
-        const refreshed_bytes: usize = if (refreshed) |value| value.bytes else 0;
-        if ((self.index.count() - refreshed_count) >= self.limits.max_entries or
-            (self.total_bytes - refreshed_bytes) + candidate_bytes > self.limits.max_total_bytes) return;
 
-        self.state_dir.writeFileAtomicLimit(key, buf.items, 0o600, self.limits.max_object_bytes + record_overhead_bytes) catch return;
+        if (self.test_write_barrier) |barrier| barrier.pauseIfMatched(key);
+        const write_succeeded = blk: {
+            self.state_dir.writeFileAtomicLimit(key, buf.items, 0o600, self.limits.max_object_bytes + record_overhead_bytes) catch break :blk false;
+            break :blk true;
+        };
 
-        // The first Vary representation supersedes any direct record stored
-        // at its primary key. Mirror the in-memory transition so restart
-        // reconciliation cannot retain an unreachable stale direct file.
-        if (record.vary_primary_key) |primary| self.removeLocked(primary);
+        self.mutex.lock();
+        self.reserved_entries -= reserved_entry;
+        self.reserved_bytes -= reserved_growth;
+        if (!write_succeeded or self.disabled) {
+            if (self.index.getPtr(key)) |value| value.pending_write = false;
+            self.mutex.unlock();
+            return;
+        }
 
-        var final_key: ?[]const u8 = owned_key;
+        var final_key: []const u8 = owned_key.?;
+        var used_new_key = true;
         if (self.index.fetchRemove(key)) |removed| {
             self.total_bytes -= removed.value.bytes;
             if (removed.value.vary_primary_key) |primary| {
@@ -421,6 +593,7 @@ pub const DiskCache = struct {
                 if (!same_variant) self.pruneVariantLocked(primary[0..], removed.key);
             }
             final_key = removed.key;
+            used_new_key = false;
         }
         var vary_primary: ?[key_len]u8 = null;
         if (record.vary_primary_key) |primary| {
@@ -428,18 +601,13 @@ pub const DiskCache = struct {
             @memcpy(primary_buf[0..], primary);
             vary_primary = primary_buf;
         }
-        self.index.putAssumeCapacity(final_key.?, .{ .bytes = candidate_bytes, .last_used_ms = now_ms, .vary_primary_key = vary_primary });
-        owned_key = null;
+        self.index.putAssumeCapacity(final_key, .{ .bytes = candidate_bytes, .last_used_ms = now_ms, .vary_primary_key = vary_primary });
+        if (used_new_key) owned_key = null;
         self.total_bytes += candidate_bytes;
 
         if (record.vary_primary_key) |primary| {
             if (self.vary_index.getPtr(primary)) |index| {
                 if (index.indexOf(key) == null) {
-                    if (index.count == self.max_vary_variants) {
-                        const victim = index.variant_keys[0];
-                        index.removeAt(0);
-                        self.removeLocked(victim[0..]);
-                    }
                     @memcpy(index.variant_keys[index.count][0..], key);
                     index.count += 1;
                 }
@@ -450,10 +618,8 @@ pub const DiskCache = struct {
                 self.vary_index.putAssumeCapacity(owned_primary.?, fresh);
                 owned_primary = null;
             }
-        } else if (self.vary_index.fetchRemove(key)) |variants| {
-            for (variants.value.variant_keys[0..variants.value.count]) |variant| self.removeLocked(variant[0..]);
-            self.allocator.free(variants.key);
         }
+        self.mutex.unlock();
     }
 
     /// Reads, validates and decodes `key`. `scratch` must outlive the
@@ -466,6 +632,8 @@ pub const DiskCache = struct {
     /// wedge every future lookup for that key.
     pub fn get(self: *DiskCache, scratch: std.mem.Allocator, key: []const u8, now_ms: u64) ?LoadedRecord {
         if (!isHexLowerKey(key)) return null;
+        const io_guard = self.lockIo(key, null);
+        defer io_guard.unlock();
         self.mutex.lock();
         if (self.disabled) {
             self.mutex.unlock();
@@ -476,20 +644,20 @@ pub const DiskCache = struct {
         if (!tracked) return null;
 
         const raw = self.state_dir.readFileAlloc(scratch, key, self.limits.max_object_bytes + record_overhead_bytes, false) catch {
-            self.remove(key);
+            self.removeWithIoHeld(key);
             return null;
         };
         const maybe_decoded = decodeRecord(scratch, raw) catch return null;
         const decoded = maybe_decoded orelse {
-            self.remove(key);
+            self.removeWithIoHeld(key);
             return null;
         };
         if (decoded.fingerprint != self.fingerprint or !std.mem.eql(u8, decoded.key, key)) {
-            self.remove(key);
+            self.removeWithIoHeld(key);
             return null;
         }
         if (now_ms >= decoded.record.swr_until_ms) {
-            self.remove(key);
+            self.removeWithIoHeld(key);
             return null;
         }
 
@@ -967,4 +1135,178 @@ test "DiskCache.put refuses an object larger than max_object_bytes" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     try std.testing.expectEqual(@as(?LoadedRecord, null), cache.get(arena.allocator(), "e" ** 64, 10));
+}
+
+test "DiskCache stalled write does not block a disjoint write or Vary metadata lookup" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var cache = try DiskCache.init(allocator, root_path, .{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 }, 55);
+    defer cache.deinit();
+    const key_a = "1" ** 64;
+    const candidates = [_][]const u8{ "2" ** 64, "3" ** 64, "4" ** 64, "5" ** 64 };
+    var key_b = candidates[0];
+    for (candidates) |candidate| {
+        if (DiskCache.ioLane(candidate) != DiskCache.ioLane(key_a)) {
+            key_b = candidate;
+            break;
+        }
+    }
+    try std.testing.expect(DiskCache.ioLane(key_a) != DiskCache.ioLane(key_b));
+    const vary_primary = "a" ** 64;
+    const vary_secondary = "b" ** 64;
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    const record = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "body",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    };
+    var vary_record = record;
+    vary_record.vary_primary_key = vary_primary;
+    cache.put(vary_secondary, vary_record, 0);
+
+    var barrier = TestWriteBarrier{ .key = key_a };
+    cache.test_write_barrier = &barrier;
+    const PutWorker = struct {
+        fn run(target: *DiskCache, key: []const u8, value: PutRecord, started: *std.atomic.Value(bool), done: *std.atomic.Value(bool)) void {
+            started.store(true, .release);
+            target.put(key, value, 1);
+            done.store(true, .release);
+        }
+    };
+    var a_started = std.atomic.Value(bool).init(false);
+    var a_done = std.atomic.Value(bool).init(false);
+    const writer_a = try std.Thread.spawn(.{}, PutWorker.run, .{ &cache, key_a, record, &a_started, &a_done });
+    while (!a_started.load(.acquire)) std.atomic.spinLoopHint();
+    barrier.waitUntilReached();
+
+    var b_started = std.atomic.Value(bool).init(false);
+    var b_done = std.atomic.Value(bool).init(false);
+    const writer_b = std.Thread.spawn(.{}, PutWorker.run, .{ &cache, key_b, record, &b_started, &b_done }) catch |err| {
+        barrier.release();
+        writer_a.join();
+        return err;
+    };
+    while (!b_started.load(.acquire)) std.atomic.spinLoopHint();
+
+    var vary_done = std.atomic.Value(bool).init(false);
+    var vary_tracked = false;
+    const VaryWorker = struct {
+        fn run(target: *DiskCache, primary: []const u8, result: *bool, done: *std.atomic.Value(bool)) void {
+            result.* = target.isVaryTracked(primary);
+            done.store(true, .release);
+        }
+    };
+    const vary_reader = std.Thread.spawn(.{}, VaryWorker.run, .{ &cache, vary_primary, &vary_tracked, &vary_done }) catch |err| {
+        barrier.release();
+        writer_a.join();
+        writer_b.join();
+        return err;
+    };
+    var attempts: usize = 0;
+    while ((!b_done.load(.acquire) or !vary_done.load(.acquire)) and attempts < 100) : (attempts += 1) {
+        std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    const disjoint_write_completed = b_done.load(.acquire);
+    const vary_lookup_completed = vary_done.load(.acquire);
+    barrier.release();
+    writer_a.join();
+    writer_b.join();
+    vary_reader.join();
+    cache.test_write_barrier = null;
+
+    try std.testing.expect(disjoint_write_completed);
+    try std.testing.expect(vary_lookup_completed);
+    try std.testing.expect(vary_tracked);
+    try std.testing.expect(a_done.load(.acquire));
+}
+
+test "DiskCache failed direct-to-Vary transition cannot revive the direct record after restart" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
+    const primary = "c" ** 64;
+    const secondary = "d" ** 64;
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    {
+        var cache = try DiskCache.init(allocator, root_path, limits, 88);
+        defer cache.deinit();
+        cache.put(primary, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &headers,
+            .body = "old direct",
+            .stored_at_ms = 0,
+            .expires_at_ms = 60_000,
+            .swr_until_ms = 60_000,
+            .initial_age_seconds = 0,
+        }, 0);
+        cache.state_dir.fault = .write;
+        cache.state_dir.fault_file = secondary;
+        cache.put(secondary, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &headers,
+            .body = "new variant",
+            .stored_at_ms = 1,
+            .expires_at_ms = 60_000,
+            .swr_until_ms = 60_000,
+            .initial_age_seconds = 0,
+            .vary_primary_key = primary,
+        }, 1);
+    }
+
+    var reopened = try DiskCache.init(allocator, root_path, limits, 88);
+    defer reopened.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(reopened.get(arena.allocator(), primary, 2) == null);
+    try std.testing.expect(reopened.get(arena.allocator(), secondary, 2) == null);
+}
+
+test "DiskCache restart quota shrink evicts equal-recency keys deterministically" {
+    const allocator = std.testing.allocator;
+    var iteration: usize = 0;
+    while (iteration < 3) : (iteration += 1) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+        defer allocator.free(root_path);
+        const headers = [_]gpc.CacheHeaderView{};
+        const record = PutRecord{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &headers,
+            .body = "same",
+            .stored_at_ms = 0,
+            .expires_at_ms = 60_000,
+            .swr_until_ms = 60_000,
+            .initial_age_seconds = 0,
+        };
+        {
+            var writer = try DiskCache.init(allocator, root_path, .{ .max_object_bytes = 4096, .max_entries = 4, .max_total_bytes = 1 << 20 }, 99);
+            defer writer.deinit();
+            writer.put("1" ** 64, record, 0);
+            writer.put("2" ** 64, record, 0);
+            writer.put("3" ** 64, record, 0);
+        }
+        var reopened = try DiskCache.init(allocator, root_path, .{ .max_object_bytes = 4096, .max_entries = 2, .max_total_bytes = 1 << 20 }, 99);
+        defer reopened.deinit();
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        try std.testing.expect(reopened.get(arena.allocator(), "1" ** 64, 1) == null);
+        try std.testing.expect(reopened.get(arena.allocator(), "2" ** 64, 1) != null);
+        try std.testing.expect(reopened.get(arena.allocator(), "3" ** 64, 1) != null);
+    }
 }

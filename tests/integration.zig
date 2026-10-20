@@ -14821,6 +14821,153 @@ test "generic proxy_pass response cache disk tier survives a process restart (#9
     try std.testing.expect(second.header("Age") != null);
 }
 
+test "disk-only stale ETag revalidates with one origin 304 then becomes a fresh hit (#903)" {
+    const allocator = std.testing.allocator;
+    const headers: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=1" },
+        .{ .name = "ETag", .value = "\"disk-v1\"" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 200, .body = "disk-etag-v1", .headers = headers },
+        .{ .status_code = 304, .body = "", .headers = headers },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cache_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(cache_root);
+    const cache_path = try std.fmt.allocPrint(allocator, "{s}/proxy-cache", .{cache_root});
+    defer allocator.free(cache_path);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /etag {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    const extra_env: []const EnvPair = &.{
+        .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "1" },
+        .{ .name = "TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS", .value = "10" },
+        .{ .name = "TARDIGRADE_PROXY_CACHE_PATH", .value = cache_path },
+    };
+    const request_headers: []const RequestHeader = &.{.{ .name = "Host", .value = "disk-etag-restart.test" }};
+
+    {
+        var first_process = try TardigradeProcess.start(allocator, .{
+            .profile = .generic,
+            .config_text = config_text,
+            .ready_path = "/healthz",
+            .extra_env = extra_env,
+        });
+        defer first_process.stop();
+        var first = try sendRequest(allocator, first_process.port, .{ .method = "GET", .path = "/etag", .body = null, .headers = request_headers });
+        defer first.deinit();
+        try assertContains(first.body, "disk-etag-v1");
+        try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+    }
+    compat.sleepNs(1_200 * std.time.ns_per_ms);
+
+    var second_process = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = extra_env,
+    });
+    defer second_process.stop();
+    var stale = try sendRequest(allocator, second_process.port, .{ .method = "GET", .path = "/etag", .body = null, .headers = request_headers });
+    defer stale.deinit();
+    try assertContains(stale.body, "disk-etag-v1");
+    var attempts: usize = 0;
+    while (origin.requestCount() < 2 and attempts < 100) : (attempts += 1) compat.sleepNs(25 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+    try std.testing.expectEqualStrings("\"disk-v1\"", origin.capturedHeader("If-None-Match").?);
+
+    var fresh = try sendRequest(allocator, second_process.port, .{ .method = "GET", .path = "/etag", .body = null, .headers = request_headers });
+    defer fresh.deinit();
+    try assertContains(fresh.body, "disk-etag-v1");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+}
+
+test "two Accept-Encoding variants survive a process restart without cross-replay (#903)" {
+    const allocator = std.testing.allocator;
+    const vary_headers: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "Vary", .value = "Accept-Encoding" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 200, .body = "gzip-representation", .headers = vary_headers },
+        .{ .status_code = 200, .body = "identity-representation", .headers = vary_headers },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cache_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(cache_root);
+    const cache_path = try std.fmt.allocPrint(allocator, "{s}/proxy-cache", .{cache_root});
+    defer allocator.free(cache_path);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /vary {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    const extra_env: []const EnvPair = &.{
+        .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" },
+        .{ .name = "TARDIGRADE_PROXY_CACHE_PATH", .value = cache_path },
+    };
+    const gzip_request: []const RequestHeader = &.{
+        .{ .name = "Host", .value = "vary-restart.test" },
+        .{ .name = "Accept-Encoding", .value = "gzip" },
+    };
+    const identity_request: []const RequestHeader = &.{
+        .{ .name = "Host", .value = "vary-restart.test" },
+        .{ .name = "Accept-Encoding", .value = "identity" },
+    };
+
+    {
+        var first_process = try TardigradeProcess.start(allocator, .{
+            .profile = .generic,
+            .config_text = config_text,
+            .ready_path = "/healthz",
+            .extra_env = extra_env,
+        });
+        defer first_process.stop();
+        var gzip = try sendRequest(allocator, first_process.port, .{ .method = "GET", .path = "/vary", .body = null, .headers = gzip_request });
+        defer gzip.deinit();
+        try assertContains(gzip.body, "gzip-representation");
+        var identity = try sendRequest(allocator, first_process.port, .{ .method = "GET", .path = "/vary", .body = null, .headers = identity_request });
+        defer identity.deinit();
+        try assertContains(identity.body, "identity-representation");
+        try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+    }
+
+    var second_process = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = extra_env,
+    });
+    defer second_process.stop();
+    var gzip = try sendRequest(allocator, second_process.port, .{ .method = "GET", .path = "/vary", .body = null, .headers = gzip_request });
+    defer gzip.deinit();
+    try assertContains(gzip.body, "gzip-representation");
+    var identity = try sendRequest(allocator, second_process.port, .{ .method = "GET", .path = "/vary", .body = null, .headers = identity_request });
+    defer identity.deinit();
+    try assertContains(identity.body, "identity-representation");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+}
+
 test "generic proxy_pass response cache serves a bounded stale hit and refreshes once in the background (#903)" {
     const allocator = std.testing.allocator;
 
@@ -15015,6 +15162,93 @@ test "generic proxy_pass response cache isolates by query string and never share
     defer cookie2.deinit();
     try assertContains(cookie2.body, "cookie-2");
     try std.testing.expectEqual(@as(u32, 9), origin.requestCount());
+}
+
+test "shipping cache never persists or replays token-bearing origin response headers (#903)" {
+    const allocator = std.testing.allocator;
+    const auth_header: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "Authorization", .value = "Bearer origin-auth-secret" },
+    };
+    const proxy_auth_header: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "Proxy-Authorization", .value = "Basic origin-proxy-secret" },
+    };
+    const session_header: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "X-Session-Token", .value = "origin-session-secret" },
+    };
+    const app_token_header: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "X-Api-Key", .value = "origin-api-secret" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "auth-one", .headers = auth_header },
+        .{ .body = "auth-two", .headers = auth_header },
+        .{ .body = "proxy-one", .headers = proxy_auth_header },
+        .{ .body = "proxy-two", .headers = proxy_auth_header },
+        .{ .body = "session-one", .headers = session_header },
+        .{ .body = "session-two", .headers = session_header },
+        .{ .body = "token-one", .headers = app_token_header },
+        .{ .body = "token-two", .headers = app_token_header },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cache_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(cache_root);
+    const cache_path = try std.fmt.allocPrint(allocator, "{s}/proxy-cache", .{cache_root});
+    defer allocator.free(cache_path);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /secret/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    {
+        var tardigrade = try TardigradeProcess.start(allocator, .{
+            .profile = .generic,
+            .config_text = config_text,
+            .ready_path = "/healthz",
+            .extra_env = &.{
+                .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" },
+                .{ .name = "TARDIGRADE_PROXY_CACHE_PATH", .value = cache_path },
+            },
+        });
+        defer tardigrade.stop();
+        inline for (.{
+            .{ .path = "/secret/auth", .first = "auth-one", .second = "auth-two" },
+            .{ .path = "/secret/proxy", .first = "proxy-one", .second = "proxy-two" },
+            .{ .path = "/secret/session", .first = "session-one", .second = "session-two" },
+            .{ .path = "/secret/token", .first = "token-one", .second = "token-two" },
+        }) |case| {
+            var first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = case.path, .body = null, .headers = &.{} });
+            defer first.deinit();
+            try assertContains(first.body, case.first);
+            var second = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = case.path, .body = null, .headers = &.{} });
+            defer second.deinit();
+            try assertContains(second.body, case.second);
+        }
+        try std.testing.expectEqual(@as(u32, 8), origin.requestCount());
+    }
+
+    var cache_dir = try compat.wrapDir(tmp.dir).openDir("proxy-cache", .{ .iterate = true });
+    defer cache_dir.close();
+    var iterator = cache_dir.iterate();
+    while (try iterator.next(compat.io())) |entry| {
+        if (entry.kind != .file) continue;
+        const bytes = try cache_dir.readFileAlloc(allocator, entry.name, 1024 * 1024);
+        defer allocator.free(bytes);
+        inline for (.{ "origin-auth-secret", "origin-proxy-secret", "origin-session-secret", "origin-api-secret" }) |secret| {
+            try std.testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
+        }
+    }
 }
 
 test "generic proxy_pass response cache never stores finite SSE responses (#901)" {

@@ -451,6 +451,20 @@ pub const EdgeConfig = struct {
     /// retained per resource (#902), clamped to
     /// `gateway_proxy_cache.hard_max_vary_variants`.
     proxy_response_cache_max_vary_variants: usize,
+    /// Bounded disk-tier entry-count cap, independent of the in-memory
+    /// `proxy_response_cache_max_entries` (#903). Only meaningful when
+    /// `proxy_cache_path` is non-empty.
+    proxy_response_cache_disk_max_entries: usize,
+    /// Bounded disk-tier aggregate resident-byte cap (#903).
+    proxy_response_cache_disk_max_total_bytes: usize,
+    /// Stable hash over the config fields that determine route/upstream
+    /// identity plus the generic cache's policy knobs, computed once at load
+    /// time (#903). A disk-persisted entry recorded under a different
+    /// fingerprint than the current process's is never served.
+    proxy_response_cache_disk_fingerprint: u64,
+    /// Bounds simultaneous single-flight stale-while-revalidate background
+    /// refreshes across every cache key (#903).
+    proxy_response_cache_revalidation_max_concurrency: u32,
     /// Optional comma-separated ISO country codes to block (requires external country header input).
     geo_blocked_countries: [][]const u8,
     /// Header containing country code provided by external edge/CDN.
@@ -1338,6 +1352,23 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const proxy_response_cache_max_vary_variants_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_MAX_VARY_VARIANTS", "8") catch unreachable;
     defer allocator.free(proxy_response_cache_max_vary_variants_str);
     const proxy_response_cache_max_vary_variants = std.fmt.parseInt(usize, proxy_response_cache_max_vary_variants_str, 10) catch 8;
+    // #903: bounded disk tier for the generic proxy_pass response cache.
+    // `TARDIGRADE_PROXY_CACHE_PATH`/`_STALE_WHILE_REVALIDATE_SECONDS` above
+    // already carry the operator-facing path/SWR window (shared with the
+    // legacy control-plane cache); these two knobs bound the *new* disk
+    // tier's own footprint independently of the in-memory caps above.
+    const proxy_response_cache_disk_max_entries_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_DISK_MAX_ENTRIES", "2000") catch unreachable;
+    defer allocator.free(proxy_response_cache_disk_max_entries_str);
+    const proxy_response_cache_disk_max_entries = std.fmt.parseInt(usize, proxy_response_cache_disk_max_entries_str, 10) catch 2000;
+    const proxy_response_cache_disk_max_total_bytes_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_DISK_MAX_TOTAL_BYTES", "268435456") catch unreachable;
+    defer allocator.free(proxy_response_cache_disk_max_total_bytes_str);
+    const proxy_response_cache_disk_max_total_bytes = std.fmt.parseInt(usize, proxy_response_cache_disk_max_total_bytes_str, 10) catch 256 * 1024 * 1024;
+    // Bounds simultaneous single-flight background revalidations spawned by
+    // stale-while-revalidate hits across every key, independent of the
+    // per-key single-flight lock (#903).
+    const proxy_response_cache_revalidation_max_concurrency_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_REVALIDATION_MAX_CONCURRENCY", "4") catch unreachable;
+    defer allocator.free(proxy_response_cache_revalidation_max_concurrency_str);
+    const proxy_response_cache_revalidation_max_concurrency = std.fmt.parseInt(u32, proxy_response_cache_revalidation_max_concurrency_str, 10) catch 4;
     const geo_blocked_countries_raw = envOrDefault(allocator, "TARDIGRADE_GEO_BLOCKED_COUNTRIES", "") catch unreachable;
     defer allocator.free(geo_blocked_countries_raw);
     const geo_blocked_countries = try parseCsvValues(allocator, geo_blocked_countries_raw);
@@ -1821,6 +1852,37 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(named_locations);
     }
+    // #903: a stable (process-restart-surviving) fingerprint over the
+    // config fields that determine route/upstream identity plus the cache
+    // policy knobs themselves. A disk-persisted cache entry is only valid
+    // for a process whose current fingerprint matches the one recorded when
+    // it was written -- any change here (not just an in-process reload
+    // generation bump, which resets to 0 every restart and so cannot by
+    // itself gate cross-restart validity) invalidates the whole disk tier
+    // rather than risk serving a stale representation from a retargeted
+    // route/upstream or a shrunk freshness ceiling.
+    const proxy_response_cache_disk_fingerprint = computeProxyCacheDiskFingerprint(
+        &.{
+            location_blocks_raw,
+            named_locations_raw,
+            location_error_pages_raw,
+            upstream_base_url,
+            upstream_base_urls_raw,
+            upstream_backup_base_urls_raw,
+            upstream_chat_base_urls_raw,
+            upstream_chat_backup_base_urls_raw,
+            upstream_commands_base_urls_raw,
+            upstream_commands_backup_base_urls_raw,
+        },
+        &.{
+            @as(u64, proxy_cache_ttl_seconds),
+            @as(u64, proxy_cache_stale_while_revalidate_seconds),
+            @as(u64, proxy_response_cache_max_object_bytes),
+            @as(u64, proxy_response_cache_max_entries),
+            @as(u64, proxy_response_cache_max_total_bytes),
+            @as(u64, proxy_response_cache_max_vary_variants),
+        },
+    );
     const mirror_rules_raw = envOrDefault(allocator, "TARDIGRADE_MIRROR_RULES", "") catch unreachable;
     defer allocator.free(mirror_rules_raw);
     const mirror_rules = try parseMirrorRules(allocator, mirror_rules_raw);
@@ -1979,6 +2041,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .proxy_response_cache_max_entries = proxy_response_cache_max_entries,
         .proxy_response_cache_max_total_bytes = proxy_response_cache_max_total_bytes,
         .proxy_response_cache_max_vary_variants = proxy_response_cache_max_vary_variants,
+        .proxy_response_cache_disk_max_entries = proxy_response_cache_disk_max_entries,
+        .proxy_response_cache_disk_max_total_bytes = proxy_response_cache_disk_max_total_bytes,
+        .proxy_response_cache_disk_fingerprint = proxy_response_cache_disk_fingerprint,
+        .proxy_response_cache_revalidation_max_concurrency = proxy_response_cache_revalidation_max_concurrency,
         .geo_blocked_countries = geo_blocked_countries,
         .geo_country_header = geo_country_header,
         .add_headers = add_headers,
@@ -4036,20 +4102,17 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: TARDIGRADE_REAL_IP_HEADER is not a valid header name", .{});
         return error.InvalidConfigValue;
     }
-    // #901: the shipping generic proxy_pass response cache (C1) is strictly
-    // bounded in-memory only -- no disk tier and no stale-while-revalidate
-    // serving yet (those are #903/#902). TARGET_PROXY_CACHE_PATH and
-    // TARGET_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS already did nothing
-    // for the generic path before this slice (the control-plane disk-cache
-    // writer they feed has no live reader either, per #900's wiring audit),
-    // so reject them explicitly rather than let an operator believe either
-    // knob is doing something.
-    validateProxyCacheDiskPathUnsupported(cfg.proxy_cache_path) catch {
-        std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_PATH is not supported yet -- the generic proxy_pass response cache is strictly bounded in-memory only; unset this variable", .{});
+    // #903: the generic proxy_pass response cache now has a bounded,
+    // crash-safe disk tier and bounded stale-while-revalidate serving, so
+    // TARDIGRADE_PROXY_CACHE_PATH and
+    // TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS are real again
+    // (shared with the legacy control-plane cache's own disk helpers).
+    validateProxyCacheDiskPath(cfg.proxy_cache_path) catch {
+        std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_PATH must be an absolute path with no NUL byte", .{});
         return error.InvalidConfigValue;
     };
-    validateProxyCacheStaleWhileRevalidateUnsupported(cfg.proxy_cache_stale_while_revalidate_seconds) catch {
-        std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS is not supported yet -- stale-while-revalidate serving ships in a later release; unset this variable", .{});
+    validateProxyCacheStaleWhileRevalidate(cfg.proxy_cache_stale_while_revalidate_seconds, cfg.proxy_cache_ttl_seconds) catch {
+        std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS requires a nonzero TARDIGRADE_PROXY_CACHE_TTL_SECONDS and must be <= 604800 (7 days)", .{});
         return error.InvalidConfigValue;
     };
     validateProxyResponseCacheBounds(
@@ -4065,6 +4128,18 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_MAX_VARY_VARIANTS must be nonzero and no greater than 16", .{});
         return error.InvalidConfigValue;
     };
+    validateProxyResponseCacheDiskBounds(
+        cfg.proxy_cache_path,
+        cfg.proxy_response_cache_disk_max_entries,
+        cfg.proxy_response_cache_disk_max_total_bytes,
+    ) catch {
+        std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_PATH is set but TARDIGRADE_PROXY_CACHE_DISK_MAX_ENTRIES/_MAX_TOTAL_BYTES must both be nonzero to bound the disk tier", .{});
+        return error.InvalidConfigValue;
+    };
+    if (cfg.proxy_response_cache_revalidation_max_concurrency == 0) {
+        std.log.err("config validation failed: TARDIGRADE_PROXY_CACHE_REVALIDATION_MAX_CONCURRENCY must be nonzero", .{});
+        return error.InvalidConfigValue;
+    }
     validateGeoTrustConfig(cfg.geo_blocked_countries.len, cfg.trust_require_upstream_identity, cfg.trusted_upstream_identities.len) catch {
         std.log.err("config validation failed: TARDIGRADE_GEO_BLOCKED_COUNTRIES requires TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true and at least one TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES entry", .{});
         return error.InvalidConfigValue;
@@ -4369,15 +4444,50 @@ fn validateProxyStreamBufferSize(size: usize) !void {
     if (size == 0 or size > 1024 * 1024) return error.InvalidConfigValue;
 }
 
-/// #901: `TARDIGRADE_PROXY_CACHE_PATH` has no disk tier to feed yet.
-fn validateProxyCacheDiskPathUnsupported(path: []const u8) !void {
-    if (path.len > 0) return error.InvalidConfigValue;
+/// #903: an enabled disk path must be absolute (a relative path is ambiguous
+/// once the process `chroot`s or changes its working directory) and must not
+/// contain a NUL byte or exceed the platform path length.
+fn validateProxyCacheDiskPath(path: []const u8) !void {
+    if (path.len == 0) return;
+    if (path.len >= std.fs.max_path_bytes) return error.InvalidConfigValue;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidConfigValue;
+    if (path[0] != '/') return error.InvalidConfigValue;
 }
 
-/// #901: `TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS` has no
-/// stale-while-revalidate serving to feed yet.
-fn validateProxyCacheStaleWhileRevalidateUnsupported(seconds: u32) !void {
-    if (seconds > 0) return error.InvalidConfigValue;
+/// #903: stale-while-revalidate serving is only meaningful alongside an
+/// enabled cache, and an unbounded window would let an operator keep serving
+/// an arbitrarily old representation forever.
+fn validateProxyCacheStaleWhileRevalidate(seconds: u32, ttl_seconds: u32) !void {
+    if (seconds == 0) return;
+    if (ttl_seconds == 0) return error.InvalidConfigValue;
+    if (seconds > 604_800) return error.InvalidConfigValue;
+}
+
+/// #903: an enabled disk tier must itself be bounded on every axis, the same
+/// contract `validateProxyResponseCacheBounds` applies to the in-memory tier.
+fn validateProxyResponseCacheDiskBounds(path: []const u8, max_entries: usize, max_total_bytes: usize) !void {
+    if (path.len == 0) return;
+    if (max_entries == 0 or max_total_bytes == 0) return error.InvalidConfigValue;
+}
+
+/// #903: a stable, order-sensitive, length-prefixed hash over the fields
+/// that determine route/upstream identity and cache policy. Length-prefixing
+/// (rather than a plain delimiter) means no field-boundary ambiguity can make
+/// two distinct configurations collide.
+fn computeProxyCacheDiskFingerprint(parts: []const []const u8, numbers: []const u64) u64 {
+    var hasher = std.hash.Wyhash.init(0x5441_5244_4947_4144);
+    for (parts) |part| {
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, part.len, .little);
+        hasher.update(&len_buf);
+        hasher.update(part);
+    }
+    for (numbers) |n| {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, n, .little);
+        hasher.update(&buf);
+    }
+    return hasher.final();
 }
 
 /// #901: an enabled generic response cache must be bounded on every axis.
@@ -5486,12 +5596,16 @@ test "#512 native persistent ticket-key path requires stateless or hybrid resump
     try validate(&cfg);
 }
 
-test "validate rejects the unsupported proxy cache disk path and stale-while-revalidate knobs (#901)" {
-    try std.testing.expectError(error.InvalidConfigValue, validateProxyCacheDiskPathUnsupported("/var/cache/tardigrade/proxy"));
-    try validateProxyCacheDiskPathUnsupported("");
+test "validate accepts a bounded proxy cache disk path and stale-while-revalidate window (#903)" {
+    try validateProxyCacheDiskPath("/var/cache/tardigrade/proxy");
+    try validateProxyCacheDiskPath("");
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyCacheDiskPath("relative/path"));
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyCacheDiskPath("/has\x00nul"));
 
-    try std.testing.expectError(error.InvalidConfigValue, validateProxyCacheStaleWhileRevalidateUnsupported(30));
-    try validateProxyCacheStaleWhileRevalidateUnsupported(0);
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyCacheStaleWhileRevalidate(30, 0));
+    try validateProxyCacheStaleWhileRevalidate(30, 60);
+    try validateProxyCacheStaleWhileRevalidate(0, 0);
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyCacheStaleWhileRevalidate(604_801, 60));
 
     try std.testing.expectError(error.InvalidConfigValue, validateProxyResponseCacheBounds(60, 0, 10, 10));
     try std.testing.expectError(error.InvalidConfigValue, validateProxyResponseCacheBounds(60, 10, 0, 10));
@@ -5501,12 +5615,32 @@ test "validate rejects the unsupported proxy cache disk path and stale-while-rev
     // Enabled with every bound intact.
     try validateProxyResponseCacheBounds(60, 10, 10, 10);
 
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyResponseCacheDiskBounds("/cache", 0, 10));
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyResponseCacheDiskBounds("/cache", 10, 0));
+    try validateProxyResponseCacheDiskBounds("", 0, 0);
+    try validateProxyResponseCacheDiskBounds("/cache", 10, 10);
+
     const allocator = std.testing.allocator;
     var cfg = try loadFromEnv(allocator);
     defer cfg.deinit(allocator);
     try validate(&cfg);
     cfg.proxy_cache_ttl_seconds = 60;
     try validate(&cfg);
+
+    allocator.free(cfg.proxy_cache_path);
+    cfg.proxy_cache_path = try allocator.dupe(u8, "/var/cache/tardigrade/proxy");
+    try validate(&cfg);
+    cfg.proxy_cache_stale_while_revalidate_seconds = 30;
+    try validate(&cfg);
+}
+
+test "computeProxyCacheDiskFingerprint is deterministic and sensitive to every input" {
+    const base = computeProxyCacheDiskFingerprint(&.{ "a", "b" }, &.{ 1, 2 });
+    try std.testing.expectEqual(base, computeProxyCacheDiskFingerprint(&.{ "a", "b" }, &.{ 1, 2 }));
+    try std.testing.expect(base != computeProxyCacheDiskFingerprint(&.{ "a", "c" }, &.{ 1, 2 }));
+    try std.testing.expect(base != computeProxyCacheDiskFingerprint(&.{ "a", "b" }, &.{ 1, 3 }));
+    // No delimiter ambiguity: "ab" split as one field differs from "a","b".
+    try std.testing.expect(base != computeProxyCacheDiskFingerprint(&.{"ab"}, &.{ 1, 2 }));
 }
 
 test "native resumption config rejects an unrecognized mode or ticket usage" {

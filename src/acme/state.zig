@@ -171,6 +171,14 @@ pub const StateDir = struct {
         return openSubdirRaw(self.dir_fd, &self.fault, &self.fault_file, name, false);
     }
 
+    /// Best-effort unlink; a missing file is not an error. Same contract as
+    /// `SubDir.removeFile`, for callers that store entries directly in the
+    /// top-level state directory rather than a nested subdirectory (#903).
+    pub fn removeFile(self: *StateDir, name: []const u8) void {
+        if (!validName(name)) return;
+        zig_compat.unlinkAt(self.dir_fd, name);
+    }
+
     /// Remove `.<name>.tmp-*` leftovers from a crashed writer. We hold the
     /// lock, so no live writer owns them. Best effort: failure to clean up
     /// must not block startup, and a leftover is mode `0600` anyway.

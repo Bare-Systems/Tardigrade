@@ -5,6 +5,7 @@ const http = @import("http.zig");
 const tls_core = @import("tls_core");
 const edge_config = @import("edge_config.zig");
 const gpc = @import("gateway_proxy_cache.zig");
+const gpdc = @import("gateway_proxy_disk_cache.zig");
 const acme_renewal = @import("acme_renewal.zig");
 
 /// Shared inbound request buffer size limit, also used as a default proxy
@@ -537,6 +538,25 @@ pub const GatewayState = struct {
     /// control-plane JSON proxy's own (differently-shaped) cache. [proxy_response_cache_mutex]
     proxy_response_cache: ?gpc.ProxyResponseCache,
     proxy_response_cache_generation: u64 = 0,
+    /// Bounded, crash-safe disk tier for the same cache (#903). Owned and
+    /// rebuilt on every reload alongside `proxy_response_cache`, under the
+    /// same mutex. `null` when `cfg.proxy_cache_path` is empty, or when
+    /// opening/validating it failed (fails open to memory-only caching
+    /// rather than aborting the reload/startup). [proxy_response_cache_mutex]
+    proxy_response_cache_disk: ?gpdc.DiskCache = null,
+    /// Per-key single-flight guard for stale-while-revalidate background
+    /// refresh (#903): a key present here already has a background
+    /// revalidation thread in flight. [proxy_response_cache_mutex]
+    proxy_response_cache_revalidation_locks: std.StringHashMap(void),
+    /// Global cap on simultaneous background revalidations across every
+    /// key, independent of the per-key lock above (#903). Atomic: checked
+    /// and adjusted from the detached revalidation thread without taking
+    /// `proxy_response_cache_mutex`, since it never gates cache contents.
+    proxy_response_cache_revalidation_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// cfg snapshot, read from request-handling threads without
+    /// `proxy_response_cache_mutex` (an atomic rather than a plain field
+    /// since reload writes it from a different thread than every reader).
+    proxy_response_cache_revalidation_max_concurrency: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     security_headers: http.security_headers.SecurityHeaders, // cfg-derived; re-derived on reload [runtime_mutex]
     /// Owned HSTS header value. Empty when HSTS is disabled or TLS is not
     /// configured. Heap-owned; re-derived (old value freed) on reload. [runtime_mutex]
@@ -668,6 +688,10 @@ pub const GatewayState = struct {
         if (self.idempotency_store) |*is| is.deinit();
         if (self.proxy_cache_store) |*pc| pc.deinit();
         if (self.proxy_response_cache) |*prc| prc.deinit();
+        if (self.proxy_response_cache_disk) |*disk| disk.deinit();
+        var revalidation_lock_it = self.proxy_response_cache_revalidation_locks.iterator();
+        while (revalidation_lock_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.proxy_response_cache_revalidation_locks.deinit();
         if (self.session_store) |*ss| ss.deinit();
         self.upstream_client.deinit();
         if (self.acme_challenge_store) |*store| store.deinit();
@@ -1119,30 +1143,146 @@ pub const GatewayState = struct {
     /// #901: generic `proxy_pass` response-cache lookup. Returns a deep copy
     /// allocated from `scratch` (the caller's request-scoped arena), so the
     /// mutex here never needs to stay held past this call -- no cache
-    /// operation here crosses network I/O.
+    /// operation here crosses network I/O. #903: on a memory miss, falls
+    /// through to the disk tier, deliberately still holding
+    /// `proxy_response_cache_mutex` for the (bounded, local-filesystem-only)
+    /// disk read -- `DiskCache` is swapped wholesale on reload under this
+    /// same lock, so a caller must hold it for the whole call rather than
+    /// only to fetch a pointer, or a concurrent reload could free/replace
+    /// the `DiskCache` out from under an in-flight read. A *fresh* disk hit
+    /// is also hydrated back into the memory cache so the next request for
+    /// the same key is an in-memory hit again. A *stale* disk hit is
+    /// returned as-is without hydration -- a representation already past
+    /// its freshness lifetime is not worth promoting back into the bounded
+    /// memory tier.
     pub fn proxyResponseCacheLookup(self: *GatewayState, scratch: std.mem.Allocator, generation: u64, key: []const u8, now_ms: u64) !?gpc.LookupResult {
         self.proxy_response_cache_mutex.lock();
-        defer self.proxy_response_cache_mutex.unlock();
-        if (self.proxy_response_cache_generation != generation) return null;
-        if (self.proxy_response_cache) |*cache| {
-            return try cache.lookup(scratch, key, now_ms);
+        if (self.proxy_response_cache_generation != generation) {
+            self.proxy_response_cache_mutex.unlock();
+            return null;
         }
-        return null;
+        if (self.proxy_response_cache) |*cache| {
+            if (try cache.lookup(scratch, key, now_ms)) |hit| {
+                self.proxy_response_cache_mutex.unlock();
+                return hit;
+            }
+        }
+        self.proxy_response_cache_mutex.unlock();
+        return self.proxyResponseCacheDiskLookup(scratch, generation, key, now_ms);
+    }
+
+    fn proxyResponseCacheDiskLookup(self: *GatewayState, scratch: std.mem.Allocator, generation: u64, key: []const u8, now_ms: u64) !?gpc.LookupResult {
+        const loaded = blk: {
+            self.proxy_response_cache_mutex.lock();
+            defer self.proxy_response_cache_mutex.unlock();
+            if (self.proxy_response_cache_disk) |*disk| break :blk disk.get(scratch, key, now_ms);
+            break :blk null;
+        } orelse return null;
+
+        const stale = now_ms >= loaded.expires_at_ms;
+        const resident_seconds = (now_ms -| loaded.stored_at_ms) / 1000;
+        const age_seconds: u32 = @intCast(@min(@as(u64, loaded.initial_age_seconds) + resident_seconds, std.math.maxInt(u32)));
+        const result = gpc.LookupResult{
+            .status_code = loaded.status_code,
+            .reason = @constCast(loaded.reason),
+            .headers = loaded.headers,
+            .body = @constCast(loaded.body),
+            .age_seconds = age_seconds,
+            .stale = stale,
+        };
+        if (!stale) {
+            const views = try scratch.alloc(gpc.CacheHeaderView, loaded.headers.len);
+            for (loaded.headers, 0..) |h, i| views[i] = .{ .name = h.name, .value = h.value };
+            const remaining_ttl_seconds: u32 = @intCast(@min((loaded.expires_at_ms -| now_ms) / 1000 + 1, std.math.maxInt(u32)));
+            const remaining_swr_seconds: u32 = if (loaded.swr_until_ms > loaded.expires_at_ms)
+                @intCast(@min((loaded.swr_until_ms -| loaded.expires_at_ms) / 1000, std.math.maxInt(u32)))
+            else
+                0;
+            self.proxy_response_cache_mutex.lock();
+            defer self.proxy_response_cache_mutex.unlock();
+            if (self.proxy_response_cache_generation == generation) {
+                if (self.proxy_response_cache) |*cache| {
+                    cache.put(now_ms, key, .{
+                        .status_code = loaded.status_code,
+                        .reason = loaded.reason,
+                        .headers = views,
+                        .body = loaded.body,
+                        .ttl_seconds = remaining_ttl_seconds,
+                        .initial_age_seconds = 0,
+                        .swr_seconds = remaining_swr_seconds,
+                    }) catch {};
+                }
+            }
+        }
+        return result;
     }
 
     /// #901: fills one entry. Fails open: every error (too large, at
     /// capacity, disabled, or allocation failure) just means the next
     /// request is a miss too -- the caller already proxied this response
     /// normally and only needs the error to count a `fill_error` metric.
+    /// #903: also write-through to the disk tier (best-effort, outside
+    /// `proxy_response_cache_mutex` -- disk I/O never happens while that
+    /// lock is held).
     pub fn proxyResponseCachePut(self: *GatewayState, now_ms: u64, generation: u64, key: []const u8, params: gpc.PutParams) !void {
         self.proxy_response_cache_mutex.lock();
-        defer self.proxy_response_cache_mutex.unlock();
-        if (self.proxy_response_cache_generation != generation) return error.ProxyResponseCacheGenerationMismatch;
+        if (self.proxy_response_cache_generation != generation) {
+            self.proxy_response_cache_mutex.unlock();
+            return error.ProxyResponseCacheGenerationMismatch;
+        }
         if (self.proxy_response_cache) |*cache| {
-            try cache.put(now_ms, key, params);
+            cache.put(now_ms, key, params) catch |err| {
+                self.proxy_response_cache_mutex.unlock();
+                return err;
+            };
+            self.proxy_response_cache_mutex.unlock();
+            self.proxyResponseCacheDiskPut(now_ms, key, params);
             return;
         }
+        self.proxy_response_cache_mutex.unlock();
         return error.ProxyResponseCacheDisabled;
+    }
+
+    /// #903: per-key single-flight guard for a stale-while-revalidate
+    /// background refresh. `false` when another refresh for this exact key
+    /// is already in flight -- the caller must not spawn a second one.
+    pub fn proxyResponseCacheTryLockRevalidation(self: *GatewayState, key: []const u8) !bool {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache_revalidation_locks.contains(key)) return false;
+        const owned = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned);
+        try self.proxy_response_cache_revalidation_locks.put(owned, {});
+        return true;
+    }
+
+    pub fn proxyResponseCacheUnlockRevalidation(self: *GatewayState, key: []const u8) void {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache_revalidation_locks.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+        }
+    }
+
+    /// #903: best-effort disk write-through, called with
+    /// `proxy_response_cache_mutex` already released. A disk tier that is
+    /// disabled, unavailable, or refuses the object (too large, at
+    /// capacity) silently leaves the in-memory fill as the only copy.
+    fn proxyResponseCacheDiskPut(self: *GatewayState, now_ms: u64, key: []const u8, params: gpc.PutParams) void {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        const disk = if (self.proxy_response_cache_disk) |*d| d else return;
+        const expires_at_ms = now_ms + @as(u64, params.ttl_seconds - params.initial_age_seconds) * 1000;
+        disk.put(key, .{
+            .status_code = params.status_code,
+            .reason = params.reason,
+            .headers = params.headers,
+            .body = params.body,
+            .stored_at_ms = now_ms,
+            .expires_at_ms = expires_at_ms,
+            .swr_until_ms = expires_at_ms + @as(u64, params.swr_seconds) * 1000,
+            .initial_age_seconds = params.initial_age_seconds,
+        }, now_ms);
     }
 
     /// #902: whether `primary_key` currently resolves through the bounded
@@ -3305,6 +3445,23 @@ pub const GatewayState = struct {
         return out.toOwnedSlice();
     }
 };
+
+/// #903: opens (or declines to open) the disk tier for a fresh/reloaded
+/// config. `null` whenever `proxy_cache_path` is empty or the cache is
+/// disabled outright, and also on any `DiskCache.init` failure -- a
+/// misconfigured or unavailable disk tier degrades to memory-only caching
+/// rather than aborting startup/reload.
+pub fn openProxyResponseCacheDisk(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) ?gpdc.DiskCache {
+    if (cfg.proxy_cache_ttl_seconds == 0 or cfg.proxy_cache_path.len == 0) return null;
+    return gpdc.DiskCache.init(allocator, cfg.proxy_cache_path, .{
+        .max_object_bytes = cfg.proxy_response_cache_max_object_bytes,
+        .max_entries = cfg.proxy_response_cache_disk_max_entries,
+        .max_total_bytes = cfg.proxy_response_cache_disk_max_total_bytes,
+    }, cfg.proxy_response_cache_disk_fingerprint) catch |err| {
+        std.log.warn("proxy response cache disk tier unavailable at '{s}' ({s}); continuing with memory-only caching", .{ cfg.proxy_cache_path, @errorName(err) });
+        return null;
+    };
+}
 
 /// Linear congruential PRNG step used for load-balancing randomness.
 /// Always called while holding GatewayState.upstream_mutex; exposed as a

@@ -14747,6 +14747,149 @@ test "generic proxy_pass response cache serves a GET hit without a second upstre
     try std.testing.expectEqual(@as(u32, 3), origin.requestCount());
 }
 
+test "generic proxy_pass response cache disk tier survives a process restart (#903)" {
+    const allocator = std.testing.allocator;
+
+    const fresh_for_a_minute: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 200, .body = "disk-persisted-generation", .headers = fresh_for_a_minute },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cache_root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(cache_root);
+    const cache_path = try std.fmt.allocPrint(allocator, "{s}/proxy-cache", .{cache_root});
+    defer allocator.free(cache_path);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /public {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+
+    const extra_env: []const EnvPair = &.{
+        .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" },
+        .{ .name = "TARDIGRADE_PROXY_CACHE_PATH", .value = cache_path },
+    };
+
+    {
+        var first_process = try TardigradeProcess.start(allocator, .{
+            .profile = .generic,
+            .config_text = config_text,
+            .ready_path = "/healthz",
+            .extra_env = extra_env,
+        });
+        defer first_process.stop();
+
+        // A real MISS, fetched from (and persisted by) the first process.
+        var first = try sendRequest(allocator, first_process.port, .{ .method = "GET", .path = "/public?a=1", .body = null, .headers = &.{.{ .name = "Host", .value = "disk-cache-restart.test" }} });
+        defer first.deinit();
+        try std.testing.expectEqual(@as(u16, 200), first.status_code);
+        try assertContains(first.body, "disk-persisted-generation");
+        try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+    }
+    // `first_process.stop()` above has already returned: the disk entry
+    // this process's fill wrote must have been durably fsync'd/renamed
+    // before the write call returned, not merely buffered in this now-dead
+    // process's memory.
+
+    var second_process = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = extra_env,
+    });
+    defer second_process.stop();
+
+    // A brand new process, unchanged route/config, same disk cache path:
+    // the same GET is a disk HIT -- zero additional origin calls.
+    var second = try sendRequest(allocator, second_process.port, .{ .method = "GET", .path = "/public?a=1", .body = null, .headers = &.{.{ .name = "Host", .value = "disk-cache-restart.test" }} });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 200), second.status_code);
+    try assertContains(second.body, "disk-persisted-generation");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+    try std.testing.expect(second.header("Age") != null);
+}
+
+test "generic proxy_pass response cache serves a bounded stale hit and refreshes once in the background (#903)" {
+    const allocator = std.testing.allocator;
+
+    const fresh_for_one_second: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=1" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 200, .body = "swr-generation-one", .headers = fresh_for_one_second },
+        .{ .status_code = 200, .body = "swr-generation-two", .headers = fresh_for_one_second },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /stale {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "1" },
+            .{ .name = "TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS", .value = "10" },
+        },
+    });
+    defer tardigrade.stop();
+
+    // First GET: a real MISS.
+    var first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/stale?a=1", .body = null, .headers = &.{} });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try assertContains(first.body, "swr-generation-one");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    // Past `max-age=1` but inside the 10-second stale-while-revalidate
+    // window: still answered immediately from cache (never origin
+    // latency on the client's critical path) with the *old* body, while a
+    // single background revalidation gets triggered.
+    compat.sleepNs(1_200 * std.time.ns_per_ms);
+    var stale = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/stale?a=1", .body = null, .headers = &.{} });
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(u16, 200), stale.status_code);
+    try assertContains(stale.body, "swr-generation-one");
+
+    // Poll for the background refresh to complete: bounded by this test's
+    // own timeout, not an arbitrary sleep that could flake under load.
+    var attempts: u32 = 0;
+    while (origin.requestCount() < 2 and attempts < 100) : (attempts += 1) {
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+
+    // A subsequent request is fresh again (served from the refreshed
+    // entry) with no further origin call.
+    var refreshed = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/stale?a=1", .body = null, .headers = &.{} });
+    defer refreshed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), refreshed.status_code);
+    try assertContains(refreshed.body, "swr-generation-two");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+}
+
 test "generic proxy_pass response cache isolates by query string and never shares Authorization/Set-Cookie responses (#901)" {
     const allocator = std.testing.allocator;
 

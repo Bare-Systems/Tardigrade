@@ -3060,7 +3060,26 @@ fn handleHttp3LocationProxyPass(
                         // here can safely fall through to the live origin request.
                         const include_body = fillable_method and disposition == .full;
                         if (applyHttp3ProxyCacheHit(allocator, response, ctx.state, &hit, correlation_id, disposition, include_body)) |_| {
-                            ctx.state.metricsRecordProxyCacheOutcome(.hit);
+                            ctx.state.metricsRecordProxyCacheOutcome(if (hit.stale) .stale else .hit);
+                            // #903: response already built; a bounded,
+                            // single-flight background refresh runs
+                            // independently of it.
+                            if (hit.stale) {
+                                if (ctx.cfg_lease) |lease| {
+                                    gproxy_runtime.maybeSpawnProxyResponseCacheRevalidation(
+                                        ctx.state,
+                                        lease,
+                                        cache_generation,
+                                        key_buf[0..],
+                                        hit.headers,
+                                        request.headers.get("accept-encoding"),
+                                        target,
+                                        proxySuffixPathForLocation(request_path, matched, ctx.cfg.location_blocks),
+                                        request.headers.get(":authority") orelse request.headers.get("host"),
+                                        ctx.client_ip,
+                                    );
+                                }
+                            }
                             return;
                         } else |_| {
                             ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
@@ -3167,7 +3186,7 @@ fn handleHttp3LocationProxyPass(
     if (response_cache_key) |key_bytes| {
         const buffered = upstream_response.boundedBufferedForCompatibility();
         const cache_generation = if (ctx.cfg_lease) |lease| lease.version.generation else 0;
-        gproxy_runtime.tryFillResponseCache(allocator, ctx.state, cache_generation, ctx.cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered, &request.headers) catch {
+        gproxy_runtime.tryFillResponseCache(allocator, ctx.state, cache_generation, ctx.cfg.proxy_cache_ttl_seconds, ctx.cfg.proxy_cache_stale_while_revalidate_seconds, key_bytes[0..], buffered, &request.headers) catch {
             ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
         };
     }

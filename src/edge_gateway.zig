@@ -139,6 +139,9 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         else
             null,
         .proxy_response_cache_generation = 1,
+        .proxy_response_cache_disk = gs.openProxyResponseCacheDisk(state_allocator, cfg),
+        .proxy_response_cache_revalidation_locks = std.StringHashMap(void).init(state_allocator),
+        .proxy_response_cache_revalidation_max_concurrency = std.atomic.Value(u32).init(cfg.proxy_response_cache_revalidation_max_concurrency),
         .security_headers = blk: {
             var s = if (cfg.security_headers_enabled)
                 http.security_headers.SecurityHeaders.api
@@ -888,6 +891,20 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
                 cfg.proxy_response_cache_max_vary_variants,
             },
         );
+        if (state.proxy_response_cache_disk != null) {
+            state.logger.info(
+                null,
+                "Generic proxy_pass response cache disk tier enabled (#903): path={s} max_entries={d} max_total_bytes={d}",
+                .{ cfg.proxy_cache_path, cfg.proxy_response_cache_disk_max_entries, cfg.proxy_response_cache_disk_max_total_bytes },
+            );
+        }
+        if (cfg.proxy_cache_stale_while_revalidate_seconds > 0) {
+            state.logger.info(
+                null,
+                "Generic proxy_pass response cache stale-while-revalidate enabled (#903): window={d}s max_concurrency={d}",
+                .{ cfg.proxy_cache_stale_while_revalidate_seconds, cfg.proxy_response_cache_revalidation_max_concurrency },
+            );
+        }
     }
     if (state.session_store != null) {
         state.logger.info(null, "Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });
@@ -5600,7 +5617,7 @@ fn executeHttp2ProxyRoute(
     );
     errdefer proxy_response.deinit(allocator);
     if (response_cache_key) |key_bytes| {
-        gproxy_runtime.tryFillResponseCache(allocator, state, cache_generation, route_cfg.proxy_cache_ttl_seconds, key_bytes[0..], &proxy_response.bounded_buffered, &request.headers) catch {
+        gproxy_runtime.tryFillResponseCache(allocator, state, cache_generation, route_cfg.proxy_cache_ttl_seconds, route_cfg.proxy_cache_stale_while_revalidate_seconds, key_bytes[0..], &proxy_response.bounded_buffered, &request.headers) catch {
             state.metricsRecordProxyCacheOutcome(.fill_error);
         };
     }

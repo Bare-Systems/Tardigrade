@@ -114,6 +114,7 @@ pub fn tryFillResponseCache(
     state: *GatewayState,
     generation: u64,
     ttl_ceiling_seconds: u32,
+    swr_ceiling_seconds: u32,
     key: []const u8,
     buffered: *const BufferedUpstreamResponse,
     request_headers: *const http.Headers,
@@ -142,6 +143,7 @@ pub fn tryFillResponseCache(
         .body = buffered.body,
         .ttl_seconds = freshness.ttl_seconds,
         .initial_age_seconds = freshness.initial_age_seconds,
+        .swr_seconds = gpc.staleWhileRevalidateSeconds(freshness, swr_ceiling_seconds),
     };
     const now_ms = http.event_loop.monotonicMs();
     if (!freshness.vary_on_accept_encoding) {
@@ -153,6 +155,198 @@ pub fn tryFillResponseCache(
     var secondary_buf: [64]u8 = undefined;
     const secondary_key = gpc.buildVaryVariantKey(&secondary_buf, key, discriminator);
     try state.proxyResponseCachePutVaryVariant(now_ms, generation, key, secondary_key, params);
+}
+
+fn findCacheHeaderValue(headers: []const gpc.CacheHeader, name: []const u8) ?[]const u8 {
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
+}
+
+/// Owns every allocation a detached background revalidation needs, on its
+/// own arena so cleanup (success or failure) is always exactly one
+/// `arena.deinit()` -- never a hand-matched chain of individual frees.
+const ProxyResponseCacheRevalidationTask = struct {
+    arena: std.heap.ArenaAllocator,
+    state: *GatewayState,
+    config_lease: gs.ConfigLease,
+    generation: u64,
+    primary_key: []const u8,
+    etag: ?[]const u8,
+    last_modified: ?[]const u8,
+    accept_encoding: ?[]const u8,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]const u8,
+    incoming_host: ?[]const u8,
+    client_ip: []const u8,
+};
+
+fn buildProxyResponseCacheRevalidationTask(
+    task: *ProxyResponseCacheRevalidationTask,
+    state: *GatewayState,
+    config_lease: *gs.ConfigLease,
+    generation: u64,
+    primary_key: []const u8,
+    hit_headers: []const gpc.CacheHeader,
+    accept_encoding: ?[]const u8,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]const u8,
+    incoming_host: ?[]const u8,
+    client_ip: []const u8,
+) !void {
+    task.arena = std.heap.ArenaAllocator.init(state.allocator);
+    errdefer task.arena.deinit();
+    const a = task.arena.allocator();
+    task.state = state;
+    task.config_lease = config_lease.retain();
+    task.generation = generation;
+    task.primary_key = try a.dupe(u8, primary_key);
+    task.etag = if (findCacheHeaderValue(hit_headers, "etag")) |v| try a.dupe(u8, v) else null;
+    task.last_modified = if (findCacheHeaderValue(hit_headers, "last-modified")) |v| try a.dupe(u8, v) else null;
+    task.accept_encoding = if (accept_encoding) |v| try a.dupe(u8, v) else null;
+    task.proxy_pass_target = try a.dupe(u8, proxy_pass_target);
+    task.suffix_path = if (suffix_path) |v| try a.dupe(u8, v) else null;
+    task.incoming_host = if (incoming_host) |v| try a.dupe(u8, v) else null;
+    task.client_ip = try a.dupe(u8, client_ip);
+}
+
+/// Performs the actual upstream GET (with conditional validators reused from
+/// the stale hit, never a blind re-fetch) and refills the cache on a fresh
+/// `200`. A `304`, any non-`200`, or any transport error simply leaves the
+/// existing stale entry to expire at its own `swr_until_ms` deadline --
+/// never overwrites a representation (or a `Vary` variant) this revalidation
+/// cannot positively confirm is the one the next request will ask for again.
+fn proxyResponseCacheRevalidationThread(task: *ProxyResponseCacheRevalidationTask) void {
+    defer {
+        task.state.proxyResponseCacheUnlockRevalidation(task.primary_key);
+        _ = task.state.proxy_response_cache_revalidation_inflight.fetchSub(1, .acq_rel);
+        task.config_lease.release();
+        const allocator = task.state.allocator;
+        task.arena.deinit();
+        allocator.destroy(task);
+    }
+
+    const cfg = task.config_lease.cfg;
+    var headers = http.Headers.init(task.arena.allocator());
+    if (task.incoming_host) |h| headers.append("Host", h) catch return;
+    if (task.accept_encoding) |v| headers.append("Accept-Encoding", v) catch return;
+    if (task.etag) |v| headers.append("If-None-Match", v) catch return;
+    if (task.last_modified) |v| headers.append("If-Modified-Since", v) catch return;
+
+    const upstream_pool = upstreamPoolForScope(cfg, .global);
+    const selected_base_url = task.state.nextUpstreamBaseUrl(cfg, upstream_pool, task.client_ip, task.proxy_pass_target);
+    const resolved = resolveProxyTarget(task.arena.allocator(), selected_base_url, task.proxy_pass_target, task.suffix_path) catch return;
+    const upstream_url = appendProxyQueryString(task.arena.allocator(), resolved.url, null) catch return;
+    const forwarded_proto = if (edge_config.usesNativeTls(cfg)) "https" else "http";
+
+    const buffered = executeBoundedBufferedHttpProxyRequest(
+        task.arena.allocator(),
+        cfg,
+        upstream_url.value,
+        resolved.unix_socket_path,
+        "GET",
+        &headers,
+        "",
+        "proxy-cache-revalidate",
+        task.client_ip,
+        forwarded_proto,
+        task.incoming_host,
+        null,
+        &.{},
+        null,
+        null,
+        null,
+        null,
+        false,
+        cfg.upstream_timeout_ms,
+        cfg.upstream_connect_timeout_ms,
+        cfg.upstream_response_timeout_ms,
+        null,
+        &task.state.upstream_pool,
+        &task.state.h2_pool,
+    ) catch return;
+
+    if (buffered.status_code != 200 or buffered.had_content_encoding) return;
+    tryFillResponseCache(
+        task.arena.allocator(),
+        task.state,
+        task.generation,
+        cfg.proxy_cache_ttl_seconds,
+        cfg.proxy_cache_stale_while_revalidate_seconds,
+        task.primary_key,
+        &buffered,
+        &headers,
+    ) catch {};
+}
+
+/// Triggers, at most, one bounded single-flight background revalidation for
+/// `primary_key` (#903). Best-effort and silent on every bail-out path: the
+/// caller has already served the stale hit to its own client regardless of
+/// whether this spawns anything. Bounded on two independent axes -- the
+/// global `proxy_response_cache_revalidation_max_concurrency` cap (checked
+/// via one atomic fetch-add, not a lock) and the per-key single-flight
+/// lock -- so neither a hot single key nor a high-cardinality stale working
+/// set can fan out unboundedly many background threads.
+pub fn maybeSpawnProxyResponseCacheRevalidation(
+    state: *GatewayState,
+    config_lease: *gs.ConfigLease,
+    generation: u64,
+    primary_key: []const u8,
+    hit_headers: []const gpc.CacheHeader,
+    accept_encoding: ?[]const u8,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]const u8,
+    incoming_host: ?[]const u8,
+    client_ip: []const u8,
+) void {
+    const max_concurrency = state.proxy_response_cache_revalidation_max_concurrency.load(.acquire);
+    if (max_concurrency == 0) return;
+    const prev_inflight = state.proxy_response_cache_revalidation_inflight.fetchAdd(1, .acq_rel);
+    if (prev_inflight >= max_concurrency) {
+        _ = state.proxy_response_cache_revalidation_inflight.fetchSub(1, .acq_rel);
+        state.metricsRecordProxyCacheOutcome(.revalidation_skipped_concurrency);
+        return;
+    }
+    if (!(state.proxyResponseCacheTryLockRevalidation(primary_key) catch false)) {
+        _ = state.proxy_response_cache_revalidation_inflight.fetchSub(1, .acq_rel);
+        return;
+    }
+
+    const task = state.allocator.create(ProxyResponseCacheRevalidationTask) catch {
+        state.proxyResponseCacheUnlockRevalidation(primary_key);
+        _ = state.proxy_response_cache_revalidation_inflight.fetchSub(1, .acq_rel);
+        return;
+    };
+    buildProxyResponseCacheRevalidationTask(
+        task,
+        state,
+        config_lease,
+        generation,
+        primary_key,
+        hit_headers,
+        accept_encoding,
+        proxy_pass_target,
+        suffix_path,
+        incoming_host,
+        client_ip,
+    ) catch {
+        state.allocator.destroy(task);
+        state.proxyResponseCacheUnlockRevalidation(primary_key);
+        _ = state.proxy_response_cache_revalidation_inflight.fetchSub(1, .acq_rel);
+        return;
+    };
+    state.metricsRecordProxyCacheOutcome(.revalidation_spawned);
+    const thread = std.Thread.spawn(.{}, proxyResponseCacheRevalidationThread, .{task}) catch {
+        var lease = task.config_lease;
+        lease.release();
+        task.arena.deinit();
+        state.allocator.destroy(task);
+        state.proxyResponseCacheUnlockRevalidation(primary_key);
+        _ = state.proxy_response_cache_revalidation_inflight.fetchSub(1, .acq_rel);
+        return;
+    };
+    thread.detach();
 }
 
 pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
@@ -871,10 +1065,29 @@ pub fn handleLocationProxyPass(
                                 // (#935 review).
                                 .wire_content_length_override = hit.body.len,
                             };
-                            state.metricsRecordProxyCacheOutcome(.hit);
+                            state.metricsRecordProxyCacheOutcome(if (hit.stale) .stale else .hit);
                             ctx.setUpstreamResult(target, prepared.status_code, prepared.body.len);
                             try writeBufferedUpstreamResponseWithMetrics(writer, &replay, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, null, &state.metrics, &state.metrics_mutex);
                             state.metricsRecord(prepared.status_code);
+                            // #903: the client already has its answer; a
+                            // bounded, single-flight background refresh
+                            // runs independently of this response.
+                            if (hit.stale) {
+                                if (ctx.response_stream_config_lease) |raw_lease| {
+                                    maybeSpawnProxyResponseCacheRevalidation(
+                                        state,
+                                        @ptrCast(@alignCast(raw_lease)),
+                                        ctx.config_generation,
+                                        key_buf[0..],
+                                        hit.headers,
+                                        request.headers.get("accept-encoding"),
+                                        target,
+                                        suffix_path,
+                                        incoming_host,
+                                        client_ip,
+                                    );
+                                }
+                            }
                             return prepared.status_code;
                         }
                     }
@@ -1226,7 +1439,7 @@ pub fn handleLocationProxyPass(
 
     if (response_cache_key) |key_bytes| {
         const buffered = upstream_response.boundedBufferedForCompatibility();
-        tryFillResponseCache(temp_allocator, state, ctx.config_generation, cfg.proxy_cache_ttl_seconds, key_bytes[0..], buffered, &request.headers) catch {
+        tryFillResponseCache(temp_allocator, state, ctx.config_generation, cfg.proxy_cache_ttl_seconds, cfg.proxy_cache_stale_while_revalidate_seconds, key_bytes[0..], buffered, &request.headers) catch {
             state.metricsRecordProxyCacheOutcome(.fill_error);
         };
     }

@@ -66,7 +66,22 @@ pub const ForwardAuthOutcome = enum { allowed, denied, timeout, unavailable, inv
 /// #901: generic `proxy_pass` response-cache outcomes. Closed enum; the
 /// Prometheus label is the tag name. `fill_error` is additive to `miss` (a
 /// miss that then failed to store, not a fifth mutually-exclusive outcome).
-pub const ProxyCacheOutcome = enum { hit, miss, bypass, fill_error };
+pub const ProxyCacheOutcome = enum {
+    hit,
+    miss,
+    bypass,
+    fill_error,
+    /// Served a representation past its freshness lifetime but still
+    /// inside its bounded stale-while-revalidate window (#903).
+    stale,
+    /// A stale hit triggered a bounded, single-flight background
+    /// revalidation (#903).
+    revalidation_spawned,
+    /// A stale hit wanted to trigger a background revalidation but the
+    /// global `TARDIGRADE_PROXY_CACHE_REVALIDATION_MAX_CONCURRENCY` cap was
+    /// already reached (#903); the stale hit was still served.
+    revalidation_skipped_concurrency,
+};
 /// #812: WebSocket upgrade outcomes on `proxy_websocket` locations. Closed
 /// enum; the Prometheus label is the tag name.
 pub const WebSocketUpgradeOutcome = enum {
@@ -326,6 +341,9 @@ pub const Metrics = struct {
     proxy_cache_miss: u64,
     proxy_cache_bypass: u64,
     proxy_cache_fill_error: u64,
+    proxy_cache_stale: u64,
+    proxy_cache_revalidation_spawned: u64,
+    proxy_cache_revalidation_skipped_concurrency: u64,
     proxy_ttfb_ms_count: u64,
     proxy_ttfb_ms_sum: u64,
     // Upstream keep-alive connection pool (#141). Populated from the pool's own
@@ -603,6 +621,9 @@ pub const Metrics = struct {
             .proxy_cache_miss = 0,
             .proxy_cache_bypass = 0,
             .proxy_cache_fill_error = 0,
+            .proxy_cache_stale = 0,
+            .proxy_cache_revalidation_spawned = 0,
+            .proxy_cache_revalidation_skipped_concurrency = 0,
             .proxy_ttfb_ms_count = 0,
             .proxy_ttfb_ms_sum = 0,
             .upstream_connections_new = 0,
@@ -1283,6 +1304,9 @@ pub const Metrics = struct {
             .miss => self.proxy_cache_miss += 1,
             .bypass => self.proxy_cache_bypass += 1,
             .fill_error => self.proxy_cache_fill_error += 1,
+            .stale => self.proxy_cache_stale += 1,
+            .revalidation_spawned => self.proxy_cache_revalidation_spawned += 1,
+            .revalidation_skipped_concurrency => self.proxy_cache_revalidation_skipped_concurrency += 1,
         }
     }
 
@@ -1575,6 +1599,9 @@ pub const Metrics = struct {
             \\tardigrade_proxy_cache_outcome_total{{outcome="miss"}} {d}
             \\tardigrade_proxy_cache_outcome_total{{outcome="bypass"}} {d}
             \\tardigrade_proxy_cache_outcome_total{{outcome="fill_error"}} {d}
+            \\tardigrade_proxy_cache_outcome_total{{outcome="stale"}} {d}
+            \\tardigrade_proxy_cache_outcome_total{{outcome="revalidation_spawned"}} {d}
+            \\tardigrade_proxy_cache_outcome_total{{outcome="revalidation_skipped_concurrency"}} {d}
             \\# HELP tardigrade_proxy_ttfb_ms Proxied upstream time to first byte in milliseconds
             \\# TYPE tardigrade_proxy_ttfb_ms summary
             \\tardigrade_proxy_ttfb_ms_sum {d}
@@ -1613,6 +1640,9 @@ pub const Metrics = struct {
             self.proxy_cache_miss,
             self.proxy_cache_bypass,
             self.proxy_cache_fill_error,
+            self.proxy_cache_stale,
+            self.proxy_cache_revalidation_spawned,
+            self.proxy_cache_revalidation_skipped_concurrency,
             self.proxy_ttfb_ms_sum,
             self.proxy_ttfb_ms_count,
             self.upstream_connections_new,

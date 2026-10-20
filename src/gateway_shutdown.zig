@@ -1184,6 +1184,13 @@ fn applyReloadedRuntimeConfig(
         })
     else
         null;
+    // #903: same wholesale-rebuild convention as the in-memory cache above.
+    // The old `DiskCache` is closed (releasing its advisory directory lock)
+    // before the new one opens the same path, so a reload never holds two
+    // conflicting locks on one directory.
+    if (state.proxy_response_cache_disk) |*disk| disk.deinit();
+    state.proxy_response_cache_disk = gs.openProxyResponseCacheDisk(state.allocator, cfg);
+    state.proxy_response_cache_revalidation_max_concurrency.store(cfg.proxy_response_cache_revalidation_max_concurrency, .release);
     // Publish the new cache epoch in the same critical section as the swap.
     // A response still running on an older config lease can neither read nor
     // fill this cache after the lock is released.
@@ -1344,6 +1351,11 @@ test "applyReloadedRuntimeConfig atomically swaps proxy cache generation and upd
     state.proxy_cache_ttl_seconds = 0;
     state.proxy_response_cache_mutex = .{};
     state.proxy_response_cache = null;
+    state.proxy_response_cache_disk = null;
+    state.proxy_response_cache_revalidation_locks = std.StringHashMap(void).init(allocator);
+    defer state.proxy_response_cache_revalidation_locks.deinit();
+    state.proxy_response_cache_revalidation_inflight = std.atomic.Value(u32).init(0);
+    state.proxy_response_cache_revalidation_max_concurrency = std.atomic.Value(u32).init(0);
     state.runtime_mutex = .{};
     // `metricsToPrometheus` (called below) locks this via `muxMetricsSnapshot`
     // — left uninitialized, `.lock()` on garbage memory hangs indefinitely
@@ -1391,6 +1403,7 @@ test "applyReloadedRuntimeConfig atomically swaps proxy cache generation and upd
     applyReloadedRuntimeConfig(&cfg, 1, &state, &first_security);
     defer if (state.hsts_value.len > 0) allocator.free(state.hsts_value);
     defer if (state.proxy_response_cache) |*cache| cache.deinit();
+    defer if (state.proxy_response_cache_disk) |*disk| disk.deinit();
 
     // The ACL now belongs to the configuration version rather than to
     // `GatewayState`; `applyReloadedRuntimeConfig` leaves `prepared_security`

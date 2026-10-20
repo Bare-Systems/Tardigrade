@@ -1,5 +1,10 @@
-//! Conservative, bounded, in-memory GET response cache for the generic
-//! `proxy_pass` data plane (#901 C1, extended by #902 C2).
+//! Bounded, in-memory GET response cache for the generic `proxy_pass` data
+//! plane (#901 C1, extended by #902 C2 and #903 C3). The disk tier itself
+//! lives in `gateway_proxy_disk_cache.zig`, wired in via `GatewayState`
+//! (`gateway_state.zig`) rather than here -- this module owns eligibility,
+//! freshness/stale-while-revalidate windowing, variant/validator handling,
+//! and the bounded in-memory store that both a direct lookup and a disk
+//! hydration fill into.
 //!
 //! C1 is a deliberately narrow slice: only complete, buffered, successful
 //! `GET` responses with explicit origin freshness (`max-age`/`s-maxage`) are
@@ -7,8 +12,7 @@
 //! (`Authorization`, `Cookie`, verified client certificate, built-in auth,
 //! `forward_auth`, or any configured policy rule). `Set-Cookie` and
 //! `no-store`/`private`/`no-cache` responses are never stored, and neither is
-//! a response carrying any `Vary` value this cache does not understand. No
-//! disk tier here -- that is #903.
+//! a response carrying any `Vary` value this cache does not understand.
 //!
 //! C2 adds, on top of that conservative base: a bounded, FIFO-capped
 //! `Vary: Accept-Encoding` variant store (every other `Vary` field name, and
@@ -16,14 +20,20 @@
 //! per-header variant space); `ETag`/`Last-Modified` validator-based
 //! conditional responses answered entirely from an already-fresh cache entry
 //! (`If-None-Match`/`If-Modified-Since` -> `304`); and serving `HEAD` from a
-//! stored `GET` entry's metadata. Upstream-initiated revalidation of a
-//! *stale* entry (the cache itself issuing a conditional request to the
-//! origin and refreshing metadata on a `304`) and bounded single-flight fill
-//! collapsing are not implemented here; see the C2 follow-up issue. The entry
-//! representation below is intentionally separate from
-//! `http.idempotency.IdempotencyStore`, which only models
-//! `status/body/content_type` and is not a fit for replaying arbitrary
-//! response headers with a correct `Age`.
+//! stored `GET` entry's metadata.
+//!
+//! C3 adds a bounded stale-while-revalidate window (`swr_seconds`/
+//! `swr_until_ms`): a hit past `expires_at_ms` but before `swr_until_ms` is
+//! returned with `LookupResult.stale = true` rather than evicted outright,
+//! and is never extended for a response carrying `must-revalidate`/
+//! `proxy-revalidate` (`Freshness.forbids_stale`). Triggering the actual
+//! bounded, single-flight background refresh for a stale hit is the
+//! caller's job (`gateway_proxy_runtime.maybeSpawnProxyResponseCacheRevalidation`),
+//! not this module's. Bounded simultaneous-miss fill collapsing is not
+//! implemented here; see the open follow-up issue. The entry representation
+//! below is intentionally separate from `http.idempotency.IdempotencyStore`,
+//! which only models `status/body/content_type` and is not a fit for
+//! replaying arbitrary response headers with a correct `Age`.
 
 const std = @import("std");
 const compat = @import("zig_compat");
@@ -74,6 +84,12 @@ pub const PutParams = struct {
     /// separately from resident time so replay emits the RFC-correct current
     /// age even if the process monotonic clock started after the origin did.
     initial_age_seconds: u32 = 0,
+    /// Bounded stale-while-revalidate window (#903), already capped by the
+    /// operator ceiling and zeroed by the caller whenever the response
+    /// forbids stale serving (`must-revalidate`/`proxy-revalidate`) or the
+    /// feature is disabled. `0` means this entry is evicted outright at
+    /// `ttl_seconds`, the same as before #903.
+    swr_seconds: u32 = 0,
 };
 
 pub const LookupResult = struct {
@@ -82,6 +98,12 @@ pub const LookupResult = struct {
     headers: []CacheHeader,
     body: []u8,
     age_seconds: u32,
+    /// Set when this hit is past its `ttl_seconds` freshness lifetime but
+    /// still inside its `swr_seconds` stale-serving window (#903). A caller
+    /// that serves a stale hit is responsible for triggering (bounded,
+    /// single-flight) background revalidation; `lookup`/lookup-equivalents
+    /// never do this themselves.
+    stale: bool = false,
 };
 
 const Entry = struct {
@@ -96,6 +118,11 @@ const Entry = struct {
     body: []u8,
     stored_at_ms: u64,
     expires_at_ms: u64,
+    /// `expires_at_ms + swr_seconds * 1000` (#903); equal to `expires_at_ms`
+    /// when this entry has no stale-serving window. `lookup` evicts at this
+    /// deadline instead of `expires_at_ms`, reporting `LookupResult.stale`
+    /// for anything served past `expires_at_ms` but before this.
+    swr_until_ms: u64,
     initial_age_seconds: u32,
     /// Accounted size used for the aggregate/per-object caps; computed once
     /// at fill time from the same fields.
@@ -318,10 +345,11 @@ pub const ProxyResponseCache = struct {
     /// `null` on a miss or an expired entry (which this also evicts).
     pub fn lookup(self: *ProxyResponseCache, scratch: std.mem.Allocator, key: []const u8, now_ms: u64) !?LookupResult {
         const entry = self.map.getPtr(key) orelse return null;
-        if (now_ms >= entry.expires_at_ms) {
+        if (now_ms >= entry.swr_until_ms) {
             self.removeLocked(key);
             return null;
         }
+        const stale = now_ms >= entry.expires_at_ms;
         const reason_copy = try scratch.dupe(u8, entry.reason);
         const headers_copy = try scratch.alloc(CacheHeader, entry.headers.len);
         for (entry.headers, 0..) |h, i| {
@@ -344,6 +372,7 @@ pub const ProxyResponseCache = struct {
             .headers = headers_copy,
             .body = body_copy,
             .age_seconds = age_seconds,
+            .stale = stale,
         };
     }
 
@@ -384,6 +413,7 @@ pub const ProxyResponseCache = struct {
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
 
+        const expires_at_ms = now_ms + @as(u64, params.ttl_seconds - params.initial_age_seconds) * 1000;
         return .{ .key = owned_key, .entry = .{
             .metadata_arena = arena,
             .status_code = params.status_code,
@@ -391,7 +421,8 @@ pub const ProxyResponseCache = struct {
             .headers = owned_headers,
             .body = owned_body,
             .stored_at_ms = now_ms,
-            .expires_at_ms = now_ms + @as(u64, params.ttl_seconds - params.initial_age_seconds) * 1000,
+            .expires_at_ms = expires_at_ms,
+            .swr_until_ms = expires_at_ms + @as(u64, params.swr_seconds) * 1000,
             .initial_age_seconds = params.initial_age_seconds,
             .bytes = object_bytes,
         } };
@@ -741,6 +772,10 @@ pub const Freshness = struct {
     /// than refusing outright. Every other `Vary` content, including `*` or
     /// any additional field name, still makes this function return `null`.
     vary_on_accept_encoding: bool = false,
+    /// Set when `Cache-Control` carries `must-revalidate` or
+    /// `proxy-revalidate` (#903): this representation must never be served
+    /// stale, regardless of any configured stale-while-revalidate window.
+    forbids_stale: bool = false,
 };
 
 /// Match an HTTP media type while ignoring case, surrounding whitespace, and
@@ -773,6 +808,7 @@ pub fn responseFreshness(headers: anytype, ceiling_seconds: u32) ?Freshness {
     var response_age: ?u32 = null;
     var saw_vary = false;
     var vary_is_only_accept_encoding = true;
+    var forbids_stale = false;
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "set-cookie")) return null;
         if (std.ascii.eqlIgnoreCase(h.name, "vary")) {
@@ -804,6 +840,8 @@ pub fn responseFreshness(headers: anytype, ceiling_seconds: u32) ?Freshness {
                 s_maxage = std.fmt.parseInt(u32, std.mem.trim(u8, tok["s-maxage=".len..], " \t"), 10) catch null;
             } else if (std.ascii.startsWithIgnoreCase(tok, "max-age=")) {
                 max_age = std.fmt.parseInt(u32, std.mem.trim(u8, tok["max-age=".len..], " \t"), 10) catch null;
+            } else if (std.ascii.eqlIgnoreCase(directive_name, "must-revalidate") or std.ascii.eqlIgnoreCase(directive_name, "proxy-revalidate")) {
+                forbids_stale = true;
             }
         }
     }
@@ -819,7 +857,17 @@ pub fn responseFreshness(headers: anytype, ceiling_seconds: u32) ?Freshness {
         .ttl_seconds = ttl_seconds,
         .initial_age_seconds = initial_age_seconds,
         .vary_on_accept_encoding = saw_vary and vary_is_only_accept_encoding,
+        .forbids_stale = forbids_stale,
     };
+}
+
+/// The bounded stale-while-revalidate window for one fill, given the
+/// operator's configured ceiling and this response's own freshness (#903).
+/// `0` (no stale serving) whenever the feature is off or the response
+/// forbids it.
+pub fn staleWhileRevalidateSeconds(freshness: Freshness, ceiling_seconds: u32) u32 {
+    if (ceiling_seconds == 0 or freshness.forbids_stale) return 0;
+    return ceiling_seconds;
 }
 
 test "isCacheableRequest accepts a plain GET and refuses personalized signals" {

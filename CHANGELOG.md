@@ -80,6 +80,34 @@ All notable user-facing changes to Tardigrade are documented here.
   initiated revalidation of a *stale* entry (the cache issuing its own
   conditional request to the origin) and bounded single-flight fill
   collapsing are not part of this slice; tracked in a follow-up issue.
+- **Crash-safe disk tier and bounded stale-while-revalidate for the generic
+  response cache (#903, C3 of #900).** `TARDIGRADE_PROXY_CACHE_PATH` (an
+  absolute path) now persists eligible fills to disk: one content-addressed
+  file per cache key, written atomically (exclusive-create temp + `fsync` +
+  rename + `fsync` parent directory) via the same hardened, symlink-
+  refusing, ownership/permission-checked primitive ACME native state uses.
+  A memory miss consults the disk tier before falling through to the
+  origin, and a fresh disk hit is hydrated back into memory. Every record
+  is tagged with a stable fingerprint over the route/upstream/cache-policy
+  configuration; a process restart with unchanged config serves a prior
+  entry, while any fingerprint change, corruption, truncation, or wrong-key
+  record is a safe miss (best-effort deleted), never a leak across
+  configurations. Bounded independently by new
+  `TARDIGRADE_PROXY_CACHE_DISK_MAX_ENTRIES`/`_MAX_TOTAL_BYTES` (LRU
+  eviction) with one bounded startup reconciliation scan; disk faults fail
+  open to memory-only caching. `TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS`
+  (requires a nonzero TTL, capped at 7 days) now extends a cache entry's
+  serving window past its freshness lifetime: a stale hit is still answered
+  immediately, while triggering at most one bounded, single-flight (per
+  key, and globally capped by new
+  `TARDIGRADE_PROXY_CACHE_REVALIDATION_MAX_CONCURRENCY`, default `4`)
+  background revalidation GET that reuses the entry's `ETag`/`Last-Modified`
+  as conditional validators rather than a blind re-fetch. A response
+  carrying `must-revalidate`/`proxy-revalidate` is never served stale. Both
+  knobs previously failed `tardi check`/startup outright; new
+  `tardigrade_proxy_cache_outcome_total{outcome="stale"|"revalidation_spawned"|"revalidation_skipped_concurrency"}`
+  metrics. See the Support Matrix for the full contract; bounded
+  simultaneous-miss fill collapsing remains a follow-up.
 
 - **Native H2 `rewrite` support with `forward_auth` parity (#814).** The
   native HTTP/2 route path now runs a bounded effective-route loop for

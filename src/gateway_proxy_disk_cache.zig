@@ -22,6 +22,15 @@
 //! silently leaking bytes a crashed process never got to account for. If the
 //! bounded scan cannot reach EOF, the tier disables itself rather than enforce
 //! quota against a partial directory view.
+//!
+//! Disabling is durable, not just in-process: any disable (a truncated scan,
+//! a faulted unlink, a fence write that failed while a sibling's I/O lane was
+//! busy) writes a best-effort marker file that the next `init` checks before
+//! trusting anything else in the directory. A disable can follow a mutation
+//! this process could not fully account for, and bytes left behind can look
+//! like a perfectly ordinary, reconcilable directory to a fresh scan -- so
+//! once disabled, the namespace requires an operator to purge the directory
+//! before the disk tier will serve from it again.
 
 const std = @import("std");
 const compat = @import("zig_compat");
@@ -64,6 +73,14 @@ const tombstone_magic = "TPDCTMB3".*;
 const fence_magic = "TPDCFNC3".*;
 const tombstone_bytes = tombstone_magic.len + @sizeOf(u64) + key_len + @sizeOf(u64);
 const io_lane_count: usize = 64;
+
+/// Fixed, non-hex name: `reconcileFromDisk`'s directory scan already skips
+/// every entry that is not exactly `key_len` lowercase hex characters, so
+/// this can never collide with a cache record and is never mistaken for one.
+/// Its mere presence -- independent of the config fingerprint -- durably
+/// marks the whole namespace untrustworthy; see `disableLocked`.
+const poison_name = "disk-cache.disabled";
+const poison_marker = "TARDIGRADE-DISK-CACHE-POISONED\x00".*;
 
 /// Test-only pause point for proving that unrelated keys remain responsive
 /// while one durable write is stalled. The pointer is null in production.
@@ -226,10 +243,42 @@ pub const DiskCache = struct {
             .vary_index = std.StringHashMap(VaryIndexEntry).init(allocator),
             .max_vary_variants = @max(1, @min(limits.max_vary_variants, gpc.hard_max_vary_variants)),
         };
+        // A prior process may have disabled itself mid-mutation (a faulted
+        // fence write racing a busy sibling lane, a truncated startup scan,
+        // an unprovable unlink) -- states where the bytes left on disk can
+        // look like a perfectly ordinary, reconcilable directory. Trusting
+        // that appearance would resurrect whatever representation the prior
+        // process could no longer account for. The durable marker makes
+        // "disabled" permanent until an operator purges the directory,
+        // rather than merely in-process.
+        if (self.isPoisonedOnDisk()) {
+            self.disabled = true;
+            return self;
+        }
         self.reconcileFromDisk(root_path);
         self.applyFencesAtStartup();
         self.evictToFitLocked();
         return self;
+    }
+
+    /// Fail-safe: only a confirmed `NotFound` counts as "not poisoned". Any
+    /// other error (unsafe file type, I/O failure, oversized/corrupt marker)
+    /// cannot prove the marker is absent, so the namespace is still treated
+    /// as untrustworthy.
+    fn isPoisonedOnDisk(self: *DiskCache) bool {
+        var buf: [poison_marker.len]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        _ = self.state_dir.readFileAlloc(fba.allocator(), poison_name, poison_marker.len, false) catch |err| {
+            return err != error.NotFound;
+        };
+        return true;
+    }
+
+    /// Best-effort: if even this write fails, a restart falls back to
+    /// whatever `reconcileFromDisk` can determine on its own (which already
+    /// fails closed on a truncated scan).
+    fn poisonDurableBestEffort(self: *DiskCache) void {
+        self.state_dir.writeFileAtomicLimit(poison_name, &poison_marker, 0o600, poison_marker.len) catch {};
     }
 
     const IoGuard = struct {
@@ -243,7 +292,7 @@ pub const DiskCache = struct {
         }
     };
 
-    fn ioLane(key: []const u8) usize {
+    pub fn ioLane(key: []const u8) usize {
         return @intCast(std.hash.Wyhash.hash(0x5444_4349_4f, key) % io_lane_count);
     }
 
@@ -381,6 +430,7 @@ pub const DiskCache = struct {
         self.vary_index.clearRetainingCapacity();
         self.total_bytes = 0;
         self.disabled = true;
+        self.poisonDurableBestEffort();
     }
 
     fn trackVariantLocked(self: *DiskCache, primary_key: []const u8, secondary_key: []const u8) !void {
@@ -482,6 +532,21 @@ pub const DiskCache = struct {
 
     fn isFencedLocked(self: *DiskCache, primary: []const u8) bool {
         return if (self.index.get(primary)) |marker| marker.fence else false;
+    }
+
+    /// True when `key` must never be served: missing, a tombstone/fence
+    /// itself, or a Vary secondary whose primary now carries a direct-policy
+    /// fence. Called both before the durable read and again immediately
+    /// before returning a decoded record, so a fence installed by a
+    /// concurrent writer in between (the only way a secondary's own index
+    /// entry survives a family retirement: its I/O lane was busy) still
+    /// masks the stale representation rather than letting it resume serving
+    /// under its old key.
+    fn isMaskedRecordLocked(self: *DiskCache, key: []const u8) bool {
+        const value = self.index.get(key) orelse return true;
+        if (value.tombstone) return true;
+        if (value.vary_primary_key) |primary| return self.isFencedLocked(primary[0..]);
+        return false;
     }
 
     /// Retires every tracked variant of `primary` once, each under its own
@@ -990,10 +1055,9 @@ pub const DiskCache = struct {
             self.mutex.unlock();
             return null;
         }
-        const tracked = self.index.contains(key);
-        const tombstone = if (self.index.get(key)) |value| value.tombstone else false;
+        const masked = self.isMaskedRecordLocked(key);
         self.mutex.unlock();
-        if (!tracked or tombstone) return null;
+        if (masked) return null;
 
         const raw = self.state_dir.readFileAlloc(scratch, key, self.limits.max_object_bytes + record_overhead_bytes, false) catch {
             self.removeWithIoHeld(key);
@@ -1033,7 +1097,15 @@ pub const DiskCache = struct {
             .vary_primary_key = decoded.record.vary_primary_key,
         };
 
+        // Re-check immediately before returning: a concurrent writer could
+        // have installed the primary's fence while this read was in flight
+        // (the test read barrier proves this interleaving), and that must
+        // still mask an already-decoded, otherwise-valid record.
         self.mutex.lock();
+        if (self.disabled or self.isMaskedRecordLocked(key)) {
+            self.mutex.unlock();
+            return null;
+        }
         if (self.index.getPtr(key)) |value| value.last_used_ms = now_ms;
         self.mutex.unlock();
         return loaded;
@@ -2315,6 +2387,11 @@ test "DiskCache Vary-to-direct fences the family durably when a sibling lane is 
         defer arena.deinit();
         try std.testing.expect(!cache.isVaryTracked(primary));
         try std.testing.expect(cache.get(arena.allocator(), siblings[0], 2) == null);
+        // The surviving sibling (its lane was busy during retirement) is
+        // still tracked and its file is still on disk -- the regression this
+        // test exists for: a fence on the primary must mask it in-process,
+        // before any restart gets a chance to durably retire it.
+        try std.testing.expect(cache.get(arena.allocator(), siblings[1], 2) == null);
         try std.testing.expect(cache.get(arena.allocator(), primary, 2) == null);
     }
     // Restart: the durable fence masks the surviving sibling.
@@ -2326,6 +2403,69 @@ test "DiskCache Vary-to-direct fences the family durably when a sibling lane is 
     try std.testing.expect(reopened.get(arena.allocator(), siblings[0], 2) == null);
     try std.testing.expect(reopened.get(arena.allocator(), siblings[1], 2) == null);
     try std.testing.expect(reopened.get(arena.allocator(), primary, 2) == null);
+}
+
+test "DiskCache get rechecks the primary fence installed while an in-flight secondary read was paused" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
+    const primary = "c" ** 64;
+    const candidates = [_][]const u8{ "d" ** 64, "e" ** 64, "f" ** 64, "a" ** 64 };
+    var secondary = candidates[0];
+    for (candidates) |candidate| {
+        if (DiskCache.ioLane(candidate) != DiskCache.ioLane(primary)) {
+            secondary = candidate;
+            break;
+        }
+    }
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    const record = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "variant",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    };
+    var cache = try DiskCache.init(allocator, root_path, limits, 98);
+    defer cache.deinit();
+    var variant = record;
+    variant.vary_primary_key = primary;
+    cache.put(secondary, variant, 0);
+
+    var read_barrier = TestIoBarrier{ .key = secondary };
+    cache.test_read_barrier = &read_barrier;
+
+    const Getter = struct {
+        fn run(target: *DiskCache, key: []const u8, saw_hit: *std.atomic.Value(bool)) void {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const loaded = target.get(arena.allocator(), key, 2);
+            saw_hit.store(loaded != null, .release);
+        }
+    };
+    var saw_hit = std.atomic.Value(bool).init(true);
+    const getter = try std.Thread.spawn(.{}, Getter.run, .{ &cache, secondary, &saw_hit });
+    read_barrier.waitUntilReached();
+
+    // The secondary's own I/O lane is held by the paused read, so its file
+    // cannot be retired, but the primary's lane is free: the fence still
+    // commits durably while the read sits decoded-but-not-yet-returned.
+    var direct = record;
+    direct.body = "direct";
+    cache.put(primary, direct, 1);
+    try std.testing.expect(!cache.isVaryTracked(primary));
+
+    read_barrier.release();
+    getter.join();
+    cache.test_read_barrier = null;
+
+    try std.testing.expect(!saw_hit.load(.acquire));
 }
 
 test "DiskCache failed fence write with a busy sibling disables the tier" {
@@ -2355,15 +2495,31 @@ test "DiskCache failed fence write with a busy sibling disables the tier" {
         .swr_until_ms = 60_000,
         .initial_age_seconds = 0,
     };
-    var cache = try DiskCache.init(allocator, root_path, limits, 97);
-    defer cache.deinit();
-    var variant = record;
-    variant.vary_primary_key = primary;
-    cache.put(secondary, variant, 0);
-    cache.state_dir.fault = .write;
-    cache.state_dir.fault_file = primary;
-    cache.io_lanes[DiskCache.ioLane(secondary)].lock();
-    cache.put(primary, record, 1);
-    cache.io_lanes[DiskCache.ioLane(secondary)].unlock();
-    try std.testing.expect(cache.disabled);
+    {
+        var cache = try DiskCache.init(allocator, root_path, limits, 97);
+        defer cache.deinit();
+        var variant = record;
+        variant.vary_primary_key = primary;
+        cache.put(secondary, variant, 0);
+        cache.state_dir.fault = .write;
+        cache.state_dir.fault_file = primary;
+        cache.io_lanes[DiskCache.ioLane(secondary)].lock();
+        cache.put(primary, record, 1);
+        cache.io_lanes[DiskCache.ioLane(secondary)].unlock();
+        try std.testing.expect(cache.disabled);
+    }
+    // No durable fence could be written and the busy sibling could not be
+    // retired, so the on-disk directory still looks like an ordinary,
+    // reconcilable Vary family under the unchanged fingerprint: exactly the
+    // state a naive restart would happily replay under the new (direct)
+    // representation policy. The durable poison marker must keep the next
+    // process from trusting it instead.
+    var reopened = try DiskCache.init(allocator, root_path, limits, 97);
+    defer reopened.deinit();
+    try std.testing.expect(reopened.disabled);
+    try std.testing.expect(!reopened.isVaryTracked(primary));
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(reopened.get(arena.allocator(), secondary, 2) == null);
+    try std.testing.expect(reopened.get(arena.allocator(), primary, 2) == null);
 }

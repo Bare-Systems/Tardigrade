@@ -2009,6 +2009,98 @@ pub const GatewayState = struct {
         try std.testing.expect(!state.proxy_response_cache.?.isVaryTracked(primary));
     }
 
+    test "a stale Vary secondary cannot resurrect through the public lookup after a busy-sibling fence transition" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+        defer allocator.free(root_path);
+
+        var state: GatewayState = undefined;
+        state.allocator = allocator;
+        state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache_mutation_lanes = @splat(.{});
+        state.proxy_response_cache = gpc.ProxyResponseCache.init(allocator, .{
+            .max_object_bytes = 4096,
+            .max_entries = 8,
+            .max_total_bytes = 32 * 1024,
+            .max_vary_variants = 4,
+        });
+        defer state.proxy_response_cache.?.deinit();
+        state.proxy_response_cache_disk = try gpdc.DiskCache.init(allocator, root_path, .{
+            .max_object_bytes = 4096,
+            .max_entries = 8,
+            .max_total_bytes = 1 << 20,
+            .max_vary_variants = 4,
+        }, 101);
+        defer state.proxy_response_cache_disk.?.deinit();
+        state.proxy_response_cache_disk_accepting = true;
+        state.proxy_response_cache_disk_inflight = 0;
+        state.proxy_response_cache_condition = .{};
+        state.proxy_response_cache_generation = 11;
+
+        const primary = "1" ** 64;
+        const candidates = [_][]const u8{ "2" ** 64, "3" ** 64, "4" ** 64, "5" ** 64, "6" ** 64 };
+        var secondary = candidates[0];
+        for (candidates) |candidate| {
+            if (proxyResponseCacheMutationLane(primary) != proxyResponseCacheMutationLane(candidate) and
+                !gpdc.DiskCache.keysShareIoLane(primary, candidate))
+            {
+                secondary = candidate;
+                break;
+            }
+        }
+
+        // The request that chose this secondary is long gone: only the disk
+        // tier remembers it, as the review's "particularly after the new
+        // direct RAM entry expires/evicts" scenario describes.
+        state.proxy_response_cache_disk.?.put(secondary, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &.{.{ .name = "Cache-Control", .value = "max-age=60" }},
+            .body = "stale-variant",
+            .stored_at_ms = 0,
+            .expires_at_ms = 60_000,
+            .swr_until_ms = 60_000,
+            .initial_age_seconds = 0,
+            .vary_primary_key = primary,
+        }, 0);
+
+        // A concurrent writer's I/O lane keeps the secondary from being
+        // durably retired, exactly as in the disk-tier unit test, but here
+        // the policy transition itself runs through the public GatewayState
+        // write path.
+        state.proxy_response_cache_disk.?.io_lanes[gpdc.DiskCache.ioLane(secondary)].lock();
+        try state.proxyResponseCachePut(1, 11, primary, .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &.{.{ .name = "Cache-Control", .value = "max-age=60" }},
+            .body = "direct",
+            .ttl_seconds = 60,
+        });
+        state.proxy_response_cache_disk.?.io_lanes[gpdc.DiskCache.ioLane(secondary)].unlock();
+
+        try std.testing.expect(!state.proxyResponseCacheIsVaryTracked(11, primary));
+
+        // The new direct RAM entry has since expired/evicted; only the disk
+        // tier (primary fence plus the still-undeleted secondary file)
+        // remains, matching the review scenario precisely.
+        {
+            state.proxy_response_cache_mutex.lock();
+            defer state.proxy_response_cache_mutex.unlock();
+            const revision = state.proxy_response_cache.?.entryRevision(primary).?;
+            try std.testing.expect(state.proxy_response_cache.?.removeIfRevision(primary, revision));
+        }
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        // A request that still believes the secondary is the right
+        // representation (it checked `isVaryTracked` before the transition
+        // above) must get a safe miss, never the superseded body.
+        const hit = try state.proxyResponseCacheLookup(arena.allocator(), 11, primary, secondary, 2);
+        try std.testing.expect(hit == null);
+    }
+
     test "proxy response cache serializes racing fills without exceeding its cap" {
         // Two origin responses can complete at nearly the same instant.  The
         // gateway lock must make this a one-entry store rather than a

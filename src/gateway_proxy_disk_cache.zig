@@ -447,6 +447,17 @@ pub const DiskCache = struct {
             self.mutex.unlock();
             return .gone;
         };
+        if (vary_primary) |primary| {
+            // The victim must still be a variant of this primary; a
+            // repurposed key (now direct, or under another primary) is not
+            // ours to delete. Only the stale reference is dropped.
+            const still_ours = if (tracked.vary_primary_key) |stored| std.mem.eql(u8, stored[0..], primary) else false;
+            if (!still_ours) {
+                self.pruneVariantLocked(primary, victim);
+                self.mutex.unlock();
+                return .gone;
+            }
+        }
         if (tracked.pending_write) {
             self.mutex.unlock();
             return .busy;
@@ -504,7 +515,13 @@ pub const DiskCache = struct {
         // Also remove a valid but untracked file (for example, one left by a
         // failed process between rename and index publication). No global
         // index mutex is held while touching the filesystem.
-        self.state_dir.removeFile(owned orelse key);
+        // Explicit invalidation (policy change, corruption) must survive a
+        // power loss; on a fault stop serving the disk tier altogether.
+        self.state_dir.removeFileDurable(owned orelse key) catch {
+            self.mutex.lock();
+            self.disableLocked();
+            self.mutex.unlock();
+        };
         if (owned) |removed_key| self.allocator.free(removed_key);
     }
 
@@ -609,18 +626,6 @@ pub const DiskCache = struct {
     pub fn put(self: *DiskCache, key: []const u8, record: PutRecord, now_ms: u64) void {
         if (!isHexLowerKey(key)) return;
         if (record.vary_primary_key) |primary| if (!isHexLowerKey(primary)) return;
-        if (record.reason.len > max_reason_bytes) return;
-        if (record.headers.len > max_headers) return;
-        for (record.headers) |h| {
-            if (h.name.len > max_header_name_bytes or h.value.len > max_header_value_bytes) return;
-        }
-        const object_bytes = recordBytes(key, record);
-        if (object_bytes > self.limits.max_object_bytes) return;
-
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
-        const now_unix_ms = self.unixNowMs() orelse return;
-        encodeRecord(self.allocator, &buf, key, record, self.fingerprint, now_ms, now_unix_ms) catch return;
         const io_guard = self.lockIo(key, record.vary_primary_key);
         defer io_guard.unlock();
         var tombstone_primary: ?[]const u8 = null;
@@ -669,6 +674,20 @@ pub const DiskCache = struct {
             }
         }
 
+        // The policy fence above has already run, so every refusal below
+        // leaves at worst a safe miss on disk, never the obsolete shape.
+        if (record.reason.len > max_reason_bytes) return;
+        if (record.headers.len > max_headers) return;
+        for (record.headers) |h| {
+            if (h.name.len > max_header_name_bytes or h.value.len > max_header_value_bytes) return;
+        }
+        const object_bytes = recordBytes(key, record);
+        if (object_bytes > self.limits.max_object_bytes) return;
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        const now_unix_ms = self.unixNowMs() orelse return;
+        encodeRecord(self.allocator, &buf, key, record, self.fingerprint, now_ms, now_unix_ms) catch return;
         // Keep each primary's variant set bounded before reserving the new
         // record. The primary I/O lane prevents another variant writer from
         // changing this set while the filesystem operation is in flight.
@@ -1948,4 +1967,117 @@ test "DiskCache quota eviction never unlinks a victim that a concurrent writer i
     defer arena.deinit();
     const loaded = reopened.get(arena.allocator(), key_b, 9) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("new-b", loaded.body);
+}
+
+test "DiskCache policy fence runs even when the new candidate fails preflight" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 1024, .max_entries = 8, .max_total_bytes = 1 << 20 };
+    const primary = "c" ** 64;
+    const secondary = "d" ** 64;
+    const other_primary = "e" ** 64;
+    const other_secondary = "f" ** 64;
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    const small = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "small",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    };
+    const oversized_body = [_]u8{'x'} ** 2048;
+    var big = small;
+    big.body = &oversized_body;
+    {
+        var cache = try DiskCache.init(allocator, root_path, limits, 92);
+        defer cache.deinit();
+        // Direct -> Vary with a candidate over the object limit.
+        cache.put(primary, small, 0);
+        var big_variant = big;
+        big_variant.vary_primary_key = primary;
+        cache.put(secondary, big_variant, 1);
+        // Vary -> direct with a candidate over the object limit.
+        var small_variant = small;
+        small_variant.vary_primary_key = other_primary;
+        cache.put(other_secondary, small_variant, 0);
+        cache.put(other_primary, big, 1);
+    }
+    var reopened = try DiskCache.init(allocator, root_path, limits, 92);
+    defer reopened.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(reopened.get(arena.allocator(), primary, 2) == null);
+    try std.testing.expect(reopened.get(arena.allocator(), other_secondary, 2) == null);
+}
+
+test "DiskCache explicit invalidation is durable and disables the tier on an fsync fault" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
+    const key = "c" ** 64;
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    var cache = try DiskCache.init(allocator, root_path, limits, 93);
+    defer cache.deinit();
+    cache.put(key, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "public",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    }, 0);
+    cache.state_dir.fault = .fsync_dir;
+    cache.state_dir.fault_file = key;
+    cache.remove(key);
+    try std.testing.expect(cache.disabled);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(cache.get(arena.allocator(), key, 1) == null);
+}
+
+test "DiskCache FIFO retirement refuses a victim no longer associated with the primary" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
+    const primary = "c" ** 64;
+    const other_primary = "e" ** 64;
+    const victim = "d" ** 64;
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    var cache = try DiskCache.init(allocator, root_path, limits, 94);
+    defer cache.deinit();
+    cache.put(victim, .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "repurposed",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+        .vary_primary_key = other_primary,
+    }, 0);
+    var victim_key: [key_len]u8 = undefined;
+    @memcpy(victim_key[0..], victim);
+    {
+        const guard = cache.lockIo(victim, null);
+        defer guard.unlock();
+        try std.testing.expectEqual(DiskCache.RetireResult.gone, cache.retireVictimWithLanes(guard, &victim_key, primary, true));
+    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(cache.get(arena.allocator(), victim, 1) != null);
 }

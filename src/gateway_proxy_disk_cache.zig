@@ -178,7 +178,10 @@ pub const DiskCache = struct {
     /// bypassing quota. Valid records are decoded to rebuild the bounded Vary
     /// primary-to-secondary index required after restart.
     fn reconcileFromDisk(self: *DiskCache, root_path: []const u8) void {
-        const dir_fd = compat.openDirNoFollow(root_path) catch return;
+        const dir_fd = compat.openDirNoFollow(root_path) catch {
+            self.disableLocked();
+            return;
+        };
         defer compat.closeFd(dir_fd);
         var dir: std.Io.Dir = .{ .handle = dir_fd };
         const io = compat.io();
@@ -192,15 +195,28 @@ pub const DiskCache = struct {
                 return;
             }) orelse return;
             visited += 1;
-            if (entry.kind != .file) continue;
             if (!isHexLowerKey(entry.name)) continue;
-            const st = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch continue;
-            if (st.kind != .file) continue;
-            const owned = self.allocator.dupe(u8, entry.name) catch continue;
+            if (entry.kind != .file) {
+                self.disableLocked();
+                return;
+            }
+            const st = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch {
+                self.disableLocked();
+                return;
+            };
+            if (st.kind != .file) {
+                self.disableLocked();
+                return;
+            }
+            const owned = self.allocator.dupe(u8, entry.name) catch {
+                self.disableLocked();
+                return;
+            };
             const bytes: usize = @intCast(st.size);
             const gop = self.index.getOrPut(owned) catch {
                 self.allocator.free(owned);
-                continue;
+                self.disableLocked();
+                return;
             };
             if (gop.found_existing) {
                 self.allocator.free(owned);
@@ -230,7 +246,11 @@ pub const DiskCache = struct {
 
         // Reaching the cap without EOF means there may be unaccounted files.
         // Disable the tier rather than enforcing quota against a partial view.
-        if ((it.next(io) catch null) != null) self.disableLocked();
+        const more = it.next(io) catch {
+            self.disableLocked();
+            return;
+        };
+        if (more != null) self.disableLocked();
     }
 
     fn disableLocked(self: *DiskCache) void {

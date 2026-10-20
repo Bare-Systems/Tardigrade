@@ -3052,7 +3052,7 @@ fn handleHttp3LocationProxyPass(
                         break :blk null;
                     };
                 };
-                const disposition: gpc.ServeDisposition = if (cache_hit) |hit| gpc.decideCacheServe(hit.headers, &request.headers) else .require_origin;
+                const disposition: gpc.ServeDisposition = if (cache_hit) |hit| gpc.decideLookupServe(&hit, &request.headers) else .require_origin;
                 if (cache_hit) |hit| {
                     if (disposition != .require_origin) {
                         // A cached replay must fail open. `applyHttp3ProxyCacheHit`
@@ -3072,6 +3072,7 @@ fn handleHttp3LocationProxyPass(
                                         cache_generation,
                                         key_buf[0..],
                                         effective_key.?,
+                                        hit.revision,
                                         hit.headers,
                                         request.headers.get("accept-encoding"),
                                         target,

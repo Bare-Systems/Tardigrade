@@ -174,6 +174,7 @@ const ProxyResponseCacheRevalidationTask = struct {
     generation: u64,
     primary_key: []const u8,
     effective_key: []const u8,
+    revision: u64,
     etag: ?[]const u8,
     last_modified: ?[]const u8,
     accept_encoding: ?[]const u8,
@@ -192,6 +193,7 @@ fn buildProxyResponseCacheRevalidationTask(
     generation: u64,
     primary_key: []const u8,
     effective_key: []const u8,
+    revision: u64,
     hit_headers: []const gpc.CacheHeader,
     accept_encoding: ?[]const u8,
     proxy_pass_target: []const u8,
@@ -210,6 +212,7 @@ fn buildProxyResponseCacheRevalidationTask(
     task.generation = generation;
     task.primary_key = try a.dupe(u8, primary_key);
     task.effective_key = try a.dupe(u8, effective_key);
+    task.revision = revision;
     task.etag = if (findCacheHeaderValue(hit_headers, "etag")) |v| try a.dupe(u8, v) else null;
     task.last_modified = if (findCacheHeaderValue(hit_headers, "last-modified")) |v| try a.dupe(u8, v) else null;
     task.accept_encoding = if (accept_encoding) |v| try a.dupe(u8, v) else null;
@@ -227,9 +230,16 @@ fn buildProxyResponseCacheRevalidationTask(
 /// supplied the validators while retaining its body. Other statuses and
 /// transport errors leave the stale entry to expire normally.
 fn proxyResponseCacheRevalidationThread(task: *ProxyResponseCacheRevalidationTask) void {
+    var succeeded = false;
     defer {
         const state = task.state;
         const allocator = state.allocator;
+        if (!succeeded) state.proxyResponseCacheRecordRevalidationFailure(
+            task.generation,
+            task.effective_key,
+            task.revision,
+            http.event_loop.monotonicMs(),
+        );
         state.proxyResponseCacheUnlockRevalidation(task.primary_key);
         task.config_lease.release();
         task.arena.deinit();
@@ -290,13 +300,26 @@ fn proxyResponseCacheRevalidationThread(task: *ProxyResponseCacheRevalidationTas
             task.generation,
             task.primary_key,
             task.effective_key,
+            task.revision,
             metadata,
             cfg.proxy_cache_ttl_seconds,
             cfg.proxy_cache_stale_while_revalidate_seconds,
-        ) catch {};
+        ) catch |err| {
+            if (err == error.NotCacheable or err == error.VaryMismatch) {
+                task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key);
+                succeeded = true;
+            }
+            return;
+        };
+        succeeded = true;
         return;
     }
-    if (buffered.status_code != 200 or buffered.had_content_encoding) return;
+    if (buffered.status_code != 200) return;
+    if (buffered.had_content_encoding or gpc.responseFreshness(buffered.headers, cfg.proxy_cache_ttl_seconds) == null) {
+        task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key);
+        succeeded = true;
+        return;
+    }
     tryFillResponseCache(
         task.arena.allocator(),
         task.state,
@@ -306,23 +329,24 @@ fn proxyResponseCacheRevalidationThread(task: *ProxyResponseCacheRevalidationTas
         task.primary_key,
         &buffered,
         &headers,
-    ) catch {};
+    ) catch return;
+    succeeded = true;
 }
 
 /// Triggers, at most, one bounded single-flight background revalidation for
 /// `primary_key` (#903). Best-effort and silent on every bail-out path: the
 /// caller has already served the stale hit to its own client regardless of
-/// whether this spawns anything. Bounded on two independent axes -- the
-/// global `proxy_response_cache_revalidation_max_concurrency` cap (checked
-/// via one atomic fetch-add, not a lock) and the per-key single-flight
-/// lock -- so neither a hot single key nor a high-cardinality stale working
-/// set can fan out unboundedly many background threads.
+/// whether this spawns anything. Admission, generation, per-key cooldown,
+/// the global concurrency cap, and the single-flight key are committed
+/// together under the cache mutex so reload cannot pass its drain barrier
+/// while an old request is between those checks and registration.
 pub fn maybeSpawnProxyResponseCacheRevalidation(
     state: *GatewayState,
     config_lease: *gs.ConfigLease,
     generation: u64,
     primary_key: []const u8,
     effective_key: []const u8,
+    revision: u64,
     hit_headers: []const gpc.CacheHeader,
     accept_encoding: ?[]const u8,
     proxy_pass_target: []const u8,
@@ -332,17 +356,19 @@ pub fn maybeSpawnProxyResponseCacheRevalidation(
     client_ip: []const u8,
     proxy_set_headers: []const http.location_router.ProxySetHeader,
 ) void {
-    const max_concurrency = state.proxy_response_cache_revalidation_max_concurrency.load(.acquire);
-    if (max_concurrency == 0) return;
-    const prev_inflight = state.proxy_response_cache_revalidation_inflight.fetchAdd(1, .acq_rel);
-    if (prev_inflight >= max_concurrency) {
-        state.proxyResponseCacheRevalidationFinished();
-        state.metricsRecordProxyCacheOutcome(.revalidation_skipped_concurrency);
-        return;
-    }
-    if (!(state.proxyResponseCacheTryLockRevalidation(primary_key) catch false)) {
-        state.proxyResponseCacheRevalidationFinished();
-        return;
+    switch (state.proxyResponseCacheTryRegisterRevalidation(
+        generation,
+        primary_key,
+        effective_key,
+        revision,
+        http.event_loop.monotonicMs(),
+    ) catch return) {
+        .admitted => {},
+        .concurrency => {
+            state.metricsRecordProxyCacheOutcome(.revalidation_skipped_concurrency);
+            return;
+        },
+        .unavailable => return,
     }
 
     const task = state.allocator.create(ProxyResponseCacheRevalidationTask) catch {
@@ -357,6 +383,7 @@ pub fn maybeSpawnProxyResponseCacheRevalidation(
         generation,
         primary_key,
         effective_key,
+        revision,
         hit_headers,
         accept_encoding,
         proxy_pass_target,
@@ -1073,7 +1100,7 @@ pub fn handleLocationProxyPass(
                         break :blk null;
                     };
                 };
-                const disposition: gpc.ServeDisposition = if (cache_hit) |hit| gpc.decideCacheServe(hit.headers, &request.headers) else .require_origin;
+                const disposition: gpc.ServeDisposition = if (cache_hit) |hit| gpc.decideLookupServe(&hit, &request.headers) else .require_origin;
                 if (cache_hit) |hit| {
                     if (disposition != .require_origin) {
                         // Replay assembly is cache-only work. If it cannot
@@ -1115,6 +1142,7 @@ pub fn handleLocationProxyPass(
                                         ctx.config_generation,
                                         key_buf[0..],
                                         effective_key.?,
+                                        hit.revision,
                                         hit.headers,
                                         request.headers.get("accept-encoding"),
                                         target,

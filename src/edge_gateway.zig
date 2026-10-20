@@ -5566,7 +5566,7 @@ fn executeHttp2ProxyRoute(
                         break :blk null;
                     };
                 };
-                const disposition: gproxy_cache.ServeDisposition = if (hit) |value| gproxy_cache.decideCacheServe(value.headers, &request.headers) else .require_origin;
+                const disposition: gproxy_cache.ServeDisposition = if (hit) |value| gproxy_cache.decideLookupServe(&value, &request.headers) else .require_origin;
                 if (hit) |value| {
                     if (disposition != .require_origin) {
                         // This copy is solely for replaying an already-cached
@@ -5586,6 +5586,7 @@ fn executeHttp2ProxyRoute(
                                         cache_generation,
                                         key_buf[0..],
                                         effective_key.?,
+                                        value.revision,
                                         value.headers,
                                         request.headers.get("accept-encoding"),
                                         target,

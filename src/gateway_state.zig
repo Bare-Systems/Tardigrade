@@ -17,6 +17,12 @@ pub const ProxyCacheLookup = struct {
     is_stale: bool,
 };
 
+pub const ProxyResponseCacheRevalidationAdmission = enum {
+    admitted,
+    concurrency,
+    unavailable,
+};
+
 pub const UpstreamHealth = struct {
     fail_count: u32 = 0,
     unhealthy_until_ms: u64 = 0,
@@ -555,9 +561,9 @@ pub const GatewayState = struct {
     /// revalidation thread in flight. [proxy_response_cache_mutex]
     proxy_response_cache_revalidation_locks: std.StringHashMap(void),
     /// Global cap on simultaneous background revalidations across every
-    /// key, independent of the per-key lock above (#903). Atomic: checked
-    /// and adjusted from the detached revalidation thread without taking
-    /// `proxy_response_cache_mutex`, since it never gates cache contents.
+    /// key, independent of the per-key lock above (#903). Registration is
+    /// serialized with reload under `proxy_response_cache_mutex`; the atomic
+    /// value also lets completion publish its progress to the drain waiter.
     proxy_response_cache_revalidation_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// cfg snapshot, read from request-handling threads without
     /// `proxy_response_cache_mutex` (an atomic rather than a plain field
@@ -1158,13 +1164,12 @@ pub const GatewayState = struct {
     /// through to the disk tier after leasing the current generation under
     /// `proxy_response_cache_mutex`. The filesystem read runs without that
     /// global memory-cache lock; reload publishes its new generation and
-    /// waits for leased disk operations before destroying the old tier. A
-    /// *fresh* disk hit
-    /// is also hydrated back into the memory cache so the next request for
-    /// the same key is an in-memory hit again. A *stale* disk hit is
-    /// returned as-is without hydration -- a representation already past
-    /// its freshness lifetime is not worth promoting back into the bounded
-    /// memory tier.
+    /// waits for leased disk operations before destroying the old tier.
+    /// Every disk hit is hydrated back into memory before it is returned.
+    /// A stale representation in particular needs an in-memory entry and
+    /// revision token before conditional background revalidation can be
+    /// admitted. If promotion fails, this fails open as a cache miss and the
+    /// request reaches the origin synchronously.
     pub fn proxyResponseCacheLookup(self: *GatewayState, scratch: std.mem.Allocator, generation: u64, key: []const u8, now_ms: u64) !?gpc.LookupResult {
         {
             self.proxy_response_cache_mutex.lock();
@@ -1197,13 +1202,20 @@ pub const GatewayState = struct {
 
     fn proxyResponseCacheDiskLookup(self: *GatewayState, scratch: std.mem.Allocator, generation: u64, key: []const u8, now_ms: u64) !?gpc.LookupResult {
         const disk = self.proxyResponseCacheAcquireDisk(generation) orelse return null;
-        defer self.proxyResponseCacheReleaseDisk();
-        const loaded = disk.get(scratch, key, now_ms) orelse return null;
+        const loaded = disk.get(scratch, key, now_ms) orelse {
+            self.proxyResponseCacheReleaseDisk();
+            return null;
+        };
+        // `loaded` owns its bytes in request scratch, so the tier lease can
+        // end before taking the memory-cache mutex. Reload waits for disk
+        // leases while holding that mutex; carrying the lease into hydration
+        // would invert the lock order and deadlock.
+        self.proxyResponseCacheReleaseDisk();
 
         const stale = now_ms >= loaded.expires_at_ms;
         const resident_seconds = (now_ms -| loaded.stored_at_ms) / 1000;
         const age_seconds: u32 = @intCast(@min(@as(u64, loaded.initial_age_seconds) + resident_seconds, std.math.maxInt(u32)));
-        const result = gpc.LookupResult{
+        var result = gpc.LookupResult{
             .status_code = loaded.status_code,
             .reason = @constCast(loaded.reason),
             .headers = loaded.headers,
@@ -1211,34 +1223,31 @@ pub const GatewayState = struct {
             .age_seconds = age_seconds,
             .stale = stale,
         };
-        if (!stale) {
-            const views = try scratch.alloc(gpc.CacheHeaderView, loaded.headers.len);
-            for (loaded.headers, 0..) |h, i| views[i] = .{ .name = h.name, .value = h.value };
-            self.proxy_response_cache_mutex.lock();
-            defer self.proxy_response_cache_mutex.unlock();
-            if (self.proxy_response_cache_generation == generation) {
-                if (self.proxy_response_cache) |*cache| {
-                    const params = gpc.PutParams{
-                        .status_code = loaded.status_code,
-                        .reason = loaded.reason,
-                        .headers = views,
-                        .body = loaded.body,
-                        .ttl_seconds = 0,
-                        .initial_age_seconds = loaded.initial_age_seconds,
-                        .absolute_timing = .{
-                            .stored_at_ms = loaded.stored_at_ms,
-                            .expires_at_ms = loaded.expires_at_ms,
-                            .swr_until_ms = loaded.swr_until_ms,
-                        },
-                    };
-                    if (loaded.vary_primary_key) |primary| {
-                        cache.putVaryVariant(now_ms, primary, key, params) catch {};
-                    } else {
-                        cache.put(now_ms, key, params) catch {};
-                    }
-                }
-            }
+        const views = try scratch.alloc(gpc.CacheHeaderView, loaded.headers.len);
+        for (loaded.headers, 0..) |h, i| views[i] = .{ .name = h.name, .value = h.value };
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache_generation != generation) return null;
+        const cache = if (self.proxy_response_cache) |*value| value else return null;
+        const params = gpc.PutParams{
+            .status_code = loaded.status_code,
+            .reason = loaded.reason,
+            .headers = views,
+            .body = loaded.body,
+            .ttl_seconds = 0,
+            .initial_age_seconds = loaded.initial_age_seconds,
+            .absolute_timing = .{
+                .stored_at_ms = loaded.stored_at_ms,
+                .expires_at_ms = loaded.expires_at_ms,
+                .swr_until_ms = loaded.swr_until_ms,
+            },
+        };
+        if (loaded.vary_primary_key) |primary| {
+            cache.putVaryVariant(now_ms, primary, key, params) catch return null;
+        } else {
+            cache.put(now_ms, key, params) catch return null;
         }
+        result.revision = cache.entryRevision(key) orelse return null;
         return result;
     }
 
@@ -1268,17 +1277,33 @@ pub const GatewayState = struct {
         return error.ProxyResponseCacheDisabled;
     }
 
-    /// #903: per-key single-flight guard for a stale-while-revalidate
-    /// background refresh. `false` when another refresh for this exact key
-    /// is already in flight -- the caller must not spawn a second one.
-    pub fn proxyResponseCacheTryLockRevalidation(self: *GatewayState, key: []const u8) !bool {
+    /// Atomically register a background refresh against the current cache
+    /// generation. Reload stops admission and publishes its next generation
+    /// under this same mutex before waiting for the registered count to
+    /// drain, closing the old load/increment race.
+    pub fn proxyResponseCacheTryRegisterRevalidation(
+        self: *GatewayState,
+        generation: u64,
+        primary_key: []const u8,
+        effective_key: []const u8,
+        revision: u64,
+        now_ms: u64,
+    ) !ProxyResponseCacheRevalidationAdmission {
         self.proxy_response_cache_mutex.lock();
         defer self.proxy_response_cache_mutex.unlock();
-        if (self.proxy_response_cache_revalidation_locks.contains(key)) return false;
-        const owned = try self.allocator.dupe(u8, key);
+        if (self.proxy_response_cache_generation != generation or
+            self.proxy_response_cache_revalidation_cancel.isStopped()) return .unavailable;
+        const max_concurrency = self.proxy_response_cache_revalidation_max_concurrency.load(.acquire);
+        if (max_concurrency == 0) return .unavailable;
+        if (self.proxy_response_cache_revalidation_inflight.load(.acquire) >= max_concurrency) return .concurrency;
+        const cache = if (self.proxy_response_cache) |*value| value else return .unavailable;
+        if (!cache.canRevalidate(effective_key, revision, now_ms)) return .unavailable;
+        if (self.proxy_response_cache_revalidation_locks.contains(primary_key)) return .unavailable;
+        const owned = try self.allocator.dupe(u8, primary_key);
         errdefer self.allocator.free(owned);
         try self.proxy_response_cache_revalidation_locks.put(owned, {});
-        return true;
+        _ = self.proxy_response_cache_revalidation_inflight.fetchAdd(1, .acq_rel);
+        return .admitted;
     }
 
     pub fn proxyResponseCacheUnlockRevalidation(self: *GatewayState, key: []const u8) void {
@@ -1287,6 +1312,29 @@ pub const GatewayState = struct {
         if (self.proxy_response_cache_revalidation_locks.fetchRemove(key)) |removed| {
             self.allocator.free(removed.key);
         }
+    }
+
+    pub fn proxyResponseCacheRecordRevalidationFailure(self: *GatewayState, generation: u64, key: []const u8, revision: u64, now_ms: u64) void {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache_generation != generation) return;
+        if (self.proxy_response_cache) |*cache| cache.recordRevalidationFailure(key, revision, now_ms);
+    }
+
+    /// Remove one obsolete representation from both tiers. The disk lease
+    /// keeps reload from destroying the tier while unlinking outside the
+    /// global memory-cache mutex.
+    pub fn proxyResponseCacheInvalidate(self: *GatewayState, generation: u64, key: []const u8) void {
+        self.proxy_response_cache_mutex.lock();
+        if (self.proxy_response_cache_generation != generation) {
+            self.proxy_response_cache_mutex.unlock();
+            return;
+        }
+        if (self.proxy_response_cache) |*cache| cache.remove(key);
+        self.proxy_response_cache_mutex.unlock();
+        const disk = self.proxyResponseCacheAcquireDisk(generation) orelse return;
+        defer self.proxyResponseCacheReleaseDisk();
+        disk.remove(key);
     }
 
     /// #903: best-effort disk write-through, called with
@@ -1354,6 +1402,7 @@ pub const GatewayState = struct {
         generation: u64,
         primary_key: []const u8,
         effective_key: []const u8,
+        expected_revision: u64,
         response_headers: []const gpc.CacheHeaderView,
         ttl_ceiling_seconds: u32,
         swr_ceiling_seconds: u32,
@@ -1367,6 +1416,7 @@ pub const GatewayState = struct {
                 now_ms,
                 primary_key,
                 effective_key,
+                expected_revision,
                 response_headers,
                 ttl_ceiling_seconds,
                 swr_ceiling_seconds,
@@ -1393,8 +1443,8 @@ pub const GatewayState = struct {
     /// publish the next generation, and wait until both detached workers and
     /// leased disk operations have stopped touching cache-owned state.
     pub fn proxyResponseCachePrepareReload(self: *GatewayState, next_generation: u64) void {
-        self.proxy_response_cache_revalidation_max_concurrency.store(0, .release);
         self.proxy_response_cache_mutex.lock();
+        self.proxy_response_cache_revalidation_max_concurrency.store(0, .release);
         self.proxy_response_cache_generation = next_generation;
         self.proxy_response_cache_disk_accepting = false;
         self.proxy_response_cache_revalidation_cancel.cancel(.shutdown);
@@ -1410,6 +1460,51 @@ pub const GatewayState = struct {
         const previous = self.proxy_response_cache_revalidation_inflight.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
         if (previous == 1) self.proxy_response_cache_condition.broadcast();
+    }
+
+    test "proxy response cache revalidation admission is generation scoped and backed off" {
+        var state: GatewayState = undefined;
+        state.allocator = std.testing.allocator;
+        state.proxy_response_cache_mutex = .{};
+        state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
+            .max_object_bytes = 4096,
+            .max_entries = 4,
+            .max_total_bytes = 16 * 1024,
+        });
+        defer state.proxy_response_cache.?.deinit();
+        state.proxy_response_cache_disk = null;
+        state.proxy_response_cache_disk_accepting = true;
+        state.proxy_response_cache_disk_inflight = 0;
+        state.proxy_response_cache_condition = .{};
+        state.proxy_response_cache_generation = 7;
+        state.proxy_response_cache_revalidation_locks = std.StringHashMap(void).init(std.testing.allocator);
+        defer state.proxy_response_cache_revalidation_locks.deinit();
+        state.proxy_response_cache_revalidation_inflight = std.atomic.Value(u32).init(0);
+        state.proxy_response_cache_revalidation_max_concurrency = std.atomic.Value(u32).init(1);
+        state.proxy_response_cache_revalidation_cancel = http.cancellation.CancellationToken.init(0);
+
+        try state.proxy_response_cache.?.put(0, "key", .{
+            .status_code = 200,
+            .reason = "OK",
+            .headers = &.{.{ .name = "Cache-Control", .value = "max-age=1" }},
+            .body = "body",
+            .ttl_seconds = 1,
+            .swr_seconds = 30,
+        });
+        const revision = state.proxy_response_cache.?.entryRevision("key").?;
+        try std.testing.expectEqual(ProxyResponseCacheRevalidationAdmission.admitted, try state.proxyResponseCacheTryRegisterRevalidation(7, "key", "key", revision, 1_500));
+        try std.testing.expectEqual(ProxyResponseCacheRevalidationAdmission.concurrency, try state.proxyResponseCacheTryRegisterRevalidation(7, "other", "key", revision, 1_500));
+        state.proxyResponseCacheRecordRevalidationFailure(7, "key", revision, 1_500);
+        state.proxyResponseCacheUnlockRevalidation("key");
+        state.proxyResponseCacheRevalidationFinished();
+
+        try std.testing.expectEqual(ProxyResponseCacheRevalidationAdmission.unavailable, try state.proxyResponseCacheTryRegisterRevalidation(7, "key", "key", revision, 2_499));
+        try std.testing.expectEqual(ProxyResponseCacheRevalidationAdmission.admitted, try state.proxyResponseCacheTryRegisterRevalidation(7, "key", "key", revision, 2_500));
+        state.proxyResponseCacheUnlockRevalidation("key");
+        state.proxyResponseCacheRevalidationFinished();
+
+        state.proxyResponseCachePrepareReload(8);
+        try std.testing.expectEqual(ProxyResponseCacheRevalidationAdmission.unavailable, try state.proxyResponseCacheTryRegisterRevalidation(7, "key", "key", revision, 3_000));
     }
 
     test "proxy response cache rejects a different config generation" {

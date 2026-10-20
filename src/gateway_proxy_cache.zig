@@ -114,6 +114,10 @@ pub const LookupResult = struct {
     /// single-flight) background revalidation; `lookup`/lookup-equivalents
     /// never do this themselves.
     stale: bool = false,
+    /// Changes every time this exact key is replaced or refreshed. A
+    /// background 304 must still match this revision before it can renew the
+    /// representation it originally validated.
+    revision: u64 = 0,
 };
 
 pub const PersistenceSnapshot = struct {
@@ -156,6 +160,9 @@ const Entry = struct {
     /// (expiry, FIFO eviction, or an unvaried refill), instead of only ever
     /// growing the index (#935 review).
     vary_primary_key: ?[]const u8 = null,
+    revision: u64,
+    revalidation_failures: u8 = 0,
+    revalidation_retry_at_ms: u64 = 0,
 
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         self.metadata_arena.deinit();
@@ -216,6 +223,7 @@ pub const ProxyResponseCache = struct {
     limits: Limits,
     vary_index: std.StringHashMap(VaryIndexEntry),
     max_vary_variants: usize,
+    next_revision: u64 = 1,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) ProxyResponseCache {
         return .{
@@ -395,7 +403,29 @@ pub const ProxyResponseCache = struct {
             .body = body_copy,
             .age_seconds = age_seconds,
             .stale = stale,
+            .revision = entry.revision,
         };
+    }
+
+    /// These are called only while GatewayState holds the cache mutex.
+    /// Keeping cooldown state on the bounded entry avoids a second,
+    /// independently growing per-key map, and replacement resets it.
+    pub fn canRevalidate(self: *const ProxyResponseCache, key: []const u8, revision: u64, now_ms: u64) bool {
+        const entry = self.map.get(key) orelse return false;
+        return entry.revision == revision and now_ms >= entry.revalidation_retry_at_ms;
+    }
+
+    pub fn entryRevision(self: *const ProxyResponseCache, key: []const u8) ?u64 {
+        return if (self.map.get(key)) |entry| entry.revision else null;
+    }
+
+    pub fn recordRevalidationFailure(self: *ProxyResponseCache, key: []const u8, revision: u64, now_ms: u64) void {
+        const entry = self.map.getPtr(key) orelse return;
+        if (entry.revision != revision) return;
+        entry.revalidation_failures +|= 1;
+        const shift: u6 = @intCast(@min(entry.revalidation_failures - 1, 5));
+        const delay_ms: u64 = @min(@as(u64, 1_000) << shift, 30_000);
+        entry.revalidation_retry_at_ms = now_ms +| delay_ms;
     }
 
     fn refreshable304Header(name: []const u8) bool {
@@ -423,11 +453,13 @@ pub const ProxyResponseCache = struct {
         now_ms: u64,
         primary_key: []const u8,
         effective_key: []const u8,
+        expected_revision: u64,
         response_headers: []const CacheHeaderView,
         ttl_ceiling_seconds: u32,
         swr_ceiling_seconds: u32,
     ) !void {
         const entry = self.map.getPtr(effective_key) orelse return error.CacheMiss;
+        if (entry.revision != expected_revision) return error.CacheRevisionMismatch;
         const is_variant = entry.vary_primary_key != null;
         if (entry.vary_primary_key) |stored_primary| {
             if (!std.mem.eql(u8, stored_primary, primary_key)) return error.VaryMismatch;
@@ -515,7 +547,7 @@ pub const ProxyResponseCache = struct {
     fn prepareEntry(self: *ProxyResponseCache, now_ms: u64, key: []const u8, params: PutParams) !PreparedEntry {
         if (params.absolute_timing == null and (params.ttl_seconds == 0 or params.initial_age_seconds >= params.ttl_seconds)) return error.NotCacheable;
         if (params.absolute_timing) |timing| {
-            if (timing.expires_at_ms <= now_ms or timing.swr_until_ms < timing.expires_at_ms or timing.stored_at_ms > now_ms) return error.NotCacheable;
+            if (timing.swr_until_ms <= now_ms or timing.swr_until_ms < timing.expires_at_ms or timing.stored_at_ms > now_ms) return error.NotCacheable;
         }
         const object_bytes = objectBytes(key, params);
         if (object_bytes > self.limits.max_object_bytes) return error.ObjectTooLarge;
@@ -545,6 +577,9 @@ pub const ProxyResponseCache = struct {
             timing.swr_until_ms
         else
             expires_at_ms + @as(u64, params.swr_seconds) * 1000;
+        const revision = self.next_revision;
+        self.next_revision +%= 1;
+        if (self.next_revision == 0) self.next_revision = 1;
         return .{ .key = owned_key, .entry = .{
             .metadata_arena = arena,
             .status_code = params.status_code,
@@ -556,6 +591,7 @@ pub const ProxyResponseCache = struct {
             .swr_until_ms = swr_until_ms,
             .initial_age_seconds = params.initial_age_seconds,
             .bytes = object_bytes,
+            .revision = revision,
         } };
     }
 
@@ -606,6 +642,10 @@ pub const ProxyResponseCache = struct {
         self.removeLocked(key);
         self.map.putAssumeCapacity(prepared.key, prepared.entry);
         self.total_bytes += prepared.entry.bytes;
+    }
+
+    pub fn remove(self: *ProxyResponseCache, key: []const u8) void {
+        self.removeLocked(key);
     }
 };
 
@@ -1297,6 +1337,14 @@ pub fn decideCacheServe(hit_headers: []const CacheHeader, request_headers: *cons
     return .full;
 }
 
+/// A local conditional 304 is valid only for an already-fresh hit. A stale
+/// validator must be sent to the origin synchronously before the client can
+/// be told its representation is still current.
+pub fn decideLookupServe(hit: *const LookupResult, request_headers: *const http.Headers) ServeDisposition {
+    const decided = decideCacheServe(hit.headers, request_headers);
+    return if (hit.stale and decided == .not_modified) .require_origin else decided;
+}
+
 /// RFC 9110 §15.4.5: a `304` reply may repeat any of these header fields
 /// from the `200` it is validating, and must not carry anything that
 /// describes a representation body (`Content-Type`/`Content-Length`/content
@@ -1355,6 +1403,26 @@ test "decideCacheServe validates If-None-Match and If-Modified-Since against sto
     try headers.append("If-None-Match", "\"v1\"");
     try headers.append("If-Modified-Since", "Tue, 20 Oct 2015 07:28:00 GMT");
     try std.testing.expectEqual(ServeDisposition.not_modified, decideCacheServe(stored, &headers));
+}
+
+test "decideLookupServe never emits a local 304 from a stale validator" {
+    var headers = http.Headers.init(std.testing.allocator);
+    defer headers.deinit();
+    try headers.append("If-None-Match", "\"v1\"");
+    const stored_headers: []CacheHeader = @constCast(&[_]CacheHeader{
+        .{ .name = @constCast("ETag"), .value = @constCast("\"v1\"") },
+    });
+    const fresh = LookupResult{
+        .status_code = 200,
+        .reason = @constCast("OK"),
+        .headers = stored_headers,
+        .body = @constCast("body"),
+        .age_seconds = 0,
+    };
+    var stale = fresh;
+    stale.stale = true;
+    try std.testing.expectEqual(ServeDisposition.not_modified, decideLookupServe(&fresh, &headers));
+    try std.testing.expectEqual(ServeDisposition.require_origin, decideLookupServe(&stale, &headers));
 }
 
 test "decideCacheServe applies weak If-None-Match comparison per RFC 9110 13.1.2" {
@@ -1991,7 +2059,8 @@ test "ProxyResponseCache 304 refresh keeps the body and renews metadata" {
         .swr_seconds = 10,
     });
 
-    try cache.refreshNotModified(1_500, "key", "key", &.{
+    const original_revision = cache.entryRevision("key").?;
+    try cache.refreshNotModified(1_500, "key", "key", original_revision, &.{
         .{ .name = "Cache-Control", .value = "max-age=30" },
         .{ .name = "ETag", .value = "\"v2\"" },
     }, 60, 10);
@@ -2003,6 +2072,68 @@ test "ProxyResponseCache 304 refresh keeps the body and renews metadata" {
     try std.testing.expectEqualStrings("retained body", hit.body);
     try std.testing.expectEqualStrings("\"v2\"", findStoredHeader(hit.headers, "etag").?);
     try std.testing.expectEqualStrings("text/plain", findStoredHeader(hit.headers, "content-type").?);
+}
+
+test "ProxyResponseCache rejects a delayed 304 for a replaced revision" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(0, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{ .{ .name = "Cache-Control", .value = "max-age=1" }, .{ .name = "ETag", .value = "\"v1\"" } },
+        .body = "v1 body",
+        .ttl_seconds = 1,
+        .swr_seconds = 10,
+    });
+    const v1_revision = cache.entryRevision("key").?;
+    try cache.put(1_100, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{ .{ .name = "Cache-Control", .value = "max-age=30" }, .{ .name = "ETag", .value = "\"v2\"" } },
+        .body = "v2 body",
+        .ttl_seconds = 30,
+    });
+
+    try std.testing.expectError(error.CacheRevisionMismatch, cache.refreshNotModified(1_200, "key", "key", v1_revision, &.{
+        .{ .name = "Cache-Control", .value = "max-age=60" },
+    }, 60, 10));
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const hit = (try cache.lookup(arena.allocator(), "key", 1_300)).?;
+    try std.testing.expectEqualStrings("v2 body", hit.body);
+    try std.testing.expectEqualStrings("\"v2\"", findStoredHeader(hit.headers, "etag").?);
+}
+
+test "ProxyResponseCache applies bounded exponential revalidation backoff" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(0, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Cache-Control", .value = "max-age=1" }},
+        .body = "body",
+        .ttl_seconds = 1,
+        .swr_seconds = 30,
+    });
+    const revision = cache.entryRevision("key").?;
+    try std.testing.expect(cache.canRevalidate("key", revision, 1_500));
+    cache.recordRevalidationFailure("key", revision, 1_500);
+    try std.testing.expect(!cache.canRevalidate("key", revision, 2_499));
+    try std.testing.expect(cache.canRevalidate("key", revision, 2_500));
+    cache.recordRevalidationFailure("key", revision, 2_500);
+    try std.testing.expect(!cache.canRevalidate("key", revision, 4_499));
+    try std.testing.expect(cache.canRevalidate("key", revision, 4_500));
 }
 
 test "ProxyResponseCache disk hydration preserves exact deadlines and Age basis" {
@@ -2032,6 +2163,33 @@ test "ProxyResponseCache disk hydration preserves exact deadlines and Age basis"
     const hit = (try cache.lookup(arena.allocator(), "key", 10_499)).?;
     try std.testing.expectEqual(@as(u32, 8), hit.age_seconds);
     try std.testing.expect((try cache.lookup(arena.allocator(), "key", 10_500)) == null);
+}
+
+test "ProxyResponseCache hydrates an absolute stale-while-revalidate record" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(15_000, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Cache-Control", .value = "max-age=10" }},
+        .body = "stale disk body",
+        .ttl_seconds = 0,
+        .absolute_timing = .{
+            .stored_at_ms = 0,
+            .expires_at_ms = 10_000,
+            .swr_until_ms = 20_000,
+        },
+    });
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const hit = (try cache.lookup(arena.allocator(), "key", 15_000)).?;
+    try std.testing.expect(hit.stale);
+    try std.testing.expect(hit.revision != 0);
 }
 
 test "buildCacheKey is deterministic and distinguishes field splits" {

@@ -891,6 +891,33 @@ pub fn varyAcceptEncodingDiscriminator(buf: *[max_vary_discriminator_bytes]u8, h
 /// (no stored validator). `If-Match`/`If-Unmodified-Since` remain excluded:
 /// their semantics are for conditional mutation, not GET freshness, and this
 /// cache does not implement them.
+/// A client asking for end-to-end validation (`no-cache`, `max-age=0`) or
+/// refusing storage (`no-store`, legacy `Pragma: no-cache`) must reach the
+/// origin: neither a fresh nor a stale shared hit may answer it. This is a
+/// conservative bypass, not a full request-directive parser; an unparseable
+/// `max-age` also bypasses.
+fn requestForcesOrigin(headers: *const http.Headers) bool {
+    for (headers.iterator()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "pragma") and
+            std.ascii.indexOfIgnoreCase(h.value, "no-cache") != null) return true;
+        if (!std.ascii.eqlIgnoreCase(h.name, "cache-control")) continue;
+        var parts = std.mem.splitScalar(u8, h.value, ',');
+        while (parts.next()) |raw| {
+            const directive = std.mem.trim(u8, raw, " \t");
+            const eq = std.mem.indexOfScalar(u8, directive, '=');
+            const name = std.mem.trim(u8, directive[0 .. eq orelse directive.len], " \t");
+            if (std.ascii.eqlIgnoreCase(name, "no-cache") or
+                std.ascii.eqlIgnoreCase(name, "no-store")) return true;
+            if (std.ascii.eqlIgnoreCase(name, "max-age")) {
+                const value = std.mem.trim(u8, directive[(eq orelse return true) + 1 ..], " \t\"");
+                const seconds = std.fmt.parseInt(u64, value, 10) catch return true;
+                if (seconds == 0) return true;
+            }
+        }
+    }
+    return false;
+}
+
 pub fn isCacheableRequest(
     cfg: *const edge_config.EdgeConfig,
     block: *const edge_config.EdgeConfig.LocationBlock,
@@ -904,6 +931,7 @@ pub fn isCacheableRequest(
     // (never filled from a HEAD response itself -- callers gate fill on the
     // original method being GET).
     if (!std.mem.eql(u8, method, "GET") and !std.mem.eql(u8, method, "HEAD")) return false;
+    if (requestForcesOrigin(headers)) return false;
     // C1 deliberately has no request-body cache key. A bodyful (or not-yet
     // materialized streaming) GET must therefore always reach the origin.
     if (request_has_body or streaming_request_body) return false;
@@ -1126,6 +1154,42 @@ test "isCacheableRequest accepts a plain GET and refuses personalized signals" {
 
     block.auth = .required;
     try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &http.Headers.init(std.testing.allocator), false, false, false));
+}
+
+test "isCacheableRequest bypasses the cache for client no-cache, max-age=0, no-store and Pragma" {
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.policy_rules_raw = "";
+    cfg.policy_approval_routes_raw = "";
+    var block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+    };
+    const forcing = [_][2][]const u8{
+        .{ "Cache-Control", "no-cache" },
+        .{ "Cache-Control", "max-age=0" },
+        .{ "Cache-Control", "no-store" },
+        .{ "Cache-Control", "max-age=60, No-Cache" },
+        .{ "Cache-Control", "max-age=bogus" },
+        .{ "Pragma", "no-cache" },
+    };
+    for (forcing) |pair| {
+        var headers = http.Headers.init(std.testing.allocator);
+        defer headers.deinit();
+        try headers.append(pair[0], pair[1]);
+        try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &headers, false, false, false));
+    }
+    // A repeated field instance still forces the origin.
+    var repeated = http.Headers.init(std.testing.allocator);
+    defer repeated.deinit();
+    try repeated.append("Cache-Control", "max-age=60");
+    try repeated.append("Cache-Control", "no-cache");
+    try std.testing.expect(!isCacheableRequest(&cfg, &block, "GET", &repeated, false, false, false));
+    var permissive = http.Headers.init(std.testing.allocator);
+    defer permissive.deinit();
+    try permissive.append("Cache-Control", "max-age=60");
+    try std.testing.expect(isCacheableRequest(&cfg, &block, "GET", &permissive, false, false, false));
 }
 
 test "isCacheableRequest refuses forward_auth, client-cert policy, client identity and route policy" {

@@ -431,7 +431,7 @@ pub const DiskCache = struct {
     /// is re-validated under the index mutex once the lane is owned. Because
     /// the lane is held across detach and unlink, a concurrent writer of the
     /// victim cannot publish a newer file that this unlink would then delete.
-    fn retireVictimWithLanes(self: *DiskCache, held: IoGuard, victim: *const [key_len]u8, vary_primary: ?[]const u8, durable: bool) RetireResult {
+    fn retireVictimWithLanes(self: *DiskCache, held: IoGuard, victim: *const [key_len]u8, vary_primary: ?[]const u8) RetireResult {
         const lane = ioLane(victim);
         const own_lane = lane == held.first or (held.second != null and lane == held.second.?);
         if (!own_lane and !self.io_lanes[lane].tryLock()) return .busy;
@@ -468,16 +468,12 @@ pub const DiskCache = struct {
         };
         self.mutex.unlock();
         defer self.allocator.free(owned);
-        if (durable) {
-            self.state_dir.removeFileDurable(owned) catch {
-                self.mutex.lock();
-                self.disableLocked();
-                self.mutex.unlock();
-                return .failed;
-            };
-        } else {
-            self.state_dir.removeFile(owned);
-        }
+        self.state_dir.removeFileDurable(owned) catch {
+            self.mutex.lock();
+            self.disableLocked();
+            self.mutex.unlock();
+            return .failed;
+        };
         return .retired;
     }
 
@@ -489,8 +485,13 @@ pub const DiskCache = struct {
             guard += 1;
             const victim = self.oldestKeyLocked(null, &.{}) orelse break;
             const owned = self.detachLocked(victim) orelse continue;
-            self.state_dir.removeFile(owned);
-            self.allocator.free(owned);
+            defer self.allocator.free(owned);
+            // An unverifiable deletion would leave the index smaller than
+            // the directory, so fail closed instead of under-reporting.
+            self.state_dir.removeFileDurable(owned) catch {
+                self.disableLocked();
+                return;
+            };
         }
     }
 
@@ -659,17 +660,10 @@ pub const DiskCache = struct {
                     self.mutex.unlock();
                     break;
                 }
-                const retired_variant = self.detachLocked(victim.?[0..]);
                 self.mutex.unlock();
-                if (retired_variant) |owned| {
-                    self.state_dir.removeFileDurable(owned) catch {
-                        self.allocator.free(owned);
-                        self.mutex.lock();
-                        self.disableLocked();
-                        self.mutex.unlock();
-                        return;
-                    };
-                    self.allocator.free(owned);
+                switch (self.retireVictimWithLanes(io_guard, &victim.?, key)) {
+                    .retired, .gone => {},
+                    .busy, .failed => return,
                 }
             }
         }
@@ -710,7 +704,7 @@ pub const DiskCache = struct {
                 // The FIFO victim is a different key with its own I/O lane;
                 // retire it under that lane with a durable unlink. If its
                 // lane is busy the new variant is simply not persisted.
-                switch (self.retireVictimWithLanes(io_guard, &victim.?, primary, true)) {
+                switch (self.retireVictimWithLanes(io_guard, &victim.?, primary)) {
                     .retired, .gone => {},
                     .busy, .failed => return,
                 }
@@ -769,7 +763,7 @@ pub const DiskCache = struct {
             var victim: [key_len]u8 = undefined;
             @memcpy(victim[0..], victim_ptr);
             self.mutex.unlock();
-            switch (self.retireVictimWithLanes(io_guard, &victim, null, false)) {
+            switch (self.retireVictimWithLanes(io_guard, &victim, null)) {
                 .retired, .gone => continue,
                 .busy => {
                     // Another writer owns that victim's lane right now;
@@ -2075,9 +2069,90 @@ test "DiskCache FIFO retirement refuses a victim no longer associated with the p
     {
         const guard = cache.lockIo(victim, null);
         defer guard.unlock();
-        try std.testing.expectEqual(DiskCache.RetireResult.gone, cache.retireVictimWithLanes(guard, &victim_key, primary, true));
+        try std.testing.expectEqual(DiskCache.RetireResult.gone, cache.retireVictimWithLanes(guard, &victim_key, primary));
     }
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     try std.testing.expect(cache.get(arena.allocator(), victim, 1) != null);
+}
+
+test "DiskCache quota eviction fails closed when the victim cannot be durably unlinked" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 1, .max_total_bytes = 1 << 20 };
+    const old_key = "1" ** 64;
+    const new_key = "2" ** 64;
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    const record = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "body",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    };
+    var cache = try DiskCache.init(allocator, root_path, limits, 95);
+    defer cache.deinit();
+    cache.put(old_key, record, 0);
+    cache.state_dir.fault = .fsync_dir;
+    cache.state_dir.fault_file = old_key;
+    cache.put(new_key, record, 1);
+    try std.testing.expect(cache.disabled);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(cache.get(arena.allocator(), new_key, 2) == null);
+}
+
+test "DiskCache Vary-to-direct transition does not unlink a sibling whose lane is busy" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const limits = Limits{ .max_object_bytes = 4096, .max_entries = 8, .max_total_bytes = 1 << 20 };
+    const primary = "c" ** 64;
+    const candidates = [_][]const u8{ "d" ** 64, "e" ** 64, "f" ** 64, "a" ** 64, "b" ** 64 };
+    var secondary = candidates[0];
+    for (candidates) |candidate| {
+        if (DiskCache.ioLane(candidate) != DiskCache.ioLane(primary)) {
+            secondary = candidate;
+            break;
+        }
+    }
+    try std.testing.expect(DiskCache.ioLane(secondary) != DiskCache.ioLane(primary));
+    const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=60" }};
+    const record = PutRecord{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &headers,
+        .body = "variant",
+        .stored_at_ms = 0,
+        .expires_at_ms = 60_000,
+        .swr_until_ms = 60_000,
+        .initial_age_seconds = 0,
+    };
+    var cache = try DiskCache.init(allocator, root_path, limits, 96);
+    defer cache.deinit();
+    var variant = record;
+    variant.vary_primary_key = primary;
+    cache.put(secondary, variant, 0);
+
+    // Another operation owns the sibling's lane: the transition must not
+    // delete the sibling out from under it, and must not publish the direct
+    // record either (safe miss).
+    cache.io_lanes[DiskCache.ioLane(secondary)].lock();
+    var direct = record;
+    direct.body = "direct";
+    cache.put(primary, direct, 1);
+    cache.io_lanes[DiskCache.ioLane(secondary)].unlock();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect(cache.get(arena.allocator(), secondary, 2) != null);
+    try std.testing.expect(cache.get(arena.allocator(), primary, 2) == null);
 }

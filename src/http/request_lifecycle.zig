@@ -120,7 +120,7 @@ test "RequestLifecycle: checkDeadline on past deadline cancels once and returns 
     lc.token.deadline_ms = 1; // epoch+1ms is always in the past
     try std.testing.expect(lc.checkDeadline(.routing));
     try std.testing.expect(lc.token.isCancelled());
-    try std.testing.expectEqual(CancelReason.timeout, lc.token.reason.?);
+    try std.testing.expectEqual(CancelReason.timeout, lc.token.cancelReason().?);
     // Second call: still true (deadline still past) but cancel was already set
     try std.testing.expect(lc.checkDeadline(.auth));
 }

@@ -2397,6 +2397,10 @@ pub const Runtime = struct {
             self.sendInternalErrorResponse(entry, incoming.stream_id, now);
             return;
         };
+        // Stamped before any bounded-worker queueing so the handler's total
+        // request deadline is anchored to real arrival time, not dequeue
+        // time (#948 queue-time-excluded-from-deadline).
+        request.admitted_at_ms = compat.milliTimestamp();
         var request_owned_here = true;
         defer if (request_owned_here) request.deinit();
         request.client_ip = formatAddressHostAlloc(allocator, entry.conn.activePathKey().remote) catch {
@@ -2495,6 +2499,12 @@ pub const Runtime = struct {
         defer response.deinit();
         handler(allocator, &request, &response, self.request_handler_ctx) catch |err| {
             if (err == error.Http3RequestParked) return;
+            if (err == error.RequestCancelled) {
+                entry.conn.resetStream(incoming.stream_id, 0x010c) catch {}; // H3_REQUEST_CANCELLED
+                entry.h3.finishRequest(incoming.stream_id);
+                self.noteRequestCompletedWithLatency(now, nowUs());
+                return;
+            }
             self.logger.warn(null, "http3: request handler failed: {s}", .{@errorName(err)});
             self.sendInternalErrorResponse(entry, incoming.stream_id, now);
             return;

@@ -50,6 +50,12 @@ pub const StreamRequest = struct {
     /// alive for the synchronous handler lifetime and cancels it when QUIC
     /// reports a peer RESET_STREAM or STOP_SENDING for this stream.
     cancel_token: ?*cancellation.CancellationToken = null,
+    /// Wall-clock arrival time (`compat.milliTimestamp()`) stamped by the
+    /// reactor at admission, before any bounded-worker queueing delay. The
+    /// handler derives the request's absolute deadline from this instead of
+    /// its own dequeue time, so `request_total_timeout_ms` bounds the whole
+    /// request lifetime rather than only the time a worker actually runs it.
+    admitted_at_ms: i64 = 0,
 
     pub const Early425RetryContinuation = struct {
         ctx: *anyopaque,

@@ -3053,7 +3053,7 @@ const Http3CacheFillContinuation = struct {
         };
         plan.request.cancel_token = &plan.cancel_token;
         if (original_token) |token| {
-            if (token.isCancelled()) plan.cancel_token.cancel(token.reason orelse .client_disconnect);
+            if (token.cancelReason()) |reason| plan.cancel_token.cancel(reason);
         }
         return plan;
     }
@@ -7177,10 +7177,23 @@ pub fn handleHttp3Request(
     var fallback_cancel_token = http.cancellation.CancellationToken.init(0);
     const cancel_token = request.cancel_token orelse &fallback_cancel_token;
     if (effective_cfg.request_total_timeout_ms > 0) {
-        const request_deadline = compat.milliTimestamp() + @as(i64, effective_cfg.request_total_timeout_ms);
+        // Anchor the deadline to the reactor's admission timestamp, not to
+        // now: a request queued behind a bounded H3 worker pool must not
+        // get a fresh budget on dequeue, or `request_total_timeout_ms`
+        // stops bounding total request lifetime under worker saturation.
+        const admitted_at_ms = if (request.admitted_at_ms != 0) request.admitted_at_ms else compat.milliTimestamp();
+        const request_deadline = admitted_at_ms + @as(i64, effective_cfg.request_total_timeout_ms);
         if (cancel_token.deadline_ms == 0 or cancel_token.deadline_ms > request_deadline) {
             cancel_token.deadline_ms = request_deadline;
         }
+        // The configured total-request budget was already exhausted by the
+        // time this job reached a worker (e.g. queued behind a saturated
+        // bounded executor): stop before routing/auth/cache/origin rather
+        // than letting a dequeued-but-dead job spend a fresh budget. This is
+        // distinct from the cache-fill park/resume path, which always parks
+        // and defers its own cancellation check to resume time regardless
+        // of `request_total_timeout_ms`.
+        if (cancel_token.isStopped()) return error.RequestCancelled;
     }
     effective_ctx.cancel_token = cancel_token;
 
@@ -7279,7 +7292,7 @@ pub fn logAccessForRequest(state: *GatewayState, ctx: *const http.request_contex
 pub fn logAccess(state: *GatewayState, ctx: *const http.request_context.RequestContext, method: []const u8, path: []const u8, status: u16, user_agent: []const u8) void {
     state.metricsRecordLatencyMs(ctx.elapsedMs());
     const cancel_reason: []const u8 = if (ctx.lifecycle) |lc|
-        if (lc.token.reason) |reason| @tagName(reason) else ""
+        if (lc.token.cancelReason()) |reason| @tagName(reason) else ""
     else
         "";
     const entry = http.access_log.AccessLogEntry{

@@ -976,6 +976,7 @@ const GatedUpstream = struct {
     stop_flag: std.atomic.Value(bool),
     entered: std.atomic.Value(bool),
     release_flag: std.atomic.Value(bool),
+    request_count: std.atomic.Value(u32),
 
     fn start(allocator: std.mem.Allocator) !GatedUpstream {
         const server = try compat.listenTcp(test_host, 0);
@@ -986,6 +987,7 @@ const GatedUpstream = struct {
             .stop_flag = std.atomic.Value(bool).init(false),
             .entered = std.atomic.Value(bool).init(false),
             .release_flag = std.atomic.Value(bool).init(false),
+            .request_count = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -1025,6 +1027,10 @@ const GatedUpstream = struct {
     fn release(self: *GatedUpstream) void {
         self.release_flag.store(true, .release);
     }
+
+    fn requestCount(self: *const GatedUpstream) u32 {
+        return self.request_count.load(.acquire);
+    }
 };
 
 fn gatedUpstreamThreadMain(server: *GatedUpstream) void {
@@ -1044,6 +1050,7 @@ fn gatedUpstreamThreadMain(server: *GatedUpstream) void {
         defer server.allocator.free(req.raw);
         if (req.request_line.len == 0) continue;
 
+        _ = server.request_count.fetchAdd(1, .acq_rel);
         server.entered.store(true, .release);
         while (!server.release_flag.load(.acquire)) {
             if (server.stop_flag.load(.seq_cst)) return;
@@ -5276,16 +5283,23 @@ test "interop.openssl.h2.proxy_request_translation_is_secret_safe" {
     try std.testing.expect(std.mem.indexOf(u8, transcript_body, secret_token) == null);
 }
 
-test "interop.h2.generic proxy response cache replays a bounded public GET (#901)" {
+test "interop.h2.generic proxy response cache replays and synchronously revalidates a bounded public GET (#934)" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
     var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
 
-    const fresh: []const ResponseHeader = &.{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
+    const expiring: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=1" },
+        .{ .name = "ETag", .value = "\"h2-v1\"" },
+    };
+    const refreshed: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "ETag", .value = "\"h2-v1\"" },
+    };
     var upstream = try UpstreamServer.start(allocator, &.{
-        .{ .body = "h2-cache-first", .headers = fresh },
-        .{ .body = "h2-cache-should-not-be-fetched", .headers = fresh },
+        .{ .body = "h2-cache-first", .headers = expiring },
+        .{ .status_code = 304, .body = "", .headers = refreshed },
     });
     defer upstream.stop();
     try upstream.run();
@@ -5333,6 +5347,16 @@ test "interop.h2.generic proxy response cache replays a bounded public GET (#901
     try std.testing.expect(second.header("Age") != null);
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 
+    compat.sleepNs(1_100 * std.time.ns_per_ms);
+    var revalidated = try pureZigH2GetResponse(allocator, tardigrade.port, request_headers[0..]);
+    defer revalidated.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), revalidated.status);
+    try assertContains(revalidated.body, "h2-cache-first");
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+    const conditional = (try upstream.capturedHeaderHistoryAt(allocator, "If-None-Match", 1)) orelse return error.MissingConditionalHeader;
+    defer allocator.free(conditional);
+    try std.testing.expectEqualStrings("\"h2-v1\"", conditional);
+
     // RFC 9110 §8.6: a cached HEAD replay's `content-length` must describe
     // the cached GET representation's actual size (`"h2-cache-first".len`),
     // never `0` for a nonempty representation (#935 review).
@@ -5347,7 +5371,7 @@ test "interop.h2.generic proxy response cache replays a bounded public GET (#901
     try std.testing.expectEqual(@as(u16, 200), head.status);
     try std.testing.expectEqual(@as(usize, 0), head.body.len);
     try std.testing.expectEqualStrings("14", head.header("content-length").?);
-    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
 }
 
 test "interop.openssl.h2.auth_required_proxy_fails_closed" {
@@ -15549,12 +15573,13 @@ test "generic proxy response cache bypasses valid session identities (#901)" {
     try std.testing.expectEqualStrings("bob", bob_identity);
 }
 
-test "generic proxy response cache keeps concurrent misses independent (#901)" {
+test "generic proxy response cache collapses concurrent misses to one origin fill (#934)" {
     const allocator = std.testing.allocator;
-    // This fixture does not release either response until both requests have
-    // arrived, making two live misses an observed condition rather than a
-    // scheduling-dependent consequence of a fixed sleep.
-    var origin = try TwoArrivalGatedUpstream.start(std.heap.page_allocator);
+    // The origin holds the elected owner's response until the second request
+    // has entered the gateway. If collapsing regresses, the serial origin
+    // will observe a second request after release; the final count therefore
+    // proves both clients shared one fill rather than racing two fills.
+    var origin = try GatedUpstream.start(std.heap.page_allocator);
     defer origin.stop();
     try origin.run();
     const config_text = try std.fmt.allocPrint(allocator,
@@ -15605,10 +15630,10 @@ test "generic proxy response cache keeps concurrent misses independent (#901)" {
         if (second_thread) |thread| thread.join();
     }
     first_thread = try std.Thread.spawn(.{}, Result.run, .{ &first, tardigrade.port });
-    try origin.waitForArrivals(1, 5_000);
+    try origin.waitEntered(5_000);
     var second = Result{};
     second_thread = try std.Thread.spawn(.{}, Result.run, .{ &second, tardigrade.port });
-    try origin.waitForArrivals(2, 5_000);
+    compat.sleepNs(100 * std.time.ns_per_ms);
     origin.release();
     first_thread.?.join();
     first_thread = null;
@@ -15620,14 +15645,85 @@ test "generic proxy response cache keeps concurrent misses independent (#901)" {
     defer first_response.deinit();
     var second_response = second.response orelse return error.InvalidHttpResponse;
     defer second_response.deinit();
-    try assertContains(first_response.body, "first-live");
-    try assertContains(second_response.body, "second-live");
-    try std.testing.expectEqual(@as(u32, 2), origin.arrivals.load(.acquire));
+    try assertContains(first_response.body, "gated-origin-a");
+    try assertContains(second_response.body, "gated-origin-a");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
 
     var cached = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/same", .body = null, .headers = &.{} });
     defer cached.deinit();
     try std.testing.expect(cached.header("Age") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cached.body, "first-live") != null or std.mem.indexOf(u8, cached.body, "second-live") != null);
+    try assertContains(cached.body, "gated-origin-a");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+}
+
+test "generic proxy response cache does not collapse distinct Accept-Encoding variants (#934)" {
+    const allocator = std.testing.allocator;
+    var origin = try TwoArrivalGatedUpstream.start(std.heap.page_allocator);
+    defer origin.stop();
+    try origin.run();
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /same {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" },
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const Result = struct {
+        encoding: []const u8,
+        response: ?HttpResponse = null,
+        err: ?anyerror = null,
+
+        fn run(result: *@This(), port: u16) void {
+            result.response = sendRequest(std.heap.page_allocator, port, .{
+                .method = "GET",
+                .path = "/same",
+                .body = null,
+                .headers = &.{.{ .name = "Accept-Encoding", .value = result.encoding }},
+            }) catch |err| {
+                result.err = err;
+                return;
+            };
+        }
+    };
+    var gzip = Result{ .encoding = "gzip" };
+    var identity = Result{ .encoding = "identity" };
+    var gzip_thread: ?std.Thread = null;
+    var identity_thread: ?std.Thread = null;
+    defer {
+        origin.release();
+        if (gzip_thread) |thread| thread.join();
+        if (identity_thread) |thread| thread.join();
+    }
+    gzip_thread = try std.Thread.spawn(.{}, Result.run, .{ &gzip, tardigrade.port });
+    identity_thread = try std.Thread.spawn(.{}, Result.run, .{ &identity, tardigrade.port });
+    try origin.waitForArrivals(2, 5_000);
+    origin.release();
+    gzip_thread.?.join();
+    gzip_thread = null;
+    identity_thread.?.join();
+    identity_thread = null;
+    if (gzip.err) |err| return err;
+    if (identity.err) |err| return err;
+    var gzip_response = gzip.response orelse return error.InvalidHttpResponse;
+    defer gzip_response.deinit();
+    var identity_response = identity.response orelse return error.InvalidHttpResponse;
+    defer identity_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), gzip_response.status_code);
+    try std.testing.expectEqual(@as(u16, 200), identity_response.status_code);
     try std.testing.expectEqual(@as(u32, 2), origin.arrivals.load(.acquire));
 }
 
@@ -15872,6 +15968,82 @@ test "generic proxy response cache answers If-None-Match/If-Modified-Since from 
     try std.testing.expectEqual(@as(u16, 304), matching_date.status_code);
     try std.testing.expectEqual(@as(usize, 0), matching_date.body.len);
     try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+}
+
+test "generic proxy response cache synchronously revalidates expired entries with origin 304 or changed 200 (#934)" {
+    const allocator = std.testing.allocator;
+    const expired_v1: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=1" },
+        .{ .name = "ETag", .value = "W/\"v1\"" },
+        .{ .name = "Last-Modified", .value = "Wed, 21 Oct 2015 07:28:00 GMT" },
+    };
+    const refreshed_v1: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "ETag", .value = "W/\"v1\"" },
+    };
+    const changed_v2: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "ETag", .value = "\"v2\"" },
+    };
+    var origin = try UpstreamServer.start(allocator, &.{
+        .{ .body = "retained-v1", .headers = expired_v1 },
+        .{ .status_code = 304, .body = "", .headers = refreshed_v1 },
+        .{ .body = "old-changed", .headers = expired_v1 },
+        .{ .body = "new-v2", .headers = changed_v2 },
+    });
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" }},
+    });
+    defer tardigrade.stop();
+
+    var seed = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/etag", .body = null, .headers = &.{} });
+    defer seed.deinit();
+    try assertContains(seed.body, "retained-v1");
+    compat.sleepNs(1_100 * std.time.ns_per_ms);
+
+    var revalidated = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/etag", .body = null, .headers = &.{} });
+    defer revalidated.deinit();
+    try std.testing.expectEqual(@as(u16, 200), revalidated.status_code);
+    try assertContains(revalidated.body, "retained-v1");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+    const etag_header = (try origin.capturedHeaderHistoryAt(allocator, "If-None-Match", 1)) orelse return error.MissingConditionalHeader;
+    defer allocator.free(etag_header);
+    try std.testing.expectEqualStrings("W/\"v1\"", etag_header);
+    try std.testing.expect((try origin.capturedHeaderHistoryAt(allocator, "If-Modified-Since", 1)) == null);
+
+    var cached = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/etag", .body = null, .headers = &.{} });
+    defer cached.deinit();
+    try assertContains(cached.body, "retained-v1");
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+
+    var changed_seed = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/changed", .body = null, .headers = &.{} });
+    defer changed_seed.deinit();
+    try assertContains(changed_seed.body, "old-changed");
+    compat.sleepNs(1_100 * std.time.ns_per_ms);
+    var changed = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/changed", .body = null, .headers = &.{} });
+    defer changed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), changed.status_code);
+    try assertContains(changed.body, "new-v2");
+    const changed_etag = (try origin.capturedHeaderHistoryAt(allocator, "If-None-Match", 3)) orelse return error.MissingConditionalHeader;
+    defer allocator.free(changed_etag);
+    try std.testing.expectEqualStrings("W/\"v1\"", changed_etag);
+    try std.testing.expectEqual(@as(u32, 4), origin.requestCount());
 }
 
 test "generic proxy response cache serves HEAD from a stored GET entry's metadata without an origin call (#902)" {

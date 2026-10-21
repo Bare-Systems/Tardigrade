@@ -23,6 +23,29 @@ pub const ProxyResponseCacheRevalidationAdmission = enum {
     unavailable,
 };
 
+pub const proxy_response_cache_fill_max_waiters_per_key: u16 = 32;
+pub const proxy_response_cache_fill_max_waiters_global: usize = 256;
+pub const proxy_response_cache_fill_wait_timeout_ms: u32 = 2_000;
+
+pub const ProxyResponseCacheFillFlight = struct {
+    key: []u8,
+    generation: u64,
+    completed: std.Io.Event = .unset,
+    owner_active: bool = true,
+    waiters: u16 = 0,
+};
+
+/// Admission to the foreground response-cache collapsing policy. An owner
+/// performs the ordinary origin request; a waiter sleeps on the owner's
+/// bounded event and then rechecks the cache; an independent caller follows
+/// the pre-existing proxy path immediately (overflow, OOM, or stale
+/// generation all fail open this way).
+pub const ProxyResponseCacheFillAdmission = union(enum) {
+    owner,
+    waiter: *ProxyResponseCacheFillFlight,
+    independent,
+};
+
 pub const UpstreamHealth = struct {
     fail_count: u32 = 0,
     unhealthy_until_ms: u64 = 0,
@@ -561,6 +584,15 @@ pub const GatewayState = struct {
     /// waits for this count to drain before destroying the tier.
     proxy_response_cache_disk_inflight: usize = 0,
     proxy_response_cache_condition: compat.Condition = .{},
+    /// Foreground initial fills and synchronous expired-entry revalidations
+    /// share one owner per generation-scoped representation key. The map and
+    /// waiter counters are protected by `proxy_response_cache_mutex`; owners
+    /// never retain a record pointer and never hold the mutex across origin
+    /// I/O. Waiters retain a pointer only while counted on that record, which
+    /// prevents completion/reload from freeing it before their bounded wait
+    /// returns.
+    proxy_response_cache_fill_flights: std.StringHashMap(*ProxyResponseCacheFillFlight),
+    proxy_response_cache_fill_waiters: usize = 0,
     /// Per-key single-flight guard for stale-while-revalidate background
     /// refresh (#903): a key present here already has a background
     /// revalidation thread in flight. [proxy_response_cache_mutex]
@@ -714,6 +746,13 @@ pub const GatewayState = struct {
         var revalidation_lock_it = self.proxy_response_cache_revalidation_locks.iterator();
         while (revalidation_lock_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.proxy_response_cache_revalidation_locks.deinit();
+        std.debug.assert(self.proxy_response_cache_fill_waiters == 0);
+        var fill_it = self.proxy_response_cache_fill_flights.iterator();
+        while (fill_it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*.key);
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.proxy_response_cache_fill_flights.deinit();
         if (self.session_store) |*ss| ss.deinit();
         self.upstream_client.deinit();
         if (self.acme_challenge_store) |*store| store.deinit();
@@ -1320,6 +1359,7 @@ pub const GatewayState = struct {
             .body = @constCast(loaded.body),
             .age_seconds = age_seconds,
             .stale = stale,
+            .stale_servable = stale,
         };
         const views = try scratch.alloc(gpc.CacheHeaderView, loaded.headers.len);
         for (loaded.headers, 0..) |h, i| views[i] = .{ .name = h.name, .value = h.value };
@@ -1380,6 +1420,105 @@ pub const GatewayState = struct {
         }
         self.proxy_response_cache_mutex.unlock();
         return error.ProxyResponseCacheDisabled;
+    }
+
+    fn destroyProxyResponseCacheFillFlightLocked(self: *GatewayState, flight: *ProxyResponseCacheFillFlight) void {
+        const removed = self.proxy_response_cache_fill_flights.fetchRemove(flight.key) orelse return;
+        std.debug.assert(removed.value == flight);
+        self.allocator.free(flight.key);
+        self.allocator.destroy(flight);
+    }
+
+    /// Elect one foreground owner for a generation-scoped representation.
+    /// The caller supplies the normalized coordination key (including the
+    /// Accept-Encoding discriminator even before an origin first declares
+    /// `Vary`) so unrelated variants never share a flight.
+    pub fn proxyResponseCacheBeginFill(
+        self: *GatewayState,
+        generation: u64,
+        coordination_key: []const u8,
+    ) !ProxyResponseCacheFillAdmission {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        if (self.proxy_response_cache_generation != generation or self.proxy_response_cache == null) return .independent;
+
+        if (self.proxy_response_cache_fill_flights.get(coordination_key)) |flight| {
+            if (flight.generation != generation) return .independent;
+            if (flight.waiters >= proxy_response_cache_fill_max_waiters_per_key or
+                self.proxy_response_cache_fill_waiters >= proxy_response_cache_fill_max_waiters_global)
+            {
+                return .independent;
+            }
+            flight.waiters += 1;
+            self.proxy_response_cache_fill_waiters += 1;
+            return .{ .waiter = flight };
+        }
+
+        const flight = try self.allocator.create(ProxyResponseCacheFillFlight);
+        errdefer self.allocator.destroy(flight);
+        const owned_key = try self.allocator.dupe(u8, coordination_key);
+        errdefer self.allocator.free(owned_key);
+        flight.* = .{ .key = owned_key, .generation = generation };
+        try self.proxy_response_cache_fill_flights.put(owned_key, flight);
+        return .owner;
+    }
+
+    /// Complete an owner flight on every exit path. Success and failure have
+    /// identical wake semantics: waiters must re-run lookup and never consume
+    /// response bytes directly from the owner.
+    pub fn proxyResponseCacheFinishFill(self: *GatewayState, generation: u64, coordination_key: []const u8) void {
+        self.proxy_response_cache_mutex.lock();
+        defer self.proxy_response_cache_mutex.unlock();
+        const flight = self.proxy_response_cache_fill_flights.get(coordination_key) orelse return;
+        if (flight.generation != generation or !flight.owner_active) return;
+        flight.owner_active = false;
+        flight.completed.set(compat.io());
+        if (flight.waiters == 0) self.destroyProxyResponseCacheFillFlightLocked(flight);
+    }
+
+    /// Wait at most two seconds (and never past the request's shorter
+    /// deadline/cancellation), then release this caller's reference. A true
+    /// result only means the owner finished; the caller still has to recheck
+    /// cache generation, eligibility, freshness, and variant.
+    pub fn proxyResponseCacheWaitForFill(
+        self: *GatewayState,
+        flight: *ProxyResponseCacheFillFlight,
+        cancel_token: ?*const http.cancellation.CancellationToken,
+    ) bool {
+        const started_ms = http.event_loop.monotonicMs();
+        const deadline_ms = started_ms + proxy_response_cache_fill_wait_timeout_ms;
+        var completed = false;
+        while (true) {
+            if (flight.completed.isSet()) {
+                completed = true;
+                break;
+            }
+            if (cancel_token) |token| if (token.isStopped()) break;
+            const now_ms = http.event_loop.monotonicMs();
+            if (now_ms >= deadline_ms) break;
+            var wait_ms: u32 = @intCast(@min(deadline_ms - now_ms, 50));
+            if (cancel_token) |token| {
+                if (token.deadline_ms != 0) wait_ms = @min(wait_ms, token.effectiveTimeoutMs(wait_ms));
+            }
+            flight.completed.waitTimeout(compat.io(), .{ .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(wait_ms),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => break,
+            };
+        }
+
+        self.proxy_response_cache_mutex.lock();
+        std.debug.assert(flight.waiters > 0);
+        flight.waiters -= 1;
+        std.debug.assert(self.proxy_response_cache_fill_waiters > 0);
+        self.proxy_response_cache_fill_waiters -= 1;
+        const should_destroy = !flight.owner_active and flight.waiters == 0;
+        if (should_destroy) self.destroyProxyResponseCacheFillFlightLocked(flight);
+        if (self.proxy_response_cache_fill_waiters == 0) self.proxy_response_cache_condition.broadcast();
+        self.proxy_response_cache_mutex.unlock();
+        return completed;
     }
 
     /// Atomically register a background refresh against the current cache
@@ -1618,8 +1757,22 @@ pub const GatewayState = struct {
         self.proxy_response_cache_generation = next_generation;
         self.proxy_response_cache_disk_accepting = false;
         self.proxy_response_cache_revalidation_cancel.cancel(.shutdown);
-        while (self.proxy_response_cache_revalidation_inflight.load(.acquire) != 0 or self.proxy_response_cache_disk_inflight != 0) {
+        var fill_it = self.proxy_response_cache_fill_flights.iterator();
+        while (fill_it.next()) |entry| {
+            entry.value_ptr.*.owner_active = false;
+            entry.value_ptr.*.completed.set(compat.io());
+        }
+        while (self.proxy_response_cache_revalidation_inflight.load(.acquire) != 0 or
+            self.proxy_response_cache_disk_inflight != 0 or
+            self.proxy_response_cache_fill_waiters != 0)
+        {
             self.proxy_response_cache_condition.wait(&self.proxy_response_cache_mutex);
+        }
+        while (self.proxy_response_cache_fill_flights.count() != 0) {
+            var it = self.proxy_response_cache_fill_flights.iterator();
+            const entry = it.next().?;
+            std.debug.assert(entry.value_ptr.*.waiters == 0);
+            self.destroyProxyResponseCacheFillFlightLocked(entry.value_ptr.*);
         }
         self.proxy_response_cache_mutex.unlock();
     }
@@ -1648,6 +1801,9 @@ pub const GatewayState = struct {
         state.proxy_response_cache_disk_inflight = 0;
         state.proxy_response_cache_condition = .{};
         state.proxy_response_cache_generation = 7;
+        state.proxy_response_cache_fill_flights = std.StringHashMap(*ProxyResponseCacheFillFlight).init(std.testing.allocator);
+        defer state.proxy_response_cache_fill_flights.deinit();
+        state.proxy_response_cache_fill_waiters = 0;
         state.proxy_response_cache_revalidation_locks = std.StringHashMap(void).init(std.testing.allocator);
         defer state.proxy_response_cache_revalidation_locks.deinit();
         state.proxy_response_cache_revalidation_inflight = std.atomic.Value(u32).init(0);

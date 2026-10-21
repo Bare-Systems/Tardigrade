@@ -29,8 +29,9 @@
 //! `proxy-revalidate` (`Freshness.forbids_stale`). Triggering the actual
 //! bounded, single-flight background refresh for a stale hit is the
 //! caller's job (`gateway_proxy_runtime.maybeSpawnProxyResponseCacheRevalidation`),
-//! not this module's. Bounded simultaneous-miss fill collapsing is not
-//! implemented here; see the open follow-up issue. The entry representation
+//! not this module's. #934 additionally retains an expired validator-bearing
+//! entry as a non-servable synchronous-revalidation candidate; foreground
+//! fill collapsing lives in `GatewayState`. The entry representation
 //! below is intentionally separate from `http.idempotency.IdempotencyStore`,
 //! which only models `status/body/content_type` and is not a fit for
 //! replaying arbitrary response headers with a correct `Age`.
@@ -114,6 +115,11 @@ pub const LookupResult = struct {
     /// single-flight) background revalidation; `lookup`/lookup-equivalents
     /// never do this themselves.
     stale: bool = false,
+    /// True only while this stale representation is inside its configured
+    /// stale-while-revalidate serving window. Expired entries with a retained
+    /// validator remain bounded residents for synchronous revalidation but
+    /// must never be replayed before the origin confirms them.
+    stale_servable: bool = false,
     /// Changes every time this exact key is replaced or refreshed. A
     /// background 304 must still match this revision before it can renew the
     /// representation it originally validated.
@@ -370,16 +376,18 @@ pub const ProxyResponseCache = struct {
         self.removeMapEntryOnly(key);
     }
 
-    /// Deep-copies a live, unexpired entry into `scratch` (expected to be an
-    /// arena the caller tears down once the response is written). Returns
-    /// `null` on a miss or an expired entry (which this also evicts).
+    /// Deep-copies a live entry into `scratch` (expected to be an arena the
+    /// caller tears down once the response is written). Expired entries with
+    /// an unambiguous validator remain available for synchronous revalidation;
+    /// expired entries without one are evicted and returned as a miss.
     pub fn lookup(self: *ProxyResponseCache, scratch: std.mem.Allocator, key: []const u8, now_ms: u64) !?LookupResult {
         const entry = self.map.getPtr(key) orelse return null;
-        if (now_ms >= entry.swr_until_ms) {
+        const stale = now_ms >= entry.expires_at_ms;
+        const stale_servable = stale and now_ms < entry.swr_until_ms;
+        if (now_ms >= entry.swr_until_ms and revalidationValidator(entry.headers) == null) {
             self.removeLocked(key);
             return null;
         }
-        const stale = now_ms >= entry.expires_at_ms;
         const reason_copy = try scratch.dupe(u8, entry.reason);
         const headers_copy = try scratch.alloc(CacheHeader, entry.headers.len);
         for (entry.headers, 0..) |h, i| {
@@ -403,6 +411,7 @@ pub const ProxyResponseCache = struct {
             .body = body_copy,
             .age_seconds = age_seconds,
             .stale = stale,
+            .stale_servable = stale_servable,
             .revision = entry.revision,
         };
     }
@@ -1409,6 +1418,31 @@ pub const ServeDisposition = enum {
     require_origin,
 };
 
+pub const RevalidationValidator = union(enum) {
+    etag: []const u8,
+    last_modified: []const u8,
+};
+
+/// Select the one origin precondition an expired shared representation may
+/// safely contribute. ETag has RFC precedence; repeated validator fields are
+/// treated as ambiguous and disable cache-initiated revalidation.
+pub fn revalidationValidator(headers: []const CacheHeader) ?RevalidationValidator {
+    var etag: ?[]const u8 = null;
+    var last_modified: ?[]const u8 = null;
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "etag")) {
+            if (etag != null or header.value.len == 0) return null;
+            etag = header.value;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "last-modified")) {
+            if (last_modified != null or header.value.len == 0) return null;
+            last_modified = header.value;
+        }
+    }
+    if (etag) |value| return .{ .etag = value };
+    if (last_modified) |value| return .{ .last_modified = value };
+    return null;
+}
+
 fn findStoredHeader(headers: []const CacheHeader, name: []const u8) ?[]const u8 {
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
@@ -1476,6 +1510,7 @@ pub fn decideCacheServe(hit_headers: []const CacheHeader, request_headers: *cons
 /// validator must be sent to the origin synchronously before the client can
 /// be told its representation is still current.
 pub fn decideLookupServe(hit: *const LookupResult, request_headers: *const http.Headers) ServeDisposition {
+    if (hit.stale and !hit.stale_servable) return .require_origin;
     const decided = decideCacheServe(hit.headers, request_headers);
     return if (hit.stale and decided == .not_modified) .require_origin else decided;
 }
@@ -2207,6 +2242,68 @@ test "ProxyResponseCache 304 refresh keeps the body and renews metadata" {
     try std.testing.expectEqualStrings("retained body", hit.body);
     try std.testing.expectEqualStrings("\"v2\"", findStoredHeader(hit.headers, "etag").?);
     try std.testing.expectEqualStrings("text/plain", findStoredHeader(hit.headers, "content-type").?);
+}
+
+test "ProxyResponseCache retains expired validators without serving them stale" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(0, "validated", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{
+            .{ .name = "Cache-Control", .value = "max-age=1" },
+            .{ .name = "ETag", .value = "W/\"v1\"" },
+        },
+        .body = "retained",
+        .ttl_seconds = 1,
+    });
+    try cache.put(0, "unvalidated", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "Cache-Control", .value = "max-age=1" }},
+        .body = "discarded",
+        .ttl_seconds = 1,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const expired = (try cache.lookup(arena.allocator(), "validated", 1_001)).?;
+    try std.testing.expect(expired.stale);
+    try std.testing.expect(!expired.stale_servable);
+    var request_headers = http.Headers.init(allocator);
+    defer request_headers.deinit();
+    try std.testing.expectEqual(ServeDisposition.require_origin, decideLookupServe(&expired, &request_headers));
+    try std.testing.expectEqualStrings("retained", expired.body);
+    try std.testing.expectEqual(@as(?LookupResult, null), try cache.lookup(arena.allocator(), "unvalidated", 1_001));
+}
+
+test "revalidationValidator prefers one ETag and rejects ambiguous validators" {
+    const etag = [_]CacheHeader{
+        .{ .name = @constCast("Last-Modified"), .value = @constCast("Mon, 01 Jan 2024 00:00:00 GMT") },
+        .{ .name = @constCast("ETag"), .value = @constCast("W/\"v1\"") },
+    };
+    switch (revalidationValidator(&etag).?) {
+        .etag => |value| try std.testing.expectEqualStrings("W/\"v1\"", value),
+        else => return error.TestUnexpectedResult,
+    }
+    const last_modified = [_]CacheHeader{.{
+        .name = @constCast("Last-Modified"),
+        .value = @constCast("Mon, 01 Jan 2024 00:00:00 GMT"),
+    }};
+    switch (revalidationValidator(&last_modified).?) {
+        .last_modified => |value| try std.testing.expectEqualStrings("Mon, 01 Jan 2024 00:00:00 GMT", value),
+        else => return error.TestUnexpectedResult,
+    }
+    const repeated = [_]CacheHeader{
+        .{ .name = @constCast("ETag"), .value = @constCast("\"v1\"") },
+        .{ .name = @constCast("ETag"), .value = @constCast("\"v2\"") },
+    };
+    try std.testing.expectEqual(@as(?RevalidationValidator, null), revalidationValidator(&repeated));
 }
 
 test "ProxyResponseCache rejects token-bearing 304 metadata" {

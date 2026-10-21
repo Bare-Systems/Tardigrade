@@ -19,6 +19,19 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **Synchronous stale revalidation and bounded collapsed fills for the generic
+  response cache (#934).** An expired in-memory `GET` representation with an
+  `ETag` or `Last-Modified` validator now sends an origin-only conditional
+  request on H1, H2, and H3. An origin `304` refreshes permitted freshness
+  metadata while retaining the cached `200` body; a changed `200` follows the
+  ordinary replacement path. Concurrent initial fills and synchronous
+  revalidations are collapsed per config generation and normalized
+  representation: one owner performs origin I/O while at most 32 waiters per
+  key and 256 globally wait for up to 2 seconds, then recheck the cache.
+  Overflow, timeout, cancellation, owner failure, reload, and shutdown all
+  fail open to the normal independent proxy path; no cache mutex is held over
+  origin I/O.
+
 - **Automatic HTTPS bootstrap, activation and HTTP→HTTPS redirect for
   experimental builds (#884, epic #759 phase A4, child of #834).** On a
   general-profile build compiled with `-Dacme-experimental`,

@@ -23,6 +23,14 @@ const session = tls_core.session;
 const session_cache = tls_core.session_cache;
 const sni_provider = tls_core.sni_provider;
 
+/// #944: see the matching helper in `src/crypto/rsa.zig` -- gates the one
+/// test in this file whose large-RSA-keygen cost dominates this module's
+/// contribution to the default `zig build test` wall time.
+fn skipInTestFastMode() bool {
+    const value = std.c.getenv("TARDIGRADE_TEST_FAST") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
 fn clientEntropy() tls_backend.Entropy {
     return .{ .hello_random = [_]u8{0xc1} ** 32 };
 }
@@ -737,6 +745,13 @@ fn expectRsaCertificateVerifyHandshake(cert_der: []const u8, key_der: []const u8
 }
 
 test "#335 RSA-3072 and RSA-4096 CertificateVerify signatures fit the TLS engine buffer" {
+    // #944: skipped under `zig build test-fast` (env var set only by that
+    // step; the default `test`/`test-tls` runs leave it unset and still
+    // exercise this). A full RSA-3072 and RSA-4096 keygen+sign handshake is
+    // ~20s of this module's wall time in a Debug build's unoptimized bigint
+    // modexp -- the single largest contributor to the default `zig build
+    // test` run profiled for #944.
+    if (skipInTestFastMode()) return error.SkipZigTest;
     try expectRsaCertificateVerifyHandshake(rsa3072_certificate_der, rsa3072_private_key_pkcs8_der, 384);
     try expectRsaCertificateVerifyHandshake(rsa4096_certificate_der, rsa4096_private_key_pkcs8_der, 512);
 }

@@ -24,6 +24,22 @@ fn skipOws(header: []const u8, start: usize) usize {
     return i;
 }
 
+/// Return whether `value` is exactly one syntactically valid entity-tag.
+/// Unlike `If-None-Match`, response `ETag` fields cannot contain a list or
+/// wildcard, so callers validating origin metadata need this stricter shape.
+pub fn isSingleEntityTag(value: []const u8) bool {
+    var cursor = skipOws(value, 0);
+    if (std.mem.startsWith(u8, value[cursor..], "W/")) cursor += 2;
+    if (cursor >= value.len or value[cursor] != '"') return false;
+    cursor += 1;
+    while (cursor < value.len and value[cursor] != '"') : (cursor += 1) {
+        if (!isEtagc(value[cursor])) return false;
+    }
+    if (cursor >= value.len) return false;
+    cursor = skipOws(value, cursor + 1);
+    return cursor == value.len;
+}
+
 /// Result of evaluating one `If-None-Match` field-value against a stored
 /// validator. Kept distinct from a plain `bool` so a caller combining several
 /// repeated header instances (RFC 9110 §5.3) can tell "no match in this
@@ -177,4 +193,14 @@ test "evaluateIfNoneMatch distinguishes invalid syntax from a valid nonmatch" {
     try std.testing.expectEqual(EntityTagMatch.no_match, evaluateIfNoneMatch("\"rev1\"", "\"other\""));
     try std.testing.expectEqual(EntityTagMatch.invalid, evaluateIfNoneMatch("\"rev1\"", "junk\"rev1\""));
     try std.testing.expectEqual(EntityTagMatch.invalid, evaluateIfNoneMatch("\"rev1\"", "\"rev1\", junk\"oops\""));
+}
+
+test "isSingleEntityTag rejects response lists and wildcard" {
+    try std.testing.expect(isSingleEntityTag("\"rev1\""));
+    try std.testing.expect(isSingleEntityTag(" W/\"rev1\"\t"));
+    try std.testing.expect(isSingleEntityTag("\"comma,inside\""));
+    try std.testing.expect(!isSingleEntityTag("*"));
+    try std.testing.expect(!isSingleEntityTag("\"rev1\", \"rev2\""));
+    try std.testing.expect(!isSingleEntityTag("\"rev1\" trailing"));
+    try std.testing.expect(!isSingleEntityTag("unterminated"));
 }

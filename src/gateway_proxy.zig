@@ -4066,7 +4066,7 @@ fn responseStreamCloseReason(err: anyerror, cancel_token: ?*const CancellationTo
     if (err == error.ResponseStreamShutdown or http.shutdown.isShutdownRequested()) return .shutdown;
     if (err == error.RequestCancelled) {
         if (cancel_token) |token| {
-            if (token.reason) |cancel_reason| return switch (cancel_reason) {
+            if (token.cancelReason()) |cancel_reason| return switch (cancel_reason) {
                 .client_disconnect => .client,
                 .shutdown => .shutdown,
                 .timeout, .upstream_timeout => .timeout,

@@ -140,6 +140,7 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             null,
         .proxy_response_cache_generation = 1,
         .proxy_response_cache_disk = gs.openProxyResponseCacheDisk(state_allocator, cfg),
+        .proxy_response_cache_fill_flights = std.StringHashMap(*gs.ProxyResponseCacheFillFlight).init(state_allocator),
         .proxy_response_cache_revalidation_locks = std.StringHashMap(void).init(state_allocator),
         .proxy_response_cache_revalidation_max_concurrency = std.atomic.Value(u32).init(cfg.proxy_response_cache_revalidation_max_concurrency),
         .security_headers = blk: {
@@ -5516,6 +5517,11 @@ fn executeHttp2ProxyRoute(
     // owned BufferedUpstreamResponse because finalization emits frames after
     // this route function returns.
     var response_cache_key: ?[64]u8 = null;
+    var synchronous_revalidation: ?gproxy_runtime.SynchronousCacheRevalidation = null;
+    defer if (synchronous_revalidation) |*plan| plan.deinit(allocator);
+    var response_cache_fill_key: ?[64]u8 = null;
+    var response_cache_fill_owner = false;
+    defer if (response_cache_fill_owner) state.proxyResponseCacheFinishFill(cache_generation, response_cache_fill_key.?[0..]);
     if (route_cfg.proxy_cache_ttl_seconds > 0) {
         const cache_method = request.method.toString();
         const fillable_method = std.mem.eql(u8, cache_method, "GET");
@@ -5603,12 +5609,69 @@ fn executeHttp2ProxyRoute(
                             state.metricsRecordProxyCacheOutcome(.fill_error);
                         }
                     }
+                    if (fillable_method) {
+                        synchronous_revalidation = try gproxy_runtime.prepareSynchronousCacheRevalidation(
+                            allocator,
+                            key_buf[0..],
+                            effective_key.?,
+                            &value,
+                            &request.headers,
+                        );
+                    }
                 }
                 state.metricsRecordProxyCacheOutcome(.miss);
                 // A HEAD miss (or an unvalidatable HEAD hit) must not fill
                 // the cache -- a HEAD response has no body to store, and
                 // storing one would poison a later GET replay.
-                if (fillable_method) response_cache_key = key_buf;
+                if (fillable_method) {
+                    response_cache_key = key_buf;
+                    var coordination_buf: [64]u8 = undefined;
+                    if (gproxy_runtime.responseCacheFillCoordinationKey(&coordination_buf, key_buf[0..], &request.headers)) |coordination_key| {
+                        switch (state.proxyResponseCacheBeginFill(cache_generation, coordination_key) catch .independent) {
+                            .owner => {
+                                response_cache_fill_key = coordination_buf;
+                                response_cache_fill_owner = true;
+                            },
+                            .waiter => |flight| {
+                                _ = state.proxyResponseCacheWaitForFill(flight, &lifecycle.token);
+                                const waited_is_vary = state.proxyResponseCacheIsVaryTracked(cache_generation, key_buf[0..]);
+                                var waited_discriminator_buf: [gproxy_cache.max_vary_discriminator_bytes]u8 = undefined;
+                                var waited_secondary_buf: [64]u8 = undefined;
+                                const waited_effective_key: ?[]const u8 = if (!waited_is_vary) key_buf[0..] else waited: {
+                                    const discriminator = gproxy_cache.varyAcceptEncodingDiscriminator(&waited_discriminator_buf, &request.headers) orelse break :waited null;
+                                    break :waited gproxy_cache.buildVaryVariantKey(&waited_secondary_buf, key_buf[0..], discriminator);
+                                };
+                                const waited_lookup = if (waited_effective_key) |waited_key| state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, key_buf[0..], waited_key, http.event_loop.monotonicMs()) catch blk: {
+                                    state.metricsRecordProxyCacheOutcome(.fill_error);
+                                    break :blk null;
+                                } else null;
+                                if (synchronous_revalidation) |*plan| plan.deinit(allocator);
+                                synchronous_revalidation = null;
+                                if (waited_lookup) |waited_hit| {
+                                    const waited_disposition = gproxy_cache.decideLookupServe(&waited_hit, &request.headers);
+                                    if (waited_disposition != .require_origin) {
+                                        if (http2CachedProxyResponse(allocator, &waited_hit, waited_disposition, waited_disposition == .full)) |cached| {
+                                            state.metricsRecordProxyCacheOutcome(.hit);
+                                            ctx.setUpstreamResult(target, cached.status_code, cached.body.len);
+                                            return .{ .response = cached };
+                                        } else |_| {
+                                            state.metricsRecordProxyCacheOutcome(.fill_error);
+                                        }
+                                    } else {
+                                        synchronous_revalidation = try gproxy_runtime.prepareSynchronousCacheRevalidation(
+                                            allocator,
+                                            key_buf[0..],
+                                            waited_effective_key.?,
+                                            &waited_hit,
+                                            &request.headers,
+                                        );
+                                    }
+                                }
+                            },
+                            .independent => {},
+                        }
+                    }
+                }
             }
         }
     }
@@ -5620,13 +5683,19 @@ fn executeHttp2ProxyRoute(
     defer upstream_url.deinit(allocator);
 
     const forwarded_proto = if (edge_config.usesNativeTls(route_cfg)) "https" else "http";
+    var origin_revalidation_headers: ?http.Headers = null;
+    defer if (origin_revalidation_headers) |*headers| headers.deinit();
+    if (synchronous_revalidation) |*plan| {
+        origin_revalidation_headers = try gproxy_runtime.buildOriginRevalidationHeaders(allocator, &request.headers, plan);
+    }
+    const origin_request_headers = if (origin_revalidation_headers) |*headers| headers else &request.headers;
     var proxy_response = try gproxy_runtime.executeBufferedDataPlaneProxyRequest(
         allocator,
         route_cfg,
         upstream_url.value,
         resolved.unix_socket_path,
         request.method.toString(),
-        &request.headers,
+        origin_request_headers,
         request.body orelse "",
         correlation_id,
         client_ip,
@@ -5647,10 +5716,50 @@ fn executeHttp2ProxyRoute(
         &state.h2_pool,
     );
     errdefer proxy_response.deinit(allocator);
+    if (synchronous_revalidation) |*plan| {
+        if (proxy_response.statusCode() == 304) {
+            var refresh_arena = std.heap.ArenaAllocator.init(allocator);
+            defer refresh_arena.deinit();
+            const refreshed = gproxy_runtime.finishSynchronousCacheRevalidation(
+                refresh_arena.allocator(),
+                state,
+                cache_generation,
+                route_cfg.proxy_cache_ttl_seconds,
+                route_cfg.proxy_cache_stale_while_revalidate_seconds,
+                plan,
+                &proxy_response.bounded_buffered,
+            ) catch {
+                state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision);
+                proxy_response.deinit(allocator);
+                return .{ .local_rejection = .{
+                    .status_code = @intFromEnum(http.Status.bad_gateway),
+                    .code = "invalid_cache_revalidation",
+                    .message = "Origin returned an invalid cache revalidation response",
+                    .no_store = true,
+                } };
+            };
+            const cached = try http2CachedProxyResponse(allocator, &refreshed, .full, true);
+            proxy_response.deinit(allocator);
+            if (response_cache_fill_owner) {
+                state.proxyResponseCacheFinishFill(cache_generation, response_cache_fill_key.?[0..]);
+                response_cache_fill_owner = false;
+            }
+            state.metricsRecordProxyCacheOutcome(.hit);
+            ctx.setUpstreamResult(resolved.upstream_host, cached.status_code, cached.body.len);
+            return .{ .response = cached };
+        }
+        if (proxy_response.statusCode() == 200) {
+            state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision);
+        }
+    }
     if (response_cache_key) |key_bytes| {
         gproxy_runtime.tryFillResponseCache(allocator, state, cache_generation, route_cfg.proxy_cache_ttl_seconds, route_cfg.proxy_cache_stale_while_revalidate_seconds, key_bytes[0..], &proxy_response.bounded_buffered, &request.headers) catch {
             state.metricsRecordProxyCacheOutcome(.fill_error);
         };
+    }
+    if (response_cache_fill_owner) {
+        state.proxyResponseCacheFinishFill(cache_generation, response_cache_fill_key.?[0..]);
+        response_cache_fill_owner = false;
     }
     ctx.setUpstreamResult(resolved.upstream_host, proxy_response.statusCode(), proxy_response.bodyLen());
     state.appendTranscript(
@@ -12168,7 +12277,15 @@ test "H2 live: an abrupt client disconnect (no GOAWAY) settles the active sessio
 
     // Prove the session is genuinely live before tearing the socket down.
     try client.sendData(1, false, "alive");
-    var echo = try client.readFrame(allocator);
+    // The server may issue its own connection/stream WINDOW_UPDATE(s) for
+    // the just-received "alive" DATA before (or interleaved with) echoing
+    // it back; skip those rather than assume the very next frame is the
+    // echo.
+    var echo: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.typ != .window_update) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
     defer http.http2_frame.deinitFrame(allocator, &echo);
     try std.testing.expectEqual(http.http2_frame.Type.data, echo.typ);
     try std.testing.expectEqualStrings("alive", echo.payload);
@@ -12255,7 +12372,15 @@ test "H2 live: graceful shutdown settles the active session as shutdown without 
     try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
 
     try client.sendData(1, false, "alive");
-    var echo = try client.readFrame(allocator);
+    // The server may issue its own connection/stream WINDOW_UPDATE(s) for
+    // the just-received "alive" DATA before (or interleaved with) echoing
+    // it back; skip those rather than assume the very next frame is the
+    // echo.
+    var echo: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.typ != .window_update) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
     defer http.http2_frame.deinitFrame(allocator, &echo);
     try std.testing.expectEqual(http.http2_frame.Type.data, echo.typ);
     try std.testing.expectEqualStrings("alive", echo.payload);

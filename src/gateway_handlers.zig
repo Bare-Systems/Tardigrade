@@ -646,6 +646,7 @@ fn minimalHttp3ProxyConfig(blocks: []http.location_router.LocationBlock) edge_co
     cfg.upstream_connect_timeout_ms = 5000;
     cfg.upstream_response_timeout_ms = 5000;
     cfg.upstream_timeout_budget_ms = 0;
+    cfg.request_total_timeout_ms = 0;
     cfg.upstream_retry_attempts = 1;
     cfg.upstream_retry_idempotent_only = true;
     cfg.upstream_max_fails = 0;
@@ -2324,6 +2325,9 @@ fn executeSubrequest(allocator: std.mem.Allocator, url: []const u8, method: std.
 pub const Http3DispatchContext = struct {
     config_store: *ReloadableConfigStore,
     cfg: *const edge_config.EdgeConfig,
+    /// Stable composition-root context. Per-request copies point back here so
+    /// parked continuations never retain a stack-local effective context.
+    root_ctx: ?*Http3DispatchContext = null,
     cfg_lease: ?*gs.ConfigLease = null,
     state: *GatewayState,
     client_ip: []const u8 = "unknown",
@@ -2331,6 +2335,9 @@ pub const Http3DispatchContext = struct {
     /// Resolved identity for path-scoped policy re-checks after a rewrite.
     identity: ?[]const u8 = null,
     device_id: ?[]const u8 = null,
+    /// Request-owned QUIC cancellation/deadline token. It is pinned by the
+    /// HTTP/3 runtime for the complete synchronous handler invocation.
+    cancel_token: ?*const http.cancellation.CancellationToken = null,
 };
 
 const Http3LocationOutcome = union(enum) {
@@ -2541,6 +2548,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
     budget_start_ms: u64,
     last_attempt_start_ms: u64 = 0,
     circuit_permit: ?http.circuit_breaker.Permit = null,
+    cancel_token: ?*const http.cancellation.CancellationToken = null,
 
     pub fn recordEarlyUpstream425Action(
         self: *Http3BufferedProxyAttemptExecutor,
@@ -2601,7 +2609,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
             per_attempt_timeout_ms,
             self.cfg.upstream_connect_timeout_ms,
             self.cfg.upstream_response_timeout_ms,
-            null,
+            self.cancel_token,
             &self.state.upstream_pool,
             &self.state.h2_pool,
         );
@@ -2976,6 +2984,117 @@ const Http3Early425ProxyContinuation = struct {
     }
 };
 
+/// Owned request snapshot used when an HTTP/3 cache miss joins an existing
+/// fill. The QUIC reactor polls only `ready`; it never sleeps on the cache
+/// event. Reset/shutdown destroys the continuation and releases the admitted
+/// waiter exactly once. A normal resume re-enters the request pipeline so the
+/// current config, authorization, cache generation, Vary key and entry
+/// revision are all checked again before serving bytes.
+const Http3CacheFillContinuation = struct {
+    dispatch_ctx: *Http3DispatchContext,
+    state: *GatewayState,
+    flight: *gs.ProxyResponseCacheFillFlight,
+    wait_deadline_ms: u64,
+    waiter_released: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cancel_token: http.cancellation.CancellationToken,
+    request: http.http3_session.StreamRequest,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        dispatch_ctx: *Http3DispatchContext,
+        request: *const http.http3_session.StreamRequest,
+        flight: *gs.ProxyResponseCacheFillFlight,
+    ) !*Http3CacheFillContinuation {
+        // Cache eligibility excludes verified client identities, so no
+        // connection-owned certificate slices may escape into this snapshot.
+        std.debug.assert(request.headers.client_cert == null);
+        const plan = try allocator.create(Http3CacheFillContinuation);
+        errdefer allocator.destroy(plan);
+
+        const method = try allocator.dupe(u8, request.method);
+        errdefer allocator.free(method);
+        const path = try allocator.dupe(u8, request.path);
+        errdefer allocator.free(path);
+        const authority = if (request.authority) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (authority) |value| allocator.free(value);
+        var headers = try request.headers.clone(allocator);
+        errdefer headers.deinit();
+        headers.client_cert = null;
+        const body = try allocator.dupe(u8, request.body);
+        errdefer allocator.free(body);
+        const client_ip = if (request.client_ip) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (client_ip) |value| allocator.free(value);
+
+        const original_token = request.cancel_token;
+        plan.* = .{
+            .dispatch_ctx = dispatch_ctx.root_ctx orelse dispatch_ctx,
+            .state = dispatch_ctx.state,
+            .flight = flight,
+            .wait_deadline_ms = http.event_loop.monotonicMs() + gs.proxy_response_cache_fill_wait_timeout_ms,
+            .cancel_token = http.cancellation.CancellationToken.init(if (original_token) |token| token.deadline_ms else 0),
+            .request = .{
+                .allocator = allocator,
+                .stream_id = request.stream_id,
+                .method = method,
+                .path = path,
+                .authority = authority,
+                .headers = headers,
+                .body = body,
+                .client_ip = client_ip,
+                .transport_early = false,
+                .client_auth_policy_fingerprint = request.client_auth_policy_fingerprint,
+                .downstream_handshake_complete = true,
+                .downstream_handshake = null,
+                .park_early_425_retry = null,
+                .park_cache_fill = null,
+                .cache_fill_wait_resumed = true,
+                .cancel_token = undefined,
+            },
+        };
+        plan.request.cancel_token = &plan.cancel_token;
+        if (original_token) |token| {
+            if (token.cancelReason()) |reason| plan.cancel_token.cancel(reason);
+        }
+        return plan;
+    }
+
+    fn releaseWaiter(self: *Http3CacheFillContinuation) void {
+        if (self.waiter_released.swap(true, .acq_rel)) return;
+        self.state.proxyResponseCacheReleaseFillWaiter(self.flight);
+    }
+
+    fn ready(ctx: *anyopaque, now_ms: u64) bool {
+        const self: *Http3CacheFillContinuation = @ptrCast(@alignCast(ctx));
+        return self.state.proxyResponseCacheFillCompleted(self.flight) or
+            self.cancel_token.isStopped() or
+            now_ms >= self.wait_deadline_ms;
+    }
+
+    fn cancel(ctx: *anyopaque, reason: http.cancellation.CancelReason) void {
+        const self: *Http3CacheFillContinuation = @ptrCast(@alignCast(ctx));
+        self.cancel_token.cancel(reason);
+        self.releaseWaiter();
+    }
+
+    fn run(ctx: *anyopaque, allocator: std.mem.Allocator, response: *http.Response) !void {
+        const self: *Http3CacheFillContinuation = @ptrCast(@alignCast(ctx));
+        self.releaseWaiter();
+        // A request deadline and a peer reset are terminal for this stream.
+        // Do not re-enter routing/auth/rate limiting or serve a cache hit once
+        // the request itself is no longer live. The H3 runtime maps this
+        // cancellation to a stream reset rather than a synthetic 500.
+        if (self.cancel_token.isStopped()) return error.RequestCancelled;
+        try handleHttp3Request(allocator, &self.request, response, self.dispatch_ctx);
+    }
+
+    fn destroy(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *Http3CacheFillContinuation = @ptrCast(@alignCast(ctx));
+        self.releaseWaiter();
+        self.request.deinit();
+        allocator.destroy(self);
+    }
+};
+
 fn handleHttp3LocationProxyPass(
     allocator: std.mem.Allocator,
     request: *const http.http3_session.StreamRequest,
@@ -2998,6 +3117,12 @@ fn handleHttp3LocationProxyPass(
     // directly, so the hit/fill shapes differ even though the eligibility
     // and freshness rules (`gateway_proxy_cache.zig`) are shared.
     var response_cache_key: ?[64]u8 = null;
+    var synchronous_revalidation: ?gproxy_runtime.SynchronousCacheRevalidation = null;
+    defer if (synchronous_revalidation) |*plan| plan.deinit(allocator);
+    const cache_generation = if (ctx.cfg_lease) |lease| lease.version.generation else 0;
+    var response_cache_fill_key: ?[64]u8 = null;
+    var response_cache_fill_owner = false;
+    defer if (response_cache_fill_owner) ctx.state.proxyResponseCacheFinishFill(cache_generation, response_cache_fill_key.?[0..]);
     if (ctx.cfg.proxy_cache_ttl_seconds > 0) {
         const fillable_method = std.mem.eql(u8, request.method, "GET");
         if (!gpc.isCacheableRequest(
@@ -3032,7 +3157,6 @@ fn handleHttp3LocationProxyPass(
                 .path = request_path,
                 .query = request_query orelse "",
             });
-            const cache_generation = if (ctx.cfg_lease) |lease| lease.version.generation else 0;
             const is_vary_tracked = ctx.state.proxyResponseCacheIsVaryTracked(cache_generation, key_buf[0..]);
             var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
             var secondary_buf: [64]u8 = undefined;
@@ -3089,12 +3213,96 @@ fn handleHttp3LocationProxyPass(
                             ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
                         }
                     }
+                    if (fillable_method) {
+                        synchronous_revalidation = try gproxy_runtime.prepareSynchronousCacheRevalidation(
+                            allocator,
+                            key_buf[0..],
+                            effective_key.?,
+                            &hit,
+                            &request.headers,
+                        );
+                    }
                 }
                 ctx.state.metricsRecordProxyCacheOutcome(.miss);
                 // A HEAD miss (or an unvalidatable HEAD hit) must not fill
                 // the cache -- a HEAD response has no body to store, and
                 // storing one would poison a later GET replay.
-                if (fillable_method) response_cache_key = key_buf;
+                if (fillable_method) {
+                    response_cache_key = key_buf;
+                    var coordination_buf: [64]u8 = undefined;
+                    if (!request.cache_fill_wait_resumed and gproxy_runtime.responseCacheFillCoordinationKey(&coordination_buf, key_buf[0..], &request.headers) != null) {
+                        const coordination_key = gproxy_runtime.responseCacheFillCoordinationKey(&coordination_buf, key_buf[0..], &request.headers).?;
+                        switch (ctx.state.proxyResponseCacheBeginFill(cache_generation, coordination_key) catch .independent) {
+                            .owner => {
+                                response_cache_fill_key = coordination_buf;
+                                response_cache_fill_owner = true;
+                            },
+                            .waiter => |flight| {
+                                if (request.park_cache_fill) |parker| {
+                                    const continuation = Http3CacheFillContinuation.init(allocator, ctx, request, flight) catch |err| {
+                                        ctx.state.proxyResponseCacheReleaseFillWaiter(flight);
+                                        return err;
+                                    };
+                                    parker.park(.{
+                                        .ctx = continuation,
+                                        .ready_fn = Http3CacheFillContinuation.ready,
+                                        .cancel_fn = Http3CacheFillContinuation.cancel,
+                                        .resume_fn = Http3CacheFillContinuation.run,
+                                        .deinit_fn = Http3CacheFillContinuation.destroy,
+                                    }) catch |err| {
+                                        Http3CacheFillContinuation.destroy(continuation, allocator);
+                                        return err;
+                                    };
+                                    // Ownership moved into the runtime's
+                                    // parked-stream list. All local defers may
+                                    // now unwind without blocking the reactor.
+                                    return error.Http3RequestParked;
+                                }
+                                // Direct dispatcher tests and embedders that
+                                // do not provide a runtime parker retain the
+                                // bounded synchronous behavior.
+                                _ = ctx.state.proxyResponseCacheWaitForFill(flight, ctx.cancel_token);
+                                if (ctx.cancel_token) |token| if (token.isStopped()) {
+                                    try rejectHttp3ProxyError(allocator, response, ctx, .gateway_timeout, "request_cancelled", "HTTP/3 request was cancelled while waiting for a cache fill", correlation_id);
+                                    return;
+                                };
+                                const waited_is_vary = ctx.state.proxyResponseCacheIsVaryTracked(cache_generation, key_buf[0..]);
+                                var waited_discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
+                                var waited_secondary_buf: [64]u8 = undefined;
+                                const waited_effective_key: ?[]const u8 = if (!waited_is_vary) key_buf[0..] else waited: {
+                                    const discriminator = gpc.varyAcceptEncodingDiscriminator(&waited_discriminator_buf, &request.headers) orelse break :waited null;
+                                    break :waited gpc.buildVaryVariantKey(&waited_secondary_buf, key_buf[0..], discriminator);
+                                };
+                                const waited_lookup = if (waited_effective_key) |waited_key| ctx.state.proxyResponseCacheLookup(hit_arena.allocator(), cache_generation, key_buf[0..], waited_key, http.event_loop.monotonicMs()) catch blk: {
+                                    ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+                                    break :blk null;
+                                } else null;
+                                if (synchronous_revalidation) |*plan| plan.deinit(allocator);
+                                synchronous_revalidation = null;
+                                if (waited_lookup) |waited_hit| {
+                                    const waited_disposition = gpc.decideLookupServe(&waited_hit, &request.headers);
+                                    if (waited_disposition != .require_origin) {
+                                        if (applyHttp3ProxyCacheHit(allocator, response, ctx.state, &waited_hit, correlation_id, waited_disposition, waited_disposition == .full)) |_| {
+                                            ctx.state.metricsRecordProxyCacheOutcome(.hit);
+                                            return;
+                                        } else |_| {
+                                            ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
+                                        }
+                                    } else {
+                                        synchronous_revalidation = try gproxy_runtime.prepareSynchronousCacheRevalidation(
+                                            allocator,
+                                            key_buf[0..],
+                                            waited_effective_key.?,
+                                            &waited_hit,
+                                            &request.headers,
+                                        );
+                                    }
+                                }
+                            },
+                            .independent => {},
+                        }
+                    }
+                }
             }
         }
     }
@@ -3124,6 +3332,12 @@ fn handleHttp3LocationProxyPass(
         filtered_headers = headers;
     }
     const proxy_headers: *const http.Headers = if (filtered_headers) |*headers| headers else source_headers;
+    var origin_revalidation_headers: ?http.Headers = null;
+    defer if (origin_revalidation_headers) |*headers| headers.deinit();
+    if (synchronous_revalidation) |*plan| {
+        origin_revalidation_headers = try gproxy_runtime.buildOriginRevalidationHeaders(allocator, proxy_headers, plan);
+    }
+    const origin_proxy_headers: *const http.Headers = if (origin_revalidation_headers) |*headers| headers else proxy_headers;
 
     const max_attempts = gproxy_runtime.proxyRetryAttemptLimit(ctx.cfg.upstream_retry_attempts, ctx.cfg.upstream_retry_idempotent_only, request.method);
     var attempt_executor = Http3BufferedProxyAttemptExecutor{
@@ -3135,7 +3349,7 @@ fn handleHttp3LocationProxyPass(
         .upstream_url = upstream_url.value,
         .unix_socket_path = resolved.unix_socket_path,
         .method = request.method,
-        .headers = proxy_headers,
+        .headers = origin_proxy_headers,
         .body = request.body,
         .correlation_id = correlation_id,
         .client_ip = ctx.client_ip,
@@ -3145,6 +3359,7 @@ fn handleHttp3LocationProxyPass(
         .selection_base_url = ctx.cfg.upstream_base_url,
         .absolute_target = absolute_target,
         .budget_start_ms = http.event_loop.monotonicMs(),
+        .cancel_token = ctx.cancel_token,
     };
 
     var upstream_response: gproxy_runtime.DataPlaneProxyResponse = switch (try gproxy_runtime.runBufferedProxyAttempts(
@@ -3187,12 +3402,44 @@ fn handleHttp3LocationProxyPass(
         recordHttp3ProxyOutcome(ctx.state, ctx.cfg, ctx.cfg.upstream_base_url, absolute_target, upstream_response.statusCode(), permit);
         attempt_executor.circuit_permit = null;
     }
+    if (synchronous_revalidation) |*plan| {
+        if (upstream_response.statusCode() == 304) {
+            var refresh_arena = std.heap.ArenaAllocator.init(allocator);
+            defer refresh_arena.deinit();
+            const refreshed = gproxy_runtime.finishSynchronousCacheRevalidation(
+                refresh_arena.allocator(),
+                ctx.state,
+                cache_generation,
+                ctx.cfg.proxy_cache_ttl_seconds,
+                ctx.cfg.proxy_cache_stale_while_revalidate_seconds,
+                plan,
+                upstream_response.boundedBufferedForCompatibility(),
+            ) catch {
+                ctx.state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision);
+                try rejectHttp3ProxyError(allocator, response, ctx, .bad_gateway, "invalid_cache_revalidation", "Origin returned an invalid cache revalidation response", correlation_id);
+                return;
+            };
+            if (response_cache_fill_owner) {
+                ctx.state.proxyResponseCacheFinishFill(cache_generation, response_cache_fill_key.?[0..]);
+                response_cache_fill_owner = false;
+            }
+            ctx.state.metricsRecordProxyCacheOutcome(.hit);
+            try applyHttp3ProxyCacheHit(allocator, response, ctx.state, &refreshed, correlation_id, .full, true);
+            return;
+        }
+        if (upstream_response.statusCode() == 200) {
+            ctx.state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision);
+        }
+    }
     if (response_cache_key) |key_bytes| {
         const buffered = upstream_response.boundedBufferedForCompatibility();
-        const cache_generation = if (ctx.cfg_lease) |lease| lease.version.generation else 0;
         gproxy_runtime.tryFillResponseCache(allocator, ctx.state, cache_generation, ctx.cfg.proxy_cache_ttl_seconds, ctx.cfg.proxy_cache_stale_while_revalidate_seconds, key_bytes[0..], buffered, &request.headers) catch {
             ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
         };
+    }
+    if (response_cache_fill_owner) {
+        ctx.state.proxyResponseCacheFinishFill(cache_generation, response_cache_fill_key.?[0..]);
+        response_cache_fill_owner = false;
     }
     try applyHttp3ProxyResponse(allocator, response, ctx.state, &upstream_response, correlation_id);
 }
@@ -3307,6 +3554,461 @@ test "applyHttp3ProxyCacheHit declares the cached representation's actual length
     try std.testing.expectEqual(@as(usize, 0), not_modified_body.len);
     try std.testing.expectEqualStrings("21", not_modified_response.headers.get("content-length") orelse "");
     try std.testing.expectEqual(@as(usize, 1), not_modified_response.headers.countByName("content-length"));
+}
+
+test "H3 proxy synchronously revalidates an expired cached body with an origin 304 (#934)" {
+    const allocator = std.testing.allocator;
+    var origin = try H3ProxyOrigin.start(allocator, &.{ 200, 304 });
+    defer origin.stop();
+    try origin.run();
+
+    var target_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "http://127.0.0.1:{d}", .{origin.port()});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/cache",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.proxy_cache_ttl_seconds = 60;
+    cfg.proxy_cache_stale_while_revalidate_seconds = 0;
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    state.proxy_response_cache_mutation_lanes = @splat(.{});
+    state.proxy_response_cache = gpc.ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer state.proxy_response_cache.?.deinit();
+    state.proxy_response_cache_generation = 1;
+    state.proxy_response_cache_disk = null;
+    state.proxy_response_cache_disk_accepting = true;
+    state.proxy_response_cache_disk_inflight = 0;
+    state.proxy_response_cache_condition = .{};
+    state.proxy_response_cache_fill_flights = std.StringHashMap(*gs.ProxyResponseCacheFillFlight).init(allocator);
+    defer state.proxy_response_cache_fill_flights.deinit();
+    state.proxy_response_cache_fill_waiters = 0;
+    state.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+
+    const issueRequest = struct {
+        fn run(a: std.mem.Allocator, ctx: *Http3DispatchContext) !http.Response {
+            var request = http.http3_session.StreamRequest{
+                .allocator = a,
+                .method = try a.dupe(u8, "GET"),
+                .path = try a.dupe(u8, "/cache"),
+                .authority = null,
+                .headers = http.Headers.init(a),
+                .body = try a.alloc(u8, 0),
+                .client_ip = try a.dupe(u8, "127.0.0.1"),
+            };
+            defer request.deinit();
+            var response = http.Response.init(a);
+            errdefer response.deinit();
+            try handleHttp3Request(a, &request, &response, ctx);
+            return response;
+        }
+    }.run;
+
+    var initial = try issueRequest(allocator, &dispatch_ctx);
+    defer initial.deinit();
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(initial.status));
+    try std.testing.expectEqualStrings("ok", initial.body orelse "");
+    compat.sleepNs(1_100 * std.time.ns_per_ms);
+
+    var refreshed = try issueRequest(allocator, &dispatch_ctx);
+    defer refreshed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(refreshed.status));
+    try std.testing.expectEqualStrings("ok", refreshed.body orelse "");
+    try std.testing.expectEqual(@as(usize, 2), origin.requestCount());
+    try std.testing.expect(origin.requestContainsIgnoreCase(1, "If-None-Match: W/\"h3-v1\""));
+}
+
+fn initCollapseTestState(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+) void {
+    initHttp3ProxyTestState(state, allocator, &.{});
+    state.proxy_response_cache_mutation_lanes = @splat(.{});
+    state.proxy_response_cache = gpc.ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    state.proxy_response_cache_generation = 1;
+    state.proxy_response_cache_disk = null;
+    state.proxy_response_cache_disk_accepting = true;
+    state.proxy_response_cache_disk_inflight = 0;
+    state.proxy_response_cache_condition = .{};
+    state.proxy_response_cache_fill_flights = std.StringHashMap(*gs.ProxyResponseCacheFillFlight).init(allocator);
+    state.proxy_response_cache_fill_waiters = 0;
+    state.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
+}
+
+const CollapseCaller = struct {
+    status: u16 = 0,
+    body: [64]u8 = undefined,
+    body_len: usize = 0,
+    err: ?anyerror = null,
+    cancel_token: ?*http.cancellation.CancellationToken = null,
+
+    /// Request-scoped allocations happen on `std.heap.page_allocator`, not
+    /// `std.testing.allocator`: several of these run concurrently on their
+    /// own OS thread, and the testing allocator's leak bookkeeping is not
+    /// safe to drive from more than one thread at a time.
+    fn run(result: *@This(), path: []const u8, ctx: *Http3DispatchContext) void {
+        const a = std.heap.page_allocator;
+        var request = http.http3_session.StreamRequest{
+            .allocator = a,
+            .method = a.dupe(u8, "GET") catch |err| {
+                result.err = err;
+                return;
+            },
+            .path = a.dupe(u8, path) catch |err| {
+                result.err = err;
+                return;
+            },
+            .authority = null,
+            .headers = http.Headers.init(a),
+            .body = a.alloc(u8, 0) catch |err| {
+                result.err = err;
+                return;
+            },
+            .client_ip = a.dupe(u8, "127.0.0.1") catch |err| {
+                result.err = err;
+                return;
+            },
+            .cancel_token = result.cancel_token,
+        };
+        defer request.deinit();
+        var response = http.Response.init(a);
+        defer response.deinit();
+        handleHttp3Request(a, &request, &response, ctx) catch |err| {
+            result.err = err;
+            return;
+        };
+        result.status = @intFromEnum(response.status);
+        const body = response.body orelse "";
+        result.body_len = @min(body.len, result.body.len);
+        @memcpy(result.body[0..result.body_len], body[0..result.body_len]);
+    }
+};
+
+const H3CacheFillParkCapture = struct {
+    parked: ?http.http3_session.StreamRequest.CacheFillContinuation = null,
+
+    fn park(ctx: *anyopaque, continuation: http.http3_session.StreamRequest.CacheFillContinuation) anyerror!void {
+        const self: *H3CacheFillParkCapture = @ptrCast(@alignCast(ctx));
+        if (self.parked != null) return error.TestDuplicatePark;
+        self.parked = continuation;
+    }
+
+    fn cancelAndDeinit(self: *H3CacheFillParkCapture, allocator: std.mem.Allocator, reason: http.cancellation.CancelReason) void {
+        const parked = self.parked orelse return;
+        self.parked = null;
+        parked.cancel(reason);
+        parked.deinit(allocator);
+    }
+};
+
+/// Poll (never sleep a fixed guess) the cache's own waiter bookkeeping until
+/// `expected` concurrent callers have registered as collapsed waiters for
+/// the single in-flight fill, or fail the test if that never happens (#945).
+fn waitForCollapsedWaiters(state: *GatewayState, expected: usize, timeout_ms: u64) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (true) {
+        state.proxy_response_cache_mutex.lock();
+        const waiters = state.proxy_response_cache_fill_waiters;
+        state.proxy_response_cache_mutex.unlock();
+        if (waiters >= expected) return;
+        if (compat.milliTimestamp() >= deadline) return error.WaitersNeverRegistered;
+        compat.sleepNs(1 * std.time.ns_per_ms);
+    }
+}
+
+test "H3 direct dispatcher collapses 20 concurrent handler callers to one origin fill with no stuck waiters (#945)" {
+    const num_callers = 20;
+    const allocator = std.testing.allocator;
+    var origin = try GatedH3ProxyOrigin.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=60\r\nContent-Length: 9\r\nConnection: close\r\n\r\ncollapsed",
+    });
+    defer origin.stop();
+    try origin.run();
+
+    var target_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "http://127.0.0.1:{d}", .{origin.port()});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/collapse",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.proxy_cache_ttl_seconds = 60;
+    cfg.proxy_cache_stale_while_revalidate_seconds = 0;
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initCollapseTestState(allocator, &state);
+    defer deinitHttp3ProxyTestState(&state);
+    defer state.proxy_response_cache.?.deinit();
+    defer state.proxy_response_cache_fill_flights.deinit();
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+
+    var results: [num_callers]CollapseCaller = undefined;
+    for (&results) |*r| r.* = .{};
+    var threads: [num_callers]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |thread| thread.join();
+    for (0..num_callers) |i| {
+        threads[i] = try std.Thread.spawn(.{}, CollapseCaller.run, .{ &results[i], "/collapse", &dispatch_ctx });
+        spawned += 1;
+    }
+
+    try origin.waitEntered(5_000);
+    try waitForCollapsedWaiters(&state, num_callers - 1, 5_000);
+    origin.release();
+
+    for (threads[0..spawned]) |thread| thread.join();
+    spawned = 0;
+    for (&results) |*r| {
+        if (r.err) |err| return err;
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expectEqualStrings("collapsed", r.body[0..r.body_len]);
+    }
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_flights.count());
+}
+
+test "H3 cache waiter parks without blocking and reset releases its flight before the owner completes (#934)" {
+    const allocator = std.testing.allocator;
+    var origin = try GatedH3ProxyOrigin.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nowner",
+    });
+    defer origin.stop();
+    try origin.run();
+
+    var target_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "http://127.0.0.1:{d}", .{origin.port()});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/park-reset",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.proxy_cache_ttl_seconds = 60;
+    cfg.proxy_cache_stale_while_revalidate_seconds = 0;
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initCollapseTestState(allocator, &state);
+    defer deinitHttp3ProxyTestState(&state);
+    defer state.proxy_response_cache.?.deinit();
+    defer state.proxy_response_cache_fill_flights.deinit();
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+
+    var owner_result = CollapseCaller{};
+    const owner_thread = try std.Thread.spawn(.{}, CollapseCaller.run, .{ &owner_result, "/park-reset", &dispatch_ctx });
+    var owner_joined = false;
+    defer if (!owner_joined) {
+        origin.release();
+        owner_thread.join();
+    };
+    try origin.waitEntered(5_000);
+
+    var capture = H3CacheFillParkCapture{};
+    defer capture.cancelAndDeinit(allocator, .shutdown);
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .stream_id = 7,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/park-reset"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+        .park_cache_fill = .{ .ctx = &capture, .park_fn = H3CacheFillParkCapture.park },
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    const started_ms = compat.milliTimestamp();
+    try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &response, &dispatch_ctx));
+    try std.testing.expect(compat.milliTimestamp() - started_ms < 500);
+    try std.testing.expect(capture.parked != null);
+    try std.testing.expectEqual(@as(usize, 1), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    capture.cancelAndDeinit(allocator, .client_disconnect);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    origin.release();
+    owner_thread.join();
+    owner_joined = true;
+    if (owner_result.err) |err| return err;
+    try std.testing.expectEqual(@as(u16, 200), owner_result.status);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_flights.count());
+}
+
+test "H3 parked cache-fill continuation refuses to resume once its own request deadline has passed, without a QUIC reset (#934)" {
+    const allocator = std.testing.allocator;
+    var origin = try GatedH3ProxyOrigin.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nowner",
+    });
+    defer origin.stop();
+    try origin.run();
+
+    var target_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "http://127.0.0.1:{d}", .{origin.port()});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/park-deadline",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.proxy_cache_ttl_seconds = 60;
+    cfg.proxy_cache_stale_while_revalidate_seconds = 0;
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initCollapseTestState(allocator, &state);
+    defer deinitHttp3ProxyTestState(&state);
+    defer state.proxy_response_cache.?.deinit();
+    defer state.proxy_response_cache_fill_flights.deinit();
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+
+    var owner_result = CollapseCaller{};
+    const owner_thread = try std.Thread.spawn(.{}, CollapseCaller.run, .{ &owner_result, "/park-deadline", &dispatch_ctx });
+    var owner_joined = false;
+    defer if (!owner_joined) {
+        origin.release();
+        owner_thread.join();
+    };
+    try origin.waitEntered(5_000);
+
+    var capture = H3CacheFillParkCapture{};
+    defer capture.cancelAndDeinit(allocator, .shutdown);
+    // A deadline already in the past, never an explicit cancel/reset: proves
+    // `isStopped()`'s wall-clock check alone -- not just a QUIC
+    // RESET_STREAM -- must stop the resume (#934 P2).
+    var deadline_token = http.cancellation.CancellationToken.init(compat.milliTimestamp() - 1);
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .stream_id = 9,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/park-deadline"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+        .cancel_token = &deadline_token,
+        .park_cache_fill = .{ .ctx = &capture, .park_fn = H3CacheFillParkCapture.park },
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &response, &dispatch_ctx));
+    try std.testing.expect(capture.parked != null);
+    try std.testing.expectEqual(@as(usize, 1), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    // Resuming a continuation whose deadline already passed must neither
+    // re-run routing/auth/the cache lookup (the response stays untouched)
+    // nor attempt a second origin fetch; it must still release its waiter
+    // slot exactly once.
+    try std.testing.expectError(error.RequestCancelled, capture.parked.?.run(allocator, &response));
+    try std.testing.expectEqual(http.Status.ok, response.status);
+    try std.testing.expect(response.body == null);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    capture.parked.?.deinit(allocator);
+    capture.parked = null;
+
+    origin.release();
+    owner_thread.join();
+    owner_joined = true;
+    if (owner_result.err) |err| return err;
+    try std.testing.expectEqual(@as(u16, 200), owner_result.status);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_flights.count());
+}
+
+test "H3 proxy response cache wakes waiters for an independent retry when the owner fill fails, and respects a canceled waiter's deadline without touching the origin (#934)(#945)" {
+    const allocator = std.testing.allocator;
+    var origin = try GatedH3ProxyOrigin.start(allocator, &.{
+        "garbage that is not a valid HTTP response status line\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=60\r\nContent-Length: 11\r\nConnection: close\r\n\r\nindependent",
+    });
+    defer origin.stop();
+    try origin.run();
+
+    var target_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "http://127.0.0.1:{d}", .{origin.port()});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/collapse-fail",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.proxy_cache_ttl_seconds = 60;
+    cfg.proxy_cache_stale_while_revalidate_seconds = 0;
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initCollapseTestState(allocator, &state);
+    defer deinitHttp3ProxyTestState(&state);
+    defer state.proxy_response_cache.?.deinit();
+    defer state.proxy_response_cache_fill_flights.deinit();
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+
+    var owner_result = CollapseCaller{};
+    const owner_thread = try std.Thread.spawn(.{}, CollapseCaller.run, .{ &owner_result, "/collapse-fail", &dispatch_ctx });
+    try origin.waitEntered(5_000);
+
+    // Already past its deadline before it ever asks to wait: proves
+    // cancellation short-circuits the wait immediately rather than riding
+    // out the owner's 2-second fill budget (#934 P2).
+    var canceled_token = http.cancellation.CancellationToken.init(1);
+    var canceled_result = CollapseCaller{ .cancel_token = &canceled_token };
+    const canceled_thread = try std.Thread.spawn(.{}, CollapseCaller.run, .{ &canceled_result, "/collapse-fail", &dispatch_ctx });
+
+    var independent_result = CollapseCaller{};
+    const independent_thread = try std.Thread.spawn(.{}, CollapseCaller.run, .{ &independent_result, "/collapse-fail", &dispatch_ctx });
+
+    const canceled_started_ms = compat.milliTimestamp();
+    canceled_thread.join();
+    const canceled_elapsed_ms = compat.milliTimestamp() - canceled_started_ms;
+    try std.testing.expect(canceled_elapsed_ms < 1_000);
+    if (canceled_result.err) |err| return err;
+    try std.testing.expectEqual(@as(u16, 504), canceled_result.status);
+
+    try waitForCollapsedWaiters(&state, 1, 5_000);
+    origin.release();
+
+    owner_thread.join();
+    if (owner_result.err) |err| return err;
+    try std.testing.expect(owner_result.status != 200);
+
+    independent_thread.join();
+    if (independent_result.err) |err| return err;
+    try std.testing.expectEqual(@as(u16, 200), independent_result.status);
+    try std.testing.expectEqualStrings("independent", independent_result.body[0..independent_result.body_len]);
+
+    try std.testing.expectEqual(@as(u32, 2), origin.requestCount());
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_flights.count());
 }
 
 fn handleHttp3StaticLocation(
@@ -4599,6 +5301,13 @@ const H3ProxyOrigin = struct {
         return std.mem.indexOf(u8, self.requests.items[index], needle) != null;
     }
 
+    fn requestContainsIgnoreCase(self: *H3ProxyOrigin, index: usize, needle: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (index >= self.requests.items.len) return false;
+        return std.ascii.indexOfIgnoreCase(self.requests.items[index], needle) != null;
+    }
+
     fn threadMain(self: *H3ProxyOrigin) void {
         var idx: usize = 0;
         while (idx < self.statuses.len) : (idx += 1) {
@@ -4623,12 +5332,127 @@ const H3ProxyOrigin = struct {
                 return;
             };
             self.mutex.unlock();
-            const body = if (self.statuses[idx] == 200) "ok" else "too early";
-            var response_buf: [256]u8 = undefined;
-            const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 {d} test\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
-                self.statuses[idx], body.len, body,
+            const status = self.statuses[idx];
+            const body = if (status == 200) "ok" else if (status == 304) "" else "too early";
+            const cache_headers = if (status == 200)
+                "Cache-Control: public, max-age=1\r\nETag: W/\"h3-v1\"\r\n"
+            else if (status == 304)
+                "Cache-Control: public, max-age=60\r\nETag: W/\"h3-v1\"\r\n"
+            else
+                "";
+            var response_buf: [384]u8 = undefined;
+            const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 {d} test\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+                status, cache_headers, body.len, body,
             }) catch return;
             _ = std.c.write(fd, response.ptr, response.len);
+        }
+    }
+};
+
+/// A real TCP origin whose first connection is held open -- read, but not
+/// answered -- until the test calls `release()`. Used to prove that several
+/// concurrent real H3 callers for the same cache key actually registered as
+/// collapsed waiters before the owner can complete, rather than inferring it
+/// from a fixed sleep (#945).
+const GatedH3ProxyOrigin = struct {
+    allocator: std.mem.Allocator,
+    listen_fd: std.posix.fd_t,
+    listen_port: u16,
+    thread: ?std.Thread = null,
+    stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    request_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Raw HTTP responses written in connection order; connection 0 is held
+    /// until `release()` and may be deliberately malformed.
+    responses: []const []const u8,
+
+    fn start(allocator: std.mem.Allocator, responses: []const []const u8) !GatedH3ProxyOrigin {
+        const listen_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+        try std.testing.expect(listen_fd >= 0);
+        _ = std.c.setsockopt(listen_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int));
+        var sin: std.c.sockaddr.in = .{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 0),
+            .addr = std.mem.nativeToBig(u32, 0x7f000001),
+            .zero = [_]u8{0} ** 8,
+        };
+        try std.testing.expect(std.c.bind(listen_fd, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) == 0);
+        try std.testing.expect(std.c.listen(listen_fd, 32) == 0);
+        var bound: std.c.sockaddr.in = undefined;
+        var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        try std.testing.expect(std.c.getsockname(listen_fd, @ptrCast(&bound), &bound_len) == 0);
+        return .{
+            .allocator = allocator,
+            .listen_fd = listen_fd,
+            .listen_port = std.mem.bigToNative(u16, bound.port),
+            .responses = responses,
+        };
+    }
+
+    fn run(self: *GatedH3ProxyOrigin) !void {
+        self.thread = try std.Thread.spawn(.{}, GatedH3ProxyOrigin.threadMain, .{self});
+    }
+
+    fn stop(self: *GatedH3ProxyOrigin) void {
+        self.stop_flag.store(true, .seq_cst);
+        self.release_flag.store(true, .release);
+        if (self.thread) |_| {
+            if (compat.tcpConnectToHost(self.allocator, "127.0.0.1", self.port())) |stream| {
+                stream.close();
+            } else |_| {}
+        }
+        if (self.thread) |thread| thread.join();
+        _ = std.c.close(self.listen_fd);
+        self.* = undefined;
+    }
+
+    fn port(self: *const GatedH3ProxyOrigin) u16 {
+        return self.listen_port;
+    }
+
+    fn waitEntered(self: *const GatedH3ProxyOrigin, timeout_ms: u64) !void {
+        const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (compat.milliTimestamp() < deadline) {
+            if (self.entered.load(.acquire)) return;
+            compat.sleepNs(1 * std.time.ns_per_ms);
+        }
+        return error.GatedUpstreamNotEntered;
+    }
+
+    fn release(self: *GatedH3ProxyOrigin) void {
+        self.release_flag.store(true, .release);
+    }
+
+    fn requestCount(self: *const GatedH3ProxyOrigin) u32 {
+        return self.request_count.load(.acquire);
+    }
+
+    fn threadMain(self: *GatedH3ProxyOrigin) void {
+        var idx: usize = 0;
+        while (idx < self.responses.len and !self.stop_flag.load(.seq_cst)) : (idx += 1) {
+            const fd = std.c.accept(self.listen_fd, null, null);
+            if (fd < 0) return;
+            defer _ = std.c.close(fd);
+            var raw = std.ArrayList(u8).empty;
+            defer raw.deinit(self.allocator);
+            var buf: [1024]u8 = undefined;
+            while (true) {
+                const n = std.c.read(fd, &buf, buf.len);
+                if (n <= 0) return;
+                raw.appendSlice(self.allocator, buf[0..@intCast(n)]) catch return;
+                if (std.mem.indexOf(u8, raw.items, "\r\n\r\n") != null) break;
+            }
+            _ = self.request_count.fetchAdd(1, .release);
+            if (idx == 0) {
+                self.entered.store(true, .release);
+                while (!self.release_flag.load(.acquire)) {
+                    if (self.stop_flag.load(.seq_cst)) return;
+                    compat.sleepNs(1 * std.time.ns_per_ms);
+                }
+                if (self.stop_flag.load(.seq_cst)) return;
+            }
+            _ = std.c.write(fd, self.responses[idx].ptr, self.responses[idx].len);
         }
     }
 };
@@ -6346,9 +7170,32 @@ pub fn handleHttp3Request(
     );
 
     var effective_ctx = ctx.*;
+    effective_ctx.root_ctx = ctx.root_ctx orelse ctx;
     effective_ctx.cfg = effective_cfg;
     effective_ctx.cfg_lease = &cfg_lease;
     effective_ctx.client_ip = client_ip;
+    var fallback_cancel_token = http.cancellation.CancellationToken.init(0);
+    const cancel_token = request.cancel_token orelse &fallback_cancel_token;
+    if (effective_cfg.request_total_timeout_ms > 0) {
+        // Anchor the deadline to the reactor's admission timestamp, not to
+        // now: a request queued behind a bounded H3 worker pool must not
+        // get a fresh budget on dequeue, or `request_total_timeout_ms`
+        // stops bounding total request lifetime under worker saturation.
+        const admitted_at_ms = if (request.admitted_at_ms != 0) request.admitted_at_ms else compat.milliTimestamp();
+        const request_deadline = admitted_at_ms + @as(i64, effective_cfg.request_total_timeout_ms);
+        if (cancel_token.deadline_ms == 0 or cancel_token.deadline_ms > request_deadline) {
+            cancel_token.deadline_ms = request_deadline;
+        }
+        // The configured total-request budget was already exhausted by the
+        // time this job reached a worker (e.g. queued behind a saturated
+        // bounded executor): stop before routing/auth/cache/origin rather
+        // than letting a dequeued-but-dead job spend a fresh budget. This is
+        // distinct from the cache-fill park/resume path, which always parks
+        // and defers its own cancellation check to resume time regardless
+        // of `request_total_timeout_ms`.
+        if (cancel_token.isStopped()) return error.RequestCancelled;
+    }
+    effective_ctx.cancel_token = cancel_token;
 
     // Preserve the H1 invariant that replay rejection happens before auth,
     // rate-limit, approval, or upstream side effects. The normal H3 router
@@ -6445,7 +7292,7 @@ pub fn logAccessForRequest(state: *GatewayState, ctx: *const http.request_contex
 pub fn logAccess(state: *GatewayState, ctx: *const http.request_context.RequestContext, method: []const u8, path: []const u8, status: u16, user_agent: []const u8) void {
     state.metricsRecordLatencyMs(ctx.elapsedMs());
     const cancel_reason: []const u8 = if (ctx.lifecycle) |lc|
-        if (lc.token.reason) |reason| @tagName(reason) else ""
+        if (lc.token.cancelReason()) |reason| @tagName(reason) else ""
     else
         "";
     const entry = http.access_log.AccessLogEntry{

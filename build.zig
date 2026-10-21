@@ -42,6 +42,13 @@ pub fn build(b: *std.Build) void {
     const app_version = b.option([]const u8, "version", "Version string embedded in the tardi binary") orelse "dev";
     const commit_sha = b.option([]const u8, "commit", "Source commit SHA embedded in benchmark/diagnostic metadata (default: `git rev-parse HEAD`, or \"unknown\")") orelse gitCommitSha(b);
     const go_bin = b.option([]const u8, "go-bin", "Go command used to build the PKI crypto/x509 oracle") orelse "go";
+    // #944: selects a named subsystem/test out of the ~2000-case
+    // `exe_unit_tests` population (the `src/main.zig` test tree) for
+    // `test-exe-filtered`, without compiling a second test runner and
+    // without running the whole population. Required for that step (see its
+    // definition below): the step fails closed, rather than silently running
+    // (or silently skipping) everything, when this is omitted.
+    const exe_test_filter = b.option([]const u8, "exe-test-filter", "Select a named subsystem/test from exe_unit_tests for the test-exe-filtered step (required for that step; fails the build if it matches zero tests)");
     const quic_test_filter = b.option([]const u8, "quic-test-filter", "Filter tests run by the test-quic step");
     const quic_test_filters: []const []const u8 = if (quic_test_filter) |filter| &.{filter} else &.{};
     const crypto_test_filter = b.option([]const u8, "crypto-test-filter", "Filter tests run by the test-crypto-provider-fuzz step");
@@ -131,6 +138,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/crypto/root.zig"),
         .target = target,
         .optimize = optimize,
+        // #944: rsa.zig's own tests read `TARDIGRADE_TEST_FAST` via
+        // `std.c.getenv` to skip the large-RSA-keygen cases under
+        // `zig build test-fast`.
+        .link_libc = true,
     });
     crypto_mod.addImport("crypto_secrets", crypto_secrets_mod);
     const pki_mod = b.createModule(.{
@@ -368,6 +379,7 @@ pub fn build(b: *std.Build) void {
         "tardigrade_bin_path",
         b.option([]const u8, "tardigrade-bin-path", "Path to the tardi executable used by integration tests") orelse b.getInstallPath(.bin, "tardi"),
     );
+    integration_options.addOption([]const u8, "h3_interop_tool_path", b.getInstallPath(.bin, "h3_interop_tool"));
 
     integration_options.addOption(bool, "acme_experimental", acme_experimental);
 
@@ -459,6 +471,90 @@ pub fn build(b: *std.Build) void {
     run_explain_integration_tests.step.dependOn(b.getInstallStep());
     const explain_integration_step = b.step("test-integration-explain", "Run tardi explain <field> real-binary regression tests");
     explain_integration_step.dependOn(&run_explain_integration_tests.step);
+
+    // #945: the curated PR-smoke live-process subset -- startup/health,
+    // proxy round-trip, request-policy/auth-denied origin side effect,
+    // invalid-config/reload, auth-gated cache isolation, and one native
+    // H1/H2/TLS boundary case plus bounded H1/H3 cache-collapse acceptance
+    // -- instead of the full `test-integration`
+    // suite on ordinary PRs (see ci.yml's `integration-test` job and
+    // docs/CI.md). Each named filter below is a stable, existing
+    // `tests/integration.zig` test name, not a new test. Unlike
+    // `test-integration-native-tls`'s combined multi-name `.filters` above,
+    // each name here gets its own #944 `count_named_exe_test_matches.zig`
+    // zero-match probe: a single multi-name probe would stay nonzero (and
+    // silently pass) as long as just one of the five names still matched
+    // something, letting a rename/removal of any other named case quietly
+    // drop out of smoke coverage instead of failing the build.
+    const integration_smoke_filters = &[_][]const u8{
+        "bearclaw edge prefix routes health without auth and enforces auth on v1 paths",
+        "jwt auth rejects malformed bearer and invalid signature without proxying",
+        "invalid reload leaves the previous config active (#170)",
+        "native TLS listener dispatches ALPN h2 through HTTP/2 frames",
+        "forward_auth responses are never shared-cacheable over h1",
+        "generic proxy response cache collapses concurrent misses to one origin fill (#934)",
+        "h3interop.cache_fill_reset releases waiter and unrelated QUIC request progresses before owner (#934)",
+    };
+    const integration_smoke_step = b.step("test-integration-smoke", "Run the curated PR-smoke live-process integration subset (#945), including deterministic H1/H3 cache-collapse acceptance; fails closed if any named case matches nothing");
+    for (integration_smoke_filters) |filter_name| {
+        const probe = b.addTest(.{
+            .root_module = integration_mod,
+            .filters = &.{filter_name},
+            .test_runner = .{
+                .path = b.path("scripts/count_named_exe_test_matches.zig"),
+                .mode = .simple,
+            },
+        });
+        integration_smoke_step.dependOn(&b.addRunArtifact(probe).step);
+    }
+    const integration_smoke_tests = b.addTest(.{
+        .root_module = integration_mod,
+        .filters = integration_smoke_filters,
+    });
+    const run_integration_smoke_tests = b.addRunArtifact(integration_smoke_tests);
+    run_integration_smoke_tests.step.dependOn(b.getInstallStep());
+    integration_smoke_step.dependOn(&run_integration_smoke_tests.step);
+
+    // #945: the focused ACME-experimental smoke case for ordinary PRs --
+    // the real HTTP-01 issuance -> CA-verified native TLS listener
+    // acceptance test -- instead of the full `test-integration
+    // -Dacme-experimental` suite (see ci.yml's `acme-experimental-integration`
+    // job). Pair with `test-acme -Dacme-experimental` for the unit side.
+    const integration_acme_smoke_filters = &[_][]const u8{
+        "automatic HTTPS (#884): a live HTTP-01 issuance activates a CA-verified TLS listener",
+    };
+    const integration_acme_smoke_step = b.step("test-integration-acme-smoke", "Run the focused ACME-experimental PR-smoke case (#945): a live HTTP-01 issuance activating a CA-verified native TLS listener; requires -Dacme-experimental and fails closed without it or if the filter matches nothing");
+    if (!acme_experimental) {
+        // The target case checks `integration_options.acme_experimental` at
+        // runtime and calls `return error.SkipZigTest` when it's unset, so
+        // the #944 compiled-test-inventory zero-match guard below cannot see
+        // this case: the filter still matches a real named test, which still
+        // compiles and "passes" by skipping -- exactly the "skipped/success"
+        // false-green #945 forbids for a curated smoke selection. Check the
+        // flag directly instead of relying on the runtime skip to surface.
+        const missing_acme_experimental = b.addFail("test-integration-acme-smoke requires -Dacme-experimental; its target case skips itself (reporting success) without it, which would otherwise silently provide zero coverage");
+        integration_acme_smoke_step.dependOn(&missing_acme_experimental.step);
+    } else {
+        // Same zero-match guard as `test-integration-smoke` above, for a
+        // rename/removal of the named case once -Dacme-experimental is set.
+        const integration_acme_smoke_probe = b.addTest(.{
+            .root_module = integration_mod,
+            .filters = integration_acme_smoke_filters,
+            .test_runner = .{
+                .path = b.path("scripts/count_named_exe_test_matches.zig"),
+                .mode = .simple,
+            },
+        });
+        const run_integration_acme_smoke_probe = b.addRunArtifact(integration_acme_smoke_probe);
+        const integration_acme_smoke_tests = b.addTest(.{
+            .root_module = integration_mod,
+            .filters = integration_acme_smoke_filters,
+        });
+        const run_integration_acme_smoke_tests = b.addRunArtifact(integration_acme_smoke_tests);
+        run_integration_acme_smoke_tests.step.dependOn(b.getInstallStep());
+        integration_acme_smoke_step.dependOn(&run_integration_acme_smoke_probe.step);
+        integration_acme_smoke_step.dependOn(&run_integration_acme_smoke_tests.step);
+    }
 
     // Resumption/0-RTT external interop, restart, and soak suite (#369, and
     // #522's `h3interop.*` QUIC/H3 cases -- `h3interop.` contains the
@@ -627,6 +723,46 @@ pub fn build(b: *std.Build) void {
     crypto_step.dependOn(&crypto_boundary_audit.step);
     test_step.dependOn(&run_crypto_boundary_audit_tests.step);
     test_step.dependOn(&crypto_boundary_audit.step);
+
+    // #944: compiled-test-inventory zero-match guard for the new
+    // `-Dexe-test-filter`/`test-exe-filtered` step below. See that tool's
+    // doc comment for why this queries the compiler's own post-filter test
+    // inventory for the exact `exe_test_mod` compilation `test-exe-filtered`
+    // runs, rather than approximating it by walking source text.
+    const exe_test_filter_guard_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/count_named_exe_test_matches.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const exe_test_filter_guard_tests = b.addTest(.{ .root_module = exe_test_filter_guard_mod });
+    const run_exe_test_filter_guard_tests = b.addRunArtifact(exe_test_filter_guard_tests);
+    test_step.dependOn(&run_exe_test_filter_guard_tests.step);
+
+    // End-to-end regression for the guard above: spawns the real `zig`
+    // compiler against fixture files to prove it rejects a filter that only
+    // reaches a comptime-unselected branch, accepts one that reaches a real
+    // named test, and that an ordinary failing selected test still fails on
+    // its own. See tests/exe_test_filter_guard_integration.zig.
+    const exe_test_filter_guard_integration_options = b.addOptions();
+    exe_test_filter_guard_integration_options.addOption([]const u8, "zig_exe_path", b.graph.zig_exe);
+    exe_test_filter_guard_integration_options.addOption(
+        []const u8,
+        "count_named_exe_test_matches_path",
+        b.pathFromRoot("scripts/count_named_exe_test_matches.zig"),
+    );
+    const exe_test_filter_guard_integration_mod = b.createModule(.{
+        .root_source_file = b.path("tests/exe_test_filter_guard_integration.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    exe_test_filter_guard_integration_mod.addImport("zig_compat", host_compat_mod);
+    exe_test_filter_guard_integration_mod.addImport(
+        "exe_test_filter_guard_integration_options",
+        exe_test_filter_guard_integration_options.createModule(),
+    );
+    const exe_test_filter_guard_integration_tests = b.addTest(.{ .root_module = exe_test_filter_guard_integration_mod });
+    const run_exe_test_filter_guard_integration_tests = b.addRunArtifact(exe_test_filter_guard_integration_tests);
+    test_step.dependOn(&run_exe_test_filter_guard_integration_tests.step);
 
     // Bounded session-resumption cache (#364/#365). Kept as a standalone
     // test target for focused cache/persistence coverage, while also exported
@@ -978,6 +1114,9 @@ pub fn build(b: *std.Build) void {
         .root_module = h3_interop_mod,
     });
     const h3_interop_install = b.addInstallArtifact(h3_interop_tool, .{});
+    run_integration_tests.step.dependOn(&h3_interop_install.step);
+    run_integration_smoke_tests.step.dependOn(&h3_interop_install.step);
+    run_resumption_interop_tests.step.dependOn(&h3_interop_install.step);
     const h3_interop_step = b.step("build-h3-interop", "Build the native HTTP/3 interop client/server tool");
     h3_interop_step.dependOn(&h3_interop_install.step);
     const h3_interop_tests = b.addTest(.{ .root_module = h3_interop_mod });
@@ -1208,6 +1347,107 @@ pub fn build(b: *std.Build) void {
     const pki_reduce_step = b.step("test-pki-reduce", "Run offline PKI mismatch-minimization tests");
     pki_reduce_step.dependOn(&run_pki_reduce_tests.step);
     test_step.dependOn(&run_pki_reduce_tests.step);
+
+    // #944: run a single named subsystem/test out of the ~2000-case
+    // exe_unit_tests population (`src/main.zig`'s test tree) without
+    // executing the whole population at runtime. `-Dexe-test-filter` is
+    // required: an omitted filter fails the build via
+    // `missing_exe_test_filter` instead of silently running (or silently
+    // skipping) everything, and a filter that matches zero named tests
+    // fails via the compiled-test-inventory guard built from
+    // `scripts/count_named_exe_test_matches.zig` instead of silently
+    // passing on the always-present unnamed `refAllDecls` smoke test (see
+    // that tool's doc comment). An empty string is a distinct, realistic
+    // misuse (e.g. an unset shell variable in
+    // `-Dexe-test-filter="$TEST_NAME"`): Zig's own `.filters = &.{""}`
+    // matches every test name via empty-substring semantics, so it is
+    // rejected the same way as an omitted filter rather than silently
+    // running the whole population.
+    const test_exe_filtered_step = b.step("test-exe-filtered", "Run exactly the exe_unit_tests named by -Dexe-test-filter=<substring>, without running the whole src/main.zig test population (#944)");
+    if (exe_test_filter) |filter| {
+        if (std.mem.trim(u8, filter, " \t\r\n").len == 0) {
+            const empty_exe_test_filter = b.addFail("test-exe-filtered requires a non-empty -Dexe-test-filter=<substring>; an empty filter would match every exe_unit_tests name instead of naming the test(s) to run");
+            test_exe_filtered_step.dependOn(&empty_exe_test_filter.step);
+        } else {
+            const exe_test_filter_probe = b.addTest(.{
+                .root_module = exe_test_mod,
+                .filters = &.{filter},
+                .test_runner = .{
+                    .path = b.path("scripts/count_named_exe_test_matches.zig"),
+                    .mode = .simple,
+                },
+            });
+            const run_exe_test_filter_probe = b.addRunArtifact(exe_test_filter_probe);
+            const exe_test_filtered = b.addTest(.{ .root_module = exe_test_mod, .filters = &.{filter} });
+            const run_exe_test_filtered = b.addRunArtifact(exe_test_filtered);
+            test_exe_filtered_step.dependOn(&run_exe_test_filter_probe.step);
+            test_exe_filtered_step.dependOn(&run_exe_test_filtered.step);
+        }
+    } else {
+        const missing_exe_test_filter = b.addFail("test-exe-filtered requires -Dexe-test-filter=<substring> naming the test(s) to run (e.g. `zig build test-exe-filtered -Dexe-test-filter=\"jwt\"`); omitting it would otherwise have to either run the entire population or silently skip it");
+        test_exe_filtered_step.dependOn(&missing_exe_test_filter.step);
+    }
+
+    // #944: bounded fast developer/agent iteration gate. Every run artifact
+    // below is the *same* one `test` depends on (nothing is recompiled or
+    // re-specified with different semantics) except for two deliberate
+    // differences, both documented in CONTRIBUTING.md's "Test performance"
+    // section alongside the profiling evidence that motivated them:
+    //
+    //   1. `crypto_tests`/`record_mode_handshake_tests` are re-run (the
+    //      already-built binaries, not recompiled) with
+    //      `TARDIGRADE_TEST_FAST=1` set, which skips exactly the two
+    //      large-RSA-3072/4096-keygen cases that otherwise dominate this
+    //      run's wall time in a Debug build's unoptimized bigint modexp
+    //      (~45s of the ~120s warm-cache baseline, combined). The same
+    //      variable also trims a third, smaller `crypto/rsa.zig` negative
+    //      test down to one representative mutation case instead of seven,
+    //      rather than skipping it outright -- a malformed-key rejection
+    //      stays covered in `test-fast`. The default `test`/`test-crypto`/
+    //      `test-tls` steps leave the variable unset and still exercise
+    //      every case every time.
+    //   2. Four targets are omitted outright, each for a reason already
+    //      documented at its own definition above and each still reachable
+    //      through its existing dedicated/standalone step and the default
+    //      `test` step: the real-socket QUIC/H3 UDP smoke test (timer/
+    //      socket-bound, unreliable under sandboxed environments), the H3
+    //      soak, the out-of-process OpenSSL differential (subprocess-spawn
+    //      overhead), and the benchmark-suite correctness smoke (a
+    //      benchmark workload, not a regression test).
+    //
+    // Nothing is deleted and `zig build test` is untouched: it is still the
+    // complete, unfiltered gate every target above belongs to.
+    const crypto_tests_fast = b.addRunArtifact(crypto_tests);
+    crypto_tests_fast.setEnvironmentVariable("TARDIGRADE_TEST_FAST", "1");
+    const record_mode_handshake_tests_fast = b.addRunArtifact(record_mode_handshake_tests);
+    record_mode_handshake_tests_fast.setEnvironmentVariable("TARDIGRADE_TEST_FAST", "1");
+
+    const test_fast_step = b.step("test-fast", "Bounded fast developer/agent test gate (#944): targets <2 minutes warm-cache on the reference machine documented in CONTRIBUTING.md's \"Test performance\" section; pair with --test-timeout to bound an individual hung test, e.g. `zig build test-fast --test-timeout 30s`");
+    test_fast_step.dependOn(&run_exe_unit_tests.step);
+    test_fast_step.dependOn(&run_tls_core_tests.step);
+    test_fast_step.dependOn(&run_compat_tests.step);
+    test_fast_step.dependOn(&run_allocation_regression_tests.step);
+    test_fast_step.dependOn(&run_quic_tests.step);
+    test_fast_step.dependOn(&run_quic_varint_tests.step);
+    test_fast_step.dependOn(&crypto_tests_fast.step);
+    test_fast_step.dependOn(&run_crypto_secret_tests.step);
+    test_fast_step.dependOn(&run_crypto_boundary_audit_tests.step);
+    test_fast_step.dependOn(&crypto_boundary_audit.step);
+    test_fast_step.dependOn(&run_exe_test_filter_guard_tests.step);
+    test_fast_step.dependOn(&run_session_cache_tests.step);
+    test_fast_step.dependOn(&run_session_cache_persistence_tests.step);
+    test_fast_step.dependOn(&run_crypto_vector_tests.step);
+    test_fast_step.dependOn(&run_crypto_corpus_tests.step);
+    test_fast_step.dependOn(&run_crypto_provider_fuzz_tests.step);
+    test_fast_step.dependOn(&record_mode_handshake_tests_fast.step);
+    test_fast_step.dependOn(&run_key_schedule_tests.step);
+    test_fast_step.dependOn(&run_http3_tests.step);
+    test_fast_step.dependOn(&run_quic_h3_smoke_tests.step);
+    test_fast_step.dependOn(&run_quic_h3_e2e_tests.step);
+    test_fast_step.dependOn(&run_tls_interop_matrix_tests.step);
+    test_fast_step.dependOn(&run_h3_interop_tests.step);
+    test_fast_step.dependOn(&run_pki_tests.step);
+    test_fast_step.dependOn(&run_pki_reduce_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

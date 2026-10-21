@@ -49,6 +49,10 @@ zig fmt --check build.zig src/ tests/
 # Unit tests (matches CI)
 zig build test --summary all --error-style verbose
 
+# Bounded fast developer/agent gate -- use this for ordinary edit/test/review
+# iteration instead of the full `test` above (see "Test performance" below)
+zig build test-fast --summary all --error-style verbose
+
 # Stable Web PKI differential corpus (requires OpenSSL and Go)
 zig build test-pki-differential --summary all --error-style verbose
 
@@ -62,6 +66,14 @@ zig build test-pki-reduce --summary all --error-style verbose
 # Integration tests — builds and drives a live tardigrade process against
 # mock upstreams; requires system OpenSSL. Not required for most contributions.
 zig build test-integration
+
+# Bounded curated smoke subset of the above (#945): startup/health, proxy
+# round-trip, auth-denied origin side effect, invalid config/reload,
+# auth-gated cache isolation, and one native H1/H2/TLS boundary case. This
+# is what PR CI's smoke mode runs
+# instead of the full `test-integration` above; use it locally for a fast
+# live-process sanity check instead of the full suite.
+zig build test-integration-smoke
 
 # Failure-mode / chaos suite — a filtered view of the integration harness that
 # exercises broken origins and clients (see "Failure-mode harness" below).
@@ -84,6 +96,140 @@ harness failures, not ordinary certificate rejections. The Go crypto/x509
 oracle is built once as a test helper and invoked directly; use
 `zig build -Dgo-bin=/path/to/go test-pki-differential` when a non-default Go
 tool is required.
+
+## Test performance
+
+**Agent/local iteration runs `zig build test-fast`, not `zig build test`.**
+The default `test` step is the complete, unfiltered gate (28 run artifacts,
+~4,850 test cases as of #944) and CI still runs it in full; it is not a fast
+edit/test/review loop. Don't wait on or repeatedly re-run the full `zig build
+test` locally -- use `test-fast` below, and treat independently-running CI as
+the evidence for the full suite once it finishes.
+
+### Agent execution policy (#945)
+
+A local agent (or human doing fast iteration) should, for an ordinary patch:
+
+- Run `zig fmt --check build.zig src/ tests/`.
+- Run `zig build test-fast` (or a single narrower target: `test-exe-filtered
+  -Dexe-test-filter=<name>`, `test-crypto`, `test-tls`, etc. -- whichever
+  covers the area actually touched).
+- When the change touches a live-process path, run a scoped integration
+  target (`test-integration-smoke`, `test-failure`, or a single
+  `test-integration -Dintegration-test-filter=<name>` case) -- not the full
+  `test-integration` suite.
+- **Must not** launch and then repeatedly re-poll a complete `zig build test`
+  or `zig build test-integration` across many wakeup cycles: those are the
+  full gate, independently run by CI (and, since #945, by a weekly scheduled
+  full run against `main` -- see docs/CI.md), not a local iteration loop.
+  Full CI status is the thing to check at handoff/merge, not to reproduce
+  locally beforehand.
+- Apply a hard local runtime budget and treat a timeout as a failure, not as
+  "still running, keep waiting": roughly 120s for a fast/filtered target,
+  5 minutes for a scoped integration target (tune against this file's
+  measured baselines below; both support `--test-timeout`, e.g. `zig build
+  test-fast --test-timeout 30s`). Never silently drop or ignore a timeout --
+  report it as the failure it is.
+
+If something *outside this repo* (e.g. an AI-Manager controller) is the one
+forcibly waiting or repeatedly polling for a test run to finish, that is a
+controller-side bug to fix in its own project, not a reason to add a
+scheduler or polling loop inside Tardigrade.
+
+```bash
+# Bounded fast developer/agent gate: targets <2 minutes warm-cache (see the
+# reference baseline below). Omits four targets that each have their own
+# dedicated step and still run under the default `test`/CI; see their
+# reasons at each target's definition in build.zig.
+zig build test-fast --summary all --error-style verbose
+
+# Same, with a hard per-test ceiling so a newly-introduced hang fails
+# immediately instead of spinning:
+zig build test-fast --summary all --test-timeout 30s
+```
+
+### Baseline (#944)
+
+Measured 2026-10-20 on the reference machine: Apple M4, 10 cores, macOS
+Darwin 25.3.0, Zig 0.16.0, `-Doptimize=Debug` (the default), warm
+`.zig-cache` (no recompilation; every number below is pure test-run wall
+time). These are real measurements on one machine, not promises for every
+machine -- a slower CI runner or a cold cache will be higher; see the
+acceptance note in #944.
+
+| Run | Wall clock |
+| --- | --- |
+| `zig build test` (full, unfiltered) | ~100-120s |
+| `zig build test-fast` | ~95-120s (observed across repeated runs; system load/thermal throttling noise, not a regression) |
+
+Per-run-artifact breakdown of `zig build test`, slowest first (28 run
+artifacts total; this is every one that took at least a few seconds):
+
+| Test target | Tests | Wall time | Notes |
+| --- | --- | --- | --- |
+| `exe_unit_tests` (the `src/main.zig` tree) | 1,980 | ~60s | Large by count (~30ms/test average), not by any single pathological case. |
+| `crypto_mod` tests (`test-crypto`'s core) | 59 | ~58s | Dominated by one case (below). |
+| `tls13_backend_tests.zig` (`test-tls`'s record-mode handshake suite) | 283 | ~46s | Dominated by one case (below). |
+| `quic_h3_udp_smoke.zig` (real-socket UDP smoke, part of `test-quic`) | 24 | ~11s | Real loopback sockets + poll(2) timers; previously found unreliable under sandboxed/CI environments. |
+| `tls_core` tests (`test-tls`'s main suite) | 755 | ~11s | Large by count, unremarkable average. |
+| `session_cache.zig` + `session_cache_persistence.zig` | 494 | ~14s combined | |
+
+Two single test cases account for **~42s** of the full suite's wall time by
+themselves -- RSA-3072/4096 key generation and signing, which is inherently
+expensive arithmetic (large-modulus `std.crypto.ff` modular exponentiation)
+that gets no optimization in a Debug build:
+
+- `crypto/rsa.zig`: `"RSA-3072 and RSA-4096 private keys sign messages the
+  native verifier accepts"` -- **~21s** alone (confirmed via a temporary
+  `-Dcrypto-test-filter`-equivalent rebuild isolating just this case).
+- `tls/tls13_backend_tests.zig`: `"#335 RSA-3072 and RSA-4096
+  CertificateVerify signatures fit the TLS engine buffer"` -- **~21s** alone,
+  via the same large keygen+sign path reached through a real TLS handshake.
+- A second, smaller contributor in `crypto/rsa.zig`: `"RSA private-key DER
+  rejects every component mutation that breaks a required relationship"` --
+  **~11s** (7 full-modulus validations against a 2048-bit key per mutation
+  case).
+
+These are genuine correctness regressions, not spins or bugs, so they are not
+deleted. `zig build test-fast` sets `TARDIGRADE_TEST_FAST=1`, which the first
+two tests above check (via `std.c.getenv`, matching the existing
+`TARDIGRADE_SOAK_HEAVY` convention in `tests/http3_soak.zig`) to skip
+themselves entirely; every other invocation -- `zig build test`, `zig build
+test-crypto`, `zig build test-tls`, CI -- leaves the variable unset and still
+runs them. The third, smaller test above checks the same variable but does
+not skip itself: it instead runs only its first mutation case (still proving
+a malformed CRT relationship is rejected) instead of all seven, so a
+representative negative-security regression stays in `test-fast` rather than
+being dropped outright. `test-fast` also omits, entirely (each already has its own
+dedicated/standalone step, unaffected, and the default `test` step still runs
+all four):
+
+- `test-quic`'s real-socket UDP smoke (`quic_h3_udp_smoke.zig`, ~11s) --
+  sandbox/CI-unreliable per the note above.
+- The H3 soak (`tests/http3_soak.zig`) -- an explicit soak workload, not a
+  bounded regression test.
+- `test-crypto-openssl` -- spawns a real `openssl`/EVP-oracle subprocess per
+  case; differential/interop tooling, not a pure-Zig regression.
+- `test-crypto-bench`'s correctness smoke -- a benchmark workload's sanity
+  check, not a regression test; `bench-crypto` runs the full suite.
+
+### Running one named test without the whole population
+
+```bash
+# Select a single named test/subsystem from exe_unit_tests (the src/main.zig
+# test tree, ~2000 cases) without compiling a second test runner and without
+# running the rest of the population:
+zig build test-exe-filtered -Dexe-test-filter="jwt"
+```
+
+`-Dexe-test-filter` is required for this step -- omitting it fails the build
+rather than silently running (or silently skipping) everything. A filter that
+matches zero named tests also fails the build, via a small checked-in guard
+(`scripts/count_named_exe_test_matches.zig`) that queries the compiler's own
+post-filter test inventory for the real compilation: Zig's own test
+filtering has no "zero tests matched" failure mode on its own (`src/main.zig`'s
+always-present unnamed `refAllDecls` smoke test still runs and still reports
+success), so a stale or typo'd filter would otherwise pass silently.
 
 ## Failure-mode harness
 
@@ -113,7 +259,7 @@ Reload-during-active-streams and graceful-shutdown-under-load are covered by the
 `#170` tests in the same file. The suite is part of `test-integration`, so CI
 running `zig build test-integration` also runs it; use `zig build test-failure`
 locally to iterate on just these scenarios. Run a single scenario with a name
-filter, e.g. `zig build test-integration -- --test-filter "failure: client abort"`.
+filter, e.g. `zig build test-integration -Dintegration-test-filter="failure: client abort"`.
 
 ## Build options
 
@@ -138,10 +284,14 @@ zig build -Doptimize=ReleaseFast
 # Static production binary (Linux; no OpenSSL dependency)
 zig build -Dstatic-executable=true -Drequire-static-system-libs=true
 
-# Run a specific test by name filter
-zig build test -- --test-filter "jwt"
+# Run a single named test/subsystem out of exe_unit_tests (the src/main.zig
+# test tree) without running the whole ~2000-case population (#944). Note:
+# `zig build test -- --test-filter ...` does *not* do this -- `--` arguments
+# are only forwarded to `zig build run`, not to any test step.
+zig build test-exe-filtered -Dexe-test-filter="jwt"
 
-# Per-test timeout (Zig build-runner flag)
+# Per-test timeout (Zig build-runner flag): bounds every test in whichever
+# step(s) you run, terminating (not hanging) one that spins past the deadline.
 zig build test --test-timeout 10s
 ```
 

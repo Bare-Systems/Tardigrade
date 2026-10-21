@@ -50,6 +50,26 @@ pub const PublishedCheck = struct {
     }
 };
 
+/// Injectable Unix-seconds clock for the `ChallengeStore` TTL check
+/// (`acme_challenge_store.zig`'s `now`/`expires_at` are always Unix
+/// seconds). Defaults to the real wall clock; a test driving the order
+/// engine's own `orders.UnixClock` off a fake clock can hand this listener
+/// the identical fake, so a challenge's publish-to-expiry window is bounded
+/// by one controlled clock instead of a real-time race between the two
+/// (#883 P2 review).
+pub const UnixNow = struct {
+    ctx: ?*anyopaque = null,
+    nowFn: *const fn (ctx: ?*anyopaque) i64 = realNow,
+
+    fn realNow(_: ?*anyopaque) i64 {
+        return compat.unixTimestamp();
+    }
+
+    pub fn now(self: UnixNow) i64 {
+        return self.nowFn(self.ctx);
+    }
+};
+
 /// Design §8.3: optional HTTP->HTTPS redirect, served by this listener for
 /// managed hosts only, only once published (never for a first-run
 /// deployment whose certificate does not exist yet).
@@ -76,6 +96,8 @@ pub const Options = struct {
     total_deadline_ms: u32 = default_total_deadline_ms,
     /// `null` (the default): never redirect, exactly today's behavior.
     https_redirect: ?HttpsRedirectOptions = null,
+    /// Defaults to the real wall clock; see `UnixNow`.
+    unix_now: UnixNow = .{},
 };
 
 /// A peer's raw address bytes, family-tagged, for per-IP admission counting.
@@ -136,6 +158,7 @@ pub const Listener = struct {
     head_read_deadline_ms: u32,
     total_deadline_ms: u32,
     https_redirect: ?HttpsRedirectOptions,
+    unix_now: UnixNow,
     stopping: std.atomic.Value(bool) = .init(false),
     slots_mutex: compat.Mutex = .{},
     slots: [default_max_connections]ConnSlot = @splat(.{}),
@@ -168,6 +191,7 @@ pub const Listener = struct {
             .head_read_deadline_ms = options.head_read_deadline_ms,
             .total_deadline_ms = options.total_deadline_ms,
             .https_redirect = options.https_redirect,
+            .unix_now = options.unix_now,
         };
         self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
     }
@@ -475,7 +499,7 @@ pub const Listener = struct {
             respondStatus(self.allocator, fd, total_deadline_ns, .misdirected_request);
             return;
         };
-        const key_auth = self.store.getCopy(self.allocator, compat.unixTimestamp(), managed_host, token) orelse {
+        const key_auth = self.store.getCopy(self.allocator, self.unix_now.now(), managed_host, token) orelse {
             respondStatus(self.allocator, fd, total_deadline_ns, .not_found);
             return;
         };

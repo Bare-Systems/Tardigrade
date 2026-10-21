@@ -399,16 +399,43 @@ test "ACME A3 (#883): the real listener serves issuance again after a stop/resta
     try testing.expectEqual(@as(usize, 0), env.listener.activeConnections());
 }
 
-/// Live-fetches `host`/`token` on the real listener before and after a real
-/// wall-clock sleep, so a single hook invocation (itself a blocking read
-/// inside the production authorization *poll* call) can observe the
-/// published challenge both live and -- purely through `ChallengeStore`'s
-/// own TTL enforcement, never an explicit `store.remove` -- expired, while
-/// the order engine itself is still blocked in that very call, not yet past
-/// any deadline/cleanup check of its own (#883 P2 review).
+/// Shared, independently advanceable Unix-seconds clock the order engine's
+/// own `ChallengeStore` admission (`orders_mod.Options.unix_clock`) and this
+/// real listener's own TTL check (`listener_mod.Options.unix_now`) are both
+/// pointed at, instead of each reading the real wall clock on its own. A
+/// published challenge's live window is then bounded purely by when the test
+/// itself jumps this clock forward, never by how much real CI-scheduling
+/// delay elapses between publish and the first live fetch (#883 P2 review:
+/// a real-time race here could expire the entry before that first fetch).
+const FakeUnixClock = struct {
+    now_s: std.atomic.Value(i64),
+
+    fn init(start: i64) FakeUnixClock {
+        return .{ .now_s = .init(start) };
+    }
+
+    fn tick(ctx: ?*anyopaque) i64 {
+        const self: *FakeUnixClock = @ptrCast(@alignCast(ctx.?));
+        return self.now_s.load(.acquire);
+    }
+
+    fn advance(self: *FakeUnixClock, delta_s: i64) void {
+        _ = self.now_s.fetchAdd(delta_s, .release);
+    }
+};
+
+/// Live-fetches `host`/`token` on the real listener before and after jumping
+/// the shared `FakeUnixClock` well past the published challenge's TTL, so a
+/// single hook invocation (itself a blocking read inside the production
+/// authorization *poll* call) can observe the published challenge both live
+/// and -- purely through `ChallengeStore`'s own TTL enforcement, never an
+/// explicit `store.remove` -- expired, while the order engine itself is
+/// still blocked in that very call, not yet past any deadline/cleanup check
+/// of its own (#883 P2 review).
 const ExpiryCtx = struct {
     allocator: std.mem.Allocator,
     listener_port: u16,
+    clock: *FakeUnixClock,
     before_status: u16 = 0,
     before_body_matched: bool = false,
     after_status: u16 = 0,
@@ -421,16 +448,26 @@ const ExpiryCtx = struct {
         self.before_status = before.status;
         self.before_body_matched = std.mem.eql(u8, before.body, key_authorization);
 
-        // Comfortably past the short real TTL this test's `authz_deadline_s`
+        // Comfortably past the short TTL this test's `authz_deadline_s`
         // bounds the published challenge to (design §8.2): the store must
         // expire this entry on its own, independent of the order engine
         // (which is blocked right here, inside this very poll call, and has
-        // not reached any deadline check since publishing it).
-        zig_compat.sleepNs(3 * std.time.ns_per_s);
+        // not reached any deadline check since publishing it). An instant
+        // clock jump, not a real sleep, so this can never race the "before"
+        // fetch above.
+        self.clock.advance(10);
 
         var after = liveFetch(self.allocator, self.listener_port, host, token) catch return false;
         defer after.deinit(self.allocator);
         self.after_status = after.status;
+
+        // A real, bounded wall-clock sleep -- unrelated to the TTL check
+        // above, which the fake clock jump already settled -- so the
+        // transport's own real-time read deadline for this very poll
+        // request trips for real, converting it into the order engine's
+        // ordinary `AuthorizationTimedOut` back in `orders.zig` (the same
+        // path a genuinely slow CA peer would hit).
+        zig_compat.sleepNs(3 * std.time.ns_per_s);
 
         // Report a validation failure either way: the point of this test is
         // the two live fetches above, not a successful issuance.
@@ -446,16 +483,30 @@ test "ACME A3 (#883 P2): the live listener serves a published challenge before i
     const session = try env.openSession();
     defer session.close();
 
-    var ctx = ExpiryCtx{ .allocator = testing.allocator, .listener_port = env.listener.port() };
+    var fake_unix = FakeUnixClock.init(zig_compat.unixTimestamp());
+    // Restart the real listener bound to the same store, this time handing
+    // it the same fake clock the order engine's own `unix_clock` below uses,
+    // so both sides of the TTL check share one controlled time source
+    // (#883 P2 review).
+    env.listener.deinit();
+    try env.listener.start(testing.allocator, "127.0.0.1", 0, .{
+        .managed_hosts = env.managed_hosts,
+        .store = &env.store,
+        .unix_now = .{ .ctx = &fake_unix, .nowFn = FakeUnixClock.tick },
+    });
+
+    var ctx = ExpiryCtx{ .allocator = testing.allocator, .listener_port = env.listener.port(), .clock = &fake_unix };
     env.ca.live_validate = .{ .ctx = &ctx, .validateFn = ExpiryCtx.validate };
 
     var opts = orders_mod.Options{};
     fastPoll(&opts);
+    opts.unix_clock = .{ .ctx = &fake_unix, .nowFn = FakeUnixClock.tick };
     // Short enough that `store.put`'s TTL (bounded by this deadline, design
-    // §8.2/§9.1) elapses during `ExpiryCtx.validate`'s sleep above; the
-    // order engine's own read of that same poll response then times out too
-    // (the same real clock, the same deadline), so `obtain` itself still
-    // fails closed on a bounded, ordinary deadline error.
+    // §8.2/§9.1) is already crossed by `ExpiryCtx.validate`'s clock jump
+    // above; the order engine's own read of that same poll response then
+    // times out too via its own real clock and the real sleep above, so
+    // `obtain` itself still fails closed on a bounded, ordinary deadline
+    // error.
     opts.limits.authz_deadline_s = 2;
     const names = [_][]const u8{"a.example.com"};
     try testing.expectError(error.AuthorizationTimedOut, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, opts));

@@ -427,12 +427,16 @@ pub const DiskCache = struct {
     /// confirmed (by this or any other caller's retry) -- never trading one
     /// durable guard for a merely in-process bool.
     ///
-    /// That check is still only a snapshot: `self.mutex` is released before
-    /// the unlink itself runs, and an unrelated key's disable can flip
-    /// `disabled` true and fail its own poison write in the window between
-    /// the snapshot and the unlink completing. Re-verifying immediately
-    /// after the unlink and restoring the file if that happened closes the
-    /// gap without ever holding `self.mutex` across the filesystem I/O.
+    /// The safety check and the unlink both run while `transition_mutex` is
+    /// held for this entire call, and `disableLocked` (the only place
+    /// `self.disabled` is ever set true after `init`) holds the same lock
+    /// across its own disabled-flag flip and poison write. That makes the
+    /// two mutually exclusive: no disable can land between this check and
+    /// the unlink, so unlike an earlier version of this function, there is
+    /// no window where the guard is gone but the disable it would have
+    /// protected against is only partway durable, and nothing needs to be
+    /// restored afterward. `self.mutex` itself is still only held for the
+    /// brief flag read/write, never across the filesystem I/O.
     fn endTransitionGuard(self: *DiskCache) void {
         self.transition_mutex.lock();
         defer self.transition_mutex.unlock();
@@ -446,13 +450,6 @@ pub const DiskCache = struct {
 
         if (self.test_before_guard_removal) |barrier| barrier.pauseIfMatched(transition_guard_name);
         self.state_dir.removeFileDurable(transition_guard_name) catch {};
-
-        self.mutex.lock();
-        const became_unsafe = self.disabled and !self.poison_write_confirmed;
-        self.mutex.unlock();
-        if (became_unsafe) {
-            self.state_dir.writeFileAtomicLimit(transition_guard_name, &transition_guard_marker, 0o600, transition_guard_marker.len) catch {};
-        }
     }
 
     /// Admission check for a representation-policy transition that would
@@ -667,11 +664,19 @@ pub const DiskCache = struct {
     }
 
     /// Assumes `self.mutex` is held on entry and returns with it held again
-    /// (it is released only internally, around the durable marker write, by
-    /// `persistPoisonCoalescedLocked`). The in-memory index is cleared and
-    /// `self.disabled` published before that write is even attempted, so a
-    /// slow or faulted filesystem never stalls an unrelated key's lookup
-    /// behind this call the way a synchronous write under the lock would.
+    /// (it is released internally, both around `transition_mutex` and around
+    /// the durable marker write inside `persistPoisonCoalescedLocked`). The
+    /// in-memory index is cleared before any of that, so a slow or faulted
+    /// filesystem never stalls an unrelated key's lookup behind this call the
+    /// way a synchronous write under the lock would.
+    ///
+    /// `self.disabled` flips from false to true only here, and only while
+    /// `transition_mutex` is held for the flip and the poison write that
+    /// follows -- the same lock `endTransitionGuard` holds across its own
+    /// safety check and guard-file removal. That makes the two mutually
+    /// exclusive: an unrelated disable can never land in the gap between
+    /// `endTransitionGuard`'s check and its unlink, closing the crash window
+    /// a delete-then-restore repair could not.
     fn disableLocked(self: *DiskCache) void {
         var it = self.index.iterator();
         while (it.next()) |kv| self.allocator.free(kv.key_ptr.*);
@@ -680,8 +685,12 @@ pub const DiskCache = struct {
         while (vit.next()) |kv| self.allocator.free(kv.key_ptr.*);
         self.vary_index.clearRetainingCapacity();
         self.total_bytes = 0;
+        self.mutex.unlock();
+        self.transition_mutex.lock();
+        self.mutex.lock();
         self.disabled = true;
         self.persistPoisonCoalescedLocked();
+        self.transition_mutex.unlock();
     }
 
     fn trackVariantLocked(self: *DiskCache, primary_key: []const u8, secondary_key: []const u8) !void {
@@ -3319,7 +3328,7 @@ test "DiskCache keeps the transition guard durable when an unrelated key's disab
     try std.testing.expect(reopened.get(arena.allocator(), primary_a, 2) == null);
 }
 
-test "DiskCache restores the transition guard when an unrelated disable races the removal decision itself" {
+test "DiskCache's transition-guard removal and an unrelated disable are mutually exclusive, closing the delete-then-restore TOCTOU" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3360,9 +3369,10 @@ test "DiskCache restores the transition guard when an unrelated disable races th
 
         // Pause A's own `endPolicyTransition` right after it reads
         // `safe_to_remove` -- while `disabled` is still false -- but before
-        // it unlinks the guard file. This is the exact TOCTOU window: the
-        // snapshot says "safe", but nothing yet protects against a disable
-        // that starts after it was taken.
+        // it unlinks the guard file. Unlike the earlier delete-then-restore
+        // design, this whole check-and-unlink runs under `transition_mutex`,
+        // the same lock `disableLocked` must acquire before it can ever flip
+        // `disabled` true.
         var barrier = TestIoBarrier{ .key = transition_guard_name };
         cache.test_before_guard_removal = &barrier;
         const Ender = struct {
@@ -3370,43 +3380,66 @@ test "DiskCache restores the transition guard when an unrelated disable races th
                 target.endPolicyTransition(admission_value);
             }
         };
-        const thread = try std.Thread.spawn(.{}, Ender.run, .{ &cache, admission });
+        const ender = try std.Thread.spawn(.{}, Ender.run, .{ &cache, admission });
         barrier.waitUntilReached();
 
-        // An entirely independent key's disable races into exactly that
-        // window: its own poison write fails, leaving `disabled` true but
-        // `poison_write_confirmed` false.
+        // An entirely independent key's disable attempt -- its own poison
+        // write faulted -- must now block behind `transition_mutex` rather
+        // than being able to race into the window between A's snapshot and
+        // its unlink.
         cache.state_dir.fault = .write;
         cache.state_dir.fault_file = poison_name;
-        cache.mutex.lock();
-        cache.disableLocked();
-        cache.mutex.unlock();
-        try std.testing.expect(cache.disabled);
-        try std.testing.expect(!cache.poison_write_confirmed);
+        var disable_done = std.atomic.Value(bool).init(false);
+        const Disabler = struct {
+            fn run(target: *DiskCache, done: *std.atomic.Value(bool)) void {
+                target.mutex.lock();
+                target.disableLocked();
+                target.mutex.unlock();
+                done.store(true, .release);
+            }
+        };
+        const disabler = try std.Thread.spawn(.{}, Disabler.run, .{ &cache, &disable_done });
+
+        // Give the disabler every opportunity to race in if the mutual
+        // exclusion were not actually holding.
+        var attempts: usize = 0;
+        while (attempts < 50) : (attempts += 1) {
+            std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        }
+        try std.testing.expect(!disable_done.load(.acquire));
+        try std.testing.expect(!cache.disabled);
 
         barrier.release();
-        thread.join();
+        ender.join();
         cache.test_before_guard_removal = null;
 
-        // The regression this test exists for: the unlink A's thread was
-        // paused before must not durably remove the only guard protecting
-        // A's displaced secondary once an unrelated disable raced into the
-        // window between the snapshot and the unlink, unconfirmed.
-        try std.testing.expect(cache.isTransitionGuardOnDisk());
+        // A's removal really was safe at the instant it ran, and nothing
+        // could have invalidated that between the check and the unlink.
+        try std.testing.expect(!cache.isTransitionGuardOnDisk());
+
+        disabler.join();
+        try std.testing.expect(disable_done.load(.acquire));
+        try std.testing.expect(cache.disabled);
+        try std.testing.expect(!cache.poison_write_confirmed);
 
         // Deliberately no further call that could retry and confirm the
         // poison write: the crash window under test is the one between
         // here and process exit.
     }
 
+    // A's bare begin/end never fenced or retired anything, and its guard
+    // removal really was safe at the instant it ran: the sibling it was
+    // protecting is untouched on disk, so a fresh process must still serve
+    // it rather than disable over debris this process never created.
     var reopened = try DiskCache.init(allocator, root_path, limits, 61);
     defer reopened.deinit();
-    try std.testing.expect(reopened.disabled);
-    try std.testing.expect(!reopened.isVaryTracked(primary_a));
+    try std.testing.expect(!reopened.disabled);
+    try std.testing.expect(reopened.isVaryTracked(primary_a));
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    try std.testing.expect(reopened.get(arena.allocator(), sibling_a, 2) == null);
-    try std.testing.expect(reopened.get(arena.allocator(), primary_a, 2) == null);
+    const hit = reopened.get(arena.allocator(), sibling_a, 2);
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqualStrings("variant", hit.?.body);
 }
 
 test "DiskCache refuses a policy transition while disabled but not durably poisoned" {

@@ -67,6 +67,14 @@ zig build test-pki-reduce --summary all --error-style verbose
 # mock upstreams; requires system OpenSSL. Not required for most contributions.
 zig build test-integration
 
+# Bounded curated smoke subset of the above (#945): startup/health, proxy
+# round-trip, auth-denied origin side effect, invalid config/reload,
+# auth-gated cache isolation, and one native H1/H2/TLS boundary case. This
+# is what PR CI's smoke mode runs
+# instead of the full `test-integration` above; use it locally for a fast
+# live-process sanity check instead of the full suite.
+zig build test-integration-smoke
+
 # Failure-mode / chaos suite — a filtered view of the integration harness that
 # exercises broken origins and clients (see "Failure-mode harness" below).
 zig build test-failure
@@ -97,6 +105,36 @@ The default `test` step is the complete, unfiltered gate (28 run artifacts,
 edit/test/review loop. Don't wait on or repeatedly re-run the full `zig build
 test` locally -- use `test-fast` below, and treat independently-running CI as
 the evidence for the full suite once it finishes.
+
+### Agent execution policy (#945)
+
+A local agent (or human doing fast iteration) should, for an ordinary patch:
+
+- Run `zig fmt --check build.zig src/ tests/`.
+- Run `zig build test-fast` (or a single narrower target: `test-exe-filtered
+  -Dexe-test-filter=<name>`, `test-crypto`, `test-tls`, etc. -- whichever
+  covers the area actually touched).
+- When the change touches a live-process path, run a scoped integration
+  target (`test-integration-smoke`, `test-failure`, or a single
+  `test-integration -Dintegration-test-filter=<name>` case) -- not the full
+  `test-integration` suite.
+- **Must not** launch and then repeatedly re-poll a complete `zig build test`
+  or `zig build test-integration` across many wakeup cycles: those are the
+  full gate, independently run by CI (and, since #945, by a weekly scheduled
+  full run against `main` -- see docs/CI.md), not a local iteration loop.
+  Full CI status is the thing to check at handoff/merge, not to reproduce
+  locally beforehand.
+- Apply a hard local runtime budget and treat a timeout as a failure, not as
+  "still running, keep waiting": roughly 120s for a fast/filtered target,
+  5 minutes for a scoped integration target (tune against this file's
+  measured baselines below; both support `--test-timeout`, e.g. `zig build
+  test-fast --test-timeout 30s`). Never silently drop or ignore a timeout --
+  report it as the failure it is.
+
+If something *outside this repo* (e.g. an AI-Manager controller) is the one
+forcibly waiting or repeatedly polling for a test run to finish, that is a
+controller-side bug to fix in its own project, not a reason to add a
+scheduler or polling loop inside Tardigrade.
 
 ```bash
 # Bounded fast developer/agent gate: targets <2 minutes warm-cache (see the

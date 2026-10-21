@@ -12168,7 +12168,15 @@ test "H2 live: an abrupt client disconnect (no GOAWAY) settles the active sessio
 
     // Prove the session is genuinely live before tearing the socket down.
     try client.sendData(1, false, "alive");
-    var echo = try client.readFrame(allocator);
+    // The server may issue its own connection/stream WINDOW_UPDATE(s) for
+    // the just-received "alive" DATA before (or interleaved with) echoing
+    // it back; skip those rather than assume the very next frame is the
+    // echo.
+    var echo: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.typ != .window_update) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
     defer http.http2_frame.deinitFrame(allocator, &echo);
     try std.testing.expectEqual(http.http2_frame.Type.data, echo.typ);
     try std.testing.expectEqualStrings("alive", echo.payload);
@@ -12255,7 +12263,15 @@ test "H2 live: graceful shutdown settles the active session as shutdown without 
     try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
 
     try client.sendData(1, false, "alive");
-    var echo = try client.readFrame(allocator);
+    // The server may issue its own connection/stream WINDOW_UPDATE(s) for
+    // the just-received "alive" DATA before (or interleaved with) echoing
+    // it back; skip those rather than assume the very next frame is the
+    // echo.
+    var echo: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.typ != .window_update) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
     defer http.http2_frame.deinitFrame(allocator, &echo);
     try std.testing.expectEqual(http.http2_frame.Type.data, echo.typ);
     try std.testing.expectEqualStrings("alive", echo.payload);

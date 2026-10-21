@@ -3,12 +3,10 @@
 CI runs in exactly **two modes**. `CHANGELOG.md` picks the mode automatically,
 so ordinary unreleased work gets fast feedback and promoting a numbered
 release runs the complete suite. There is no third tier and no label-driven
-policy. (#944 adds `zig build test-fast` as a bounded *local/agent* iteration
-target -- see CONTRIBUTING.md's "Test performance" section -- but that is a
-Zig build target, not a CI mode; CI itself still runs smoke/full as described
-below. Wiring `test-fast` into CI is explicitly out of scope for #944, which
-keeps this two-mode contract from #806 authoritative, and is left to a
-separate ticket if wanted.)
+policy. (#944 added `zig build test-fast` as a bounded *local/agent*
+iteration target -- see CONTRIBUTING.md's "Test performance" section; #945
+wired it, and a curated live-process integration subset, into smoke mode
+itself -- see "What each mode runs" below.)
 
 ## Mode selection
 
@@ -23,6 +21,7 @@ only git, never the GitHub API, and runs identically locally.
 | Push to `main` | same comparison, `before` vs `after`; release promotion = `full` |
 | `workflow_dispatch` `mode=smoke` / `mode=full` | that mode, on any ref |
 | `workflow_dispatch` `mode=auto` | same detector against `origin/main` |
+| Scheduled weekly run (`schedule`, Thursday 03:11 UTC on `main`) | always `full` (#945) -- independent of changelog state, so an unreleased `main` still gets periodic full-mode regression coverage between numbered releases |
 
 The comparison is the changelog at the **merge base** versus at head, so a
 release that landed on `main` after the PR branched is not counted as new,
@@ -46,18 +45,27 @@ scripts/test-ci-mode.sh
 
 **Smoke** (every PR / push without a release promotion): format, lint
 (actionlint, shellcheck, detector tests), production dependency audit (Linux),
-Linux unit tests + hostile-HTTP corpus + `tardi init` validation, Linux
-native-TLS-listener integration, the default-profile live-process integration
-suite (`Integration tests`), example-config validation, and Security
-(gitleaks, Trivy, zizmor) plus Dependency review on PRs.
+Linux `zig build test-fast` (#944's bounded gate, not the full unit suite) +
+hostile-HTTP corpus + `tardi init` validation, Linux native-TLS-listener
+integration, the **curated** live-process integration subset
+(`test-integration-smoke`: startup/health, proxy round-trip, auth-denied
+origin side effect, invalid config/reload, auth-gated cache isolation, and
+one native H1/H2/TLS boundary case) instead of the full suite, the focused
+ACME-experimental issuance case
+(`test-integration-acme-smoke`) instead of its full matrix, example-config
+validation, and Security (gitleaks, Trivy, zizmor) plus Dependency review on
+PRs (#945).
 
-**Full** = smoke, plus everything else: unit / native-TLS tests on
+**Full** = smoke, but with `test`/`test-integration`/
+`test-integration -Dacme-experimental` run unfiltered instead of the smoke
+subsets above, plus everything else: unit / native-TLS tests on
 `ubuntu-24.04-arm` and `macos-14`, appliance-profile tests (all OSes), the
 Debug/ReleaseSafe/ReleaseFast build matrix, macOS binary audit, PKI
 differential, packaging (DEB/RPM/Docker/install), Homebrew formula smoke,
 performance smoke, crypto benchmarks, H3 resumption/0-RTT peer interop, the
 TLS interop/conformance matrix, Linux/Darwin release-smoke, and the native TLS
-reuse soak.
+reuse soak. Full also now runs unattended once a week against `main` (see
+"Mode selection" above), not only at release promotion or explicit dispatch.
 
 `ci.yml` calls the substantive jobs from `linux-release-smoke.yml`,
 `darwin-release-smoke.yml`, and `native-tls-reuse-soak.yml` in full mode, so
@@ -116,6 +124,28 @@ The representative smoke path is 19m51s faster than the pre-change PR run,
 or about **62% less wall-clock time**. Smoke omits cross-OS/arch legs, the
 9-way build matrix, packaging, interop, and performance checks; full includes
 them.
+
+### #945: smoke-mode `test` / `test-integration` reduction
+
+The table above measures whole-workflow wall clock; it predates #945's
+changes to what the `test`, `integration-test`, and
+`acme-experimental-integration` jobs run *inside* smoke mode. Local
+reference-machine measurements (same machine/config as CONTRIBUTING.md's
+"Test performance" baseline: Apple M4, 10 cores, macOS Darwin 25.3.0, Zig
+0.16.0, `-Doptimize=Debug`, warm `.zig-cache`) for the two biggest smoke-mode
+changes:
+
+| Step | Before (unfiltered) | After (smoke target) |
+| --- | --- | --- |
+| Unit tests | `zig build test`: ~100-120s | `zig build test-fast`: ~95-120s (#944; unchanged by #945) |
+| Live-process integration | `zig build test-integration`: ~4m20s warm | `zig build test-integration-smoke`: ~9.5s warm |
+
+These are local wall-clock numbers, not a re-run of the GitHub Actions
+workflow above; they demonstrate the magnitude of the per-job reduction
+`test-integration-smoke` exists to produce, not a new whole-workflow
+after-measurement. Re-measure the full workflow wall clock the same way the
+table above was built once this PR lands on a representative PR, rather than
+trusting these local numbers as CI evidence.
 
 ## Failure-behaviour checks
 

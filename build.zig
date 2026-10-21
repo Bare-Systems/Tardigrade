@@ -471,6 +471,87 @@ pub fn build(b: *std.Build) void {
     const explain_integration_step = b.step("test-integration-explain", "Run tardi explain <field> real-binary regression tests");
     explain_integration_step.dependOn(&run_explain_integration_tests.step);
 
+    // #945: the curated PR-smoke live-process subset -- startup/health,
+    // proxy round-trip, request-policy/auth-denied origin side effect,
+    // invalid-config/reload, auth-gated cache isolation, and one native
+    // H1/H2/TLS boundary case -- instead of the full `test-integration`
+    // suite on ordinary PRs (see ci.yml's `integration-test` job and
+    // docs/CI.md). Each named filter below is a stable, existing
+    // `tests/integration.zig` test name, not a new test. Unlike
+    // `test-integration-native-tls`'s combined multi-name `.filters` above,
+    // each name here gets its own #944 `count_named_exe_test_matches.zig`
+    // zero-match probe: a single multi-name probe would stay nonzero (and
+    // silently pass) as long as just one of the five names still matched
+    // something, letting a rename/removal of any other named case quietly
+    // drop out of smoke coverage instead of failing the build.
+    const integration_smoke_filters = &[_][]const u8{
+        "bearclaw edge prefix routes health without auth and enforces auth on v1 paths",
+        "jwt auth rejects malformed bearer and invalid signature without proxying",
+        "invalid reload leaves the previous config active (#170)",
+        "native TLS listener dispatches ALPN h2 through HTTP/2 frames",
+        "forward_auth responses are never shared-cacheable over h1",
+    };
+    const integration_smoke_step = b.step("test-integration-smoke", "Run the curated PR-smoke live-process integration subset (#945): startup/health, proxy round-trip, auth-denied origin side effect, invalid config/reload, auth-gated cache isolation, and one native H1/H2/TLS boundary case; fails closed if any named case matches nothing");
+    for (integration_smoke_filters) |filter_name| {
+        const probe = b.addTest(.{
+            .root_module = integration_mod,
+            .filters = &.{filter_name},
+            .test_runner = .{
+                .path = b.path("scripts/count_named_exe_test_matches.zig"),
+                .mode = .simple,
+            },
+        });
+        integration_smoke_step.dependOn(&b.addRunArtifact(probe).step);
+    }
+    const integration_smoke_tests = b.addTest(.{
+        .root_module = integration_mod,
+        .filters = integration_smoke_filters,
+    });
+    const run_integration_smoke_tests = b.addRunArtifact(integration_smoke_tests);
+    run_integration_smoke_tests.step.dependOn(b.getInstallStep());
+    integration_smoke_step.dependOn(&run_integration_smoke_tests.step);
+
+    // #945: the focused ACME-experimental smoke case for ordinary PRs --
+    // the real HTTP-01 issuance -> CA-verified native TLS listener
+    // acceptance test -- instead of the full `test-integration
+    // -Dacme-experimental` suite (see ci.yml's `acme-experimental-integration`
+    // job). Pair with `test-acme -Dacme-experimental` for the unit side.
+    const integration_acme_smoke_filters = &[_][]const u8{
+        "automatic HTTPS (#884): a live HTTP-01 issuance activates a CA-verified TLS listener",
+    };
+    const integration_acme_smoke_step = b.step("test-integration-acme-smoke", "Run the focused ACME-experimental PR-smoke case (#945): a live HTTP-01 issuance activating a CA-verified native TLS listener; requires -Dacme-experimental and fails closed without it or if the filter matches nothing");
+    if (!acme_experimental) {
+        // The target case checks `integration_options.acme_experimental` at
+        // runtime and calls `return error.SkipZigTest` when it's unset, so
+        // the #944 compiled-test-inventory zero-match guard below cannot see
+        // this case: the filter still matches a real named test, which still
+        // compiles and "passes" by skipping -- exactly the "skipped/success"
+        // false-green #945 forbids for a curated smoke selection. Check the
+        // flag directly instead of relying on the runtime skip to surface.
+        const missing_acme_experimental = b.addFail("test-integration-acme-smoke requires -Dacme-experimental; its target case skips itself (reporting success) without it, which would otherwise silently provide zero coverage");
+        integration_acme_smoke_step.dependOn(&missing_acme_experimental.step);
+    } else {
+        // Same zero-match guard as `test-integration-smoke` above, for a
+        // rename/removal of the named case once -Dacme-experimental is set.
+        const integration_acme_smoke_probe = b.addTest(.{
+            .root_module = integration_mod,
+            .filters = integration_acme_smoke_filters,
+            .test_runner = .{
+                .path = b.path("scripts/count_named_exe_test_matches.zig"),
+                .mode = .simple,
+            },
+        });
+        const run_integration_acme_smoke_probe = b.addRunArtifact(integration_acme_smoke_probe);
+        const integration_acme_smoke_tests = b.addTest(.{
+            .root_module = integration_mod,
+            .filters = integration_acme_smoke_filters,
+        });
+        const run_integration_acme_smoke_tests = b.addRunArtifact(integration_acme_smoke_tests);
+        run_integration_acme_smoke_tests.step.dependOn(b.getInstallStep());
+        integration_acme_smoke_step.dependOn(&run_integration_acme_smoke_probe.step);
+        integration_acme_smoke_step.dependOn(&run_integration_acme_smoke_tests.step);
+    }
+
     // Resumption/0-RTT external interop, restart, and soak suite (#369, and
     // #522's `h3interop.*` QUIC/H3 cases -- `h3interop.` contains the
     // `interop.` filter substring, so they run under this same step): the

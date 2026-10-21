@@ -1,6 +1,7 @@
 const std = @import("std");
 const Headers = @import("headers.zig").Headers;
 const request_context = @import("request_context.zig");
+const cancellation = @import("cancellation.zig");
 const Response = @import("response.zig").Response;
 
 pub const Http3SessionError = error{
@@ -40,6 +41,21 @@ pub const StreamRequest = struct {
     downstream_handshake_complete: bool = true,
     downstream_handshake: ?request_context.DownstreamHandshakeBarrier = null,
     park_early_425_retry: ?ParkEarly425Retry = null,
+    park_cache_fill: ?ParkCacheFill = null,
+    /// Internal marker on an owned retry snapshot resumed after a parked
+    /// cache-fill wait. The handler re-runs lookup and policy, but does not
+    /// join the same collapsing flight again.
+    cache_fill_wait_resumed: bool = false,
+    /// Runtime-owned request/stream stop signal. The runtime keeps the token
+    /// alive for the synchronous handler lifetime and cancels it when QUIC
+    /// reports a peer RESET_STREAM or STOP_SENDING for this stream.
+    cancel_token: ?*cancellation.CancellationToken = null,
+    /// Wall-clock arrival time (`compat.milliTimestamp()`) stamped by the
+    /// reactor at admission, before any bounded-worker queueing delay. The
+    /// handler derives the request's absolute deadline from this instead of
+    /// its own dequeue time, so `request_total_timeout_ms` bounds the whole
+    /// request lifetime rather than only the time a worker actually runs it.
+    admitted_at_ms: i64 = 0,
 
     pub const Early425RetryContinuation = struct {
         ctx: *anyopaque,
@@ -64,6 +80,39 @@ pub const StreamRequest = struct {
         }
     };
 
+    pub const CacheFillContinuation = struct {
+        ctx: *anyopaque,
+        ready_fn: *const fn (*anyopaque, u64) bool,
+        cancel_fn: *const fn (*anyopaque, cancellation.CancelReason) void,
+        resume_fn: *const fn (*anyopaque, std.mem.Allocator, *Response) anyerror!void,
+        deinit_fn: *const fn (*anyopaque, std.mem.Allocator) void,
+
+        pub fn isReady(self: CacheFillContinuation, now_ms: u64) bool {
+            return self.ready_fn(self.ctx, now_ms);
+        }
+
+        pub fn cancel(self: CacheFillContinuation, reason: cancellation.CancelReason) void {
+            self.cancel_fn(self.ctx, reason);
+        }
+
+        pub fn run(self: CacheFillContinuation, allocator: std.mem.Allocator, response: *Response) !void {
+            try self.resume_fn(self.ctx, allocator, response);
+        }
+
+        pub fn deinit(self: CacheFillContinuation, allocator: std.mem.Allocator) void {
+            self.deinit_fn(self.ctx, allocator);
+        }
+    };
+
+    pub const ParkCacheFill = struct {
+        ctx: *anyopaque,
+        park_fn: *const fn (*anyopaque, CacheFillContinuation) anyerror!void,
+
+        pub fn park(self: ParkCacheFill, continuation: CacheFillContinuation) !void {
+            try self.park_fn(self.ctx, continuation);
+        }
+    };
+
     pub fn deinit(self: *StreamRequest) void {
         self.allocator.free(self.method);
         self.allocator.free(self.path);
@@ -76,6 +125,11 @@ pub const StreamRequest = struct {
 
     pub fn parkEarly425Retry(self: *const StreamRequest, continuation: Early425RetryContinuation) !void {
         const parker = self.park_early_425_retry orelse return error.Http3Early425RetryCannotPark;
+        try parker.park(continuation);
+    }
+
+    pub fn parkCacheFill(self: *const StreamRequest, continuation: CacheFillContinuation) !void {
+        const parker = self.park_cache_fill orelse return error.Http3CacheFillCannotPark;
         try parker.park(continuation);
     }
 };
@@ -153,6 +207,8 @@ pub const StreamAssembler = struct {
             .downstream_handshake_complete = true,
             .downstream_handshake = null,
             .park_early_425_retry = null,
+            .park_cache_fill = null,
+            .cache_fill_wait_resumed = false,
         };
     }
 };

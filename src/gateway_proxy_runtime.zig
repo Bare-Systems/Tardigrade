@@ -176,6 +176,268 @@ fn findCacheHeaderValue(headers: []const gpc.CacheHeader, name: []const u8) ?[]c
     return null;
 }
 
+/// Request-owned description of a synchronous expired-entry validation. The
+/// validator is copied out of cache scratch so H1/H2/H3 may release their
+/// lookup arena before origin I/O without retaining cache-owned memory.
+pub const SynchronousCacheRevalidation = struct {
+    primary_key: [64]u8,
+    effective_key: [64]u8,
+    revision: u64,
+    validator_name: []const u8,
+    validator_value: []u8,
+
+    pub fn deinit(self: *SynchronousCacheRevalidation, allocator: std.mem.Allocator) void {
+        allocator.free(self.validator_value);
+        self.* = undefined;
+    }
+};
+
+pub fn prepareSynchronousCacheRevalidation(
+    allocator: std.mem.Allocator,
+    primary_key: []const u8,
+    effective_key: []const u8,
+    hit: *const gpc.LookupResult,
+    request_headers: *const http.Headers,
+) !?SynchronousCacheRevalidation {
+    if (!hit.stale or hit.stale_servable) return null;
+    // Never replace or combine caller preconditions with cache-generated
+    // ones. Their validator may name a different client representation; the
+    // ordinary proxy path remains authoritative in that ambiguous case.
+    if (request_headers.countByName("if-none-match") != 0 or
+        request_headers.countByName("if-modified-since") != 0)
+    {
+        return null;
+    }
+    const validator = gpc.revalidationValidator(hit.headers) orelse return null;
+    var plan = SynchronousCacheRevalidation{
+        .primary_key = undefined,
+        .effective_key = undefined,
+        .revision = hit.revision,
+        .validator_name = undefined,
+        .validator_value = undefined,
+    };
+    std.debug.assert(primary_key.len == plan.primary_key.len and effective_key.len == plan.effective_key.len);
+    @memcpy(plan.primary_key[0..], primary_key);
+    @memcpy(plan.effective_key[0..], effective_key);
+    switch (validator) {
+        .etag => |value| {
+            plan.validator_name = "If-None-Match";
+            plan.validator_value = try allocator.dupe(u8, value);
+        },
+        .last_modified => |value| {
+            plan.validator_name = "If-Modified-Since";
+            plan.validator_value = try allocator.dupe(u8, value);
+        },
+    }
+    return plan;
+}
+
+/// Clone the caller's headers into an origin-only set and append the cache
+/// validator. The caller's request identity, access log, and transcript keep
+/// observing the untouched downstream fields.
+pub fn buildOriginRevalidationHeaders(
+    allocator: std.mem.Allocator,
+    source: *const http.Headers,
+    plan: *const SynchronousCacheRevalidation,
+) !http.Headers {
+    var headers = http.Headers.init(allocator);
+    errdefer headers.deinit();
+    for (source.iterator()) |header| try headers.append(header.name, header.value);
+    headers.client_cert = source.client_cert;
+    try headers.append(plan.validator_name, plan.validator_value);
+    return headers;
+}
+
+/// Apply an origin 304 to the exact expired representation and return a fresh
+/// request-owned lookup copy. Any malformed/ineligible 304 is an error and
+/// must never be forwarded as a bodyless success to a nonconditional caller.
+pub fn finishSynchronousCacheRevalidation(
+    scratch: std.mem.Allocator,
+    state: *GatewayState,
+    generation: u64,
+    ttl_ceiling_seconds: u32,
+    swr_ceiling_seconds: u32,
+    plan: *const SynchronousCacheRevalidation,
+    buffered: *const BufferedUpstreamResponse,
+) !gpc.LookupResult {
+    if (buffered.status_code != 304 or buffered.body.len != 0) return error.InvalidCacheRevalidationResponse;
+    const metadata = try scratch.alloc(gpc.CacheHeaderView, buffered.headers.len);
+    defer scratch.free(metadata);
+    for (buffered.headers, 0..) |header, i| metadata[i] = .{ .name = header.name, .value = header.value };
+    try state.proxyResponseCacheRefreshNotModified(
+        scratch,
+        http.event_loop.monotonicMs(),
+        generation,
+        plan.primary_key[0..],
+        plan.effective_key[0..],
+        plan.revision,
+        metadata,
+        ttl_ceiling_seconds,
+        swr_ceiling_seconds,
+    );
+    return (try state.proxyResponseCacheLookup(
+        scratch,
+        generation,
+        plan.primary_key[0..],
+        plan.effective_key[0..],
+        http.event_loop.monotonicMs(),
+    )) orelse error.CacheMiss;
+}
+
+/// Always include the normalized Accept-Encoding discriminator in the
+/// foreground coordination key—even before a first origin response declares
+/// `Vary`—so simultaneous initial fills for different variants never share an
+/// owner.
+pub fn responseCacheFillCoordinationKey(
+    out: *[64]u8,
+    primary_key: []const u8,
+    request_headers: *const http.Headers,
+) ?[]const u8 {
+    var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
+    const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, request_headers) orelse return null;
+    return gpc.buildVaryVariantKey(out, primary_key, discriminator);
+}
+
+test "proxy response cache foreground fill collapses and bounds same-key waiters" {
+    var state: GatewayState = undefined;
+    state.allocator = std.testing.allocator;
+    state.proxy_response_cache_mutex = .{};
+    state.proxy_response_cache_condition = .{};
+    state.proxy_response_cache_generation = 7;
+    state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer state.proxy_response_cache.?.deinit();
+    state.proxy_response_cache_fill_flights = std.StringHashMap(*gs.ProxyResponseCacheFillFlight).init(std.testing.allocator);
+    defer state.proxy_response_cache_fill_flights.deinit();
+    state.proxy_response_cache_fill_waiters = 0;
+    state.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
+
+    try std.testing.expectEqual(gs.ProxyResponseCacheFillAdmission.owner, try state.proxyResponseCacheBeginFill(7, "representation"));
+    var waiters: [gs.proxy_response_cache_fill_max_waiters_per_key]*gs.ProxyResponseCacheFillFlight = undefined;
+    for (&waiters) |*slot| {
+        slot.* = switch (try state.proxyResponseCacheBeginFill(7, "representation")) {
+            .waiter => |flight| flight,
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    try std.testing.expectEqual(gs.ProxyResponseCacheFillAdmission.independent, try state.proxyResponseCacheBeginFill(7, "representation"));
+    try std.testing.expectEqual(@as(usize, gs.proxy_response_cache_fill_max_waiters_per_key), state.proxy_response_cache_fill_waiters);
+
+    state.proxyResponseCacheFinishFill(7, "representation");
+    for (waiters) |flight| try std.testing.expect(state.proxyResponseCacheWaitForFill(flight, null));
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_flights.count());
+    try std.testing.expectEqual(gs.ProxyResponseCacheFillAdmission.independent, try state.proxyResponseCacheBeginFill(8, "wrong-generation"));
+
+    const keys = [_][]const u8{ "global-0", "global-1", "global-2", "global-3", "global-4", "global-5", "global-6", "global-7" };
+    var global_waiters: [gs.proxy_response_cache_fill_max_waiters_global]*gs.ProxyResponseCacheFillFlight = undefined;
+    var waiter_index: usize = 0;
+    for (keys) |key| {
+        try std.testing.expectEqual(gs.ProxyResponseCacheFillAdmission.owner, try state.proxyResponseCacheBeginFill(7, key));
+        for (0..gs.proxy_response_cache_fill_max_waiters_per_key) |_| {
+            global_waiters[waiter_index] = switch (try state.proxyResponseCacheBeginFill(7, key)) {
+                .waiter => |flight| flight,
+                else => return error.TestUnexpectedResult,
+            };
+            waiter_index += 1;
+        }
+    }
+    try std.testing.expectEqual(gs.proxy_response_cache_fill_max_waiters_global, waiter_index);
+    try std.testing.expectEqual(gs.ProxyResponseCacheFillAdmission.owner, try state.proxyResponseCacheBeginFill(7, "global-overflow"));
+    try std.testing.expectEqual(gs.ProxyResponseCacheFillAdmission.independent, try state.proxyResponseCacheBeginFill(7, "global-overflow"));
+    for (keys) |key| state.proxyResponseCacheFinishFill(7, key);
+    state.proxyResponseCacheFinishFill(7, "global-overflow");
+    for (global_waiters) |flight| try std.testing.expect(state.proxyResponseCacheWaitForFill(flight, null));
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_flights.count());
+}
+
+test "cache-generated origin validators do not mutate downstream request headers" {
+    const allocator = std.testing.allocator;
+    var request_headers = http.Headers.init(allocator);
+    defer request_headers.deinit();
+    try request_headers.append("X-Request", "caller");
+    const stored_headers = [_]gpc.CacheHeader{
+        .{ .name = @constCast("ETag"), .value = @constCast("W/\"v1\"") },
+        .{ .name = @constCast("Last-Modified"), .value = @constCast("Wed, 21 Oct 2015 07:28:00 GMT") },
+    };
+    const hit = gpc.LookupResult{
+        .status_code = 200,
+        .reason = @constCast("OK"),
+        .headers = @constCast(&stored_headers),
+        .body = @constCast("body"),
+        .age_seconds = 2,
+        .stale = true,
+        .stale_servable = false,
+        .revision = 9,
+    };
+    const key = "0" ** 64;
+    var plan = (try prepareSynchronousCacheRevalidation(allocator, key, key, &hit, &request_headers)).?;
+    defer plan.deinit(allocator);
+    try std.testing.expectEqualStrings("If-None-Match", plan.validator_name);
+    try std.testing.expectEqualStrings("W/\"v1\"", plan.validator_value);
+
+    var origin_headers = try buildOriginRevalidationHeaders(allocator, &request_headers, &plan);
+    defer origin_headers.deinit();
+    try std.testing.expect(request_headers.get("if-none-match") == null);
+    try std.testing.expectEqualStrings("W/\"v1\"", origin_headers.get("if-none-match").?);
+    try std.testing.expectEqualStrings("caller", origin_headers.get("x-request").?);
+
+    try request_headers.append("If-Modified-Since", "Thu, 22 Oct 2015 07:28:00 GMT");
+    try std.testing.expect((try prepareSynchronousCacheRevalidation(allocator, key, key, &hit, &request_headers)) == null);
+}
+
+test "proxy response cache reload wakes foreground fill waiters" {
+    var state: GatewayState = undefined;
+    state.allocator = std.testing.allocator;
+    state.proxy_response_cache_mutex = .{};
+    state.proxy_response_cache_condition = .{};
+    state.proxy_response_cache_generation = 4;
+    state.proxy_response_cache = gpc.ProxyResponseCache.init(std.testing.allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer state.proxy_response_cache.?.deinit();
+    state.proxy_response_cache_fill_flights = std.StringHashMap(*gs.ProxyResponseCacheFillFlight).init(std.testing.allocator);
+    defer state.proxy_response_cache_fill_flights.deinit();
+    state.proxy_response_cache_fill_waiters = 0;
+    state.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
+    state.proxy_response_cache_disk_accepting = true;
+    state.proxy_response_cache_disk_inflight = 0;
+    state.proxy_response_cache_revalidation_inflight = std.atomic.Value(u32).init(0);
+    state.proxy_response_cache_revalidation_max_concurrency = std.atomic.Value(u32).init(1);
+    state.proxy_response_cache_revalidation_cancel = http.cancellation.CancellationToken.init(0);
+
+    try std.testing.expectEqual(gs.ProxyResponseCacheFillAdmission.owner, try state.proxyResponseCacheBeginFill(4, "reload-key"));
+    const flight = switch (try state.proxyResponseCacheBeginFill(4, "reload-key")) {
+        .waiter => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    const WaitContext = struct {
+        state: *GatewayState,
+        flight: *gs.ProxyResponseCacheFillFlight,
+        completed: bool = false,
+
+        fn run(ctx: *@This()) void {
+            ctx.completed = ctx.state.proxyResponseCacheWaitForFill(ctx.flight, null);
+        }
+    };
+    var wait_ctx = WaitContext{ .state = &state, .flight = flight };
+    const thread = try std.Thread.spawn(.{}, WaitContext.run, .{&wait_ctx});
+    state.proxyResponseCachePrepareReload(5);
+    thread.join();
+    try std.testing.expect(wait_ctx.completed);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_flights.count());
+    try std.testing.expectEqual(@as(u64, 5), state.proxy_response_cache_generation);
+    // The old owner can finish after reload without touching the new epoch.
+    state.proxyResponseCacheFinishFill(4, "reload-key");
+}
+
 /// Owns every allocation a detached background revalidation needs, on its
 /// own arena so cleanup (success or failure) is always exactly one
 /// `arena.deinit()` -- never a hand-matched chain of individual frees.
@@ -1081,6 +1343,13 @@ pub fn handleLocationProxyPass(
     // request) and before any upstream selection, so a hit never touches the
     // upstream pool/circuit-breaker/retry machinery below at all.
     var response_cache_key: ?[64]u8 = null;
+    var synchronous_revalidation: ?SynchronousCacheRevalidation = null;
+    defer if (synchronous_revalidation) |*plan| plan.deinit(temp_allocator);
+    var response_cache_fill_key: ?[64]u8 = null;
+    var response_cache_fill_owner = false;
+    defer if (response_cache_fill_owner) {
+        state.proxyResponseCacheFinishFill(ctx.config_generation, response_cache_fill_key.?[0..]);
+    };
     if (cfg.proxy_cache_ttl_seconds > 0) {
         const cache_method = request.method.toString();
         const fillable_method = std.mem.eql(u8, cache_method, "GET");
@@ -1192,12 +1461,84 @@ pub fn handleLocationProxyPass(
                             return prepared.status_code;
                         }
                     }
+                    if (fillable_method) {
+                        synchronous_revalidation = try prepareSynchronousCacheRevalidation(
+                            temp_allocator,
+                            key_buf[0..],
+                            effective_key.?,
+                            &hit,
+                            &request.headers,
+                        );
+                    }
                 }
                 state.metricsRecordProxyCacheOutcome(.miss);
                 // A HEAD miss (or an unvalidatable HEAD hit) must not fill
                 // the cache -- a HEAD response has no body to store, and
                 // storing one would poison a later GET replay.
-                if (fillable_method) response_cache_key = key_buf;
+                if (fillable_method) {
+                    response_cache_key = key_buf;
+                    var coordination_buf: [64]u8 = undefined;
+                    if (responseCacheFillCoordinationKey(&coordination_buf, key_buf[0..], &request.headers)) |coordination_key| {
+                        switch (state.proxyResponseCacheBeginFill(ctx.config_generation, coordination_key) catch .independent) {
+                            .owner => {
+                                response_cache_fill_key = coordination_buf;
+                                response_cache_fill_owner = true;
+                            },
+                            .waiter => |flight| {
+                                _ = state.proxyResponseCacheWaitForFill(flight, if (ctx.lifecycle) |lc| &lc.token else null);
+                                const waited_is_vary = state.proxyResponseCacheIsVaryTracked(ctx.config_generation, key_buf[0..]);
+                                var waited_discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
+                                var waited_secondary_buf: [64]u8 = undefined;
+                                const waited_effective_key: ?[]const u8 = if (!waited_is_vary) key_buf[0..] else waited: {
+                                    const discriminator = gpc.varyAcceptEncodingDiscriminator(&waited_discriminator_buf, &request.headers) orelse break :waited null;
+                                    break :waited gpc.buildVaryVariantKey(&waited_secondary_buf, key_buf[0..], discriminator);
+                                };
+                                const waited_lookup = if (waited_effective_key) |waited_key| state.proxyResponseCacheLookup(temp_allocator, ctx.config_generation, key_buf[0..], waited_key, http.event_loop.monotonicMs()) catch blk: {
+                                    state.metricsRecordProxyCacheOutcome(.fill_error);
+                                    break :blk null;
+                                } else null;
+                                // A waiter must never carry its pre-wait
+                                // revision/validator into a new origin request:
+                                // the owner may have replaced or invalidated
+                                // that exact representation while we slept.
+                                if (synchronous_revalidation) |*plan| plan.deinit(temp_allocator);
+                                synchronous_revalidation = null;
+                                if (waited_lookup) |waited_hit| {
+                                    const waited_disposition = gpc.decideLookupServe(&waited_hit, &request.headers);
+                                    if (waited_disposition != .require_origin) {
+                                        if (prepareHttp1CacheReplay(temp_allocator, &waited_hit, waited_disposition, waited_disposition == .full)) |prepared_value| {
+                                            var prepared = prepared_value;
+                                            defer prepared.deinit(temp_allocator);
+                                            const replay = .{
+                                                .status_code = prepared.status_code,
+                                                .reason = prepared.reason,
+                                                .headers = prepared.headers,
+                                                .body = prepared.body,
+                                                .wire_content_length_override = waited_hit.body.len,
+                                            };
+                                            state.metricsRecordProxyCacheOutcome(.hit);
+                                            ctx.setUpstreamResult(target, prepared.status_code, prepared.body.len);
+                                            try writeBufferedUpstreamResponseWithMetrics(writer, &replay, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, null, &state.metrics, &state.metrics_mutex);
+                                            state.metricsRecord(prepared.status_code);
+                                            return prepared.status_code;
+                                        } else |_| {
+                                            state.metricsRecordProxyCacheOutcome(.fill_error);
+                                        }
+                                    } else {
+                                        synchronous_revalidation = try prepareSynchronousCacheRevalidation(
+                                            temp_allocator,
+                                            key_buf[0..],
+                                            waited_effective_key.?,
+                                            &waited_hit,
+                                            &request.headers,
+                                        );
+                                    }
+                                }
+                            },
+                            .independent => {},
+                        }
+                    }
+                }
             }
         }
     }
@@ -1487,6 +1828,12 @@ pub fn handleLocationProxyPass(
         .absolute_target = absolute_proxy_target,
         .budget_start_ms = budget_start_ms,
     };
+    var origin_revalidation_headers: ?http.Headers = null;
+    defer if (origin_revalidation_headers) |*headers| headers.deinit();
+    if (synchronous_revalidation) |*plan| {
+        origin_revalidation_headers = try buildOriginRevalidationHeaders(temp_allocator, &request.headers, plan);
+        attempt_executor.origin_headers = &origin_revalidation_headers.?;
+    }
     var upstream_response: DataPlaneProxyResponse = switch (try runBufferedProxyAttempts(
         &ctx.early_data,
         first_attempt_forward_early_data,
@@ -1538,11 +1885,63 @@ pub fn handleLocationProxyPass(
     defer upstream_response.deinit(allocator);
     defer state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
 
+    if (synchronous_revalidation) |*plan| {
+        if (upstream_response.statusCode() == 304) {
+            // The 304 is an origin success even though the downstream receives
+            // the refreshed cached 200. Settle any half-open circuit probe
+            // before the early cache-replay return below.
+            attempt_executor.recordCircuitSuccess();
+            const refreshed = finishSynchronousCacheRevalidation(
+                temp_allocator,
+                state,
+                ctx.config_generation,
+                cfg.proxy_cache_ttl_seconds,
+                cfg.proxy_cache_stale_while_revalidate_seconds,
+                plan,
+                upstream_response.boundedBufferedForCompatibility(),
+            ) catch {
+                state.proxyResponseCacheInvalidate(ctx.config_generation, plan.effective_key[0..], plan.revision);
+                try sendApiError(allocator, writer, .bad_gateway, "invalid_cache_revalidation", "Origin returned an invalid cache revalidation response", correlation_id, keep_alive, state);
+                ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.bad_gateway), 0);
+                return @intFromEnum(http.Status.bad_gateway);
+            };
+            var prepared = try prepareHttp1CacheReplay(temp_allocator, &refreshed, .full, true);
+            defer prepared.deinit(temp_allocator);
+            if (response_cache_fill_owner) {
+                state.proxyResponseCacheFinishFill(ctx.config_generation, response_cache_fill_key.?[0..]);
+                response_cache_fill_owner = false;
+            }
+            const replay = .{
+                .status_code = prepared.status_code,
+                .reason = prepared.reason,
+                .headers = prepared.headers,
+                .body = prepared.body,
+                .wire_content_length_override = refreshed.body.len,
+            };
+            state.metricsRecordProxyCacheOutcome(.hit);
+            ctx.setUpstreamResult(resolved.upstream_host, prepared.status_code, prepared.body.len);
+            try writeBufferedUpstreamResponseWithMetrics(writer, &replay, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, sticky_set_cookie, &state.metrics, &state.metrics_mutex);
+            state.metricsRecord(prepared.status_code);
+            return prepared.status_code;
+        }
+        if (upstream_response.statusCode() == 200) {
+            // A changed complete representation supersedes the validator's
+            // stale entry even when the new response later proves
+            // uncacheable; never leave the obsolete body available for a
+            // future 304 renewal.
+            state.proxyResponseCacheInvalidate(ctx.config_generation, plan.effective_key[0..], plan.revision);
+        }
+    }
+
     if (response_cache_key) |key_bytes| {
         const buffered = upstream_response.boundedBufferedForCompatibility();
         tryFillResponseCache(temp_allocator, state, ctx.config_generation, cfg.proxy_cache_ttl_seconds, cfg.proxy_cache_stale_while_revalidate_seconds, key_bytes[0..], buffered, &request.headers) catch {
             state.metricsRecordProxyCacheOutcome(.fill_error);
         };
+    }
+    if (response_cache_fill_owner) {
+        state.proxyResponseCacheFinishFill(ctx.config_generation, response_cache_fill_key.?[0..]);
+        response_cache_fill_owner = false;
     }
 
     const transcript_redactions: []const []const u8 = if (request.headers.get("authorization")) |raw_auth|
@@ -2052,6 +2451,7 @@ const ProductionBufferedProxyAttemptExecutor = struct {
     state: *GatewayState,
     ctx: *http.request_context.RequestContext,
     request: *const http.Request,
+    origin_headers: ?*const http.Headers = null,
     body: []const u8,
     upstream_url: []const u8,
     unix_socket_path: ?[]const u8,
@@ -2120,7 +2520,7 @@ const ProductionBufferedProxyAttemptExecutor = struct {
             self.upstream_url,
             self.unix_socket_path,
             self.request.method.toString(),
-            &self.request.headers,
+            self.origin_headers orelse &self.request.headers,
             self.body,
             self.correlation_id,
             self.client_ip,

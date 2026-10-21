@@ -11,6 +11,7 @@
 //!       [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]
 //!   h3_interop_tool client --host A.B.C.D --port N --authority NAME \
 //!       --path /p [--body STR] [--empty-initial-key-share] \
+//!       [--reset-after-request] \
 //!       [--expect-hrr] [--insecure | --pin cert.der] [--verbose] \
 //!       [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]
 //!
@@ -277,6 +278,11 @@ const Args = struct {
     timeout_ms: u64 = 15_000,
     empty_initial_key_share: bool = false,
     expect_hrr: bool = false,
+    /// Send both STOP_SENDING and RESET_STREAM immediately after the request
+    /// is on the wire, then keep driving QUIC briefly so an external server
+    /// observes cancellation without waiting for idle timeout.
+    reset_after_request: bool = false,
+    reset_after_request_delay_ms: u64 = 0,
     qlog_dir: []const u8 = "",
     /// #625: `.current` (default) is the standard `QlogFileSeq` header; pass
     /// `--qlog-dialect qvis-legacy` only when the artifact is meant to be
@@ -357,6 +363,11 @@ fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
             args.empty_initial_key_share = true;
         } else if (std.mem.eql(u8, arg, "--expect-hrr")) {
             args.expect_hrr = true;
+        } else if (std.mem.eql(u8, arg, "--reset-after-request")) {
+            args.reset_after_request = true;
+        } else if (std.mem.eql(u8, arg, "--reset-after-request-ms")) {
+            args.reset_after_request = true;
+            args.reset_after_request_delay_ms = try std.fmt.parseInt(u64, it.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, arg, "--host")) {
             args.host = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, arg, "--port")) {
@@ -795,7 +806,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print(
             "h3-interop: bad arguments ({s})\n" ++
                 "usage: h3_interop_tool server --port N --cert cert.pem --key key.pem [--requests N] [--expect-hrr] [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]\n" ++
-                "       h3_interop_tool client --host IP --port N --authority NAME --path /p [--empty-initial-key-share] [--expect-hrr] [--insecure|--pin cert.der] [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]\n" ++
+                "       h3_interop_tool client --host IP --port N --authority NAME --path /p [--reset-after-request] [--empty-initial-key-share] [--expect-hrr] [--insecure|--pin cert.der] [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]\n" ++
                 "\nnegotiation (#338, shared vocabulary with tls_interop_tool):\n" ++
                 matrix.flag_usage,
             .{@errorName(err)},
@@ -877,6 +888,8 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     if (artifacts.qlog_file != null) h3.setEventSink(artifacts.h3Sink());
 
     var request_id: ?u64 = null;
+    var request_sent_at_us: ?u64 = null;
+    var reset_sent_at_us: ?u64 = null;
     const deadline = nowUs() + args.timeout_ms * 1_000;
     var success = false;
 
@@ -906,8 +919,23 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
                     .path = args.path,
                     .body = args.body,
                 });
+                request_sent_at_us = nowUs();
             }
             try h3.pump(client);
+            if (args.reset_after_request and reset_sent_at_us == null) {
+                if (nowUs() -| request_sent_at_us.? >= args.reset_after_request_delay_ms * std.time.us_per_ms) {
+                    try client.stopSending(request_id.?, 0x010c); // H3_REQUEST_CANCELLED
+                    try client.resetStream(request_id.?, 0x010c);
+                    reset_sent_at_us = nowUs();
+                }
+            }
+            if (reset_sent_at_us) |sent_at| {
+                if (nowUs() -| sent_at >= 200 * std.time.us_per_ms) {
+                    success = true;
+                    break;
+                }
+                continue;
+            }
             if (request_id) |id| {
                 if (try h3.pollResponse(id)) |response| {
                     var line: [8192]u8 = undefined;

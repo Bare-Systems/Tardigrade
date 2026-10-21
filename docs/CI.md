@@ -3,7 +3,12 @@
 CI runs in exactly **two modes**. `CHANGELOG.md` picks the mode automatically,
 so ordinary unreleased work gets fast feedback and promoting a numbered
 release runs the complete suite. There is no third tier and no label-driven
-policy.
+policy. (#944 adds `zig build test-fast` as a bounded *local/agent* iteration
+target -- see CONTRIBUTING.md's "Test performance" section -- but that is a
+Zig build target, not a CI mode; CI itself still runs smoke/full as described
+below. Wiring `test-fast` into CI is explicitly out of scope for #944, which
+keeps this two-mode contract from #806 authoritative, and is left to a
+separate ticket if wanted.)
 
 ## Mode selection
 

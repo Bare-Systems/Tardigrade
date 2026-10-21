@@ -511,6 +511,33 @@ pub const DiskCache = struct {
         if (admission == .admitted) self.endTransitionGuard();
     }
 
+    /// Admission check for the opposite representation-policy transition
+    /// from `beginPolicyTransitionIfVaryTracked`: a direct fill under
+    /// `primary` becoming the first member of a new Vary family, which
+    /// `DiskCache.put` persists by installing a tombstone over the old
+    /// direct record. Must be called -- and, if `.admitted`, paired with
+    /// `endPolicyTransition` -- strictly before any RAM representation
+    /// switch is published, so a durable guard failure can still prevent
+    /// RAM from committing a Vary policy disk cannot yet prove is safe
+    /// (i.e. that the old direct body cannot be resurrected as a restart
+    /// miss) after a crash mid-tombstone.
+    pub fn beginDirectToVaryGuard(self: *DiskCache, primary: []const u8) TransitionAdmission {
+        self.mutex.lock();
+        self.retryPoisonLocked();
+        if (self.disabled or self.disable_pending) {
+            const result: TransitionAdmission = if (self.poison_write_confirmed) .not_needed else .refused;
+            self.mutex.unlock();
+            return result;
+        }
+        const tracked = if (self.index.get(primary)) |marker|
+            !marker.tombstone and marker.vary_primary_key == null
+        else
+            false;
+        self.mutex.unlock();
+        if (!tracked) return .not_needed;
+        return if (self.beginTransitionGuard()) .admitted else .refused;
+    }
+
     /// Admission check for an ordinary key removal/invalidation through the
     /// public API (`GatewayState.proxyResponseCacheInvalidate`). Unlike
     /// `beginPolicyTransitionIfVaryTracked`, there is no "not tracked" skip:

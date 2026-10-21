@@ -580,7 +580,7 @@ fn proxyResponseCacheRevalidationThread(task: *ProxyResponseCacheRevalidationTas
             cfg.proxy_cache_stale_while_revalidate_seconds,
         ) catch |err| {
             if (err == error.NotCacheable or err == error.VaryMismatch) {
-                task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision);
+                task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision, http.event_loop.monotonicMs());
                 succeeded = true;
             } else if (err == error.CacheRevisionMismatch) {
                 succeeded = true;
@@ -597,7 +597,7 @@ fn proxyResponseCacheRevalidationThread(task: *ProxyResponseCacheRevalidationTas
         cfg.proxy_cache_stale_while_revalidate_seconds,
         &buffered,
     ) catch return) orelse {
-        task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision);
+        task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision, http.event_loop.monotonicMs());
         succeeded = true;
         return;
     };
@@ -609,7 +609,7 @@ fn proxyResponseCacheRevalidationThread(task: *ProxyResponseCacheRevalidationTas
     else blk: {
         var discriminator_buf: [gpc.max_vary_discriminator_bytes]u8 = undefined;
         const discriminator = gpc.varyAcceptEncodingDiscriminator(&discriminator_buf, &headers) orelse {
-            task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision);
+            task.state.proxyResponseCacheInvalidate(task.generation, task.effective_key, task.revision, http.event_loop.monotonicMs());
             succeeded = true;
             return;
         };
@@ -1900,7 +1900,7 @@ pub fn handleLocationProxyPass(
                 plan,
                 upstream_response.boundedBufferedForCompatibility(),
             ) catch {
-                state.proxyResponseCacheInvalidate(ctx.config_generation, plan.effective_key[0..], plan.revision);
+                state.proxyResponseCacheInvalidate(ctx.config_generation, plan.effective_key[0..], plan.revision, http.event_loop.monotonicMs());
                 try sendApiError(allocator, writer, .bad_gateway, "invalid_cache_revalidation", "Origin returned an invalid cache revalidation response", correlation_id, keep_alive, state);
                 ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.bad_gateway), 0);
                 return @intFromEnum(http.Status.bad_gateway);
@@ -1929,7 +1929,7 @@ pub fn handleLocationProxyPass(
             // stale entry even when the new response later proves
             // uncacheable; never leave the obsolete body available for a
             // future 304 renewal.
-            state.proxyResponseCacheInvalidate(ctx.config_generation, plan.effective_key[0..], plan.revision);
+            state.proxyResponseCacheInvalidate(ctx.config_generation, plan.effective_key[0..], plan.revision, http.event_loop.monotonicMs());
         }
     }
 

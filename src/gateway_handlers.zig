@@ -3415,7 +3415,7 @@ fn handleHttp3LocationProxyPass(
                 plan,
                 upstream_response.boundedBufferedForCompatibility(),
             ) catch {
-                ctx.state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision);
+                ctx.state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision, http.event_loop.monotonicMs());
                 try rejectHttp3ProxyError(allocator, response, ctx, .bad_gateway, "invalid_cache_revalidation", "Origin returned an invalid cache revalidation response", correlation_id);
                 return;
             };
@@ -3428,7 +3428,7 @@ fn handleHttp3LocationProxyPass(
             return;
         }
         if (upstream_response.statusCode() == 200) {
-            ctx.state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision);
+            ctx.state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision, http.event_loop.monotonicMs());
         }
     }
     if (response_cache_key) |key_bytes| {

@@ -5729,7 +5729,7 @@ fn executeHttp2ProxyRoute(
                 plan,
                 &proxy_response.bounded_buffered,
             ) catch {
-                state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision);
+                state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision, http.event_loop.monotonicMs());
                 proxy_response.deinit(allocator);
                 return .{ .local_rejection = .{
                     .status_code = @intFromEnum(http.Status.bad_gateway),
@@ -5749,7 +5749,7 @@ fn executeHttp2ProxyRoute(
             return .{ .response = cached };
         }
         if (proxy_response.statusCode() == 200) {
-            state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision);
+            state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision, http.event_loop.monotonicMs());
         }
     }
     if (response_cache_key) |key_bytes| {

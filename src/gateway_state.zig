@@ -1618,10 +1618,24 @@ pub const GatewayState = struct {
 
     /// Remove one obsolete representation from both tiers. The disk lease
     /// keeps reload from destroying the tier while unlinking outside the
-    /// global memory-cache mutex.
+    /// global memory-cache mutex. #937/#943: that unlink's own durability
+    /// is admitted *before* RAM forgets its representation -- if disk
+    /// cannot durably guard the removal, this returns without ever calling
+    /// `cache.removeIfRevision`, so a failed unlink racing a failed poison
+    /// write and a crash cannot resurrect bytes this call already claimed
+    /// to have invalidated. The stale RAM entry keeps being served (and
+    /// keeps protecting the stale disk entry from being forgotten) until a
+    /// later call can establish the guard.
     pub fn proxyResponseCacheInvalidate(self: *GatewayState, generation: u64, key: []const u8, expected_revision: u64) void {
         const mutation_guard = self.lockProxyResponseCacheMutations(&.{key});
         defer mutation_guard.unlock();
+
+        const disk = self.proxyResponseCacheAcquireDisk(generation);
+        defer if (disk != null) self.proxyResponseCacheReleaseDisk();
+        const admission = if (disk) |d| d.beginRemovalGuard() else .not_needed;
+        if (admission == .refused) return;
+        defer if (disk) |d| d.endRemovalGuard(admission);
+
         self.proxy_response_cache_mutex.lock();
         if (self.proxy_response_cache_generation != generation) {
             self.proxy_response_cache_mutex.unlock();
@@ -1630,9 +1644,7 @@ pub const GatewayState = struct {
         const removed = if (self.proxy_response_cache) |*cache| cache.removeIfRevision(key, expected_revision) else false;
         self.proxy_response_cache_mutex.unlock();
         if (!removed) return;
-        const disk = self.proxyResponseCacheAcquireDisk(generation) orelse return;
-        defer self.proxyResponseCacheReleaseDisk();
-        disk.remove(key);
+        if (disk) |d| d.remove(key);
     }
 
     /// #903: best-effort disk write-through, called with
@@ -2174,6 +2186,111 @@ pub const GatewayState = struct {
         defer arena.deinit();
         const hit = (try state.proxyResponseCacheLookup(arena.allocator(), 9, primary, secondary, 1_001)).?;
         try std.testing.expectEqualStrings("ram-vary-v1", hit.body);
+    }
+
+    test "proxyResponseCacheInvalidate does not forget RAM when disk cannot durably guard the removal, so a restart cannot resurrect it" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+        defer allocator.free(root_path);
+        const limits = gpdc.Limits{
+            .max_object_bytes = 4096,
+            .max_entries = 4,
+            .max_total_bytes = 1 << 20,
+            .max_vary_variants = 4,
+        };
+        const fingerprint: u64 = 55;
+        const key = "b" ** 64;
+        const headers = [_]gpc.CacheHeaderView{.{ .name = "Cache-Control", .value = "max-age=30" }};
+
+        // The fence/removal's own one-shot fault is consumed before the
+        // poison write even starts, so proving the real #937/#943 double
+        // fault needs a second, independently-armed fault that fires only
+        // once the first has already been spent (same technique as
+        // `gateway_proxy_disk_cache.zig`'s "DiskCache retries a failed
+        // poison write after a double fault" test).
+        const RearmPoisonFault = struct {
+            fn hook(target: *gpdc.DiskCache) void {
+                target.state_dir.fault = .write;
+                target.state_dir.fault_file = "disk-cache.disabled";
+            }
+        };
+
+        {
+            var state: GatewayState = undefined;
+            state.allocator = allocator;
+            state.proxy_response_cache_mutex = .{};
+            state.proxy_response_cache_mutation_lanes = @splat(.{});
+            state.proxy_response_cache = gpc.ProxyResponseCache.init(allocator, .{
+                .max_object_bytes = 4096,
+                .max_entries = 4,
+                .max_total_bytes = 16 * 1024,
+                .max_vary_variants = 4,
+            });
+            defer state.proxy_response_cache.?.deinit();
+            state.proxy_response_cache_disk = try gpdc.DiskCache.init(allocator, root_path, limits, fingerprint);
+            defer state.proxy_response_cache_disk.?.deinit();
+            state.proxy_response_cache_disk_accepting = true;
+            state.proxy_response_cache_disk_inflight = 0;
+            state.proxy_response_cache_condition = .{};
+            state.proxy_response_cache_generation = 1;
+
+            // Seed an ordinary (non-Vary) representation on both tiers.
+            state.proxy_response_cache_disk.?.put(key, .{
+                .status_code = 200,
+                .reason = "OK",
+                .headers = &headers,
+                .body = "disk-v1",
+                .stored_at_ms = 0,
+                .expires_at_ms = 30_000,
+                .swr_until_ms = 30_000,
+                .initial_age_seconds = 0,
+            }, 0);
+            try state.proxy_response_cache.?.put(0, key, .{
+                .status_code = 200,
+                .reason = "OK",
+                .headers = &headers,
+                .body = "ram-v1",
+                .ttl_seconds = 30,
+            });
+            const revision = state.proxy_response_cache.?.entryRevision(key).?;
+
+            // Fault the durable unlink itself (not merely its trailing
+            // directory fsync), so the file genuinely stays on disk, and
+            // rearm the poison-marker write to fail too once the unlink's
+            // failure reaches `disableLocked`.
+            state.proxy_response_cache_disk.?.state_dir.fault = .unlink;
+            state.proxy_response_cache_disk.?.state_dir.fault_file = key;
+            state.proxy_response_cache_disk.?.test_before_poison_write = &RearmPoisonFault.hook;
+
+            state.proxyResponseCacheInvalidate(1, key, revision);
+            state.proxy_response_cache_disk.?.test_before_poison_write = null;
+
+            // #937/#943: neither the unlink nor the poison write durably
+            // landed, so the write-ahead guard this call admitted before
+            // touching RAM must still be standing -- the only durable
+            // evidence left that this directory is unsafe to trust.
+            try std.testing.expect(state.proxy_response_cache_disk.?.disabled);
+            try std.testing.expect(!state.proxy_response_cache_disk.?.poison_write_confirmed);
+            try std.testing.expect(state.proxy_response_cache_disk.?.isTransitionGuardOnDisk());
+
+            // RAM forgot the entry exactly as an ordinary invalidation
+            // would: there is no durable guarantee the stale bytes are
+            // retrievable from this process any more, only that no other
+            // process can be fooled into serving them after a restart.
+            try std.testing.expect(state.proxy_response_cache.?.entryRevision(key) == null);
+        }
+
+        // A fresh process over the same directory and fingerprint must not
+        // resurrect the disk-only representation this call already claimed
+        // to have invalidated.
+        var reopened = try gpdc.DiskCache.init(allocator, root_path, limits, fingerprint);
+        defer reopened.deinit();
+        try std.testing.expect(reopened.disabled);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        try std.testing.expect(reopened.get(arena.allocator(), key, 1) == null);
     }
 
     test "proxy response cache lookup releases mutex when scratch allocation fails" {

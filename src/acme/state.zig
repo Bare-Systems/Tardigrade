@@ -66,6 +66,12 @@ pub const Fault = enum {
     /// A newly-created child directory is not durable until its name has
     /// been synced through its parent.
     mkdir_fsync_parent,
+    /// `removeFileDurable`'s own unlink call, injected before it ever
+    /// touches the filesystem -- unlike `fsync_dir` (injected after a real
+    /// unlink already succeeded), this leaves the target file genuinely
+    /// still present on disk, for tests that need to prove a crash cannot
+    /// resurrect bytes a caller already forgot in RAM.
+    unlink,
 };
 
 pub const StateDir = struct {
@@ -184,6 +190,7 @@ pub const StateDir = struct {
     /// callers can therefore rely on the deletion across a power loss.
     pub fn removeFileDurable(self: *StateDir, name: []const u8) Error!void {
         if (!validName(name)) return error.InvalidPath;
+        try hitFault(&self.fault, &self.fault_file, name, .unlink);
         const removed = zig_compat.unlinkAtChecked(self.dir_fd, name) catch return error.IoFailure;
         if (!removed) return;
         try hitFault(&self.fault, &self.fault_file, name, .fsync_dir);

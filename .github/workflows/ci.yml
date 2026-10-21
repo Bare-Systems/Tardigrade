@@ -15,17 +15,30 @@ on:
           - smoke
           - full
         default: auto
+  # #945: an unreleased `main` can drift for weeks of smoke-only PRs between
+  # numbered releases; this catches a feature-branch regression that smoke
+  # mode doesn't exercise (cross-OS/arch, appliance profile, build matrix,
+  # packaging, interop, perf) before it is only discovered at the next
+  # release promotion. An explicit `mode=full` dispatch (above) remains
+  # available on demand; this just adds an unattended weekly floor.
+  schedule:
+    - cron: "11 3 * * 4" # weekly, Thursday 03:11 UTC
 
 # Two validation modes only (#806), chosen by scripts/ci-mode.sh:
 #   smoke  ordinary unreleased work (no numbered changelog release added).
 #   full   a new `## [X.Y.Z]` changelog heading vs the base (release
-#          promotion), or a manual `mode=full` dispatch.
+#          promotion), a manual `mode=full` dispatch, or the scheduled
+#          weekly run against `main` (#945).
 # `ci-result` is the single stable branch-protection-required check.
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # The scheduled full run (`schedule`) shares `github.ref` (`main`) with
+  # ordinary pushes to `main`; giving it its own concurrency group keeps an
+  # unattended weekly full run from cancelling (or being cancelled by) a
+  # push's own required CI result.
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -49,7 +62,11 @@ jobs:
         id: mode
         uses: $/.github/actions/ci-mode
         with:
-          override: ${{ inputs.mode || 'auto' }}
+          # #945: the scheduled weekly run (see `on.schedule` above) is
+          # always `full`, regardless of whether `main` has a new numbered
+          # changelog heading -- that is the point of a time-based floor
+          # independent of release cadence.
+          override: ${{ inputs.mode || (github.event_name == 'schedule' && 'full') || 'auto' }}
 
       # release.yml consumes this artifact from the completed CI run rather
       # than attempting to reconstruct a push's before..after range later.
@@ -333,8 +350,19 @@ jobs:
       - name: Print Zig version
         run: zig version
 
-      - name: Run unit tests
-        run: zig build test --summary all --error-style verbose
+      # #945: smoke mode runs the bounded `test-fast` developer/agent gate
+      # (#944) instead of the full 28-run-artifact `test` step; full mode is
+      # unchanged. See docs/CI.md and CONTRIBUTING.md's "Test performance"
+      # section for what `test-fast` omits/defers and why.
+      - name: "Run unit tests (smoke: bounded test-fast gate; full: complete suite)"
+        env:
+          MODE: ${{ needs.mode.outputs.mode }}
+        run: |
+          if [ "$MODE" = "full" ]; then
+            zig build test --summary all --error-style verbose
+          else
+            zig build test-fast --summary all --error-style verbose
+          fi
 
       - name: Run hostile HTTP corpus regression gate
         if: matrix.os == 'ubuntu-latest'
@@ -1115,11 +1143,16 @@ jobs:
           retention-days: 7
 
   # ── Integration tests ─────────────────────────────────────────────────────────
-  # Default (general) profile live-process suite on Linux, in BOTH modes (#806):
-  # it is the smoke tier's core integration / security-regression gate.
-  # (macOS is deliberately excluded for scheduling-variance reasons.)
+  # Default (general) profile live-process suite on Linux, in BOTH modes (#806).
+  # #945: smoke mode now runs only the curated `test-integration-smoke`
+  # subset (startup/health, proxy round-trip, auth-denied origin side
+  # effect, invalid config/reload, auth-gated cache isolation, one native
+  # H1/H2/TLS boundary case); full mode still runs the complete
+  # `test-integration` suite. (macOS is deliberately excluded for
+  # scheduling-variance reasons.)
   integration-test:
     name: Integration tests
+    needs: mode
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -1161,15 +1194,28 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Run integration tests
-        run: zig build test-integration --summary all
+      - name: "Run integration tests (smoke: curated subset; full: complete suite)"
+        env:
+          MODE: ${{ needs.mode.outputs.mode }}
+        run: |
+          if [ "$MODE" = "full" ]; then
+            zig build test-integration --summary all
+          else
+            zig build test-integration-smoke --summary all
+          fi
 
   # #884's automatic-HTTPS path is intentionally experimental and disabled
   # in release builds, so the default integration leg correctly skips it.
   # Keep a dedicated required leg that enables the opt-in and executes the
   # real HTTP-01 -> TLS 1.3 listener acceptance test on every PR.
+  # #945: smoke mode runs the full `test-acme` unit suite (already fast) plus
+  # only the focused `test-integration-acme-smoke` issuance/activation case,
+  # instead of blindly rerunning the complete `test-integration
+  # -Dacme-experimental` suite on every PR; full mode is unchanged. ACME's
+  # own full matrix stays a full/release/explicit-dispatch gate.
   acme-experimental-integration:
     name: ACME experimental integration
+    needs: mode
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -1185,8 +1231,15 @@ jobs:
       - name: Run experimental ACME unit tests
         run: zig build test-acme -Dacme-experimental --summary all --error-style verbose
 
-      - name: Run experimental ACME integration tests
-        run: zig build test-integration -Dacme-experimental --summary all --error-style verbose
+      - name: "Run experimental ACME integration tests (smoke: focused issuance case; full: complete suite)"
+        env:
+          MODE: ${{ needs.mode.outputs.mode }}
+        run: |
+          if [ "$MODE" = "full" ]; then
+            zig build test-integration -Dacme-experimental --summary all --error-style verbose
+          else
+            zig build test-integration-acme-smoke -Dacme-experimental --summary all --error-style verbose
+          fi
 
   # ── Required result ───────────────────────────────────────────────────────────
   # The ONE check to require in branch protection ("CI result"). It passes only

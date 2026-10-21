@@ -454,6 +454,44 @@ pub const ProxyResponseCache = struct {
         return false;
     }
 
+    fn singleHeaderValue(headers: []const CacheHeaderView, name: []const u8) !?[]const u8 {
+        var value: ?[]const u8 = null;
+        for (headers) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, name)) continue;
+            if (value != null) return error.InvalidCacheValidator;
+            value = header.value;
+        }
+        return value;
+    }
+
+    /// The conditional request proves identity against the validator retained
+    /// on the entry. A 304 may omit that validator, but metadata it does send
+    /// must not relabel the retained bytes as a different representation.
+    fn validate304Validators(entry: *const Entry, response_headers: []const CacheHeaderView) !void {
+        const stored = revalidationValidator(entry.headers) orelse return error.InvalidCacheValidator;
+        const response_etag = try singleHeaderValue(response_headers, "etag");
+        const response_last_modified = try singleHeaderValue(response_headers, "last-modified");
+        switch (stored) {
+            .etag => |stored_etag| {
+                if (!http.etag.isSingleEntityTag(stored_etag)) return error.InvalidCacheValidator;
+                if (response_etag) |candidate| {
+                    if (!http.etag.isSingleEntityTag(candidate)) return error.InvalidCacheValidator;
+                    if (http.etag.evaluateIfNoneMatch(stored_etag, candidate) != .match) return error.InvalidCacheValidator;
+                }
+            },
+            .last_modified => |stored_last_modified| {
+                // An If-Modified-Since validation cannot prove a newly
+                // introduced entity-tag belongs to the retained body.
+                if (response_etag != null) return error.InvalidCacheValidator;
+                if (response_last_modified) |candidate| {
+                    if (!std.mem.eql(u8, std.mem.trim(u8, candidate, " \t"), std.mem.trim(u8, stored_last_modified, " \t"))) {
+                        return error.InvalidCacheValidator;
+                    }
+                }
+            },
+        }
+    }
+
     /// Apply a successful conditional 304 to the exact representation that
     /// supplied its validators. The body/status are retained; only RFC cache
     /// metadata is merged, and a changed `Vary` shape is rejected.
@@ -474,6 +512,7 @@ pub const ProxyResponseCache = struct {
         // token-bearing field still invalidates the shared representation
         // instead of silently renewing it.
         if (hasUnpersistableResponseHeaders(response_headers)) return error.NotCacheable;
+        try validate304Validators(entry, response_headers);
         const is_variant = entry.vary_primary_key != null;
         if (entry.vary_primary_key) |stored_primary| {
             if (!std.mem.eql(u8, stored_primary, primary_key)) return error.VaryMismatch;
@@ -2208,7 +2247,7 @@ test "ProxyResponseCache retires stale Vary variants and their index when a reso
     try std.testing.expectEqual(@as(usize, 1), cache.map.count());
 }
 
-test "ProxyResponseCache 304 refresh keeps the body and renews metadata" {
+test "ProxyResponseCache matching 304 refresh keeps the body and renews metadata" {
     const allocator = std.testing.allocator;
     var cache = ProxyResponseCache.init(allocator, .{
         .max_object_bytes = 4096,
@@ -2232,7 +2271,7 @@ test "ProxyResponseCache 304 refresh keeps the body and renews metadata" {
     const original_revision = cache.entryRevision("key").?;
     try cache.refreshNotModified(1_500, "key", "key", original_revision, &.{
         .{ .name = "Cache-Control", .value = "max-age=30" },
-        .{ .name = "ETag", .value = "\"v2\"" },
+        .{ .name = "ETag", .value = "W/\"v1\"" },
     }, 60, 10);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -2240,8 +2279,85 @@ test "ProxyResponseCache 304 refresh keeps the body and renews metadata" {
     const hit = (try cache.lookup(arena.allocator(), "key", 2_000)).?;
     try std.testing.expect(!hit.stale);
     try std.testing.expectEqualStrings("retained body", hit.body);
-    try std.testing.expectEqualStrings("\"v2\"", findStoredHeader(hit.headers, "etag").?);
+    try std.testing.expectEqualStrings("W/\"v1\"", findStoredHeader(hit.headers, "etag").?);
     try std.testing.expectEqualStrings("text/plain", findStoredHeader(hit.headers, "content-type").?);
+}
+
+test "ProxyResponseCache rejects 304 metadata that relabels the retained body" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(0, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{
+            .{ .name = "Cache-Control", .value = "max-age=1" },
+            .{ .name = "ETag", .value = "\"v1\"" },
+        },
+        .body = "v1 body",
+        .ttl_seconds = 1,
+        .swr_seconds = 10,
+    });
+
+    const revision = cache.entryRevision("key").?;
+    const invalid_values = [_][]const u8{ "\"v2\"", "*", "\"v1\", \"v2\"", "unterminated" };
+    for (invalid_values) |value| {
+        try std.testing.expectError(error.InvalidCacheValidator, cache.refreshNotModified(1_500, "key", "key", revision, &.{
+            .{ .name = "Cache-Control", .value = "max-age=30" },
+            .{ .name = "ETag", .value = value },
+        }, 60, 10));
+        try std.testing.expectEqual(revision, cache.entryRevision("key").?);
+    }
+    try std.testing.expectError(error.InvalidCacheValidator, cache.refreshNotModified(1_500, "key", "key", revision, &.{
+        .{ .name = "Cache-Control", .value = "max-age=30" },
+        .{ .name = "ETag", .value = "\"v1\"" },
+        .{ .name = "ETag", .value = "\"v1\"" },
+    }, 60, 10));
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const hit = (try cache.lookup(arena.allocator(), "key", 1_500)).?;
+    try std.testing.expect(hit.stale);
+    try std.testing.expectEqualStrings("v1 body", hit.body);
+    try std.testing.expectEqualStrings("\"v1\"", findStoredHeader(hit.headers, "etag").?);
+}
+
+test "ProxyResponseCache Last-Modified-only 304 rejects unproven validator changes" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    const last_modified = "Wed, 21 Oct 2015 07:28:00 GMT";
+    try cache.put(0, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{
+            .{ .name = "Cache-Control", .value = "max-age=1" },
+            .{ .name = "Last-Modified", .value = last_modified },
+        },
+        .body = "dated body",
+        .ttl_seconds = 1,
+    });
+    const revision = cache.entryRevision("key").?;
+    try std.testing.expectError(error.InvalidCacheValidator, cache.refreshNotModified(1_500, "key", "key", revision, &.{
+        .{ .name = "Cache-Control", .value = "max-age=30" },
+        .{ .name = "ETag", .value = "\"new\"" },
+    }, 60, 0));
+    try std.testing.expectError(error.InvalidCacheValidator, cache.refreshNotModified(1_500, "key", "key", revision, &.{
+        .{ .name = "Cache-Control", .value = "max-age=30" },
+        .{ .name = "Last-Modified", .value = "Thu, 22 Oct 2015 07:28:00 GMT" },
+    }, 60, 0));
+    try cache.refreshNotModified(1_500, "key", "key", revision, &.{
+        .{ .name = "Cache-Control", .value = "max-age=30" },
+        .{ .name = "Last-Modified", .value = last_modified },
+    }, 60, 0);
 }
 
 test "ProxyResponseCache retains expired validators without serving them stale" {

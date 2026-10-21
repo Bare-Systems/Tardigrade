@@ -15970,7 +15970,7 @@ test "generic proxy response cache answers If-None-Match/If-Modified-Since from 
     try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
 }
 
-test "generic proxy response cache synchronously revalidates expired entries with origin 304 or changed 200 (#934)" {
+test "generic proxy response cache validates origin 304 metadata before retaining an expired body (#934)" {
     const allocator = std.testing.allocator;
     const expired_v1: []const ResponseHeader = &.{
         .{ .name = "Cache-Control", .value = "public, max-age=1" },
@@ -15985,11 +15985,18 @@ test "generic proxy response cache synchronously revalidates expired entries wit
         .{ .name = "Cache-Control", .value = "public, max-age=60" },
         .{ .name = "ETag", .value = "\"v2\"" },
     };
+    const mismatched_304: []const ResponseHeader = &.{
+        .{ .name = "Cache-Control", .value = "public, max-age=60" },
+        .{ .name = "ETag", .value = "\"v2\"" },
+    };
     var origin = try UpstreamServer.start(allocator, &.{
         .{ .body = "retained-v1", .headers = expired_v1 },
         .{ .status_code = 304, .body = "", .headers = refreshed_v1 },
         .{ .body = "old-changed", .headers = expired_v1 },
         .{ .body = "new-v2", .headers = changed_v2 },
+        .{ .body = "must-not-be-relabelled-v1", .headers = expired_v1 },
+        .{ .status_code = 304, .body = "", .headers = mismatched_304 },
+        .{ .body = "replacement-v2", .headers = changed_v2 },
     });
     defer origin.stop();
     try origin.run();
@@ -16044,6 +16051,26 @@ test "generic proxy response cache synchronously revalidates expired entries wit
     defer allocator.free(changed_etag);
     try std.testing.expectEqualStrings("W/\"v1\"", changed_etag);
     try std.testing.expectEqual(@as(u32, 4), origin.requestCount());
+
+    var mismatch_seed = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/mismatch", .body = null, .headers = &.{} });
+    defer mismatch_seed.deinit();
+    try assertContains(mismatch_seed.body, "must-not-be-relabelled-v1");
+    compat.sleepNs(1_100 * std.time.ns_per_ms);
+
+    // A 304 bearing a different validator cannot bind v2's metadata to v1's
+    // retained bytes. The request fails closed and invalidates that entry.
+    var mismatch = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/mismatch", .body = null, .headers = &.{} });
+    defer mismatch.deinit();
+    try std.testing.expectEqual(@as(u16, 502), mismatch.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch.body, "must-not-be-relabelled-v1") == null);
+    try std.testing.expectEqual(@as(u32, 6), origin.requestCount());
+
+    var replacement = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/mismatch", .body = null, .headers = &.{} });
+    defer replacement.deinit();
+    try std.testing.expectEqual(@as(u16, 200), replacement.status_code);
+    try assertContains(replacement.body, "replacement-v2");
+    try std.testing.expectEqualStrings("\"v2\"", replacement.header("ETag") orelse return error.MissingConditionalHeader);
+    try std.testing.expectEqual(@as(u32, 7), origin.requestCount());
 }
 
 test "generic proxy response cache serves HEAD from a stored GET entry's metadata without an origin call (#902)" {

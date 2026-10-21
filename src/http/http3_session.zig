@@ -1,6 +1,7 @@
 const std = @import("std");
 const Headers = @import("headers.zig").Headers;
 const request_context = @import("request_context.zig");
+const cancellation = @import("cancellation.zig");
 const Response = @import("response.zig").Response;
 
 pub const Http3SessionError = error{
@@ -40,6 +41,10 @@ pub const StreamRequest = struct {
     downstream_handshake_complete: bool = true,
     downstream_handshake: ?request_context.DownstreamHandshakeBarrier = null,
     park_early_425_retry: ?ParkEarly425Retry = null,
+    /// Runtime-owned request/stream stop signal. The runtime keeps the token
+    /// alive for the synchronous handler lifetime and cancels it when QUIC
+    /// reports a peer RESET_STREAM or STOP_SENDING for this stream.
+    cancel_token: ?*cancellation.CancellationToken = null,
 
     pub const Early425RetryContinuation = struct {
         ctx: *anyopaque,

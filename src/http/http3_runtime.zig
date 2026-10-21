@@ -20,6 +20,7 @@
 const builtin = @import("builtin");
 const compat = @import("zig_compat");
 const std = @import("std");
+const cancellation = @import("cancellation.zig");
 const early_data_policy = @import("early_data.zig");
 const http3_session = @import("http3_session.zig");
 const logger_mod = @import("logger.zig");
@@ -963,6 +964,7 @@ pub const Snapshot = struct {
 const ConnEntry = struct {
     const QuicObserver = struct {
         runtime: *Runtime,
+        entry: ?*ConnEntry = null,
         connection_handle: u64,
         qlog_sink: quic.qlog.Sink = .{},
         qlog_artifacts_ctx: ?*anyopaque = null,
@@ -1033,6 +1035,8 @@ const ConnEntry = struct {
     last_tls_metrics: quic.tls_adapter.Metrics = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
     pending_h3_responses: std.ArrayList(PendingH3Response) = .empty,
+    active_request_stream_id: ?u64 = null,
+    active_request_cancel_token: ?*cancellation.CancellationToken = null,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
         for (self.parked_h3_retries.items) |*parked| parked.deinit(allocator);
@@ -1804,6 +1808,7 @@ pub const Runtime = struct {
             .cid_len = parsed.dcid.len,
             .accepted_at_us = now,
         };
+        entry.quic_observer.entry = entry;
         entry.conn.events = .{ .context = &entry.quic_observer, .emitFn = quicConnectionEvent };
         if (h3EventSinkFor(&entry.h3_observer)) |event_sink| {
             entry.h3.setEventSink(event_sink);
@@ -2143,6 +2148,14 @@ pub const Runtime = struct {
             return;
         };
         request.stream_id = incoming.stream_id;
+        var cancel_token = cancellation.CancellationToken.init(0);
+        request.cancel_token = &cancel_token;
+        entry.active_request_stream_id = incoming.stream_id;
+        entry.active_request_cancel_token = &cancel_token;
+        defer {
+            entry.active_request_stream_id = null;
+            entry.active_request_cancel_token = null;
+        }
         if (entry.client_snapshot != null) request.client_auth_policy_fingerprint = entry.client_policy_fingerprint;
         // #763: the handshake enforced the policy of the SNI it was admitted
         // under; a request whose :authority maps to a different policy must
@@ -2719,6 +2732,12 @@ pub const Runtime = struct {
             }
         }
         switch (event) {
+            .stream_reset => |reset| {
+                if (!reset.local) cancelActiveH3Request(observer, reset.id);
+            },
+            .stop_sending => |stop| {
+                if (!stop.local) cancelActiveH3Request(observer, stop.id);
+            },
             .state => |state| {
                 if (state == .established) observer.handshake_succeeded = true;
             },
@@ -2784,6 +2803,12 @@ pub const Runtime = struct {
             },
             else => {},
         }
+    }
+
+    fn cancelActiveH3Request(observer: *ConnEntry.QuicObserver, stream_id: u64) void {
+        const entry = observer.entry orelse return;
+        if (entry.active_request_stream_id != stream_id) return;
+        if (entry.active_request_cancel_token) |token| token.cancel(.client_disconnect);
     }
 
     fn emitQuicQlog(observer: *ConnEntry.QuicObserver, time_us: u64, event: quic.qlog.Event) void {

@@ -2995,7 +2995,7 @@ const Http3CacheFillContinuation = struct {
     state: *GatewayState,
     flight: *gs.ProxyResponseCacheFillFlight,
     wait_deadline_ms: u64,
-    waiter_released: bool = false,
+    waiter_released: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cancel_token: http.cancellation.CancellationToken,
     request: http.http3_session.StreamRequest,
 
@@ -3059,8 +3059,7 @@ const Http3CacheFillContinuation = struct {
     }
 
     fn releaseWaiter(self: *Http3CacheFillContinuation) void {
-        if (self.waiter_released) return;
-        self.waiter_released = true;
+        if (self.waiter_released.swap(true, .acq_rel)) return;
         self.state.proxyResponseCacheReleaseFillWaiter(self.flight);
     }
 
@@ -3080,6 +3079,11 @@ const Http3CacheFillContinuation = struct {
     fn run(ctx: *anyopaque, allocator: std.mem.Allocator, response: *http.Response) !void {
         const self: *Http3CacheFillContinuation = @ptrCast(@alignCast(ctx));
         self.releaseWaiter();
+        // A request deadline and a peer reset are terminal for this stream.
+        // Do not re-enter routing/auth/rate limiting or serve a cache hit once
+        // the request itself is no longer live. The H3 runtime maps this
+        // cancellation to a stream reset rather than a synthetic 500.
+        if (self.cancel_token.isStopped()) return error.RequestCancelled;
         try handleHttp3Request(allocator, &self.request, response, self.dispatch_ctx);
     }
 
@@ -3846,6 +3850,91 @@ test "H3 cache waiter parks without blocking and reset releases its flight befor
     capture.cancelAndDeinit(allocator, .client_disconnect);
     try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_waiters);
     try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    origin.release();
+    owner_thread.join();
+    owner_joined = true;
+    if (owner_result.err) |err| return err;
+    try std.testing.expectEqual(@as(u16, 200), owner_result.status);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_flights.count());
+}
+
+test "H3 parked cache-fill continuation refuses to resume once its own request deadline has passed, without a QUIC reset (#934)" {
+    const allocator = std.testing.allocator;
+    var origin = try GatedH3ProxyOrigin.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nowner",
+    });
+    defer origin.stop();
+    try origin.run();
+
+    var target_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "http://127.0.0.1:{d}", .{origin.port()});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/park-deadline",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.proxy_cache_ttl_seconds = 60;
+    cfg.proxy_cache_stale_while_revalidate_seconds = 0;
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initCollapseTestState(allocator, &state);
+    defer deinitHttp3ProxyTestState(&state);
+    defer state.proxy_response_cache.?.deinit();
+    defer state.proxy_response_cache_fill_flights.deinit();
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+
+    var owner_result = CollapseCaller{};
+    const owner_thread = try std.Thread.spawn(.{}, CollapseCaller.run, .{ &owner_result, "/park-deadline", &dispatch_ctx });
+    var owner_joined = false;
+    defer if (!owner_joined) {
+        origin.release();
+        owner_thread.join();
+    };
+    try origin.waitEntered(5_000);
+
+    var capture = H3CacheFillParkCapture{};
+    defer capture.cancelAndDeinit(allocator, .shutdown);
+    // A deadline already in the past, never an explicit cancel/reset: proves
+    // `isStopped()`'s wall-clock check alone -- not just a QUIC
+    // RESET_STREAM -- must stop the resume (#934 P2).
+    var deadline_token = http.cancellation.CancellationToken.init(compat.milliTimestamp() - 1);
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .stream_id = 9,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/park-deadline"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+        .cancel_token = &deadline_token,
+        .park_cache_fill = .{ .ctx = &capture, .park_fn = H3CacheFillParkCapture.park },
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &response, &dispatch_ctx));
+    try std.testing.expect(capture.parked != null);
+    try std.testing.expectEqual(@as(usize, 1), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    // Resuming a continuation whose deadline already passed must neither
+    // re-run routing/auth/the cache lookup (the response stays untouched)
+    // nor attempt a second origin fetch; it must still release its waiter
+    // slot exactly once.
+    try std.testing.expectError(error.RequestCancelled, capture.parked.?.run(allocator, &response));
+    try std.testing.expectEqual(http.Status.ok, response.status);
+    try std.testing.expect(response.body == null);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    capture.parked.?.deinit(allocator);
+    capture.parked = null;
 
     origin.release();
     owner_thread.join();

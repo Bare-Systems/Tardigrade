@@ -1213,6 +1213,218 @@ const PendingH3Response = struct {
     }
 };
 
+const async_h3_worker_count = 8;
+const async_h3_queue_capacity = 256;
+
+/// An owned H3 handler invocation. Workers may touch only this job and the
+/// process-shared handler context; connection/QUIC/H3 state remains reactor
+/// owned. Completion is observed with acquire/release ordering before the
+/// reactor reads `response`, `result_error`, or `parked_cache_fill`.
+const AsyncH3Job = struct {
+    const Work = union(enum) {
+        request: struct {
+            handler: RequestHandler,
+            handler_ctx: ?*anyopaque,
+            request: http3_session.StreamRequest,
+        },
+        cache_fill_resume: http3_session.StreamRequest.CacheFillContinuation,
+    };
+
+    allocator: std.mem.Allocator,
+    connection_handle: u64,
+    stream_id: u64,
+    started_us: u64,
+    work: Work,
+    response: response_mod.Response,
+    cancel_token: cancellation.CancellationToken = cancellation.CancellationToken.init(0),
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    result_error: ?anyerror = null,
+    parked_cache_fill: ?http3_session.StreamRequest.CacheFillContinuation = null,
+
+    fn initRequest(
+        allocator: std.mem.Allocator,
+        connection_handle: u64,
+        stream_id: u64,
+        started_us: u64,
+        handler: RequestHandler,
+        handler_ctx: ?*anyopaque,
+        request: http3_session.StreamRequest,
+    ) !*AsyncH3Job {
+        const job = try allocator.create(AsyncH3Job);
+        job.* = .{
+            .allocator = allocator,
+            .connection_handle = connection_handle,
+            .stream_id = stream_id,
+            .started_us = started_us,
+            .work = .{ .request = .{
+                .handler = handler,
+                .handler_ctx = handler_ctx,
+                .request = request,
+            } },
+            .response = response_mod.Response.init(allocator),
+        };
+        const owned = &job.work.request.request;
+        owned.cancel_token = &job.cancel_token;
+        owned.downstream_handshake_complete = true;
+        owned.downstream_handshake = null;
+        owned.park_early_425_retry = null;
+        owned.park_cache_fill = .{ .ctx = job, .park_fn = parkCacheFill };
+        return job;
+    }
+
+    fn initCacheFillResume(
+        allocator: std.mem.Allocator,
+        connection_handle: u64,
+        stream_id: u64,
+        started_us: u64,
+        continuation: http3_session.StreamRequest.CacheFillContinuation,
+    ) !*AsyncH3Job {
+        const job = try allocator.create(AsyncH3Job);
+        job.* = .{
+            .allocator = allocator,
+            .connection_handle = connection_handle,
+            .stream_id = stream_id,
+            .started_us = started_us,
+            .work = .{ .cache_fill_resume = continuation },
+            .response = response_mod.Response.init(allocator),
+        };
+        return job;
+    }
+
+    fn parkCacheFill(ctx: *anyopaque, continuation: http3_session.StreamRequest.CacheFillContinuation) anyerror!void {
+        const self: *AsyncH3Job = @ptrCast(@alignCast(ctx));
+        if (self.parked_cache_fill != null) return error.Http3DuplicateCacheFillPark;
+        self.parked_cache_fill = continuation;
+    }
+
+    fn run(self: *AsyncH3Job) void {
+        if (self.cancelled.load(.acquire)) {
+            self.result_error = error.RequestCancelled;
+            self.done.store(true, .release);
+            return;
+        }
+        switch (self.work) {
+            .request => |*owned| owned.handler(
+                self.allocator,
+                &owned.request,
+                &self.response,
+                owned.handler_ctx,
+            ) catch |err| {
+                self.result_error = err;
+            },
+            .cache_fill_resume => |continuation| continuation.run(self.allocator, &self.response) catch |err| {
+                self.result_error = err;
+            },
+        }
+        self.done.store(true, .release);
+    }
+
+    fn cancel(self: *AsyncH3Job, reason: cancellation.CancelReason) void {
+        if (self.cancelled.swap(true, .acq_rel)) return;
+        switch (self.work) {
+            .request => self.cancel_token.cancel(reason),
+            .cache_fill_resume => |continuation| continuation.cancel(reason),
+        }
+    }
+
+    fn takeParkedCacheFill(self: *AsyncH3Job) ?http3_session.StreamRequest.CacheFillContinuation {
+        const continuation = self.parked_cache_fill;
+        self.parked_cache_fill = null;
+        return continuation;
+    }
+
+    fn deinit(self: *AsyncH3Job) void {
+        if (self.parked_cache_fill) |continuation| {
+            continuation.cancel(.shutdown);
+            continuation.deinit(self.allocator);
+        }
+        switch (self.work) {
+            .request => |*owned| owned.request.deinit(),
+            .cache_fill_resume => |continuation| continuation.deinit(self.allocator),
+        }
+        self.response.deinit();
+        self.allocator.destroy(self);
+    }
+};
+
+/// Fixed-size, bounded executor for blocking H3 application work. Workers
+/// execute owned jobs only; the reactor drains completions and is the sole
+/// caller of QUIC/H3 connection methods.
+const AsyncH3Executor = struct {
+    allocator: ?std.mem.Allocator = null,
+    threads: if (builtin.single_threaded) [0]std.Thread else []std.Thread = if (builtin.single_threaded) .{} else &.{},
+    mutex: compat.Mutex = .{},
+    cond: compat.Condition = .{},
+    queue: std.ArrayList(*AsyncH3Job) = .empty,
+    max_queue_len: usize = 0,
+    initialized: bool = false,
+    shutting_down: bool = false,
+
+    const SubmitError = error{ QueueFull, Unavailable };
+
+    fn init(self: *AsyncH3Executor, allocator: std.mem.Allocator, worker_count: usize, max_queue_len: usize) !void {
+        if (builtin.single_threaded) return error.ThreadsUnavailable;
+        self.* = .{
+            .allocator = allocator,
+            .threads = &.{},
+            .max_queue_len = max_queue_len,
+        };
+        try self.queue.ensureTotalCapacity(allocator, max_queue_len);
+        self.threads = try allocator.alloc(std.Thread, @max(worker_count, 1));
+        errdefer allocator.free(self.threads);
+        var spawned: usize = 0;
+        errdefer {
+            self.mutex.lock();
+            self.shutting_down = true;
+            self.mutex.unlock();
+            self.cond.broadcast();
+            for (self.threads[0..spawned]) |thread| thread.join();
+            self.queue.deinit(allocator);
+        }
+        for (self.threads) |*thread| {
+            thread.* = try std.Thread.spawn(.{}, workerMain, .{self});
+            spawned += 1;
+        }
+        self.initialized = true;
+    }
+
+    fn submit(self: *AsyncH3Executor, job: *AsyncH3Job) SubmitError!void {
+        if (!self.initialized or builtin.single_threaded) return error.Unavailable;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.shutting_down or self.queue.items.len >= self.max_queue_len) return error.QueueFull;
+        self.queue.appendAssumeCapacity(job);
+        self.cond.signal();
+    }
+
+    fn workerMain(self: *AsyncH3Executor) void {
+        while (true) {
+            self.mutex.lock();
+            while (self.queue.items.len == 0 and !self.shutting_down) self.cond.wait(&self.mutex);
+            if (self.queue.items.len == 0 and self.shutting_down) {
+                self.mutex.unlock();
+                return;
+            }
+            const job = self.queue.orderedRemove(0);
+            self.mutex.unlock();
+            job.run();
+        }
+    }
+
+    fn shutdownAndJoin(self: *AsyncH3Executor) void {
+        if (!self.initialized) return;
+        self.mutex.lock();
+        self.shutting_down = true;
+        self.mutex.unlock();
+        self.cond.broadcast();
+        for (self.threads) |thread| thread.join();
+        self.allocator.?.free(self.threads);
+        self.queue.deinit(self.allocator.?);
+        self.* = .{};
+    }
+};
+
 /// The Retry token key ring and the process stateless-reset key are the
 /// only long-lived secrets `Runtime` owns. Grouping them here makes their
 /// lifecycle (installed at `init`, wiped on teardown or a later init
@@ -1307,6 +1519,10 @@ pub const Runtime = struct {
     /// message — the two are separate capabilities on some platforms, and one
     /// refusal is enough to know marking will never work here.
     ecn_send_enabled: bool = false,
+    async_h3_executor: AsyncH3Executor = .{},
+    /// Reactor-owned registry. Worker threads only mutate each job's owned
+    /// result and `done` flag; they never append/remove registry entries.
+    async_h3_jobs: std.ArrayList(*AsyncH3Job) = .empty,
 
     /// Erase `crypto_provider_state` to the boundary type for a `Connection`.
     /// Borrows `self`, so the returned value must not outlive this `Runtime`
@@ -1455,12 +1671,21 @@ pub const Runtime = struct {
 
     pub fn start(self: *Runtime) void {
         if (self.thread != null) return;
+        self.async_h3_executor.init(self.allocator, async_h3_worker_count, async_h3_queue_capacity) catch |err| {
+            self.logger.warn(null, "http3: bounded request executor unavailable: {s}", .{@errorName(err)});
+            return;
+        };
         self.thread = std.Thread.spawn(.{}, loopMain, .{self}) catch null;
+        if (self.thread == null) self.async_h3_executor.shutdownAndJoin();
     }
 
     pub fn deinit(self: *Runtime) void {
         self.stopping.store(true, .release);
         if (self.thread) |thread| thread.join();
+        for (self.async_h3_jobs.items) |job| job.cancel(.shutdown);
+        self.async_h3_executor.shutdownAndJoin();
+        for (self.async_h3_jobs.items) |job| job.deinit();
+        self.async_h3_jobs.deinit(self.allocator);
         _ = std.c.close(self.socket_fd);
         self.secrets.deinit();
         self.* = undefined;
@@ -1520,6 +1745,7 @@ pub const Runtime = struct {
 
         while (!self.stopping.load(.acquire)) {
             const now = nowUs();
+            self.drainCompletedAsyncH3Jobs(&connections);
             const draining = self.drain_requested.load(.acquire);
             const drain_deadline = self.drain_deadline_us.load(.acquire);
             const drain_expired = draining and drain_deadline != 0 and now >= drain_deadline;
@@ -1967,6 +2193,7 @@ pub const Runtime = struct {
         reason: RemovalReason,
     ) void {
         if (connections.fetchRemove(handle)) |kv| {
+            self.cancelAsyncH3JobsForConnection(handle, .shutdown);
             self.foldPathMetrics(kv.value);
             if (reason != .administrative and !kv.value.quic_observer.handshake_succeeded and !kv.value.handshake_failure_recorded) {
                 kv.value.handshake_failure_recorded = true;
@@ -2170,20 +2397,13 @@ pub const Runtime = struct {
             self.sendInternalErrorResponse(entry, incoming.stream_id, now);
             return;
         };
-        defer request.deinit();
+        var request_owned_here = true;
+        defer if (request_owned_here) request.deinit();
         request.client_ip = formatAddressHostAlloc(allocator, entry.conn.activePathKey().remote) catch {
             self.sendInternalErrorResponse(entry, incoming.stream_id, now);
             return;
         };
         request.stream_id = incoming.stream_id;
-        var cancel_token = cancellation.CancellationToken.init(0);
-        request.cancel_token = &cancel_token;
-        entry.active_request_stream_id = incoming.stream_id;
-        entry.active_request_cancel_token = &cancel_token;
-        defer {
-            entry.active_request_stream_id = null;
-            entry.active_request_cancel_token = null;
-        }
         if (entry.client_snapshot != null) request.client_auth_policy_fingerprint = entry.client_policy_fingerprint;
         // #763: the handshake enforced the policy of the SNI it was admitted
         // under; a request whose :authority maps to a different policy must
@@ -2215,6 +2435,46 @@ pub const Runtime = struct {
             }
         }
         request.transport_early = incoming.transport_early;
+
+        // Ordinary established H3 requests execute on a fixed-size bounded
+        // worker pool. The job owns every request byte and communicates back
+        // only an owned response/continuation; this keeps blocking origin I/O
+        // (including the first cache-fill owner) off the UDP reactor. A
+        // verified client identity remains connection-owned, so that rarer
+        // path deliberately stays synchronous until it has an owned identity
+        // snapshot of its own. Accepted 0-RTT likewise retains the existing
+        // reactor handshake/425 state machine.
+        if (entry.conn.isEstablished() and !incoming.transport_early and request.headers.client_cert == null and self.async_h3_executor.initialized) {
+            const job = AsyncH3Job.initRequest(
+                allocator,
+                entry.quic_observer.connection_handle,
+                incoming.stream_id,
+                now,
+                handler,
+                self.request_handler_ctx,
+                request,
+            ) catch {
+                self.sendInternalErrorResponse(entry, incoming.stream_id, now);
+                return;
+            };
+            request_owned_here = false;
+            self.submitAsyncH3Job(job) catch |err| {
+                job.deinit();
+                self.logger.warn(null, "http3: request executor admission failed: {s}", .{@errorName(err)});
+                self.sendStatusResponse(entry, incoming.stream_id, 503, now);
+                return;
+            };
+            return;
+        }
+
+        var cancel_token = cancellation.CancellationToken.init(0);
+        request.cancel_token = &cancel_token;
+        entry.active_request_stream_id = incoming.stream_id;
+        entry.active_request_cancel_token = &cancel_token;
+        defer {
+            entry.active_request_stream_id = null;
+            entry.active_request_cancel_token = null;
+        }
         request.downstream_handshake_complete = entry.conn.isEstablished();
         request.downstream_handshake = .{
             .ctx = entry.conn,
@@ -2243,6 +2503,88 @@ pub const Runtime = struct {
         self.sendHandlerResponse(entry, incoming.stream_id, &response, now);
     }
 
+    fn submitAsyncH3Job(self: *Runtime, job: *AsyncH3Job) !void {
+        try self.async_h3_jobs.append(self.allocator, job);
+        self.async_h3_executor.submit(job) catch |err| {
+            _ = self.async_h3_jobs.pop();
+            return err;
+        };
+    }
+
+    fn drainCompletedAsyncH3Jobs(self: *Runtime, connections: *std.AutoHashMap(u64, *ConnEntry)) void {
+        var index: usize = 0;
+        while (index < self.async_h3_jobs.items.len) {
+            const job = self.async_h3_jobs.items[index];
+            if (!job.done.load(.acquire)) {
+                index += 1;
+                continue;
+            }
+            _ = self.async_h3_jobs.orderedRemove(index);
+            defer job.deinit();
+
+            const entry = connections.get(job.connection_handle) orelse {
+                if (job.takeParkedCacheFill()) |continuation| {
+                    continuation.cancel(.shutdown);
+                    continuation.deinit(self.allocator);
+                }
+                continue;
+            };
+            if (job.cancelled.load(.acquire)) {
+                if (job.takeParkedCacheFill()) |continuation| {
+                    continuation.cancel(.client_disconnect);
+                    continuation.deinit(self.allocator);
+                }
+                continue;
+            }
+
+            if (job.result_error) |err| {
+                if (err == error.Http3RequestParked) {
+                    const continuation = job.takeParkedCacheFill() orelse {
+                        self.logger.warn(null, "http3: handler reported a parked cache fill without a continuation", .{});
+                        self.sendInternalErrorResponse(entry, job.stream_id, job.started_us);
+                        continue;
+                    };
+                    entry.parked_h3_cache_fills.append(self.allocator, .{
+                        .stream_id = job.stream_id,
+                        .started_us = job.started_us,
+                        .continuation = continuation,
+                    }) catch |append_err| {
+                        self.logger.warn(null, "http3: failed to retain parked cache fill: {s}", .{@errorName(append_err)});
+                        continuation.cancel(.shutdown);
+                        continuation.deinit(self.allocator);
+                        self.sendInternalErrorResponse(entry, job.stream_id, job.started_us);
+                    };
+                    continue;
+                }
+                if (err == error.RequestCancelled) {
+                    entry.conn.resetStream(job.stream_id, 0x010c) catch {}; // H3_REQUEST_CANCELLED
+                    entry.h3.finishRequest(job.stream_id);
+                    self.noteRequestCompletedWithLatency(job.started_us, nowUs());
+                    continue;
+                }
+                self.logger.warn(null, "http3: asynchronous request handler failed: {s}", .{@errorName(err)});
+                self.sendInternalErrorResponse(entry, job.stream_id, job.started_us);
+                continue;
+            }
+            self.sendHandlerResponse(entry, job.stream_id, &job.response, job.started_us);
+        }
+    }
+
+    fn cancelAsyncH3Job(self: *Runtime, connection_handle: u64, stream_id: u64, reason: cancellation.CancelReason) bool {
+        for (self.async_h3_jobs.items) |job| {
+            if (job.connection_handle != connection_handle or job.stream_id != stream_id) continue;
+            job.cancel(reason);
+            return true;
+        }
+        return false;
+    }
+
+    fn cancelAsyncH3JobsForConnection(self: *Runtime, connection_handle: u64, reason: cancellation.CancelReason) void {
+        for (self.async_h3_jobs.items) |job| {
+            if (job.connection_handle == connection_handle) job.cancel(reason);
+        }
+    }
+
     fn resumeParkedH3Retries(self: *Runtime, entry: *ConnEntry) void {
         self.resumeParkedH3RetriesForEntry(entry);
     }
@@ -2259,11 +2601,38 @@ pub const Runtime = struct {
                 continue;
             }
             var parked = entry.parked_h3_cache_fills.orderedRemove(index);
+            if (self.async_h3_executor.initialized) {
+                const job = AsyncH3Job.initCacheFillResume(
+                    self.allocator,
+                    entry.quic_observer.connection_handle,
+                    parked.stream_id,
+                    parked.started_us,
+                    parked.continuation,
+                ) catch |err| {
+                    self.logger.warn(null, "http3: cache-fill resume executor admission failed: {s}", .{@errorName(err)});
+                    parked.cancelAndDeinit(self.allocator, .shutdown);
+                    self.sendStatusResponse(entry, parked.stream_id, 503, parked.started_us);
+                    continue;
+                };
+                self.submitAsyncH3Job(job) catch |err| {
+                    self.logger.warn(null, "http3: cache-fill resume executor admission failed: {s}", .{@errorName(err)});
+                    job.cancel(.shutdown);
+                    job.deinit();
+                    self.sendStatusResponse(entry, parked.stream_id, 503, parked.started_us);
+                };
+                continue;
+            }
             defer parked.deinit(self.allocator);
 
             var response = response_mod.Response.init(self.allocator);
             defer response.deinit();
             parked.continuation.run(self.allocator, &response) catch |err| {
+                if (err == error.RequestCancelled) {
+                    entry.conn.resetStream(parked.stream_id, 0x010c) catch {}; // H3_REQUEST_CANCELLED
+                    entry.h3.finishRequest(parked.stream_id);
+                    self.noteRequestCompletedWithLatency(parked.started_us, nowUs());
+                    continue;
+                }
                 if (err == error.Http3RequestParked) {
                     self.logger.warn(null, "http3: resumed cache-fill request attempted to park again", .{});
                 } else {
@@ -2880,6 +3249,7 @@ pub const Runtime = struct {
         if (entry.active_request_stream_id == stream_id) {
             if (entry.active_request_cancel_token) |token| token.cancel(.client_disconnect);
         }
+        _ = observer.runtime.cancelAsyncH3Job(observer.connection_handle, stream_id, .client_disconnect);
         _ = observer.runtime.cancelParkedH3CacheFillForEntry(entry, stream_id, .client_disconnect);
     }
 
@@ -5657,6 +6027,7 @@ const TestH3ResumeSession = struct {
 const TestH3ResumeEntry = struct {
     conn: *TestH3ResumeConn,
     h3: TestH3ResumeSession = .{},
+    quic_observer: struct { connection_handle: u64 = 0 } = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
     parked_h3_cache_fills: std.ArrayList(ParkedH3CacheFill) = .empty,
     pending_h3_responses: std.ArrayList(PendingH3Response) = .empty,

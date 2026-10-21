@@ -4422,6 +4422,138 @@ test "h3interop.cache_fill_reset releases waiter and unrelated QUIC request prog
     try std.testing.expectEqual(@as(u16, 200), owner.status);
 }
 
+// This is the inverse of the H1-owner test above: the *first* request into a
+// cold cache key is itself a real external H3/QUIC client, so it becomes the
+// fill owner on the shipping UDP reactor rather than a parked waiter. Before
+// #948's bounded worker executor, that owner's blocking origin fetch ran
+// inline on `Runtime.loopMain`, starving every other H3 connection/stream
+// until the origin returned. This proves an unrelated H3 request on a
+// separate QUIC connection still completes while the H3 owner's origin call
+// remains held open, and that a same-key H3 waiter still shares the single
+// fill and releases cleanly on reset.
+test "h3interop.cache_fill_h3_owner_unblocks_reactor_for_unrelated_requests (#934)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+
+    var origin = try GatedUpstream.start(std.heap.page_allocator);
+    defer origin.stop();
+    try origin.run();
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /same {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\
+        \\location = /unrelated {{
+        \\    return 200 unrelated-live;
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" },
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const OwnerH3Result = struct {
+        status_ok: bool = false,
+        body_ok: bool = false,
+        err: ?anyerror = null,
+
+        fn run(result: *@This(), quic_port_: u16) void {
+            var child = runNativeH3Client(std.heap.page_allocator, quic_port_, "/same", null) catch |err| {
+                result.err = err;
+                return;
+            };
+            defer child.deinit(std.heap.page_allocator);
+            result.status_ok = child.outcome == .normal_exit and
+                std.mem.indexOf(u8, child.stdout, "status: 200") != null;
+            result.body_ok = std.mem.indexOf(u8, child.stdout, "gated-origin-a") != null;
+        }
+    };
+    var owner = OwnerH3Result{};
+    const owner_thread = try std.Thread.spawn(.{}, OwnerH3Result.run, .{ &owner, quic_port });
+    var owner_joined = false;
+    defer if (!owner_joined) {
+        origin.release();
+        owner_thread.join();
+    };
+
+    // The deterministic barrier: the H3 owner's dispatch reached the real
+    // origin, which only happens off the worker executor since the reactor
+    // thread never calls into `GatedUpstream` directly.
+    try origin.waitEntered(5_000);
+
+    const WaiterResetResult = struct {
+        ok: bool = false,
+        err: ?anyerror = null,
+
+        fn run(result: *@This(), quic_port_: u16) void {
+            var child = runNativeH3Client(std.heap.page_allocator, quic_port_, "/same", 750) catch |err| {
+                result.err = err;
+                return;
+            };
+            defer child.deinit(std.heap.page_allocator);
+            result.ok = child.outcome == .normal_exit;
+        }
+    };
+    var waiter = WaiterResetResult{};
+    const waiter_thread = try std.Thread.spawn(.{}, WaiterResetResult.run, .{ &waiter, quic_port });
+    var waiter_joined = false;
+    defer if (!waiter_joined) waiter_thread.join();
+
+    // A same-key H3 request must register as a waiter on the H3 owner's
+    // flight, not start a second origin attempt.
+    try waitForTlsProxyCacheFillWaiters(allocator, tardigrade.port, 1, 5_000);
+
+    // Both the H3 owner and the H3 waiter are still blocked on the held
+    // origin. An unrelated H3 GET on a distinct QUIC connection must still
+    // complete now, proving the reactor kept reading/processing packets
+    // instead of sleeping on the owner's synchronous origin call.
+    var unrelated = try runNativeH3Client(allocator, quic_port, "/unrelated", null);
+    defer unrelated.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(unrelated.outcome));
+    try assertContains(unrelated.stdout, "status: 200");
+    try assertContains(unrelated.stdout, "unrelated-live");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    waiter_thread.join();
+    waiter_joined = true;
+    if (waiter.err) |err| return err;
+    try std.testing.expect(waiter.ok);
+    try waitForTlsProxyCacheFillWaiters(allocator, tardigrade.port, 0, 2_000);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    origin.release();
+    owner_thread.join();
+    owner_joined = true;
+    if (owner.err) |err| return err;
+    try std.testing.expect(owner.status_ok);
+    try std.testing.expect(owner.body_ok);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+}
+
 test "h3interop.quic.early.accepted" {
     try requireGenericNativeTlsProfile();
     const allocator = std.testing.allocator;

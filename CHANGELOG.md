@@ -29,8 +29,14 @@ All notable user-facing changes to Tardigrade are documented here.
   representation: one owner performs origin I/O while at most 32 waiters per
   key and 256 globally wait for up to 2 seconds, then recheck the cache.
   HTTP/3 waiters are parked as reactor-owned continuations so QUIC reset,
-  timers, and unrelated streams continue to make progress; the live waiter
-  and owner-flight counts are exposed as Prometheus gauges.
+  timers, and unrelated streams continue to make progress. Established H3
+  requests, including the first request that becomes a fill owner, now run
+  on a bounded worker executor rather than inline on the single-threaded UDP
+  reactor, so a slow origin fetch no longer stalls unrelated H3 connections;
+  a resumed parked continuation that has already passed its own cancellation
+  or request deadline resets its stream instead of re-entering routing/auth
+  or serving a stale cache hit. The live waiter and owner-flight counts are
+  exposed as Prometheus gauges.
   Overflow, timeout, cancellation, owner failure, reload, and shutdown all
   fail open to the normal independent proxy path; no cache mutex is held over
   origin I/O.

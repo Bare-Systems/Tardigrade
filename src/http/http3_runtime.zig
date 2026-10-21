@@ -851,6 +851,27 @@ const ParkedH3Retry = struct {
     }
 };
 
+const ParkedH3CacheFill = struct {
+    stream_id: u64,
+    started_us: u64,
+    continuation: http3_session.StreamRequest.CacheFillContinuation,
+
+    fn cancelAndDeinit(
+        self: *ParkedH3CacheFill,
+        allocator: std.mem.Allocator,
+        reason: cancellation.CancelReason,
+    ) void {
+        self.continuation.cancel(reason);
+        self.continuation.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn deinit(self: *ParkedH3CacheFill, allocator: std.mem.Allocator) void {
+        self.continuation.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const RemovalReason = enum {
     unauthenticated_initial,
     handshake_timeout,
@@ -1034,6 +1055,7 @@ const ConnEntry = struct {
     last_stream_metrics: quic.stream.Metrics = .{},
     last_tls_metrics: quic.tls_adapter.Metrics = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
+    parked_h3_cache_fills: std.ArrayList(ParkedH3CacheFill) = .empty,
     pending_h3_responses: std.ArrayList(PendingH3Response) = .empty,
     active_request_stream_id: ?u64 = null,
     active_request_cancel_token: ?*cancellation.CancellationToken = null,
@@ -1041,6 +1063,8 @@ const ConnEntry = struct {
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
         for (self.parked_h3_retries.items) |*parked| parked.deinit(allocator);
         self.parked_h3_retries.deinit(allocator);
+        for (self.parked_h3_cache_fills.items) |*parked| parked.cancelAndDeinit(allocator, .shutdown);
+        self.parked_h3_cache_fills.deinit(allocator);
         for (self.pending_h3_responses.items) |*pending| pending.deinit(allocator);
         self.pending_h3_responses.deinit(allocator);
         self.h3.deinit();
@@ -1545,6 +1569,9 @@ pub const Runtime = struct {
                         continue;
                     }
                     wake_us = connectionWakeUs(entry, now, wake_us);
+                    if (entry.parked_h3_cache_fills.items.len != 0) {
+                        wake_us = @min(wake_us, now + 50 * std.time.us_per_ms);
+                    }
                 }
                 for (reap[0..reap_count]) |r| {
                     self.removeConnection(&connections, &routes, &per_ip, r.handle, r.reason);
@@ -2093,6 +2120,7 @@ pub const Runtime = struct {
             return;
         };
         self.resumePendingH3Responses(entry, now);
+        self.resumeParkedH3CacheFills(entry, now);
         self.resumeParkedH3Retries(entry);
         while (true) {
             const incoming = entry.h3.pollRequest() catch {
@@ -2198,6 +2226,10 @@ pub const Runtime = struct {
             .ctx = &park_ctx,
             .park_fn = parkH3Early425Retry,
         };
+        request.park_cache_fill = .{
+            .ctx = &park_ctx,
+            .park_fn = parkH3CacheFill,
+        };
 
         var response = response_mod.Response.init(allocator);
         defer response.deinit();
@@ -2213,6 +2245,35 @@ pub const Runtime = struct {
 
     fn resumeParkedH3Retries(self: *Runtime, entry: *ConnEntry) void {
         self.resumeParkedH3RetriesForEntry(entry);
+    }
+
+    fn resumeParkedH3CacheFills(self: *Runtime, entry: *ConnEntry, now_us: u64) void {
+        self.resumeParkedH3CacheFillsForEntry(entry, now_us);
+    }
+
+    fn resumeParkedH3CacheFillsForEntry(self: *Runtime, entry: anytype, now_us: u64) void {
+        var index: usize = 0;
+        while (index < entry.parked_h3_cache_fills.items.len) {
+            if (!entry.parked_h3_cache_fills.items[index].continuation.isReady(now_us / std.time.us_per_ms)) {
+                index += 1;
+                continue;
+            }
+            var parked = entry.parked_h3_cache_fills.orderedRemove(index);
+            defer parked.deinit(self.allocator);
+
+            var response = response_mod.Response.init(self.allocator);
+            defer response.deinit();
+            parked.continuation.run(self.allocator, &response) catch |err| {
+                if (err == error.Http3RequestParked) {
+                    self.logger.warn(null, "http3: resumed cache-fill request attempted to park again", .{});
+                } else {
+                    self.logger.warn(null, "http3: parked cache-fill request failed: {s}", .{@errorName(err)});
+                }
+                self.sendInternalErrorResponse(entry, parked.stream_id, parked.started_us);
+                continue;
+            };
+            self.sendHandlerResponse(entry, parked.stream_id, &response, parked.started_us);
+        }
     }
 
     fn resumeParkedH3RetriesForEntry(self: *Runtime, entry: anytype) void {
@@ -2447,6 +2508,15 @@ pub const Runtime = struct {
     fn parkH3Early425Retry(ctx: *anyopaque, continuation: http3_session.StreamRequest.Early425RetryContinuation) anyerror!void {
         const park_ctx: *H3ParkContext = @ptrCast(@alignCast(ctx));
         try park_ctx.entry.parked_h3_retries.append(park_ctx.runtime.allocator, .{
+            .stream_id = park_ctx.stream_id,
+            .started_us = park_ctx.started_us,
+            .continuation = continuation,
+        });
+    }
+
+    fn parkH3CacheFill(ctx: *anyopaque, continuation: http3_session.StreamRequest.CacheFillContinuation) anyerror!void {
+        const park_ctx: *H3ParkContext = @ptrCast(@alignCast(ctx));
+        try park_ctx.entry.parked_h3_cache_fills.append(park_ctx.runtime.allocator, .{
             .stream_id = park_ctx.stream_id,
             .started_us = park_ctx.started_us,
             .continuation = continuation,
@@ -2807,8 +2877,29 @@ pub const Runtime = struct {
 
     fn cancelActiveH3Request(observer: *ConnEntry.QuicObserver, stream_id: u64) void {
         const entry = observer.entry orelse return;
-        if (entry.active_request_stream_id != stream_id) return;
-        if (entry.active_request_cancel_token) |token| token.cancel(.client_disconnect);
+        if (entry.active_request_stream_id == stream_id) {
+            if (entry.active_request_cancel_token) |token| token.cancel(.client_disconnect);
+        }
+        _ = observer.runtime.cancelParkedH3CacheFillForEntry(entry, stream_id, .client_disconnect);
+    }
+
+    fn cancelParkedH3CacheFillForEntry(
+        self: *Runtime,
+        entry: anytype,
+        stream_id: u64,
+        reason: cancellation.CancelReason,
+    ) bool {
+        var index: usize = 0;
+        while (index < entry.parked_h3_cache_fills.items.len) {
+            if (entry.parked_h3_cache_fills.items[index].stream_id != stream_id) {
+                index += 1;
+                continue;
+            }
+            var parked = entry.parked_h3_cache_fills.orderedRemove(index);
+            parked.cancelAndDeinit(self.allocator, reason);
+            return true;
+        }
+        return false;
     }
 
     fn emitQuicQlog(observer: *ConnEntry.QuicObserver, time_us: u64, event: quic.qlog.Event) void {
@@ -5463,6 +5554,49 @@ const TestParkedContinuationState = struct {
     }
 };
 
+const TestParkedCacheFillState = struct {
+    ready_now: bool = false,
+    run_calls: usize = 0,
+    cancel_calls: usize = 0,
+    deinit_calls: usize = 0,
+    last_cancel_reason: ?cancellation.CancelReason = null,
+
+    fn ready(ctx: *anyopaque, now_ms: u64) bool {
+        _ = now_ms;
+        const self: *TestParkedCacheFillState = @ptrCast(@alignCast(ctx));
+        return self.ready_now;
+    }
+
+    fn cancel(ctx: *anyopaque, reason: cancellation.CancelReason) void {
+        const self: *TestParkedCacheFillState = @ptrCast(@alignCast(ctx));
+        self.cancel_calls += 1;
+        self.last_cancel_reason = reason;
+    }
+
+    fn run(ctx: *anyopaque, allocator: std.mem.Allocator, response: *response_mod.Response) !void {
+        _ = allocator;
+        const self: *TestParkedCacheFillState = @ptrCast(@alignCast(ctx));
+        self.run_calls += 1;
+        _ = response.setStatus(.ok).setBody("cache-resumed");
+    }
+
+    fn deinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const self: *TestParkedCacheFillState = @ptrCast(@alignCast(ctx));
+        self.deinit_calls += 1;
+    }
+
+    fn continuation(self: *TestParkedCacheFillState) http3_session.StreamRequest.CacheFillContinuation {
+        return .{
+            .ctx = self,
+            .ready_fn = ready,
+            .cancel_fn = cancel,
+            .resume_fn = run,
+            .deinit_fn = deinit,
+        };
+    }
+};
+
 const TestH3ResumeConn = struct {
     established: bool = false,
     reset_calls: usize = 0,
@@ -5524,11 +5658,14 @@ const TestH3ResumeEntry = struct {
     conn: *TestH3ResumeConn,
     h3: TestH3ResumeSession = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
+    parked_h3_cache_fills: std.ArrayList(ParkedH3CacheFill) = .empty,
     pending_h3_responses: std.ArrayList(PendingH3Response) = .empty,
 
     fn deinit(self: *TestH3ResumeEntry, allocator: std.mem.Allocator) void {
         for (self.parked_h3_retries.items) |*parked| parked.deinit(allocator);
         self.parked_h3_retries.deinit(allocator);
+        for (self.parked_h3_cache_fills.items) |*parked| parked.cancelAndDeinit(allocator, .shutdown);
+        self.parked_h3_cache_fills.deinit(allocator);
         for (self.pending_h3_responses.items) |*pending| pending.deinit(allocator);
         self.pending_h3_responses.deinit(allocator);
     }
@@ -5644,6 +5781,70 @@ test "parked H3 retry resumes only after connection establishment" {
     try testing.expectEqual(@as(u64, 11), entry.h3.last_stream_id);
     try testing.expectEqual(@as(usize, 1), latency.count);
     try testing.expect(latency.last_ms > 0);
+}
+
+test "H3 reactor polls a parked cache fill without blocking and resumes it once" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-cache-fill-resume-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{ .established = true };
+    var entry = TestH3ResumeEntry{ .conn = &conn };
+    defer entry.deinit(allocator);
+    var continuation = TestParkedCacheFillState{};
+    try entry.parked_h3_cache_fills.append(allocator, .{
+        .stream_id = 15,
+        .started_us = 1,
+        .continuation = continuation.continuation(),
+    });
+
+    runtime.resumeParkedH3CacheFillsForEntry(&entry, 1);
+    try testing.expectEqual(@as(usize, 1), entry.parked_h3_cache_fills.items.len);
+    try testing.expectEqual(@as(usize, 0), continuation.run_calls);
+    try testing.expectEqual(@as(usize, 0), entry.h3.send_calls);
+
+    continuation.ready_now = true;
+    runtime.resumeParkedH3CacheFillsForEntry(&entry, 2);
+    try testing.expectEqual(@as(usize, 0), entry.parked_h3_cache_fills.items.len);
+    try testing.expectEqual(@as(usize, 1), continuation.run_calls);
+    try testing.expectEqual(@as(usize, 0), continuation.cancel_calls);
+    try testing.expectEqual(@as(usize, 1), continuation.deinit_calls);
+    try testing.expectEqual(@as(usize, 1), entry.h3.send_calls);
+    try testing.expectEqual(@as(u16, 200), entry.h3.last_status);
+    try testing.expectEqual(@as(u64, 15), entry.h3.last_stream_id);
+}
+
+test "H3 peer reset cancels a parked cache fill and releases it without resumption" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-cache-fill-cancel-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{ .established = true };
+    var entry = TestH3ResumeEntry{ .conn = &conn };
+    defer entry.deinit(allocator);
+    var continuation = TestParkedCacheFillState{};
+    try entry.parked_h3_cache_fills.append(allocator, .{
+        .stream_id = 19,
+        .started_us = 1,
+        .continuation = continuation.continuation(),
+    });
+
+    try testing.expect(runtime.cancelParkedH3CacheFillForEntry(&entry, 19, .client_disconnect));
+    try testing.expectEqual(@as(usize, 0), entry.parked_h3_cache_fills.items.len);
+    try testing.expectEqual(@as(usize, 0), continuation.run_calls);
+    try testing.expectEqual(@as(usize, 1), continuation.cancel_calls);
+    try testing.expectEqual(cancellation.CancelReason.client_disconnect, continuation.last_cancel_reason.?);
+    try testing.expectEqual(@as(usize, 1), continuation.deinit_calls);
+    try testing.expectEqual(@as(usize, 0), entry.h3.send_calls);
+    try testing.expect(!runtime.cancelParkedH3CacheFillForEntry(&entry, 19, .client_disconnect));
 }
 
 test "H3 runtime parks backpressured response and resumes completion once" {

@@ -2325,6 +2325,9 @@ fn executeSubrequest(allocator: std.mem.Allocator, url: []const u8, method: std.
 pub const Http3DispatchContext = struct {
     config_store: *ReloadableConfigStore,
     cfg: *const edge_config.EdgeConfig,
+    /// Stable composition-root context. Per-request copies point back here so
+    /// parked continuations never retain a stack-local effective context.
+    root_ctx: ?*Http3DispatchContext = null,
     cfg_lease: ?*gs.ConfigLease = null,
     state: *GatewayState,
     client_ip: []const u8 = "unknown",
@@ -2981,6 +2984,113 @@ const Http3Early425ProxyContinuation = struct {
     }
 };
 
+/// Owned request snapshot used when an HTTP/3 cache miss joins an existing
+/// fill. The QUIC reactor polls only `ready`; it never sleeps on the cache
+/// event. Reset/shutdown destroys the continuation and releases the admitted
+/// waiter exactly once. A normal resume re-enters the request pipeline so the
+/// current config, authorization, cache generation, Vary key and entry
+/// revision are all checked again before serving bytes.
+const Http3CacheFillContinuation = struct {
+    dispatch_ctx: *Http3DispatchContext,
+    state: *GatewayState,
+    flight: *gs.ProxyResponseCacheFillFlight,
+    wait_deadline_ms: u64,
+    waiter_released: bool = false,
+    cancel_token: http.cancellation.CancellationToken,
+    request: http.http3_session.StreamRequest,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        dispatch_ctx: *Http3DispatchContext,
+        request: *const http.http3_session.StreamRequest,
+        flight: *gs.ProxyResponseCacheFillFlight,
+    ) !*Http3CacheFillContinuation {
+        // Cache eligibility excludes verified client identities, so no
+        // connection-owned certificate slices may escape into this snapshot.
+        std.debug.assert(request.headers.client_cert == null);
+        const plan = try allocator.create(Http3CacheFillContinuation);
+        errdefer allocator.destroy(plan);
+
+        const method = try allocator.dupe(u8, request.method);
+        errdefer allocator.free(method);
+        const path = try allocator.dupe(u8, request.path);
+        errdefer allocator.free(path);
+        const authority = if (request.authority) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (authority) |value| allocator.free(value);
+        var headers = try request.headers.clone(allocator);
+        errdefer headers.deinit();
+        headers.client_cert = null;
+        const body = try allocator.dupe(u8, request.body);
+        errdefer allocator.free(body);
+        const client_ip = if (request.client_ip) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (client_ip) |value| allocator.free(value);
+
+        const original_token = request.cancel_token;
+        plan.* = .{
+            .dispatch_ctx = dispatch_ctx.root_ctx orelse dispatch_ctx,
+            .state = dispatch_ctx.state,
+            .flight = flight,
+            .wait_deadline_ms = http.event_loop.monotonicMs() + gs.proxy_response_cache_fill_wait_timeout_ms,
+            .cancel_token = http.cancellation.CancellationToken.init(if (original_token) |token| token.deadline_ms else 0),
+            .request = .{
+                .allocator = allocator,
+                .stream_id = request.stream_id,
+                .method = method,
+                .path = path,
+                .authority = authority,
+                .headers = headers,
+                .body = body,
+                .client_ip = client_ip,
+                .transport_early = false,
+                .client_auth_policy_fingerprint = request.client_auth_policy_fingerprint,
+                .downstream_handshake_complete = true,
+                .downstream_handshake = null,
+                .park_early_425_retry = null,
+                .park_cache_fill = null,
+                .cache_fill_wait_resumed = true,
+                .cancel_token = undefined,
+            },
+        };
+        plan.request.cancel_token = &plan.cancel_token;
+        if (original_token) |token| {
+            if (token.isCancelled()) plan.cancel_token.cancel(token.reason orelse .client_disconnect);
+        }
+        return plan;
+    }
+
+    fn releaseWaiter(self: *Http3CacheFillContinuation) void {
+        if (self.waiter_released) return;
+        self.waiter_released = true;
+        self.state.proxyResponseCacheReleaseFillWaiter(self.flight);
+    }
+
+    fn ready(ctx: *anyopaque, now_ms: u64) bool {
+        const self: *Http3CacheFillContinuation = @ptrCast(@alignCast(ctx));
+        return self.state.proxyResponseCacheFillCompleted(self.flight) or
+            self.cancel_token.isStopped() or
+            now_ms >= self.wait_deadline_ms;
+    }
+
+    fn cancel(ctx: *anyopaque, reason: http.cancellation.CancelReason) void {
+        const self: *Http3CacheFillContinuation = @ptrCast(@alignCast(ctx));
+        self.cancel_token.cancel(reason);
+        self.releaseWaiter();
+    }
+
+    fn run(ctx: *anyopaque, allocator: std.mem.Allocator, response: *http.Response) !void {
+        const self: *Http3CacheFillContinuation = @ptrCast(@alignCast(ctx));
+        self.releaseWaiter();
+        try handleHttp3Request(allocator, &self.request, response, self.dispatch_ctx);
+    }
+
+    fn destroy(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *Http3CacheFillContinuation = @ptrCast(@alignCast(ctx));
+        self.releaseWaiter();
+        self.request.deinit();
+        allocator.destroy(self);
+    }
+};
+
 fn handleHttp3LocationProxyPass(
     allocator: std.mem.Allocator,
     request: *const http.http3_session.StreamRequest,
@@ -3116,13 +3226,37 @@ fn handleHttp3LocationProxyPass(
                 if (fillable_method) {
                     response_cache_key = key_buf;
                     var coordination_buf: [64]u8 = undefined;
-                    if (gproxy_runtime.responseCacheFillCoordinationKey(&coordination_buf, key_buf[0..], &request.headers)) |coordination_key| {
+                    if (!request.cache_fill_wait_resumed and gproxy_runtime.responseCacheFillCoordinationKey(&coordination_buf, key_buf[0..], &request.headers) != null) {
+                        const coordination_key = gproxy_runtime.responseCacheFillCoordinationKey(&coordination_buf, key_buf[0..], &request.headers).?;
                         switch (ctx.state.proxyResponseCacheBeginFill(cache_generation, coordination_key) catch .independent) {
                             .owner => {
                                 response_cache_fill_key = coordination_buf;
                                 response_cache_fill_owner = true;
                             },
                             .waiter => |flight| {
+                                if (request.park_cache_fill) |parker| {
+                                    const continuation = Http3CacheFillContinuation.init(allocator, ctx, request, flight) catch |err| {
+                                        ctx.state.proxyResponseCacheReleaseFillWaiter(flight);
+                                        return err;
+                                    };
+                                    parker.park(.{
+                                        .ctx = continuation,
+                                        .ready_fn = Http3CacheFillContinuation.ready,
+                                        .cancel_fn = Http3CacheFillContinuation.cancel,
+                                        .resume_fn = Http3CacheFillContinuation.run,
+                                        .deinit_fn = Http3CacheFillContinuation.destroy,
+                                    }) catch |err| {
+                                        Http3CacheFillContinuation.destroy(continuation, allocator);
+                                        return err;
+                                    };
+                                    // Ownership moved into the runtime's
+                                    // parked-stream list. All local defers may
+                                    // now unwind without blocking the reactor.
+                                    return error.Http3RequestParked;
+                                }
+                                // Direct dispatcher tests and embedders that
+                                // do not provide a runtime parker retain the
+                                // bounded synchronous behavior.
                                 _ = ctx.state.proxyResponseCacheWaitForFill(flight, ctx.cancel_token);
                                 if (ctx.cancel_token) |token| if (token.isStopped()) {
                                     try rejectHttp3ProxyError(allocator, response, ctx, .gateway_timeout, "request_cancelled", "HTTP/3 request was cancelled while waiting for a cache fill", correlation_id);
@@ -3455,6 +3589,7 @@ test "H3 proxy synchronously revalidates an expired cached body with an origin 3
     state.proxy_response_cache_fill_flights = std.StringHashMap(*gs.ProxyResponseCacheFillFlight).init(allocator);
     defer state.proxy_response_cache_fill_flights.deinit();
     state.proxy_response_cache_fill_waiters = 0;
+    state.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
     var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
 
     const issueRequest = struct {
@@ -3508,6 +3643,7 @@ fn initCollapseTestState(
     state.proxy_response_cache_condition = .{};
     state.proxy_response_cache_fill_flights = std.StringHashMap(*gs.ProxyResponseCacheFillFlight).init(allocator);
     state.proxy_response_cache_fill_waiters = 0;
+    state.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
 }
 
 const CollapseCaller = struct {
@@ -3559,6 +3695,23 @@ const CollapseCaller = struct {
     }
 };
 
+const H3CacheFillParkCapture = struct {
+    parked: ?http.http3_session.StreamRequest.CacheFillContinuation = null,
+
+    fn park(ctx: *anyopaque, continuation: http.http3_session.StreamRequest.CacheFillContinuation) anyerror!void {
+        const self: *H3CacheFillParkCapture = @ptrCast(@alignCast(ctx));
+        if (self.parked != null) return error.TestDuplicatePark;
+        self.parked = continuation;
+    }
+
+    fn cancelAndDeinit(self: *H3CacheFillParkCapture, allocator: std.mem.Allocator, reason: http.cancellation.CancelReason) void {
+        const parked = self.parked orelse return;
+        self.parked = null;
+        parked.cancel(reason);
+        parked.deinit(allocator);
+    }
+};
+
 /// Poll (never sleep a fixed guess) the cache's own waiter bookkeeping until
 /// `expected` concurrent callers have registered as collapsed waiters for
 /// the single in-flight fill, or fail the test if that never happens (#945).
@@ -3574,7 +3727,7 @@ fn waitForCollapsedWaiters(state: *GatewayState, expected: usize, timeout_ms: u6
     }
 }
 
-test "H3 proxy response cache collapses 20 real concurrent callers to one origin fill with no stuck waiters (#945)" {
+test "H3 direct dispatcher collapses 20 concurrent handler callers to one origin fill with no stuck waiters (#945)" {
     const num_callers = 20;
     const allocator = std.testing.allocator;
     var origin = try GatedH3ProxyOrigin.start(allocator, &.{
@@ -3626,6 +3779,79 @@ test "H3 proxy response cache collapses 20 real concurrent callers to one origin
     }
     try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
     try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_flights.count());
+}
+
+test "H3 cache waiter parks without blocking and reset releases its flight before the owner completes (#934)" {
+    const allocator = std.testing.allocator;
+    var origin = try GatedH3ProxyOrigin.start(allocator, &.{
+        "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nowner",
+    });
+    defer origin.stop();
+    try origin.run();
+
+    var target_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "http://127.0.0.1:{d}", .{origin.port()});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/park-reset",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.proxy_cache_ttl_seconds = 60;
+    cfg.proxy_cache_stale_while_revalidate_seconds = 0;
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initCollapseTestState(allocator, &state);
+    defer deinitHttp3ProxyTestState(&state);
+    defer state.proxy_response_cache.?.deinit();
+    defer state.proxy_response_cache_fill_flights.deinit();
+    var dispatch_ctx = Http3DispatchContext{ .config_store = &config_store, .cfg = &cfg, .state = &state };
+
+    var owner_result = CollapseCaller{};
+    const owner_thread = try std.Thread.spawn(.{}, CollapseCaller.run, .{ &owner_result, "/park-reset", &dispatch_ctx });
+    var owner_joined = false;
+    defer if (!owner_joined) {
+        origin.release();
+        owner_thread.join();
+    };
+    try origin.waitEntered(5_000);
+
+    var capture = H3CacheFillParkCapture{};
+    defer capture.cancelAndDeinit(allocator, .shutdown);
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .stream_id = 7,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/park-reset"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .client_ip = try allocator.dupe(u8, "127.0.0.1"),
+        .park_cache_fill = .{ .ctx = &capture, .park_fn = H3CacheFillParkCapture.park },
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    const started_ms = compat.milliTimestamp();
+    try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &response, &dispatch_ctx));
+    try std.testing.expect(compat.milliTimestamp() - started_ms < 500);
+    try std.testing.expect(capture.parked != null);
+    try std.testing.expectEqual(@as(usize, 1), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    capture.cancelAndDeinit(allocator, .client_disconnect);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_waiters);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    origin.release();
+    owner_thread.join();
+    owner_joined = true;
+    if (owner_result.err) |err| return err;
+    try std.testing.expectEqual(@as(u16, 200), owner_result.status);
     try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_fill_flights.count());
 }
 
@@ -6855,6 +7081,7 @@ pub fn handleHttp3Request(
     );
 
     var effective_ctx = ctx.*;
+    effective_ctx.root_ctx = ctx.root_ctx orelse ctx;
     effective_ctx.cfg = effective_cfg;
     effective_ctx.cfg_lease = &cfg_lease;
     effective_ctx.client_ip = client_ip;

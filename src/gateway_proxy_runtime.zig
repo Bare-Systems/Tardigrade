@@ -313,6 +313,7 @@ test "proxy response cache foreground fill collapses and bounds same-key waiters
     state.proxy_response_cache_fill_flights = std.StringHashMap(*gs.ProxyResponseCacheFillFlight).init(std.testing.allocator);
     defer state.proxy_response_cache_fill_flights.deinit();
     state.proxy_response_cache_fill_waiters = 0;
+    state.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
 
     try std.testing.expectEqual(gs.ProxyResponseCacheFillAdmission.owner, try state.proxyResponseCacheBeginFill(7, "representation"));
     var waiters: [gs.proxy_response_cache_fill_max_waiters_per_key]*gs.ProxyResponseCacheFillFlight = undefined;
@@ -404,6 +405,7 @@ test "proxy response cache reload wakes foreground fill waiters" {
     state.proxy_response_cache_fill_flights = std.StringHashMap(*gs.ProxyResponseCacheFillFlight).init(std.testing.allocator);
     defer state.proxy_response_cache_fill_flights.deinit();
     state.proxy_response_cache_fill_waiters = 0;
+    state.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
     state.proxy_response_cache_disk_accepting = true;
     state.proxy_response_cache_disk_inflight = 0;
     state.proxy_response_cache_revalidation_inflight = std.atomic.Value(u32).init(0);

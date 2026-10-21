@@ -28,6 +28,9 @@ All notable user-facing changes to Tardigrade are documented here.
   revalidations are collapsed per config generation and normalized
   representation: one owner performs origin I/O while at most 32 waiters per
   key and 256 globally wait for up to 2 seconds, then recheck the cache.
+  HTTP/3 waiters are parked as reactor-owned continuations so QUIC reset,
+  timers, and unrelated streams continue to make progress; the live waiter
+  and owner-flight counts are exposed as Prometheus gauges.
   Overflow, timeout, cancellation, owner failure, reload, and shutdown all
   fail open to the normal independent proxy path; no cache mutex is held over
   origin I/O.

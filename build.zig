@@ -379,6 +379,7 @@ pub fn build(b: *std.Build) void {
         "tardigrade_bin_path",
         b.option([]const u8, "tardigrade-bin-path", "Path to the tardi executable used by integration tests") orelse b.getInstallPath(.bin, "tardi"),
     );
+    integration_options.addOption([]const u8, "h3_interop_tool_path", b.getInstallPath(.bin, "h3_interop_tool"));
 
     integration_options.addOption(bool, "acme_experimental", acme_experimental);
 
@@ -474,7 +475,8 @@ pub fn build(b: *std.Build) void {
     // #945: the curated PR-smoke live-process subset -- startup/health,
     // proxy round-trip, request-policy/auth-denied origin side effect,
     // invalid-config/reload, auth-gated cache isolation, and one native
-    // H1/H2/TLS boundary case -- instead of the full `test-integration`
+    // H1/H2/TLS boundary case plus bounded H1/H3 cache-collapse acceptance
+    // -- instead of the full `test-integration`
     // suite on ordinary PRs (see ci.yml's `integration-test` job and
     // docs/CI.md). Each named filter below is a stable, existing
     // `tests/integration.zig` test name, not a new test. Unlike
@@ -490,8 +492,10 @@ pub fn build(b: *std.Build) void {
         "invalid reload leaves the previous config active (#170)",
         "native TLS listener dispatches ALPN h2 through HTTP/2 frames",
         "forward_auth responses are never shared-cacheable over h1",
+        "generic proxy response cache collapses concurrent misses to one origin fill (#934)",
+        "h3interop.cache_fill_reset releases waiter and unrelated QUIC request progresses before owner (#934)",
     };
-    const integration_smoke_step = b.step("test-integration-smoke", "Run the curated PR-smoke live-process integration subset (#945): startup/health, proxy round-trip, auth-denied origin side effect, invalid config/reload, auth-gated cache isolation, and one native H1/H2/TLS boundary case; fails closed if any named case matches nothing");
+    const integration_smoke_step = b.step("test-integration-smoke", "Run the curated PR-smoke live-process integration subset (#945), including deterministic H1/H3 cache-collapse acceptance; fails closed if any named case matches nothing");
     for (integration_smoke_filters) |filter_name| {
         const probe = b.addTest(.{
             .root_module = integration_mod,
@@ -1110,6 +1114,9 @@ pub fn build(b: *std.Build) void {
         .root_module = h3_interop_mod,
     });
     const h3_interop_install = b.addInstallArtifact(h3_interop_tool, .{});
+    run_integration_tests.step.dependOn(&h3_interop_install.step);
+    run_integration_smoke_tests.step.dependOn(&h3_interop_install.step);
+    run_resumption_interop_tests.step.dependOn(&h3_interop_install.step);
     const h3_interop_step = b.step("build-h3-interop", "Build the native HTTP/3 interop client/server tool");
     h3_interop_step.dependOn(&h3_interop_install.step);
     const h3_interop_tests = b.addTest(.{ .root_module = h3_interop_mod });

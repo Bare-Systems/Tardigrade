@@ -3983,6 +3983,45 @@ fn runGtlsClient(allocator: std.mem.Allocator, client_path: []const u8, spec: Gt
     });
 }
 
+fn runNativeH3Client(
+    allocator: std.mem.Allocator,
+    quic_port: u16,
+    path: []const u8,
+    reset_after_request_ms: ?u64,
+) !bounded_process.Result {
+    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(port_str);
+    const reset_delay = if (reset_after_request_ms) |delay| try std.fmt.allocPrint(allocator, "{d}", .{delay}) else null;
+    defer if (reset_delay) |value| allocator.free(value);
+    var argv = std.array_list.Managed([]const u8).init(allocator);
+    defer argv.deinit();
+    try argv.appendSlice(&.{
+        integration_options.h3_interop_tool_path,
+        "client",
+        "--host",
+        test_host,
+        "--port",
+        port_str,
+        "--authority",
+        quic_interop_server_name,
+        "--path",
+        path,
+        "--insecure",
+        "--timeout-ms",
+        "5000",
+    });
+    if (reset_delay) |value| {
+        try argv.append("--reset-after-request-ms");
+        try argv.append(value);
+    }
+    return bounded_process.run(allocator, .{
+        .argv = argv.items,
+        .stdout_limit = 64 * 1024,
+        .stderr_limit = 64 * 1024,
+        .deadline_ms = 7_000,
+    });
+}
+
 fn ngtcp2SessionPath(allocator: std.mem.Allocator, port: u16, tag: []const u8) ![]u8 {
     const dir = try interopSecretsDir(allocator);
     defer allocator.free(dir);
@@ -4269,6 +4308,118 @@ test "h3interop.forward_auth.deny_then_allow" {
     try waitForUpstreamCount(&upstream, 1, 2_000);
     try std.testing.expectEqualStrings("h3-alice", upstream.capturedHeader("X-Auth-Request-User").?);
     try std.testing.expectEqual(@as(u32, 2), auth.requestCount());
+}
+
+test "h3interop.cache_fill_reset releases waiter and unrelated QUIC request progresses before owner (#934)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+
+    var origin = try GatedUpstream.start(std.heap.page_allocator);
+    defer origin.stop();
+    try origin.run();
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /same {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\
+        \\location = /unrelated {{
+        \\    return 200 unrelated-live;
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" },
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const OwnerResult = struct {
+        status: u16 = 0,
+        err: ?anyerror = null,
+
+        fn run(result: *@This(), port: u16) void {
+            var response = sendPureZigTlsHttp1RequestWithServerName(std.heap.page_allocator, port, "/same", quic_interop_server_name) catch |err| {
+                result.err = err;
+                return;
+            };
+            defer response.deinit();
+            result.status = response.status_code;
+        }
+    };
+    var owner = OwnerResult{};
+    const owner_thread = try std.Thread.spawn(.{}, OwnerResult.run, .{ &owner, tardigrade.port });
+    var owner_joined = false;
+    defer if (!owner_joined) {
+        origin.release();
+        owner_thread.join();
+    };
+    try origin.waitEntered(5_000);
+
+    const ResetResult = struct {
+        ok: bool = false,
+        err: ?anyerror = null,
+
+        fn run(result: *@This(), port: u16) void {
+            var child = runNativeH3Client(std.heap.page_allocator, port, "/same", 750) catch |err| {
+                result.err = err;
+                return;
+            };
+            defer child.deinit(std.heap.page_allocator);
+            result.ok = child.outcome == .normal_exit;
+        }
+    };
+    var reset = ResetResult{};
+    const reset_thread = try std.Thread.spawn(.{}, ResetResult.run, .{ &reset, quic_port });
+    var reset_joined = false;
+    defer if (!reset_joined) reset_thread.join();
+
+    // This gauge is the deterministic barrier: the request is parked in the
+    // shipping Runtime, not merely handshaken or queued at a socket.
+    try waitForTlsProxyCacheFillWaiters(allocator, tardigrade.port, 1, 5_000);
+    reset_thread.join();
+    reset_joined = true;
+    if (reset.err) |err| return err;
+    try std.testing.expect(reset.ok);
+    try waitForTlsProxyCacheFillWaiters(allocator, tardigrade.port, 0, 2_000);
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    // The held H1 owner is deliberately still blocked. A second real QUIC
+    // connection must complete now, proving the reset was ingested and the
+    // UDP reactor never slept on the fill event.
+    var unrelated = try runNativeH3Client(allocator, quic_port, "/unrelated", null);
+    defer unrelated.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(unrelated.outcome));
+    try assertContains(unrelated.stdout, "status: 200");
+    try assertContains(unrelated.stdout, "unrelated-live");
+    try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
+
+    origin.release();
+    owner_thread.join();
+    owner_joined = true;
+    if (owner.err) |err| return err;
+    try std.testing.expectEqual(@as(u16, 200), owner.status);
 }
 
 test "h3interop.quic.early.accepted" {
@@ -13726,6 +13877,49 @@ fn prometheusMetricValue(body: []const u8, name: []const u8) ?u64 {
     return null;
 }
 
+fn waitForTlsProxyCacheFillWaiters(
+    allocator: std.mem.Allocator,
+    port: u16,
+    expected: u64,
+    timeout_ms: u64,
+) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        var metrics = sendPureZigTlsHttp1RequestWithServerName(allocator, port, "/status/metrics", quic_interop_server_name) catch {
+            compat.sleepNs(10 * std.time.ns_per_ms);
+            continue;
+        };
+        defer metrics.deinit();
+        if (prometheusMetricValue(metrics.body, "tardigrade_proxy_cache_fill_waiters") == expected) return;
+        compat.sleepNs(10 * std.time.ns_per_ms);
+    }
+    return error.ProxyCacheFillWaiterCountNotObserved;
+}
+
+fn waitForProxyCacheFillWaiters(
+    allocator: std.mem.Allocator,
+    port: u16,
+    expected: u64,
+    timeout_ms: u64,
+) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        var metrics = sendRequest(allocator, port, .{
+            .method = "GET",
+            .path = "/status/metrics",
+            .body = null,
+            .headers = &.{},
+        }) catch {
+            compat.sleepNs(10 * std.time.ns_per_ms);
+            continue;
+        };
+        defer metrics.deinit();
+        if (prometheusMetricValue(metrics.body, "tardigrade_proxy_cache_fill_waiters") == expected) return;
+        compat.sleepNs(10 * std.time.ns_per_ms);
+    }
+    return error.ProxyCacheFillWaiterCountNotObserved;
+}
+
 fn prometheusLabeledMetricValue(body: []const u8, name: []const u8, labels: []const []const u8) ?u64 {
     var lines = std.mem.splitScalar(u8, body, '\n');
     while (lines.next()) |line_raw| {
@@ -15574,6 +15768,7 @@ test "generic proxy response cache bypasses valid session identities (#901)" {
 }
 
 test "generic proxy response cache collapses concurrent misses to one origin fill (#934)" {
+    const num_callers = 20;
     const allocator = std.testing.allocator;
     // The origin holds the elected owner's response until the second request
     // has entered the gateway. If collapsing regresses, the serial origin
@@ -15598,7 +15793,7 @@ test "generic proxy response cache collapses concurrent misses to one origin fil
         .ready_path = "/healthz",
         .extra_env = &.{
             .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "60" },
-            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "24" },
         },
     });
     defer tardigrade.stop();
@@ -15619,34 +15814,34 @@ test "generic proxy response cache collapses concurrent misses to one origin fil
             };
         }
     };
-    var first = Result{};
-    var first_thread: ?std.Thread = null;
-    var second_thread: ?std.Thread = null;
+    var results: [num_callers]Result = @splat(.{});
+    var threads: [num_callers]std.Thread = undefined;
+    var spawned: usize = 0;
     defer {
         // Do not leave a test worker parked at the origin if any assertion or
         // bounded wait above fails before the normal release/join sequence.
         origin.release();
-        if (first_thread) |thread| thread.join();
-        if (second_thread) |thread| thread.join();
+        for (threads[0..spawned]) |thread| thread.join();
     }
-    first_thread = try std.Thread.spawn(.{}, Result.run, .{ &first, tardigrade.port });
+    threads[0] = try std.Thread.spawn(.{}, Result.run, .{ &results[0], tardigrade.port });
+    spawned = 1;
     try origin.waitEntered(5_000);
-    var second = Result{};
-    second_thread = try std.Thread.spawn(.{}, Result.run, .{ &second, tardigrade.port });
-    compat.sleepNs(100 * std.time.ns_per_ms);
+    for (1..num_callers) |i| {
+        threads[i] = try std.Thread.spawn(.{}, Result.run, .{ &results[i], tardigrade.port });
+        spawned += 1;
+    }
+    // Deterministic admission barrier: every non-owner caller has reached
+    // the gateway's actual single-flight waiter accounting before release.
+    try waitForProxyCacheFillWaiters(allocator, tardigrade.port, num_callers - 1, 5_000);
     origin.release();
-    first_thread.?.join();
-    first_thread = null;
-    second_thread.?.join();
-    second_thread = null;
-    if (first.err) |err| return err;
-    if (second.err) |err| return err;
-    var first_response = first.response orelse return error.InvalidHttpResponse;
-    defer first_response.deinit();
-    var second_response = second.response orelse return error.InvalidHttpResponse;
-    defer second_response.deinit();
-    try assertContains(first_response.body, "gated-origin-a");
-    try assertContains(second_response.body, "gated-origin-a");
+    for (threads[0..spawned]) |thread| thread.join();
+    spawned = 0;
+    for (&results) |*result| {
+        if (result.err) |err| return err;
+        var response = result.response orelse return error.InvalidHttpResponse;
+        defer response.deinit();
+        try assertContains(response.body, "gated-origin-a");
+    }
     try std.testing.expectEqual(@as(u32, 1), origin.requestCount());
 
     var cached = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/same", .body = null, .headers = &.{} });

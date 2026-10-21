@@ -593,6 +593,9 @@ pub const GatewayState = struct {
     /// returns.
     proxy_response_cache_fill_flights: std.StringHashMap(*ProxyResponseCacheFillFlight),
     proxy_response_cache_fill_waiters: usize = 0,
+    /// Lock-free scrape mirror; the cache mutex remains authoritative for
+    /// admission and flight lifetime accounting.
+    proxy_response_cache_fill_waiters_observed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// Per-key single-flight guard for stale-while-revalidate background
     /// refresh (#903): a key present here already has a background
     /// revalidation thread in flight. [proxy_response_cache_mutex]
@@ -1451,6 +1454,7 @@ pub const GatewayState = struct {
             }
             flight.waiters += 1;
             self.proxy_response_cache_fill_waiters += 1;
+            self.proxy_response_cache_fill_waiters_observed.store(self.proxy_response_cache_fill_waiters, .release);
             return .{ .waiter = flight };
         }
 
@@ -1514,11 +1518,44 @@ pub const GatewayState = struct {
         flight.waiters -= 1;
         std.debug.assert(self.proxy_response_cache_fill_waiters > 0);
         self.proxy_response_cache_fill_waiters -= 1;
+        self.proxy_response_cache_fill_waiters_observed.store(self.proxy_response_cache_fill_waiters, .release);
         const should_destroy = !flight.owner_active and flight.waiters == 0;
         if (should_destroy) self.destroyProxyResponseCacheFillFlightLocked(flight);
         if (self.proxy_response_cache_fill_waiters == 0) self.proxy_response_cache_condition.broadcast();
         self.proxy_response_cache_mutex.unlock();
         return completed;
+    }
+
+    /// Non-blocking half of `proxyResponseCacheWaitForFill`, used by the
+    /// single-threaded HTTP/3 reactor. The returned pointer remains valid
+    /// until the matching `proxyResponseCacheReleaseFillWaiter` call because
+    /// the admission's waiter reference prevents the flight from being
+    /// destroyed after its owner completes.
+    pub fn proxyResponseCacheFillCompleted(
+        self: *GatewayState,
+        flight: *const ProxyResponseCacheFillFlight,
+    ) bool {
+        _ = self;
+        return flight.completed.isSet();
+    }
+
+    /// Release a waiter admitted by `proxyResponseCacheBeginFill` without
+    /// sleeping. This is the cancellation/continuation counterpart to the
+    /// accounting tail of `proxyResponseCacheWaitForFill`.
+    pub fn proxyResponseCacheReleaseFillWaiter(
+        self: *GatewayState,
+        flight: *ProxyResponseCacheFillFlight,
+    ) void {
+        self.proxy_response_cache_mutex.lock();
+        std.debug.assert(flight.waiters > 0);
+        flight.waiters -= 1;
+        std.debug.assert(self.proxy_response_cache_fill_waiters > 0);
+        self.proxy_response_cache_fill_waiters -= 1;
+        self.proxy_response_cache_fill_waiters_observed.store(self.proxy_response_cache_fill_waiters, .release);
+        const should_destroy = !flight.owner_active and flight.waiters == 0;
+        if (should_destroy) self.destroyProxyResponseCacheFillFlightLocked(flight);
+        if (self.proxy_response_cache_fill_waiters == 0) self.proxy_response_cache_condition.broadcast();
+        self.proxy_response_cache_mutex.unlock();
     }
 
     /// Atomically register a background refresh against the current cache
@@ -1804,6 +1841,7 @@ pub const GatewayState = struct {
         state.proxy_response_cache_fill_flights = std.StringHashMap(*ProxyResponseCacheFillFlight).init(std.testing.allocator);
         defer state.proxy_response_cache_fill_flights.deinit();
         state.proxy_response_cache_fill_waiters = 0;
+        state.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
         state.proxy_response_cache_revalidation_locks = std.StringHashMap(void).init(std.testing.allocator);
         defer state.proxy_response_cache_revalidation_locks.deinit();
         state.proxy_response_cache_revalidation_inflight = std.atomic.Value(u32).init(0);
@@ -3634,6 +3672,13 @@ pub const GatewayState = struct {
         var combined = std.array_list.Managed(u8).init(allocator);
         errdefer combined.deinit();
         try combined.appendSlice(base);
+        const cache_fill_waiters = self.proxy_response_cache_fill_waiters_observed.load(.acquire);
+        try combined.print(
+            \\# HELP tardigrade_proxy_cache_fill_waiters Current admitted foreground cache-fill waiters
+            \\# TYPE tardigrade_proxy_cache_fill_waiters gauge
+            \\tardigrade_proxy_cache_fill_waiters {d}
+            \\
+        , .{cache_fill_waiters});
         self.runtime_mutex.lock();
         const proxy_buffer_limits = self.proxy_buffer_limits;
         const tls_buffer_limits = self.tls_buffer_limits;
@@ -5445,6 +5490,7 @@ fn initSlotTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.connection_mutex = .{};
     gs.metrics_mutex = .{};
     gs.runtime_mutex = .{};
+    gs.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
     gs.metrics = http.metrics.Metrics.init();
     gs.active_connections_total = 0;
     gs.max_active_connections = 0;

@@ -7835,6 +7835,414 @@ test "interop.h2.finite request handoff keeps siblings and control frames live (
     try std.testing.expectEqual(@as(u32, 3), fast_upstream.requestCount());
 }
 
+// ---------------------------------------------------------------------------
+// #863 real-process H2 transport validation gate -- see `run()`'s own
+// comment in `edge_gateway.zig` on `TARDIGRADE_TEST_H2_SESSION_HOOK` and
+// `H2_TEST_ONLY_SESSION_PATH` for why this sentinel path (hardcoded here
+// rather than shared, same convention as `TARDIGRADE_TLS_SERVER_NAME`
+// elsewhere in this file) is reachable at all. Mirrors the #830 WebSocket
+// reactor smoke test's RSS/FD/socket evidence shape
+// (`websocketRssKb`/`websocketOpenFds`/`websocketSocketCount`,
+// `writeWebsocketReactorSmokeEvidence`) rather than inventing a second
+// convention.
+// ---------------------------------------------------------------------------
+
+const h2_test_only_session_path = "/__h2_transport_test_only_session";
+
+fn h2SendHeaders(client: *PureZigTlsClient, allocator: std.mem.Allocator, stream_id: u31, end_stream: bool, headers: []const hpack.HeaderField) !void {
+    const block = try hpack.encodeLiteralHeaderBlock(allocator, headers);
+    defer allocator.free(block);
+    const flags: u8 = if (end_stream) 0x1 | 0x4 else 0x4;
+    try client.writeHttp2Frame(0x1, flags, stream_id, block);
+}
+
+fn h2SendData(client: *PureZigTlsClient, stream_id: u31, end_stream: bool, payload: []const u8) !void {
+    try client.writeHttp2Frame(0x0, if (end_stream) @as(u8, 0x1) else 0x0, stream_id, payload);
+}
+
+const H2TransportSessionEcho = struct { stream_id: u31, buf: *std.array_list.Managed(u8) };
+
+/// Real-process counterpart of `edge_gateway.zig`'s `testDrainOrdinaryResponse`:
+/// same per-call state machine (first frame must be `HEADERS` carrying
+/// `:status == expected_status`; `DATA` only valid after; anything else,
+/// or any frame once the stream already completed, fails the test) so a
+/// failed/empty/reset response can never be mistaken for a correct one.
+fn h2DrainOrdinaryResponse(
+    client: *PureZigTlsClient,
+    allocator: std.mem.Allocator,
+    stream_id: u31,
+    expected_status: u16,
+    session_echoes: []const H2TransportSessionEcho,
+    frame_budget: usize,
+) !void {
+    const State = enum { awaiting_headers, awaiting_body, done };
+    var state: State = .awaiting_headers;
+    var frames_read: usize = 0;
+    while (true) {
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+        } else if (frame.stream_id == stream_id) {
+            switch (state) {
+                .awaiting_headers => {
+                    if (frame.typ != 0x1) return error.UnexpectedOrdinaryResponseFrame;
+                    var decoded = try hpack.decode(allocator, frame.payload);
+                    defer hpack.deinitDecoded(allocator, &decoded);
+                    var status: ?u16 = null;
+                    for (decoded.headers) |h| {
+                        if (std.mem.eql(u8, h.name, ":status")) status = std.fmt.parseInt(u16, h.value, 10) catch null;
+                    }
+                    try std.testing.expectEqual(@as(?u16, expected_status), status);
+                    state = if ((frame.flags & 0x1) != 0) .done else .awaiting_body;
+                },
+                .awaiting_body => {
+                    if (frame.typ != 0x0) return error.UnexpectedOrdinaryResponseFrame;
+                    if ((frame.flags & 0x1) != 0) state = .done;
+                },
+                .done => return error.UnexpectedOrdinaryResponseFrame,
+            }
+            if (state == .done) return;
+        } else {
+            for (session_echoes) |echo| {
+                if (frame.stream_id == echo.stream_id and frame.typ == 0x0) try echo.buf.appendSlice(frame.payload);
+            }
+        }
+        frames_read += 1;
+        if (frames_read > frame_budget) return error.TestFrameBudgetExceeded;
+    }
+}
+
+/// Duplicated from `edge_gateway.zig`'s `percentile95` rather than shared:
+/// this is a separate build module (`tests/integration.zig` has no
+/// dependency on the `tardi` binary's own source), same convention
+/// `tests/http3_soak.zig` already documents for its own RSS/FD helpers.
+fn h2TransportPercentile95(allocator: std.mem.Allocator, samples: []const i64) !i64 {
+    const sorted = try allocator.dupe(i64, samples);
+    defer allocator.free(sorted);
+    std.mem.sort(i64, sorted, {}, std.sort.asc(i64));
+    const rank = (sorted.len * 95 + 99) / 100; // ceil(0.95 * len), at least 1
+    const index = @min(sorted.len - 1, if (rank == 0) 0 else rank - 1);
+    return sorted[index];
+}
+
+const H2TransportResourceSample = struct {
+    phase: []const u8,
+    rss_kb: u64,
+    open_fds: u64,
+    sockets: u64,
+    active_connections: u64,
+    worker_active_jobs: u64,
+    worker_queued_jobs: u64,
+};
+
+/// Composition boundary (stated once, PR review convention already
+/// established by `tests/http3_soak.zig`): per-H2-session Prometheus series
+/// (queued-byte high-water, flow-control blocked/resumed counts, writer
+/// queue depth) do not exist yet, so this records real process-level
+/// RSS/FD/socket evidence and the existing generic
+/// worker/connection-pool metrics, not fabricated H2-session-specific ones.
+/// Each call briefly opens its own short-lived metrics connection
+/// (`pureZigH2GetResponse`), which itself transiently touches this
+/// process's own fd/socket count by the same small, constant amount at
+/// every phase -- an consistent, documented measurement bias rather than
+/// an asymmetry between phases.
+fn h2TransportResourceSample(allocator: std.mem.Allocator, pid: std.c.pid_t, port: u16, phase: []const u8) !H2TransportResourceSample {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    return .{
+        .phase = phase,
+        .rss_kb = try websocketRssKb(allocator, pid),
+        .open_fds = try websocketOpenFds(allocator, pid),
+        .sockets = try websocketSocketCount(allocator, pid),
+        .active_connections = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0,
+        .worker_active_jobs = prometheusMetricValue(metrics.body, "tardigrade_worker_active_jobs") orelse 0,
+        .worker_queued_jobs = prometheusMetricValue(metrics.body, "tardigrade_worker_queued_jobs") orelse 0,
+    };
+}
+
+fn writeH2TransportValidationEvidence(
+    allocator: std.mem.Allocator,
+    baseline_p95_ms: i64,
+    loaded_p95_ms: i64,
+    samples: []const H2TransportResourceSample,
+) !void {
+    const path = compat.getEnvVarOwned(allocator, "TARDIGRADE_H2_TRANSPORT_EVIDENCE") catch return;
+    defer allocator.free(path);
+    const source_sha = compat.getEnvVarOwned(allocator, "TARDIGRADE_H2_TRANSPORT_SOURCE_SHA") catch try allocator.dupe(u8, "unknown");
+    defer allocator.free(source_sha);
+    const runner = compat.getEnvVarOwned(allocator, "RUNNER_NAME") catch try allocator.dupe(u8, "local");
+    defer allocator.free(runner);
+    const json = try compat.stringifyAlloc(allocator, .{
+        .schema_version = 1,
+        .issue = 863,
+        .profile = "h2-transport-validation",
+        .source_sha = source_sha,
+        .platform = @tagName(builtin.os.tag),
+        .architecture = @tagName(builtin.cpu.arch),
+        .cpu_count = std.Thread.getCpuCount() catch 0,
+        .runner = runner,
+        .rest_baseline_p95_ms = baseline_p95_ms,
+        .rest_loaded_p95_ms = loaded_p95_ms,
+        .resource_samples = samples,
+    }, .{});
+    defer allocator.free(json);
+
+    var file = try compat.cwd().createFile(path, .{ .truncate = true, .read = false });
+    defer file.close();
+    try file.writeAll(json);
+    try file.writeAll("\n");
+}
+
+test "interop.h2.live-process transport validation: long-lived sessions, REST load, fault injection, and resource settle (#863)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .auth_token_hashes = null,
+        .ready_https_insecure = true,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_TEST_H2_SESSION_HOOK", .value = "1" },
+            // The 2MiB production default (`edge_config.zig`) comfortably
+            // fits ordinary request bodies but not two #867
+            // `HTTP2_SESSION_RESERVED_BYTES` (~1.3MiB each) sessions at
+            // once; raise it so the second session attach below is
+            // admitted rather than legitimately refused for a reason
+            // unrelated to what this test is proving.
+            .{ .name = "TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES", .value = "8388608" },
+            // `spawn()` itself defaults this to "1" (room for ordinary
+            // requests while idle). This test keeps one connection whose
+            // own thread blocks for the entire test (two long-lived
+            // sessions never return control), so a second worker is
+            // required for the metrics-sampling connections opened
+            // concurrently below to ever be accepted.
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" },
+        },
+    });
+    defer tardigrade.stop();
+    const pid = tardigrade.child.id orelse return error.MissingChildPid;
+
+    var samples = std.array_list.Managed(H2TransportResourceSample).init(allocator);
+    defer samples.deinit();
+    try samples.append(try h2TransportResourceSample(allocator, pid, tardigrade.port, "baseline"));
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    // Destroyed explicitly (not deferred) below, before the settle-polling
+    // phase: `errdefer` only covers an early-error unwind, so the explicit
+    // call on the success path below is never a double-free.
+    errdefer client.destroy();
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{});
+    try completeH2SettingsHandshake(client, allocator);
+
+    var next_stream_id: u31 = 1;
+
+    // >=50 same-run baseline REST samples before any long-lived session
+    // exists (#863's agreed acceptance criterion) -- the real-process,
+    // real-TLS counterpart of the ratio gate `edge_gateway.zig`'s
+    // in-process socketpair test already proves.
+    var baseline_samples = try std.array_list.Managed(i64).initCapacity(allocator, 50);
+    defer baseline_samples.deinit();
+    var b: usize = 0;
+    while (b < 50) : (b += 1) {
+        const stream_id = next_stream_id;
+        next_stream_id += 2;
+        const started = compat.milliTimestamp();
+        try h2SendHeaders(client, allocator, stream_id, true, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/ordinary" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        });
+        try h2DrainOrdinaryResponse(client, allocator, stream_id, 404, &.{}, 50);
+        try baseline_samples.append(compat.milliTimestamp() - started);
+    }
+
+    // Two long-lived sessions admitted on the same connection through the
+    // #863 test-only hook.
+    const session_a = next_stream_id;
+    next_stream_id += 2;
+    const session_b = next_stream_id;
+    next_stream_id += 2;
+    for ([_]u31{ session_a, session_b }) |session_stream| {
+        try h2SendHeaders(client, allocator, session_stream, false, &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = h2_test_only_session_path },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        });
+        var headers: Http2WireFrame = while (true) {
+            var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+            if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+                try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+                frame.deinit(allocator);
+                continue;
+            }
+            if (frame.typ == 0x8) {
+                frame.deinit(allocator);
+                continue;
+            }
+            break frame;
+        };
+        defer headers.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x1), headers.typ);
+        try std.testing.expectEqual(session_stream, headers.stream_id);
+    }
+
+    try samples.append(try h2TransportResourceSample(allocator, pid, tardigrade.port, "populated"));
+
+    var session_a_echo = std.array_list.Managed(u8).init(allocator);
+    defer session_a_echo.deinit();
+    var session_b_echo = std.array_list.Managed(u8).init(allocator);
+    defer session_b_echo.deinit();
+    const echoes = [_]H2TransportSessionEcho{
+        .{ .stream_id = session_a, .buf = &session_a_echo },
+        .{ .stream_id = session_b, .buf = &session_b_echo },
+    };
+    var expected_a = std.array_list.Managed(u8).init(allocator);
+    defer expected_a.deinit();
+    var expected_b = std.array_list.Managed(u8).init(allocator);
+    defer expected_b.deinit();
+
+    // >=50 loaded REST samples while both sessions stay genuinely active.
+    var loaded_samples = try std.array_list.Managed(i64).initCapacity(allocator, 50);
+    defer loaded_samples.deinit();
+    var l: usize = 0;
+    while (l < 50) : (l += 1) {
+        var chunk_buf_a: [24]u8 = undefined;
+        const chunk_a = try std.fmt.bufPrint(&chunk_buf_a, "a-{d}", .{l});
+        try expected_a.appendSlice(chunk_a);
+        try h2SendData(client, session_a, false, chunk_a);
+        var chunk_buf_b: [24]u8 = undefined;
+        const chunk_b = try std.fmt.bufPrint(&chunk_buf_b, "b-{d}", .{l});
+        try expected_b.appendSlice(chunk_b);
+        try h2SendData(client, session_b, false, chunk_b);
+
+        const stream_id = next_stream_id;
+        next_stream_id += 2;
+        const started = compat.milliTimestamp();
+        try h2SendHeaders(client, allocator, stream_id, true, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/ordinary" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        });
+        try h2DrainOrdinaryResponse(client, allocator, stream_id, 404, &echoes, 200);
+        try loaded_samples.append(compat.milliTimestamp() - started);
+    }
+
+    const drain_deadline = compat.milliTimestamp() + 5_000;
+    while (session_a_echo.items.len < expected_a.items.len or session_b_echo.items.len < expected_b.items.len) {
+        if (compat.milliTimestamp() > drain_deadline) return error.SessionEchoDidNotSettle;
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            continue;
+        }
+        for (echoes) |echo| {
+            if (frame.stream_id == echo.stream_id and frame.typ == 0x0) try echo.buf.appendSlice(frame.payload);
+        }
+    }
+    try std.testing.expectEqualSlices(u8, expected_a.items, session_a_echo.items);
+    try std.testing.expectEqualSlices(u8, expected_b.items, session_b_echo.items);
+
+    const baseline_p95_ms = try h2TransportPercentile95(allocator, baseline_samples.items);
+    const loaded_p95_ms = try h2TransportPercentile95(allocator, loaded_samples.items);
+    // A real spawned process over real loopback TLS has materially more
+    // scheduling/syscall noise than the in-process socketpair unit test
+    // this mirrors; the floor is correspondingly larger, still bounding
+    // regressions rather than acting as a throughput allowance.
+    const floor_ms: i64 = 50;
+    try std.testing.expect(loaded_p95_ms <= @max(floor_ms, baseline_p95_ms * 2));
+
+    // Fault injection: a PING round-trip (#863's "PING/SETTINGS progress"),
+    // then RST_STREAM on session B while session A and ordinary siblings
+    // keep working.
+    const ping_payload = [_]u8{ 'h', '2', 't', 'e', 's', 't', 'o', 'k' };
+    try client.writeHttp2Frame(0x6, 0, 0, &ping_payload);
+    var saw_ping_ack = false;
+    var ping_frames: usize = 0;
+    while (!saw_ping_ack) {
+        ping_frames += 1;
+        if (ping_frames > 50) return error.TestFrameBudgetExceeded;
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x6 and (frame.flags & 0x1) != 0 and std.mem.eql(u8, frame.payload, &ping_payload)) saw_ping_ack = true;
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+    }
+
+    try client.writeHttp2Frame(0x3, 0, session_b, &[_]u8{ 0, 0, 0, 8 }); // RST_STREAM(cancel)
+
+    const after_rst_stream = next_stream_id;
+    next_stream_id += 2;
+    try h2SendHeaders(client, allocator, after_rst_stream, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    try h2DrainOrdinaryResponse(client, allocator, after_rst_stream, 404, &.{.{ .stream_id = session_a, .buf = &session_a_echo }}, 200);
+
+    try h2SendData(client, session_a, false, "still-alive");
+    const still_alive_deadline = compat.milliTimestamp() + 5_000;
+    while (!std.mem.endsWith(u8, session_a_echo.items, "still-alive")) {
+        if (compat.milliTimestamp() > still_alive_deadline) return error.SessionEchoDidNotSettle;
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            continue;
+        }
+        if (frame.stream_id == session_a and frame.typ == 0x0) try session_a_echo.appendSlice(frame.payload);
+    }
+
+    try samples.append(try h2TransportResourceSample(allocator, pid, tardigrade.port, "post_fault"));
+
+    // Close session A locally and end the connection cleanly.
+    try h2SendData(client, session_a, true, "");
+    try client.writeHttp2Frame(0x7, 0, 0, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }); // GOAWAY(NO_ERROR)
+    client.destroy();
+
+    // Settle: poll a fresh short-lived connection's own open-fd/socket count
+    // until it returns to the pre-test baseline, bounded by a fixed
+    // deadline (#863's "resource settle after churn" applied here to
+    // ordinary connection teardown rather than process shutdown).
+    // `tardigrade_active_connections` is not used for this poll: it read
+    // back 0 at every phase in manual verification of this exact scenario,
+    // including while the main session connection was demonstrably open
+    // and serving traffic, so it is not a trustworthy signal here (left
+    // recorded in the evidence JSON for visibility, not used as a gate).
+    const baseline_open_fds = samples.items[0].open_fds;
+    const baseline_sockets = samples.items[0].sockets;
+    const settle_deadline = compat.milliTimestamp() + 10_000;
+    var settled_sample: H2TransportResourceSample = undefined;
+    while (true) {
+        settled_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "settled");
+        if (settled_sample.open_fds <= baseline_open_fds and settled_sample.sockets <= baseline_sockets) break;
+        if (compat.milliTimestamp() > settle_deadline) return error.ConnectionDidNotSettle;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    try samples.append(settled_sample);
+    try std.testing.expect(settled_sample.rss_kb <= samples.items[1].rss_kb + 16 * 1024);
+    try std.testing.expect(settled_sample.open_fds <= samples.items[0].open_fds + 4);
+    try std.testing.expect(settled_sample.sockets <= samples.items[0].sockets + 2);
+
+    try writeH2TransportValidationEvidence(allocator, baseline_p95_ms, loaded_p95_ms, samples.items);
+}
+
 test "interop.h2.proxy_response_respects_peer_initial_window_size" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;

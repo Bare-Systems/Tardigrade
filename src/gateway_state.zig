@@ -131,14 +131,23 @@ pub const Http2PendingStream = struct {
 
 /// Internal/test-only hook for attaching an HTTP/2 stream to a persistent,
 /// bidirectional stream session (#867) instead of ordinary finite dispatch.
-/// Production traffic never sets this -- `run()`'s `GatewayState` literal
-/// never does, and this ticket deliberately does not negotiate RFC 8441
-/// CONNECT/WebSocket semantics that would let a real client request one.
-/// It exists so the connection-owned session registry, DATA routing,
-/// wake-fd polling, and RST/GOAWAY/shutdown teardown in
-/// `handleHttp2Connection` run through the exact production code path a
-/// future protocol upgrade will reuse, proven end to end by a real H2
-/// client/server test rather than by calling session helpers directly.
+/// This ticket deliberately does not negotiate RFC 8441 CONNECT/WebSocket
+/// semantics that would let a real client request one. It exists so the
+/// connection-owned session registry, DATA routing, wake-fd polling, and
+/// RST/GOAWAY/shutdown teardown in `handleHttp2Connection` run through the
+/// exact production code path a future protocol upgrade will reuse, proven
+/// end to end by a real H2 client/server test rather than by calling
+/// session helpers directly.
+///
+/// `run()`'s `GatewayState` literal never sets this field inline; ordinary
+/// deployments never set or export `TARDIGRADE_TEST_H2_SESSION_HOOK`, so
+/// `run()` leaves this `null` for every real deployment. The sole exception
+/// (#863) is `run()` itself conditionally attaching a labeled transport-only
+/// echo consumer, strictly gated on that one literal env var being exactly
+/// `"1"` and matched against a non-production sentinel path -- added so a
+/// real spawned `tardi` process can be driven through this same seam for
+/// live RSS/FD/socket evidence before #864/#910 ship a real production
+/// attach route, exactly as #863's own agent-handoff sanctions.
 pub const H2SessionTestHook = struct {
     ctx: ?*anyopaque = null,
     /// Decide whether this stream's parsed headers request a persistent

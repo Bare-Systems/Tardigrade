@@ -141,7 +141,7 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         .proxy_response_cache_generation = 1,
         .proxy_response_cache_disk = gs.openProxyResponseCacheDisk(state_allocator, cfg),
         .proxy_response_cache_fill_flights = std.StringHashMap(*gs.ProxyResponseCacheFillFlight).init(state_allocator),
-        .proxy_response_cache_revalidation_locks = std.StringHashMap(void).init(state_allocator),
+        .proxy_response_cache_revalidation_locks = std.StringHashMap(gs.ProxyResponseCacheRevalidationGuard).init(state_allocator),
         .proxy_response_cache_revalidation_max_concurrency = std.atomic.Value(u32).init(cfg.proxy_response_cache_revalidation_max_concurrency),
         .security_headers = blk: {
             var s = if (cfg.security_headers_enabled)
@@ -5610,8 +5610,10 @@ fn executeHttp2ProxyRoute(
                         }
                     }
                     if (fillable_method) {
-                        synchronous_revalidation = try gproxy_runtime.prepareSynchronousCacheRevalidation(
+                        synchronous_revalidation = try gproxy_runtime.prepareDurablyAdmittedSynchronousCacheRevalidation(
                             allocator,
+                            state,
+                            cache_generation,
                             key_buf[0..],
                             effective_key.?,
                             &value,
@@ -5658,8 +5660,10 @@ fn executeHttp2ProxyRoute(
                                             state.metricsRecordProxyCacheOutcome(.fill_error);
                                         }
                                     } else {
-                                        synchronous_revalidation = try gproxy_runtime.prepareSynchronousCacheRevalidation(
+                                        synchronous_revalidation = try gproxy_runtime.prepareDurablyAdmittedSynchronousCacheRevalidation(
                                             allocator,
+                                            state,
+                                            cache_generation,
                                             key_buf[0..],
                                             waited_effective_key.?,
                                             &waited_hit,
@@ -5729,7 +5733,7 @@ fn executeHttp2ProxyRoute(
                 plan,
                 &proxy_response.bounded_buffered,
             ) catch {
-                state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision);
+                state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision, http.event_loop.monotonicMs());
                 proxy_response.deinit(allocator);
                 return .{ .local_rejection = .{
                     .status_code = @intFromEnum(http.Status.bad_gateway),
@@ -5749,7 +5753,7 @@ fn executeHttp2ProxyRoute(
             return .{ .response = cached };
         }
         if (proxy_response.statusCode() == 200) {
-            state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision);
+            state.proxyResponseCacheInvalidate(cache_generation, plan.effective_key[0..], plan.revision, http.event_loop.monotonicMs());
         }
     }
     if (response_cache_key) |key_bytes| {

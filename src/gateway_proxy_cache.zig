@@ -707,6 +707,21 @@ pub const ProxyResponseCache = struct {
         self.removeLocked(key);
         return true;
     }
+
+    /// #937/#943 P1: ends `key`'s stale-while-revalidate eligibility right
+    /// now, without forgetting the entry outright. Used when the origin has
+    /// just declared a stale representation uncacheable but the disk tier
+    /// cannot yet durably guard forgetting it in RAM (a later retry handles
+    /// the durable removal) -- servability must still fail closed in the
+    /// meantime, so this is never called on anything but an already-stale
+    /// entry. `lookup` then reports `.stale_servable = false`, which
+    /// `decideLookupServe` turns into `.require_origin` for every
+    /// subsequent request instead of replaying the forbidden body.
+    pub fn forbidStaleServing(self: *ProxyResponseCache, key: []const u8, expected_revision: u64, now_ms: u64) void {
+        const entry = self.map.getPtr(key) orelse return;
+        if (entry.revision != expected_revision) return;
+        entry.swr_until_ms = @min(entry.swr_until_ms, now_ms);
+    }
 };
 
 pub const KeyParts = struct {
@@ -2510,6 +2525,57 @@ test "ProxyResponseCache applies bounded exponential revalidation backoff" {
     cache.recordRevalidationFailure("key", revision, 2_500);
     try std.testing.expect(!cache.canRevalidate("key", revision, 4_499));
     try std.testing.expect(cache.canRevalidate("key", revision, 4_500));
+}
+
+test "ProxyResponseCache forbidStaleServing ends SWR eligibility without forgetting the entry" {
+    const allocator = std.testing.allocator;
+    var cache = ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer cache.deinit();
+    try cache.put(0, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "ETag", .value = "\"v1\"" }},
+        .body = "body",
+        .ttl_seconds = 1,
+        .swr_seconds = 30,
+    });
+    const revision = cache.entryRevision("key").?;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    // Still inside the SWR window before the origin declares this stale
+    // representation forbidden.
+    const before = (try cache.lookup(arena.allocator(), "key", 1_500)).?;
+    try std.testing.expect(before.stale);
+    try std.testing.expect(before.stale_servable);
+
+    // #937/#943 P1: a disk guard refusal must still fail serving closed,
+    // even though the entry (and its disk record) cannot yet be forgotten.
+    cache.forbidStaleServing("key", revision, 1_500);
+    const after = (try cache.lookup(arena.allocator(), "key", 1_501)).?;
+    try std.testing.expect(after.stale);
+    try std.testing.expect(!after.stale_servable);
+    try std.testing.expectEqual(revision, after.revision);
+
+    // A mismatched revision (a newer fill already replaced this entry) must
+    // never suppress servability of the fill that superseded it.
+    try cache.put(2_000, "key", .{
+        .status_code = 200,
+        .reason = "OK",
+        .headers = &.{.{ .name = "ETag", .value = "\"v2\"" }},
+        .body = "body v2",
+        .ttl_seconds = 30,
+        .swr_seconds = 30,
+    });
+    const v2_revision = cache.entryRevision("key").?;
+    cache.forbidStaleServing("key", revision, 2_500);
+    const unaffected = (try cache.lookup(arena.allocator(), "key", 2_500)).?;
+    try std.testing.expect(!unaffected.stale);
+    try std.testing.expectEqual(v2_revision, unaffected.revision);
 }
 
 test "ProxyResponseCache disk hydration preserves exact deadlines and Age basis" {

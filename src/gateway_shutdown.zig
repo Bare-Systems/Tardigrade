@@ -1374,7 +1374,7 @@ test "applyReloadedRuntimeConfig atomically swaps proxy cache generation and upd
     defer state.proxy_response_cache_fill_flights.deinit();
     state.proxy_response_cache_fill_waiters = 0;
     state.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
-    state.proxy_response_cache_revalidation_locks = std.StringHashMap(void).init(allocator);
+    state.proxy_response_cache_revalidation_locks = std.StringHashMap(gs.ProxyResponseCacheRevalidationGuard).init(allocator);
     defer state.proxy_response_cache_revalidation_locks.deinit();
     state.proxy_response_cache_revalidation_inflight = std.atomic.Value(u32).init(0);
     state.proxy_response_cache_revalidation_max_concurrency = std.atomic.Value(u32).init(0);

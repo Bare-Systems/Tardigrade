@@ -12511,6 +12511,367 @@ test "H2 live: repeated session attach/close churn over one connection settles e
     hook_ctx.joinAll();
 }
 
+/// One long-lived session stream a combined live test is watching for
+/// interleaved echo DATA while it drains an unrelated ordinary response on
+/// another stream (see `testDrainOrdinaryResponse` below).
+const TestSessionEcho = struct { stream_id: u31, buf: *std.array_list.Managed(u8) };
+
+/// Reads frames until `stream_id` reports END_STREAM (on either a HEADERS or
+/// a DATA frame -- an empty-bodied response still ends on the HEADERS frame
+/// itself), appending any DATA observed for each entry in `session_echoes`
+/// along the way. This is what lets a #863 combined live test prove ordinary
+/// REST responses keep completing *while* one or more long-lived sessions
+/// are simultaneously producing DATA on the same connection, without losing
+/// either side's bytes to the other's read loop.
+fn testDrainOrdinaryResponse(
+    client: *TestH2Client,
+    allocator: std.mem.Allocator,
+    stream_id: u31,
+    session_echoes: []const TestSessionEcho,
+    frame_budget: usize,
+) !void {
+    var frames_read: usize = 0;
+    while (true) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.stream_id == stream_id) {
+            if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) return;
+        } else {
+            for (session_echoes) |echo| {
+                if (frame.stream_id == echo.stream_id and frame.typ == .data) {
+                    try echo.buf.appendSlice(frame.payload);
+                }
+            }
+        }
+        frames_read += 1;
+        if (frames_read > frame_budget) return error.TestFrameBudgetExceeded;
+    }
+}
+
+test "H2 live: two concurrent long-lived sessions stay correct and bounded under 50 interleaved ordinary requests on one connection (#863)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = ChurnSessionHookCtx.init(allocator, "/session");
+    defer hook_ctx.deinit();
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = ChurnSessionHookCtx.shouldAttach,
+        .attach = ChurnSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer {
+        _ = std.c.shutdown(server_fd, std.c.SHUT.RDWR);
+        testJoinOnce(&server_thread);
+        hook_ctx.joinAll();
+    }
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    // Baseline: ordinary requests with no session attached yet, establishing
+    // the regression threshold the #863 acceptance criteria require loaded
+    // REST latency to be measured against.
+    var baseline_worst_ms: i64 = 0;
+    var baseline_stream: u31 = 1;
+    while (baseline_stream <= 9) : (baseline_stream += 2) {
+        const started = compat.milliTimestamp();
+        try client.sendHeaders(allocator, baseline_stream, true, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/ordinary" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "test.local" },
+        });
+        try testDrainOrdinaryResponse(&client, allocator, baseline_stream, &.{}, 50);
+        baseline_worst_ms = @max(baseline_worst_ms, compat.milliTimestamp() - started);
+    }
+
+    // Two long-lived sessions admitted on the same connection -- #863 asks
+    // for "one or more" on top of ordinary traffic; this proves at least two
+    // stay independently live and correct at once, not just one.
+    var session_a_echo = std.array_list.Managed(u8).init(allocator);
+    defer session_a_echo.deinit();
+    var session_b_echo = std.array_list.Managed(u8).init(allocator);
+    defer session_b_echo.deinit();
+    const session_a: u31 = 11;
+    const session_b: u31 = 13;
+    const echoes = [_]TestSessionEcho{
+        .{ .stream_id = session_a, .buf = &session_a_echo },
+        .{ .stream_id = session_b, .buf = &session_b_echo },
+    };
+
+    for ([_]u31{ session_a, session_b }) |session_stream| {
+        try client.sendHeaders(allocator, session_stream, false, &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = "/session" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "test.local" },
+        });
+        // A prior stream's receive-credit WINDOW_UPDATE(s) may still be
+        // interleaved here; skip those rather than assume the very next
+        // frame is this session's attach response.
+        var headers: http.http2_frame.Frame = while (true) {
+            var frame = try client.readFrame(allocator);
+            if (frame.typ != .window_update) break frame;
+            http.http2_frame.deinitFrame(allocator, &frame);
+        };
+        defer http.http2_frame.deinitFrame(allocator, &headers);
+        try std.testing.expectEqual(http.http2_frame.Type.headers, headers.typ);
+        try std.testing.expectEqual(session_stream, headers.stream_id);
+    }
+
+    var expected_a = std.array_list.Managed(u8).init(allocator);
+    defer expected_a.deinit();
+    var expected_b = std.array_list.Managed(u8).init(allocator);
+    defer expected_b.deinit();
+
+    // 50 ordinary sibling requests interleaved on the same connection while
+    // both sessions remain open, matching the #863 acceptance criterion of
+    // "repeated ordinary requests complete on the same connection" as a
+    // long-lived bidirectional stream stays open -- doubled, and with
+    // measured latency rather than just completion.
+    var loaded_worst_ms: i64 = 0;
+    var i: usize = 0;
+    var next_stream: u31 = 15;
+    while (i < 50) : (i += 1) {
+        // Keep both sessions genuinely active throughout the REST load
+        // rather than merely open and idle.
+        var chunk_buf: [24]u8 = undefined;
+        const chunk_a = try std.fmt.bufPrint(&chunk_buf, "a-{d}", .{i});
+        try expected_a.appendSlice(chunk_a);
+        try client.sendData(session_a, false, chunk_a);
+        var chunk_buf_b: [24]u8 = undefined;
+        const chunk_b = try std.fmt.bufPrint(&chunk_buf_b, "b-{d}", .{i});
+        try expected_b.appendSlice(chunk_b);
+        try client.sendData(session_b, false, chunk_b);
+
+        const started = compat.milliTimestamp();
+        try client.sendHeaders(allocator, next_stream, true, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/ordinary" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "test.local" },
+        });
+        try testDrainOrdinaryResponse(&client, allocator, next_stream, &echoes, 200);
+        loaded_worst_ms = @max(loaded_worst_ms, compat.milliTimestamp() - started);
+        next_stream += 2;
+    }
+
+    // Drain whatever either session's echo has not yet delivered: both
+    // sessions are still open (no END_STREAM sent), so this cannot block on
+    // a terminal condition -- only on bytes that genuinely have not arrived
+    // yet after the loop above already observed every ordinary response.
+    const drain_deadline = compat.milliTimestamp() + 5_000;
+    while (session_a_echo.items.len < expected_a.items.len or session_b_echo.items.len < expected_b.items.len) {
+        if (compat.milliTimestamp() > drain_deadline) return error.SessionEchoDidNotSettle;
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        for (echoes) |echo| {
+            if (frame.stream_id == echo.stream_id and frame.typ == .data) try echo.buf.appendSlice(frame.payload);
+        }
+    }
+    try std.testing.expectEqualSlices(u8, expected_a.items, session_a_echo.items);
+    try std.testing.expectEqualSlices(u8, expected_b.items, session_b_echo.items);
+
+    // This is deliberately generous (not a throughput benchmark): the gate
+    // is that two live sessions and 50 siblings on one connection must not
+    // regress ordinary latency by an order of magnitude, not that they are
+    // equally fast in an inherently tiny in-process socketpair test.
+    try std.testing.expect(loaded_worst_ms <= @max(@as(i64, 50), baseline_worst_ms * 20));
+
+    // Both sessions settle cleanly (local END_STREAM) before the connection
+    // itself closes, proving the two-session/50-request load above leaves
+    // nothing dangling: `std.testing.allocator` fails this test on any leak.
+    try client.sendData(session_a, true, "");
+    try client.sendData(session_b, true, "");
+    try http.http2_frame.writeGoaway(client.writer(), next_stream - 2, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    hook_ctx.joinAll();
+}
+
+test "H2 live: RST_STREAM on one long-lived session and flow-control exhaustion/recovery on another settle independently while ordinary siblings keep completing (#863)" {
+    const allocator = std.testing.allocator;
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = ChurnSessionHookCtx.init(allocator, "/session");
+    defer hook_ctx.deinit();
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = ChurnSessionHookCtx.shouldAttach,
+        .attach = ChurnSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer {
+        _ = std.c.shutdown(server_fd, std.c.SHUT.RDWR);
+        testJoinOnce(&server_thread);
+        hook_ctx.joinAll();
+    }
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    // A tiny per-stream send window (applies to every stream opened after
+    // this SETTINGS frame) is what lets this test drive session A into a
+    // real stream-level flow-control stall without needing tens of
+    // thousands of bytes.
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{.{ 4, 4096 }});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    const session_a: u31 = 1;
+    const session_b: u31 = 3;
+    for ([_]u31{ session_a, session_b }) |session_stream| {
+        try client.sendHeaders(allocator, session_stream, false, &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = "/session" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "test.local" },
+        });
+        var headers: http.http2_frame.Frame = while (true) {
+            var frame = try client.readFrame(allocator);
+            if (frame.typ != .window_update) break frame;
+            http.http2_frame.deinitFrame(allocator, &frame);
+        };
+        defer http.http2_frame.deinitFrame(allocator, &headers);
+        try std.testing.expectEqual(http.http2_frame.Type.headers, headers.typ);
+        try std.testing.expectEqual(session_stream, headers.stream_id);
+    }
+
+    // Drive session A's outbound echo into exhausting its 4,096-byte stream
+    // send window.
+    const total_bytes: usize = 6_000;
+    var send_buf: [6_000]u8 = undefined;
+    for (&send_buf, 0..) |*b, idx| b.* = @intCast((idx % 26) + 'a');
+    try client.sendData(session_a, false, &send_buf);
+
+    var echoed_a = std.array_list.Managed(u8).init(allocator);
+    defer echoed_a.deinit();
+    var frames_read: usize = 0;
+    while (echoed_a.items.len < 4_096) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.stream_id == session_a and frame.typ == .data) try echoed_a.appendSlice(frame.payload);
+        frames_read += 1;
+        if (frames_read > 1_000) return error.TestFrameBudgetExceeded;
+    }
+    try std.testing.expectEqual(@as(usize, 4_096), echoed_a.items.len);
+
+    // While session A is stalled on its own stream-level send window, an
+    // ordinary sibling must still complete -- A's exhaustion must not be
+    // connection-wide.
+    try client.sendHeaders(allocator, 5, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    try testDrainOrdinaryResponse(&client, allocator, 5, &.{.{ .stream_id = session_a, .buf = &echoed_a }}, 200);
+    try std.testing.expectEqual(@as(usize, 4_096), echoed_a.items.len);
+
+    // RST_STREAM on session B, still mid-attach and unrelated to A's
+    // flow-control stall, must settle only B: A stays exhausted exactly
+    // where it was, and the connection keeps multiplexing.
+    try http.http2_frame.writeRstStream(client.writer(), session_b, http.http2_stream.ErrorCode.cancel.value());
+    try client.sendHeaders(allocator, 7, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    try testDrainOrdinaryResponse(&client, allocator, 7, &.{.{ .stream_id = session_a, .buf = &echoed_a }}, 200);
+    try std.testing.expectEqual(@as(usize, 4_096), echoed_a.items.len);
+
+    // Resuming only session A's stream-level credit drains the rest of its
+    // echo, proving the earlier stall and B's reset never leaked into each
+    // other's accounting.
+    try http.http2_frame.writeWindowUpdate(client.writer(), session_a, @intCast(total_bytes - 4_096));
+    while (echoed_a.items.len < total_bytes) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.stream_id == session_a and frame.typ == .data) try echoed_a.appendSlice(frame.payload);
+        frames_read += 1;
+        if (frames_read > 2_000) return error.TestFrameBudgetExceeded;
+    }
+    try std.testing.expectEqualSlices(u8, &send_buf, echoed_a.items);
+
+    // A final ordinary sibling reconfirms the connection is still healthy
+    // after both fault injections, before the local close below.
+    try client.sendHeaders(allocator, 9, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    try testDrainOrdinaryResponse(&client, allocator, 9, &.{.{ .stream_id = session_a, .buf = &echoed_a }}, 200);
+
+    try client.sendData(session_a, true, "");
+    try http.http2_frame.writeGoaway(client.writer(), 9, 0);
+    testJoinOnce(&server_thread);
+    try server_ctx.result;
+    hook_ctx.joinAll();
+}
+
 test "H2 session RST_STREAM settles the consumer and detaches without leaking" {
     const allocator = std.testing.allocator;
     var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);

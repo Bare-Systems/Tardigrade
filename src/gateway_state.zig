@@ -23,6 +23,25 @@ pub const ProxyResponseCacheRevalidationAdmission = enum {
     unavailable,
 };
 
+pub const ProxyResponseCacheRevalidationGuard = struct {
+    disk: ?*gpdc.DiskCache = null,
+    admission: gpdc.DiskCache.TransitionAdmission = .not_needed,
+};
+
+pub const ProxyResponseCacheDurableRevalidationGuard = struct {
+    state: *GatewayState,
+    disk: ?*gpdc.DiskCache = null,
+    admission: gpdc.DiskCache.TransitionAdmission = .not_needed,
+
+    pub fn release(self: *ProxyResponseCacheDurableRevalidationGuard) void {
+        if (self.disk) |disk| {
+            disk.endRemovalGuard(self.admission);
+            self.state.proxyResponseCacheReleaseDisk();
+        }
+        self.* = undefined;
+    }
+};
+
 pub const proxy_response_cache_fill_max_waiters_per_key: u16 = 32;
 pub const proxy_response_cache_fill_max_waiters_global: usize = 256;
 pub const proxy_response_cache_fill_wait_timeout_ms: u32 = 2_000;
@@ -599,7 +618,7 @@ pub const GatewayState = struct {
     /// Per-key single-flight guard for stale-while-revalidate background
     /// refresh (#903): a key present here already has a background
     /// revalidation thread in flight. [proxy_response_cache_mutex]
-    proxy_response_cache_revalidation_locks: std.StringHashMap(void),
+    proxy_response_cache_revalidation_locks: std.StringHashMap(ProxyResponseCacheRevalidationGuard),
     /// Global cap on simultaneous background revalidations across every
     /// key, independent of the per-key lock above (#903). Registration is
     /// serialized with reload under `proxy_response_cache_mutex`; the atomic
@@ -1585,27 +1604,86 @@ pub const GatewayState = struct {
         now_ms: u64,
     ) !ProxyResponseCacheRevalidationAdmission {
         self.proxy_response_cache_mutex.lock();
-        defer self.proxy_response_cache_mutex.unlock();
         if (self.proxy_response_cache_generation != generation or
-            self.proxy_response_cache_revalidation_cancel.isStopped()) return .unavailable;
+            self.proxy_response_cache_revalidation_cancel.isStopped())
+        {
+            self.proxy_response_cache_mutex.unlock();
+            return .unavailable;
+        }
         const max_concurrency = self.proxy_response_cache_revalidation_max_concurrency.load(.acquire);
-        if (max_concurrency == 0) return .unavailable;
-        if (self.proxy_response_cache_revalidation_inflight.load(.acquire) >= max_concurrency) return .concurrency;
-        const cache = if (self.proxy_response_cache) |*value| value else return .unavailable;
-        if (!cache.canRevalidate(effective_key, revision, now_ms)) return .unavailable;
-        if (self.proxy_response_cache_revalidation_locks.contains(primary_key)) return .unavailable;
-        const owned = try self.allocator.dupe(u8, primary_key);
-        errdefer self.allocator.free(owned);
-        try self.proxy_response_cache_revalidation_locks.put(owned, {});
+        if (max_concurrency == 0) {
+            self.proxy_response_cache_mutex.unlock();
+            return .unavailable;
+        }
+        if (self.proxy_response_cache_revalidation_inflight.load(.acquire) >= max_concurrency) {
+            self.proxy_response_cache_mutex.unlock();
+            return .concurrency;
+        }
+        const cache = if (self.proxy_response_cache) |*value| value else {
+            self.proxy_response_cache_mutex.unlock();
+            return .unavailable;
+        };
+        if (!cache.canRevalidate(effective_key, revision, now_ms) or
+            self.proxy_response_cache_revalidation_locks.contains(primary_key))
+        {
+            self.proxy_response_cache_mutex.unlock();
+            return .unavailable;
+        }
+        const owned = self.allocator.dupe(u8, primary_key) catch |err| {
+            self.proxy_response_cache_mutex.unlock();
+            return err;
+        };
+        self.proxy_response_cache_revalidation_locks.put(owned, .{}) catch |err| {
+            self.allocator.free(owned);
+            self.proxy_response_cache_mutex.unlock();
+            return err;
+        };
         _ = self.proxy_response_cache_revalidation_inflight.fetchAdd(1, .acq_rel);
-        return .admitted;
+
+        // Reserve the single-flight slot before filesystem I/O, then acquire
+        // a durable write-ahead removal guard before the worker is allowed to
+        // contact origin. Reload observes the registered worker and waits,
+        // so the disk tier remains alive while this lease is established.
+        // The guard covers every conditional result: a 200 can make the old
+        // representation uncacheable or change direct/Vary policy, and an
+        // invalid 304 can require the same durable retirement.
+        self.proxy_response_cache_mutex.unlock();
+        const disk = self.proxyResponseCacheAcquireDisk(generation);
+        const guard_admission = if (disk) |d| d.beginRemovalGuard() else .not_needed;
+        if (guard_admission == .refused) {
+            if (disk != null) self.proxyResponseCacheReleaseDisk();
+            self.proxyResponseCacheUnlockRevalidation(primary_key);
+            self.proxyResponseCacheRevalidationFinished();
+            return .unavailable;
+        }
+
+        self.proxy_response_cache_mutex.lock();
+        const still_current = self.proxy_response_cache_generation == generation and
+            !self.proxy_response_cache_revalidation_cancel.isStopped();
+        if (still_current) {
+            const registered = self.proxy_response_cache_revalidation_locks.getPtr(primary_key).?;
+            registered.* = .{ .disk = disk, .admission = guard_admission };
+            self.proxy_response_cache_mutex.unlock();
+            return .admitted;
+        }
+        self.proxy_response_cache_mutex.unlock();
+        if (disk) |d| d.endRemovalGuard(guard_admission);
+        if (disk != null) self.proxyResponseCacheReleaseDisk();
+        self.proxyResponseCacheUnlockRevalidation(primary_key);
+        self.proxyResponseCacheRevalidationFinished();
+        return .unavailable;
     }
 
     pub fn proxyResponseCacheUnlockRevalidation(self: *GatewayState, key: []const u8) void {
         self.proxy_response_cache_mutex.lock();
-        defer self.proxy_response_cache_mutex.unlock();
-        if (self.proxy_response_cache_revalidation_locks.fetchRemove(key)) |removed| {
-            self.allocator.free(removed.key);
+        const removed = self.proxy_response_cache_revalidation_locks.fetchRemove(key);
+        self.proxy_response_cache_mutex.unlock();
+        if (removed) |entry| {
+            self.allocator.free(entry.key);
+            if (entry.value.disk) |disk| {
+                disk.endRemovalGuard(entry.value.admission);
+                self.proxyResponseCacheReleaseDisk();
+            }
         }
     }
 
@@ -1614,6 +1692,28 @@ pub const GatewayState = struct {
         defer self.proxy_response_cache_mutex.unlock();
         if (self.proxy_response_cache_generation != generation) return;
         if (self.proxy_response_cache) |*cache| cache.recordRevalidationFailure(key, revision, now_ms);
+    }
+
+    /// Establish the durable write-ahead boundary before a foreground
+    /// conditional origin request. Returning null means the caller must not
+    /// send cache-derived validators: it can still use the ordinary origin
+    /// path, but no origin decision may invalidate a shared representation
+    /// unless this guard survives through the ensuing RAM+disk mutation.
+    pub fn proxyResponseCacheBeginDurableRevalidation(self: *GatewayState, generation: u64) ?ProxyResponseCacheDurableRevalidationGuard {
+        self.proxy_response_cache_mutex.lock();
+        const current = self.proxy_response_cache_generation == generation and self.proxy_response_cache != null;
+        const disk_configured = self.proxy_response_cache_disk != null;
+        self.proxy_response_cache_mutex.unlock();
+        if (!current) return null;
+        if (!disk_configured) return .{ .state = self };
+
+        const disk = self.proxyResponseCacheAcquireDisk(generation) orelse return null;
+        const admission = disk.beginRemovalGuard();
+        if (admission == .refused) {
+            self.proxyResponseCacheReleaseDisk();
+            return null;
+        }
+        return .{ .state = self, .disk = disk, .admission = admission };
     }
 
     /// Remove one obsolete representation from both tiers. The disk lease
@@ -1754,11 +1854,11 @@ pub const GatewayState = struct {
     /// mutation that commits RAM and persists disk, so a delayed worker can
     /// neither overwrite nor durably outlive a newer foreground fill.
     ///
-    /// When `secondary_key` is null this is a direct refresh, which, like
-    /// `proxyResponseCachePut`, can displace an existing on-disk Vary
-    /// family. #937/#943: that admission is decided before RAM is touched,
-    /// so a durable guard failure aborts without ever switching RAM to the
-    /// new direct representation.
+    /// A direct refresh can displace an on-disk Vary family, while a refresh
+    /// with `secondary_key` can turn an old direct representation into its
+    /// first Vary variant. #937/#943: both admissions are decided before RAM
+    /// is touched, so a durable guard failure aborts without switching RAM
+    /// to a policy disk cannot safely recover after a crash.
     pub fn proxyResponseCacheReplaceRevalidated(
         self: *GatewayState,
         now_ms: u64,
@@ -1777,8 +1877,11 @@ pub const GatewayState = struct {
 
         const disk = self.proxyResponseCacheAcquireDisk(generation);
         defer if (disk != null) self.proxyResponseCacheReleaseDisk();
-        const admission = if (secondary_key == null)
-            (if (disk) |d| d.beginPolicyTransitionIfVaryTracked(primary_key) else .not_needed)
+        const admission = if (disk) |d|
+            if (secondary_key == null)
+                d.beginPolicyTransitionIfVaryTracked(primary_key)
+            else
+                d.beginDirectToVaryGuard(primary_key)
         else
             .not_needed;
         if (admission == .refused) return error.ProxyResponseCacheDiskTransitionNotDurable;
@@ -1921,7 +2024,7 @@ pub const GatewayState = struct {
         defer state.proxy_response_cache_fill_flights.deinit();
         state.proxy_response_cache_fill_waiters = 0;
         state.proxy_response_cache_fill_waiters_observed = std.atomic.Value(usize).init(0);
-        state.proxy_response_cache_revalidation_locks = std.StringHashMap(void).init(std.testing.allocator);
+        state.proxy_response_cache_revalidation_locks = std.StringHashMap(ProxyResponseCacheRevalidationGuard).init(std.testing.allocator);
         defer state.proxy_response_cache_revalidation_locks.deinit();
         state.proxy_response_cache_revalidation_inflight = std.atomic.Value(u32).init(0);
         state.proxy_response_cache_revalidation_max_concurrency = std.atomic.Value(u32).init(1);
@@ -2292,6 +2395,136 @@ pub const GatewayState = struct {
         defer arena.deinit();
         const hit = (try state.proxyResponseCacheLookup(arena.allocator(), 9, primary, primary, 1_001)).?;
         try std.testing.expectEqualStrings("ram-direct-v1", hit.body);
+    }
+
+    test "background revalidation guards origin decisions and direct-to-Vary replacement across restart" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+        defer allocator.free(root_path);
+        const limits = gpdc.Limits{
+            .max_object_bytes = 4096,
+            .max_entries = 4,
+            .max_total_bytes = 1 << 20,
+            .max_vary_variants = 4,
+        };
+        const fingerprint: u64 = 102;
+        const primary = "1" ** 64;
+        const secondary = "2" ** 64;
+        const headers = [_]gpc.CacheHeaderView{
+            .{ .name = "Cache-Control", .value = "max-age=1, stale-while-revalidate=30" },
+            .{ .name = "ETag", .value = "\"v1\"" },
+        };
+
+        const RearmFallbackUnlink = struct {
+            fn hook(target: *gpdc.DiskCache, key: []const u8) void {
+                target.state_dir.fault = .unlink;
+                target.state_dir.fault_file = key;
+            }
+        };
+        const RearmPoisonWrite = struct {
+            fn hook(target: *gpdc.DiskCache) void {
+                target.state_dir.fault = .write;
+                target.state_dir.fault_file = "disk-cache.disabled";
+            }
+        };
+
+        {
+            var state: GatewayState = undefined;
+            state.allocator = allocator;
+            state.proxy_response_cache_mutex = .{};
+            state.proxy_response_cache_mutation_lanes = @splat(.{});
+            state.proxy_response_cache = gpc.ProxyResponseCache.init(allocator, .{
+                .max_object_bytes = 4096,
+                .max_entries = 4,
+                .max_total_bytes = 16 * 1024,
+                .max_vary_variants = 4,
+            });
+            defer state.proxy_response_cache.?.deinit();
+            state.proxy_response_cache_disk = try gpdc.DiskCache.init(allocator, root_path, limits, fingerprint);
+            defer state.proxy_response_cache_disk.?.deinit();
+            state.proxy_response_cache_disk_accepting = true;
+            state.proxy_response_cache_disk_inflight = 0;
+            state.proxy_response_cache_condition = .{};
+            state.proxy_response_cache_generation = 10;
+            state.proxy_response_cache_revalidation_locks = std.StringHashMap(ProxyResponseCacheRevalidationGuard).init(allocator);
+            defer state.proxy_response_cache_revalidation_locks.deinit();
+            state.proxy_response_cache_revalidation_inflight = std.atomic.Value(u32).init(0);
+            state.proxy_response_cache_revalidation_max_concurrency = std.atomic.Value(u32).init(1);
+            state.proxy_response_cache_revalidation_cancel = http.cancellation.CancellationToken.init(0);
+
+            state.proxy_response_cache_disk.?.put(primary, .{
+                .status_code = 200,
+                .reason = "OK",
+                .headers = &headers,
+                .body = "disk-direct-v1",
+                .stored_at_ms = 0,
+                .expires_at_ms = 1_000,
+                .swr_until_ms = 31_000,
+                .initial_age_seconds = 0,
+            }, 0);
+            try state.proxy_response_cache.?.put(0, primary, .{
+                .status_code = 200,
+                .reason = "OK",
+                .headers = &headers,
+                .body = "ram-direct-v1",
+                .ttl_seconds = 1,
+                .swr_seconds = 30,
+            });
+            const revision = state.proxy_response_cache.?.entryRevision(primary).?;
+
+            // If the write-ahead guard itself cannot be committed, no
+            // worker is registered and therefore no conditional origin
+            // request can learn a policy decision that exists only in RAM.
+            state.proxy_response_cache_disk.?.state_dir.fault = .write;
+            state.proxy_response_cache_disk.?.state_dir.fault_file = "disk-cache.transitioning";
+            try std.testing.expectEqual(ProxyResponseCacheRevalidationAdmission.unavailable, try state.proxyResponseCacheTryRegisterRevalidation(10, primary, primary, revision, 1_500));
+            try std.testing.expectEqual(@as(u32, 0), state.proxy_response_cache_revalidation_inflight.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_revalidation_locks.count());
+
+            // Registration is the pre-origin durability boundary: the
+            // worker cannot be admitted until the namespace guard is on
+            // disk, and its disk lease/guard remain owned by the registry.
+            try std.testing.expectEqual(ProxyResponseCacheRevalidationAdmission.admitted, try state.proxyResponseCacheTryRegisterRevalidation(10, primary, primary, revision, 1_500));
+            try std.testing.expect(state.proxy_response_cache_disk.?.isTransitionGuardOnDisk());
+            try std.testing.expectEqual(@as(usize, 1), state.proxy_response_cache_disk_inflight);
+
+            // Model the background origin returning a cacheable 200 that
+            // changes policy to Vary, followed by independent tombstone,
+            // fallback-unlink, and poison-marker failures.
+            state.proxy_response_cache_disk.?.test_before_tombstone_fallback_remove = &RearmFallbackUnlink.hook;
+            state.proxy_response_cache_disk.?.test_before_poison_write = &RearmPoisonWrite.hook;
+            state.proxy_response_cache_disk.?.state_dir.fault = .write;
+            state.proxy_response_cache_disk.?.state_dir.fault_file = primary;
+            try state.proxyResponseCacheReplaceRevalidated(1_500, 10, primary, primary, revision, secondary, .{
+                .status_code = 200,
+                .reason = "OK",
+                .headers = &headers,
+                .body = "vary-v2",
+                .ttl_seconds = 30,
+            });
+            state.proxy_response_cache_disk.?.test_before_tombstone_fallback_remove = null;
+            state.proxy_response_cache_disk.?.test_before_poison_write = null;
+
+            try std.testing.expect(state.proxy_response_cache.?.isVaryTracked(primary));
+            try std.testing.expect(state.proxy_response_cache_disk.?.disabled);
+            try std.testing.expect(!state.proxy_response_cache_disk.?.poison_write_confirmed);
+
+            // Worker cleanup releases the outer lease, but an unsafe disk
+            // outcome must retain the durable guard for the next process.
+            state.proxyResponseCacheUnlockRevalidation(primary);
+            state.proxyResponseCacheRevalidationFinished();
+            try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_disk_inflight);
+            try std.testing.expect(state.proxy_response_cache_disk.?.isTransitionGuardOnDisk());
+        }
+
+        var reopened = try gpdc.DiskCache.init(allocator, root_path, limits, fingerprint);
+        defer reopened.deinit();
+        try std.testing.expect(reopened.disabled);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        try std.testing.expect(reopened.get(arena.allocator(), primary, 1_501) == null);
     }
 
     test "proxyResponseCacheInvalidate does not forget RAM when disk cannot durably guard the removal, so a restart cannot resurrect it" {

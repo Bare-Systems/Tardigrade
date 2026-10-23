@@ -277,6 +277,10 @@ pub const DiskCache = struct {
     /// letting a test re-arm a one-shot `state_dir.fault` that an earlier,
     /// unrelated write already consumed.
     test_before_poison_write: ?*const fn (*DiskCache) void = null,
+    /// Test-only: invoked after a direct-to-Vary tombstone write fails but
+    /// before its fallback durable unlink, allowing the two independent
+    /// storage failures to be reproduced deterministically.
+    test_before_tombstone_fallback_remove: ?*const fn (*DiskCache, []const u8) void = null,
     /// Test-only pause point, keyed by primary, between a successful
     /// `beginTransitionGuard` and the fence write that follows it --
     /// proving a concurrent, differently-laned primary's own transition can
@@ -1153,6 +1157,7 @@ pub const DiskCache = struct {
             // The marker never replaced the old direct file, so a restart
             // would recover it under the stale policy. Retire that file
             // durably instead; only if even that fails is the tier disabled.
+            if (self.test_before_tombstone_fallback_remove) |hook| hook(self, key);
             const retired = self.state_dir.removeFileDurable(key);
             self.mutex.lock();
             if (retired) |_| {

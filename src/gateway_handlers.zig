@@ -3214,8 +3214,10 @@ fn handleHttp3LocationProxyPass(
                         }
                     }
                     if (fillable_method) {
-                        synchronous_revalidation = try gproxy_runtime.prepareSynchronousCacheRevalidation(
+                        synchronous_revalidation = try gproxy_runtime.prepareDurablyAdmittedSynchronousCacheRevalidation(
                             allocator,
+                            ctx.state,
+                            cache_generation,
                             key_buf[0..],
                             effective_key.?,
                             &hit,
@@ -3289,8 +3291,10 @@ fn handleHttp3LocationProxyPass(
                                             ctx.state.metricsRecordProxyCacheOutcome(.fill_error);
                                         }
                                     } else {
-                                        synchronous_revalidation = try gproxy_runtime.prepareSynchronousCacheRevalidation(
+                                        synchronous_revalidation = try gproxy_runtime.prepareDurablyAdmittedSynchronousCacheRevalidation(
                                             allocator,
+                                            ctx.state,
+                                            cache_generation,
                                             key_buf[0..],
                                             waited_effective_key.?,
                                             &waited_hit,

@@ -13,6 +13,7 @@ const gpt = @import("gateway_proxy_target.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const gcp = @import("gateway_control_plane_proxy.zig");
 const gpc = @import("gateway_proxy_cache.zig");
+const gpdc = @import("gateway_proxy_disk_cache.zig");
 const ga = @import("gateway_auth.zig");
 const gs = @import("gateway_state.zig");
 const gws_tunnel = @import("gateway_websocket_tunnel.zig");
@@ -185,8 +186,10 @@ pub const SynchronousCacheRevalidation = struct {
     revision: u64,
     validator_name: []const u8,
     validator_value: []u8,
+    durable_guard: ?gs.ProxyResponseCacheDurableRevalidationGuard = null,
 
     pub fn deinit(self: *SynchronousCacheRevalidation, allocator: std.mem.Allocator) void {
+        if (self.durable_guard) |*guard| guard.release();
         allocator.free(self.validator_value);
         self.* = undefined;
     }
@@ -229,6 +232,27 @@ pub fn prepareSynchronousCacheRevalidation(
             plan.validator_value = try allocator.dupe(u8, value);
         },
     }
+    return plan;
+}
+
+/// Prepare a foreground conditional revalidation only after the disk
+/// namespace can durably record any invalidating policy decision the origin
+/// may return. On refusal, discard the cache validator and let the caller use
+/// its ordinary unconditional origin path.
+pub fn prepareDurablyAdmittedSynchronousCacheRevalidation(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    generation: u64,
+    primary_key: []const u8,
+    effective_key: []const u8,
+    hit: *const gpc.LookupResult,
+    request_headers: *const http.Headers,
+) !?SynchronousCacheRevalidation {
+    var plan = (try prepareSynchronousCacheRevalidation(allocator, primary_key, effective_key, hit, request_headers)) orelse return null;
+    plan.durable_guard = state.proxyResponseCacheBeginDurableRevalidation(generation) orelse {
+        plan.deinit(allocator);
+        return null;
+    };
     return plan;
 }
 
@@ -388,6 +412,62 @@ test "cache-generated origin validators do not mutate downstream request headers
 
     try request_headers.append("If-Modified-Since", "Thu, 22 Oct 2015 07:28:00 GMT");
     try std.testing.expect((try prepareSynchronousCacheRevalidation(allocator, key, key, &hit, &request_headers)) == null);
+}
+
+test "foreground conditional revalidation requires a durable pre-origin guard" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.proxy_response_cache_mutex = .{};
+    state.proxy_response_cache = gpc.ProxyResponseCache.init(allocator, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 16 * 1024,
+    });
+    defer state.proxy_response_cache.?.deinit();
+    state.proxy_response_cache_disk = try gpdc.DiskCache.init(allocator, root_path, .{
+        .max_object_bytes = 4096,
+        .max_entries = 4,
+        .max_total_bytes = 1 << 20,
+    }, 103);
+    defer state.proxy_response_cache_disk.?.deinit();
+    state.proxy_response_cache_disk_accepting = true;
+    state.proxy_response_cache_disk_inflight = 0;
+    state.proxy_response_cache_condition = .{};
+    state.proxy_response_cache_generation = 11;
+
+    var request_headers = http.Headers.init(allocator);
+    defer request_headers.deinit();
+    const stored_headers = [_]gpc.CacheHeader{.{ .name = @constCast("ETag"), .value = @constCast("\"v1\"") }};
+    const hit = gpc.LookupResult{
+        .status_code = 200,
+        .reason = @constCast("OK"),
+        .headers = @constCast(&stored_headers),
+        .body = @constCast("body"),
+        .age_seconds = 2,
+        .stale = true,
+        .stale_servable = false,
+        .revision = 9,
+    };
+    const key = "0" ** 64;
+
+    state.proxy_response_cache_disk.?.state_dir.fault = .write;
+    state.proxy_response_cache_disk.?.state_dir.fault_file = "disk-cache.transitioning";
+    try std.testing.expect((try prepareDurablyAdmittedSynchronousCacheRevalidation(allocator, &state, 11, key, key, &hit, &request_headers)) == null);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_disk_inflight);
+    try std.testing.expect(!state.proxy_response_cache_disk.?.isTransitionGuardOnDisk());
+
+    var admitted = (try prepareDurablyAdmittedSynchronousCacheRevalidation(allocator, &state, 11, key, key, &hit, &request_headers)).?;
+    try std.testing.expectEqual(@as(usize, 1), state.proxy_response_cache_disk_inflight);
+    try std.testing.expect(state.proxy_response_cache_disk.?.isTransitionGuardOnDisk());
+    admitted.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_response_cache_disk_inflight);
+    try std.testing.expect(!state.proxy_response_cache_disk.?.isTransitionGuardOnDisk());
 }
 
 test "proxy response cache reload wakes foreground fill waiters" {
@@ -1462,8 +1542,10 @@ pub fn handleLocationProxyPass(
                         }
                     }
                     if (fillable_method) {
-                        synchronous_revalidation = try prepareSynchronousCacheRevalidation(
+                        synchronous_revalidation = try prepareDurablyAdmittedSynchronousCacheRevalidation(
                             temp_allocator,
+                            state,
+                            ctx.config_generation,
                             key_buf[0..],
                             effective_key.?,
                             &hit,
@@ -1525,8 +1607,10 @@ pub fn handleLocationProxyPass(
                                             state.metricsRecordProxyCacheOutcome(.fill_error);
                                         }
                                     } else {
-                                        synchronous_revalidation = try prepareSynchronousCacheRevalidation(
+                                        synchronous_revalidation = try prepareDurablyAdmittedSynchronousCacheRevalidation(
                                             temp_allocator,
+                                            state,
+                                            ctx.config_generation,
                                             key_buf[0..],
                                             waited_effective_key.?,
                                             &waited_hit,

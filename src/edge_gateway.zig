@@ -4205,7 +4205,35 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     h2InstallSessionRegistry(conn, SessionDrainCtx.pollFds, SessionDrainCtx.drain, &session_drain_ctx);
     defer h2InstallSessionRegistry(conn, null, null, null);
 
-    while (!http.shutdown.isShutdownRequested() and !goaway_received) {
+    // #863 graceful shutdown: the boundary this connection announced via
+    // GOAWAY once a shutdown was first observed (RFC 9113 §6.8), and the
+    // wall-clock deadline (from `cfg.shutdown_drain_timeout_ms`, the same
+    // knob `worker_pool.shutdownAndJoin` already uses) by which already-
+    // admitted streams/sessions must finish on their own before this
+    // connection gives up draining and settles everything as `.shutdown`
+    // below, same as an immediate (`shutdown_drain_timeout_ms == 0`) or
+    // abrupt shutdown always has.
+    var shutdown_goaway_last_stream_id: ?u31 = null;
+    var shutdown_drain_deadline_ms: ?u64 = null;
+    while (!goaway_received) {
+        if (http.shutdown.isShutdownRequested()) {
+            if (shutdown_goaway_last_stream_id == null) {
+                // Announce the boundary exactly once: streams already
+                // admitted at or below `last_client_stream_id` keep being
+                // serviced by the rest of this loop; anything above it is
+                // refused, never dispatched, at the `.headers` admission
+                // check below.
+                shutdown_goaway_last_stream_id = last_client_stream_id;
+                try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.no_error.value());
+                shutdown_drain_deadline_ms = if (cfg.shutdown_drain_timeout_ms > 0)
+                    http.event_loop.monotonicMs() +| cfg.shutdown_drain_timeout_ms
+                else
+                    null;
+            }
+            const drained = streams.count() == 0 and sessions.count() == 0;
+            const deadline_elapsed = if (shutdown_drain_deadline_ms) |deadline| http.event_loop.monotonicMs() >= deadline else true;
+            if (drained or deadline_elapsed) return;
+        }
         // Apply any worker completions that already arrived. A busy
         // connection that keeps `readFrame` returning real data every
         // iteration never falls into `waitFor`'s blocking poll, so draining
@@ -4373,6 +4401,19 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     continue;
                 }
                 if (!streams.contains(frame.stream_id)) {
+                    if (shutdown_goaway_last_stream_id) |boundary| {
+                        if (frame.stream_id > boundary) {
+                            // #863 graceful drain: this connection already
+                            // announced it will not accept anything past
+                            // `boundary`. Refuse the stream (never admitted
+                            // into `streams`/`pending`, never reaches
+                            // ordinary dispatch or the #867 session hook)
+                            // instead of tearing down already-admitted work
+                            // with a connection-wide GOAWAY.
+                            try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.refused_stream.value());
+                            continue;
+                        }
+                    }
                     if (streams.count() >= HTTP2_MAX_CONCURRENT_STREAMS) {
                         // Bound all per-stream maps and header/body ownership.
                         // Close the connection on a peer that exceeds the
@@ -13496,6 +13537,152 @@ test "H2 live: a protocol violation above the admitted stream boundary tears dow
     // The session admitted before the violation still settles cleanly
     // through the same connection-teardown path an ordinary GOAWAY/EOF
     // uses -- `std.testing.allocator` fails this test if it leaked instead.
+    testJoinOnce(&hook_ctx.consumer_thread);
+}
+
+// PR review (#863): the protocol-violation test above proves the
+// tear-down-on-error GOAWAY path, not RFC 9113 §6.8's graceful drain
+// contract -- a distinct boundary announced on an *ordinary* shutdown,
+// after which already-admitted work keeps running to completion instead of
+// being torn down. A positive `cfg.shutdown_drain_timeout_ms` (unlike every
+// other #863/#867 live test's zeroed `cfg`) is what opts this connection
+// into that drain instead of settling the session as `.shutdown` the
+// instant the flag is observed, exactly like `worker_pool.shutdownAndJoin`'s
+// own `0 -> no drain` convention.
+test "H2 live: graceful shutdown announces a GOAWAY boundary, drains the admitted session to completion, and refuses a stream above it (#863)" {
+    const allocator = std.testing.allocator;
+    http.shutdown.reset();
+    defer http.shutdown.reset();
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+
+    var hook_ctx = LiveSessionHookCtx{ .allocator = allocator, .attach_path = "/session" };
+    state.h2_session_test_hook = .{
+        .ctx = &hook_ctx,
+        .shouldAttach = LiveSessionHookCtx.shouldAttach,
+        .attach = LiveSessionHookCtx.attach,
+    };
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.shutdown_drain_timeout_ms = 2_000;
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinOnFailure(server_fd, &server_thread, &hook_ctx.consumer_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    // Admit the one long-lived session this GOAWAY's boundary must cover.
+    try client.sendHeaders(allocator, 1, false, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/session" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var session_headers = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &session_headers);
+    try std.testing.expectEqual(http.http2_frame.Type.headers, session_headers.typ);
+
+    http.shutdown.requestShutdown();
+    // Nothing else is pending, so nudge the loop the same way the existing
+    // #863/#867 shutdown tests do: the connection loop only rechecks the
+    // shutdown flag between frame reads.
+    try client.writer().enqueueFrame(.ping, 0, 0, &[_]u8{0} ** 8);
+
+    var saw_goaway = false;
+    var saw_ping_ack = false;
+    var frames_read: usize = 0;
+    while (!saw_goaway or !saw_ping_ack) {
+        var frame = try client.readFrame(allocator);
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        if (frame.typ == .goaway) {
+            saw_goaway = true;
+            try std.testing.expectEqual(@as(u31, 0), frame.stream_id);
+            const reported_last_stream_id = std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFF_FFFF;
+            try std.testing.expectEqual(@as(u32, 1), reported_last_stream_id);
+            try std.testing.expectEqual(@as(u32, http.http2_stream.ErrorCode.no_error.value()), std.mem.readInt(u32, frame.payload[4..8], .big));
+        } else if (frame.typ == .ping and (frame.flags & http.http2_frame.Flags.ACK) != 0) {
+            saw_ping_ack = true;
+        } else if (frame.typ != .window_update) {
+            return error.UnexpectedFrameWhileAwaitingShutdownGoaway;
+        }
+        frames_read += 1;
+        if (frames_read > 20) return error.TestFrameBudgetExceeded;
+    }
+
+    // A new stream above the announced boundary races the GOAWAY: refused
+    // outright, never dispatched (not even to the ordinary `/ordinary` 404
+    // route), rather than disturbing the already-admitted session.
+    try client.sendHeaders(allocator, 3, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "test.local" },
+    });
+    var refused: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.typ != .window_update) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
+    defer http.http2_frame.deinitFrame(allocator, &refused);
+    try std.testing.expectEqual(http.http2_frame.Type.rst_stream, refused.typ);
+    try std.testing.expectEqual(@as(u31, 3), refused.stream_id);
+    try std.testing.expectEqual(@as(u32, http.http2_stream.ErrorCode.refused_stream.value()), std.mem.readInt(u32, refused.payload[0..4], .big));
+
+    // The admitted session is still genuinely live and completes normally
+    // after the GOAWAY, proving the boundary drains existing work instead
+    // of abandoning it.
+    try client.sendData(1, false, "still-alive");
+    var echo: http.http2_frame.Frame = while (true) {
+        var frame = try client.readFrame(allocator);
+        if (frame.typ != .window_update) break frame;
+        http.http2_frame.deinitFrame(allocator, &frame);
+    };
+    defer http.http2_frame.deinitFrame(allocator, &echo);
+    try std.testing.expectEqual(http.http2_frame.Type.data, echo.typ);
+    try std.testing.expectEqualStrings("still-alive", echo.payload);
+
+    // Closing the session locally (same convention the churn/two-session
+    // tests use) gives this connection a deterministic next loop iteration
+    // without depending on a blocking read that nothing further would ever
+    // satisfy.
+    try client.sendData(1, true, "");
+    try http.http2_frame.writeGoaway(client.writer(), 3, 0);
+    const settle_started = compat.milliTimestamp();
+    testJoinOnce(&server_thread);
+    const settle_elapsed_ms = compat.milliTimestamp() - settle_started;
+    try std.testing.expect(settle_elapsed_ms <= 2_000);
+    try server_ctx.result;
+    // Exactly one detach: `std.testing.allocator` fails this test if the
+    // session leaked or was settled twice.
     testJoinOnce(&hook_ctx.consumer_thread);
 }
 

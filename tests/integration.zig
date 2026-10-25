@@ -7867,17 +7867,27 @@ const H2TransportSessionEcho = struct { stream_id: u31, buf: *std.array_list.Man
 /// `:status == expected_status`; `DATA` only valid after; anything else,
 /// or any frame once the stream already completed, fails the test) so a
 /// failed/empty/reset response can never be mistaken for a correct one.
+///
+/// PR review (#863): a status-only oracle also passes for an empty or
+/// truncated body, which never proves successful REST/static/proxy routing
+/// under multiplexed load. When `expected_body` is non-null, the accumulated
+/// DATA bytes and any `content-length` response header (if present) must
+/// match it exactly, not just the terminal status/END_STREAM shape.
 fn h2DrainOrdinaryResponse(
     client: *PureZigTlsClient,
     allocator: std.mem.Allocator,
     stream_id: u31,
     expected_status: u16,
+    expected_body: ?[]const u8,
     session_echoes: []const H2TransportSessionEcho,
     frame_budget: usize,
 ) !void {
     const State = enum { awaiting_headers, awaiting_body, done };
     var state: State = .awaiting_headers;
     var frames_read: usize = 0;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    var content_length: ?u64 = null;
     while (true) {
         var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
         defer frame.deinit(allocator);
@@ -7892,17 +7902,25 @@ fn h2DrainOrdinaryResponse(
                     var status: ?u16 = null;
                     for (decoded.headers) |h| {
                         if (std.mem.eql(u8, h.name, ":status")) status = std.fmt.parseInt(u16, h.value, 10) catch null;
+                        if (std.mem.eql(u8, h.name, "content-length")) content_length = std.fmt.parseInt(u64, h.value, 10) catch null;
                     }
                     try std.testing.expectEqual(@as(?u16, expected_status), status);
                     state = if ((frame.flags & 0x1) != 0) .done else .awaiting_body;
                 },
                 .awaiting_body => {
                     if (frame.typ != 0x0) return error.UnexpectedOrdinaryResponseFrame;
+                    try body.appendSlice(frame.payload);
                     if ((frame.flags & 0x1) != 0) state = .done;
                 },
                 .done => return error.UnexpectedOrdinaryResponseFrame,
             }
-            if (state == .done) return;
+            if (state == .done) {
+                if (expected_body) |expected| {
+                    try std.testing.expectEqualSlices(u8, expected, body.items);
+                    if (content_length) |cl| try std.testing.expectEqual(@as(u64, expected.len), cl);
+                }
+                return;
+            }
         } else {
             for (session_echoes) |echo| {
                 if (frame.stream_id == echo.stream_id and frame.typ == 0x0) try echo.buf.appendSlice(frame.payload);
@@ -7917,6 +7935,15 @@ fn h2DrainOrdinaryResponse(
 /// this is a separate build module (`tests/integration.zig` has no
 /// dependency on the `tardi` binary's own source), same convention
 /// `tests/http3_soak.zig` already documents for its own RSS/FD helpers.
+/// PR review (#863): millisecond-resolution timestamps make this gate
+/// meaningless -- a genuinely healthy real-process p95 commonly rounds to
+/// 0-2ms, at which point even the intended 2x ratio check still tolerates a
+/// 25x-50x regression once a fixed millisecond floor is added on top.
+/// Microsecond resolution keeps the ratio itself the real bound.
+fn h2TransportElapsedUs(started_ns: i128) i64 {
+    return @intCast(@divFloor(compat.monotonicNanoTimestamp() - started_ns, 1_000));
+}
+
 fn h2TransportPercentile95(allocator: std.mem.Allocator, samples: []const i64) !i64 {
     const sorted = try allocator.dupe(i64, samples);
     defer allocator.free(sorted);
@@ -7968,8 +7995,8 @@ fn h2TransportResourceSample(allocator: std.mem.Allocator, pid: std.c.pid_t, por
 
 fn writeH2TransportValidationEvidence(
     allocator: std.mem.Allocator,
-    baseline_p95_ms: i64,
-    loaded_p95_ms: i64,
+    baseline_p95_us: i64,
+    loaded_p95_us: i64,
     samples: []const H2TransportResourceSample,
 ) !void {
     const path = compat.getEnvVarOwned(allocator, "TARDIGRADE_H2_TRANSPORT_EVIDENCE") catch return;
@@ -7978,8 +8005,12 @@ fn writeH2TransportValidationEvidence(
     defer allocator.free(source_sha);
     const runner = compat.getEnvVarOwned(allocator, "RUNNER_NAME") catch try allocator.dupe(u8, "local");
     defer allocator.free(runner);
+    // schema_version 2 (#863 review): the latency fields moved from
+    // millisecond to microsecond resolution, so an older consumer reading
+    // this file by field name alone must not silently misinterpret the
+    // units.
     const json = try compat.stringifyAlloc(allocator, .{
-        .schema_version = 1,
+        .schema_version = 2,
         .issue = 863,
         .profile = "h2-transport-validation",
         .source_sha = source_sha,
@@ -7987,8 +8018,8 @@ fn writeH2TransportValidationEvidence(
         .architecture = @tagName(builtin.cpu.arch),
         .cpu_count = std.Thread.getCpuCount() catch 0,
         .runner = runner,
-        .rest_baseline_p95_ms = baseline_p95_ms,
-        .rest_loaded_p95_ms = loaded_p95_ms,
+        .rest_baseline_p95_us = baseline_p95_us,
+        .rest_loaded_p95_us = loaded_p95_us,
         .resource_samples = samples,
     }, .{});
     defer allocator.free(json);
@@ -8009,6 +8040,17 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     var tardigrade = try TardigradeProcess.start(allocator, .{
         .auth_token_hashes = null,
         .ready_https_insecure = true,
+        // PR review (#863): a status-only 404 oracle on an unconfigured
+        // path never proves successful REST/static/proxy routing under
+        // multiplexed load. `/ordinary` is a real configured 200 route with
+        // a known, finite body, so every baseline/loaded sample below
+        // exercises genuine routing and response-byte correctness; the
+        // 404 case stays covered separately against an unconfigured path.
+        .config_text =
+        \\location = /ordinary {
+        \\    return 200 ok;
+        \\}
+        ,
         .extra_env = &.{
             .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
             .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
@@ -8039,10 +8081,14 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     try samples.append(try h2TransportResourceSample(allocator, pid, tardigrade.port, "baseline"));
 
     const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
-    // Destroyed explicitly (not deferred) below, before the settle-polling
-    // phase: `errdefer` only covers an early-error unwind, so the explicit
-    // call on the success path below is never a double-free.
-    errdefer client.destroy();
+    // PR review (#863): an `errdefer client.destroy()` here stays armed for
+    // the rest of the function, including after the explicit `destroy()`
+    // below -- any later failure (settle-polling deadline, a trailing
+    // assertion) would then double-free the same pointer. `client_owned`
+    // makes the single `defer` below a no-op once ownership has already
+    // been given up on the success path.
+    var client_owned = true;
+    defer if (client_owned) client.destroy();
     try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
     try client.writeHttp2Frame(0x4, 0, 0, &.{});
     try completeH2SettingsHandshake(client, allocator);
@@ -8059,15 +8105,30 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     while (b < 50) : (b += 1) {
         const stream_id = next_stream_id;
         next_stream_id += 2;
-        const started = compat.milliTimestamp();
+        const started_ns = compat.monotonicNanoTimestamp();
         try h2SendHeaders(client, allocator, stream_id, true, &.{
             .{ .name = ":method", .value = "GET" },
             .{ .name = ":path", .value = "/ordinary" },
             .{ .name = ":scheme", .value = "https" },
             .{ .name = ":authority", .value = "tardigrade.test" },
         });
-        try h2DrainOrdinaryResponse(client, allocator, stream_id, 404, &.{}, 50);
-        try baseline_samples.append(compat.milliTimestamp() - started);
+        try h2DrainOrdinaryResponse(client, allocator, stream_id, 200, "ok", &.{}, 50);
+        try baseline_samples.append(h2TransportElapsedUs(started_ns));
+    }
+
+    // Negative case (#863 review): a genuinely unconfigured path still 404s,
+    // kept as a separate assertion now that the sampled requests above
+    // exercise a real 200 route instead of relying on 404 for both.
+    {
+        const stream_id = next_stream_id;
+        next_stream_id += 2;
+        try h2SendHeaders(client, allocator, stream_id, true, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/not-a-configured-route" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        });
+        try h2DrainOrdinaryResponse(client, allocator, stream_id, 404, null, &.{}, 50);
     }
 
     // Two long-lived sessions admitted on the same connection through the
@@ -8132,15 +8193,15 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
 
         const stream_id = next_stream_id;
         next_stream_id += 2;
-        const started = compat.milliTimestamp();
+        const started_ns = compat.monotonicNanoTimestamp();
         try h2SendHeaders(client, allocator, stream_id, true, &.{
             .{ .name = ":method", .value = "GET" },
             .{ .name = ":path", .value = "/ordinary" },
             .{ .name = ":scheme", .value = "https" },
             .{ .name = ":authority", .value = "tardigrade.test" },
         });
-        try h2DrainOrdinaryResponse(client, allocator, stream_id, 404, &echoes, 200);
-        try loaded_samples.append(compat.milliTimestamp() - started);
+        try h2DrainOrdinaryResponse(client, allocator, stream_id, 200, "ok", &echoes, 200);
+        try loaded_samples.append(h2TransportElapsedUs(started_ns));
     }
 
     const drain_deadline = compat.milliTimestamp() + 5_000;
@@ -8159,14 +8220,17 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     try std.testing.expectEqualSlices(u8, expected_a.items, session_a_echo.items);
     try std.testing.expectEqualSlices(u8, expected_b.items, session_b_echo.items);
 
-    const baseline_p95_ms = try h2TransportPercentile95(allocator, baseline_samples.items);
-    const loaded_p95_ms = try h2TransportPercentile95(allocator, loaded_samples.items);
-    // A real spawned process over real loopback TLS has materially more
-    // scheduling/syscall noise than the in-process socketpair unit test
-    // this mirrors; the floor is correspondingly larger, still bounding
-    // regressions rather than acting as a throughput allowance.
-    const floor_ms: i64 = 50;
-    try std.testing.expect(loaded_p95_ms <= @max(floor_ms, baseline_p95_ms * 2));
+    const baseline_p95_us = try h2TransportPercentile95(allocator, baseline_samples.items);
+    const loaded_p95_us = try h2TransportPercentile95(allocator, loaded_samples.items);
+    // PR review (#863): a healthy real-process p95 commonly rounds to 0-2ms
+    // at millisecond resolution, so a 50ms floor on top of the 2x ratio let
+    // a 25x-50x regression pass silently. Microsecond samples make the
+    // floor only absorb genuine scheduling/syscall quantization noise for a
+    // real spawned process over real loopback TLS (materially more than the
+    // in-process socketpair unit test this mirrors), not a throughput
+    // allowance.
+    const floor_us: i64 = 20_000;
+    try std.testing.expect(loaded_p95_us <= @max(floor_us, baseline_p95_us * 2));
 
     // Fault injection: a PING round-trip (#863's "PING/SETTINGS progress"),
     // then RST_STREAM on session B while session A and ordinary siblings
@@ -8194,7 +8258,7 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "tardigrade.test" },
     });
-    try h2DrainOrdinaryResponse(client, allocator, after_rst_stream, 404, &.{.{ .stream_id = session_a, .buf = &session_a_echo }}, 200);
+    try h2DrainOrdinaryResponse(client, allocator, after_rst_stream, 200, "ok", &.{.{ .stream_id = session_a, .buf = &session_a_echo }}, 200);
 
     try h2SendData(client, session_a, false, "still-alive");
     const still_alive_deadline = compat.milliTimestamp() + 5_000;
@@ -8209,12 +8273,68 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
         if (frame.stream_id == session_a and frame.typ == 0x0) try session_a_echo.appendSlice(frame.payload);
     }
 
-    try samples.append(try h2TransportResourceSample(allocator, pid, tardigrade.port, "post_fault"));
+    const post_fault_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "post_fault");
+    try samples.append(post_fault_sample);
+
+    // Second churn cycle (#863 review: prove no monotonic growth across
+    // *repeated* churn, not just a single open/close pass). The per-session
+    // echo round trip itself is already proven above (session_a/session_b)
+    // and in `edge_gateway.zig`'s dedicated 20-iteration churn test; this
+    // cycle's job is purely to show resource usage returns to the same
+    // per-session level again after a second attach/close pass on this
+    // same connection, rather than growing with each additional cycle.
+    const session_c = next_stream_id;
+    next_stream_id += 2;
+    const session_d = next_stream_id;
+    next_stream_id += 2;
+    // Attach both before closing either: closing `session_c` inside this
+    // same loop iteration would race its own closing DATA(END_STREAM)
+    // frame against `session_d`'s attach HEADERS below, since both ride
+    // the same connection.
+    for ([_]u31{ session_c, session_d }) |session_stream| {
+        try h2SendHeaders(client, allocator, session_stream, false, &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = h2_test_only_session_path },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        });
+        var headers: Http2WireFrame = while (true) {
+            var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+            if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+                try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+                frame.deinit(allocator);
+                continue;
+            }
+            if (frame.typ == 0x8 or frame.stream_id != session_stream) {
+                frame.deinit(allocator);
+                continue;
+            }
+            break frame;
+        };
+        defer headers.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x1), headers.typ);
+        try std.testing.expectEqual(session_stream, headers.stream_id);
+    }
+    // Close immediately: this cycle proves settle after a repeated
+    // attach/close pass, not another echo round trip.
+    try h2SendData(client, session_c, true, "");
+    try h2SendData(client, session_d, true, "");
+
+    const churn2_settle_deadline = compat.milliTimestamp() + 5_000;
+    var churn2_settled: H2TransportResourceSample = undefined;
+    while (true) {
+        churn2_settled = try h2TransportResourceSample(allocator, pid, tardigrade.port, "churn_2_settled");
+        if (churn2_settled.open_fds <= post_fault_sample.open_fds and churn2_settled.sockets <= post_fault_sample.sockets) break;
+        if (compat.milliTimestamp() > churn2_settle_deadline) return error.ConnectionDidNotSettle;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    try samples.append(churn2_settled);
 
     // Close session A locally and end the connection cleanly.
     try h2SendData(client, session_a, true, "");
     try client.writeHttp2Frame(0x7, 0, 0, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }); // GOAWAY(NO_ERROR)
     client.destroy();
+    client_owned = false;
 
     // Settle: poll a fresh short-lived connection's own open-fd/socket count
     // until it returns to the pre-test baseline, bounded by a fixed
@@ -8240,7 +8360,7 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     try std.testing.expect(settled_sample.open_fds <= samples.items[0].open_fds + 4);
     try std.testing.expect(settled_sample.sockets <= samples.items[0].sockets + 2);
 
-    try writeH2TransportValidationEvidence(allocator, baseline_p95_ms, loaded_p95_ms, samples.items);
+    try writeH2TransportValidationEvidence(allocator, baseline_p95_us, loaded_p95_us, samples.items);
 }
 
 test "interop.h2.proxy_response_respects_peer_initial_window_size" {

@@ -474,16 +474,17 @@ pub fn build(b: *std.Build) void {
 
     // #945: the curated PR-smoke live-process subset -- startup/health,
     // proxy round-trip, request-policy/auth-denied origin side effect,
-    // invalid-config/reload, auth-gated cache isolation, and one native
-    // H1/H2/TLS boundary case plus bounded H1/H3 cache-collapse acceptance
-    // -- instead of the full `test-integration`
+    // invalid-config/reload, auth-gated cache isolation, one native
+    // H1/H2/TLS boundary case plus bounded H1/H3 cache-collapse acceptance,
+    // and the #863 real-process H2 transport validation gate -- instead of
+    // the full `test-integration`
     // suite on ordinary PRs (see ci.yml's `integration-test` job and
     // docs/CI.md). Each named filter below is a stable, existing
     // `tests/integration.zig` test name, not a new test. Unlike
     // `test-integration-native-tls`'s combined multi-name `.filters` above,
     // each name here gets its own #944 `count_named_exe_test_matches.zig`
     // zero-match probe: a single multi-name probe would stay nonzero (and
-    // silently pass) as long as just one of the five names still matched
+    // silently pass) as long as just one of the names below still matched
     // something, letting a rename/removal of any other named case quietly
     // drop out of smoke coverage instead of failing the build.
     const integration_smoke_filters = &[_][]const u8{
@@ -494,6 +495,10 @@ pub fn build(b: *std.Build) void {
         "forward_auth responses are never shared-cacheable over h1",
         "generic proxy response cache collapses concurrent misses to one origin fill (#934)",
         "h3interop.cache_fill_reset releases waiter and unrelated QUIC request progresses before owner (#934)",
+        // #863 review: a green `integration-test` CI job must actually show
+        // this real-process H2 transport validation gate ran, not just that
+        // the curated filter list happened not to exclude it.
+        "interop.h2.live-process transport validation: long-lived sessions, REST load, fault injection, and resource settle (#863)",
     };
     const integration_smoke_step = b.step("test-integration-smoke", "Run the curated PR-smoke live-process integration subset (#945), including deterministic H1/H3 cache-collapse acceptance; fails closed if any named case matches nothing");
     for (integration_smoke_filters) |filter_name| {

@@ -49,8 +49,11 @@ Linux `zig build test-fast` (#944's bounded gate, not the full unit suite) +
 hostile-HTTP corpus + `tardi init` validation, Linux native-TLS-listener
 integration, the **curated** live-process integration subset
 (`test-integration-smoke`: startup/health, proxy round-trip, auth-denied
-origin side effect, invalid config/reload, auth-gated cache isolation, and
-one native H1/H2/TLS boundary case) instead of the full suite, the focused
+origin side effect, invalid config/reload, auth-gated cache isolation, one
+native H1/H2/TLS boundary case, and the #863 real-process H2 transport
+validation gate -- long-lived sessions, REST load, fault injection, and
+resource settle, with its evidence JSON uploaded as the
+`h2-transport-validation` artifact) instead of the full suite, the focused
 ACME-experimental issuance case
 (`test-integration-acme-smoke`) instead of its full matrix, example-config
 validation, and Security (gitleaks, Trivy, zizmor) plus Dependency review on

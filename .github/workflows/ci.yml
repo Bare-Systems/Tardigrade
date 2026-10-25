@@ -1197,12 +1197,26 @@ jobs:
       - name: "Run integration tests (smoke: curated subset; full: complete suite)"
         env:
           MODE: ${{ needs.mode.outputs.mode }}
+          # #863: real source SHA and a real evidence output path, so the
+          # curated smoke run's #863 case always emits machine-readable
+          # evidence instead of silently no-oping without these set.
+          TARDIGRADE_H2_TRANSPORT_EVIDENCE: ${{ runner.temp }}/h2-transport-validation.json
+          TARDIGRADE_H2_TRANSPORT_SOURCE_SHA: ${{ github.sha }}
         run: |
           if [ "$MODE" = "full" ]; then
             zig build test-integration --summary all
           else
             zig build test-integration-smoke --summary all
           fi
+
+      - name: Upload H2 transport validation evidence (#863)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: h2-transport-validation
+          path: ${{ runner.temp }}/h2-transport-validation.json
+          if-no-files-found: warn
+          retention-days: 14
 
   # #884's automatic-HTTPS path is intentionally experimental and disabled
   # in release builds, so the default integration leg correctly skips it.

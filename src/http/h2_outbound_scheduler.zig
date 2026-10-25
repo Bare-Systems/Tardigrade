@@ -6,6 +6,7 @@
 const std = @import("std");
 const compat = @import("zig_compat");
 const http2_frame = @import("http2_frame.zig");
+const h2_transport_metrics = @import("h2_transport_metrics.zig");
 
 pub const default_max_queued_bytes: usize = 256 * 1024;
 
@@ -55,6 +56,10 @@ pub const Scheduler = struct {
         for (self.entries.items) |entry| self.allocator.free(entry.bytes);
         if (self.active) |active| self.allocator.free(active.entry.bytes);
         self.entries.deinit(self.allocator);
+        // #951 review: a connection torn down with unflushed frames still
+        // owed the global aggregate a matching decrement, or it would
+        // retain this scheduler's last published contribution forever.
+        if (self.queued_bytes > 0) h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(self.queued_bytes)));
         self.mutex.unlock();
         if (self.wake_read >= 0) _ = std.c.close(self.wake_read);
         if (self.wake_write >= 0) _ = std.c.close(self.wake_write);
@@ -72,11 +77,10 @@ pub const Scheduler = struct {
     }
 
     /// Current total queued bytes (including the in-progress `active`
-    /// frame, if any). #863 review: a read-only snapshot for the connection
-    /// runtime's own periodic metrics publication, deliberately not a
-    /// mutation hook inside `enqueueOwnedLocked`/`cancelStream`/`flush`
-    /// themselves, to avoid touching this struct's concurrency-sensitive
-    /// hot path.
+    /// frame, if any). #951 review: `enqueueOwnedLocked`/`cancelStream`/
+    /// `flush` now publish their own deltas directly as they mutate
+    /// `queued_bytes`, so this remains a plain read-only snapshot for
+    /// callers/tests that want this one connection's own current value.
     pub fn queuedBytes(self: *Scheduler) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -152,9 +156,11 @@ pub const Scheduler = struct {
         if (owned.bytes.len > self.max_queued_bytes -| self.queued_bytes) return error.QueueFull;
         self.entries.append(self.allocator, owned) catch |err| return err;
         self.queued_bytes += owned.bytes.len;
+        h2_transport_metrics.writerQueueBytesChanged(@intCast(owned.bytes.len));
         if (!self.wake_pending.load(.acquire)) self.signalLocked() catch |err| {
             const removed = self.entries.pop().?;
             self.queued_bytes -= removed.bytes.len;
+            h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(removed.bytes.len)));
             return err;
         };
         self.wake_pending.store(true, .release);
@@ -180,6 +186,7 @@ pub const Scheduler = struct {
                 const removed = self.entries.orderedRemove(i);
                 refunded_payload_bytes += dataFramePayloadLen(removed.bytes);
                 self.queued_bytes -= removed.bytes.len;
+                h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(removed.bytes.len)));
                 self.allocator.free(removed.bytes);
                 continue;
             }
@@ -190,6 +197,7 @@ pub const Scheduler = struct {
                 refunded_payload_bytes += dataFramePayloadLen(active.entry.bytes);
                 self.active = null;
                 self.queued_bytes -= active.entry.bytes.len;
+                h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(active.entry.bytes.len)));
                 self.allocator.free(active.entry.bytes);
             }
         }
@@ -230,6 +238,7 @@ pub const Scheduler = struct {
                 const done = self.active.?.entry;
                 self.active = null;
                 self.queued_bytes -= done.bytes.len;
+                h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(done.bytes.len)));
                 self.allocator.free(done.bytes);
             }
             self.mutex.unlock();

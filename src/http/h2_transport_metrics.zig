@@ -56,25 +56,31 @@ pub fn sessionClosed(reason: SessionCloseReason) void {
     }
 }
 
-/// `delta` is the signed change in a #867 session's reserved
-/// (`HTTP2_SESSION_RESERVED_BYTES`) share of the connection memory budget --
-/// positive on attach, negative on detach.
+/// `delta` is the signed change in real bytes actually sitting in a #867
+/// session's bounded inbound/outbound queues (`Session.inbound_bytes` +
+/// `Session.outbound_bytes`), published from `h2_stream_session.zig` at
+/// every enqueue (`deliverInbound`/`write`), dequeue (`read`/
+/// `commitOutboundSent`), and settle (`settleLocked`, on reset/GOAWAY/
+/// connection-closed/shutdown) -- not a static reserved-capacity share, so
+/// an idle session reports 0 and a session queued up to its caps reports
+/// the real occupied amount.
 pub fn sessionQueuedBytesChanged(delta: i64) void {
     const new_val = session_queued_bytes.fetchAdd(delta, .monotonic) + delta;
     bumpHighWater(&session_queued_bytes_high_water, new_val);
 }
 
-/// Snapshot of `Scheduler.queued_bytes` for one connection's outbound
-/// writer queue, taken once per H2 connection-loop iteration (not on every
-/// mutation inside the scheduler itself, to avoid touching its
-/// concurrency-sensitive hot path) and published here so the process-wide
-/// high-water mark reflects real queued bytes across every live connection,
-/// even though each connection's `Scheduler` is otherwise never visible
-/// outside the connection that owns it.
-pub fn publishWriterQueueBytes(connection_queued_bytes: usize) void {
-    const val: i64 = @intCast(@min(connection_queued_bytes, std.math.maxInt(i64)));
-    _ = writer_queue_bytes.store(val, .monotonic);
-    bumpHighWater(&writer_queue_bytes_high_water, val);
+/// `delta` is the signed change in one connection's `Scheduler.queued_bytes`,
+/// published from `h2_outbound_scheduler.zig` at every real enqueue/flush/
+/// cancel mutation (and on connection teardown, for whatever a torn-down
+/// scheduler still held). Summing per-connection deltas into one aggregate
+/// -- instead of each connection's own periodic sample overwriting the
+/// last -- is what lets the process-wide value and high-water mark reflect
+/// every live connection at once, and lets a peak that is enqueued and
+/// drained within a single H2 loop iteration still register before the
+/// matching decrement.
+pub fn writerQueueBytesChanged(delta: i64) void {
+    const new_val = writer_queue_bytes.fetchAdd(delta, .monotonic) + delta;
+    bumpHighWater(&writer_queue_bytes_high_water, new_val);
 }
 
 pub fn flowControlBlocked() void {
@@ -150,14 +156,16 @@ test "sessionQueuedBytesChanged tracks current value and a monotonic high water 
     try std.testing.expectEqual(@as(u64, 150), s.session_queued_bytes_high_water);
 }
 
-test "publishWriterQueueBytes tracks current value and a monotonic high water mark" {
+test "writerQueueBytesChanged aggregates deltas across connections and tracks a monotonic high water mark" {
     resetForTesting();
-    publishWriterQueueBytes(1000);
-    publishWriterQueueBytes(200);
-    publishWriterQueueBytes(600);
+    // Two "connections" each contributing their own queue depth: the
+    // aggregate is their sum, not whichever published last (#951 review).
+    writerQueueBytesChanged(1000);
+    writerQueueBytesChanged(200);
+    writerQueueBytesChanged(-1000);
     const s = snapshot();
-    try std.testing.expectEqual(@as(u64, 600), s.writer_queue_bytes);
-    try std.testing.expectEqual(@as(u64, 1000), s.writer_queue_bytes_high_water);
+    try std.testing.expectEqual(@as(u64, 200), s.writer_queue_bytes);
+    try std.testing.expectEqual(@as(u64, 1200), s.writer_queue_bytes_high_water);
 }
 
 test "sessionClosed increments exactly the matching reason counter" {

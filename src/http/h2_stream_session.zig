@@ -29,6 +29,7 @@
 const std = @import("std");
 const compat = @import("zig_compat");
 const http2_stream = @import("http2_stream.zig");
+const h2_transport_metrics = @import("h2_transport_metrics.zig");
 
 pub const Error = error{ QueueFull, Closed, WakeFailed, InvalidCapacity } || std.mem.Allocator.Error;
 
@@ -170,6 +171,7 @@ pub const Session = struct {
         errdefer self.allocator.free(owned);
         try self.inbound.append(self.allocator, .{ .bytes = owned });
         self.inbound_bytes += owned.len;
+        h2_transport_metrics.sessionQueuedBytesChanged(@intCast(owned.len));
         self.cond.signal();
     }
 
@@ -220,12 +222,14 @@ pub const Session = struct {
         if (self.terminal != null) return;
         self.terminal = terminal;
         self.inbound_credit_to_return += self.inbound_bytes;
+        const released: i64 = @intCast(self.inbound_bytes + self.outbound_bytes);
         for (self.inbound.items) |chunk| self.allocator.free(chunk.bytes);
         self.inbound.clearAndFree(self.allocator);
         self.inbound_bytes = 0;
         for (self.outbound.items) |chunk| self.allocator.free(chunk.bytes);
         self.outbound.clearAndFree(self.allocator);
         self.outbound_bytes = 0;
+        if (released > 0) h2_transport_metrics.sessionQueuedBytesChanged(-released);
         self.cond.broadcast();
         self.signalWakeLocked() catch {
             self.wake_failed = true;
@@ -263,6 +267,8 @@ pub const Session = struct {
                 _ = self.outbound.orderedRemove(0);
             }
         }
+        const committed = n - remaining;
+        if (committed > 0) h2_transport_metrics.sessionQueuedBytesChanged(-@as(i64, @intCast(committed)));
         self.cond.broadcast();
     }
 
@@ -353,6 +359,7 @@ pub const Session = struct {
                 @memcpy(buf[0..n], avail[0..n]);
                 chunk.offset += n;
                 self.inbound_bytes -= n;
+                h2_transport_metrics.sessionQueuedBytesChanged(-@as(i64, @intCast(n)));
                 self.inbound_credit_to_return += n;
                 if (chunk.offset == chunk.bytes.len) {
                     self.allocator.free(chunk.bytes);
@@ -413,6 +420,7 @@ pub const Session = struct {
                 return err;
             };
             self.outbound_bytes += n;
+            h2_transport_metrics.sessionQueuedBytesChanged(@intCast(n));
             remaining = remaining[n..];
             self.signalWakeLocked() catch {
                 self.wake_failed = true;

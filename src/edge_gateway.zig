@@ -2477,7 +2477,22 @@ const WaitingEncryptedHttpConnection = struct {
             const n = self.inner.read(out) catch |err| switch (err) {
                 error.WouldBlock => {
                     self.observeTlsBufferMetrics();
+                    // #951 review: `waitFor` only sets `shutdown_wake_observed`
+                    // and returns normally, so without this check a silent
+                    // peer would make this loop retry `inner.read` (still
+                    // `WouldBlock`, no TLS bytes arrived) and call `waitFor`
+                    // again -- but the *second* call excludes the now-
+                    // observed shutdown fd from its poll set, so it blocks
+                    // for the full `read_timeout_ms` instead of returning
+                    // control to the H2 frame loop to notice shutdown and
+                    // install its bounded drain deadline. Catching the
+                    // false->true transition right here, once, lets the
+                    // caller (`readExact`, only at a frame boundary where
+                    // bailing cannot desync the byte stream) decide whether
+                    // it is safe to surface this instead of swallowing it.
+                    const was_wake_observed = self.shutdown_wake_observed;
                     try self.waitFor(.{ .read = true }, self.read_timeout_ms);
+                    if (!was_wake_observed and self.shutdown_wake_observed) return error.Http2ShutdownWake;
                     continue;
                 },
                 else => return err,
@@ -3197,7 +3212,10 @@ fn h2ResetStreamState(
         buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
         http.h2_transport_metrics.sessionDetached();
         http.h2_transport_metrics.sessionClosed(.detached);
-        http.h2_transport_metrics.sessionQueuedBytesChanged(-@as(i64, @intCast(HTTP2_SESSION_RESERVED_BYTES)));
+        // #951 review: `sessionQueuedBytesChanged` is now published from
+        // `h2_stream_session.zig` itself at every real enqueue/dequeue, and
+        // `deliverReset` below settles (and zeroes) any bytes still queued
+        // -- a fixed reserved-capacity decrement here would double count.
         session.deliverReset(.cancel);
         // Unread inbound bytes already charged the peer's connection-level
         // receive window (see `Session.settleLocked`). The stream itself is
@@ -3613,7 +3631,9 @@ fn h2ProcessHeaderBlock(
             try sessions.put(stream_id, session);
             buffered_request_bytes.* += HTTP2_SESSION_RESERVED_BYTES;
             http.h2_transport_metrics.sessionAttached();
-            http.h2_transport_metrics.sessionQueuedBytesChanged(@intCast(HTTP2_SESSION_RESERVED_BYTES));
+            // #951 review: a freshly attached session has no real queued
+            // bytes yet; `deliverInbound`/`write` publish `sessionQueued
+            // BytesChanged` themselves as data actually arrives/drains.
             if (end_stream) session.deliverRemoteEndStream();
             hook.attach(hook.ctx, session);
             ps.deinit(allocator);
@@ -3945,7 +3965,9 @@ fn h2SettleAllSessions(
             .connection_closed => .connection_closed,
             .shutdown => .shutdown,
         });
-        http.h2_transport_metrics.sessionQueuedBytesChanged(-@as(i64, @intCast(HTTP2_SESSION_RESERVED_BYTES)));
+        // The `deliverGoaway`/`deliverConnectionClosed`/`deliverShutdown`
+        // call above already settled (and zeroed) this session's real
+        // queued bytes; see the matching comment in `h2ResetStreamState`.
         if (session.runtimeDetach()) {
             session.deinit();
             allocator.destroy(session);
@@ -3971,7 +3993,10 @@ fn h2DetachSession(
     buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
     http.h2_transport_metrics.sessionDetached();
     http.h2_transport_metrics.sessionClosed(.detached);
-    http.h2_transport_metrics.sessionQueuedBytesChanged(-@as(i64, @intCast(HTTP2_SESSION_RESERVED_BYTES)));
+    // Every caller already settled (via `deliverReset`/etc, see the
+    // matching comment in `h2ResetStreamState`) or naturally drained both
+    // queues to 0 before reaching this detach, so there is no real queued-
+    // byte delta left to publish here.
     // Any inbound bytes that already charged the peer's connection-level
     // receive window but were never credited back -- because the session
     // settled (reset, wake failure, cancellation) before a consumer drained
@@ -4375,7 +4400,11 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     var shutdown_goaway_last_stream_id: ?u31 = null;
     var shutdown_drain_deadline_ms: ?u64 = null;
     while (!goaway_received) {
-        http.h2_transport_metrics.publishWriterQueueBytes(outbound.queuedBytes());
+        // #951 review: `outbound` (the `Scheduler`) now publishes its own
+        // `writerQueueBytesChanged` deltas directly at every real enqueue/
+        // flush/cancel mutation, so a once-per-iteration absolute sample
+        // here is no longer needed (and would have missed intra-iteration
+        // peaks and double-counted against other live connections).
         if (http.shutdown.isShutdownRequested()) {
             if (shutdown_goaway_last_stream_id == null) {
                 // Announce the boundary exactly once: streams already
@@ -4460,9 +4489,20 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
 
         h2BeginReadScope(conn);
 
-        var frame = http.http2_frame.readFrame(conn, allocator, HTTP2_MAX_FRAME_SIZE) catch |err| switch (err) {
-            error.ConnectionClosed => return,
-            else => return err,
+        var frame = http.http2_frame.readFrame(conn, allocator, HTTP2_MAX_FRAME_SIZE) catch |err| {
+            // #951 review: a shutdown wake noticed at a safe (zero-bytes-
+            // consumed) frame boundary bubbles up as this error so the top
+            // of the loop can check `isShutdownRequested`, announce GOAWAY
+            // and install the bounded drain deadline, instead of this read
+            // silently retrying for up to the full idle `read_timeout_ms`.
+            // Matched by name, not `switch (err) { error.Http2ShutdownWake
+            // => ... }`: `conn` is `anytype`, and most concrete connection
+            // types this function is instantiated with (every test fake)
+            // never produce this error, which a literal switch prong would
+            // fail to compile against for those instantiations.
+            if (std.mem.eql(u8, @errorName(err), "Http2ShutdownWake")) continue;
+            if (std.mem.eql(u8, @errorName(err), "ConnectionClosed")) return;
+            return err;
         };
         defer http.http2_frame.deinitFrame(allocator, &frame);
         const frame_transport_early = h2LastReadTransportEarly(conn);

@@ -8191,16 +8191,59 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
         try std.testing.expectEqual(session_stream, headers.stream_id);
     }
 
+    // #951 review: `h2_session_queued_bytes` now tracks real bytes sitting
+    // in a session's bounded queues (see `h2_stream_session.zig`), not a
+    // fixed `HTTP2_SESSION_RESERVED_BYTES` charge merely for being
+    // attached -- an idle just-attached session reports 0. Generate actual
+    // backpressure instead: this client never raises the connection-level
+    // flow-control window past RFC 9113's 65,535-byte default (no
+    // WINDOW_UPDATE on stream 0 so far), so echoing back more than that in
+    // one go reliably leaves the remainder genuinely queued in session_a's
+    // outbound buffer, deterministically and without depending on OS
+    // socket buffer sizes.
+    const backpressure_len: usize = 100 * 1024;
+    const backpressure_payload = try allocator.alloc(u8, backpressure_len);
+    defer allocator.free(backpressure_payload);
+    @memset(backpressure_payload, 'q');
+    {
+        var sent: usize = 0;
+        while (sent < backpressure_len) {
+            const chunk_len = @min(backpressure_len - sent, 8 * 1024);
+            try h2SendData(client, session_a, false, backpressure_payload[sent..][0..chunk_len]);
+            sent += chunk_len;
+        }
+    }
+
     const populated_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "populated");
     try samples.append(populated_sample);
-    // Real session-count/queue-byte evidence (#863 review): both sessions
-    // are genuinely attached at this point, and each one's
-    // `HTTP2_SESSION_RESERVED_BYTES` reservation is charged on attach, so
-    // this is not a process-level stand-in -- it is the exact per-session
-    // accounting the review asked for.
     try std.testing.expectEqual(@as(u64, 2), populated_sample.h2_active_sessions);
     try std.testing.expect(populated_sample.h2_session_queued_bytes > baseline_sample.h2_session_queued_bytes);
     try std.testing.expectEqual(populated_sample.h2_session_queued_bytes, populated_sample.h2_session_queued_bytes_high_water);
+
+    // Release both the connection-level *and* session_a's own stream-level
+    // window so the stalled remainder of `backpressure_payload` actually
+    // drains before this test moves on -- whichever was smaller is what
+    // actually stalled the echo, and a generous increment on both avoids
+    // needing a second round trip either way.
+    {
+        var inc: [4]u8 = undefined;
+        std.mem.writeInt(u32, inc[0..4], @intCast(backpressure_len), .big);
+        try client.writeHttp2Frame(0x8, 0, 0, inc[0..]);
+        try client.writeHttp2Frame(0x8, 0, session_a, inc[0..]);
+    }
+    var backpressure_echo = std.array_list.Managed(u8).init(allocator);
+    defer backpressure_echo.deinit();
+    while (backpressure_echo.items.len < backpressure_len) {
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            continue;
+        }
+        if (frame.typ == 0x8) continue;
+        if (frame.stream_id == session_a and frame.typ == 0x0) try backpressure_echo.appendSlice(frame.payload);
+    }
+    try std.testing.expectEqualSlices(u8, backpressure_payload, backpressure_echo.items);
 
     var session_a_echo = std.array_list.Managed(u8).init(allocator);
     defer session_a_echo.deinit();
@@ -8322,12 +8365,14 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     try samples.append(post_fault_sample);
     // RST_STREAM(cancel) on session B above detached exactly that one
     // session (through `h2DetachSession`'s `.detached` reason, #863
-    // review); session A's own reserved queue bytes are the only ones that
-    // should remain.
+    // review). Session A is still attached, but the "still-alive" wait
+    // above only returns once its echo has fully drained back to the
+    // client, so with real (not reserved-capacity) queue-byte accounting
+    // there is nothing left actually queued at this sampling point.
     try std.testing.expectEqual(@as(u64, 1), post_fault_sample.h2_active_sessions);
     try std.testing.expectEqual(@as(u64, 1), post_fault_sample.h2_session_close_detached_total);
     try std.testing.expect(post_fault_sample.h2_session_queued_bytes < populated_sample.h2_session_queued_bytes);
-    try std.testing.expect(post_fault_sample.h2_session_queued_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 0), post_fault_sample.h2_session_queued_bytes);
 
     // Second churn cycle (#863 review: prove no monotonic growth across
     // *repeated* churn, not just a single open/close pass). The per-session
@@ -8395,10 +8440,13 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     try std.testing.expectEqual(post_fault_sample.h2_active_sessions, churn2_settled.h2_active_sessions);
     try std.testing.expectEqual(post_fault_sample.h2_session_queued_bytes, churn2_settled.h2_session_queued_bytes);
     try std.testing.expectEqual(@as(u64, 3), churn2_settled.h2_session_close_detached_total);
-    // The high-water mark must reflect the actual peak (all three
-    // concurrently-live sessions during the second churn cycle: A, C, and
-    // D), not merely the current/settled value.
-    try std.testing.expect(churn2_settled.h2_session_queued_bytes_high_water > populated_sample.h2_session_queued_bytes_high_water);
+    // The high-water mark is a monotonic running peak across the whole
+    // connection (`h2_transport_metrics.bumpHighWater`), not a per-sample
+    // snapshot: this churn cycle's own session_c/session_d traffic is tiny
+    // next to `populated_sample`'s deliberate backpressure injection above,
+    // so the bound here is that the peak never goes backwards, not that
+    // this later, smaller cycle must set a new record.
+    try std.testing.expect(churn2_settled.h2_session_queued_bytes_high_water >= populated_sample.h2_session_queued_bytes_high_water);
 
     // Close session A locally and end the connection cleanly.
     try h2SendData(client, session_a, true, "");

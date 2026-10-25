@@ -48,6 +48,10 @@ pub const Scheduler = struct {
             _ = std.c.close(fds[1]);
             return error.WakeFailed;
         }
+        // #951 review: publish the configured cap so evidence/tests can
+        // assert the writer-queue high-water mark never exceeds it without
+        // hardcoding `default_max_queued_bytes` on the reading side.
+        h2_transport_metrics.setWriterQueueCapBytes(max_queued_bytes);
         return .{ .allocator = allocator, .max_queued_bytes = max_queued_bytes, .wake_read = fds[0], .wake_write = fds[1] };
     }
 

@@ -130,6 +130,13 @@ pub const Session = struct {
         }
         try setNonBlocking(fds[0]);
         try setNonBlocking(fds[1]);
+        // #951 review: register this stream's own slot in the process-wide
+        // per-stream table (`h2_transport_metrics.sessionSlotRegister`)
+        // *before* this session is reachable by any producer/consumer, so
+        // the slot always exists once bytes can actually be queued against
+        // it -- `sessionSlotUpdate`'s no-op-on-miss behavior would otherwise
+        // silently drop every update for this stream.
+        h2_transport_metrics.sessionSlotRegister(stream_id);
         return .{
             .allocator = allocator,
             .stream_id = stream_id,
@@ -140,8 +147,28 @@ pub const Session = struct {
         };
     }
 
+    /// Publish this stream's current queue occupancy into its own
+    /// per-stream slot (#951 review), called under `self.mutex` right after
+    /// every site that already updates the process-wide aggregate via
+    /// `h2_transport_metrics.sessionQueuedBytesChanged`.
+    fn publishQueueSlot(self: *const Session) void {
+        h2_transport_metrics.sessionSlotUpdate(self.stream_id, self.inbound_bytes, self.outbound_bytes);
+    }
+
     /// Only valid once both the runtime and the consumer have detached.
+    ///
+    /// #951 review: `settleLocked` already refunds the global queued-bytes
+    /// gauge and zeroes `inbound_bytes`/`outbound_bytes` on every terminal
+    /// path, but a session destroyed without ever settling (e.g. the
+    /// runtime and consumer both detach normally while bytes are still
+    /// queued) would otherwise free those chunks here without refunding
+    /// the gauge, permanently overstating it. Refund whatever is still
+    /// outstanding exactly once before freeing; this is a no-op after
+    /// `settleLocked` already zeroed both counters.
     pub fn deinit(self: *Session) void {
+        const outstanding: i64 = @intCast(self.inbound_bytes + self.outbound_bytes);
+        if (outstanding > 0) h2_transport_metrics.sessionQueuedBytesChanged(-outstanding);
+        h2_transport_metrics.sessionSlotUnregister(self.stream_id);
         for (self.inbound.items) |chunk| self.allocator.free(chunk.bytes);
         self.inbound.deinit(self.allocator);
         for (self.outbound.items) |chunk| self.allocator.free(chunk.bytes);
@@ -172,6 +199,7 @@ pub const Session = struct {
         try self.inbound.append(self.allocator, .{ .bytes = owned });
         self.inbound_bytes += owned.len;
         h2_transport_metrics.sessionQueuedBytesChanged(@intCast(owned.len));
+        self.publishQueueSlot();
         self.cond.signal();
     }
 
@@ -230,6 +258,7 @@ pub const Session = struct {
         self.outbound.clearAndFree(self.allocator);
         self.outbound_bytes = 0;
         if (released > 0) h2_transport_metrics.sessionQueuedBytesChanged(-released);
+        self.publishQueueSlot();
         self.cond.broadcast();
         self.signalWakeLocked() catch {
             self.wake_failed = true;
@@ -269,6 +298,7 @@ pub const Session = struct {
         }
         const committed = n - remaining;
         if (committed > 0) h2_transport_metrics.sessionQueuedBytesChanged(-@as(i64, @intCast(committed)));
+        self.publishQueueSlot();
         self.cond.broadcast();
     }
 
@@ -360,6 +390,7 @@ pub const Session = struct {
                 chunk.offset += n;
                 self.inbound_bytes -= n;
                 h2_transport_metrics.sessionQueuedBytesChanged(-@as(i64, @intCast(n)));
+                self.publishQueueSlot();
                 self.inbound_credit_to_return += n;
                 if (chunk.offset == chunk.bytes.len) {
                     self.allocator.free(chunk.bytes);
@@ -421,6 +452,7 @@ pub const Session = struct {
             };
             self.outbound_bytes += n;
             h2_transport_metrics.sessionQueuedBytesChanged(@intCast(n));
+            self.publishQueueSlot();
             remaining = remaining[n..];
             self.signalWakeLocked() catch {
                 self.wake_failed = true;
@@ -685,6 +717,36 @@ test "GOAWAY, connection close, and shutdown settle as closed with their own rea
         try std.testing.expectEqual(ReadResult{ .closed = case.reason }, session.read(&buf));
         try std.testing.expectEqual(WriteResult{ .closed = case.reason }, try session.write("x"));
     }
+}
+
+test "deinit refunds the global queued-bytes gauge exactly once, with or without a prior settle" {
+    const allocator = std.testing.allocator;
+
+    // No settle before deinit: `settleLocked` never zeroed the counters, so
+    // `deinit` itself must refund whatever is still queued.
+    h2_transport_metrics.resetForTesting();
+    {
+        var session = try Session.init(allocator, 1, 1024, 1024);
+        try session.deliverInbound("queued-in");
+        try std.testing.expectEqual(WriteResult.ok, try session.write("queued-out"));
+        try std.testing.expectEqual(@as(u64, "queued-in".len + "queued-out".len), h2_transport_metrics.snapshot().session_queued_bytes);
+        session.deinit();
+    }
+    try std.testing.expectEqual(@as(u64, 0), h2_transport_metrics.snapshot().session_queued_bytes);
+
+    // Settle before deinit: `settleLocked` already refunded and zeroed both
+    // counters, so `deinit`'s own refund must be a no-op, not a double
+    // refund driving the gauge negative (clamped to 0 by `snapshot`).
+    h2_transport_metrics.resetForTesting();
+    {
+        var session = try Session.init(allocator, 1, 1024, 1024);
+        try session.deliverInbound("queued-in");
+        try std.testing.expectEqual(WriteResult.ok, try session.write("queued-out"));
+        session.deliverReset(.cancel);
+        try std.testing.expectEqual(@as(u64, 0), h2_transport_metrics.snapshot().session_queued_bytes);
+        session.deinit();
+    }
+    try std.testing.expectEqual(@as(u64, 0), h2_transport_metrics.snapshot().session_queued_bytes);
 }
 
 test "consumer-requested cancellation is observed exactly once by the runtime" {

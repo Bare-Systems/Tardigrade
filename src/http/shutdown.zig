@@ -80,6 +80,17 @@ pub fn ensureShutdownNotifyPipe() void {
         }
         shutdown_notify_read = fds[0];
         shutdown_notify_write = fds[1];
+        // #951 review: `requestShutdown`/`handleSignal` only write a wake
+        // byte on the one false->true transition of `shutdown_requested`,
+        // and `notifyShutdownWaiters` no-ops whenever `shutdown_notify_write`
+        // is still -1 -- which it always is before this line runs for the
+        // very first time. If that one coalesced notification fired while
+        // this pipe did not exist yet (or while another thread was still
+        // creating it), it is otherwise lost forever: the flag is already
+        // `true`, so no later call will ever write again. Catch up here,
+        // before publishing `.ready`, by depositing a byte ourselves if
+        // shutdown was already requested by the time the fds became usable.
+        if (isShutdownRequested()) notifyShutdownWaiters();
         shutdown_notify_state.store(.ready, .release);
         return;
     }

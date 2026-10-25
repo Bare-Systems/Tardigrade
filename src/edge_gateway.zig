@@ -2418,6 +2418,17 @@ const WaitingEncryptedHttpConnection = struct {
     /// bound rather than a best-effort one that only fires if something else
     /// happens to wake the connection first.
     shutdown_drain_deadline_ms: ?u64 = null,
+    /// #951 review: `shutdown_drain_deadline_ms` above is only installed by
+    /// the owning H2 loop once it regains control at a frame boundary and
+    /// announces GOAWAY -- but a connection blocked deep inside a partially
+    /// read frame (any `readExact` call past its first byte) never returns
+    /// control there, so that loop-driven install can never happen while
+    /// the peer stays silent. Configured once at connection setup from
+    /// `cfg.shutdown_drain_timeout_ms`, this lets `waitFor` itself start the
+    /// real deadline the instant *it* first observes the shutdown signal,
+    /// independent of whether the H2 loop ever gets to run its own
+    /// GOAWAY-boundary bookkeeping again.
+    shutdown_drain_timeout_ms: u64 = 0,
     /// #863 review: `http.shutdown`'s notify pipe is deliberately level-
     /// triggered and never drained (so every connection, not just whichever
     /// one happens to read it first, observes it) -- so once this
@@ -2431,6 +2442,14 @@ const WaitingEncryptedHttpConnection = struct {
 
     pub fn setShutdownDrainDeadline(self: *WaitingEncryptedHttpConnection, deadline_ms: ?u64) void {
         self.shutdown_drain_deadline_ms = deadline_ms;
+    }
+
+    pub fn setShutdownDrainTimeoutMs(self: *WaitingEncryptedHttpConnection, timeout_ms: u64) void {
+        self.shutdown_drain_timeout_ms = timeout_ms;
+    }
+
+    pub fn shutdownDrainDeadlineMs(self: *const WaitingEncryptedHttpConnection) ?u64 {
+        return self.shutdown_drain_deadline_ms;
     }
 
     fn init(
@@ -2751,7 +2770,18 @@ const WaitingEncryptedHttpConnection = struct {
             };
             return error.WouldBlock;
         }
-        if (fds[3].fd >= 0 and fds[3].revents != 0) self.shutdown_wake_observed = true;
+        if (fds[3].fd >= 0 and fds[3].revents != 0) {
+            self.shutdown_wake_observed = true;
+            // #951 review: a connection stuck mid-frame (any `readExact`
+            // call past its first byte) never returns to the H2 loop to
+            // get its deadline installed via `setShutdownDrainDeadline`.
+            // Starting the fallback deadline here, from the moment this
+            // wait itself first notices shutdown, bounds that case too
+            // instead of leaving it on the full `read_timeout_ms`.
+            if (self.shutdown_drain_deadline_ms == null and self.shutdown_drain_timeout_ms > 0) {
+                self.shutdown_drain_deadline_ms = http.event_loop.monotonicMs() +| self.shutdown_drain_timeout_ms;
+            }
+        }
         if (fds[1].fd >= 0 and (fds[1].revents != 0 or (fds[0].revents & std.posix.POLL.OUT) != 0)) {
             const outbound = self.h2_outbound orelse return error.ConnectionClosed;
             // We are already in the poll owner. Use the non-waiting record
@@ -3123,6 +3153,35 @@ fn h2InstallShutdownDrainDeadline(conn: anytype, deadline_ms: ?u64) void {
     } else {
         if (comptime @hasDecl(T, "setShutdownDrainDeadline")) conn.setShutdownDrainDeadline(deadline_ms);
     }
+}
+
+/// Configure the connection's own fallback shutdown-drain bound (#951
+/// review) once at connection setup, independent of the H2 loop's later
+/// GOAWAY-boundary deadline install -- see `shutdown_drain_timeout_ms` on
+/// `WaitingEncryptedHttpConnection`.
+fn h2InstallShutdownDrainTimeoutMs(conn: anytype, timeout_ms: u64) void {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "setShutdownDrainTimeoutMs")) conn.setShutdownDrainTimeoutMs(timeout_ms);
+    } else {
+        if (comptime @hasDecl(T, "setShutdownDrainTimeoutMs")) conn.setShutdownDrainTimeoutMs(timeout_ms);
+    }
+}
+
+/// Read back whatever drain deadline the connection already has installed
+/// (#951 review) -- possibly self-installed by `waitFor` while this loop was
+/// still blocked inside a partially read frame -- so the GOAWAY-boundary
+/// announcement below never clobbers an earlier start time with a later one.
+fn h2ShutdownDrainDeadline(conn: anytype) ?u64 {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "shutdownDrainDeadlineMs")) return conn.shutdownDrainDeadlineMs();
+    } else {
+        if (comptime @hasDecl(T, "shutdownDrainDeadlineMs")) return conn.shutdownDrainDeadlineMs();
+    }
+    return null;
 }
 
 fn h2DownstreamHandshakeComplete(conn: anytype) bool {
@@ -4389,6 +4448,14 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     h2InstallSessionRegistry(conn, SessionDrainCtx.pollFds, SessionDrainCtx.drain, &session_drain_ctx);
     defer h2InstallSessionRegistry(conn, null, null, null);
 
+    // #951 review: configure the connection's own fallback drain bound once,
+    // up front -- not only when the loop below first notices shutdown --
+    // so a connection already blocked inside a partially read frame when
+    // shutdown fires still gets a bounded wait instead of the full
+    // `read_timeout_ms`. See `shutdown_drain_timeout_ms` on
+    // `WaitingEncryptedHttpConnection`.
+    h2InstallShutdownDrainTimeoutMs(conn, cfg.shutdown_drain_timeout_ms);
+
     // #863 graceful shutdown: the boundary this connection announced via
     // GOAWAY once a shutdown was first observed (RFC 9113 §6.8), and the
     // wall-clock deadline (from `cfg.shutdown_drain_timeout_ms`, the same
@@ -4414,10 +4481,14 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 // check below.
                 shutdown_goaway_last_stream_id = last_client_stream_id;
                 try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.no_error.value());
-                shutdown_drain_deadline_ms = if (cfg.shutdown_drain_timeout_ms > 0)
+                // #951 review: `waitFor` may already have self-installed an
+                // earlier-starting deadline while this loop was still
+                // blocked inside a partially read frame; honor that start
+                // time instead of resetting the clock to now.
+                shutdown_drain_deadline_ms = h2ShutdownDrainDeadline(conn) orelse (if (cfg.shutdown_drain_timeout_ms > 0)
                     http.event_loop.monotonicMs() +| cfg.shutdown_drain_timeout_ms
                 else
-                    null;
+                    null);
                 // A silent peer with a silent attached session may never
                 // send another frame and never fire a session wake fd, so
                 // nothing else would ever cause the blocking wait below to

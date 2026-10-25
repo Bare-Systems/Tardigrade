@@ -311,7 +311,14 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
         hook_ctx.deinit();
         state_allocator.destroy(hook_ctx);
     };
-    if (h2TestSessionHookRequested()) {
+    // PR review (#863): loopback-only peer admission (`h2TestSessionHookPeerIsLoopback`)
+    // is not an authorization boundary by itself -- any local process on a
+    // shipping binary that happens to have this env var set or inherited
+    // could still attach. Gating the whole wiring behind `-Dh2-test-hook`
+    // (default off) keeps it out of the compiled binary entirely for every
+    // default/release build, the same comptime-flag convention
+    // `build_options.acme_experimental` already uses elsewhere in this file.
+    if (build_options.h2_test_hook_enabled and h2TestSessionHookRequested()) {
         const hook_ctx = try state_allocator.create(ChurnSessionHookCtx);
         hook_ctx.* = ChurnSessionHookCtx.init(state_allocator, H2_TEST_ONLY_SESSION_PATH);
         state.h2_session_test_hook = .{
@@ -2411,6 +2418,16 @@ const WaitingEncryptedHttpConnection = struct {
     /// bound rather than a best-effort one that only fires if something else
     /// happens to wake the connection first.
     shutdown_drain_deadline_ms: ?u64 = null,
+    /// #863 review: `http.shutdown`'s notify pipe is deliberately level-
+    /// triggered and never drained (so every connection, not just whichever
+    /// one happens to read it first, observes it) -- so once this
+    /// connection's own `waitFor` has used it to escape one otherwise-
+    /// unbounded wait, it must stop polling that fd on every subsequent
+    /// call. Otherwise each call would see the same still-unread byte and
+    /// return immediately forever, turning every later bounded wait (which
+    /// already enforces `shutdown_drain_deadline_ms` correctly on its own)
+    /// into a busy spin instead of a real sleep.
+    shutdown_wake_observed: bool = false,
 
     pub fn setShutdownDrainDeadline(self: *WaitingEncryptedHttpConnection, deadline_ms: ?u64) void {
         self.shutdown_drain_deadline_ms = deadline_ms;
@@ -2662,15 +2679,25 @@ const WaitingEncryptedHttpConnection = struct {
         // flush (#865); slot 2 wakes it when a worker's request-job
         // completion is ready to apply (#866). Both stay `-1` (ignored by
         // `poll`) when their producer is not installed on this connection.
-        // Slots 3.. are one per attached #867 session, so any of them --
-        // not just the one TLS socket -- can wake this one blocking wait;
-        // unused slots also stay `-1`.
-        var fds: [3 + HTTP2_MAX_CONCURRENT_STREAMS]std.posix.pollfd = undefined;
+        // Slot 3 (#863) wakes this wait the instant `http.shutdown
+        // .requestShutdown` fires anywhere in the process, even if this
+        // connection has not yet installed its own drain deadline (that
+        // deadline bounds how long an *already-noticed* shutdown may keep
+        // draining, not how long this wait can stay blocked before
+        // noticing one in the first place). Slots 4.. are one per attached
+        // #867 session, so any of them -- not just the one TLS socket --
+        // can wake this one blocking wait; unused slots also stay `-1`.
+        var fds: [4 + HTTP2_MAX_CONCURRENT_STREAMS]std.posix.pollfd = undefined;
         fds[0] = .{ .fd = self.inner.rawFd(), .events = events, .revents = 0 };
         fds[1] = .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 };
         fds[2] = .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 };
         if (self.h2_outbound) |outbound| fds[1].fd = outbound.wakeFd();
         if (self.h2_request_handoff) |handoff| fds[2].fd = handoff.wakeFd();
+        fds[3] = .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 };
+        if (!self.shutdown_wake_observed) {
+            http.shutdown.ensureShutdownNotifyPipe();
+            fds[3].fd = http.shutdown.shutdownNotifyReadFd();
+        }
 
         var session_fd_buf: [HTTP2_MAX_CONCURRENT_STREAMS]std.posix.fd_t = undefined;
         var session_fd_count: usize = 0;
@@ -2678,9 +2705,9 @@ const WaitingEncryptedHttpConnection = struct {
             const ctx = self.h2_session_ctx orelse return error.ConnectionClosed;
             const session_fds = get_fds(ctx, &session_fd_buf);
             session_fd_count = session_fds.len;
-            for (session_fds, 0..) |fd, i| fds[3 + i] = .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
+            for (session_fds, 0..) |fd, i| fds[4 + i] = .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
         }
-        for (session_fd_count..HTTP2_MAX_CONCURRENT_STREAMS) |i| fds[3 + i] = .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 };
+        for (session_fd_count..HTTP2_MAX_CONCURRENT_STREAMS) |i| fds[4 + i] = .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 };
 
         var bounded_ms: i32 = if (timeout_ms == 0)
             30_000
@@ -2709,6 +2736,7 @@ const WaitingEncryptedHttpConnection = struct {
             };
             return error.WouldBlock;
         }
+        if (fds[3].fd >= 0 and fds[3].revents != 0) self.shutdown_wake_observed = true;
         if (fds[1].fd >= 0 and (fds[1].revents != 0 or (fds[0].revents & std.posix.POLL.OUT) != 0)) {
             const outbound = self.h2_outbound orelse return error.ConnectionClosed;
             // We are already in the poll owner. Use the non-waiting record
@@ -2722,7 +2750,7 @@ const WaitingEncryptedHttpConnection = struct {
             const drain_ctx = self.h2_completion_drain_ctx orelse return error.ConnectionClosed;
             try drain_fn(drain_ctx);
         }
-        for (fds[3 .. 3 + session_fd_count]) |pfd| {
+        for (fds[4 .. 4 + session_fd_count]) |pfd| {
             if (pfd.revents != 0) {
                 const drain_fn = self.h2_session_drain_fn orelse return error.ConnectionClosed;
                 const ctx = self.h2_session_ctx orelse return error.ConnectionClosed;
@@ -3167,6 +3195,9 @@ fn h2ResetStreamState(
     if (sessions.fetchRemove(stream_id)) |removed| {
         const session = removed.value;
         buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
+        http.h2_transport_metrics.sessionDetached();
+        http.h2_transport_metrics.sessionClosed(.detached);
+        http.h2_transport_metrics.sessionQueuedBytesChanged(-@as(i64, @intCast(HTTP2_SESSION_RESERVED_BYTES)));
         session.deliverReset(.cancel);
         // Unread inbound bytes already charged the peer's connection-level
         // receive window (see `Session.settleLocked`). The stream itself is
@@ -3581,6 +3612,8 @@ fn h2ProcessHeaderBlock(
             try h2WriteSessionResponseHeaders(writer, allocator, stream_id);
             try sessions.put(stream_id, session);
             buffered_request_bytes.* += HTTP2_SESSION_RESERVED_BYTES;
+            http.h2_transport_metrics.sessionAttached();
+            http.h2_transport_metrics.sessionQueuedBytesChanged(@intCast(HTTP2_SESSION_RESERVED_BYTES));
             if (end_stream) session.deliverRemoteEndStream();
             hook.attach(hook.ctx, session);
             ps.deinit(allocator);
@@ -3835,9 +3868,22 @@ fn flushHttp2SessionOutbound(
     const max_data_frame: usize = HTTP2_MAX_FRAME_SIZE;
     while (true) {
         const credit = @min(conn_send_window.*, stream.send_window);
-        if (credit <= 0) break;
+        if (credit <= 0) {
+            // Only a real blocked *transition* (window exhausted with
+            // outbound session bytes actually waiting to go out), not
+            // every subsequent poll of an already-known-exhausted window.
+            if (!stream.send_window_blocked and session.peekOutbound(1) != null) {
+                stream.send_window_blocked = true;
+                http.h2_transport_metrics.flowControlBlocked();
+            }
+            break;
+        }
         const chunk = session.peekOutbound(@min(max_data_frame, @as(usize, @intCast(credit)))) orelse break;
         if (chunk.len == 0) break;
+        if (stream.send_window_blocked) {
+            stream.send_window_blocked = false;
+            http.h2_transport_metrics.flowControlResumed();
+        }
         const n = chunk.len;
         try h2WriteDataFrame(conn, outbound, writer, 0, stream_id, chunk);
         session.commitOutboundSent(n);
@@ -3893,6 +3939,13 @@ fn h2SettleAllSessions(
             .connection_closed => session.deliverConnectionClosed(),
             .shutdown => session.deliverShutdown(),
         }
+        http.h2_transport_metrics.sessionDetached();
+        http.h2_transport_metrics.sessionClosed(switch (reason) {
+            .goaway => .goaway,
+            .connection_closed => .connection_closed,
+            .shutdown => .shutdown,
+        });
+        http.h2_transport_metrics.sessionQueuedBytesChanged(-@as(i64, @intCast(HTTP2_SESSION_RESERVED_BYTES)));
         if (session.runtimeDetach()) {
             session.deinit();
             allocator.destroy(session);
@@ -3916,6 +3969,9 @@ fn h2DetachSession(
     const removed = sessions.fetchRemove(stream_id) orelse return;
     const session = removed.value;
     buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
+    http.h2_transport_metrics.sessionDetached();
+    http.h2_transport_metrics.sessionClosed(.detached);
+    http.h2_transport_metrics.sessionQueuedBytesChanged(-@as(i64, @intCast(HTTP2_SESSION_RESERVED_BYTES)));
     // Any inbound bytes that already charged the peer's connection-level
     // receive window but were never credited back -- because the session
     // settled (reset, wake failure, cancellation) before a consumer drained
@@ -4319,6 +4375,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     var shutdown_goaway_last_stream_id: ?u31 = null;
     var shutdown_drain_deadline_ms: ?u64 = null;
     while (!goaway_received) {
+        http.h2_transport_metrics.publishWriterQueueBytes(outbound.queuedBytes());
         if (http.shutdown.isShutdownRequested()) {
             if (shutdown_goaway_last_stream_id == null) {
                 // Announce the boundary exactly once: streams already
@@ -5536,6 +5593,30 @@ fn executeHttp2ProxyRoute(
         if (ctx.scopes) |v| allocator.free(v);
     }
     try ghandlers.primeRequestAuthContext(allocator, route_cfg, state, &ctx, &request.headers);
+
+    // #863 review: the metrics endpoint is a top-level route decision in
+    // `ghandlers.resolveRoute` (checked before any location-block
+    // auth/forward_auth/policy gate), but this H2 path went straight to
+    // `http.location_router.matchLocation` without ever checking
+    // `route_cfg.metrics_path` -- so `/status/metrics` over H2 always fell
+    // through to this function's generic 404 default, never actually
+    // serving real Prometheus text. Mirror `ghandlers.handleMetricsRoute`'s
+    // auth gate and ordering here, before any location-based checks below.
+    if (route_cfg.metrics_path.len > 0 and std.mem.eql(u8, request.uri.path, route_cfg.metrics_path)) {
+        if (route_cfg.metrics_require_auth and !ctx.authenticated and ctx.identity == null) {
+            return .{ .local_rejection = .{
+                .status_code = @intFromEnum(http.Status.unauthorized),
+                .code = "unauthorized",
+                .message = "Unauthorized",
+            } };
+        }
+        const payload = try state.metricsToPrometheus(allocator);
+        return .{ .static_response = .{
+            .body = payload,
+            .status_code = @intFromEnum(http.Status.ok),
+            .content_type = "text/plain; version=0.0.4; charset=utf-8",
+        } };
+    }
 
     if (h2EvaluateRequestPolicy(route_cfg, state, request, connection_ip, client_ip, ctx.identity)) |rejection| {
         return .{ .local_rejection = rejection };
@@ -11009,13 +11090,23 @@ const ChurnSessionHookCtx = struct {
     allocator: std.mem.Allocator,
     attach_path: []const u8,
     mutex: compat.Mutex = .{},
-    consumer_threads: std.array_list.Managed(std.Thread),
+    consumer_threads: std.array_list.Managed(ConsumerHandle),
+
+    /// `done` is heap-allocated (not embedded by value in the list entry)
+    /// because `std.array_list.Managed` may move entries on growth, and
+    /// `runEchoConsumer` holds a pointer to it for the lifetime of the
+    /// thread.
+    const ConsumerHandle = struct {
+        thread: std.Thread,
+        done: *std.atomic.Value(bool),
+    };
 
     fn init(allocator: std.mem.Allocator, attach_path: []const u8) ChurnSessionHookCtx {
-        return .{ .allocator = allocator, .attach_path = attach_path, .consumer_threads = std.array_list.Managed(std.Thread).init(allocator) };
+        return .{ .allocator = allocator, .attach_path = attach_path, .consumer_threads = std.array_list.Managed(ConsumerHandle).init(allocator) };
     }
 
     fn deinit(self: *ChurnSessionHookCtx) void {
+        for (self.consumer_threads.items) |h| self.allocator.destroy(h.done);
         self.consumer_threads.deinit();
     }
 
@@ -11023,7 +11114,10 @@ const ChurnSessionHookCtx = struct {
     /// `errdefer` call and the normal trailing call never join the same
     /// handle twice, which is undefined behavior.
     fn joinAll(self: *ChurnSessionHookCtx) void {
-        for (self.consumer_threads.items) |t| t.join();
+        for (self.consumer_threads.items) |h| {
+            h.thread.join();
+            self.allocator.destroy(h.done);
+        }
         self.consumer_threads.clearRetainingCapacity();
     }
 
@@ -11035,13 +11129,38 @@ const ChurnSessionHookCtx = struct {
 
     fn attach(raw: ?*anyopaque, session: *http.h2_stream_session.Session) void {
         const self: *ChurnSessionHookCtx = @ptrCast(@alignCast(raw.?));
-        const t = std.Thread.spawn(.{}, runEchoConsumer, .{ self, session }) catch @panic("consumer spawn failed");
+        const done = self.allocator.create(std.atomic.Value(bool)) catch @panic("consumer done-flag alloc failed");
+        done.* = std.atomic.Value(bool).init(false);
+        const t = std.Thread.spawn(.{}, runEchoConsumer, .{ self, session, done }) catch @panic("consumer spawn failed");
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.consumer_threads.append(t) catch @panic("consumer thread list append failed");
+        self.reapFinishedLocked();
+        self.consumer_threads.append(.{ .thread = t, .done = done }) catch @panic("consumer thread list append failed");
     }
 
-    fn runEchoConsumer(self: *ChurnSessionHookCtx, session: *http.h2_stream_session.Session) void {
+    /// PR review (#863): bounds `consumer_threads`' steady-state size during
+    /// long-running churn. Without this, every attach only ever appended --
+    /// never joined or freed -- until `run()` itself returned, so the
+    /// registry (and the retained native thread join resources behind it)
+    /// grew monotonically with the number of churned sessions rather than
+    /// with how many are concurrently live. Called with `mutex` already
+    /// held; a handle is only reaped once its consumer has actually
+    /// finished, so this never blocks on a still-live session.
+    fn reapFinishedLocked(self: *ChurnSessionHookCtx) void {
+        var i: usize = 0;
+        while (i < self.consumer_threads.items.len) {
+            const h = self.consumer_threads.items[i];
+            if (h.done.load(.acquire)) {
+                h.thread.join();
+                self.allocator.destroy(h.done);
+                _ = self.consumer_threads.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn runEchoConsumer(self: *ChurnSessionHookCtx, session: *http.h2_stream_session.Session, done: *std.atomic.Value(bool)) void {
         var buf: [4096]u8 = undefined;
         while (true) {
             switch (session.read(&buf)) {
@@ -11054,6 +11173,7 @@ const ChurnSessionHookCtx = struct {
             session.deinit();
             self.allocator.destroy(session);
         }
+        done.store(true, .release);
     }
 };
 

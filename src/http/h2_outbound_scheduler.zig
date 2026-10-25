@@ -71,6 +71,18 @@ pub const Scheduler = struct {
         return self.active != null or self.entries.items.len > 0;
     }
 
+    /// Current total queued bytes (including the in-progress `active`
+    /// frame, if any). #863 review: a read-only snapshot for the connection
+    /// runtime's own periodic metrics publication, deliberately not a
+    /// mutation hook inside `enqueueOwnedLocked`/`cancelStream`/`flush`
+    /// themselves, to avoid touching this struct's concurrency-sensitive
+    /// hot path.
+    pub fn queuedBytes(self: *Scheduler) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.queued_bytes;
+    }
+
     pub fn writer(self: *Scheduler) Writer {
         return .{ .scheduler = self };
     }

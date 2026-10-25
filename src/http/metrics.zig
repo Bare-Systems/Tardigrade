@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("zig_compat");
 const proxy_buffer_account = @import("proxy_buffer_account.zig");
 const response_stream_lifecycle = @import("response_stream_lifecycle.zig");
+const h2_transport_metrics = @import("h2_transport_metrics.zig");
 const encrypted_stream = @import("tls_core").encrypted_stream;
 
 pub const TlsBufferConnectionMetrics = struct {
@@ -1573,6 +1574,7 @@ pub const Metrics = struct {
         try self.appendWebSocketPrometheus(&out);
         try self.appendResponseStreamPrometheus(&out);
         try self.appendEarlyDataReplayPrometheus(&out);
+        try self.appendH2TransportPrometheus(&out);
 
         try out.print(
             \\# HELP tardigrade_proxy_client_aborts_total Total proxied transfers aborted by downstream clients
@@ -2216,6 +2218,59 @@ pub const Metrics = struct {
         inline for (comptime std.enums.values(response_stream_lifecycle.CloseReason)) |reason| {
             try out.print("tardigrade_response_stream_closes_total{{reason=\"{s}\"}} {d}\n", .{ @tagName(reason), self.response_stream_closes_total[@intFromEnum(reason)] });
         }
+    }
+
+    /// #863 review: the #867 H2 session lifecycle/queue/flow-control
+    /// counters `h2_transport_metrics.zig` tracks, not anything stored on
+    /// `Metrics` itself -- that module's free-standing globals are the
+    /// process-wide source of truth, reachable from call sites that never
+    /// see this struct. `self` is unused, kept only so this method matches
+    /// every sibling `append*Prometheus` helper's calling convention.
+    fn appendH2TransportPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        _ = self;
+        const s = h2_transport_metrics.snapshot();
+        try out.print(
+            \\# HELP tardigrade_h2_active_sessions Current #867 persistent H2 sessions attached across every connection
+            \\# TYPE tardigrade_h2_active_sessions gauge
+            \\tardigrade_h2_active_sessions {d}
+            \\# HELP tardigrade_h2_session_queued_bytes Current reserved queue bytes across every attached #867 H2 session
+            \\# TYPE tardigrade_h2_session_queued_bytes gauge
+            \\tardigrade_h2_session_queued_bytes {d}
+            \\# HELP tardigrade_h2_session_queued_bytes_high_water Highest tardigrade_h2_session_queued_bytes observed since process start
+            \\# TYPE tardigrade_h2_session_queued_bytes_high_water gauge
+            \\tardigrade_h2_session_queued_bytes_high_water {d}
+            \\# HELP tardigrade_h2_writer_queue_bytes Current queued bytes in one connection's outbound H2 writer queue, last sampled across every connection
+            \\# TYPE tardigrade_h2_writer_queue_bytes gauge
+            \\tardigrade_h2_writer_queue_bytes {d}
+            \\# HELP tardigrade_h2_writer_queue_bytes_high_water Highest tardigrade_h2_writer_queue_bytes observed since process start
+            \\# TYPE tardigrade_h2_writer_queue_bytes_high_water gauge
+            \\tardigrade_h2_writer_queue_bytes_high_water {d}
+            \\# HELP tardigrade_h2_flow_control_blocked_total Total #867 session send-window-exhausted transitions
+            \\# TYPE tardigrade_h2_flow_control_blocked_total counter
+            \\tardigrade_h2_flow_control_blocked_total {d}
+            \\# HELP tardigrade_h2_flow_control_resumed_total Total #867 session send-window-replenished transitions
+            \\# TYPE tardigrade_h2_flow_control_resumed_total counter
+            \\tardigrade_h2_flow_control_resumed_total {d}
+            \\# HELP tardigrade_h2_session_close_total Total #867 session closes, by reason
+            \\# TYPE tardigrade_h2_session_close_total counter
+            \\tardigrade_h2_session_close_total{{reason="goaway"}} {d}
+            \\tardigrade_h2_session_close_total{{reason="connection_closed"}} {d}
+            \\tardigrade_h2_session_close_total{{reason="shutdown"}} {d}
+            \\tardigrade_h2_session_close_total{{reason="detached"}} {d}
+            \\
+        , .{
+            s.active_sessions,
+            s.session_queued_bytes,
+            s.session_queued_bytes_high_water,
+            s.writer_queue_bytes,
+            s.writer_queue_bytes_high_water,
+            s.flow_control_blocked_total,
+            s.flow_control_resumed_total,
+            s.session_close_goaway_total,
+            s.session_close_connection_closed_total,
+            s.session_close_shutdown_total,
+            s.session_close_detached_total,
+        });
     }
 
     fn appendForwardAuthPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {

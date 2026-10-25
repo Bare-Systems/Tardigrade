@@ -111,6 +111,19 @@ pub fn build(b: *std.Build) void {
         "Enable native ACME implementation slices (account bootstrap, #832) before they are supported; never for release builds",
     ) orelse false;
     build_options.addOption(bool, "acme_experimental", acme_experimental);
+    // #863 review: the real-process H2 session test hook (`run()`'s
+    // `h2_session_test_hook` wiring in `edge_gateway.zig`) is reachable by
+    // any *local* process on a shipping binary that happens to have
+    // `TARDIGRADE_TEST_H2_SESSION_HOOK=1` set or inherited, bypassing
+    // ordinary route/auth dispatch. Compiling that wiring out entirely
+    // unless this flag is set keeps it out of every default/release build;
+    // it is never set for release artifacts.
+    const h2_test_hook = b.option(
+        bool,
+        "h2-test-hook",
+        "Compile the #863 real-process H2 session test hook into the gateway binary; test-only, never for release builds",
+    ) orelse false;
+    build_options.addOption(bool, "h2_test_hook_enabled", h2_test_hook);
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("src/zig_compat.zig"),
         .target = target,
@@ -382,6 +395,7 @@ pub fn build(b: *std.Build) void {
     integration_options.addOption([]const u8, "h3_interop_tool_path", b.getInstallPath(.bin, "h3_interop_tool"));
 
     integration_options.addOption(bool, "acme_experimental", acme_experimental);
+    integration_options.addOption(bool, "h2_test_hook_enabled", h2_test_hook);
 
     const acme_integration_support_mod = b.createModule(.{
         .root_source_file = b.path("src/acme_integration_support.zig"),
@@ -475,18 +489,22 @@ pub fn build(b: *std.Build) void {
     // #945: the curated PR-smoke live-process subset -- startup/health,
     // proxy round-trip, request-policy/auth-denied origin side effect,
     // invalid-config/reload, auth-gated cache isolation, one native
-    // H1/H2/TLS boundary case plus bounded H1/H3 cache-collapse acceptance,
-    // and the #863 real-process H2 transport validation gate -- instead of
-    // the full `test-integration`
-    // suite on ordinary PRs (see ci.yml's `integration-test` job and
-    // docs/CI.md). Each named filter below is a stable, existing
-    // `tests/integration.zig` test name, not a new test. Unlike
-    // `test-integration-native-tls`'s combined multi-name `.filters` above,
-    // each name here gets its own #944 `count_named_exe_test_matches.zig`
-    // zero-match probe: a single multi-name probe would stay nonzero (and
-    // silently pass) as long as just one of the names below still matched
-    // something, letting a rename/removal of any other named case quietly
-    // drop out of smoke coverage instead of failing the build.
+    // H1/H2/TLS boundary case plus bounded H1/H3 cache-collapse acceptance --
+    // instead of the full `test-integration` suite on ordinary PRs (see
+    // ci.yml's `integration-test` job and docs/CI.md). Each named filter
+    // below is a stable, existing `tests/integration.zig` test name, not a
+    // new test. Unlike `test-integration-native-tls`'s combined multi-name
+    // `.filters` above, each name here gets its own #944
+    // `count_named_exe_test_matches.zig` zero-match probe: a single
+    // multi-name probe would stay nonzero (and silently pass) as long as
+    // just one of the names below still matched something, letting a
+    // rename/removal of any other named case quietly drop out of smoke
+    // coverage instead of failing the build.
+    //
+    // The #863 real-process H2 transport validation gate is deliberately
+    // NOT in this list: it requires `-Dh2-test-hook` (see
+    // `test-integration-h2-transport-smoke` below), and this shared list's
+    // binary is never built with that flag.
     const integration_smoke_filters = &[_][]const u8{
         "bearclaw edge prefix routes health without auth and enforces auth on v1 paths",
         "jwt auth rejects malformed bearer and invalid signature without proxying",
@@ -495,10 +513,6 @@ pub fn build(b: *std.Build) void {
         "forward_auth responses are never shared-cacheable over h1",
         "generic proxy response cache collapses concurrent misses to one origin fill (#934)",
         "h3interop.cache_fill_reset releases waiter and unrelated QUIC request progresses before owner (#934)",
-        // #863 review: a green `integration-test` CI job must actually show
-        // this real-process H2 transport validation gate ran, not just that
-        // the curated filter list happened not to exclude it.
-        "interop.h2.live-process transport validation: long-lived sessions, REST load, fault injection, and resource settle (#863)",
     };
     const integration_smoke_step = b.step("test-integration-smoke", "Run the curated PR-smoke live-process integration subset (#945), including deterministic H1/H3 cache-collapse acceptance; fails closed if any named case matches nothing");
     for (integration_smoke_filters) |filter_name| {
@@ -519,6 +533,43 @@ pub fn build(b: *std.Build) void {
     const run_integration_smoke_tests = b.addRunArtifact(integration_smoke_tests);
     run_integration_smoke_tests.step.dependOn(b.getInstallStep());
     integration_smoke_step.dependOn(&run_integration_smoke_tests.step);
+
+    // #863 review: the real-process H2 transport validation gate attaches
+    // through the test-only `h2_session_test_hook` wiring in
+    // `edge_gateway.zig`'s `run()`, which only exists in the built `tardi`
+    // binary when `-Dh2-test-hook` is passed (kept out of every
+    // default/release build otherwise). A dedicated step -- rather than
+    // folding this case into `integration_smoke_filters` above -- lets the
+    // build fail closed exactly like `test-integration-acme-smoke` does when
+    // its own required flag is missing, instead of the target case quietly
+    // skipping itself and reporting a false-green zero-coverage pass.
+    const integration_h2_transport_smoke_filters = &[_][]const u8{
+        "interop.h2.live-process transport validation: long-lived sessions, REST load, fault injection, and resource settle (#863)",
+    };
+    const integration_h2_transport_smoke_step = b.step("test-integration-h2-transport-smoke", "Run the #863 real-process H2 transport validation gate; requires -Dh2-test-hook and fails closed without it or if the filter matches nothing");
+    if (!h2_test_hook) {
+        const missing_h2_test_hook = b.addFail("test-integration-h2-transport-smoke requires -Dh2-test-hook; its target case skips itself (reporting success) without it, which would otherwise silently provide zero coverage");
+        integration_h2_transport_smoke_step.dependOn(&missing_h2_test_hook.step);
+    } else {
+        for (integration_h2_transport_smoke_filters) |filter_name| {
+            const probe = b.addTest(.{
+                .root_module = integration_mod,
+                .filters = &.{filter_name},
+                .test_runner = .{
+                    .path = b.path("scripts/count_named_exe_test_matches.zig"),
+                    .mode = .simple,
+                },
+            });
+            integration_h2_transport_smoke_step.dependOn(&b.addRunArtifact(probe).step);
+        }
+        const integration_h2_transport_smoke_tests = b.addTest(.{
+            .root_module = integration_mod,
+            .filters = integration_h2_transport_smoke_filters,
+        });
+        const run_integration_h2_transport_smoke_tests = b.addRunArtifact(integration_h2_transport_smoke_tests);
+        run_integration_h2_transport_smoke_tests.step.dependOn(b.getInstallStep());
+        integration_h2_transport_smoke_step.dependOn(&run_integration_h2_transport_smoke_tests.step);
+    }
 
     // #945: the focused ACME-experimental smoke case for ordinary PRs --
     // the real HTTP-01 issuance -> CA-verified native TLS listener

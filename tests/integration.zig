@@ -7961,14 +7961,21 @@ const H2TransportResourceSample = struct {
     active_connections: u64,
     worker_active_jobs: u64,
     worker_queued_jobs: u64,
+    // #863 review: real #867 session lifecycle/queue/flow-control counters
+    // (`src/http/h2_transport_metrics.zig`), not fabricated or generic
+    // process-level stand-ins. Required, not `orelse 0`: a missing series
+    // here means the evidence this field exists to prove is simply absent,
+    // which must fail the sample rather than silently read as zero.
+    h2_active_sessions: u64,
+    h2_session_queued_bytes: u64,
+    h2_session_queued_bytes_high_water: u64,
+    h2_writer_queue_bytes_high_water: u64,
+    h2_flow_control_blocked_total: u64,
+    h2_flow_control_resumed_total: u64,
+    h2_session_close_goaway_total: u64,
+    h2_session_close_detached_total: u64,
 };
 
-/// Composition boundary (stated once, PR review convention already
-/// established by `tests/http3_soak.zig`): per-H2-session Prometheus series
-/// (queued-byte high-water, flow-control blocked/resumed counts, writer
-/// queue depth) do not exist yet, so this records real process-level
-/// RSS/FD/socket evidence and the existing generic
-/// worker/connection-pool metrics, not fabricated H2-session-specific ones.
 /// Each call briefly opens its own short-lived metrics connection
 /// (`pureZigH2GetResponse`), which itself transiently touches this
 /// process's own fd/socket count by the same small, constant amount at
@@ -7990,6 +7997,14 @@ fn h2TransportResourceSample(allocator: std.mem.Allocator, pid: std.c.pid_t, por
         .active_connections = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0,
         .worker_active_jobs = prometheusMetricValue(metrics.body, "tardigrade_worker_active_jobs") orelse 0,
         .worker_queued_jobs = prometheusMetricValue(metrics.body, "tardigrade_worker_queued_jobs") orelse 0,
+        .h2_active_sessions = prometheusMetricValue(metrics.body, "tardigrade_h2_active_sessions") orelse return error.MissingH2TransportMetric,
+        .h2_session_queued_bytes = prometheusMetricValue(metrics.body, "tardigrade_h2_session_queued_bytes") orelse return error.MissingH2TransportMetric,
+        .h2_session_queued_bytes_high_water = prometheusMetricValue(metrics.body, "tardigrade_h2_session_queued_bytes_high_water") orelse return error.MissingH2TransportMetric,
+        .h2_writer_queue_bytes_high_water = prometheusMetricValue(metrics.body, "tardigrade_h2_writer_queue_bytes_high_water") orelse return error.MissingH2TransportMetric,
+        .h2_flow_control_blocked_total = prometheusMetricValue(metrics.body, "tardigrade_h2_flow_control_blocked_total") orelse return error.MissingH2TransportMetric,
+        .h2_flow_control_resumed_total = prometheusMetricValue(metrics.body, "tardigrade_h2_flow_control_resumed_total") orelse return error.MissingH2TransportMetric,
+        .h2_session_close_goaway_total = prometheusMetricValue(metrics.body, "tardigrade_h2_session_close_total{reason=\"goaway\"}") orelse return error.MissingH2TransportMetric,
+        .h2_session_close_detached_total = prometheusMetricValue(metrics.body, "tardigrade_h2_session_close_total{reason=\"detached\"}") orelse return error.MissingH2TransportMetric,
     };
 }
 
@@ -8031,6 +8046,13 @@ fn writeH2TransportValidationEvidence(
 }
 
 test "interop.h2.live-process transport validation: long-lived sessions, REST load, fault injection, and resource settle (#863)" {
+    // #863 review: the test-only `h2_session_test_hook` wiring this test
+    // depends on only exists in the spawned `tardi` binary when it was
+    // built with `-Dh2-test-hook` (kept out of every default/release
+    // build otherwise). `test-integration-h2-transport-smoke` (build.zig)
+    // fails the build closed when that flag is missing instead of relying
+    // on this skip to surface, matching the `acme_experimental` convention.
+    if (!integration_options.h2_test_hook_enabled) return error.SkipZigTest;
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
 
@@ -8078,7 +8100,14 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
 
     var samples = std.array_list.Managed(H2TransportResourceSample).init(allocator);
     defer samples.deinit();
-    try samples.append(try h2TransportResourceSample(allocator, pid, tardigrade.port, "baseline"));
+    const baseline_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "baseline");
+    try samples.append(baseline_sample);
+    // `tardigrade.spawn` starts a genuinely fresh child process (#863
+    // review: real-process, not in-process), so this process's own
+    // `h2_transport_metrics` globals have never been touched by anything
+    // before this exact point.
+    try std.testing.expectEqual(@as(u64, 0), baseline_sample.h2_active_sessions);
+    try std.testing.expectEqual(@as(u64, 0), baseline_sample.h2_session_queued_bytes);
 
     const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
     // PR review (#863): an `errdefer client.destroy()` here stays armed for
@@ -8162,7 +8191,16 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
         try std.testing.expectEqual(session_stream, headers.stream_id);
     }
 
-    try samples.append(try h2TransportResourceSample(allocator, pid, tardigrade.port, "populated"));
+    const populated_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "populated");
+    try samples.append(populated_sample);
+    // Real session-count/queue-byte evidence (#863 review): both sessions
+    // are genuinely attached at this point, and each one's
+    // `HTTP2_SESSION_RESERVED_BYTES` reservation is charged on attach, so
+    // this is not a process-level stand-in -- it is the exact per-session
+    // accounting the review asked for.
+    try std.testing.expectEqual(@as(u64, 2), populated_sample.h2_active_sessions);
+    try std.testing.expect(populated_sample.h2_session_queued_bytes > baseline_sample.h2_session_queued_bytes);
+    try std.testing.expectEqual(populated_sample.h2_session_queued_bytes, populated_sample.h2_session_queued_bytes_high_water);
 
     var session_a_echo = std.array_list.Managed(u8).init(allocator);
     defer session_a_echo.deinit();
@@ -8220,17 +8258,24 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     try std.testing.expectEqualSlices(u8, expected_a.items, session_a_echo.items);
     try std.testing.expectEqualSlices(u8, expected_b.items, session_b_echo.items);
 
+    try std.testing.expect(baseline_samples.items.len >= 50);
+    try std.testing.expect(loaded_samples.items.len >= 50);
     const baseline_p95_us = try h2TransportPercentile95(allocator, baseline_samples.items);
     const loaded_p95_us = try h2TransportPercentile95(allocator, loaded_samples.items);
-    // PR review (#863): a healthy real-process p95 commonly rounds to 0-2ms
-    // at millisecond resolution, so a 50ms floor on top of the 2x ratio let
-    // a 25x-50x regression pass silently. Microsecond samples make the
-    // floor only absorb genuine scheduling/syscall quantization noise for a
-    // real spawned process over real loopback TLS (materially more than the
-    // in-process socketpair unit test this mirrors), not a throughput
-    // allowance.
-    const floor_us: i64 = 20_000;
-    try std.testing.expect(loaded_p95_us <= @max(floor_us, baseline_p95_us * 2));
+    // PR review (#863): any fixed floor on top of the 2x ratio (50ms at
+    // millisecond resolution, still 20ms/20_000us at microsecond
+    // resolution) lets a regression many times the specified ratio pass
+    // silently whenever the baseline itself is a few milliseconds or less --
+    // exactly the common case for a real loopback TLS round trip. #863's
+    // acceptance criterion is the ratio itself, not a throughput allowance,
+    // so this enforces it directly. A zero baseline would make any ratio
+    // check meaningless (vacuously true for a zero loaded p95, impossible
+    // to satisfy otherwise), so a nonzero baseline is asserted first --
+    // monotonicNanoTimestamp's resolution is far finer than a real TLS
+    // round trip over loopback, so a genuinely healthy sample set is never
+    // zero here.
+    try std.testing.expect(baseline_p95_us > 0);
+    try std.testing.expect(loaded_p95_us <= baseline_p95_us * 2);
 
     // Fault injection: a PING round-trip (#863's "PING/SETTINGS progress"),
     // then RST_STREAM on session B while session A and ordinary siblings
@@ -8275,6 +8320,14 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
 
     const post_fault_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "post_fault");
     try samples.append(post_fault_sample);
+    // RST_STREAM(cancel) on session B above detached exactly that one
+    // session (through `h2DetachSession`'s `.detached` reason, #863
+    // review); session A's own reserved queue bytes are the only ones that
+    // should remain.
+    try std.testing.expectEqual(@as(u64, 1), post_fault_sample.h2_active_sessions);
+    try std.testing.expectEqual(@as(u64, 1), post_fault_sample.h2_session_close_detached_total);
+    try std.testing.expect(post_fault_sample.h2_session_queued_bytes < populated_sample.h2_session_queued_bytes);
+    try std.testing.expect(post_fault_sample.h2_session_queued_bytes > 0);
 
     // Second churn cycle (#863 review: prove no monotonic growth across
     // *repeated* churn, not just a single open/close pass). The per-session
@@ -8324,11 +8377,28 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     var churn2_settled: H2TransportResourceSample = undefined;
     while (true) {
         churn2_settled = try h2TransportResourceSample(allocator, pid, tardigrade.port, "churn_2_settled");
-        if (churn2_settled.open_fds <= post_fault_sample.open_fds and churn2_settled.sockets <= post_fault_sample.sockets) break;
+        if (churn2_settled.open_fds <= post_fault_sample.open_fds and
+            churn2_settled.sockets <= post_fault_sample.sockets and
+            // #863 review: "no monotonic growth across *repeated* churn" --
+            // session_c/session_d's own attach/close pass must settle back
+            // to exactly session A's reserved bytes, not stay elevated by
+            // (or grow past) their own now-detached share.
+            churn2_settled.h2_active_sessions <= post_fault_sample.h2_active_sessions and
+            churn2_settled.h2_session_queued_bytes <= post_fault_sample.h2_session_queued_bytes)
+        {
+            break;
+        }
         if (compat.milliTimestamp() > churn2_settle_deadline) return error.ConnectionDidNotSettle;
         compat.sleepNs(50 * std.time.ns_per_ms);
     }
     try samples.append(churn2_settled);
+    try std.testing.expectEqual(post_fault_sample.h2_active_sessions, churn2_settled.h2_active_sessions);
+    try std.testing.expectEqual(post_fault_sample.h2_session_queued_bytes, churn2_settled.h2_session_queued_bytes);
+    try std.testing.expectEqual(@as(u64, 3), churn2_settled.h2_session_close_detached_total);
+    // The high-water mark must reflect the actual peak (all three
+    // concurrently-live sessions during the second churn cycle: A, C, and
+    // D), not merely the current/settled value.
+    try std.testing.expect(churn2_settled.h2_session_queued_bytes_high_water > populated_sample.h2_session_queued_bytes_high_water);
 
     // Close session A locally and end the connection cleanly.
     try h2SendData(client, session_a, true, "");
@@ -8351,7 +8421,18 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     var settled_sample: H2TransportResourceSample = undefined;
     while (true) {
         settled_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "settled");
-        if (settled_sample.open_fds <= baseline_open_fds and settled_sample.sockets <= baseline_sockets) break;
+        if (settled_sample.open_fds <= baseline_open_fds and
+            settled_sample.sockets <= baseline_sockets and
+            // The connection's own GOAWAY teardown (`h2SettleAllSessions`)
+            // must actually detach session A's reserved bytes too, not
+            // just the socket/fd accounting -- #863's idle-baseline settle
+            // applied to the real per-session queue, not only generic
+            // process-level signals.
+            settled_sample.h2_active_sessions == 0 and
+            settled_sample.h2_session_queued_bytes == 0)
+        {
+            break;
+        }
         if (compat.milliTimestamp() > settle_deadline) return error.ConnectionDidNotSettle;
         compat.sleepNs(50 * std.time.ns_per_ms);
     }
@@ -8359,6 +8440,11 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     try std.testing.expect(settled_sample.rss_kb <= samples.items[1].rss_kb + 16 * 1024);
     try std.testing.expect(settled_sample.open_fds <= samples.items[0].open_fds + 4);
     try std.testing.expect(settled_sample.sockets <= samples.items[0].sockets + 2);
+    // Session A's final close reason: the client's own GOAWAY (not a reset
+    // or a server shutdown) ends this connection, so `h2SettleAllSessions`
+    // must have tagged it `.goaway`, not silently folded into `.detached`.
+    try std.testing.expectEqual(@as(u64, 1), settled_sample.h2_session_close_goaway_total);
+    try std.testing.expectEqual(@as(u64, 3), settled_sample.h2_session_close_detached_total);
 
     try writeH2TransportValidationEvidence(allocator, baseline_p95_us, loaded_p95_us, samples.items);
 }

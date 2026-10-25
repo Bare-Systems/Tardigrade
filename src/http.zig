@@ -40,6 +40,7 @@ pub const compression = @import("http/compression.zig");
 pub const early_data = @import("http/early_data.zig");
 pub const metrics = @import("http/metrics.zig");
 pub const shutdown = @import("http/shutdown.zig");
+pub const h2_transport_metrics = @import("http/h2_transport_metrics.zig");
 pub const health_checker = @import("http/health_checker.zig");
 pub const circuit_breaker = @import("http/circuit_breaker.zig");
 pub const access_log = @import("http/access_log.zig");

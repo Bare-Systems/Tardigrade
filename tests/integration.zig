@@ -7980,6 +7980,11 @@ const H2TransportResourceSample = struct {
     // creation, read back so the assertion below never hardcodes a value
     // that could silently drift from the real configured cap.
     h2_writer_queue_cap_bytes: u64,
+    // #951 second review: a real per-H2-connection count (one writer-queue
+    // slot per live connection), not the generic `tardigrade_active_
+    // connections` gauge this same suite already found reading 0 even
+    // with a live H2 connection serving traffic.
+    h2_active_connections: u64,
 };
 
 /// #951 review: a lock-consistent, test-only snapshot of one currently-
@@ -7988,6 +7993,11 @@ const H2TransportResourceSample = struct {
 /// responsible for it or bound an individual stream against its own cap.
 /// `null` means this stream id has no currently-registered slot, which is
 /// also the expected (not error) state once a session has fully detached.
+/// #951 second review: the metric now also carries a `connection_id` label
+/// (each session is only ever uniquely identified by the pair, since a
+/// stream id is only unique within one connection); this test opens a
+/// single H2 connection for its whole run, so matching on `stream_id`
+/// alone is still unambiguous here.
 fn h2SessionQueuedBytesByStream(allocator: std.mem.Allocator, port: u16, stream_id: u31) !?u64 {
     var metrics = try pureZigH2GetResponse(allocator, port, &.{
         .{ .name = ":method", .value = "GET" },
@@ -7996,9 +8006,104 @@ fn h2SessionQueuedBytesByStream(allocator: std.mem.Allocator, port: u16, stream_
         .{ .name = ":authority", .value = "tardigrade.test" },
     });
     defer metrics.deinit(allocator);
-    const name = try std.fmt.allocPrint(allocator, "tardigrade_h2_session_queued_bytes_by_stream{{stream_id=\"{d}\"}}", .{stream_id});
-    defer allocator.free(name);
-    return prometheusMetricValue(metrics.body, name);
+    const label = try std.fmt.allocPrint(allocator, "stream_id=\"{d}\"", .{stream_id});
+    defer allocator.free(label);
+    return prometheusMetricValueWithLabel(metrics.body, "tardigrade_h2_session_queued_bytes_by_stream{", label);
+}
+
+/// #951 second review: `h2SessionQueuedBytesByStream` above bounds the
+/// combined inbound+outbound occupancy, but inbound and outbound each have
+/// their own independent cap (`HTTP2_SESSION_MAX_INBOUND_BYTES` vs
+/// `_MAX_OUTBOUND_BYTES`) -- a session can legitimately hold up to *both*
+/// caps at once without violating either, which the combined figure alone
+/// cannot distinguish from a single-direction cap violation.
+fn h2SessionOutboundBytesByStream(allocator: std.mem.Allocator, port: u16, stream_id: u31) !?u64 {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    const label = try std.fmt.allocPrint(allocator, "stream_id=\"{d}\"", .{stream_id});
+    defer allocator.free(label);
+    return prometheusMetricValueWithLabel(metrics.body, "tardigrade_h2_session_outbound_bytes_by_stream{", label);
+}
+
+/// #951 second review: #863's required "per-stream peak occupancy"
+/// evidence -- the per-phase `H2TransportResourceSample` only carries the
+/// process-wide aggregate high water, which cannot show which stream set
+/// it. `null` once the stream has detached, same as the other by-stream
+/// helpers.
+fn h2SessionQueuedBytesHighWaterByStream(allocator: std.mem.Allocator, port: u16, stream_id: u31) !?u64 {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    const label = try std.fmt.allocPrint(allocator, "stream_id=\"{d}\"", .{stream_id});
+    defer allocator.free(label);
+    return prometheusMetricValueWithLabel(metrics.body, "tardigrade_h2_session_queued_bytes_high_water_by_stream{", label);
+}
+
+fn h2SessionInboundBytesByStream(allocator: std.mem.Allocator, port: u16, stream_id: u31) !?u64 {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    const label = try std.fmt.allocPrint(allocator, "stream_id=\"{d}\"", .{stream_id});
+    defer allocator.free(label);
+    return prometheusMetricValueWithLabel(metrics.body, "tardigrade_h2_session_inbound_bytes_by_stream{", label);
+}
+
+/// #951 second review: the process-wide `tardigrade_h2_writer_queue_bytes_
+/// high_water`/`_cap_bytes` gauges are not comparable to each other once
+/// more than one connection is live (the first sums every connection's
+/// queued bytes, the second is whichever connection last published its
+/// cap). This test's single H2 connection has exactly one registered
+/// writer-queue slot, so its high-water mark and cap can be read back and
+/// compared directly, both scoped to that one real `connection_id`.
+fn h2WriterQueueConnectionPeak(allocator: std.mem.Allocator, body: []const u8) !?H2TransportConnectionPeak {
+    const hw_prefix = "tardigrade_h2_writer_queue_bytes_high_water_by_connection{";
+    const cap_prefix = "tardigrade_h2_writer_queue_cap_bytes_by_connection{";
+    const id_prefix = "connection_id=\"";
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    var connection_id_label: ?[]const u8 = null;
+    var connection_id: ?u64 = null;
+    var high_water: ?u64 = null;
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, hw_prefix)) continue;
+        const brace_end = std.mem.indexOfScalar(u8, line, '}') orelse continue;
+        connection_id_label = line[hw_prefix.len..brace_end];
+        const id_start = (std.mem.indexOf(u8, connection_id_label.?, id_prefix) orelse continue) + id_prefix.len;
+        const id_end = std.mem.indexOfScalarPos(u8, connection_id_label.?, id_start, '"') orelse continue;
+        connection_id = std.fmt.parseInt(u64, connection_id_label.?[id_start..id_end], 10) catch null;
+        high_water = std.fmt.parseInt(u64, std.mem.trim(u8, line[brace_end + 1 ..], " \t"), 10) catch null;
+        break;
+    }
+    const label = connection_id_label orelse return null;
+    const id = connection_id orelse return null;
+    const hw = high_water orelse return null;
+    const cap = prometheusMetricValueWithLabel(body, cap_prefix, label) orelse return null;
+    _ = allocator;
+    return .{ .connection_id = id, .writer_queue_bytes_high_water = hw, .writer_queue_cap_bytes = cap };
+}
+
+fn h2WriterQueueConnectionPeakSample(allocator: std.mem.Allocator, port: u16) !H2TransportConnectionPeak {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    return (try h2WriterQueueConnectionPeak(allocator, metrics.body)) orelse error.MissingH2TransportMetric;
 }
 
 /// Each call briefly opens its own short-lived metrics connection
@@ -8031,14 +8136,29 @@ fn h2TransportResourceSample(allocator: std.mem.Allocator, pid: std.c.pid_t, por
         .h2_session_close_goaway_total = prometheusMetricValue(metrics.body, "tardigrade_h2_session_close_total{reason=\"goaway\"}") orelse return error.MissingH2TransportMetric,
         .h2_session_close_detached_total = prometheusMetricValue(metrics.body, "tardigrade_h2_session_close_total{reason=\"detached\"}") orelse return error.MissingH2TransportMetric,
         .h2_writer_queue_cap_bytes = prometheusMetricValue(metrics.body, "tardigrade_h2_writer_queue_cap_bytes") orelse return error.MissingH2TransportMetric,
+        .h2_active_connections = prometheusMetricValue(metrics.body, "tardigrade_h2_active_connections") orelse return error.MissingH2TransportMetric,
     };
 }
+
+const H2TransportStreamPeak = struct {
+    label: []const u8,
+    stream_id: u31,
+    queued_bytes_high_water: u64,
+};
+
+const H2TransportConnectionPeak = struct {
+    connection_id: u64,
+    writer_queue_bytes_high_water: u64,
+    writer_queue_cap_bytes: u64,
+};
 
 fn writeH2TransportValidationEvidence(
     allocator: std.mem.Allocator,
     baseline_p95_us: i64,
     loaded_p95_us: i64,
     samples: []const H2TransportResourceSample,
+    stream_peaks: []const H2TransportStreamPeak,
+    connection_peak: H2TransportConnectionPeak,
 ) !void {
     const path = compat.getEnvVarOwned(allocator, "TARDIGRADE_H2_TRANSPORT_EVIDENCE") catch return;
     defer allocator.free(path);
@@ -8046,12 +8166,15 @@ fn writeH2TransportValidationEvidence(
     defer allocator.free(source_sha);
     const runner = compat.getEnvVarOwned(allocator, "RUNNER_NAME") catch try allocator.dupe(u8, "local");
     defer allocator.free(runner);
-    // schema_version 2 (#863 review): the latency fields moved from
-    // millisecond to microsecond resolution, so an older consumer reading
-    // this file by field name alone must not silently misinterpret the
-    // units.
+    // schema_version 3 (#951 second review): adds `h2_active_connections`
+    // to every resource sample, plus top-level `stream_peaks` (per-stream
+    // uniquely-attributed peak occupancy) and `connection_peak` (this
+    // connection's own writer-queue high water bound against its own
+    // configured cap) -- #863 explicitly requires per-stream/connection
+    // peak occupancy and writer depth, which the process-wide aggregate
+    // alone cannot show.
     const json = try compat.stringifyAlloc(allocator, .{
-        .schema_version = 2,
+        .schema_version = 3,
         .issue = 863,
         .profile = "h2-transport-validation",
         .source_sha = source_sha,
@@ -8062,6 +8185,8 @@ fn writeH2TransportValidationEvidence(
         .rest_baseline_p95_us = baseline_p95_us,
         .rest_loaded_p95_us = loaded_p95_us,
         .resource_samples = samples,
+        .stream_peaks = stream_peaks,
+        .connection_peak = connection_peak,
     }, .{});
     defer allocator.free(json);
 
@@ -8245,24 +8370,56 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     try std.testing.expectEqual(@as(u64, 2), populated_sample.h2_active_sessions);
     try std.testing.expect(populated_sample.h2_session_queued_bytes > baseline_sample.h2_session_queued_bytes);
     try std.testing.expectEqual(populated_sample.h2_session_queued_bytes, populated_sample.h2_session_queued_bytes_high_water);
+    // #951 second review: a real H2 connection count -- unlike the generic
+    // `tardigrade_active_connections` gauge this same test already found
+    // reading 0 even with the live main connection open, this must see at
+    // least that connection and the transient one `h2TransportResourceSample`
+    // itself just opened to fetch `/status/metrics`.
+    try std.testing.expect(populated_sample.h2_active_connections >= 2);
 
     // #951 review: per-stream attribution, not just the aggregate -- only
     // session_a received backpressure above, so its own slot must carry
     // (not merely contribute anonymously to) the entire aggregate, while
-    // the untouched session_b's slot stays at 0. Each is also asserted
-    // against its own configured cap (`HTTP2_SESSION_MAX_OUTBOUND_BYTES` in
-    // `edge_gateway.zig`, duplicated here as a literal since that constant
-    // is not exported), not just the unrelated connection-wide writer cap.
-    const session_a_queued_bytes = (try h2SessionQueuedBytesByStream(allocator, tardigrade.port, session_a)) orelse return error.MissingH2TransportMetric;
+    // the untouched session_b's slot stays at 0.
+    //
+    // #951 second review: inbound and outbound occupancy are bounded by
+    // two different, independent caps (`HTTP2_SESSION_MAX_OUTBOUND_BYTES`
+    // vs `_MAX_INBOUND_BYTES` in `edge_gateway.zig`, duplicated here as
+    // literals since neither is exported) -- comparing their *combined*
+    // figure against only the outbound cap could silently pass a
+    // violation of either cap alone, or reject a session legitimately
+    // holding up to both caps at once. This backpressure scenario only
+    // ever stalls the outbound direction (the client never raises the
+    // connection-level receive window), so each direction is checked
+    // against its own cap separately.
+    const session_a_outbound_bytes = (try h2SessionOutboundBytesByStream(allocator, tardigrade.port, session_a)) orelse return error.MissingH2TransportMetric;
+    const session_a_inbound_bytes = (try h2SessionInboundBytesByStream(allocator, tardigrade.port, session_a)) orelse return error.MissingH2TransportMetric;
     const session_b_queued_bytes = (try h2SessionQueuedBytesByStream(allocator, tardigrade.port, session_b)) orelse return error.MissingH2TransportMetric;
-    try std.testing.expectEqual(populated_sample.h2_session_queued_bytes, session_a_queued_bytes);
+    try std.testing.expectEqual(populated_sample.h2_session_queued_bytes, session_a_outbound_bytes + session_a_inbound_bytes);
     try std.testing.expectEqual(@as(u64, 0), session_b_queued_bytes);
-    try std.testing.expect(session_a_queued_bytes > 0);
-    try std.testing.expect(session_a_queued_bytes <= 256 * 1024);
-    // #951 review: the writer-queue high-water mark must never exceed the
-    // connection's own configured cap, read back as a real metric rather
-    // than assumed.
-    try std.testing.expect(populated_sample.h2_writer_queue_bytes_high_water <= populated_sample.h2_writer_queue_cap_bytes);
+    try std.testing.expect(session_a_outbound_bytes > 0);
+    try std.testing.expect(session_a_outbound_bytes <= 256 * 1024);
+    try std.testing.expect(session_a_inbound_bytes <= 65_535);
+    // #951 second review: the process-wide aggregate high water cannot be
+    // compared against the process-wide cap gauge once more than one
+    // connection is live (the latter is just whichever connection last
+    // published its own cap) -- this is this test's one real connection's
+    // own writer-queue high water bound against *its own* configured cap,
+    // both scoped to the same `connection_id`.
+    const connection_peak_populated = try h2WriterQueueConnectionPeakSample(allocator, tardigrade.port);
+    try std.testing.expect(connection_peak_populated.writer_queue_bytes_high_water <= connection_peak_populated.writer_queue_cap_bytes);
+    try std.testing.expect(connection_peak_populated.writer_queue_bytes_high_water > 0);
+
+    // #951 second review: capture per-stream uniquely-attributed peak
+    // occupancy for the persisted evidence while both sessions are still
+    // attached (`h2SessionQueuedBytesByStream`/`_high_water` return `null`
+    // once a stream's slot has been released on detach).
+    const session_a_peak_high_water = (try h2SessionQueuedBytesHighWaterByStream(allocator, tardigrade.port, session_a)) orelse return error.MissingH2TransportMetric;
+    const session_b_peak_high_water = (try h2SessionQueuedBytesHighWaterByStream(allocator, tardigrade.port, session_b)) orelse return error.MissingH2TransportMetric;
+    const stream_peaks = [_]H2TransportStreamPeak{
+        .{ .label = "session_a", .stream_id = session_a, .queued_bytes_high_water = session_a_peak_high_water },
+        .{ .label = "session_b", .stream_id = session_b, .queued_bytes_high_water = session_b_peak_high_water },
+    };
 
     // Release both the connection-level *and* session_a's own stream-level
     // window so the stalled remainder of `backpressure_payload` actually
@@ -8561,7 +8718,18 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     try std.testing.expectEqual(@as(?u64, null), try h2SessionQueuedBytesByStream(allocator, tardigrade.port, session_a));
     try std.testing.expectEqual(@as(?u64, null), try h2SessionQueuedBytesByStream(allocator, tardigrade.port, session_b));
 
-    try writeH2TransportValidationEvidence(allocator, baseline_p95_us, loaded_p95_us, samples.items);
+    try writeH2TransportValidationEvidence(
+        allocator,
+        baseline_p95_us,
+        loaded_p95_us,
+        samples.items,
+        &stream_peaks,
+        .{
+            .connection_id = connection_peak_populated.connection_id,
+            .writer_queue_bytes_high_water = connection_peak_populated.writer_queue_bytes_high_water,
+            .writer_queue_cap_bytes = connection_peak_populated.writer_queue_cap_bytes,
+        },
+    );
 }
 
 test "interop.h2.proxy_response_respects_peer_initial_window_size" {
@@ -14734,6 +14902,25 @@ fn prometheusMetricValue(body: []const u8, name: []const u8) ?u64 {
         if (line.len == name.len) continue;
         if (line[name.len] != ' ') continue;
         return std.fmt.parseInt(u64, std.mem.trim(u8, line[name.len + 1 ..], " \t"), 10) catch null;
+    }
+    return null;
+}
+
+/// Like `prometheusMetricValue`, but matches a metric line by its name
+/// prefix (including the opening `{`) plus one required label substring
+/// found anywhere inside that line's label braces, tolerating any other
+/// labels present (#951 second review: `connection_id` joined `stream_id`
+/// on several by-stream series, so an exact full-name match is no longer
+/// possible without first knowing the connection id).
+fn prometheusMetricValueWithLabel(body: []const u8, name_prefix: []const u8, label_fragment: []const u8) ?u64 {
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, name_prefix)) continue;
+        const brace_end = std.mem.indexOfScalar(u8, line, '}') orelse continue;
+        if (std.mem.indexOf(u8, line[0..brace_end], label_fragment) == null) continue;
+        const rest = std.mem.trim(u8, line[brace_end + 1 ..], " \t");
+        return std.fmt.parseInt(u64, rest, 10) catch null;
     }
     return null;
 }

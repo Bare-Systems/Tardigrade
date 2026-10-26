@@ -119,8 +119,14 @@ pub const Session = struct {
 
     runtime_attached: bool = true,
     consumer_attached: bool = true,
+    /// #951 second review: a handle to this session's own slot, claimed
+    /// once at `init` and used directly for every later update/unregister
+    /// instead of a `stream_id`-only lookup -- two simultaneous connections
+    /// commonly both use stream id 1, and a lookup keyed on stream id alone
+    /// would route both sessions' updates to whichever slot matched first.
+    metrics_slot: ?h2_transport_metrics.SlotHandle = null,
 
-    pub fn init(allocator: std.mem.Allocator, stream_id: u31, max_inbound_bytes: usize, max_outbound_bytes: usize) Error!Session {
+    pub fn init(allocator: std.mem.Allocator, connection_id: u64, stream_id: u31, max_inbound_bytes: usize, max_outbound_bytes: usize) Error!Session {
         if (max_inbound_bytes == 0 or max_outbound_bytes == 0) return error.InvalidCapacity;
         var fds: [2]std.posix.fd_t = undefined;
         if (std.c.pipe(&fds) != 0) return error.WakeFailed;
@@ -136,7 +142,7 @@ pub const Session = struct {
         // the slot always exists once bytes can actually be queued against
         // it -- `sessionSlotUpdate`'s no-op-on-miss behavior would otherwise
         // silently drop every update for this stream.
-        h2_transport_metrics.sessionSlotRegister(stream_id);
+        const metrics_slot = h2_transport_metrics.sessionSlotRegister(connection_id, stream_id);
         return .{
             .allocator = allocator,
             .stream_id = stream_id,
@@ -144,6 +150,7 @@ pub const Session = struct {
             .max_outbound_bytes = max_outbound_bytes,
             .wake_read = fds[0],
             .wake_write = fds[1],
+            .metrics_slot = metrics_slot,
         };
     }
 
@@ -152,7 +159,7 @@ pub const Session = struct {
     /// every site that already updates the process-wide aggregate via
     /// `h2_transport_metrics.sessionQueuedBytesChanged`.
     fn publishQueueSlot(self: *const Session) void {
-        h2_transport_metrics.sessionSlotUpdate(self.stream_id, self.inbound_bytes, self.outbound_bytes);
+        h2_transport_metrics.sessionSlotUpdate(self.metrics_slot, self.inbound_bytes, self.outbound_bytes);
     }
 
     /// Only valid once both the runtime and the consumer have detached.
@@ -168,7 +175,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         const outstanding: i64 = @intCast(self.inbound_bytes + self.outbound_bytes);
         if (outstanding > 0) h2_transport_metrics.sessionQueuedBytesChanged(-outstanding);
-        h2_transport_metrics.sessionSlotUnregister(self.stream_id);
+        h2_transport_metrics.sessionSlotUnregister(self.metrics_slot);
         for (self.inbound.items) |chunk| self.allocator.free(chunk.bytes);
         self.inbound.deinit(self.allocator);
         for (self.outbound.items) |chunk| self.allocator.free(chunk.bytes);
@@ -572,7 +579,7 @@ fn destroyDetached(allocator: std.mem.Allocator, session: *Session) void {
 
 test "inbound DATA is delivered incrementally without buffering the full request" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 1024, 1024);
+    var session = try Session.init(allocator, 1, 1, 1024, 1024);
     defer session.deinit();
 
     try session.deliverInbound("first");
@@ -589,7 +596,7 @@ test "inbound DATA is delivered incrementally without buffering the full request
 
 test "inbound queue is bounded and rejects a delivery exceeding capacity" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 8, 1024);
+    var session = try Session.init(allocator, 1, 1, 8, 1024);
     defer session.deinit();
 
     try session.deliverInbound("12345678");
@@ -602,7 +609,7 @@ test "inbound queue is bounded and rejects a delivery exceeding capacity" {
 
 test "receive credit accrues only on consumption, not on queuing" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 1024, 1024);
+    var session = try Session.init(allocator, 1, 1, 1024, 1024);
     defer session.deinit();
 
     try session.deliverInbound("abcd");
@@ -616,7 +623,7 @@ test "receive credit accrues only on consumption, not on queuing" {
 
 test "remote END_STREAM only settles read after the queue drains" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 1024, 1024);
+    var session = try Session.init(allocator, 1, 1, 1024, 1024);
     defer session.deinit();
 
     try session.deliverInbound("tail");
@@ -629,7 +636,7 @@ test "remote END_STREAM only settles read after the queue drains" {
 
 test "outbound production is segmented by caller-provided max length" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 1024, 1024);
+    var session = try Session.init(allocator, 1, 1, 1024, 1024);
     defer session.deinit();
 
     try std.testing.expectEqual(WriteResult.ok, try session.write("0123456789"));
@@ -646,7 +653,7 @@ test "outbound production is segmented by caller-provided max length" {
 
 test "local END_STREAM is pending only after producer finishes and queue drains" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 1024, 1024);
+    var session = try Session.init(allocator, 1, 1, 1024, 1024);
     defer session.deinit();
 
     try std.testing.expectEqual(WriteResult.ok, try session.write("bytes"));
@@ -661,7 +668,7 @@ test "local END_STREAM is pending only after producer finishes and queue drains"
 
 test "write after finishLocal is rejected before and after markLocalEndStreamSent" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 1024, 1024);
+    var session = try Session.init(allocator, 1, 1, 1024, 1024);
     defer session.deinit();
 
     session.finishLocal();
@@ -673,13 +680,13 @@ test "write after finishLocal is rejected before and after markLocalEndStreamSen
 
 test "zero-capacity session configuration is rejected" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidCapacity, Session.init(allocator, 1, 0, 64));
-    try std.testing.expectError(error.InvalidCapacity, Session.init(allocator, 1, 64, 0));
+    try std.testing.expectError(error.InvalidCapacity, Session.init(allocator, 1, 1, 0, 64));
+    try std.testing.expectError(error.InvalidCapacity, Session.init(allocator, 1, 1, 64, 0));
 }
 
 test "an allocator failure during write propagates instead of blocking forever" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var session = try Session.init(failing.allocator(), 1, 1024, 1024);
+    var session = try Session.init(failing.allocator(), 1, 1, 1024, 1024);
     defer session.deinit();
 
     try std.testing.expectError(error.OutOfMemory, session.write("bytes"));
@@ -687,7 +694,7 @@ test "an allocator failure during write propagates instead of blocking forever" 
 
 test "RST_STREAM settles exactly once, releases queued bytes, and wakes both sides" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 1024, 1024);
+    var session = try Session.init(allocator, 1, 1, 1024, 1024);
     defer session.deinit();
 
     try session.deliverInbound("queued");
@@ -710,7 +717,7 @@ test "GOAWAY, connection close, and shutdown settle as closed with their own rea
         .{ .reason = .shutdown, .trigger = Session.deliverShutdown },
     };
     for (cases) |case| {
-        var session = try Session.init(allocator, 1, 1024, 1024);
+        var session = try Session.init(allocator, 1, 1, 1024, 1024);
         defer session.deinit();
         case.trigger(&session);
         var buf: [4]u8 = undefined;
@@ -726,7 +733,7 @@ test "deinit refunds the global queued-bytes gauge exactly once, with or without
     // `deinit` itself must refund whatever is still queued.
     h2_transport_metrics.resetForTesting();
     {
-        var session = try Session.init(allocator, 1, 1024, 1024);
+        var session = try Session.init(allocator, 1, 1, 1024, 1024);
         try session.deliverInbound("queued-in");
         try std.testing.expectEqual(WriteResult.ok, try session.write("queued-out"));
         try std.testing.expectEqual(@as(u64, "queued-in".len + "queued-out".len), h2_transport_metrics.snapshot().session_queued_bytes);
@@ -739,7 +746,7 @@ test "deinit refunds the global queued-bytes gauge exactly once, with or without
     // refund driving the gauge negative (clamped to 0 by `snapshot`).
     h2_transport_metrics.resetForTesting();
     {
-        var session = try Session.init(allocator, 1, 1024, 1024);
+        var session = try Session.init(allocator, 1, 1, 1024, 1024);
         try session.deliverInbound("queued-in");
         try std.testing.expectEqual(WriteResult.ok, try session.write("queued-out"));
         session.deliverReset(.cancel);
@@ -751,7 +758,7 @@ test "deinit refunds the global queued-bytes gauge exactly once, with or without
 
 test "consumer-requested cancellation is observed exactly once by the runtime" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 1024, 1024);
+    var session = try Session.init(allocator, 1, 1, 1024, 1024);
     defer session.deinit();
 
     try std.testing.expect(!session.takeCancelRequest());
@@ -762,7 +769,7 @@ test "consumer-requested cancellation is observed exactly once by the runtime" {
 
 test "a lost wake notification is surfaced as a sticky failure instead of dropped" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 1024, 1024);
+    var session = try Session.init(allocator, 1, 1, 1024, 1024);
     defer session.deinit();
 
     // Closing only the write end is a deterministic fault injection,
@@ -777,7 +784,7 @@ test "a lost wake notification is surfaced as a sticky failure instead of droppe
 
 test "wake notification coalesces across multiple producer signals" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 1024, 1024);
+    var session = try Session.init(allocator, 1, 1, 1024, 1024);
     defer session.deinit();
 
     try std.testing.expectEqual(WriteResult.ok, try session.write("a"));
@@ -794,7 +801,7 @@ test "wake notification coalesces across multiple producer signals" {
 
 test "a stalled consumer stops earning receive credit, bounding retained memory" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 16, 1024);
+    var session = try Session.init(allocator, 1, 1, 16, 1024);
     defer session.deinit();
 
     try session.deliverInbound("0123456789012345");
@@ -805,7 +812,7 @@ test "a stalled consumer stops earning receive credit, bounding retained memory"
 test "two-party detach frees the session only after both sides release" {
     const allocator = std.testing.allocator;
     const session = try allocator.create(Session);
-    session.* = try Session.init(allocator, 1, 64, 64);
+    session.* = try Session.init(allocator, 1, 1, 64, 64);
 
     try std.testing.expect(!session.runtimeDetach());
     try std.testing.expect(session.consumerDetach());
@@ -817,7 +824,7 @@ test "repeated attach/close churn settles resources with no leak" {
     var i: usize = 0;
     while (i < 50) : (i += 1) {
         const session = try allocator.create(Session);
-        session.* = try Session.init(allocator, @intCast(i + 1), 64, 64);
+        session.* = try Session.init(allocator, 1, @intCast(i + 1), 64, 64);
         try session.deliverInbound("x");
         try session.deliverInbound("y");
         session.deliverReset(.cancel);
@@ -830,7 +837,7 @@ test "repeated attach/close churn settles resources with no leak" {
 
 test "blocked read wakes deterministically when inbound is delivered from another thread" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 64, 64);
+    var session = try Session.init(allocator, 1, 1, 64, 64);
     defer session.deinit();
 
     const Ctx = struct {
@@ -854,7 +861,7 @@ test "blocked read wakes deterministically when inbound is delivered from anothe
 
 test "blocked write wakes deterministically when the runtime commits queued bytes" {
     const allocator = std.testing.allocator;
-    var session = try Session.init(allocator, 1, 64, 4);
+    var session = try Session.init(allocator, 1, 1, 64, 4);
     defer session.deinit();
 
     const Ctx = struct {
@@ -875,4 +882,44 @@ test "blocked write wakes deterministically when the runtime commits queued byte
     try std.testing.expectEqual(WriteResult.ok, try ctx.result);
     try std.testing.expectEqual(@as(usize, 4), session.outbound_bytes);
     session.commitOutboundSent(4);
+}
+
+test "two sessions on different connections sharing a stream id do not corrupt each other's metrics (#951 second review)" {
+    const allocator = std.testing.allocator;
+    h2_transport_metrics.resetForTesting();
+    // Two simultaneous H2 connections commonly both use stream id 1; each
+    // `Session.init` call below claims its own metrics slot scoped by a
+    // distinct `connection_id`, not by `stream_id` alone.
+    var session_a = try Session.init(allocator, 100, 1, 1024, 1024);
+    defer session_a.deinit();
+    var session_b = try Session.init(allocator, 200, 1, 1024, 1024);
+    defer session_b.deinit();
+
+    try session_a.deliverInbound("from-a");
+    try session_b.deliverInbound("from-b-longer");
+
+    var buf: [8]h2_transport_metrics.SessionSlotSnapshot = undefined;
+    const slots = h2_transport_metrics.snapshotSessionSlots(&buf);
+    try std.testing.expectEqual(@as(usize, 2), slots.len);
+    for (slots) |slot| {
+        try std.testing.expectEqual(@as(u31, 1), slot.stream_id);
+        if (slot.connection_id == 100) {
+            try std.testing.expectEqual(@as(u64, "from-a".len), slot.queued_bytes);
+        } else if (slot.connection_id == 200) {
+            try std.testing.expectEqual(@as(u64, "from-b-longer".len), slot.queued_bytes);
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // Draining session_a must not disturb session_b's independently-tracked
+    // slot, and unregistering session_a (via deinit, below) must only ever
+    // release its own slot.
+    var drain_buf: [16]u8 = undefined;
+    _ = session_a.read(&drain_buf);
+    const after_drain = h2_transport_metrics.snapshotSessionSlots(&buf);
+    try std.testing.expectEqual(@as(usize, 2), after_drain.len);
+    for (after_drain) |slot| {
+        if (slot.connection_id == 200) try std.testing.expectEqual(@as(u64, "from-b-longer".len), slot.queued_bytes);
+    }
 }

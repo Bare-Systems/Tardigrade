@@ -2228,6 +2228,9 @@ pub const Metrics = struct {
     fn appendH2TransportPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
         const s = h2_transport_metrics.snapshot();
         try out.print(
+            \\# HELP tardigrade_h2_active_connections Current live H2 connections (one writer-queue slot each), unlike tardigrade_active_connections which is not H2-specific
+            \\# TYPE tardigrade_h2_active_connections gauge
+            \\tardigrade_h2_active_connections {d}
             \\# HELP tardigrade_h2_active_sessions Current #867 persistent H2 sessions attached across every connection
             \\# TYPE tardigrade_h2_active_sessions gauge
             \\tardigrade_h2_active_sessions {d}
@@ -2258,8 +2261,15 @@ pub const Metrics = struct {
             \\tardigrade_h2_session_close_total{{reason="connection_closed"}} {d}
             \\tardigrade_h2_session_close_total{{reason="shutdown"}} {d}
             \\tardigrade_h2_session_close_total{{reason="detached"}} {d}
+            \\# HELP tardigrade_h2_session_slot_overflow_total Per-stream metric registrations dropped because MAX_TRACKED_STREAMS was already full
+            \\# TYPE tardigrade_h2_session_slot_overflow_total counter
+            \\tardigrade_h2_session_slot_overflow_total {d}
+            \\# HELP tardigrade_h2_writer_queue_slot_overflow_total Per-connection writer-queue metric registrations dropped because MAX_TRACKED_CONNECTIONS was already full
+            \\# TYPE tardigrade_h2_writer_queue_slot_overflow_total counter
+            \\tardigrade_h2_writer_queue_slot_overflow_total {d}
             \\
         , .{
+            h2_transport_metrics.activeConnectionsCount(),
             s.active_sessions,
             s.session_queued_bytes,
             s.session_queued_bytes_high_water,
@@ -2272,8 +2282,11 @@ pub const Metrics = struct {
             s.session_close_connection_closed_total,
             s.session_close_shutdown_total,
             s.session_close_detached_total,
+            s.session_slot_overflow_total,
+            s.writer_queue_slot_overflow_total,
         });
         try self.appendH2SessionSlotsPrometheus(out);
+        try self.appendH2WriterQueueSlotsPrometheus(out);
     }
 
     /// #951 review: the aggregate `tardigrade_h2_session_queued_bytes*`
@@ -2283,21 +2296,60 @@ pub const Metrics = struct {
     /// counts (`h2_transport_metrics.sessionSlotRegister`/`sessionSlotUpdate`);
     /// cardinality is naturally bounded by how many streams are actually
     /// concurrently attached process-wide, same shape as the existing
-    /// `reason=` labels above.
+    /// `reason=` labels above. #951 second review: `connection_id` is added
+    /// alongside `stream_id` -- two simultaneous connections commonly both
+    /// use the same stream id, and only the pair together identifies one
+    /// session. Inbound/outbound occupancy are also exposed separately
+    /// (not only their sum): they are bounded by two different, independent
+    /// caps (`HTTP2_SESSION_MAX_INBOUND_BYTES` vs `_MAX_OUTBOUND_BYTES`), so
+    /// a combined figure cannot be checked against either cap correctly.
     fn appendH2SessionSlotsPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
         _ = self;
         var buf: [h2_transport_metrics.MAX_TRACKED_STREAMS]h2_transport_metrics.SessionSlotSnapshot = undefined;
         const slots = h2_transport_metrics.snapshotSessionSlots(&buf);
         try out.appendSlice(
-            \\# HELP tardigrade_h2_session_queued_bytes_by_stream Current real queued bytes for one attached #867 session, by stream id
+            \\# HELP tardigrade_h2_session_queued_bytes_by_stream Current real queued bytes (inbound+outbound) for one attached #867 session, by stream id and connection id
             \\# TYPE tardigrade_h2_session_queued_bytes_by_stream gauge
             \\# HELP tardigrade_h2_session_queued_bytes_high_water_by_stream Highest tardigrade_h2_session_queued_bytes_by_stream observed for this stream id since it attached
             \\# TYPE tardigrade_h2_session_queued_bytes_high_water_by_stream gauge
+            \\# HELP tardigrade_h2_session_inbound_bytes_by_stream Current real inbound-queue bytes for one attached #867 session, by stream id and connection id. Bounded by HTTP2_SESSION_MAX_INBOUND_BYTES
+            \\# TYPE tardigrade_h2_session_inbound_bytes_by_stream gauge
+            \\# HELP tardigrade_h2_session_outbound_bytes_by_stream Current real outbound-queue bytes for one attached #867 session, by stream id and connection id. Bounded by HTTP2_SESSION_MAX_OUTBOUND_BYTES
+            \\# TYPE tardigrade_h2_session_outbound_bytes_by_stream gauge
             \\
         );
         for (slots) |slot| {
-            try out.print("tardigrade_h2_session_queued_bytes_by_stream{{stream_id=\"{d}\"}} {d}\n", .{ slot.stream_id, slot.queued_bytes });
-            try out.print("tardigrade_h2_session_queued_bytes_high_water_by_stream{{stream_id=\"{d}\"}} {d}\n", .{ slot.stream_id, slot.queued_bytes_high_water });
+            try out.print("tardigrade_h2_session_queued_bytes_by_stream{{stream_id=\"{d}\",connection_id=\"{d}\"}} {d}\n", .{ slot.stream_id, slot.connection_id, slot.queued_bytes });
+            try out.print("tardigrade_h2_session_queued_bytes_high_water_by_stream{{stream_id=\"{d}\",connection_id=\"{d}\"}} {d}\n", .{ slot.stream_id, slot.connection_id, slot.queued_bytes_high_water });
+            try out.print("tardigrade_h2_session_inbound_bytes_by_stream{{stream_id=\"{d}\",connection_id=\"{d}\"}} {d}\n", .{ slot.stream_id, slot.connection_id, slot.inbound_bytes });
+            try out.print("tardigrade_h2_session_outbound_bytes_by_stream{{stream_id=\"{d}\",connection_id=\"{d}\"}} {d}\n", .{ slot.stream_id, slot.connection_id, slot.outbound_bytes });
+        }
+    }
+
+    /// #951 second review: per-connection counterpart to the process-wide
+    /// `tardigrade_h2_writer_queue_bytes_high_water`/`_cap_bytes` gauges --
+    /// those cannot be compared to each other once more than one connection
+    /// is live (the first is a sum across every connection, the second is
+    /// whichever connection last published). Each live connection's own
+    /// queued bytes/high water/cap are exposed here so they can be bounded
+    /// against each other correctly, scoped to the same `connection_id`.
+    fn appendH2WriterQueueSlotsPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        _ = self;
+        var buf: [h2_transport_metrics.MAX_TRACKED_CONNECTIONS]h2_transport_metrics.WriterQueueSlotSnapshot = undefined;
+        const slots = h2_transport_metrics.snapshotWriterQueueSlots(&buf);
+        try out.appendSlice(
+            \\# HELP tardigrade_h2_writer_queue_bytes_by_connection Current queued bytes in this connection's own outbound H2 writer queue
+            \\# TYPE tardigrade_h2_writer_queue_bytes_by_connection gauge
+            \\# HELP tardigrade_h2_writer_queue_bytes_high_water_by_connection Highest tardigrade_h2_writer_queue_bytes_by_connection observed for this connection since it was accepted
+            \\# TYPE tardigrade_h2_writer_queue_bytes_high_water_by_connection gauge
+            \\# HELP tardigrade_h2_writer_queue_cap_bytes_by_connection This connection's own configured writer-queue byte cap (Scheduler.max_queued_bytes)
+            \\# TYPE tardigrade_h2_writer_queue_cap_bytes_by_connection gauge
+            \\
+        );
+        for (slots) |slot| {
+            try out.print("tardigrade_h2_writer_queue_bytes_by_connection{{connection_id=\"{d}\"}} {d}\n", .{ slot.connection_id, slot.queued_bytes });
+            try out.print("tardigrade_h2_writer_queue_bytes_high_water_by_connection{{connection_id=\"{d}\"}} {d}\n", .{ slot.connection_id, slot.queued_bytes_high_water });
+            try out.print("tardigrade_h2_writer_queue_cap_bytes_by_connection{{connection_id=\"{d}\"}} {d}\n", .{ slot.connection_id, slot.cap_bytes });
         }
     }
 

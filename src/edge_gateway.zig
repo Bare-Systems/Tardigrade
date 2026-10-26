@@ -2772,13 +2772,23 @@ const WaitingEncryptedHttpConnection = struct {
         }
         if (fds[3].fd >= 0 and fds[3].revents != 0) {
             self.shutdown_wake_observed = true;
+            // #951 second review: a configured drain timeout of exactly
+            // zero means shutdown must not wait at all for this connection
+            // to reach a frame boundary, not merely fall back to the
+            // ordinary `read_timeout_ms` because there is no positive
+            // timeout to build a deadline from. `fds[3]` only ever fires
+            // once per connection (it is excluded from every later poll
+            // once `shutdown_wake_observed` is set), so this fails the
+            // wait immediately exactly once, the same moment shutdown is
+            // first observed.
+            if (self.shutdown_drain_timeout_ms == 0) return error.Http2ShutdownDrainTimeout;
             // #951 review: a connection stuck mid-frame (any `readExact`
             // call past its first byte) never returns to the H2 loop to
             // get its deadline installed via `setShutdownDrainDeadline`.
             // Starting the fallback deadline here, from the moment this
             // wait itself first notices shutdown, bounds that case too
             // instead of leaving it on the full `read_timeout_ms`.
-            if (self.shutdown_drain_deadline_ms == null and self.shutdown_drain_timeout_ms > 0) {
+            if (self.shutdown_drain_deadline_ms == null) {
                 self.shutdown_drain_deadline_ms = http.event_loop.monotonicMs() +| self.shutdown_drain_timeout_ms;
             }
         }
@@ -3570,6 +3580,7 @@ fn h2ProcessHeaderBlock(
     max_connection_memory_bytes: usize,
     buffered_request_bytes: *usize,
     connection_ip: []const u8,
+    connection_id: u64,
 ) !void {
     var decoded = decoder.decode(allocator, header_block) catch {
         try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
@@ -3678,6 +3689,7 @@ fn h2ProcessHeaderBlock(
             errdefer allocator.destroy(session);
             session.* = try http.h2_stream_session.Session.init(
                 allocator,
+                connection_id,
                 stream_id,
                 HTTP2_SESSION_MAX_INBOUND_BYTES,
                 HTTP2_SESSION_MAX_OUTBOUND_BYTES,
@@ -4183,8 +4195,15 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     if (!std.mem.eql(u8, preface[0..], HTTP2_PREFACE)) return error.InvalidHttp2Preface;
 
     const allocator = state.allocator;
+    // #951 second review: a stable identity for this connection's lifetime,
+    // threaded into every per-stream/per-connection metrics slot it
+    // registers below -- HTTP/2 stream ids are only unique *within* one
+    // connection, so two simultaneous connections commonly both use stream
+    // id 1.
+    const connection_id = http.h2_transport_metrics.nextConnectionId();
     var outbound = try http.h2_outbound_scheduler.Scheduler.init(
         allocator,
+        connection_id,
         http.h2_outbound_scheduler.default_max_queued_bytes,
     );
     defer outbound.deinit();
@@ -4767,6 +4786,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         cfg.max_connection_memory_bytes,
                         &buffered_request_bytes,
                         connection_ip,
+                        connection_id,
                     );
                     if (pending.getPtr(frame.stream_id)) |stamped| stamped.headers.client_cert = connClientCertificate(conn);
                 }
@@ -5067,6 +5087,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                             cfg.max_connection_memory_bytes,
                             &buffered_request_bytes,
                             connection_ip,
+                            connection_id,
                         );
                         if (pending.getPtr(stream_id)) |stamped| stamped.headers.client_cert = connClientCertificate(conn);
                     }
@@ -9232,7 +9253,7 @@ test "H2 response larger than scheduler capacity drains and completes" {
     @memset(&body, 'x');
     var conn = H2DispatchTestConn.init(allocator);
     defer conn.deinit();
-    var scheduler = try http.h2_outbound_scheduler.Scheduler.init(allocator, http.h2_outbound_scheduler.default_max_queued_bytes);
+    var scheduler = try http.h2_outbound_scheduler.Scheduler.init(allocator, 1, http.h2_outbound_scheduler.default_max_queued_bytes);
     defer scheduler.deinit();
     var response = PendingHttp2Response{
         .body_alloc = null,
@@ -9300,7 +9321,7 @@ test "H2 reset removes parked response while queued output is backpressured" {
     });
     try ready.append(1);
 
-    var scheduler = try http.h2_outbound_scheduler.Scheduler.init(allocator, 64);
+    var scheduler = try http.h2_outbound_scheduler.Scheduler.init(allocator, 1, 64);
     try scheduler.enqueueFrame(.data, 0, 1, "already-queued");
     var writer = BlockingWriter{};
     try scheduler.flush(&writer);
@@ -9372,7 +9393,7 @@ test "local STREAM_CLOSED reset drops queued response before its RST" {
     try pending_responses.put(1, .{ .body_alloc = parked, .body = parked, .status_code = 200 });
     try ready.append(1);
 
-    var scheduler = try http.h2_outbound_scheduler.Scheduler.init(allocator, 128);
+    var scheduler = try http.h2_outbound_scheduler.Scheduler.init(allocator, 1, 128);
     defer scheduler.deinit();
     try scheduler.enqueueFrame(.data, 0, 1, "stale");
     try scheduler.enqueueFrame(.data, 0, 3, "sibling");
@@ -10743,7 +10764,7 @@ fn h2DecodeFrames(allocator: std.mem.Allocator, wire: []const u8) !std.array_lis
 
 test "H2 session inbound DATA credits padding immediately but app bytes only on consumption (#867)" {
     const allocator = std.testing.allocator;
-    var session = try http.h2_stream_session.Session.init(allocator, 1, 4096, 4096);
+    var session = try http.h2_stream_session.Session.init(allocator, 1, 1, 4096, 4096);
     defer session.deinit();
 
     var out = std.Io.Writer.Allocating.init(allocator);
@@ -14721,6 +14742,90 @@ test "H2 live: a truly silent admitted stream cannot hold graceful shutdown past
     }
 }
 
+// PR review (#951 second review): a configured `shutdown_drain_timeout_ms
+// == 0` ("shut down immediately") was only enforced by `waitFor`'s deadline
+// clamp -- but that deadline was only ever installed when the configured
+// timeout was positive, so a timeout of exactly zero fell back to the full
+// ordinary `read_timeout_ms` for a peer blocked mid-frame. This regression
+// sends one byte of a nine-byte HEADERS frame header, leaves the connection
+// genuinely blocked waiting for the other eight, and proves shutdown is
+// enforced immediately rather than falling back to the 10s read timeout.
+test "H2 live: a zero drain timeout terminates immediately even with a frame already partly read (#951 second review)" {
+    const allocator = std.testing.allocator;
+    http.shutdown.reset();
+    defer http.shutdown.reset();
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    // A 10s ordinary read timeout: if the zero-drain-timeout fallback below
+    // were broken, nothing would bound this connection before that, the
+    // same "fell back to the full read timeout" defect `waitFor`'s
+    // positive-timeout deadline clamp already fixed for timeout > 0.
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+    state.h2_session_test_hook = null;
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.shutdown_drain_timeout_ms = 0;
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinServerOnFailure(server_fd, &server_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    // One byte of a nine-byte HEADERS frame header, then genuine silence:
+    // the server's next `readFrame` is left blocked inside `readExact`
+    // past its first byte (`off != 0`), the exact case `.bail_if_unread`
+    // cannot bail out of -- only the drain-timeout path can end this read.
+    const partial_header = [_]u8{0};
+    const n = std.c.write(client_fd, &partial_header, 1);
+    try std.testing.expectEqual(@as(isize, 1), n);
+    // No barrier fd is exposed from the server's own blocking read, so a
+    // short, generous sleep stands in for one: the handshake round trip
+    // just above already completed synchronously, so the server loop is
+    // already back at its next blocking frame read well before this.
+    compat.sleepNs(50 * std.time.ns_per_ms);
+
+    http.shutdown.requestShutdown();
+
+    const shutdown_started = compat.milliTimestamp();
+    try server_ctx.waitDoneBounded(2_000);
+    const shutdown_elapsed_ms = compat.milliTimestamp() - shutdown_started;
+    // Far below the 10s read timeout: only the zero-drain-timeout fallback
+    // (not that read timeout, and not the ordinary positive-timeout
+    // deadline clamp, which never installs a deadline when the configured
+    // timeout is exactly zero) can bound this.
+    try std.testing.expect(shutdown_elapsed_ms <= 2_000);
+    testJoinOnce(&server_thread);
+    try std.testing.expectError(error.Http2ShutdownDrainTimeout, server_ctx.result);
+}
+
 test "H2 live: an abrupt disconnect wakes and settles two active sessions exactly once while ordinary siblings were mid-flight (#863)" {
     const allocator = std.testing.allocator;
 
@@ -14859,7 +14964,7 @@ test "H2 session RST_STREAM settles the consumer and detaches without leaking" {
     var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
     defer sessions.deinit();
     const session = try allocator.create(http.h2_stream_session.Session);
-    session.* = try http.h2_stream_session.Session.init(allocator, 7, 64, 64);
+    session.* = try http.h2_stream_session.Session.init(allocator, 1, 7, 64, 64);
     try sessions.put(7, session);
 
     try std.testing.expect(!session.consumerDetach());
@@ -14888,7 +14993,7 @@ test "H2 GOAWAY, connection close, and shutdown settle every attached session ex
         var created: [ids.len]*http.h2_stream_session.Session = undefined;
         for (ids, 0..) |id, idx| {
             const session = try allocator.create(http.h2_stream_session.Session);
-            session.* = try http.h2_stream_session.Session.init(allocator, id, 64, 64);
+            session.* = try http.h2_stream_session.Session.init(allocator, 1, id, 64, 64);
             try sessions.put(id, session);
             created[idx] = session;
         }
@@ -14921,7 +15026,7 @@ test "H2 session attach/detach churn settles resources with no leak" {
     while (i < 50) : (i += 1) {
         const stream_id = i * 2 + 1;
         const session = try allocator.create(http.h2_stream_session.Session);
-        session.* = try http.h2_stream_session.Session.init(allocator, stream_id, 64, 64);
+        session.* = try http.h2_stream_session.Session.init(allocator, 1, stream_id, 64, 64);
         try sessions.put(stream_id, session);
         var discard_out = std.Io.Writer.Allocating.init(allocator);
         defer discard_out.deinit();
@@ -14955,7 +15060,7 @@ test "h2ResetStreamState never orphans a session when its connection-credit WIND
     defer in_flight_jobs.deinit();
 
     const session = try allocator.create(http.h2_stream_session.Session);
-    session.* = try http.h2_stream_session.Session.init(allocator, 7, 64, 64);
+    session.* = try http.h2_stream_session.Session.init(allocator, 1, 7, 64, 64);
     // Earn real receive credit (consumption, not mere queuing -- see
     // "receive credit accrues only on consumption, not on queuing" in
     // h2_stream_session.zig) so `h2ResetStreamState` actually attempts the
@@ -15006,7 +15111,7 @@ test "h2DetachSession never orphans a session when its connection-credit WINDOW_
     var buffered_request_bytes: usize = 0;
 
     const session = try allocator.create(http.h2_stream_session.Session);
-    session.* = try http.h2_stream_session.Session.init(allocator, 7, 64, 64);
+    session.* = try http.h2_stream_session.Session.init(allocator, 1, 7, 64, 64);
     try session.deliverInbound("abcd");
     var buf: [4]u8 = undefined;
     _ = session.read(&buf);
@@ -16701,6 +16806,7 @@ test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
         0,
         &buffered,
         "127.0.0.1",
+        1,
     );
 
     // No request was assembled and nothing was queued for dispatch.

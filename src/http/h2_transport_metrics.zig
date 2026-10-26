@@ -33,8 +33,25 @@ var session_close_detached_total: std.atomic.Value(u64) = std.atomic.Value(u64).
 /// so repeated publication from multiple connections is idempotent; this
 /// lets evidence/tests assert `writer_queue_bytes_high_water <= writer_queue_cap_bytes`
 /// without importing `h2_outbound_scheduler.zig` here (which would otherwise
-/// have to flow back through this module anyway).
+/// have to flow back through this module anyway). #951 second review: this
+/// single global cannot be compared against the aggregate high water above
+/// when more than one connection is live (each publishes its own cap, and
+/// the aggregate sums every connection's bytes) -- kept only as a rough,
+/// documented-as-such observability value; `writerQueueSlot*` below is the
+/// real per-connection bound.
 var writer_queue_cap_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+/// Process-wide unique identifier for one H2 connection's lifetime, handed
+/// out once per connection and threaded into every per-stream/per-connection
+/// slot it registers below. #951 second review: stream ids are only unique
+/// *within* a connection (two simultaneous connections commonly both use
+/// stream 1), so attributing a slot by stream id alone silently corrupts
+/// one connection's counters with another's.
+var next_connection_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+
+pub fn nextConnectionId() u64 {
+    return next_connection_id.fetchAdd(1, .monotonic);
+}
 
 // #951 review: the aggregate gauges above prove a process-wide total, but
 // cannot show *which* stream/connection is responsible for it, nor bound
@@ -49,13 +66,35 @@ var writer_queue_cap_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0
 // consistent snapshot of already-published values, same as the aggregate
 // counters above). Capacity is a generous fixed bound on concurrently
 // tracked streams across the whole process, independent of any single
-// connection's own (lower) concurrent-stream limit; a table overflow just
-// means that one stream's per-stream detail is not tracked, not a
-// correctness failure of the aggregate counters.
+// connection's own (lower) concurrent-stream limit; a table overflow is
+// counted (`session_slot_overflow_total`) rather than silently dropped, so
+// evidence/CI can detect and fail on it instead of quietly losing coverage.
 pub const MAX_TRACKED_STREAMS: usize = 256;
+/// Process-wide fixed bound on concurrently tracked *connections'* own
+/// writer-queue slots (separate table from `MAX_TRACKED_STREAMS` above,
+/// since a connection's own writer queue is one slot regardless of how many
+/// streams it multiplexes).
+pub const MAX_TRACKED_CONNECTIONS: usize = 128;
+
+/// A session's or scheduler's claim on one fixed slot below. Carries a
+/// generation counter (bumped every time the slot is claimed) so a handle
+/// from a stale registration can never be mistaken for a later, unrelated
+/// occupant of the same array index -- the ABA hazard a bare index would
+/// otherwise have across `*Unregister`/`*Register` cycles.
+pub const SlotHandle = struct { index: usize, generation: u64 };
+
+var session_slot_overflow_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var writer_queue_slot_overflow_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 const SessionSlot = struct {
     in_use: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Published last (release), after every other field below, so a
+    /// concurrent scraper never observes a slot it can read as `in_use` but
+    /// whose identity/byte fields are still mid-initialization (#951 second
+    /// review).
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    connection_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stream_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     inbound_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     outbound_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -64,66 +103,82 @@ const SessionSlot = struct {
 
 var session_slots: [MAX_TRACKED_STREAMS]SessionSlot = [_]SessionSlot{.{}} ** MAX_TRACKED_STREAMS;
 
-/// Claim a free slot for a newly created session. Idempotent-safe to skip
-/// silently on table exhaustion (see `MAX_TRACKED_STREAMS` above).
-pub fn sessionSlotRegister(stream_id: u31) void {
-    for (&session_slots) |*slot| {
+/// Claim a free slot for a newly created session, scoped to
+/// `connection_id` so two simultaneous connections using the same HTTP/2
+/// stream id never collide. Returns `null` on table exhaustion (counted in
+/// `session_slot_overflow_total`) instead of silently aliasing an unrelated
+/// slot.
+pub fn sessionSlotRegister(connection_id: u64, stream_id: u31) ?SlotHandle {
+    for (&session_slots, 0..) |*slot, i| {
         if (slot.in_use.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
-            slot.stream_id.store(stream_id, .release);
-            slot.inbound_bytes.store(0, .release);
-            slot.outbound_bytes.store(0, .release);
-            slot.high_water.store(0, .release);
-            return;
+            const generation = slot.generation.fetchAdd(1, .monotonic) + 1;
+            slot.connection_id.store(connection_id, .monotonic);
+            slot.stream_id.store(stream_id, .monotonic);
+            slot.inbound_bytes.store(0, .monotonic);
+            slot.outbound_bytes.store(0, .monotonic);
+            slot.high_water.store(0, .monotonic);
+            slot.ready.store(true, .release);
+            return .{ .index = i, .generation = generation };
         }
     }
+    _ = session_slot_overflow_total.fetchAdd(1, .monotonic);
+    return null;
 }
 
 /// Publish this session's current queued-byte counts. Called from every
 /// `h2_stream_session.zig` site that already mutates `inbound_bytes`/
 /// `outbound_bytes` under `Session.mutex`, so these values are always a
-/// real (not reserved-capacity) snapshot.
-pub fn sessionSlotUpdate(stream_id: u31, inbound_bytes: usize, outbound_bytes: usize) void {
-    for (&session_slots) |*slot| {
-        if (slot.in_use.load(.acquire) and slot.stream_id.load(.acquire) == @as(u32, stream_id)) {
-            const total: u64 = @intCast(inbound_bytes + outbound_bytes);
-            slot.inbound_bytes.store(@intCast(inbound_bytes), .release);
-            slot.outbound_bytes.store(@intCast(outbound_bytes), .release);
-            var prev = slot.high_water.load(.monotonic);
-            while (total > prev) {
-                prev = slot.high_water.cmpxchgWeak(prev, total, .monotonic, .monotonic) orelse break;
-            }
-            return;
-        }
+/// real (not reserved-capacity) snapshot. A `null` handle (table was
+/// exhausted at registration) is a documented no-op.
+pub fn sessionSlotUpdate(handle: ?SlotHandle, inbound_bytes: usize, outbound_bytes: usize) void {
+    const h = handle orelse return;
+    const slot = &session_slots[h.index];
+    if (slot.generation.load(.monotonic) != h.generation) return;
+    const total: u64 = @intCast(inbound_bytes + outbound_bytes);
+    slot.inbound_bytes.store(@intCast(inbound_bytes), .release);
+    slot.outbound_bytes.store(@intCast(outbound_bytes), .release);
+    var prev = slot.high_water.load(.monotonic);
+    while (total > prev) {
+        prev = slot.high_water.cmpxchgWeak(prev, total, .monotonic, .monotonic) orelse break;
     }
 }
 
-/// Release a session's slot. Safe to call even if `sessionSlotRegister`
-/// never found a free slot for it (no-op).
-pub fn sessionSlotUnregister(stream_id: u31) void {
-    for (&session_slots) |*slot| {
-        if (slot.in_use.load(.acquire) and slot.stream_id.load(.acquire) == @as(u32, stream_id)) {
-            slot.in_use.store(false, .release);
-            return;
-        }
-    }
+/// Release a session's slot. Safe to call with a `null` handle (no-op).
+pub fn sessionSlotUnregister(handle: ?SlotHandle) void {
+    const h = handle orelse return;
+    const slot = &session_slots[h.index];
+    if (slot.generation.load(.monotonic) != h.generation) return;
+    slot.ready.store(false, .release);
+    slot.in_use.store(false, .release);
 }
 
 pub const SessionSlotSnapshot = struct {
+    connection_id: u64,
     stream_id: u31,
+    inbound_bytes: u64,
+    outbound_bytes: u64,
     queued_bytes: u64,
     queued_bytes_high_water: u64,
 };
 
-/// Copy every currently-registered slot into `buf`, returning the
-/// filled prefix. Test/diagnostics-only.
+/// Copy every currently-registered, fully-published slot into `buf`,
+/// returning the filled prefix. Test/diagnostics-only. A slot mid-publish
+/// (`in_use` but not yet `ready`) or mid-teardown is skipped rather than
+/// read partially.
 pub fn snapshotSessionSlots(buf: []SessionSlotSnapshot) []SessionSlotSnapshot {
     var n: usize = 0;
     for (&session_slots) |*slot| {
         if (n >= buf.len) break;
         if (!slot.in_use.load(.acquire)) continue;
+        if (!slot.ready.load(.acquire)) continue;
+        const inbound = slot.inbound_bytes.load(.acquire);
+        const outbound = slot.outbound_bytes.load(.acquire);
         buf[n] = .{
+            .connection_id = slot.connection_id.load(.acquire),
             .stream_id = @intCast(slot.stream_id.load(.acquire)),
-            .queued_bytes = slot.inbound_bytes.load(.acquire) + slot.outbound_bytes.load(.acquire),
+            .inbound_bytes = inbound,
+            .outbound_bytes = outbound,
+            .queued_bytes = inbound + outbound,
             .queued_bytes_high_water = slot.high_water.load(.acquire),
         };
         n += 1;
@@ -136,6 +191,110 @@ pub fn snapshotSessionSlots(buf: []SessionSlotSnapshot) []SessionSlotSnapshot {
 /// cannot leave a stream_id collision for a later test.
 pub fn resetSessionSlotsForTesting() void {
     for (&session_slots) |*slot| slot.* = .{};
+    session_slot_overflow_total.store(0, .monotonic);
+}
+
+const WriterQueueSlot = struct {
+    in_use: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    connection_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    cap_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    queued_bytes: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    high_water: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+var writer_queue_slots: [MAX_TRACKED_CONNECTIONS]WriterQueueSlot = [_]WriterQueueSlot{.{}} ** MAX_TRACKED_CONNECTIONS;
+
+/// Claim one connection-scoped writer-queue slot. #951 second review: the
+/// previous single process-wide `writer_queue_cap_bytes` could only ever
+/// hold one connection's cap, so comparing the aggregate high-water mark
+/// (every live connection's queued bytes summed) against it failed on any
+/// healthy multi-connection workload. Each connection's own queued bytes
+/// and high water are now tracked and bounded against *that connection's
+/// own* cap here, independent of every other live connection.
+pub fn writerQueueSlotRegister(connection_id: u64, cap_bytes: usize) ?SlotHandle {
+    for (&writer_queue_slots, 0..) |*slot, i| {
+        if (slot.in_use.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+            const generation = slot.generation.fetchAdd(1, .monotonic) + 1;
+            slot.connection_id.store(connection_id, .monotonic);
+            slot.cap_bytes.store(@intCast(cap_bytes), .monotonic);
+            slot.queued_bytes.store(0, .monotonic);
+            slot.high_water.store(0, .monotonic);
+            slot.ready.store(true, .release);
+            return .{ .index = i, .generation = generation };
+        }
+    }
+    _ = writer_queue_slot_overflow_total.fetchAdd(1, .monotonic);
+    return null;
+}
+
+/// `delta` is the signed change in this one connection's own queued writer
+/// bytes, published from the same real enqueue/flush/cancel mutation
+/// points as the process-wide aggregate (`writerQueueBytesChanged`).
+pub fn writerQueueSlotChanged(handle: ?SlotHandle, delta: i64) void {
+    const h = handle orelse return;
+    const slot = &writer_queue_slots[h.index];
+    if (slot.generation.load(.monotonic) != h.generation) return;
+    const new_val = slot.queued_bytes.fetchAdd(delta, .monotonic) + delta;
+    if (new_val > 0) {
+        const cur: u64 = @intCast(new_val);
+        var prev = slot.high_water.load(.monotonic);
+        while (cur > prev) {
+            prev = slot.high_water.cmpxchgWeak(prev, cur, .monotonic, .monotonic) orelse break;
+        }
+    }
+}
+
+pub fn writerQueueSlotUnregister(handle: ?SlotHandle) void {
+    const h = handle orelse return;
+    const slot = &writer_queue_slots[h.index];
+    if (slot.generation.load(.monotonic) != h.generation) return;
+    slot.ready.store(false, .release);
+    slot.in_use.store(false, .release);
+}
+
+pub const WriterQueueSlotSnapshot = struct {
+    connection_id: u64,
+    queued_bytes: u64,
+    queued_bytes_high_water: u64,
+    cap_bytes: u64,
+};
+
+pub fn snapshotWriterQueueSlots(buf: []WriterQueueSlotSnapshot) []WriterQueueSlotSnapshot {
+    var n: usize = 0;
+    for (&writer_queue_slots) |*slot| {
+        if (n >= buf.len) break;
+        if (!slot.in_use.load(.acquire)) continue;
+        if (!slot.ready.load(.acquire)) continue;
+        buf[n] = .{
+            .connection_id = slot.connection_id.load(.acquire),
+            .queued_bytes = @intCast(@max(0, slot.queued_bytes.load(.acquire))),
+            .queued_bytes_high_water = slot.high_water.load(.acquire),
+            .cap_bytes = slot.cap_bytes.load(.acquire),
+        };
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+pub fn resetWriterQueueSlotsForTesting() void {
+    for (&writer_queue_slots) |*slot| slot.* = .{};
+    writer_queue_slot_overflow_total.store(0, .monotonic);
+}
+
+/// #951 second review: a real H2 connection count, derived from how many
+/// writer-queue slots (one per live `Scheduler`, i.e. one per live H2
+/// connection) are currently registered -- unlike the generic
+/// `tardigrade_active_connections` gauge, which real-process evidence
+/// observed reading 0 even while an H2 connection was demonstrably open
+/// and serving traffic.
+pub fn activeConnectionsCount() usize {
+    var n: usize = 0;
+    for (&writer_queue_slots) |*slot| {
+        if (slot.in_use.load(.acquire) and slot.ready.load(.acquire)) n += 1;
+    }
+    return n;
 }
 
 fn bumpHighWater(high_water: *std.atomic.Value(u64), current: i64) void {
@@ -218,6 +377,8 @@ pub const Snapshot = struct {
     session_close_connection_closed_total: u64,
     session_close_shutdown_total: u64,
     session_close_detached_total: u64,
+    session_slot_overflow_total: u64,
+    writer_queue_slot_overflow_total: u64,
 };
 
 pub fn snapshot() Snapshot {
@@ -234,6 +395,8 @@ pub fn snapshot() Snapshot {
         .session_close_connection_closed_total = session_close_connection_closed_total.load(.monotonic),
         .session_close_shutdown_total = session_close_shutdown_total.load(.monotonic),
         .session_close_detached_total = session_close_detached_total.load(.monotonic),
+        .session_slot_overflow_total = session_slot_overflow_total.load(.monotonic),
+        .writer_queue_slot_overflow_total = writer_queue_slot_overflow_total.load(.monotonic),
     };
 }
 
@@ -253,6 +416,7 @@ pub fn resetForTesting() void {
     session_close_shutdown_total.store(0, .monotonic);
     session_close_detached_total.store(0, .monotonic);
     resetSessionSlotsForTesting();
+    resetWriterQueueSlotsForTesting();
 }
 
 test "sessionAttached/sessionDetached track a signed active count" {
@@ -301,11 +465,11 @@ test "sessionClosed increments exactly the matching reason counter" {
 
 test "session slots track per-stream queued bytes independent of the aggregate, and release on unregister" {
     resetForTesting();
-    sessionSlotRegister(5);
-    sessionSlotRegister(9);
-    sessionSlotUpdate(5, 100, 0);
-    sessionSlotUpdate(9, 10, 20);
-    sessionSlotUpdate(5, 40, 0); // stream 5 drained down; its own high water stays at 100.
+    const h5 = sessionSlotRegister(1, 5) orelse return error.TestUnexpectedResult;
+    const h9 = sessionSlotRegister(1, 9) orelse return error.TestUnexpectedResult;
+    sessionSlotUpdate(h5, 100, 0);
+    sessionSlotUpdate(h9, 10, 20);
+    sessionSlotUpdate(h5, 40, 0); // stream 5 drained down; its own high water stays at 100.
 
     var buf: [8]SessionSlotSnapshot = undefined;
     const slots = snapshotSessionSlots(&buf);
@@ -321,10 +485,71 @@ test "session slots track per-stream queued bytes independent of the aggregate, 
         }
     }
 
-    sessionSlotUnregister(5);
+    sessionSlotUnregister(h5);
     const after_unregister = snapshotSessionSlots(&buf);
     try std.testing.expectEqual(@as(usize, 1), after_unregister.len);
     try std.testing.expectEqual(@as(u31, 9), after_unregister[0].stream_id);
+
+    // A stale handle from before unregistration must not resurrect or
+    // corrupt whatever later claims the same array slot (ABA hazard a bare
+    // index would have, #951 second review).
+    sessionSlotUpdate(h5, 999, 999);
+    const still_only_nine = snapshotSessionSlots(&buf);
+    try std.testing.expectEqual(@as(usize, 1), still_only_nine.len);
+    try std.testing.expectEqual(@as(u64, 30), still_only_nine[0].queued_bytes);
+}
+
+test "session slots scope identical stream ids to their own connection id" {
+    resetForTesting();
+    // Two simultaneous connections both legitimately use stream 1 -- the
+    // defect this regression guards against (#951 second review): a
+    // lookup keyed on stream id alone would route both sessions' updates to
+    // whichever slot matched first.
+    const conn_a = sessionSlotRegister(100, 1) orelse return error.TestUnexpectedResult;
+    const conn_b = sessionSlotRegister(200, 1) orelse return error.TestUnexpectedResult;
+    sessionSlotUpdate(conn_a, 10, 0);
+    sessionSlotUpdate(conn_b, 0, 20);
+
+    var buf: [8]SessionSlotSnapshot = undefined;
+    const slots = snapshotSessionSlots(&buf);
+    try std.testing.expectEqual(@as(usize, 2), slots.len);
+    var saw_a = false;
+    var saw_b = false;
+    for (slots) |slot| {
+        try std.testing.expectEqual(@as(u31, 1), slot.stream_id);
+        if (slot.connection_id == 100) {
+            try std.testing.expectEqual(@as(u64, 10), slot.queued_bytes);
+            saw_a = true;
+        } else if (slot.connection_id == 200) {
+            try std.testing.expectEqual(@as(u64, 20), slot.queued_bytes);
+            saw_b = true;
+        } else return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(saw_a and saw_b);
+
+    // Removal in either order must only ever release its own slot.
+    sessionSlotUnregister(conn_b);
+    const after_b = snapshotSessionSlots(&buf);
+    try std.testing.expectEqual(@as(usize, 1), after_b.len);
+    try std.testing.expectEqual(@as(u64, 100), after_b[0].connection_id);
+    sessionSlotUnregister(conn_a);
+    try std.testing.expectEqual(@as(usize, 0), snapshotSessionSlots(&buf).len);
+}
+
+test "session slot table reports overflow instead of silently dropping or aliasing a stream" {
+    resetForTesting();
+    var handles: [MAX_TRACKED_STREAMS]SlotHandle = undefined;
+    for (0..MAX_TRACKED_STREAMS) |i| {
+        handles[i] = sessionSlotRegister(1, @intCast(i + 1)) orelse return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(u64, 0), snapshot().session_slot_overflow_total);
+
+    // One more registration beyond capacity must be reported, not silently
+    // aliased onto an already-occupied slot.
+    try std.testing.expectEqual(@as(?SlotHandle, null), sessionSlotRegister(1, 9999));
+    try std.testing.expectEqual(@as(u64, 1), snapshot().session_slot_overflow_total);
+
+    for (handles) |h| sessionSlotUnregister(h);
 }
 
 test "flowControlBlocked/flowControlResumed are independent counters" {
@@ -335,4 +560,35 @@ test "flowControlBlocked/flowControlResumed are independent counters" {
     const s = snapshot();
     try std.testing.expectEqual(@as(u64, 2), s.flow_control_blocked_total);
     try std.testing.expectEqual(@as(u64, 1), s.flow_control_resumed_total);
+}
+
+test "writer queue slots bound each connection against its own cap, independent of the aggregate" {
+    resetForTesting();
+    // Two connections, each comfortably under its own 256KiB cap, whose sum
+    // exceeds a single connection's cap -- the exact healthy scenario the
+    // previous aggregate-vs-single-cap comparison (#951 review) failed.
+    const conn_a = writerQueueSlotRegister(1, 256 * 1024) orelse return error.TestUnexpectedResult;
+    const conn_b = writerQueueSlotRegister(2, 256 * 1024) orelse return error.TestUnexpectedResult;
+    writerQueueSlotChanged(conn_a, 200 * 1024);
+    writerQueueBytesChanged(200 * 1024);
+    writerQueueSlotChanged(conn_b, 200 * 1024);
+    writerQueueBytesChanged(200 * 1024);
+
+    var buf: [8]WriterQueueSlotSnapshot = undefined;
+    const slots = snapshotWriterQueueSlots(&buf);
+    try std.testing.expectEqual(@as(usize, 2), slots.len);
+    for (slots) |slot| {
+        try std.testing.expect(slot.queued_bytes_high_water <= slot.cap_bytes);
+        try std.testing.expectEqual(@as(u64, 200 * 1024), slot.queued_bytes_high_water);
+    }
+    // The process-wide aggregate (what the old, incorrect assertion used)
+    // does exceed a single connection's cap here, proving the two scopes
+    // are genuinely different quantities.
+    try std.testing.expect(snapshot().writer_queue_bytes_high_water > 256 * 1024);
+
+    writerQueueSlotChanged(conn_a, -(200 * 1024));
+    writerQueueSlotUnregister(conn_a);
+    writerQueueSlotChanged(conn_b, -(200 * 1024));
+    writerQueueSlotUnregister(conn_b);
+    try std.testing.expectEqual(@as(usize, 0), snapshotWriterQueueSlots(&buf).len);
 }

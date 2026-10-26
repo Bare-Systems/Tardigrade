@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("zig_compat");
 const Headers = @import("headers.zig").Headers;
 
 pub const MAGIC_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -57,6 +58,20 @@ pub fn writeServerHandshake(
 
 /// Length of a `Sec-WebSocket-Accept` value: base64 of a 20-byte SHA-1.
 pub const ACCEPT_KEY_LEN = 28;
+
+/// Length of a `Sec-WebSocket-Key` value: base64 of 16 random bytes.
+pub const CLIENT_KEY_LEN = 24;
+
+/// A fresh `Sec-WebSocket-Key` (RFC 6455 §4.1), written into `out` without
+/// allocating. RFC 8441 Extended CONNECT carries no client key of its own --
+/// `:protocol: websocket` replaces the whole H1 Upgrade challenge -- so
+/// Tardigrade mints one itself to perform the classic H1 handshake its
+/// upstream still expects.
+pub fn generateClientKey(out: *[CLIENT_KEY_LEN]u8) []const u8 {
+    var raw: [16]u8 = undefined;
+    compat.randomBytes(&raw);
+    return std.base64.standard.Encoder.encode(out, &raw);
+}
 
 /// `Sec-WebSocket-Accept` for `client_key` (RFC 6455 §4.2.2), written into
 /// `out` without allocating.

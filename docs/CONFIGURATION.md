@@ -462,12 +462,26 @@ relaying for `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` and is then closed, so
 tunnels never hold the process open. A `drain` tunnel that is already inside
 a reload drain closes at whichever deadline comes first.
 
-**Protocols.** WebSocket relaying is HTTP/1.1 only, over plaintext or
-Tardigrade's native TLS (`wss://`). HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220)
-extended CONNECT are not supported: Tardigrade never advertises
-`SETTINGS_ENABLE_CONNECT_PROTOCOL`, so browsers open WebSockets over a
-separate HTTP/1.1 connection even when the page itself uses HTTP/2 or HTTP/3.
-An HTTP/2 or HTTP/3 request carrying `Upgrade` is not upgraded.
+**Protocols.** WebSocket relaying accepts a downstream HTTP/1.1 `Upgrade`
+handshake or a downstream HTTP/2 RFC 8441 Extended CONNECT
+(`:method: CONNECT`, `:protocol: websocket`), over plaintext or Tardigrade's
+native TLS. A connection advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` in
+its first SETTINGS frame whenever any location (top-level or in a server
+block) has `proxy_websocket on`; otherwise Extended CONNECT is rejected as an
+ordinary unsupported HTTP/2 CONNECT. An Extended
+CONNECT runs the same admission gates as an H1 handshake (rate limits,
+ACL/geo, `auth required`, `forward_auth`, path policy, Origin allowlist,
+0-RTT 425, capacity) and, once admitted, translates to a fresh HTTP/1.1
+`ws://`/`wss://` origin handshake exactly like the H1 path -- there is no
+upstream HTTP/2 WebSocket support yet, so the origin always sees ordinary H1
+Upgrade framing regardless of which downstream protocol the client used. A
+successful Extended CONNECT gets a downstream `:status: 200` (HTTP/2 has no
+`101`); a denied or failed one gets an ordinary H2 error response with no
+upstream side effect. HTTP/3 (RFC 9220) extended CONNECT is not supported:
+Tardigrade never advertises it there, so browsers on an HTTP/3 page open
+WebSockets over a separate HTTP/1.1 or HTTP/2 connection. An HTTP/1.1 request
+carrying `Upgrade` on a location without `proxy_websocket on`, or an
+HTTP/2/HTTP/3 request carrying `Upgrade`, is not upgraded.
 
 **Observability.** `tardigrade_websocket_upgrades_total{outcome}`,
 `tardigrade_websocket_tunnels_active`,

@@ -6,8 +6,15 @@ future reactor, handoff, relay, lifecycle, and validation work. It does not
 change public WebSocket or configuration behavior.
 
 The scope is an HTTP/1.1 downstream WebSocket upgrade after a valid origin
-`101`. HTTP/2 RFC 8441 and HTTP/3 RFC 9220 extended CONNECT are unsupported;
-they must remain rejected rather than silently taking a different path.
+`101`, relayed by the fixed reactor-thread pool this document describes.
+HTTP/3 RFC 9220 extended CONNECT remains unsupported and must stay rejected
+rather than silently taking a different path. A downstream HTTP/2 RFC 8441
+Extended CONNECT tunnel (#864) runs the same admission pipeline and the same
+fresh H1 origin handshake, but is explicitly out of scope for the reactor
+contract below: it is admitted synchronously on the connection's own
+frame-reading thread and relayed on its own dedicated thread pair
+(`gateway_h2_websocket.zig`, `http/h2_websocket_relay.zig`), never handed to
+a reactor thread or counted against `proxy_websocket_reactor_threads`.
 
 ## Admission remains a worker responsibility
 

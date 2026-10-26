@@ -4355,7 +4355,7 @@ pub fn executeStreamingHttpProxyRequest(
 }
 
 /// What an HTTP/1.1 proxy request says about the client and the route.
-const ForwardedHeaderInputs = struct {
+pub const ForwardedHeaderInputs = struct {
     request_headers: *const http.Headers,
     correlation_id: []const u8,
     client_ip: []const u8,
@@ -4478,6 +4478,182 @@ pub const WebSocketUpstreamResult = union(enum) {
     /// the client as an ordinary response.
     refused: StreamingProxyResult,
 };
+
+/// Like `WebSocketUpstreamResult`, but for the RFC 8441 downstream path
+/// (#864): there is no downstream connection to relay a non-101 response
+/// onto (the H2 stream is still answered with ordinary H2 response framing,
+/// which the caller builds itself), so a declined upgrade only carries the
+/// origin's status code.
+pub const WebSocketUpstreamResultH2 = union(enum) {
+    switched: *UpgradedUpstream,
+    refused: u16,
+};
+
+/// `downstream_conn` stand-in for `openWebSocketUpstreamForH2`: an Extended
+/// CONNECT handshake carries no request body, so the streaming-upload path
+/// that would call `read` on a real downstream connection is never reached;
+/// this only exists to satisfy the generic signatures it flows through.
+const NoDownstreamBody = struct {
+    pub fn read(self: NoDownstreamBody, buf: []u8) !usize {
+        _ = self;
+        _ = buf;
+        return error.ClientAborted;
+    }
+};
+
+/// Open a fresh HTTP/1.1 connection to the origin and perform the classic
+/// WebSocket opening handshake on behalf of an admitted RFC 8441 downstream
+/// stream (#864). Unlike `openWebSocketUpstream`, there is no client-supplied
+/// `Sec-WebSocket-Key` (Extended CONNECT replaces that whole challenge with
+/// `:protocol: websocket`), so Tardigrade mints one itself, exactly as any
+/// other WebSocket client would, and validates the origin's
+/// `Sec-WebSocket-Accept` against it. A non-101 origin response is not
+/// relayed byte-for-byte to the client (there is no H1 downstream to write
+/// it onto); the caller answers the H2 stream with its own ordinary error
+/// framing using the returned status code.
+pub fn openWebSocketUpstreamForH2(
+    allocator: std.mem.Allocator,
+    owned_allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    url: []const u8,
+    unix_socket_path: ?[]const u8,
+    forwarded: ForwardedHeaderInputs,
+    cancel_token: ?*const CancellationToken,
+    proxy_buffer_observer: proxy_buffer_account.Observer,
+    proxy_buffer_global: ?*proxy_buffer_account.Aggregate,
+    pool: ?*http.upstream_pool.UpstreamPool,
+) !WebSocketUpstreamResultH2 {
+    if (cancelStopped(cancel_token)) return error.RequestCancelled;
+    const uri = try std.Uri.parse(url);
+    const is_https = unix_socket_path == null and std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    const host = if (uri.host) |h| uriComponentBytes(h) else return error.UpstreamProtocolError;
+    const port: u16 = uri.port orelse (if (is_https) @as(u16, 443) else 80);
+    const connect_timeout_ms: u32 = if (cfg.upstream_connect_timeout_ms > 0) cfg.upstream_connect_timeout_ms else cfg.upstream_timeout_ms;
+    const base_read_ms: u32 = if (cfg.upstream_response_timeout_ms > 0) cfg.upstream_response_timeout_ms else cfg.upstream_timeout_ms;
+    const read_deadline_ms: u32 = if (cancel_token) |tok| tok.effectiveTimeoutMs(base_read_ms) else base_read_ms;
+
+    var client_key_buf: [http.websocket.CLIENT_KEY_LEN]u8 = undefined;
+    const client_key = http.websocket.generateClientKey(&client_key_buf);
+    var accept_buf: [http.websocket.ACCEPT_KEY_LEN]u8 = undefined;
+    const expected_accept = http.websocket.computeAcceptKey(client_key, &accept_buf);
+
+    var forwarded_for = try buildForwardedFor(allocator, forwarded.request_headers.get("x-forwarded-for"), forwarded.client_ip);
+    defer forwarded_for.deinit(allocator);
+    var extra_headers = std.array_list.Managed(std.http.Header).init(allocator);
+    defer extra_headers.deinit();
+    var traceparent_buf: [55]u8 = undefined;
+    var set_header_arena = std.heap.ArenaAllocator.init(allocator);
+    defer set_header_arena.deinit();
+    try appendForwardedProxyHeaders(&extra_headers, set_header_arena.allocator(), forwarded_for.value, &traceparent_buf, forwarded);
+    // Forward the subprotocol/extension negotiation fields verbatim: they
+    // are ordinary end-to-end headers under RFC 8441 (unlike the H1
+    // `Sec-WebSocket-Key`/`-Version`/`-Accept` challenge, which this proxy
+    // originates itself below).
+    if (forwarded.request_headers.get("sec-websocket-protocol")) |value| {
+        try extra_headers.append(.{ .name = "Sec-WebSocket-Protocol", .value = value });
+    }
+    if (forwarded.request_headers.get("sec-websocket-extensions")) |value| {
+        try extra_headers.append(.{ .name = "Sec-WebSocket-Extensions", .value = value });
+    }
+    try extra_headers.append(.{ .name = "Upgrade", .value = "websocket" });
+    try extra_headers.append(.{ .name = "Connection", .value = "Upgrade" });
+    try extra_headers.append(.{ .name = "Sec-WebSocket-Key", .value = client_key });
+    try extra_headers.append(.{ .name = "Sec-WebSocket-Version", .value = "13" });
+
+    const relay_bytes = @max(cfg.proxy_stream_buffer_size, 16 * 1024);
+    var key_buf: [512]u8 = undefined;
+    const key = if (unix_socket_path) |socket_path|
+        std.fmt.bufPrint(&key_buf, "unix:{s}", .{socket_path}) catch socket_path
+    else
+        std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_https) "https" else "http", host, port }) catch host;
+    const capacity = proxy_buffer_account.AggregateCapacity{
+        .origin = if (pool) |p| p.originBufferAccount(key) catch return error.ProxyBufferCapacityUnavailable else null,
+        .global = proxy_buffer_global,
+    };
+    var to_upstream_reservation = ProxyBufferReservation.init(.downstream_to_upstream, cfg.proxy_buffer_limits, proxy_buffer_observer, capacity);
+    errdefer to_upstream_reservation.releaseAll();
+    var to_client_reservation = ProxyBufferReservation.init(.upstream_to_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, capacity);
+    errdefer to_client_reservation.releaseAll();
+    to_upstream_reservation.reserve(relay_bytes) catch return error.ProxyBufferCapacityUnavailable;
+    to_client_reservation.reserve(relay_bytes) catch return error.ProxyBufferCapacityUnavailable;
+    const to_upstream_buf = try owned_allocator.alloc(u8, relay_bytes);
+    errdefer owned_allocator.free(to_upstream_buf);
+    const to_client_buf = try owned_allocator.alloc(u8, relay_bytes);
+    errdefer owned_allocator.free(to_client_buf);
+
+    const fd = try (if (unix_socket_path) |socket_path|
+        compat.connectBoundedUnix(socket_path, connect_timeout_ms)
+    else
+        compat.connectBoundedTcp(host, port, connect_timeout_ms));
+    errdefer _ = std.c.close(fd);
+    if (connect_timeout_ms > 0) setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
+    var tls: ?*http.upstream_tls.UpstreamTlsConn = null;
+    errdefer if (tls) |t| {
+        t.deinit();
+        owned_allocator.destroy(t);
+    };
+    if (is_https) {
+        const tls_ptr = try owned_allocator.create(http.upstream_tls.UpstreamTlsConn);
+        tls_ptr.* = http.upstream_tls.UpstreamTlsConn.connect(fd, host, .{
+            .skip_verify = !cfg.upstream_tls_verify,
+            .ca_bundle_path = cfg.upstream_tls_ca_bundle,
+            .sni_override = cfg.upstream_tls_server_name,
+            .client_cert_path = cfg.upstream_tls_client_cert,
+            .client_key_path = cfg.upstream_tls_client_key,
+            .alpn_policy = .require_http1,
+        }) catch |err| {
+            owned_allocator.destroy(tls_ptr);
+            return err;
+        };
+        tls = tls_ptr;
+    }
+
+    var head_arena = std.heap.ArenaAllocator.init(owned_allocator);
+    errdefer head_arena.deinit();
+    var switching = SwitchingHead{};
+    var rb = StreamReadBuf{ .buf = to_client_buf };
+    var head: ParsedUpstreamHead = undefined;
+    const no_body = NoDownstreamBody{};
+    if (tls) |t| {
+        head = try sendWebSocketHandshake(allocator, t, fd, uri, extra_headers.items, no_body, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, capacity, read_deadline_ms, &head_arena, &rb, &to_client_reservation, &switching);
+    } else {
+        head = try sendWebSocketHandshake(allocator, compat.netStreamFromFd(fd), fd, uri, extra_headers.items, no_body, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, capacity, read_deadline_ms, &head_arena, &rb, &to_client_reservation, &switching);
+    }
+
+    if (head.status_code != 101) {
+        // The origin declined the upgrade. There is no H1 downstream
+        // connection to relay its response onto, so this closes everything
+        // itself and leaves the status code for the caller's own H2 framing.
+        const status = head.status_code;
+        if (tls) |t| {
+            t.deinit();
+            owned_allocator.destroy(t);
+        }
+        _ = std.c.close(fd);
+        head_arena.deinit();
+        owned_allocator.free(to_upstream_buf);
+        owned_allocator.free(to_client_buf);
+        to_upstream_reservation.releaseAll();
+        to_client_reservation.releaseAll();
+        return .{ .refused = status };
+    }
+    if (!switching.completesHandshake(expected_accept)) return error.InvalidWebSocketHandshake;
+
+    const upgraded = try owned_allocator.create(UpgradedUpstream);
+    upgraded.* = .{
+        .allocator = owned_allocator,
+        .fd = fd,
+        .tls = tls,
+        .head_arena = head_arena,
+        .head = head,
+        .early_upstream_bytes = rb.available(),
+        .to_upstream_buf = to_upstream_buf,
+        .to_client_buf = to_client_buf,
+        .to_upstream_reservation = to_upstream_reservation,
+        .to_client_reservation = to_client_reservation,
+    };
+    return .{ .switched = upgraded };
+}
 
 /// Open a fresh HTTP/1.1 connection to the origin and send it the client's
 /// WebSocket handshake (#812). Upgrade connections never come from or go back

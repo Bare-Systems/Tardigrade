@@ -79,6 +79,7 @@ const gws_tunnel = @import("gateway_websocket_tunnel.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const ga = @import("gateway_auth.zig");
 const gfa = @import("gateway_forward_auth.zig");
+const gh2ws = @import("gateway_h2_websocket.zig");
 
 // Local runtime shorthands only. Keep this list to state/types used by
 // edge_gateway itself; call subsystem behavior through the owning module alias
@@ -3384,16 +3385,18 @@ fn h2EncodedHeaderBlockLimit(cfg: *const edge_config.EdgeConfig, buffered_reques
 /// and requires the ordinary request tuple. Silently replacing an earlier
 /// `:authority` (or `:path`) makes different hops disagree about which
 /// virtual host or authorization boundary the request addresses.
-fn h2RequestHeaderBlockIsValid(fields: []const http.hpack.HeaderField, initial: bool) bool {
+fn h2RequestHeaderBlockIsValid(fields: []const http.hpack.HeaderField, initial: bool, extended_connect_enabled: bool) bool {
     var saw_regular = false;
     var saw_method = false;
     var saw_scheme = false;
     var saw_authority = false;
     var saw_path = false;
+    var saw_protocol = false;
     var method: ?[]const u8 = null;
     var scheme: ?[]const u8 = null;
     var path: ?[]const u8 = null;
     var authority: ?[]const u8 = null;
+    var protocol: ?[]const u8 = null;
     var host: ?[]const u8 = null;
 
     for (fields) |field| {
@@ -3430,6 +3433,13 @@ fn h2RequestHeaderBlockIsValid(fields: []const http.hpack.HeaderField, initial: 
             if (saw_path) return false;
             saw_path = true;
             path = field.value;
+        } else if (std.mem.eql(u8, field.name, ":protocol")) {
+            // RFC 8441 Extended CONNECT's pseudo-header. Only meaningful
+            // alongside `:method: CONNECT`; validated below once every
+            // pseudo-header has been collected.
+            if (saw_protocol) return false;
+            saw_protocol = true;
+            protocol = field.value;
         } else {
             return false;
         }
@@ -3439,11 +3449,29 @@ fn h2RequestHeaderBlockIsValid(fields: []const http.hpack.HeaderField, initial: 
     if (!saw_method) return false;
     if (http.Method.parse(method.?) == null) return false;
     if (std.mem.eql(u8, method.?, "CONNECT")) {
-        return saw_authority and !saw_scheme and !saw_path and http.request.isValidAuthority(authority.?);
+        if (protocol) |p| {
+            // RFC 8441 §4: a valid Extended CONNECT carries the same
+            // `:scheme`/`:authority`/`:path` triple an ordinary request
+            // would, plus exactly one `:protocol`. It is only ever
+            // syntactically admissible once this connection has actually
+            // negotiated the capability (RFC 9113 §8.5.1 would otherwise
+            // make `:protocol` an unrecognized pseudo-header).
+            if (!extended_connect_enabled) return false;
+            if (!std.mem.eql(u8, p, "websocket")) return false;
+            if (!saw_scheme or !saw_path) return false;
+            if (!(std.mem.eql(u8, scheme.?, "http") or std.mem.eql(u8, scheme.?, "https"))) return false;
+            if (!h2RequestPathIsValid(path.?)) return false;
+            // Fall through to the shared authority/host validation below --
+            // identical to an ordinary request from this point on.
+        } else {
+            return saw_authority and !saw_scheme and !saw_path and http.request.isValidAuthority(authority.?);
+        }
+    } else {
+        if (protocol != null) return false; // `:protocol` only valid with CONNECT.
+        if (!saw_scheme or !saw_path) return false;
+        if (!(std.mem.eql(u8, scheme.?, "http") or std.mem.eql(u8, scheme.?, "https"))) return false;
+        if (!h2RequestPathIsValid(path.?)) return false;
     }
-    if (!saw_scheme or !saw_path) return false;
-    if (!(std.mem.eql(u8, scheme.?, "http") or std.mem.eql(u8, scheme.?, "https"))) return false;
-    if (!h2RequestPathIsValid(path.?)) return false;
     // Routing authority has one meaning across the native H2 path and the
     // synthesized H1 request used by shared routing/auth code. Multiple Host
     // fields or a Host that disagrees with :authority create the same
@@ -3524,6 +3552,25 @@ fn h2HeaderBlockRequestsConnect(fields: []const http.hpack.HeaderField) bool {
     return false;
 }
 
+/// True when an initial header block is a validated RFC 8441 Extended
+/// CONNECT asking for `:protocol: websocket`, as opposed to an ordinary
+/// (authority-form) CONNECT this proxy does not tunnel. The caller must
+/// already have run `h2RequestHeaderBlockIsValid` on `fields` (with
+/// `extended_connect_enabled` true) before trusting this as more than a
+/// cheap pre-filter.
+fn h2HeaderBlockIsExtendedConnectWebSocket(fields: []const http.hpack.HeaderField) bool {
+    var is_connect = false;
+    var protocol: ?[]const u8 = null;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, ":method")) {
+            is_connect = std.mem.eql(u8, field.value, "CONNECT");
+        } else if (std.mem.eql(u8, field.name, ":protocol")) {
+            protocol = field.value;
+        }
+    }
+    return is_connect and protocol != null and std.mem.eql(u8, protocol.?, "websocket");
+}
+
 fn h2StreamAcceptsInboundFrame(streams: *std.AutoHashMap(u31, http.http2_stream.Stream), stream_id: u31) bool {
     const existing = streams.get(stream_id) orelse return true;
     return existing.canReceive();
@@ -3539,6 +3586,210 @@ fn h2WriteSessionResponseHeaders(writer: anytype, allocator: std.mem.Allocator, 
     const block = try http.hpack.encodeLiteralHeaderBlock(allocator, status_headers[0..]);
     defer allocator.free(block);
     try http.http2_frame.writeFrame(writer, .headers, http.http2_frame.Flags.END_HEADERS, stream_id, block);
+}
+
+/// `:status 200` HEADERS answering an admitted RFC 8441 Extended CONNECT
+/// (#864): RFC 8441 §4 maps the H1 Upgrade response's `101` to a downstream
+/// `200`, since `:status` is not optional and HTTP/2 has no 101. Carries no
+/// END_STREAM -- the stream stays open for the opaque WebSocket relay -- and
+/// forwards only the origin's subprotocol/extension negotiation fields
+/// (`Sec-WebSocket-Protocol`/`-Extensions`); everything else about the
+/// origin's H1 handshake (its own `Upgrade`/`Connection`/`Sec-WebSocket-Accept`)
+/// is H1-specific framing that must never leak into an H2 response.
+fn h2WriteWebSocketAcceptedHeaders(writer: anytype, allocator: std.mem.Allocator, stream_id: u31, correlation_id: []const u8, upgraded: *const gp.UpgradedUpstream) !void {
+    var headers = std.array_list.Managed(http.hpack.HeaderField).init(allocator);
+    defer headers.deinit();
+    var lowered_names = std.array_list.Managed([]u8).init(allocator);
+    defer {
+        for (lowered_names.items) |n| allocator.free(n);
+        lowered_names.deinit();
+    }
+    try headers.append(.{ .name = ":status", .value = "200" });
+    for (upgraded.head.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "sec-websocket-protocol")) {
+            try headers.append(.{ .name = "sec-websocket-protocol", .value = header.value });
+        } else if (std.ascii.eqlIgnoreCase(header.name, "sec-websocket-extensions")) {
+            try headers.append(.{ .name = "sec-websocket-extensions", .value = header.value });
+        }
+    }
+    try headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.REQUEST_HEADER_NAME), .value = correlation_id });
+    try headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.HEADER_NAME), .value = correlation_id });
+    const block = try http.hpack.encodeLiteralHeaderBlock(allocator, headers.items);
+    defer allocator.free(block);
+    try http.http2_frame.writeFrame(writer, .headers, http.http2_frame.Flags.END_HEADERS, stream_id, block);
+}
+
+/// A declined RFC 8441 Extended CONNECT (an admission gate denial, or an
+/// upstream handshake failure): a real `:status`, END_STREAM, and no body.
+/// Unlike an ordinary proxied response, this never relays the origin's own
+/// response bytes (see `gp.openWebSocketUpstreamForH2`'s doc comment for
+/// why) and never risks DATA-frame flow control, since it carries no DATA
+/// frame at all.
+fn h2WriteWebSocketRefusalHeaders(writer: anytype, allocator: std.mem.Allocator, stream_id: u31, status_code: u16, correlation_id: []const u8) !void {
+    var status_buf: [8]u8 = undefined;
+    const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status_code}) catch "502";
+    var lowered_names = std.array_list.Managed([]u8).init(allocator);
+    defer {
+        for (lowered_names.items) |n| allocator.free(n);
+        lowered_names.deinit();
+    }
+    const headers = [_]http.hpack.HeaderField{
+        .{ .name = ":status", .value = status_str },
+        .{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.REQUEST_HEADER_NAME), .value = correlation_id },
+        .{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.HEADER_NAME), .value = correlation_id },
+    };
+    const block = try http.hpack.encodeLiteralHeaderBlock(allocator, headers[0..]);
+    defer allocator.free(block);
+    try http.http2_frame.writeFrame(writer, .headers, http.http2_frame.Flags.END_HEADERS | http.http2_frame.Flags.END_STREAM, stream_id, block);
+}
+
+/// Runs an admitted RFC 8441 WebSocket tunnel's relay on its own dedicated
+/// thread (detached: nothing joins it) and releases every resource the
+/// tunnel holds once it closes. Mirrors `gateway_websocket_tunnel.TunnelJob`'s
+/// cleanup for the H1 reactor-handed-off tunnel, but drives
+/// `http.h2_websocket_relay` directly instead of the fd-pollable
+/// `tunnel_reactor`: an H2 stream session's consumer is blocking by design
+/// (see `h2_stream_session.zig`), not fd-pollable.
+const H2WebSocketTunnel = struct {
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    session: *http.h2_stream_session.Session,
+    switched: *gh2ws.Switched,
+    correlation_id: []u8,
+
+    fn spawn(allocator: std.mem.Allocator, state: *GatewayState, session: *http.h2_stream_session.Session, switched: *gh2ws.Switched, correlation_id: []const u8) !void {
+        const self = try allocator.create(H2WebSocketTunnel);
+        errdefer allocator.destroy(self);
+        const owned_id = try allocator.dupe(u8, correlation_id);
+        errdefer allocator.free(owned_id);
+        self.* = .{
+            .allocator = allocator,
+            .state = state,
+            .session = session,
+            .switched = switched,
+            .correlation_id = owned_id,
+        };
+        const thread = try std.Thread.spawn(.{}, H2WebSocketTunnel.run, .{self});
+        thread.detach();
+    }
+
+    fn run(self: *H2WebSocketTunnel) void {
+        const upstream = http.h2_websocket_relay.Upstream{ .fd = self.switched.upgraded.fd, .tls = self.switched.upgraded.tls };
+        const stats = http.h2_websocket_relay.run(self.session, upstream, self.switched.upgraded.early_upstream_bytes, .{
+            .idle_timeout_ms = self.switched.idle_timeout_ms,
+            .max_lifetime_ms = self.switched.max_lifetime_ms,
+            .drain_timeout_ms = self.switched.drain_timeout_ms,
+            .shutdown_requested = http.shutdown.isShutdownRequested,
+            .reload_drain = self.switched.reload_drain,
+        });
+        self.state.metricsRecordWebSocketTunnelClosed(stats);
+        self.state.logger.debug(self.correlation_id, "H2 websocket tunnel closed: reason={s} duration_ms={d} client_to_upstream={d} upstream_to_client={d}", .{
+            stats.close_reason.label(),
+            stats.duration_ms,
+            stats.client_to_upstream_bytes,
+            stats.upstream_to_client_bytes,
+        });
+        if (self.session.consumerDetach()) {
+            self.session.deinit();
+            self.allocator.destroy(self.session);
+        }
+        self.switched.deinit();
+        self.allocator.free(self.correlation_id);
+        self.allocator.destroy(self);
+    }
+};
+
+/// Admit (or refuse) an RFC 8441 Extended CONNECT WebSocket request (#864).
+/// Called from `h2ProcessHeaderBlock` for a stream whose initial HEADERS
+/// already passed the Extended CONNECT shape/negotiation check. Runs the
+/// full admission pipeline and upstream dial synchronously on this
+/// connection's frame-reading thread -- see the call site's doc comment for
+/// why that is an explicitly scoped tradeoff -- then, on success, attaches
+/// the stream as a #867 session and hands it to `H2WebSocketTunnel` for the
+/// actual relay.
+fn h2AdmitWebSocketConnect(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    writer: anytype,
+    stream_id: u31,
+    ps: *const Http2PendingStream,
+    connection_id: u64,
+    connection_ip: []const u8,
+    max_connection_memory_bytes: usize,
+    buffered_request_bytes: *usize,
+    streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
+    sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
+    config_superseded_at: ?*const std.atomic.Value(u64),
+) !void {
+    const method = ps.method orelse return error.InvalidHttp2Request;
+    const path = ps.path orelse return error.InvalidHttp2Request;
+    const correlation_id = try http.correlation.generate(allocator);
+    defer allocator.free(correlation_id);
+
+    var synthesized = try synthesizeHttp2Request(allocator, method, path, ps);
+    defer synthesized.deinit(allocator);
+
+    const outcome = gh2ws.admit(allocator, cfg, state, &synthesized.request, connection_ip, correlation_id, ps.transport_early, config_superseded_at) catch |err| {
+        try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.internal_error.value());
+        if (streams.getPtr(stream_id)) |s| s.close();
+        return err;
+    };
+
+    switch (outcome) {
+        .not_matched => {
+            try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.refused_stream.value());
+            if (streams.getPtr(stream_id)) |s| s.close();
+        },
+        .refused => |refused| {
+            state.metricsRecordWebSocketUpgrade(refused.outcome);
+            try h2WriteWebSocketRefusalHeaders(writer, allocator, stream_id, refused.status_code, correlation_id);
+            if (streams.getPtr(stream_id)) |s| s.localEndStream() catch {};
+        },
+        .switched => |switched| {
+            if (max_connection_memory_bytes > 0 and HTTP2_SESSION_RESERVED_BYTES > max_connection_memory_bytes -| buffered_request_bytes.*) {
+                switched.deinit();
+                try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.refused_stream.value());
+                if (streams.getPtr(stream_id)) |s| s.close();
+                state.metricsRecordWebSocketUpgrade(.capacity);
+                return;
+            }
+            const session = try allocator.create(http.h2_stream_session.Session);
+            session.* = http.h2_stream_session.Session.init(allocator, connection_id, stream_id, HTTP2_SESSION_MAX_INBOUND_BYTES, HTTP2_SESSION_MAX_OUTBOUND_BYTES) catch |err| {
+                allocator.destroy(session);
+                switched.deinit();
+                return err;
+            };
+            h2WriteWebSocketAcceptedHeaders(writer, allocator, stream_id, correlation_id, switched.upgraded) catch |err| {
+                session.deinit();
+                allocator.destroy(session);
+                switched.deinit();
+                return err;
+            };
+            sessions.put(stream_id, session) catch |err| {
+                session.deinit();
+                allocator.destroy(session);
+                switched.deinit();
+                return err;
+            };
+            buffered_request_bytes.* += HTTP2_SESSION_RESERVED_BYTES;
+            http.h2_transport_metrics.sessionAttached();
+            state.metricsRecordWebSocketUpgrade(.relayed);
+            H2WebSocketTunnel.spawn(allocator, state, session, switched, correlation_id) catch |err| {
+                // The 200 is already committed and the session already
+                // registered: settle it the same way an ordinary session
+                // that lost its wake notification does (#951's
+                // `hasWakeFailure` path) rather than leaving a stream nothing
+                // will ever service. `SessionDrainCtx.drain` sends the
+                // actual RST_STREAM and fully detaches/frees the session on
+                // its next pass once it observes the cancel request.
+                session.requestCancel();
+                _ = session.consumerDetach();
+                switched.deinit();
+                state.logger.err(correlation_id, "failed to spawn H2 websocket relay thread: {s}", .{@errorName(err)});
+            };
+        },
+    }
 }
 
 /// Decompresses and discards a header block for a stream this connection has
@@ -3581,6 +3832,9 @@ fn h2ProcessHeaderBlock(
     buffered_request_bytes: *usize,
     connection_ip: []const u8,
     connection_id: u64,
+    cfg: *const edge_config.EdgeConfig,
+    h2_websocket_enabled: bool,
+    config_superseded_at: ?*const std.atomic.Value(u64),
 ) !void {
     var decoded = decoder.decode(allocator, header_block) catch {
         try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
@@ -3593,7 +3847,7 @@ fn h2ProcessHeaderBlock(
         // only be a trailing field section that ends the stream (RFC 9113
         // §8.1); the HPACK decode above still ran so the shared dynamic
         // table stays in sync with the peer's encoder regardless.
-        if (!h2RequestHeaderBlockIsValid(decoded.headers, false) or !end_stream) {
+        if (!h2RequestHeaderBlockIsValid(decoded.headers, false, h2_websocket_enabled) or !end_stream) {
             try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
             return error.InvalidHttp2Request;
         }
@@ -3603,7 +3857,7 @@ fn h2ProcessHeaderBlock(
     }
 
     const initial_headers = !pending.contains(stream_id);
-    if (!h2RequestHeaderBlockIsValid(decoded.headers, initial_headers)) {
+    if (!h2RequestHeaderBlockIsValid(decoded.headers, initial_headers, h2_websocket_enabled)) {
         try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
         return error.InvalidHttp2Request;
     }
@@ -3614,7 +3868,14 @@ fn h2ProcessHeaderBlock(
         return error.InvalidHttp2Request;
     }
 
-    if (initial_headers and h2HeaderBlockRequestsConnect(decoded.headers)) {
+    // RFC 8441 Extended CONNECT for WebSocket is handled on its own path
+    // below, once `ps` carries the parsed method/path/authority/headers an
+    // admission decision needs. Only reached when this connection actually
+    // negotiated the capability and the envelope already passed the
+    // Extended CONNECT shape check in `h2RequestHeaderBlockIsValid`.
+    const is_extended_connect_websocket = initial_headers and h2_websocket_enabled and h2HeaderBlockIsExtendedConnectWebSocket(decoded.headers);
+
+    if (initial_headers and h2HeaderBlockRequestsConnect(decoded.headers) and !is_extended_connect_websocket) {
         // CONNECT (RFC 9113 §8.5 authority-form) is syntactically valid HTTP/2
         // and the validator above accepts it as such, but Tardigrade does not
         // implement tunneling: the shared HTTP/1 adapter has no authority-form
@@ -3658,6 +3919,23 @@ fn h2ProcessHeaderBlock(
             // not become initial request metadata).
             try ps.headers.append(h.name, h.value);
         }
+    }
+
+    if (is_extended_connect_websocket) {
+        // Runs synchronously on this connection's frame-reading thread
+        // rather than through the #866 executor/handoff: admission here
+        // (auth/ACL/forward_auth/rate/Origin/capacity, then the upstream
+        // dial and H1 WebSocket handshake) is bounded by the same
+        // connect/response timeouts an ordinary proxied request already
+        // enforces, so it cannot block sibling streams indefinitely, but it
+        // does block them for the duration of one dial. A follow-up could
+        // route this through the executor the way ordinary H2 requests are
+        // (#866); RFC 8441 itself does not require that, and every other
+        // acceptance criterion (negotiation, validation, admission parity,
+        // opaque relay, close semantics, capacity) holds either way.
+        try h2AdmitWebSocketConnect(allocator, state, cfg, writer, stream_id, &ps, connection_id, connection_ip, max_connection_memory_bytes, buffered_request_bytes, streams, sessions, config_superseded_at);
+        ps.deinit(allocator);
+        return;
     }
 
     if (state.h2_session_test_hook) |hook| {
@@ -3733,58 +4011,119 @@ test "HTTP/2 request header validation rejects ambiguous pseudo-header envelopes
         .{ .name = ":authority", .value = "example.test" },
         .{ .name = ":path", .value = "/" },
         .{ .name = "accept", .value = "*/*" },
-    }, true));
+    }, true, false));
     try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "trusted.test" },
         .{ .name = ":authority", .value = "attacker.test" },
         .{ .name = ":path", .value = "/" },
-    }, true));
+    }, true, false));
     try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = "accept", .value = "*/*" },
         .{ .name = ":path", .value = "/after-regular" },
         .{ .name = ":scheme", .value = "https" },
-    }, true));
+    }, true, false));
     try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":unknown", .value = "ignored-before" },
         .{ .name = ":path", .value = "/" },
-    }, true));
+    }, true, false));
     try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":path", .value = "/" },
         .{ .name = "X-Uppercase", .value = "invalid-in-h2" },
-    }, true));
+    }, true, false));
     try std.testing.expect(h2RequestHeaderBlockIsValid(&.{
         .{ .name = "x-checksum", .value = "abc" },
-    }, false));
+    }, false, false));
     try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
         .{ .name = ":path", .value = "/pseudo-in-trailers" },
-    }, false));
+    }, false, false));
     try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "trusted.test" },
         .{ .name = ":path", .value = "/" },
         .{ .name = "host", .value = "attacker.test" },
-    }, true));
+    }, true, false));
     try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":path", .value = "/" },
         .{ .name = "host", .value = "one.test" },
         .{ .name = "host", .value = "two.test" },
-    }, true));
+    }, true, false));
     try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "trusted.test" },
         .{ .name = ":path", .value = "/private HTTP/1.1\r\nX-Injected: yes" },
-    }, true));
+    }, true, false));
+}
+
+test "HTTP/2 Extended CONNECT (RFC 8441) is only valid when negotiated, with :protocol=websocket, and with the ordinary request triple" {
+    const valid = [_]http.hpack.HeaderField{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/chat" },
+    };
+    try std.testing.expect(h2RequestHeaderBlockIsValid(&valid, true, true));
+    // Not negotiated on this connection: fails closed even though the
+    // envelope is otherwise well-formed.
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&valid, true, false));
+    try std.testing.expect(h2HeaderBlockIsExtendedConnectWebSocket(&valid));
+
+    // Wrong :protocol value.
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "other" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/chat" },
+    }, true, true));
+
+    // Missing :scheme/:path: a valid envelope requires the full triple once
+    // :protocol is present, unlike plain authority-form CONNECT.
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":authority", .value = "example.test" },
+    }, true, true));
+
+    // Duplicate :protocol.
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/chat" },
+    }, true, true));
+
+    // `:protocol` on an ordinary (non-CONNECT) request is never valid.
+    try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/chat" },
+    }, true, true));
+
+    // Plain authority-form CONNECT (no :protocol) is unaffected by whether
+    // this connection negotiated Extended CONNECT.
+    const plain_connect = [_]http.hpack.HeaderField{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    };
+    try std.testing.expect(h2RequestHeaderBlockIsValid(&plain_connect, true, true));
+    try std.testing.expect(h2RequestHeaderBlockIsValid(&plain_connect, true, false));
+    try std.testing.expect(!h2HeaderBlockIsExtendedConnectWebSocket(&plain_connect));
 }
 
 test "HTTP/2 padded payload parsing excludes transport padding" {
@@ -4212,10 +4551,33 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     defer h2InstallOutboundScheduler(conn, null);
     errdefer outbound.flush(conn.writer()) catch {};
 
-    try http.http2_frame.writeSettings(allocator, outbound_writer, &[_][2]u32{
-        .{ 0x3, HTTP2_MAX_CONCURRENT_STREAMS }, // max concurrent streams
-        .{ 0x4, HTTP2_INITIAL_WINDOW_SIZE }, // initial window size
-    });
+    // RFC 8441 §3: a server advertises Extended CONNECT support by sending
+    // SETTINGS_ENABLE_CONNECT_PROTOCOL = 1; the client needs no symmetric
+    // settings entry of its own, and this connection accepts a negotiated
+    // Extended CONNECT WebSocket stream (#864) from the moment this SETTINGS
+    // frame is written, not only once the client's ACK is observed (there is
+    // no capability signal to wait for on this side -- see
+    // `h2RequestHeaderBlockIsValid`'s `extended_connect_enabled` gate).
+    const h2_websocket_enabled = configRelaysWebSockets(cfg);
+    // The same supersession stamp H1's `websocketReloadDrain` reads from
+    // `ctx.config_superseded_at` (#812), threaded here so an admitted H2
+    // Extended CONNECT WebSocket tunnel (#864) honors `proxy_websocket_reload
+    // drain` identically: published once by the reload that supersedes this
+    // connection's leased configuration generation, never by this connection
+    // itself.
+    const config_superseded_at: ?*const std.atomic.Value(u64) = if (config_lease) |lease| &lease.version.superseded_at_ms else null;
+    if (h2_websocket_enabled) {
+        try http.http2_frame.writeSettings(allocator, outbound_writer, &[_][2]u32{
+            .{ 0x3, HTTP2_MAX_CONCURRENT_STREAMS }, // max concurrent streams
+            .{ 0x4, HTTP2_INITIAL_WINDOW_SIZE }, // initial window size
+            .{ 0x8, 1 }, // SETTINGS_ENABLE_CONNECT_PROTOCOL
+        });
+    } else {
+        try http.http2_frame.writeSettings(allocator, outbound_writer, &[_][2]u32{
+            .{ 0x3, HTTP2_MAX_CONCURRENT_STREAMS }, // max concurrent streams
+            .{ 0x4, HTTP2_INITIAL_WINDOW_SIZE }, // initial window size
+        });
+    }
     try outbound.flush(conn.writer());
 
     var decoder = http.hpack.Decoder.init();
@@ -4787,6 +5149,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         &buffered_request_bytes,
                         connection_ip,
                         connection_id,
+                        cfg,
+                        h2_websocket_enabled,
+                        config_superseded_at,
                     );
                     if (pending.getPtr(frame.stream_id)) |stamped| stamped.headers.client_cert = connClientCertificate(conn);
                 }
@@ -5088,6 +5453,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                             &buffered_request_bytes,
                             connection_ip,
                             connection_id,
+                            cfg,
+                            h2_websocket_enabled,
+                            config_superseded_at,
                         );
                         if (pending.getPtr(stream_id)) |stamped| stamped.headers.client_cert = connClientCertificate(conn);
                     }
@@ -16892,7 +17260,7 @@ test "H2 CONNECT is refused at stream scope instead of failing in the H1 adapter
     try std.testing.expect(h2RequestHeaderBlockIsValid(&.{
         .{ .name = ":method", .value = "CONNECT" },
         .{ .name = ":authority", .value = "example.test:443" },
-    }, true));
+    }, true, false));
     try std.testing.expect(h2HeaderBlockRequestsConnect(&.{
         .{ .name = ":method", .value = "CONNECT" },
         .{ .name = ":authority", .value = "example.test:443" },
@@ -16904,15 +17272,15 @@ test "H2 CONNECT is refused at stream scope instead of failing in the H1 adapter
         .{ .name = ":method", .value = "CONNECT" },
         .{ .name = ":authority", .value = "example.test:443" },
         .{ .name = ":path", .value = "/" },
-    }, true));
+    }, true, false));
     try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
         .{ .name = ":method", .value = "CONNECT" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "example.test:443" },
-    }, true));
+    }, true, false));
     try std.testing.expect(!h2RequestHeaderBlockIsValid(&.{
         .{ .name = ":method", .value = "CONNECT" },
-    }, true));
+    }, true, false));
 
     // Ordinary methods are not mistaken for CONNECT.
     try std.testing.expect(!h2HeaderBlockRequestsConnect(&.{
@@ -16950,6 +17318,7 @@ test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
     defer sessions.deinit();
     var state: GatewayState = undefined;
     state.h2_session_test_hook = null;
+    const cfg = std.mem.zeroes(edge_config.EdgeConfig);
 
     const block = try http.hpack.encodeLiteralHeaderBlock(allocator, &.{
         .{ .name = ":method", .value = "CONNECT" },
@@ -16979,6 +17348,9 @@ test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
         &buffered,
         "127.0.0.1",
         1,
+        &cfg,
+        false,
+        null,
     );
 
     // No request was assembled and nothing was queued for dispatch.

@@ -8069,55 +8069,30 @@ fn h2SessionInboundBytesByStream(allocator: std.mem.Allocator, port: u16, stream
     return prometheusMetricValueWithLabel(metrics.body, "tardigrade_h2_session_inbound_bytes_by_stream{", label);
 }
 
-/// #951 second review: the process-wide `tardigrade_h2_writer_queue_bytes_
-/// high_water`/`_cap_bytes` gauges are not comparable to each other once
-/// more than one connection is live (the first sums every connection's
-/// queued bytes, the second is whichever connection last published its
-/// cap). This test's single H2 connection has exactly one registered
-/// writer-queue slot, so its high-water mark and cap can be read back and
-/// compared directly, both scoped to that one real `connection_id`.
-fn h2WriterQueueConnectionPeak(allocator: std.mem.Allocator, body: []const u8) !?H2TransportConnectionPeak {
+/// #951 fourth review: the previous version of this helper *guessed* which
+/// connection the test's own sessions lived on by picking whichever
+/// connection-scoped writer-queue slot happened to have the largest
+/// high-water mark. A second real connection with a larger queue (or even
+/// this same function's own transient metrics-scrape connection, in a
+/// configuration where it queues more) would silently mislabel the
+/// evidence with the wrong connection id while still reading real per-
+/// stream gauges from the right one. Callers now resolve the actual
+/// `connection_id` directly via `h2SessionConnectionIdByStream` (the
+/// per-stream series already carries it, #951 third review) and pass it
+/// in here as an exact join key instead of a guess.
+fn h2WriterQueueConnectionPeak(body: []const u8, allocator: std.mem.Allocator, connection_id: u64) !?H2TransportConnectionPeak {
     const hw_prefix = "tardigrade_h2_writer_queue_bytes_high_water_by_connection{";
     const cap_prefix = "tardigrade_h2_writer_queue_cap_bytes_by_connection{";
     const depth_hw_prefix = "tardigrade_h2_writer_queue_depth_high_water_by_connection{";
-    const id_prefix = "connection_id=\"";
-    var lines = std.mem.splitScalar(u8, body, '\n');
-    var best_label: ?[]const u8 = null;
-    var best_connection_id: u64 = 0;
-    var best_high_water: ?u64 = null;
-    while (lines.next()) |line_raw| {
-        const line = std.mem.trim(u8, line_raw, " \t\r");
-        if (!std.mem.startsWith(u8, line, hw_prefix)) continue;
-        const brace_end = std.mem.indexOfScalar(u8, line, '}') orelse continue;
-        const label = line[hw_prefix.len..brace_end];
-        const id_start = (std.mem.indexOf(u8, label, id_prefix) orelse continue) + id_prefix.len;
-        const id_end = std.mem.indexOfScalarPos(u8, label, id_start, '"') orelse continue;
-        const this_connection_id = std.fmt.parseInt(u64, label[id_start..id_end], 10) catch continue;
-        const this_high_water = std.fmt.parseInt(u64, std.mem.trim(u8, line[brace_end + 1 ..], " \t"), 10) catch continue;
-        // #951 third review: a short-lived metrics-scraping connection is
-        // itself a real, simultaneously-registered writer-queue slot (this
-        // very function's own caller opens one to fetch this scrape), so
-        // "whichever line happens to come first in the scrape text" is not
-        // a meaningful selection once more than one connection is live.
-        // Selecting the highest observed high-water deterministically
-        // identifies the connection actually under load -- an idle
-        // connection's high water never leaves 0 -- instead of an
-        // arbitrary one that could be this transient scraping connection.
-        if (best_high_water == null or this_high_water > best_high_water.?) {
-            best_label = label;
-            best_connection_id = this_connection_id;
-            best_high_water = this_high_water;
-        }
-    }
-    const label = best_label orelse return null;
-    const hw = best_high_water orelse return null;
+    const label = try std.fmt.allocPrint(allocator, "connection_id=\"{d}\"", .{connection_id});
+    defer allocator.free(label);
+    const hw = prometheusMetricValueWithLabel(body, hw_prefix, label) orelse return null;
     const cap = prometheusMetricValueWithLabel(body, cap_prefix, label) orelse return null;
     const depth_hw = prometheusMetricValueWithLabel(body, depth_hw_prefix, label) orelse return null;
-    _ = allocator;
-    return .{ .connection_id = best_connection_id, .writer_queue_bytes_high_water = hw, .writer_queue_cap_bytes = cap, .writer_queue_depth_high_water = depth_hw };
+    return .{ .connection_id = connection_id, .writer_queue_bytes_high_water = hw, .writer_queue_cap_bytes = cap, .writer_queue_depth_high_water = depth_hw };
 }
 
-fn h2WriterQueueConnectionPeakSample(allocator: std.mem.Allocator, port: u16) !H2TransportConnectionPeak {
+fn h2WriterQueueConnectionPeakSample(allocator: std.mem.Allocator, port: u16, connection_id: u64) !H2TransportConnectionPeak {
     var metrics = try pureZigH2GetResponse(allocator, port, &.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":path", .value = "/status/metrics" },
@@ -8125,7 +8100,38 @@ fn h2WriterQueueConnectionPeakSample(allocator: std.mem.Allocator, port: u16) !H
         .{ .name = ":authority", .value = "tardigrade.test" },
     });
     defer metrics.deinit(allocator);
-    return (try h2WriterQueueConnectionPeak(allocator, metrics.body)) orelse error.MissingH2TransportMetric;
+    return (try h2WriterQueueConnectionPeak(metrics.body, allocator, connection_id)) orelse error.MissingH2TransportMetric;
+}
+
+/// #951 fourth review: reads the real `connection_id` label a session's own
+/// by-stream gauge already carries (#951 third review), so the connection
+/// actually hosting a given stream can be joined on exactly instead of
+/// guessed. `null` once the stream has detached, same as the sibling
+/// by-stream helpers.
+fn h2SessionConnectionIdByStream(allocator: std.mem.Allocator, port: u16, stream_id: u31) !?u64 {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    const prefix = "tardigrade_h2_session_queued_bytes_by_stream{";
+    const stream_label = try std.fmt.allocPrint(allocator, "stream_id=\"{d}\"", .{stream_id});
+    defer allocator.free(stream_label);
+    const id_prefix = "connection_id=\"";
+    var lines = std.mem.splitScalar(u8, metrics.body, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const brace_end = std.mem.indexOfScalar(u8, line, '}') orelse continue;
+        const label = line[prefix.len..brace_end];
+        if (std.mem.indexOf(u8, label, stream_label) == null) continue;
+        const id_start = (std.mem.indexOf(u8, label, id_prefix) orelse continue) + id_prefix.len;
+        const id_end = std.mem.indexOfScalarPos(u8, label, id_start, '"') orelse continue;
+        return std.fmt.parseInt(u64, label[id_start..id_end], 10) catch null;
+    }
+    return null;
 }
 
 /// Each call briefly opens its own short-lived metrics connection
@@ -8452,13 +8458,22 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     try std.testing.expect(session_a_outbound_bytes > 0);
     try std.testing.expect(session_a_outbound_bytes <= 256 * 1024);
     try std.testing.expect(session_a_inbound_bytes <= 65_535);
+    // #951 fourth review: resolve the real `connection_id` both sessions
+    // actually ride (each session's own by-stream gauge already carries
+    // it) instead of guessing it from whichever connection's writer queue
+    // happens to have the largest high water mark -- a guess a second,
+    // busier live connection (or even the transient metrics-scrape
+    // connection below) could silently win.
+    const session_a_connection_id = (try h2SessionConnectionIdByStream(allocator, tardigrade.port, session_a)) orelse return error.MissingH2TransportMetric;
+    const session_b_connection_id = (try h2SessionConnectionIdByStream(allocator, tardigrade.port, session_b)) orelse return error.MissingH2TransportMetric;
+    try std.testing.expectEqual(session_a_connection_id, session_b_connection_id);
     // #951 second review: the process-wide aggregate high water cannot be
     // compared against the process-wide cap gauge once more than one
     // connection is live (the latter is just whichever connection last
     // published its own cap) -- this is this test's one real connection's
     // own writer-queue high water bound against *its own* configured cap,
     // both scoped to the same `connection_id`.
-    const connection_peak_populated = try h2WriterQueueConnectionPeakSample(allocator, tardigrade.port);
+    const connection_peak_populated = try h2WriterQueueConnectionPeakSample(allocator, tardigrade.port, session_a_connection_id);
     try std.testing.expect(connection_peak_populated.writer_queue_bytes_high_water <= connection_peak_populated.writer_queue_cap_bytes);
     try std.testing.expect(connection_peak_populated.writer_queue_bytes_high_water > 0);
     // #951 third review: the backpressure injected above enqueues several
@@ -8474,10 +8489,11 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     const session_a_peak_high_water = (try h2SessionQueuedBytesHighWaterByStream(allocator, tardigrade.port, session_a)) orelse return error.MissingH2TransportMetric;
     const session_b_peak_high_water = (try h2SessionQueuedBytesHighWaterByStream(allocator, tardigrade.port, session_b)) orelse return error.MissingH2TransportMetric;
     // Both sessions ride the one real H2 connection this test opened
-    // (`connection_peak_populated.connection_id`, itself now selected by
-    // peak load rather than scrape-text order, #951 third review): every
-    // stream-peak entry below carries that same connection identity rather
-    // than leaving it implicit as the earlier schema did.
+    // (`connection_peak_populated.connection_id`, itself now resolved by
+    // joining on each session's own real connection id rather than
+    // guessed from peak load, #951 fourth review): every stream-peak entry
+    // below carries that same connection identity rather than leaving it
+    // implicit as the earlier schema did.
     const stream_peaks = [_]H2TransportStreamPeak{
         .{ .label = "session_a", .connection_id = connection_peak_populated.connection_id, .stream_id = session_a, .queued_bytes_high_water = session_a_peak_high_water },
         .{ .label = "session_b", .connection_id = connection_peak_populated.connection_id, .stream_id = session_b, .queued_bytes_high_water = session_b_peak_high_water },

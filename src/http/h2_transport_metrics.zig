@@ -159,14 +159,23 @@ pub fn sessionSlotUpdate(handle: ?SlotHandle, inbound_bytes: usize, outbound_byt
 }
 
 /// Release a session's slot. Safe to call with a `null` handle (no-op).
+///
+/// #951 third review: `in_use` must be the *last* thing cleared, after
+/// `seq` is already back to even -- clearing it any earlier lets a
+/// concurrent `sessionSlotRegister`'s `cmpxchgStrong(false, true)` claim
+/// this same slot and start overwriting its identity/byte fields while
+/// this unregister's own odd->even transition is still in flight, which
+/// can momentarily publish an even `seq` mid-registration (register's own
+/// odd->even pair interleaved between this call's two increments) that a
+/// concurrent scraper could mistake for a consistent snapshot.
 pub fn sessionSlotUnregister(handle: ?SlotHandle) void {
     const h = handle orelse return;
     const slot = &session_slots[h.index];
     if (slot.generation.load(.monotonic) != h.generation) return;
     _ = slot.seq.fetchAdd(1, .release); // odd: mutation in progress.
     slot.ready.store(false, .release);
-    slot.in_use.store(false, .release);
     _ = slot.seq.fetchAdd(1, .release); // even: released.
+    slot.in_use.store(false, .release); // last: only now may a new register claim this slot.
 }
 
 pub const SessionSlotSnapshot = struct {
@@ -322,14 +331,19 @@ pub fn writerQueueSlotDepthChanged(handle: ?SlotHandle, delta: i64) void {
     _ = slot.seq.fetchAdd(1, .release); // even: published.
 }
 
+/// #951 third review: same claim-ordering fix as `sessionSlotUnregister`
+/// above -- `in_use` must not clear until `seq` is already back to even,
+/// or a concurrent `writerQueueSlotRegister` can claim this slot and begin
+/// writing its own identity/byte fields before this unregister's mutation
+/// has fully published.
 pub fn writerQueueSlotUnregister(handle: ?SlotHandle) void {
     const h = handle orelse return;
     const slot = &writer_queue_slots[h.index];
     if (slot.generation.load(.monotonic) != h.generation) return;
     _ = slot.seq.fetchAdd(1, .release); // odd: mutation in progress.
     slot.ready.store(false, .release);
-    slot.in_use.store(false, .release);
     _ = slot.seq.fetchAdd(1, .release); // even: released.
+    slot.in_use.store(false, .release); // last: only now may a new register claim this slot.
 }
 
 pub const WriterQueueSlotSnapshot = struct {

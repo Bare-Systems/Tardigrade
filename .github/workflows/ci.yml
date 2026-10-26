@@ -1204,6 +1204,49 @@ jobs:
             zig build test-integration-smoke --summary all
           fi
 
+      # #863 review: the real-process H2 transport validation gate's
+      # test-only session hook only compiles into the `tardi` binary with
+      # `-Dh2-test-hook` (kept out of every default/release build
+      # otherwise, per `build.zig`'s `h2_test_hook_enabled`), so this needs
+      # its own `zig build` invocation rather than folding into the shared
+      # step above. Runs in both smoke and full mode: it is the one curated
+      # case `docs/CI.md` requires to be visibly green on every PR.
+      - name: "Run H2 transport validation smoke (#863)"
+        env:
+          TARDIGRADE_H2_TRANSPORT_EVIDENCE: ${{ runner.temp }}/h2-transport-validation.json
+          TARDIGRADE_H2_TRANSPORT_SOURCE_SHA: ${{ github.sha }}
+        run: zig build test-integration-h2-transport-smoke -Dh2-test-hook --summary all
+
+      # `writeH2TransportValidationEvidence` silently no-ops when its env
+      # vars are unset, so a missing file must fail this job rather than
+      # just producing an empty/absent artifact; a present file must also
+      # actually carry the expected schema and a real source SHA, not just
+      # exist.
+      - name: Validate H2 transport validation evidence (#863)
+        run: |
+          file="${{ runner.temp }}/h2-transport-validation.json"
+          if [ ! -s "$file" ]; then
+            echo "::error::$file is missing or empty -- the #863 H2 transport validation case did not emit evidence" >&2
+            exit 1
+          fi
+          schema_version=$(jq -er '.schema_version' "$file")
+          issue=$(jq -er '.issue' "$file")
+          source_sha=$(jq -er '.source_sha' "$file")
+          if [ "$issue" != "863" ] || [ "$source_sha" != "${{ github.sha }}" ]; then
+            echo "::error::$file has unexpected issue=$issue source_sha=$source_sha (want issue=863 source_sha=${{ github.sha }})" >&2
+            exit 1
+          fi
+          echo "H2 transport validation evidence OK (schema_version=$schema_version, source_sha=$source_sha)"
+
+      - name: Upload H2 transport validation evidence (#863)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: h2-transport-validation
+          path: ${{ runner.temp }}/h2-transport-validation.json
+          if-no-files-found: error
+          retention-days: 14
+
   # #884's automatic-HTTPS path is intentionally experimental and disabled
   # in release builds, so the default integration leg correctly skips it.
   # Keep a dedicated required leg that enables the opt-in and executes the

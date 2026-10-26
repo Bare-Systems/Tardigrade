@@ -7835,6 +7835,986 @@ test "interop.h2.finite request handoff keeps siblings and control frames live (
     try std.testing.expectEqual(@as(u32, 3), fast_upstream.requestCount());
 }
 
+// ---------------------------------------------------------------------------
+// #863 real-process H2 transport validation gate -- see `run()`'s own
+// comment in `edge_gateway.zig` on `TARDIGRADE_TEST_H2_SESSION_HOOK` and
+// `H2_TEST_ONLY_SESSION_PATH` for why this sentinel path (hardcoded here
+// rather than shared, same convention as `TARDIGRADE_TLS_SERVER_NAME`
+// elsewhere in this file) is reachable at all. Mirrors the #830 WebSocket
+// reactor smoke test's RSS/FD/socket evidence shape
+// (`websocketRssKb`/`websocketOpenFds`/`websocketSocketCount`,
+// `writeWebsocketReactorSmokeEvidence`) rather than inventing a second
+// convention.
+// ---------------------------------------------------------------------------
+
+const h2_test_only_session_path = "/__h2_transport_test_only_session";
+
+fn h2SendHeaders(client: *PureZigTlsClient, allocator: std.mem.Allocator, stream_id: u31, end_stream: bool, headers: []const hpack.HeaderField) !void {
+    const block = try hpack.encodeLiteralHeaderBlock(allocator, headers);
+    defer allocator.free(block);
+    const flags: u8 = if (end_stream) 0x1 | 0x4 else 0x4;
+    try client.writeHttp2Frame(0x1, flags, stream_id, block);
+}
+
+fn h2SendData(client: *PureZigTlsClient, stream_id: u31, end_stream: bool, payload: []const u8) !void {
+    try client.writeHttp2Frame(0x0, if (end_stream) @as(u8, 0x1) else 0x0, stream_id, payload);
+}
+
+const H2TransportSessionEcho = struct { stream_id: u31, buf: *std.array_list.Managed(u8) };
+
+/// Real-process counterpart of `edge_gateway.zig`'s `testDrainOrdinaryResponse`:
+/// same per-call state machine (first frame must be `HEADERS` carrying
+/// `:status == expected_status`; `DATA` only valid after; anything else,
+/// or any frame once the stream already completed, fails the test) so a
+/// failed/empty/reset response can never be mistaken for a correct one.
+///
+/// PR review (#863): a status-only oracle also passes for an empty or
+/// truncated body, which never proves successful REST/static/proxy routing
+/// under multiplexed load. When `expected_body` is non-null, the accumulated
+/// DATA bytes and any `content-length` response header (if present) must
+/// match it exactly, not just the terminal status/END_STREAM shape.
+fn h2DrainOrdinaryResponse(
+    client: *PureZigTlsClient,
+    allocator: std.mem.Allocator,
+    stream_id: u31,
+    expected_status: u16,
+    expected_body: ?[]const u8,
+    session_echoes: []const H2TransportSessionEcho,
+    frame_budget: usize,
+) !void {
+    const State = enum { awaiting_headers, awaiting_body, done };
+    var state: State = .awaiting_headers;
+    var frames_read: usize = 0;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    var content_length: ?u64 = null;
+    while (true) {
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+        } else if (frame.stream_id == stream_id) {
+            switch (state) {
+                .awaiting_headers => {
+                    if (frame.typ != 0x1) return error.UnexpectedOrdinaryResponseFrame;
+                    var decoded = try hpack.decode(allocator, frame.payload);
+                    defer hpack.deinitDecoded(allocator, &decoded);
+                    var status: ?u16 = null;
+                    for (decoded.headers) |h| {
+                        if (std.mem.eql(u8, h.name, ":status")) status = std.fmt.parseInt(u16, h.value, 10) catch null;
+                        if (std.mem.eql(u8, h.name, "content-length")) content_length = std.fmt.parseInt(u64, h.value, 10) catch null;
+                    }
+                    try std.testing.expectEqual(@as(?u16, expected_status), status);
+                    state = if ((frame.flags & 0x1) != 0) .done else .awaiting_body;
+                },
+                .awaiting_body => {
+                    if (frame.typ != 0x0) return error.UnexpectedOrdinaryResponseFrame;
+                    try body.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) state = .done;
+                },
+                .done => return error.UnexpectedOrdinaryResponseFrame,
+            }
+            if (state == .done) {
+                if (expected_body) |expected| {
+                    try std.testing.expectEqualSlices(u8, expected, body.items);
+                    if (content_length) |cl| try std.testing.expectEqual(@as(u64, expected.len), cl);
+                }
+                return;
+            }
+        } else {
+            for (session_echoes) |echo| {
+                if (frame.stream_id == echo.stream_id and frame.typ == 0x0) try echo.buf.appendSlice(frame.payload);
+            }
+        }
+        frames_read += 1;
+        if (frames_read > frame_budget) return error.TestFrameBudgetExceeded;
+    }
+}
+
+/// Duplicated from `edge_gateway.zig`'s `percentile95` rather than shared:
+/// this is a separate build module (`tests/integration.zig` has no
+/// dependency on the `tardi` binary's own source), same convention
+/// `tests/http3_soak.zig` already documents for its own RSS/FD helpers.
+/// PR review (#863): millisecond-resolution timestamps make this gate
+/// meaningless -- a genuinely healthy real-process p95 commonly rounds to
+/// 0-2ms, at which point even the intended 2x ratio check still tolerates a
+/// 25x-50x regression once a fixed millisecond floor is added on top.
+/// Microsecond resolution keeps the ratio itself the real bound.
+fn h2TransportElapsedUs(started_ns: i128) i64 {
+    return @intCast(@divFloor(compat.monotonicNanoTimestamp() - started_ns, 1_000));
+}
+
+fn h2TransportPercentile95(allocator: std.mem.Allocator, samples: []const i64) !i64 {
+    const sorted = try allocator.dupe(i64, samples);
+    defer allocator.free(sorted);
+    std.mem.sort(i64, sorted, {}, std.sort.asc(i64));
+    const rank = (sorted.len * 95 + 99) / 100; // ceil(0.95 * len), at least 1
+    const index = @min(sorted.len - 1, if (rank == 0) 0 else rank - 1);
+    return sorted[index];
+}
+
+const H2TransportResourceSample = struct {
+    phase: []const u8,
+    rss_kb: u64,
+    open_fds: u64,
+    sockets: u64,
+    active_connections: u64,
+    worker_active_jobs: u64,
+    worker_queued_jobs: u64,
+    // #863 review: real #867 session lifecycle/queue/flow-control counters
+    // (`src/http/h2_transport_metrics.zig`), not fabricated or generic
+    // process-level stand-ins. Required, not `orelse 0`: a missing series
+    // here means the evidence this field exists to prove is simply absent,
+    // which must fail the sample rather than silently read as zero.
+    h2_active_sessions: u64,
+    h2_session_queued_bytes: u64,
+    h2_session_queued_bytes_high_water: u64,
+    h2_writer_queue_bytes_high_water: u64,
+    h2_flow_control_blocked_total: u64,
+    h2_flow_control_resumed_total: u64,
+    h2_session_close_goaway_total: u64,
+    h2_session_close_detached_total: u64,
+    // #951 review: the aggregate above cannot show the cap any individual
+    // stream's own queue is bounded by; this is the connection-wide
+    // `Scheduler.max_queued_bytes` constant every connection publishes on
+    // creation, read back so the assertion below never hardcodes a value
+    // that could silently drift from the real configured cap.
+    h2_writer_queue_cap_bytes: u64,
+    // #951 second review: a real per-H2-connection count (one writer-queue
+    // slot per live connection), not the generic `tardigrade_active_
+    // connections` gauge this same suite already found reading 0 even
+    // with a live H2 connection serving traffic.
+    h2_active_connections: u64,
+    // #951 third review: both fixed-capacity slot tables (per-stream and
+    // per-connection) report an overflow counter instead of silently
+    // dropping or aliasing coverage -- sampled and asserted zero at every
+    // phase below, not merely exposed and never read, so a workload that
+    // actually exceeds either table's capacity fails this gate instead of
+    // producing a quietly incomplete "green" evidence artifact.
+    h2_session_slot_overflow_total: u64,
+    h2_writer_queue_slot_overflow_total: u64,
+};
+
+/// #951 review: a lock-consistent, test-only snapshot of one currently-
+/// attached #867 session's own real queued bytes, by HTTP/2 stream id --
+/// not the process-wide aggregate, which cannot show which stream is
+/// responsible for it or bound an individual stream against its own cap.
+/// `null` means this stream id has no currently-registered slot, which is
+/// also the expected (not error) state once a session has fully detached.
+/// #951 second review: the metric now also carries a `connection_id` label
+/// (each session is only ever uniquely identified by the pair, since a
+/// stream id is only unique within one connection); this test opens a
+/// single H2 connection for its whole run, so matching on `stream_id`
+/// alone is still unambiguous here.
+fn h2SessionQueuedBytesByStream(allocator: std.mem.Allocator, port: u16, stream_id: u31) !?u64 {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    const label = try std.fmt.allocPrint(allocator, "stream_id=\"{d}\"", .{stream_id});
+    defer allocator.free(label);
+    return prometheusMetricValueWithLabel(metrics.body, "tardigrade_h2_session_queued_bytes_by_stream{", label);
+}
+
+/// #951 second review: `h2SessionQueuedBytesByStream` above bounds the
+/// combined inbound+outbound occupancy, but inbound and outbound each have
+/// their own independent cap (`HTTP2_SESSION_MAX_INBOUND_BYTES` vs
+/// `_MAX_OUTBOUND_BYTES`) -- a session can legitimately hold up to *both*
+/// caps at once without violating either, which the combined figure alone
+/// cannot distinguish from a single-direction cap violation.
+fn h2SessionOutboundBytesByStream(allocator: std.mem.Allocator, port: u16, stream_id: u31) !?u64 {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    const label = try std.fmt.allocPrint(allocator, "stream_id=\"{d}\"", .{stream_id});
+    defer allocator.free(label);
+    return prometheusMetricValueWithLabel(metrics.body, "tardigrade_h2_session_outbound_bytes_by_stream{", label);
+}
+
+/// #951 second review: #863's required "per-stream peak occupancy"
+/// evidence -- the per-phase `H2TransportResourceSample` only carries the
+/// process-wide aggregate high water, which cannot show which stream set
+/// it. `null` once the stream has detached, same as the other by-stream
+/// helpers.
+fn h2SessionQueuedBytesHighWaterByStream(allocator: std.mem.Allocator, port: u16, stream_id: u31) !?u64 {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    const label = try std.fmt.allocPrint(allocator, "stream_id=\"{d}\"", .{stream_id});
+    defer allocator.free(label);
+    return prometheusMetricValueWithLabel(metrics.body, "tardigrade_h2_session_queued_bytes_high_water_by_stream{", label);
+}
+
+fn h2SessionInboundBytesByStream(allocator: std.mem.Allocator, port: u16, stream_id: u31) !?u64 {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    const label = try std.fmt.allocPrint(allocator, "stream_id=\"{d}\"", .{stream_id});
+    defer allocator.free(label);
+    return prometheusMetricValueWithLabel(metrics.body, "tardigrade_h2_session_inbound_bytes_by_stream{", label);
+}
+
+/// #951 fourth review: the previous version of this helper *guessed* which
+/// connection the test's own sessions lived on by picking whichever
+/// connection-scoped writer-queue slot happened to have the largest
+/// high-water mark. A second real connection with a larger queue (or even
+/// this same function's own transient metrics-scrape connection, in a
+/// configuration where it queues more) would silently mislabel the
+/// evidence with the wrong connection id while still reading real per-
+/// stream gauges from the right one. Callers now resolve the actual
+/// `connection_id` directly via `h2SessionConnectionIdByStream` (the
+/// per-stream series already carries it, #951 third review) and pass it
+/// in here as an exact join key instead of a guess.
+fn h2WriterQueueConnectionPeak(body: []const u8, allocator: std.mem.Allocator, connection_id: u64) !?H2TransportConnectionPeak {
+    const hw_prefix = "tardigrade_h2_writer_queue_bytes_high_water_by_connection{";
+    const cap_prefix = "tardigrade_h2_writer_queue_cap_bytes_by_connection{";
+    const depth_hw_prefix = "tardigrade_h2_writer_queue_depth_high_water_by_connection{";
+    const label = try std.fmt.allocPrint(allocator, "connection_id=\"{d}\"", .{connection_id});
+    defer allocator.free(label);
+    const hw = prometheusMetricValueWithLabel(body, hw_prefix, label) orelse return null;
+    const cap = prometheusMetricValueWithLabel(body, cap_prefix, label) orelse return null;
+    const depth_hw = prometheusMetricValueWithLabel(body, depth_hw_prefix, label) orelse return null;
+    return .{ .connection_id = connection_id, .writer_queue_bytes_high_water = hw, .writer_queue_cap_bytes = cap, .writer_queue_depth_high_water = depth_hw };
+}
+
+fn h2WriterQueueConnectionPeakSample(allocator: std.mem.Allocator, port: u16, connection_id: u64) !H2TransportConnectionPeak {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    return (try h2WriterQueueConnectionPeak(metrics.body, allocator, connection_id)) orelse error.MissingH2TransportMetric;
+}
+
+/// #951 fourth review: reads the real `connection_id` label a session's own
+/// by-stream gauge already carries (#951 third review), so the connection
+/// actually hosting a given stream can be joined on exactly instead of
+/// guessed. `null` once the stream has detached, same as the sibling
+/// by-stream helpers.
+fn h2SessionConnectionIdByStream(allocator: std.mem.Allocator, port: u16, stream_id: u31) !?u64 {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    const prefix = "tardigrade_h2_session_queued_bytes_by_stream{";
+    const stream_label = try std.fmt.allocPrint(allocator, "stream_id=\"{d}\"", .{stream_id});
+    defer allocator.free(stream_label);
+    const id_prefix = "connection_id=\"";
+    var lines = std.mem.splitScalar(u8, metrics.body, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const brace_end = std.mem.indexOfScalar(u8, line, '}') orelse continue;
+        const label = line[prefix.len..brace_end];
+        if (std.mem.indexOf(u8, label, stream_label) == null) continue;
+        const id_start = (std.mem.indexOf(u8, label, id_prefix) orelse continue) + id_prefix.len;
+        const id_end = std.mem.indexOfScalarPos(u8, label, id_start, '"') orelse continue;
+        return std.fmt.parseInt(u64, label[id_start..id_end], 10) catch null;
+    }
+    return null;
+}
+
+/// Each call briefly opens its own short-lived metrics connection
+/// (`pureZigH2GetResponse`), which itself transiently touches this
+/// process's own fd/socket count by the same small, constant amount at
+/// every phase -- an consistent, documented measurement bias rather than
+/// an asymmetry between phases.
+fn h2TransportResourceSample(allocator: std.mem.Allocator, pid: std.c.pid_t, port: u16, phase: []const u8) !H2TransportResourceSample {
+    var metrics = try pureZigH2GetResponse(allocator, port, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/status/metrics" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    defer metrics.deinit(allocator);
+    return .{
+        .phase = phase,
+        .rss_kb = try websocketRssKb(allocator, pid),
+        .open_fds = try websocketOpenFds(allocator, pid),
+        .sockets = try websocketSocketCount(allocator, pid),
+        .active_connections = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse 0,
+        .worker_active_jobs = prometheusMetricValue(metrics.body, "tardigrade_worker_active_jobs") orelse 0,
+        .worker_queued_jobs = prometheusMetricValue(metrics.body, "tardigrade_worker_queued_jobs") orelse 0,
+        .h2_active_sessions = prometheusMetricValue(metrics.body, "tardigrade_h2_active_sessions") orelse return error.MissingH2TransportMetric,
+        .h2_session_queued_bytes = prometheusMetricValue(metrics.body, "tardigrade_h2_session_queued_bytes") orelse return error.MissingH2TransportMetric,
+        .h2_session_queued_bytes_high_water = prometheusMetricValue(metrics.body, "tardigrade_h2_session_queued_bytes_high_water") orelse return error.MissingH2TransportMetric,
+        .h2_writer_queue_bytes_high_water = prometheusMetricValue(metrics.body, "tardigrade_h2_writer_queue_bytes_high_water") orelse return error.MissingH2TransportMetric,
+        .h2_flow_control_blocked_total = prometheusMetricValue(metrics.body, "tardigrade_h2_flow_control_blocked_total") orelse return error.MissingH2TransportMetric,
+        .h2_flow_control_resumed_total = prometheusMetricValue(metrics.body, "tardigrade_h2_flow_control_resumed_total") orelse return error.MissingH2TransportMetric,
+        .h2_session_close_goaway_total = prometheusMetricValue(metrics.body, "tardigrade_h2_session_close_total{reason=\"goaway\"}") orelse return error.MissingH2TransportMetric,
+        .h2_session_close_detached_total = prometheusMetricValue(metrics.body, "tardigrade_h2_session_close_total{reason=\"detached\"}") orelse return error.MissingH2TransportMetric,
+        .h2_writer_queue_cap_bytes = prometheusMetricValue(metrics.body, "tardigrade_h2_writer_queue_cap_bytes") orelse return error.MissingH2TransportMetric,
+        .h2_active_connections = prometheusMetricValue(metrics.body, "tardigrade_h2_active_connections") orelse return error.MissingH2TransportMetric,
+        .h2_session_slot_overflow_total = prometheusMetricValue(metrics.body, "tardigrade_h2_session_slot_overflow_total") orelse return error.MissingH2TransportMetric,
+        .h2_writer_queue_slot_overflow_total = prometheusMetricValue(metrics.body, "tardigrade_h2_writer_queue_slot_overflow_total") orelse return error.MissingH2TransportMetric,
+    };
+}
+
+/// #951 third review: every `h2TransportResourceSample` call site in this
+/// test feeds straight into this assertion -- a workload that silently
+/// overran either fixed-capacity slot table (so the per-stream/per-
+/// connection evidence it was supposed to produce is actually incomplete)
+/// must fail the #863 gate immediately at the sample that first observes
+/// it, not merely carry the counter through to the JSON unexamined.
+fn h2TransportAssertNoSlotOverflow(sample: H2TransportResourceSample) !void {
+    try std.testing.expectEqual(@as(u64, 0), sample.h2_session_slot_overflow_total);
+    try std.testing.expectEqual(@as(u64, 0), sample.h2_writer_queue_slot_overflow_total);
+}
+
+const H2TransportStreamPeak = struct {
+    label: []const u8,
+    // #951 third review: metrics now correctly treat `(connection_id,
+    // stream_id)` as the unique session identity, since a stream id is
+    // only unique within one connection -- carrying only `stream_id` here
+    // recreates that same ambiguity in the persisted evidence artifact
+    // #864/#910 reuse.
+    connection_id: u64,
+    stream_id: u31,
+    queued_bytes_high_water: u64,
+};
+
+const H2TransportConnectionPeak = struct {
+    connection_id: u64,
+    writer_queue_bytes_high_water: u64,
+    writer_queue_cap_bytes: u64,
+    // #951 third review: pending frame-intent depth is a distinct
+    // dimension from byte occupancy above (a scheduler holding many tiny
+    // frames can be deep and unfair while still small by byte capacity).
+    writer_queue_depth_high_water: u64,
+};
+
+fn writeH2TransportValidationEvidence(
+    allocator: std.mem.Allocator,
+    baseline_p95_us: i64,
+    loaded_p95_us: i64,
+    samples: []const H2TransportResourceSample,
+    stream_peaks: []const H2TransportStreamPeak,
+    connection_peak: H2TransportConnectionPeak,
+) !void {
+    const path = compat.getEnvVarOwned(allocator, "TARDIGRADE_H2_TRANSPORT_EVIDENCE") catch return;
+    defer allocator.free(path);
+    const source_sha = compat.getEnvVarOwned(allocator, "TARDIGRADE_H2_TRANSPORT_SOURCE_SHA") catch try allocator.dupe(u8, "unknown");
+    defer allocator.free(source_sha);
+    const runner = compat.getEnvVarOwned(allocator, "RUNNER_NAME") catch try allocator.dupe(u8, "local");
+    defer allocator.free(runner);
+    // schema_version 4 (#951 third review): adds a `connection_id` to
+    // every `stream_peaks` entry (a stream id is only unique within one
+    // connection), `writer_queue_depth_high_water` to `connection_peak`
+    // (frame-intent depth is a distinct dimension from byte occupancy),
+    // and both slot-overflow counters to every resource sample.
+    // schema_version 3 (#951 second review): adds `h2_active_connections`
+    // to every resource sample, plus top-level `stream_peaks` (per-stream
+    // uniquely-attributed peak occupancy) and `connection_peak` (this
+    // connection's own writer-queue high water bound against its own
+    // configured cap) -- #863 explicitly requires per-stream/connection
+    // peak occupancy and writer depth, which the process-wide aggregate
+    // alone cannot show.
+    const json = try compat.stringifyAlloc(allocator, .{
+        .schema_version = 4,
+        .issue = 863,
+        .profile = "h2-transport-validation",
+        .source_sha = source_sha,
+        .platform = @tagName(builtin.os.tag),
+        .architecture = @tagName(builtin.cpu.arch),
+        .cpu_count = std.Thread.getCpuCount() catch 0,
+        .runner = runner,
+        .rest_baseline_p95_us = baseline_p95_us,
+        .rest_loaded_p95_us = loaded_p95_us,
+        .resource_samples = samples,
+        .stream_peaks = stream_peaks,
+        .connection_peak = connection_peak,
+    }, .{});
+    defer allocator.free(json);
+
+    var file = try compat.cwd().createFile(path, .{ .truncate = true, .read = false });
+    defer file.close();
+    try file.writeAll(json);
+    try file.writeAll("\n");
+}
+
+test "interop.h2.live-process transport validation: long-lived sessions, REST load, fault injection, and resource settle (#863)" {
+    // #863 review: the test-only `h2_session_test_hook` wiring this test
+    // depends on only exists in the spawned `tardi` binary when it was
+    // built with `-Dh2-test-hook` (kept out of every default/release
+    // build otherwise). `test-integration-h2-transport-smoke` (build.zig)
+    // fails the build closed when that flag is missing instead of relying
+    // on this skip to surface, matching the `acme_experimental` convention.
+    if (!integration_options.h2_test_hook_enabled) return error.SkipZigTest;
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .auth_token_hashes = null,
+        .ready_https_insecure = true,
+        // PR review (#863): a status-only 404 oracle on an unconfigured
+        // path never proves successful REST/static/proxy routing under
+        // multiplexed load. `/ordinary` is a real configured 200 route with
+        // a known, finite body, so every baseline/loaded sample below
+        // exercises genuine routing and response-byte correctness; the
+        // 404 case stays covered separately against an unconfigured path.
+        .config_text =
+        \\location = /ordinary {
+        \\    return 200 ok;
+        \\}
+        ,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_TEST_H2_SESSION_HOOK", .value = "1" },
+            // The 2MiB production default (`edge_config.zig`) comfortably
+            // fits ordinary request bodies but not two #867
+            // `HTTP2_SESSION_RESERVED_BYTES` (~1.3MiB each) sessions at
+            // once; raise it so the second session attach below is
+            // admitted rather than legitimately refused for a reason
+            // unrelated to what this test is proving.
+            .{ .name = "TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES", .value = "8388608" },
+            // `spawn()` itself defaults this to "1" (room for ordinary
+            // requests while idle). This test keeps one connection whose
+            // own thread blocks for the entire test (two long-lived
+            // sessions never return control), so a second worker is
+            // required for the metrics-sampling connections opened
+            // concurrently below to ever be accepted.
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" },
+        },
+    });
+    defer tardigrade.stop();
+    const pid = tardigrade.child.id orelse return error.MissingChildPid;
+
+    var samples = std.array_list.Managed(H2TransportResourceSample).init(allocator);
+    defer samples.deinit();
+    const baseline_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "baseline");
+    try h2TransportAssertNoSlotOverflow(baseline_sample);
+    try samples.append(baseline_sample);
+    // `tardigrade.spawn` starts a genuinely fresh child process (#863
+    // review: real-process, not in-process), so this process's own
+    // `h2_transport_metrics` globals have never been touched by anything
+    // before this exact point.
+    try std.testing.expectEqual(@as(u64, 0), baseline_sample.h2_active_sessions);
+    try std.testing.expectEqual(@as(u64, 0), baseline_sample.h2_session_queued_bytes);
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    // PR review (#863): an `errdefer client.destroy()` here stays armed for
+    // the rest of the function, including after the explicit `destroy()`
+    // below -- any later failure (settle-polling deadline, a trailing
+    // assertion) would then double-free the same pointer. `client_owned`
+    // makes the single `defer` below a no-op once ownership has already
+    // been given up on the success path.
+    var client_owned = true;
+    defer if (client_owned) client.destroy();
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{});
+    try completeH2SettingsHandshake(client, allocator);
+
+    var next_stream_id: u31 = 1;
+
+    // >=50 same-run baseline REST samples before any long-lived session
+    // exists (#863's agreed acceptance criterion) -- the real-process,
+    // real-TLS counterpart of the ratio gate `edge_gateway.zig`'s
+    // in-process socketpair test already proves.
+    var baseline_samples = try std.array_list.Managed(i64).initCapacity(allocator, 50);
+    defer baseline_samples.deinit();
+    var b: usize = 0;
+    while (b < 50) : (b += 1) {
+        const stream_id = next_stream_id;
+        next_stream_id += 2;
+        const started_ns = compat.monotonicNanoTimestamp();
+        try h2SendHeaders(client, allocator, stream_id, true, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/ordinary" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        });
+        try h2DrainOrdinaryResponse(client, allocator, stream_id, 200, "ok", &.{}, 50);
+        try baseline_samples.append(h2TransportElapsedUs(started_ns));
+    }
+
+    // Negative case (#863 review): a genuinely unconfigured path still 404s,
+    // kept as a separate assertion now that the sampled requests above
+    // exercise a real 200 route instead of relying on 404 for both.
+    {
+        const stream_id = next_stream_id;
+        next_stream_id += 2;
+        try h2SendHeaders(client, allocator, stream_id, true, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/not-a-configured-route" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        });
+        try h2DrainOrdinaryResponse(client, allocator, stream_id, 404, null, &.{}, 50);
+    }
+
+    // Two long-lived sessions admitted on the same connection through the
+    // #863 test-only hook.
+    const session_a = next_stream_id;
+    next_stream_id += 2;
+    const session_b = next_stream_id;
+    next_stream_id += 2;
+    for ([_]u31{ session_a, session_b }) |session_stream| {
+        try h2SendHeaders(client, allocator, session_stream, false, &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = h2_test_only_session_path },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        });
+        var headers: Http2WireFrame = while (true) {
+            var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+            if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+                try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+                frame.deinit(allocator);
+                continue;
+            }
+            if (frame.typ == 0x8) {
+                frame.deinit(allocator);
+                continue;
+            }
+            break frame;
+        };
+        defer headers.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x1), headers.typ);
+        try std.testing.expectEqual(session_stream, headers.stream_id);
+    }
+
+    // #951 review: `h2_session_queued_bytes` now tracks real bytes sitting
+    // in a session's bounded queues (see `h2_stream_session.zig`), not a
+    // fixed `HTTP2_SESSION_RESERVED_BYTES` charge merely for being
+    // attached -- an idle just-attached session reports 0. Generate actual
+    // backpressure instead: this client never raises the connection-level
+    // flow-control window past RFC 9113's 65,535-byte default (no
+    // WINDOW_UPDATE on stream 0 so far), so echoing back more than that in
+    // one go reliably leaves the remainder genuinely queued in session_a's
+    // outbound buffer, deterministically and without depending on OS
+    // socket buffer sizes.
+    const backpressure_len: usize = 100 * 1024;
+    const backpressure_payload = try allocator.alloc(u8, backpressure_len);
+    defer allocator.free(backpressure_payload);
+    @memset(backpressure_payload, 'q');
+    {
+        var sent: usize = 0;
+        while (sent < backpressure_len) {
+            const chunk_len = @min(backpressure_len - sent, 8 * 1024);
+            try h2SendData(client, session_a, false, backpressure_payload[sent..][0..chunk_len]);
+            sent += chunk_len;
+        }
+    }
+
+    const populated_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "populated");
+    try h2TransportAssertNoSlotOverflow(populated_sample);
+    try samples.append(populated_sample);
+    try std.testing.expectEqual(@as(u64, 2), populated_sample.h2_active_sessions);
+    try std.testing.expect(populated_sample.h2_session_queued_bytes > baseline_sample.h2_session_queued_bytes);
+    try std.testing.expectEqual(populated_sample.h2_session_queued_bytes, populated_sample.h2_session_queued_bytes_high_water);
+    // #951 second review: a real H2 connection count -- unlike the generic
+    // `tardigrade_active_connections` gauge this same test already found
+    // reading 0 even with the live main connection open, this must see at
+    // least that connection and the transient one `h2TransportResourceSample`
+    // itself just opened to fetch `/status/metrics`.
+    try std.testing.expect(populated_sample.h2_active_connections >= 2);
+
+    // #951 review: per-stream attribution, not just the aggregate -- only
+    // session_a received backpressure above, so its own slot must carry
+    // (not merely contribute anonymously to) the entire aggregate, while
+    // the untouched session_b's slot stays at 0.
+    //
+    // #951 second review: inbound and outbound occupancy are bounded by
+    // two different, independent caps (`HTTP2_SESSION_MAX_OUTBOUND_BYTES`
+    // vs `_MAX_INBOUND_BYTES` in `edge_gateway.zig`, duplicated here as
+    // literals since neither is exported) -- comparing their *combined*
+    // figure against only the outbound cap could silently pass a
+    // violation of either cap alone, or reject a session legitimately
+    // holding up to both caps at once. This backpressure scenario only
+    // ever stalls the outbound direction (the client never raises the
+    // connection-level receive window), so each direction is checked
+    // against its own cap separately.
+    const session_a_outbound_bytes = (try h2SessionOutboundBytesByStream(allocator, tardigrade.port, session_a)) orelse return error.MissingH2TransportMetric;
+    const session_a_inbound_bytes = (try h2SessionInboundBytesByStream(allocator, tardigrade.port, session_a)) orelse return error.MissingH2TransportMetric;
+    const session_b_queued_bytes = (try h2SessionQueuedBytesByStream(allocator, tardigrade.port, session_b)) orelse return error.MissingH2TransportMetric;
+    try std.testing.expectEqual(populated_sample.h2_session_queued_bytes, session_a_outbound_bytes + session_a_inbound_bytes);
+    try std.testing.expectEqual(@as(u64, 0), session_b_queued_bytes);
+    try std.testing.expect(session_a_outbound_bytes > 0);
+    try std.testing.expect(session_a_outbound_bytes <= 256 * 1024);
+    try std.testing.expect(session_a_inbound_bytes <= 65_535);
+    // #951 fourth review: resolve the real `connection_id` both sessions
+    // actually ride (each session's own by-stream gauge already carries
+    // it) instead of guessing it from whichever connection's writer queue
+    // happens to have the largest high water mark -- a guess a second,
+    // busier live connection (or even the transient metrics-scrape
+    // connection below) could silently win.
+    const session_a_connection_id = (try h2SessionConnectionIdByStream(allocator, tardigrade.port, session_a)) orelse return error.MissingH2TransportMetric;
+    const session_b_connection_id = (try h2SessionConnectionIdByStream(allocator, tardigrade.port, session_b)) orelse return error.MissingH2TransportMetric;
+    try std.testing.expectEqual(session_a_connection_id, session_b_connection_id);
+    // #951 second review: the process-wide aggregate high water cannot be
+    // compared against the process-wide cap gauge once more than one
+    // connection is live (the latter is just whichever connection last
+    // published its own cap) -- this is this test's one real connection's
+    // own writer-queue high water bound against *its own* configured cap,
+    // both scoped to the same `connection_id`.
+    const connection_peak_populated = try h2WriterQueueConnectionPeakSample(allocator, tardigrade.port, session_a_connection_id);
+    try std.testing.expect(connection_peak_populated.writer_queue_bytes_high_water <= connection_peak_populated.writer_queue_cap_bytes);
+    try std.testing.expect(connection_peak_populated.writer_queue_bytes_high_water > 0);
+    // #951 third review: the backpressure injected above enqueues several
+    // DATA frame chunks, so pending frame-intent depth -- a dimension
+    // distinct from byte occupancy -- must also have genuinely peaked
+    // above 0, not merely been exposed and left unexercised.
+    try std.testing.expect(connection_peak_populated.writer_queue_depth_high_water > 0);
+
+    // #951 second review: capture per-stream uniquely-attributed peak
+    // occupancy for the persisted evidence while both sessions are still
+    // attached (`h2SessionQueuedBytesByStream`/`_high_water` return `null`
+    // once a stream's slot has been released on detach).
+    const session_a_peak_high_water = (try h2SessionQueuedBytesHighWaterByStream(allocator, tardigrade.port, session_a)) orelse return error.MissingH2TransportMetric;
+    const session_b_peak_high_water = (try h2SessionQueuedBytesHighWaterByStream(allocator, tardigrade.port, session_b)) orelse return error.MissingH2TransportMetric;
+    // Both sessions ride the one real H2 connection this test opened
+    // (`connection_peak_populated.connection_id`, itself now resolved by
+    // joining on each session's own real connection id rather than
+    // guessed from peak load, #951 fourth review): every stream-peak entry
+    // below carries that same connection identity rather than leaving it
+    // implicit as the earlier schema did.
+    const stream_peaks = [_]H2TransportStreamPeak{
+        .{ .label = "session_a", .connection_id = connection_peak_populated.connection_id, .stream_id = session_a, .queued_bytes_high_water = session_a_peak_high_water },
+        .{ .label = "session_b", .connection_id = connection_peak_populated.connection_id, .stream_id = session_b, .queued_bytes_high_water = session_b_peak_high_water },
+    };
+
+    // Release both the connection-level *and* session_a's own stream-level
+    // window so the stalled remainder of `backpressure_payload` actually
+    // drains before this test moves on -- whichever was smaller is what
+    // actually stalled the echo, and a generous increment on both avoids
+    // needing a second round trip either way.
+    {
+        var inc: [4]u8 = undefined;
+        std.mem.writeInt(u32, inc[0..4], @intCast(backpressure_len), .big);
+        try client.writeHttp2Frame(0x8, 0, 0, inc[0..]);
+        try client.writeHttp2Frame(0x8, 0, session_a, inc[0..]);
+    }
+    var backpressure_echo = std.array_list.Managed(u8).init(allocator);
+    defer backpressure_echo.deinit();
+    while (backpressure_echo.items.len < backpressure_len) {
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            continue;
+        }
+        if (frame.typ == 0x8) continue;
+        if (frame.stream_id == session_a and frame.typ == 0x0) try backpressure_echo.appendSlice(frame.payload);
+    }
+    try std.testing.expectEqualSlices(u8, backpressure_payload, backpressure_echo.items);
+
+    // #951 review: per-stream queued bytes must return to 0 once flow
+    // control recovers and the backlog actually drains -- *while the
+    // session remains attached*, not only as a side effect of later
+    // detaching it (`h2SessionQueuedBytesByStream` returning `null` would
+    // otherwise prove nothing about drain, only about teardown).
+    try std.testing.expectEqual(@as(?u64, 0), try h2SessionQueuedBytesByStream(allocator, tardigrade.port, session_a));
+
+    var session_a_echo = std.array_list.Managed(u8).init(allocator);
+    defer session_a_echo.deinit();
+    var session_b_echo = std.array_list.Managed(u8).init(allocator);
+    defer session_b_echo.deinit();
+    const echoes = [_]H2TransportSessionEcho{
+        .{ .stream_id = session_a, .buf = &session_a_echo },
+        .{ .stream_id = session_b, .buf = &session_b_echo },
+    };
+    var expected_a = std.array_list.Managed(u8).init(allocator);
+    defer expected_a.deinit();
+    var expected_b = std.array_list.Managed(u8).init(allocator);
+    defer expected_b.deinit();
+
+    // >=50 loaded REST samples while both sessions stay genuinely active.
+    var loaded_samples = try std.array_list.Managed(i64).initCapacity(allocator, 50);
+    defer loaded_samples.deinit();
+    var l: usize = 0;
+    while (l < 50) : (l += 1) {
+        var chunk_buf_a: [24]u8 = undefined;
+        const chunk_a = try std.fmt.bufPrint(&chunk_buf_a, "a-{d}", .{l});
+        try expected_a.appendSlice(chunk_a);
+        try h2SendData(client, session_a, false, chunk_a);
+        var chunk_buf_b: [24]u8 = undefined;
+        const chunk_b = try std.fmt.bufPrint(&chunk_buf_b, "b-{d}", .{l});
+        try expected_b.appendSlice(chunk_b);
+        try h2SendData(client, session_b, false, chunk_b);
+
+        const stream_id = next_stream_id;
+        next_stream_id += 2;
+        const started_ns = compat.monotonicNanoTimestamp();
+        try h2SendHeaders(client, allocator, stream_id, true, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/ordinary" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        });
+        try h2DrainOrdinaryResponse(client, allocator, stream_id, 200, "ok", &echoes, 200);
+        try loaded_samples.append(h2TransportElapsedUs(started_ns));
+    }
+
+    const drain_deadline = compat.milliTimestamp() + 5_000;
+    while (session_a_echo.items.len < expected_a.items.len or session_b_echo.items.len < expected_b.items.len) {
+        if (compat.milliTimestamp() > drain_deadline) return error.SessionEchoDidNotSettle;
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            continue;
+        }
+        for (echoes) |echo| {
+            if (frame.stream_id == echo.stream_id and frame.typ == 0x0) try echo.buf.appendSlice(frame.payload);
+        }
+    }
+    try std.testing.expectEqualSlices(u8, expected_a.items, session_a_echo.items);
+    try std.testing.expectEqualSlices(u8, expected_b.items, session_b_echo.items);
+
+    try std.testing.expect(baseline_samples.items.len >= 50);
+    try std.testing.expect(loaded_samples.items.len >= 50);
+    const baseline_p95_us = try h2TransportPercentile95(allocator, baseline_samples.items);
+    const loaded_p95_us = try h2TransportPercentile95(allocator, loaded_samples.items);
+    // PR review (#863): any fixed floor on top of the 2x ratio (50ms at
+    // millisecond resolution, still 20ms/20_000us at microsecond
+    // resolution) lets a regression many times the specified ratio pass
+    // silently whenever the baseline itself is a few milliseconds or less --
+    // exactly the common case for a real loopback TLS round trip. #863's
+    // acceptance criterion is the ratio itself, not a throughput allowance,
+    // so this enforces it directly. A zero baseline would make any ratio
+    // check meaningless (vacuously true for a zero loaded p95, impossible
+    // to satisfy otherwise), so a nonzero baseline is asserted first --
+    // monotonicNanoTimestamp's resolution is far finer than a real TLS
+    // round trip over loopback, so a genuinely healthy sample set is never
+    // zero here.
+    try std.testing.expect(baseline_p95_us > 0);
+    try std.testing.expect(loaded_p95_us <= baseline_p95_us * 2);
+
+    // Fault injection: a PING round-trip (#863's "PING/SETTINGS progress"),
+    // then RST_STREAM on session B while session A and ordinary siblings
+    // keep working.
+    const ping_payload = [_]u8{ 'h', '2', 't', 'e', 's', 't', 'o', 'k' };
+    try client.writeHttp2Frame(0x6, 0, 0, &ping_payload);
+    var saw_ping_ack = false;
+    var ping_frames: usize = 0;
+    while (!saw_ping_ack) {
+        ping_frames += 1;
+        if (ping_frames > 50) return error.TestFrameBudgetExceeded;
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x6 and (frame.flags & 0x1) != 0 and std.mem.eql(u8, frame.payload, &ping_payload)) saw_ping_ack = true;
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+    }
+
+    try client.writeHttp2Frame(0x3, 0, session_b, &[_]u8{ 0, 0, 0, 8 }); // RST_STREAM(cancel)
+
+    const after_rst_stream = next_stream_id;
+    next_stream_id += 2;
+    try h2SendHeaders(client, allocator, after_rst_stream, true, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ordinary" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    });
+    try h2DrainOrdinaryResponse(client, allocator, after_rst_stream, 200, "ok", &.{.{ .stream_id = session_a, .buf = &session_a_echo }}, 200);
+
+    try h2SendData(client, session_a, false, "still-alive");
+    const still_alive_deadline = compat.milliTimestamp() + 5_000;
+    while (!std.mem.endsWith(u8, session_a_echo.items, "still-alive")) {
+        if (compat.milliTimestamp() > still_alive_deadline) return error.SessionEchoDidNotSettle;
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            continue;
+        }
+        if (frame.stream_id == session_a and frame.typ == 0x0) try session_a_echo.appendSlice(frame.payload);
+    }
+
+    const post_fault_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "post_fault");
+    try h2TransportAssertNoSlotOverflow(post_fault_sample);
+    try samples.append(post_fault_sample);
+    // RST_STREAM(cancel) on session B above detached exactly that one
+    // session (through `h2DetachSession`'s `.detached` reason, #863
+    // review). Session A is still attached, but the "still-alive" wait
+    // above only returns once its echo has fully drained back to the
+    // client, so with real (not reserved-capacity) queue-byte accounting
+    // there is nothing left actually queued at this sampling point.
+    try std.testing.expectEqual(@as(u64, 1), post_fault_sample.h2_active_sessions);
+    try std.testing.expectEqual(@as(u64, 1), post_fault_sample.h2_session_close_detached_total);
+    try std.testing.expect(post_fault_sample.h2_session_queued_bytes < populated_sample.h2_session_queued_bytes);
+    try std.testing.expectEqual(@as(u64, 0), post_fault_sample.h2_session_queued_bytes);
+
+    // Second churn cycle (#863 review: prove no monotonic growth across
+    // *repeated* churn, not just a single open/close pass). The per-session
+    // echo round trip itself is already proven above (session_a/session_b)
+    // and in `edge_gateway.zig`'s dedicated 20-iteration churn test; this
+    // cycle's job is purely to show resource usage returns to the same
+    // per-session level again after a second attach/close pass on this
+    // same connection, rather than growing with each additional cycle.
+    const session_c = next_stream_id;
+    next_stream_id += 2;
+    const session_d = next_stream_id;
+    next_stream_id += 2;
+    // Attach both before closing either: closing `session_c` inside this
+    // same loop iteration would race its own closing DATA(END_STREAM)
+    // frame against `session_d`'s attach HEADERS below, since both ride
+    // the same connection.
+    for ([_]u31{ session_c, session_d }) |session_stream| {
+        try h2SendHeaders(client, allocator, session_stream, false, &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = h2_test_only_session_path },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        });
+        var headers: Http2WireFrame = while (true) {
+            var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+            if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+                try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+                frame.deinit(allocator);
+                continue;
+            }
+            if (frame.typ == 0x8 or frame.stream_id != session_stream) {
+                frame.deinit(allocator);
+                continue;
+            }
+            break frame;
+        };
+        defer headers.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x1), headers.typ);
+        try std.testing.expectEqual(session_stream, headers.stream_id);
+    }
+    // Close immediately: this cycle proves settle after a repeated
+    // attach/close pass, not another echo round trip.
+    try h2SendData(client, session_c, true, "");
+    try h2SendData(client, session_d, true, "");
+
+    const churn2_settle_deadline = compat.milliTimestamp() + 5_000;
+    var churn2_settled: H2TransportResourceSample = undefined;
+    while (true) {
+        churn2_settled = try h2TransportResourceSample(allocator, pid, tardigrade.port, "churn_2_settled");
+        try h2TransportAssertNoSlotOverflow(churn2_settled);
+        if (churn2_settled.open_fds <= post_fault_sample.open_fds and
+            churn2_settled.sockets <= post_fault_sample.sockets and
+            // #863 review: "no monotonic growth across *repeated* churn" --
+            // session_c/session_d's own attach/close pass must settle back
+            // to exactly session A's reserved bytes, not stay elevated by
+            // (or grow past) their own now-detached share.
+            churn2_settled.h2_active_sessions <= post_fault_sample.h2_active_sessions and
+            churn2_settled.h2_session_queued_bytes <= post_fault_sample.h2_session_queued_bytes)
+        {
+            break;
+        }
+        if (compat.milliTimestamp() > churn2_settle_deadline) return error.ConnectionDidNotSettle;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    try samples.append(churn2_settled);
+    try std.testing.expectEqual(post_fault_sample.h2_active_sessions, churn2_settled.h2_active_sessions);
+    try std.testing.expectEqual(post_fault_sample.h2_session_queued_bytes, churn2_settled.h2_session_queued_bytes);
+    try std.testing.expectEqual(@as(u64, 3), churn2_settled.h2_session_close_detached_total);
+    // The high-water mark is a monotonic running peak across the whole
+    // connection (`h2_transport_metrics.bumpHighWater`), not a per-sample
+    // snapshot: this churn cycle's own session_c/session_d traffic is tiny
+    // next to `populated_sample`'s deliberate backpressure injection above,
+    // so the bound here is that the peak never goes backwards, not that
+    // this later, smaller cycle must set a new record.
+    try std.testing.expect(churn2_settled.h2_session_queued_bytes_high_water >= populated_sample.h2_session_queued_bytes_high_water);
+
+    // Send client GOAWAY while session A is still attached (#951 review:
+    // ending session A with its own END_STREAM first let the server's
+    // normal half-close detach race the deferred GOAWAY settle sweep, so
+    // the close reason was not reliably `.goaway`). Wait for the server to
+    // actually process the GOAWAY and settle session A before tearing the
+    // socket down, so the close reason is deterministic.
+    try client.writeHttp2Frame(0x7, 0, 0, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }); // GOAWAY(NO_ERROR)
+    const goaway_settle_deadline = compat.milliTimestamp() + 5_000;
+    while (true) {
+        const sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "goaway_processed");
+        try h2TransportAssertNoSlotOverflow(sample);
+        if (sample.h2_active_sessions == 0 and sample.h2_session_close_goaway_total >= 1) break;
+        if (compat.milliTimestamp() > goaway_settle_deadline) return error.ConnectionDidNotSettle;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    client.destroy();
+    client_owned = false;
+
+    // Settle: poll a fresh short-lived connection's own open-fd/socket count
+    // until it returns to the pre-test baseline, bounded by a fixed
+    // deadline (#863's "resource settle after churn" applied here to
+    // ordinary connection teardown rather than process shutdown).
+    // `tardigrade_active_connections` is not used for this poll: it read
+    // back 0 at every phase in manual verification of this exact scenario,
+    // including while the main session connection was demonstrably open
+    // and serving traffic, so it is not a trustworthy signal here (left
+    // recorded in the evidence JSON for visibility, not used as a gate).
+    const baseline_open_fds = samples.items[0].open_fds;
+    const baseline_sockets = samples.items[0].sockets;
+    const settle_deadline = compat.milliTimestamp() + 10_000;
+    var settled_sample: H2TransportResourceSample = undefined;
+    while (true) {
+        settled_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "settled");
+        try h2TransportAssertNoSlotOverflow(settled_sample);
+        if (settled_sample.open_fds <= baseline_open_fds and
+            settled_sample.sockets <= baseline_sockets and
+            // The connection's own GOAWAY teardown (`h2SettleAllSessions`)
+            // must actually detach session A's reserved bytes too, not
+            // just the socket/fd accounting -- #863's idle-baseline settle
+            // applied to the real per-session queue, not only generic
+            // process-level signals.
+            settled_sample.h2_active_sessions == 0 and
+            settled_sample.h2_session_queued_bytes == 0)
+        {
+            break;
+        }
+        if (compat.milliTimestamp() > settle_deadline) return error.ConnectionDidNotSettle;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+    try samples.append(settled_sample);
+    try std.testing.expect(settled_sample.rss_kb <= samples.items[1].rss_kb + 16 * 1024);
+    try std.testing.expect(settled_sample.open_fds <= samples.items[0].open_fds + 4);
+    try std.testing.expect(settled_sample.sockets <= samples.items[0].sockets + 2);
+    // Session A's final close reason: the client's own GOAWAY (not a reset
+    // or a server shutdown) ends this connection, so `h2SettleAllSessions`
+    // must have tagged it `.goaway`, not silently folded into `.detached`.
+    try std.testing.expectEqual(@as(u64, 1), settled_sample.h2_session_close_goaway_total);
+    try std.testing.expectEqual(@as(u64, 3), settled_sample.h2_session_close_detached_total);
+    // #951 review: per-stream slots are released on `Session.deinit`, same
+    // as the aggregate reaching 0 above -- confirms this isn't merely the
+    // aggregate masking a leaked individual slot.
+    try std.testing.expectEqual(@as(?u64, null), try h2SessionQueuedBytesByStream(allocator, tardigrade.port, session_a));
+    try std.testing.expectEqual(@as(?u64, null), try h2SessionQueuedBytesByStream(allocator, tardigrade.port, session_b));
+
+    try writeH2TransportValidationEvidence(
+        allocator,
+        baseline_p95_us,
+        loaded_p95_us,
+        samples.items,
+        &stream_peaks,
+        .{
+            .connection_id = connection_peak_populated.connection_id,
+            .writer_queue_bytes_high_water = connection_peak_populated.writer_queue_bytes_high_water,
+            .writer_queue_cap_bytes = connection_peak_populated.writer_queue_cap_bytes,
+            .writer_queue_depth_high_water = connection_peak_populated.writer_queue_depth_high_water,
+        },
+    );
+}
+
 test "interop.h2.proxy_response_respects_peer_initial_window_size" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -14005,6 +14985,25 @@ fn prometheusMetricValue(body: []const u8, name: []const u8) ?u64 {
         if (line.len == name.len) continue;
         if (line[name.len] != ' ') continue;
         return std.fmt.parseInt(u64, std.mem.trim(u8, line[name.len + 1 ..], " \t"), 10) catch null;
+    }
+    return null;
+}
+
+/// Like `prometheusMetricValue`, but matches a metric line by its name
+/// prefix (including the opening `{`) plus one required label substring
+/// found anywhere inside that line's label braces, tolerating any other
+/// labels present (#951 second review: `connection_id` joined `stream_id`
+/// on several by-stream series, so an exact full-name match is no longer
+/// possible without first knowing the connection id).
+fn prometheusMetricValueWithLabel(body: []const u8, name_prefix: []const u8, label_fragment: []const u8) ?u64 {
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, name_prefix)) continue;
+        const brace_end = std.mem.indexOfScalar(u8, line, '}') orelse continue;
+        if (std.mem.indexOf(u8, line[0..brace_end], label_fragment) == null) continue;
+        const rest = std.mem.trim(u8, line[brace_end + 1 ..], " \t");
+        return std.fmt.parseInt(u64, rest, 10) catch null;
     }
     return null;
 }

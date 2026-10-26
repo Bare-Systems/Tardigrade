@@ -48,7 +48,13 @@ fn hasFrameEnqueuer(comptime T: type) bool {
 
 pub fn readFrame(conn: anytype, allocator: std.mem.Allocator, max_frame_size: usize) !Frame {
     var header: [HEADER_LEN]u8 = undefined;
-    try readExact(conn, header[0..]);
+    // #951 review: only the header read may surface `error.Http2ShutdownWake`
+    // (see `readExact`), and only while zero bytes of it have been consumed
+    // -- i.e. at the one point where bailing out cannot desync the wire,
+    // because nothing from this frame has been read from the socket yet.
+    // Once any header byte (or the payload below, unconditionally) is read,
+    // this call is committed to finishing the frame regardless of shutdown.
+    try readExact(conn, header[0..], .bail_if_unread);
     const len = (@as(usize, header[0]) << 16) | (@as(usize, header[1]) << 8) | @as(usize, header[2]);
     if (len > max_frame_size) return error.Http2FrameTooLarge;
     const typ: Type = @enumFromInt(header[3]);
@@ -56,7 +62,7 @@ pub fn readFrame(conn: anytype, allocator: std.mem.Allocator, max_frame_size: us
     const sid = std.mem.readInt(u32, header[5..9], .big) & 0x7FFF_FFFF;
     const payload = try allocator.alloc(u8, len);
     errdefer allocator.free(payload);
-    try readExact(conn, payload);
+    try readExact(conn, payload, .never_bail);
     return .{
         .typ = typ,
         .flags = flags,
@@ -191,10 +197,34 @@ test "peer settings validation rejects invalid enable push and frame size" {
     try std.testing.expectError(error.InvalidSettingsValue, parseSettingsInitialWindowSize(&payload));
 }
 
-fn readExact(conn: anytype, out: []u8) !void {
+const ShutdownWakeBailPolicy = enum {
+    /// Surface `error.Http2ShutdownWake` to the caller, but only while
+    /// `off == 0` -- i.e. nothing has been consumed from the wire yet for
+    /// this call, so bailing cannot leave the byte stream mid-frame.
+    bail_if_unread,
+    /// Already committed to finishing this read (earlier bytes of the same
+    /// frame were already consumed, or the caller accepts an unbounded
+    /// read-timeout-bound wait instead): swallow the wake and keep reading.
+    never_bail,
+};
+
+fn readExact(conn: anytype, out: []u8, bail_policy: ShutdownWakeBailPolicy) !void {
     var off: usize = 0;
     while (off < out.len) {
-        const n = try conn.read(out[off..]);
+        const n = conn.read(out[off..]) catch |err| {
+            // Compared by name, not `switch (err) { error.Http2ShutdownWake
+            // => ... }`: `conn` is `anytype`, and most callers (every test
+            // fake plus the real `WaitingEncryptedHttpConnection` outside
+            // the one case that actually produces this error) have a
+            // `read` whose inferred error set never includes it, which a
+            // literal `error.Http2ShutdownWake` switch prong would fail to
+            // compile against for every one of those instantiations.
+            if (std.mem.eql(u8, @errorName(err), "Http2ShutdownWake")) {
+                if (bail_policy == .bail_if_unread and off == 0) return err;
+                continue;
+            }
+            return err;
+        };
         if (n == 0) return error.ConnectionClosed;
         off += n;
     }

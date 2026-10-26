@@ -48,6 +48,12 @@ pub const Stream = struct {
     /// Remaining bytes the client may send to the server on this stream
     /// (the server's stream receive window).
     recv_window: i32,
+    /// #863 review: edge-triggered latch so a #867 session's outbound flush
+    /// (`flushHttp2SessionOutbound`) reports a real flow-control
+    /// blocked/resumed *transition* exactly once per episode, instead of
+    /// every poll of an already-known-exhausted window counting as another
+    /// "blocked" event.
+    send_window_blocked: bool = false,
 
     pub fn init(id: u31, initial_send_window: i32) Stream {
         return .{

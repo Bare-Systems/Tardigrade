@@ -6,6 +6,7 @@
 const std = @import("std");
 const compat = @import("zig_compat");
 const http2_frame = @import("http2_frame.zig");
+const h2_transport_metrics = @import("h2_transport_metrics.zig");
 
 pub const default_max_queued_bytes: usize = 256 * 1024;
 
@@ -35,10 +36,16 @@ pub const Scheduler = struct {
     wake_write: std.posix.fd_t = -1,
     wake_pending: std.atomic.Value(bool) = .init(false),
     draining: std.atomic.Value(bool) = .init(false),
+    /// #951 second review: this connection's own writer-queue slot, so its
+    /// high-water mark can be bounded against *its own* `max_queued_bytes`
+    /// -- the process-wide aggregate high water (every live connection's
+    /// queued bytes summed) is not comparable to any single connection's
+    /// cap once more than one connection is live.
+    metrics_slot: ?h2_transport_metrics.SlotHandle = null,
 
     pub const Error = error{ QueueFull, WakeFailed, InvalidFrame } || std.mem.Allocator.Error;
 
-    pub fn init(allocator: std.mem.Allocator, max_queued_bytes: usize) !Scheduler {
+    pub fn init(allocator: std.mem.Allocator, connection_id: u64, max_queued_bytes: usize) !Scheduler {
         var fds: [2]std.posix.fd_t = undefined;
         if (std.c.pipe(&fds) != 0) return error.WakeFailed;
         const flags = std.c.fcntl(fds[0], std.c.F.GETFL, @as(c_int, 0));
@@ -47,14 +54,34 @@ pub const Scheduler = struct {
             _ = std.c.close(fds[1]);
             return error.WakeFailed;
         }
-        return .{ .allocator = allocator, .max_queued_bytes = max_queued_bytes, .wake_read = fds[0], .wake_write = fds[1] };
+        // #951 review: publish the configured cap so evidence/tests can
+        // assert the writer-queue high-water mark never exceeds it without
+        // hardcoding `default_max_queued_bytes` on the reading side.
+        h2_transport_metrics.setWriterQueueCapBytes(max_queued_bytes);
+        const metrics_slot = h2_transport_metrics.writerQueueSlotRegister(connection_id, max_queued_bytes);
+        return .{ .allocator = allocator, .max_queued_bytes = max_queued_bytes, .wake_read = fds[0], .wake_write = fds[1], .metrics_slot = metrics_slot };
     }
 
     pub fn deinit(self: *Scheduler) void {
         self.mutex.lock();
+        // #951 third review: the depth count (entries plus the in-flight
+        // `active` one, if any) needs the same teardown refund as the byte
+        // count below, computed before either list is actually freed.
+        const remaining_depth: i64 = @as(i64, @intCast(self.entries.items.len)) + @as(i64, @intFromBool(self.active != null));
         for (self.entries.items) |entry| self.allocator.free(entry.bytes);
         if (self.active) |active| self.allocator.free(active.entry.bytes);
         self.entries.deinit(self.allocator);
+        // #951 review: a connection torn down with unflushed frames still
+        // owed the global aggregate a matching decrement, or it would
+        // retain this scheduler's last published contribution forever.
+        if (self.queued_bytes > 0) {
+            h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(self.queued_bytes)));
+            h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, -@as(i64, @intCast(self.queued_bytes)));
+        }
+        if (remaining_depth > 0) {
+            h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, -remaining_depth);
+        }
+        h2_transport_metrics.writerQueueSlotUnregister(self.metrics_slot);
         self.mutex.unlock();
         if (self.wake_read >= 0) _ = std.c.close(self.wake_read);
         if (self.wake_write >= 0) _ = std.c.close(self.wake_write);
@@ -69,6 +96,17 @@ pub const Scheduler = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.active != null or self.entries.items.len > 0;
+    }
+
+    /// Current total queued bytes (including the in-progress `active`
+    /// frame, if any). #951 review: `enqueueOwnedLocked`/`cancelStream`/
+    /// `flush` now publish their own deltas directly as they mutate
+    /// `queued_bytes`, so this remains a plain read-only snapshot for
+    /// callers/tests that want this one connection's own current value.
+    pub fn queuedBytes(self: *Scheduler) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.queued_bytes;
     }
 
     pub fn writer(self: *Scheduler) Writer {
@@ -140,9 +178,15 @@ pub const Scheduler = struct {
         if (owned.bytes.len > self.max_queued_bytes -| self.queued_bytes) return error.QueueFull;
         self.entries.append(self.allocator, owned) catch |err| return err;
         self.queued_bytes += owned.bytes.len;
+        h2_transport_metrics.writerQueueBytesChanged(@intCast(owned.bytes.len));
+        h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, @intCast(owned.bytes.len));
+        h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, 1);
         if (!self.wake_pending.load(.acquire)) self.signalLocked() catch |err| {
             const removed = self.entries.pop().?;
             self.queued_bytes -= removed.bytes.len;
+            h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(removed.bytes.len)));
+            h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, -@as(i64, @intCast(removed.bytes.len)));
+            h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, -1);
             return err;
         };
         self.wake_pending.store(true, .release);
@@ -168,6 +212,9 @@ pub const Scheduler = struct {
                 const removed = self.entries.orderedRemove(i);
                 refunded_payload_bytes += dataFramePayloadLen(removed.bytes);
                 self.queued_bytes -= removed.bytes.len;
+                h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(removed.bytes.len)));
+                h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, -@as(i64, @intCast(removed.bytes.len)));
+                h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, -1);
                 self.allocator.free(removed.bytes);
                 continue;
             }
@@ -178,6 +225,9 @@ pub const Scheduler = struct {
                 refunded_payload_bytes += dataFramePayloadLen(active.entry.bytes);
                 self.active = null;
                 self.queued_bytes -= active.entry.bytes.len;
+                h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(active.entry.bytes.len)));
+                h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, -@as(i64, @intCast(active.entry.bytes.len)));
+                h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, -1);
                 self.allocator.free(active.entry.bytes);
             }
         }
@@ -218,6 +268,9 @@ pub const Scheduler = struct {
                 const done = self.active.?.entry;
                 self.active = null;
                 self.queued_bytes -= done.bytes.len;
+                h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(done.bytes.len)));
+                h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, -@as(i64, @intCast(done.bytes.len)));
+                h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, -1);
                 self.allocator.free(done.bytes);
             }
             self.mutex.unlock();
@@ -245,7 +298,7 @@ pub const Scheduler = struct {
 
 test "scheduler preserves producer FIFO and releases queued ownership" {
     const allocator = std.testing.allocator;
-    var scheduler = try Scheduler.init(allocator, 128);
+    var scheduler = try Scheduler.init(allocator, 1, 128);
     defer scheduler.deinit();
     const a = [_]u8{ 0, 0, 0, 4, 0, 0, 0, 0, 0 };
     const b = [_]u8{ 0, 0, 1, 6, 0, 0, 0, 0, 0, 9 };
@@ -259,7 +312,7 @@ test "scheduler preserves producer FIFO and releases queued ownership" {
 }
 
 test "scheduler bounds queued bytes" {
-    var scheduler = try Scheduler.init(std.testing.allocator, 9);
+    var scheduler = try Scheduler.init(std.testing.allocator, 1, 9);
     defer scheduler.deinit();
     const frame = [_]u8{ 0, 0, 0, 4, 0, 0, 0, 0, 0 };
     try scheduler.enqueue(&frame);
@@ -267,7 +320,7 @@ test "scheduler bounds queued bytes" {
 }
 
 test "atomic frame enqueue refuses capacity without queue mutation" {
-    var scheduler = try Scheduler.init(std.testing.allocator, 9);
+    var scheduler = try Scheduler.init(std.testing.allocator, 1, 9);
     defer scheduler.deinit();
     try std.testing.expectError(error.QueueFull, scheduler.writer().enqueueFrame(.data, 0, 1, &.{1}));
     try std.testing.expectEqual(@as(usize, 0), scheduler.queued_bytes);
@@ -276,7 +329,7 @@ test "atomic frame enqueue refuses capacity without queue mutation" {
 
 test "atomic frame enqueue rolls back on allocation failure" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var scheduler = try Scheduler.init(failing.allocator(), 64);
+    var scheduler = try Scheduler.init(failing.allocator(), 1, 64);
     defer scheduler.deinit();
     try std.testing.expectError(error.OutOfMemory, scheduler.enqueueFrame(.data, 0, 1, &.{ 1, 2 }));
     try std.testing.expectEqual(@as(usize, 0), scheduler.queued_bytes);
@@ -293,7 +346,7 @@ test "concurrent producers retain whole cross-stream frames" {
             self.scheduler.enqueueFrame(.data, 0, self.stream_id, self.payload) catch @panic("enqueue failed");
         }
     };
-    var scheduler = try Scheduler.init(std.testing.allocator, 128);
+    var scheduler = try Scheduler.init(std.testing.allocator, 1, 128);
     defer scheduler.deinit();
     var first = Producer{ .scheduler = &scheduler, .stream_id = 1, .payload = "first" };
     var second = Producer{ .scheduler = &scheduler, .stream_id = 3, .payload = "second" };
@@ -325,7 +378,7 @@ test "concurrent producers retain whole cross-stream frames" {
 }
 
 test "wake notification coalesces, drains, and republishes" {
-    var scheduler = try Scheduler.init(std.testing.allocator, 128);
+    var scheduler = try Scheduler.init(std.testing.allocator, 1, 128);
     defer scheduler.deinit();
     try scheduler.enqueueFrame(.data, 0, 1, "a");
     try scheduler.enqueueFrame(.data, 0, 3, "b");
@@ -364,7 +417,7 @@ test "producer wakes a waiter already blocked on the scheduler fd" {
             self.woke.store(ready == 1 and (fds[0].revents & std.posix.POLL.IN) != 0, .release);
         }
     };
-    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    var scheduler = try Scheduler.init(std.testing.allocator, 1, 64);
     defer scheduler.deinit();
     var entered = std.atomic.Value(bool).init(false);
     var woke = std.atomic.Value(bool).init(false);
@@ -382,7 +435,7 @@ test "producer wakes a waiter already blocked on the scheduler fd" {
 }
 
 test "wake publication failure rolls back producer ownership" {
-    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    var scheduler = try Scheduler.init(std.testing.allocator, 1, 64);
     defer scheduler.deinit();
     _ = std.c.close(scheduler.wake_write);
     scheduler.wake_write = -1;
@@ -398,7 +451,7 @@ test "deinit releases active and queued frames after blocked output" {
             return error.WouldBlock;
         }
     };
-    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    var scheduler = try Scheduler.init(std.testing.allocator, 1, 64);
     try scheduler.enqueueFrame(.data, 0, 1, "first");
     try scheduler.enqueueFrame(.data, 0, 3, "second");
     var writer = BlockingWriter{};
@@ -422,7 +475,7 @@ test "cancel stream drops unsent active and queued frames but keeps siblings" {
     const first = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 1, 'a' };
     const follower = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 1, 'b' };
     const sibling = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 3, 'c' };
-    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    var scheduler = try Scheduler.init(std.testing.allocator, 1, 64);
     defer scheduler.deinit();
     try scheduler.enqueue(&first);
     try scheduler.enqueue(&follower);
@@ -461,7 +514,7 @@ test "cancel stream finishes a partial frame but drops later frames" {
     const first = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 1, 'a' };
     const follower = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 1, 'b' };
     const sibling = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 3, 'c' };
-    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    var scheduler = try Scheduler.init(std.testing.allocator, 1, 64);
     defer scheduler.deinit();
     try scheduler.enqueue(&first);
     try scheduler.enqueue(&follower);
@@ -497,7 +550,7 @@ test "reentrant drain attempt preserves the active frame exactly once" {
         }
     };
     const frame = [_]u8{ 0, 0, 1, 6, 0, 0, 0, 0, 1, 9 };
-    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    var scheduler = try Scheduler.init(std.testing.allocator, 1, 64);
     defer scheduler.deinit();
     try scheduler.enqueue(&frame);
     var writer = ReentrantWriter{ .scheduler = &scheduler, .out = .init(std.testing.allocator) };
@@ -527,7 +580,7 @@ test "scheduler retains and resumes a frame after temporary backpressure" {
             return bytes.len;
         }
     };
-    var scheduler = try Scheduler.init(std.testing.allocator, 64);
+    var scheduler = try Scheduler.init(std.testing.allocator, 1, 64);
     defer scheduler.deinit();
     const frame = [_]u8{ 0, 0, 1, 6, 0, 0, 0, 0, 1, 9 };
     try scheduler.enqueue(&frame);
@@ -539,4 +592,78 @@ test "scheduler retains and resumes a frame after temporary backpressure" {
     try scheduler.flush(&writer);
     try std.testing.expectEqualSlices(u8, &frame, writer.out.written());
     try std.testing.expect(!scheduler.hasPendingOutput());
+}
+
+test "two connections each stay within their own writer-queue cap even though their aggregate exceeds a single cap (#951 second review)" {
+    const BlockingWriter = struct {
+        fn write(_: *@This(), _: []const u8) error{WouldBlock}!usize {
+            return error.WouldBlock;
+        }
+    };
+    h2_transport_metrics.resetForTesting();
+    var scheduler_a = try Scheduler.init(std.testing.allocator, 10, 256 * 1024);
+    defer scheduler_a.deinit();
+    var scheduler_b = try Scheduler.init(std.testing.allocator, 20, 256 * 1024);
+    defer scheduler_b.deinit();
+    var writer_a = BlockingWriter{};
+    var writer_b = BlockingWriter{};
+
+    const payload_a = [_]u8{0} ** (200 * 1024);
+    const payload_b = [_]u8{0} ** (200 * 1024);
+    try scheduler_a.enqueueFrame(.data, 0, 1, &payload_a);
+    try scheduler_b.enqueueFrame(.data, 0, 1, &payload_b);
+    try scheduler_a.flush(&writer_a);
+    try scheduler_b.flush(&writer_b);
+
+    // Each connection independently stays under its own 256KiB cap...
+    var buf: [8]h2_transport_metrics.WriterQueueSlotSnapshot = undefined;
+    const slots = h2_transport_metrics.snapshotWriterQueueSlots(&buf);
+    try std.testing.expectEqual(@as(usize, 2), slots.len);
+    for (slots) |slot| try std.testing.expect(slot.queued_bytes_high_water <= slot.cap_bytes);
+    // ...while the process-wide aggregate genuinely exceeds a single
+    // connection's cap without that being a failure -- the defect the old
+    // aggregate-vs-single-cap comparison had.
+    try std.testing.expect(h2_transport_metrics.snapshot().writer_queue_bytes_high_water > 256 * 1024);
+}
+
+test "writer queue depth high water is tracked independently of byte occupancy (#951 third review)" {
+    const BlockingWriter = struct {
+        fn write(_: *@This(), _: []const u8) error{WouldBlock}!usize {
+            return error.WouldBlock;
+        }
+    };
+    h2_transport_metrics.resetForTesting();
+    var scheduler_a = try Scheduler.init(std.testing.allocator, 30, 256 * 1024);
+    defer scheduler_a.deinit();
+    var scheduler_b = try Scheduler.init(std.testing.allocator, 40, 256 * 1024);
+    defer scheduler_b.deinit();
+    var writer_a = BlockingWriter{};
+    var writer_b = BlockingWriter{};
+
+    // Many tiny frames: byte occupancy stays trivially small (well under
+    // the cap) while the frame-intent depth is what actually grows large
+    // -- a scheduler holding thousands of tiny frames is deep and unfair
+    // even though it looks small by byte capacity alone.
+    const frame_count: u31 = 500;
+    var i: u31 = 0;
+    while (i < frame_count) : (i += 1) {
+        try scheduler_a.enqueueFrame(.data, 0, 1, &.{1});
+        try scheduler_b.enqueueFrame(.data, 0, 1, &.{1});
+    }
+    try scheduler_a.flush(&writer_a);
+    try scheduler_b.flush(&writer_b);
+
+    var buf: [8]h2_transport_metrics.WriterQueueSlotSnapshot = undefined;
+    const slots = h2_transport_metrics.snapshotWriterQueueSlots(&buf);
+    try std.testing.expectEqual(@as(usize, 2), slots.len);
+    for (slots) |slot| {
+        // Byte occupancy peak is tiny (one byte payload + a nine-byte
+        // header per frame, all still queued behind the blocked writer).
+        try std.testing.expect(slot.queued_bytes_high_water <= 10 * frame_count);
+        try std.testing.expect(slot.queued_bytes_high_water <= slot.cap_bytes);
+        // Depth peak reflects the real frame-intent count, a genuinely
+        // distinct dimension the byte-cap check above cannot see.
+        try std.testing.expectEqual(@as(u64, frame_count), slot.depth_high_water);
+        try std.testing.expectEqual(@as(u64, frame_count), slot.depth);
+    }
 }

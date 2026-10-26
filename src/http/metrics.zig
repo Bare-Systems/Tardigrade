@@ -2344,12 +2344,18 @@ pub const Metrics = struct {
             \\# TYPE tardigrade_h2_writer_queue_bytes_high_water_by_connection gauge
             \\# HELP tardigrade_h2_writer_queue_cap_bytes_by_connection This connection's own configured writer-queue byte cap (Scheduler.max_queued_bytes)
             \\# TYPE tardigrade_h2_writer_queue_cap_bytes_by_connection gauge
+            \\# HELP tardigrade_h2_writer_queue_depth_by_connection Current pending frame intents (queued entries plus any in-flight one) in this connection's own outbound H2 writer queue
+            \\# TYPE tardigrade_h2_writer_queue_depth_by_connection gauge
+            \\# HELP tardigrade_h2_writer_queue_depth_high_water_by_connection Highest tardigrade_h2_writer_queue_depth_by_connection observed for this connection since it was accepted
+            \\# TYPE tardigrade_h2_writer_queue_depth_high_water_by_connection gauge
             \\
         );
         for (slots) |slot| {
             try out.print("tardigrade_h2_writer_queue_bytes_by_connection{{connection_id=\"{d}\"}} {d}\n", .{ slot.connection_id, slot.queued_bytes });
             try out.print("tardigrade_h2_writer_queue_bytes_high_water_by_connection{{connection_id=\"{d}\"}} {d}\n", .{ slot.connection_id, slot.queued_bytes_high_water });
             try out.print("tardigrade_h2_writer_queue_cap_bytes_by_connection{{connection_id=\"{d}\"}} {d}\n", .{ slot.connection_id, slot.cap_bytes });
+            try out.print("tardigrade_h2_writer_queue_depth_by_connection{{connection_id=\"{d}\"}} {d}\n", .{ slot.connection_id, slot.depth });
+            try out.print("tardigrade_h2_writer_queue_depth_high_water_by_connection{{connection_id=\"{d}\"}} {d}\n", .{ slot.connection_id, slot.depth_high_water });
         }
     }
 

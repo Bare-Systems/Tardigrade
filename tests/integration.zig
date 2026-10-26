@@ -7985,6 +7985,14 @@ const H2TransportResourceSample = struct {
     // connections` gauge this same suite already found reading 0 even
     // with a live H2 connection serving traffic.
     h2_active_connections: u64,
+    // #951 third review: both fixed-capacity slot tables (per-stream and
+    // per-connection) report an overflow counter instead of silently
+    // dropping or aliasing coverage -- sampled and asserted zero at every
+    // phase below, not merely exposed and never read, so a workload that
+    // actually exceeds either table's capacity fails this gate instead of
+    // producing a quietly incomplete "green" evidence artifact.
+    h2_session_slot_overflow_total: u64,
+    h2_writer_queue_slot_overflow_total: u64,
 };
 
 /// #951 review: a lock-consistent, test-only snapshot of one currently-
@@ -8071,28 +8079,42 @@ fn h2SessionInboundBytesByStream(allocator: std.mem.Allocator, port: u16, stream
 fn h2WriterQueueConnectionPeak(allocator: std.mem.Allocator, body: []const u8) !?H2TransportConnectionPeak {
     const hw_prefix = "tardigrade_h2_writer_queue_bytes_high_water_by_connection{";
     const cap_prefix = "tardigrade_h2_writer_queue_cap_bytes_by_connection{";
+    const depth_hw_prefix = "tardigrade_h2_writer_queue_depth_high_water_by_connection{";
     const id_prefix = "connection_id=\"";
     var lines = std.mem.splitScalar(u8, body, '\n');
-    var connection_id_label: ?[]const u8 = null;
-    var connection_id: ?u64 = null;
-    var high_water: ?u64 = null;
+    var best_label: ?[]const u8 = null;
+    var best_connection_id: u64 = 0;
+    var best_high_water: ?u64 = null;
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r");
         if (!std.mem.startsWith(u8, line, hw_prefix)) continue;
         const brace_end = std.mem.indexOfScalar(u8, line, '}') orelse continue;
-        connection_id_label = line[hw_prefix.len..brace_end];
-        const id_start = (std.mem.indexOf(u8, connection_id_label.?, id_prefix) orelse continue) + id_prefix.len;
-        const id_end = std.mem.indexOfScalarPos(u8, connection_id_label.?, id_start, '"') orelse continue;
-        connection_id = std.fmt.parseInt(u64, connection_id_label.?[id_start..id_end], 10) catch null;
-        high_water = std.fmt.parseInt(u64, std.mem.trim(u8, line[brace_end + 1 ..], " \t"), 10) catch null;
-        break;
+        const label = line[hw_prefix.len..brace_end];
+        const id_start = (std.mem.indexOf(u8, label, id_prefix) orelse continue) + id_prefix.len;
+        const id_end = std.mem.indexOfScalarPos(u8, label, id_start, '"') orelse continue;
+        const this_connection_id = std.fmt.parseInt(u64, label[id_start..id_end], 10) catch continue;
+        const this_high_water = std.fmt.parseInt(u64, std.mem.trim(u8, line[brace_end + 1 ..], " \t"), 10) catch continue;
+        // #951 third review: a short-lived metrics-scraping connection is
+        // itself a real, simultaneously-registered writer-queue slot (this
+        // very function's own caller opens one to fetch this scrape), so
+        // "whichever line happens to come first in the scrape text" is not
+        // a meaningful selection once more than one connection is live.
+        // Selecting the highest observed high-water deterministically
+        // identifies the connection actually under load -- an idle
+        // connection's high water never leaves 0 -- instead of an
+        // arbitrary one that could be this transient scraping connection.
+        if (best_high_water == null or this_high_water > best_high_water.?) {
+            best_label = label;
+            best_connection_id = this_connection_id;
+            best_high_water = this_high_water;
+        }
     }
-    const label = connection_id_label orelse return null;
-    const id = connection_id orelse return null;
-    const hw = high_water orelse return null;
+    const label = best_label orelse return null;
+    const hw = best_high_water orelse return null;
     const cap = prometheusMetricValueWithLabel(body, cap_prefix, label) orelse return null;
+    const depth_hw = prometheusMetricValueWithLabel(body, depth_hw_prefix, label) orelse return null;
     _ = allocator;
-    return .{ .connection_id = id, .writer_queue_bytes_high_water = hw, .writer_queue_cap_bytes = cap };
+    return .{ .connection_id = best_connection_id, .writer_queue_bytes_high_water = hw, .writer_queue_cap_bytes = cap, .writer_queue_depth_high_water = depth_hw };
 }
 
 fn h2WriterQueueConnectionPeakSample(allocator: std.mem.Allocator, port: u16) !H2TransportConnectionPeak {
@@ -8137,11 +8159,30 @@ fn h2TransportResourceSample(allocator: std.mem.Allocator, pid: std.c.pid_t, por
         .h2_session_close_detached_total = prometheusMetricValue(metrics.body, "tardigrade_h2_session_close_total{reason=\"detached\"}") orelse return error.MissingH2TransportMetric,
         .h2_writer_queue_cap_bytes = prometheusMetricValue(metrics.body, "tardigrade_h2_writer_queue_cap_bytes") orelse return error.MissingH2TransportMetric,
         .h2_active_connections = prometheusMetricValue(metrics.body, "tardigrade_h2_active_connections") orelse return error.MissingH2TransportMetric,
+        .h2_session_slot_overflow_total = prometheusMetricValue(metrics.body, "tardigrade_h2_session_slot_overflow_total") orelse return error.MissingH2TransportMetric,
+        .h2_writer_queue_slot_overflow_total = prometheusMetricValue(metrics.body, "tardigrade_h2_writer_queue_slot_overflow_total") orelse return error.MissingH2TransportMetric,
     };
+}
+
+/// #951 third review: every `h2TransportResourceSample` call site in this
+/// test feeds straight into this assertion -- a workload that silently
+/// overran either fixed-capacity slot table (so the per-stream/per-
+/// connection evidence it was supposed to produce is actually incomplete)
+/// must fail the #863 gate immediately at the sample that first observes
+/// it, not merely carry the counter through to the JSON unexamined.
+fn h2TransportAssertNoSlotOverflow(sample: H2TransportResourceSample) !void {
+    try std.testing.expectEqual(@as(u64, 0), sample.h2_session_slot_overflow_total);
+    try std.testing.expectEqual(@as(u64, 0), sample.h2_writer_queue_slot_overflow_total);
 }
 
 const H2TransportStreamPeak = struct {
     label: []const u8,
+    // #951 third review: metrics now correctly treat `(connection_id,
+    // stream_id)` as the unique session identity, since a stream id is
+    // only unique within one connection -- carrying only `stream_id` here
+    // recreates that same ambiguity in the persisted evidence artifact
+    // #864/#910 reuse.
+    connection_id: u64,
     stream_id: u31,
     queued_bytes_high_water: u64,
 };
@@ -8150,6 +8191,10 @@ const H2TransportConnectionPeak = struct {
     connection_id: u64,
     writer_queue_bytes_high_water: u64,
     writer_queue_cap_bytes: u64,
+    // #951 third review: pending frame-intent depth is a distinct
+    // dimension from byte occupancy above (a scheduler holding many tiny
+    // frames can be deep and unfair while still small by byte capacity).
+    writer_queue_depth_high_water: u64,
 };
 
 fn writeH2TransportValidationEvidence(
@@ -8166,6 +8211,11 @@ fn writeH2TransportValidationEvidence(
     defer allocator.free(source_sha);
     const runner = compat.getEnvVarOwned(allocator, "RUNNER_NAME") catch try allocator.dupe(u8, "local");
     defer allocator.free(runner);
+    // schema_version 4 (#951 third review): adds a `connection_id` to
+    // every `stream_peaks` entry (a stream id is only unique within one
+    // connection), `writer_queue_depth_high_water` to `connection_peak`
+    // (frame-intent depth is a distinct dimension from byte occupancy),
+    // and both slot-overflow counters to every resource sample.
     // schema_version 3 (#951 second review): adds `h2_active_connections`
     // to every resource sample, plus top-level `stream_peaks` (per-stream
     // uniquely-attributed peak occupancy) and `connection_peak` (this
@@ -8174,7 +8224,7 @@ fn writeH2TransportValidationEvidence(
     // peak occupancy and writer depth, which the process-wide aggregate
     // alone cannot show.
     const json = try compat.stringifyAlloc(allocator, .{
-        .schema_version = 3,
+        .schema_version = 4,
         .issue = 863,
         .profile = "h2-transport-validation",
         .source_sha = source_sha,
@@ -8252,6 +8302,7 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     var samples = std.array_list.Managed(H2TransportResourceSample).init(allocator);
     defer samples.deinit();
     const baseline_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "baseline");
+    try h2TransportAssertNoSlotOverflow(baseline_sample);
     try samples.append(baseline_sample);
     // `tardigrade.spawn` starts a genuinely fresh child process (#863
     // review: real-process, not in-process), so this process's own
@@ -8366,6 +8417,7 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     }
 
     const populated_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "populated");
+    try h2TransportAssertNoSlotOverflow(populated_sample);
     try samples.append(populated_sample);
     try std.testing.expectEqual(@as(u64, 2), populated_sample.h2_active_sessions);
     try std.testing.expect(populated_sample.h2_session_queued_bytes > baseline_sample.h2_session_queued_bytes);
@@ -8409,6 +8461,11 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     const connection_peak_populated = try h2WriterQueueConnectionPeakSample(allocator, tardigrade.port);
     try std.testing.expect(connection_peak_populated.writer_queue_bytes_high_water <= connection_peak_populated.writer_queue_cap_bytes);
     try std.testing.expect(connection_peak_populated.writer_queue_bytes_high_water > 0);
+    // #951 third review: the backpressure injected above enqueues several
+    // DATA frame chunks, so pending frame-intent depth -- a dimension
+    // distinct from byte occupancy -- must also have genuinely peaked
+    // above 0, not merely been exposed and left unexercised.
+    try std.testing.expect(connection_peak_populated.writer_queue_depth_high_water > 0);
 
     // #951 second review: capture per-stream uniquely-attributed peak
     // occupancy for the persisted evidence while both sessions are still
@@ -8416,9 +8473,14 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     // once a stream's slot has been released on detach).
     const session_a_peak_high_water = (try h2SessionQueuedBytesHighWaterByStream(allocator, tardigrade.port, session_a)) orelse return error.MissingH2TransportMetric;
     const session_b_peak_high_water = (try h2SessionQueuedBytesHighWaterByStream(allocator, tardigrade.port, session_b)) orelse return error.MissingH2TransportMetric;
+    // Both sessions ride the one real H2 connection this test opened
+    // (`connection_peak_populated.connection_id`, itself now selected by
+    // peak load rather than scrape-text order, #951 third review): every
+    // stream-peak entry below carries that same connection identity rather
+    // than leaving it implicit as the earlier schema did.
     const stream_peaks = [_]H2TransportStreamPeak{
-        .{ .label = "session_a", .stream_id = session_a, .queued_bytes_high_water = session_a_peak_high_water },
-        .{ .label = "session_b", .stream_id = session_b, .queued_bytes_high_water = session_b_peak_high_water },
+        .{ .label = "session_a", .connection_id = connection_peak_populated.connection_id, .stream_id = session_a, .queued_bytes_high_water = session_a_peak_high_water },
+        .{ .label = "session_b", .connection_id = connection_peak_populated.connection_id, .stream_id = session_b, .queued_bytes_high_water = session_b_peak_high_water },
     };
 
     // Release both the connection-level *and* session_a's own stream-level
@@ -8570,6 +8632,7 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     }
 
     const post_fault_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "post_fault");
+    try h2TransportAssertNoSlotOverflow(post_fault_sample);
     try samples.append(post_fault_sample);
     // RST_STREAM(cancel) on session B above detached exactly that one
     // session (through `h2DetachSession`'s `.detached` reason, #863
@@ -8630,6 +8693,7 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     var churn2_settled: H2TransportResourceSample = undefined;
     while (true) {
         churn2_settled = try h2TransportResourceSample(allocator, pid, tardigrade.port, "churn_2_settled");
+        try h2TransportAssertNoSlotOverflow(churn2_settled);
         if (churn2_settled.open_fds <= post_fault_sample.open_fds and
             churn2_settled.sockets <= post_fault_sample.sockets and
             // #863 review: "no monotonic growth across *repeated* churn" --
@@ -8666,6 +8730,7 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     const goaway_settle_deadline = compat.milliTimestamp() + 5_000;
     while (true) {
         const sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "goaway_processed");
+        try h2TransportAssertNoSlotOverflow(sample);
         if (sample.h2_active_sessions == 0 and sample.h2_session_close_goaway_total >= 1) break;
         if (compat.milliTimestamp() > goaway_settle_deadline) return error.ConnectionDidNotSettle;
         compat.sleepNs(50 * std.time.ns_per_ms);
@@ -8688,6 +8753,7 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
     var settled_sample: H2TransportResourceSample = undefined;
     while (true) {
         settled_sample = try h2TransportResourceSample(allocator, pid, tardigrade.port, "settled");
+        try h2TransportAssertNoSlotOverflow(settled_sample);
         if (settled_sample.open_fds <= baseline_open_fds and
             settled_sample.sockets <= baseline_sockets and
             // The connection's own GOAWAY teardown (`h2SettleAllSessions`)
@@ -8728,6 +8794,7 @@ test "interop.h2.live-process transport validation: long-lived sessions, REST lo
             .connection_id = connection_peak_populated.connection_id,
             .writer_queue_bytes_high_water = connection_peak_populated.writer_queue_bytes_high_water,
             .writer_queue_cap_bytes = connection_peak_populated.writer_queue_cap_bytes,
+            .writer_queue_depth_high_water = connection_peak_populated.writer_queue_depth_high_water,
         },
     );
 }

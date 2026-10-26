@@ -14742,6 +14742,99 @@ test "H2 live: a truly silent admitted stream cannot hold graceful shutdown past
     }
 }
 
+/// PR review (#951 third review, wGtoZ): the previous zero-drain-timeout
+/// regressions below synchronized "the server has already consumed the
+/// partial bytes already sent and is now blocked waiting for the rest"
+/// with a fixed sleep, which cannot actually prove that ordering on a
+/// loaded runner -- it could pass purely from a clean frame boundary,
+/// never exercising the bug it claims to guard. This wraps the same raw
+/// socket `PlaintextSocketStream` reads from, counting every byte actually
+/// consumed off the wire so a test can wait for an exact count instead of
+/// guessing a delay. `http.shutdown`'s notify pipe is level-triggered and
+/// never drained, so it is harmless if `requestShutdown()` below races
+/// slightly ahead of the server's very next blocking poll call; what must
+/// be proven deterministically is only that the server had already
+/// consumed exactly the partial bytes sent so far before shutdown is ever
+/// requested.
+const BytesConsumedStream = struct {
+    fd: std.posix.fd_t,
+    bytes_consumed: std.atomic.Value(usize) = .init(0),
+
+    fn stream(self: *BytesConsumedStream) tls_core.encrypted_stream.EncryptedStream {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn backend(_: *anyopaque) tls_core.encrypted_stream.BackendKind {
+        return .pure_zig_record;
+    }
+
+    fn read(ptr: *anyopaque, out: []u8) tls_core.encrypted_stream.Error!usize {
+        const self: *BytesConsumedStream = @ptrCast(@alignCast(ptr));
+        const n = std.c.read(self.fd, out.ptr, out.len);
+        if (n >= 0) {
+            _ = self.bytes_consumed.fetchAdd(@intCast(n), .release);
+            return @intCast(n);
+        }
+        return switch (std.posix.errno(n)) {
+            .AGAIN, .INTR => error.WouldBlock,
+            else => error.SocketReadFailed,
+        };
+    }
+
+    fn write(ptr: *anyopaque, bytes: []const u8) tls_core.encrypted_stream.Error!usize {
+        const self: *BytesConsumedStream = @ptrCast(@alignCast(ptr));
+        const n = std.c.write(self.fd, bytes.ptr, bytes.len);
+        if (n >= 0) return @intCast(n);
+        return switch (std.posix.errno(n)) {
+            .AGAIN, .INTR => error.WouldBlock,
+            else => error.SocketWriteFailed,
+        };
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    fn readiness(ptr: *anyopaque) tls_core.encrypted_stream.Readiness {
+        const self: *BytesConsumedStream = @ptrCast(@alignCast(ptr));
+        var pfd = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&pfd, 0) catch 0;
+        return .{
+            .wants_read = true,
+            .can_read_plaintext = ready > 0 and (pfd[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0,
+            .can_write_plaintext = true,
+        };
+    }
+
+    fn drive(ptr: *anyopaque) tls_core.encrypted_stream.Error!tls_core.encrypted_stream.DriveResult {
+        return .{ .made_progress = false, .readiness = readiness(ptr) };
+    }
+
+    fn bufferSnapshot(_: *anyopaque) tls_core.encrypted_stream.BufferSnapshot {
+        return .{};
+    }
+
+    const vtable = tls_core.encrypted_stream.EncryptedStream.VTable{
+        .backendFn = backend,
+        .readFn = read,
+        .writeFn = write,
+        .closeFn = close,
+        .readinessFn = readiness,
+        .driveFn = drive,
+        .bufferSnapshotFn = bufferSnapshot,
+    };
+};
+
+/// Spins until `stream_state` has consumed at least `expected` bytes off
+/// the wire, bounded by `timeout_ms` -- the deterministic barrier proving
+/// the server genuinely read exactly up to a partial-frame boundary before
+/// a test requests shutdown, in place of a fixed sleep.
+fn testWaitBytesConsumed(stream_state: *BytesConsumedStream, expected: usize, timeout_ms: i64) !void {
+    const deadline = compat.milliTimestamp() +| timeout_ms;
+    while (stream_state.bytes_consumed.load(.acquire) < expected) {
+        if (compat.milliTimestamp() >= deadline) return error.TestTimeout;
+        std.Thread.yield() catch {};
+    }
+}
+
 // PR review (#951 second review): a configured `shutdown_drain_timeout_ms
 // == 0` ("shut down immediately") was only enforced by `waitFor`'s deadline
 // clamp -- but that deadline was only ever installed when the configured
@@ -14762,7 +14855,7 @@ test "H2 live: a zero drain timeout terminates immediately even with a frame alr
     defer _ = std.c.close(client_fd);
     try testSetFdNonBlocking(server_fd);
 
-    var server_stream = PlaintextSocketStream{ .fd = server_fd };
+    var server_stream = BytesConsumedStream{ .fd = server_fd };
     const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
     // A 10s ordinary read timeout: if the zero-drain-timeout fallback below
     // were broken, nothing would bound this connection before that, the
@@ -14804,13 +14897,11 @@ test "H2 live: a zero drain timeout terminates immediately even with a frame alr
     // past its first byte (`off != 0`), the exact case `.bail_if_unread`
     // cannot bail out of -- only the drain-timeout path can end this read.
     const partial_header = [_]u8{0};
-    const n = std.c.write(client_fd, &partial_header, 1);
-    try std.testing.expectEqual(@as(isize, 1), n);
-    // No barrier fd is exposed from the server's own blocking read, so a
-    // short, generous sleep stands in for one: the handshake round trip
-    // just above already completed synchronously, so the server loop is
-    // already back at its next blocking frame read well before this.
-    compat.sleepNs(50 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(isize, 1), std.c.write(client_fd, &partial_header, 1));
+    // PR review (wGtoZ): wait for the server to have actually consumed
+    // exactly this partial byte instead of sleeping a guessed delay.
+    const expected_bytes_before_shutdown = HTTP2_PREFACE.len + 9 + 9 + partial_header.len;
+    try testWaitBytesConsumed(&server_stream, expected_bytes_before_shutdown, 2_000);
 
     http.shutdown.requestShutdown();
 
@@ -14821,6 +14912,87 @@ test "H2 live: a zero drain timeout terminates immediately even with a frame alr
     // (not that read timeout, and not the ordinary positive-timeout
     // deadline clamp, which never installs a deadline when the configured
     // timeout is exactly zero) can bound this.
+    try std.testing.expect(shutdown_elapsed_ms <= 2_000);
+    testJoinOnce(&server_thread);
+    try std.testing.expectError(error.Http2ShutdownDrainTimeout, server_ctx.result);
+}
+
+// PR review (#951 third review, wGtoZ): the header-only regression above
+// cannot exercise `readFrame`'s *payload* `readExact` call, which uses
+// `.never_bail` unconditionally (unlike the header read's `off == 0`
+// `.bail_if_unread` boundary) -- a silent peer that completes a frame
+// header but stalls mid-payload must still be bounded by the same
+// zero-drain-timeout fallback, independent of `off`.
+test "H2 live: a zero drain timeout terminates immediately even with a frame's payload already partly read (#951 third review)" {
+    const allocator = std.testing.allocator;
+    http.shutdown.reset();
+    defer http.shutdown.reset();
+
+    const fds = try testH2SocketPair();
+    const server_fd = fds[0];
+    const client_fd = fds[1];
+    defer _ = std.c.close(server_fd);
+    defer _ = std.c.close(client_fd);
+    try testSetFdNonBlocking(server_fd);
+
+    var server_stream = BytesConsumedStream{ .fd = server_fd };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(server_stream.stream(), server_fd);
+    var adapter = WaitingEncryptedHttpConnection.init(inner, 10_000, 10_000);
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    state.h2_request_executor = null;
+    state.h2_session_test_hook = null;
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.shutdown_drain_timeout_ms = 0;
+    var dummy_session = ConnectionSession{};
+    var server_ctx = LiveH2ServerCtx{ .adapter = &adapter, .session = &dummy_session, .cfg = &cfg, .state = &state };
+    var server_thread: ?std.Thread = try std.Thread.spawn(.{}, LiveH2ServerCtx.run, .{&server_ctx});
+    errdefer testShutdownAndJoinServerOnFailure(server_fd, &server_thread);
+
+    var client = TestH2Client{ .fd = client_fd };
+
+    try client.writer().writeAll(HTTP2_PREFACE);
+    try http.http2_frame.writeSettings(allocator, client.writer(), &[_][2]u32{});
+    var server_settings = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings.typ);
+    try http.http2_frame.writeSettingsAck(client.writer());
+
+    var server_settings_ack = try client.readFrame(allocator);
+    defer http.http2_frame.deinitFrame(allocator, &server_settings_ack);
+    try std.testing.expectEqual(http.http2_frame.Type.settings, server_settings_ack.typ);
+    try std.testing.expect((server_settings_ack.flags & http.http2_frame.Flags.ACK) != 0);
+
+    // A complete nine-byte PING frame header declaring an eight-byte
+    // payload, then only three of those eight payload bytes: the header
+    // `readExact` completes normally (never hitting the `off == 0`
+    // `.bail_if_unread` boundary `readFrame`'s header read relies on), so
+    // the server is already committed to the `.never_bail` payload read
+    // when it stalls -- only the zero-drain-timeout poll check in
+    // `waitFor` can still bound this.
+    var ping_header: [9]u8 = undefined;
+    ping_header[0] = 0;
+    ping_header[1] = 0;
+    ping_header[2] = 8;
+    ping_header[3] = @intFromEnum(http.http2_frame.Type.ping);
+    ping_header[4] = 0;
+    std.mem.writeInt(u32, ping_header[5..9], 0, .big);
+    try std.testing.expectEqual(@as(isize, 9), std.c.write(client_fd, &ping_header, 9));
+    const partial_payload = [_]u8{ 1, 2, 3 };
+    try std.testing.expectEqual(@as(isize, 3), std.c.write(client_fd, &partial_payload, 3));
+    const expected_bytes_before_shutdown = HTTP2_PREFACE.len + 9 + 9 + ping_header.len + partial_payload.len;
+    try testWaitBytesConsumed(&server_stream, expected_bytes_before_shutdown, 2_000);
+
+    http.shutdown.requestShutdown();
+
+    const shutdown_started = compat.milliTimestamp();
+    try server_ctx.waitDoneBounded(2_000);
+    const shutdown_elapsed_ms = compat.milliTimestamp() - shutdown_started;
     try std.testing.expect(shutdown_elapsed_ms <= 2_000);
     testJoinOnce(&server_thread);
     try std.testing.expectError(error.Http2ShutdownDrainTimeout, server_ctx.result);

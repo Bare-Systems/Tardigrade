@@ -94,6 +94,17 @@ const SessionSlot = struct {
     /// review).
     ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Seqlock counter (#951 third review): odd while register/update/
+    /// unregister is actively mutating this slot's fields, even once that
+    /// mutation has fully published. `in_use`/`ready` alone cannot prevent
+    /// a scraper from being descheduled between reading them and reading
+    /// the identity/byte fields below; by the time it resumes, the slot
+    /// may have been released and reclaimed by a different session with a
+    /// different `(connection_id, stream_id)`, producing an impossible
+    /// mixed-identity sample. A reader snapshots this counter before and
+    /// after copying every field and retries whenever it is odd or has
+    /// changed, exactly as a classic seqlock.
+    seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     connection_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stream_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     inbound_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -111,6 +122,7 @@ var session_slots: [MAX_TRACKED_STREAMS]SessionSlot = [_]SessionSlot{.{}} ** MAX
 pub fn sessionSlotRegister(connection_id: u64, stream_id: u31) ?SlotHandle {
     for (&session_slots, 0..) |*slot, i| {
         if (slot.in_use.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+            _ = slot.seq.fetchAdd(1, .release); // odd: mutation in progress.
             const generation = slot.generation.fetchAdd(1, .monotonic) + 1;
             slot.connection_id.store(connection_id, .monotonic);
             slot.stream_id.store(stream_id, .monotonic);
@@ -118,6 +130,7 @@ pub fn sessionSlotRegister(connection_id: u64, stream_id: u31) ?SlotHandle {
             slot.outbound_bytes.store(0, .monotonic);
             slot.high_water.store(0, .monotonic);
             slot.ready.store(true, .release);
+            _ = slot.seq.fetchAdd(1, .release); // even: published.
             return .{ .index = i, .generation = generation };
         }
     }
@@ -134,13 +147,15 @@ pub fn sessionSlotUpdate(handle: ?SlotHandle, inbound_bytes: usize, outbound_byt
     const h = handle orelse return;
     const slot = &session_slots[h.index];
     if (slot.generation.load(.monotonic) != h.generation) return;
+    _ = slot.seq.fetchAdd(1, .release); // odd: mutation in progress.
     const total: u64 = @intCast(inbound_bytes + outbound_bytes);
-    slot.inbound_bytes.store(@intCast(inbound_bytes), .release);
-    slot.outbound_bytes.store(@intCast(outbound_bytes), .release);
+    slot.inbound_bytes.store(@intCast(inbound_bytes), .monotonic);
+    slot.outbound_bytes.store(@intCast(outbound_bytes), .monotonic);
     var prev = slot.high_water.load(.monotonic);
     while (total > prev) {
         prev = slot.high_water.cmpxchgWeak(prev, total, .monotonic, .monotonic) orelse break;
     }
+    _ = slot.seq.fetchAdd(1, .release); // even: published.
 }
 
 /// Release a session's slot. Safe to call with a `null` handle (no-op).
@@ -148,8 +163,10 @@ pub fn sessionSlotUnregister(handle: ?SlotHandle) void {
     const h = handle orelse return;
     const slot = &session_slots[h.index];
     if (slot.generation.load(.monotonic) != h.generation) return;
+    _ = slot.seq.fetchAdd(1, .release); // odd: mutation in progress.
     slot.ready.store(false, .release);
     slot.in_use.store(false, .release);
+    _ = slot.seq.fetchAdd(1, .release); // even: released.
 }
 
 pub const SessionSlotSnapshot = struct {
@@ -161,27 +178,50 @@ pub const SessionSlotSnapshot = struct {
     queued_bytes_high_water: u64,
 };
 
-/// Copy every currently-registered, fully-published slot into `buf`,
-/// returning the filled prefix. Test/diagnostics-only. A slot mid-publish
-/// (`in_use` but not yet `ready`) or mid-teardown is skipped rather than
-/// read partially.
+/// Seqlock-consistent read of one slot (#951 third review): retries while
+/// `seq` is odd (mutation in progress) or changed between the first and
+/// last load, so a scrape can never mix one session's identity with
+/// another's byte counts after an unregister/reuse interleaves with the
+/// read. Returns `null` for a slot that is not currently in use/ready, or
+/// that could not be read consistently within a bounded number of
+/// retries (treated the same as "not currently observable", never as a
+/// corrupted sample).
+fn trySnapshotSessionSlot(slot: *SessionSlot) ?SessionSlotSnapshot {
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        const seq_before = slot.seq.load(.acquire);
+        if (seq_before % 2 != 0) continue;
+        if (!slot.in_use.load(.acquire)) return null;
+        if (!slot.ready.load(.acquire)) return null;
+        const connection_id = slot.connection_id.load(.acquire);
+        const stream_id = slot.stream_id.load(.acquire);
+        const inbound = slot.inbound_bytes.load(.acquire);
+        const outbound = slot.outbound_bytes.load(.acquire);
+        const high_water = slot.high_water.load(.acquire);
+        const seq_after = slot.seq.load(.acquire);
+        if (seq_before != seq_after) continue;
+        return .{
+            .connection_id = connection_id,
+            .stream_id = @intCast(stream_id),
+            .inbound_bytes = inbound,
+            .outbound_bytes = outbound,
+            .queued_bytes = inbound + outbound,
+            .queued_bytes_high_water = high_water,
+        };
+    }
+    return null;
+}
+
+/// Copy every currently-registered, fully-published, consistently-read
+/// slot into `buf`, returning the filled prefix. Test/diagnostics-only.
 pub fn snapshotSessionSlots(buf: []SessionSlotSnapshot) []SessionSlotSnapshot {
     var n: usize = 0;
     for (&session_slots) |*slot| {
         if (n >= buf.len) break;
-        if (!slot.in_use.load(.acquire)) continue;
-        if (!slot.ready.load(.acquire)) continue;
-        const inbound = slot.inbound_bytes.load(.acquire);
-        const outbound = slot.outbound_bytes.load(.acquire);
-        buf[n] = .{
-            .connection_id = slot.connection_id.load(.acquire),
-            .stream_id = @intCast(slot.stream_id.load(.acquire)),
-            .inbound_bytes = inbound,
-            .outbound_bytes = outbound,
-            .queued_bytes = inbound + outbound,
-            .queued_bytes_high_water = slot.high_water.load(.acquire),
-        };
-        n += 1;
+        if (trySnapshotSessionSlot(slot)) |snap| {
+            buf[n] = snap;
+            n += 1;
+        }
     }
     return buf[0..n];
 }
@@ -198,10 +238,20 @@ const WriterQueueSlot = struct {
     in_use: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Seqlock counter, same convention and purpose as `SessionSlot.seq`
+    /// (#951 third review): `snapshotWriterQueueSlots` has the identical
+    /// identity-reuse hazard the session slot table had.
+    seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     connection_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     cap_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     queued_bytes: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     high_water: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// #951 third review: pending frame *intents* (queued entries plus the
+    /// in-flight `active` one, if any) -- a distinct dimension from byte
+    /// occupancy above. A scheduler holding many tiny frames can be deep
+    /// and unfair while still looking small by byte capacity alone.
+    depth: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    depth_high_water: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 var writer_queue_slots: [MAX_TRACKED_CONNECTIONS]WriterQueueSlot = [_]WriterQueueSlot{.{}} ** MAX_TRACKED_CONNECTIONS;
@@ -216,12 +266,16 @@ var writer_queue_slots: [MAX_TRACKED_CONNECTIONS]WriterQueueSlot = [_]WriterQueu
 pub fn writerQueueSlotRegister(connection_id: u64, cap_bytes: usize) ?SlotHandle {
     for (&writer_queue_slots, 0..) |*slot, i| {
         if (slot.in_use.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+            _ = slot.seq.fetchAdd(1, .release); // odd: mutation in progress.
             const generation = slot.generation.fetchAdd(1, .monotonic) + 1;
             slot.connection_id.store(connection_id, .monotonic);
             slot.cap_bytes.store(@intCast(cap_bytes), .monotonic);
             slot.queued_bytes.store(0, .monotonic);
             slot.high_water.store(0, .monotonic);
+            slot.depth.store(0, .monotonic);
+            slot.depth_high_water.store(0, .monotonic);
             slot.ready.store(true, .release);
+            _ = slot.seq.fetchAdd(1, .release); // even: published.
             return .{ .index = i, .generation = generation };
         }
     }
@@ -236,6 +290,7 @@ pub fn writerQueueSlotChanged(handle: ?SlotHandle, delta: i64) void {
     const h = handle orelse return;
     const slot = &writer_queue_slots[h.index];
     if (slot.generation.load(.monotonic) != h.generation) return;
+    _ = slot.seq.fetchAdd(1, .release); // odd: mutation in progress.
     const new_val = slot.queued_bytes.fetchAdd(delta, .monotonic) + delta;
     if (new_val > 0) {
         const cur: u64 = @intCast(new_val);
@@ -244,14 +299,37 @@ pub fn writerQueueSlotChanged(handle: ?SlotHandle, delta: i64) void {
             prev = slot.high_water.cmpxchgWeak(prev, cur, .monotonic, .monotonic) orelse break;
         }
     }
+    _ = slot.seq.fetchAdd(1, .release); // even: published.
+}
+
+/// `delta` is the signed change in this one connection's own pending frame
+/// *count* (queued entries plus the in-flight `active` one, if any) --
+/// #951 third review's required writer-queue depth, distinct from byte
+/// occupancy above.
+pub fn writerQueueSlotDepthChanged(handle: ?SlotHandle, delta: i64) void {
+    const h = handle orelse return;
+    const slot = &writer_queue_slots[h.index];
+    if (slot.generation.load(.monotonic) != h.generation) return;
+    _ = slot.seq.fetchAdd(1, .release); // odd: mutation in progress.
+    const new_val = slot.depth.fetchAdd(delta, .monotonic) + delta;
+    if (new_val > 0) {
+        const cur: u64 = @intCast(new_val);
+        var prev = slot.depth_high_water.load(.monotonic);
+        while (cur > prev) {
+            prev = slot.depth_high_water.cmpxchgWeak(prev, cur, .monotonic, .monotonic) orelse break;
+        }
+    }
+    _ = slot.seq.fetchAdd(1, .release); // even: published.
 }
 
 pub fn writerQueueSlotUnregister(handle: ?SlotHandle) void {
     const h = handle orelse return;
     const slot = &writer_queue_slots[h.index];
     if (slot.generation.load(.monotonic) != h.generation) return;
+    _ = slot.seq.fetchAdd(1, .release); // odd: mutation in progress.
     slot.ready.store(false, .release);
     slot.in_use.store(false, .release);
+    _ = slot.seq.fetchAdd(1, .release); // even: released.
 }
 
 pub const WriterQueueSlotSnapshot = struct {
@@ -259,21 +337,47 @@ pub const WriterQueueSlotSnapshot = struct {
     queued_bytes: u64,
     queued_bytes_high_water: u64,
     cap_bytes: u64,
+    depth: u64,
+    depth_high_water: u64,
 };
+
+/// Seqlock-consistent read of one writer-queue slot, same convention and
+/// rationale as `trySnapshotSessionSlot` (#951 third review).
+fn trySnapshotWriterQueueSlot(slot: *WriterQueueSlot) ?WriterQueueSlotSnapshot {
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        const seq_before = slot.seq.load(.acquire);
+        if (seq_before % 2 != 0) continue;
+        if (!slot.in_use.load(.acquire)) return null;
+        if (!slot.ready.load(.acquire)) return null;
+        const connection_id = slot.connection_id.load(.acquire);
+        const queued_bytes = slot.queued_bytes.load(.acquire);
+        const high_water = slot.high_water.load(.acquire);
+        const cap_bytes = slot.cap_bytes.load(.acquire);
+        const depth = slot.depth.load(.acquire);
+        const depth_high_water = slot.depth_high_water.load(.acquire);
+        const seq_after = slot.seq.load(.acquire);
+        if (seq_before != seq_after) continue;
+        return .{
+            .connection_id = connection_id,
+            .queued_bytes = @intCast(@max(0, queued_bytes)),
+            .queued_bytes_high_water = high_water,
+            .cap_bytes = cap_bytes,
+            .depth = @intCast(@max(0, depth)),
+            .depth_high_water = depth_high_water,
+        };
+    }
+    return null;
+}
 
 pub fn snapshotWriterQueueSlots(buf: []WriterQueueSlotSnapshot) []WriterQueueSlotSnapshot {
     var n: usize = 0;
     for (&writer_queue_slots) |*slot| {
         if (n >= buf.len) break;
-        if (!slot.in_use.load(.acquire)) continue;
-        if (!slot.ready.load(.acquire)) continue;
-        buf[n] = .{
-            .connection_id = slot.connection_id.load(.acquire),
-            .queued_bytes = @intCast(@max(0, slot.queued_bytes.load(.acquire))),
-            .queued_bytes_high_water = slot.high_water.load(.acquire),
-            .cap_bytes = slot.cap_bytes.load(.acquire),
-        };
-        n += 1;
+        if (trySnapshotWriterQueueSlot(slot)) |snap| {
+            buf[n] = snap;
+            n += 1;
+        }
     }
     return buf[0..n];
 }
@@ -591,4 +695,116 @@ test "writer queue slots bound each connection against its own cap, independent 
     writerQueueSlotChanged(conn_b, -(200 * 1024));
     writerQueueSlotUnregister(conn_b);
     try std.testing.expectEqual(@as(usize, 0), snapshotWriterQueueSlots(&buf).len);
+}
+
+test "writer queue slots track frame-intent depth independent of byte occupancy" {
+    resetForTesting();
+    const conn_a = writerQueueSlotRegister(1, 256 * 1024) orelse return error.TestUnexpectedResult;
+    writerQueueSlotDepthChanged(conn_a, 1);
+    writerQueueSlotDepthChanged(conn_a, 1);
+    writerQueueSlotDepthChanged(conn_a, 1);
+    writerQueueSlotDepthChanged(conn_a, -1); // one frame finished draining.
+
+    var buf: [8]WriterQueueSlotSnapshot = undefined;
+    const slots = snapshotWriterQueueSlots(&buf);
+    try std.testing.expectEqual(@as(usize, 1), slots.len);
+    try std.testing.expectEqual(@as(u64, 2), slots[0].depth);
+    try std.testing.expectEqual(@as(u64, 3), slots[0].depth_high_water);
+
+    writerQueueSlotUnregister(conn_a);
+}
+
+// PR review (#951 third review, wGtoM): a scraper observing `in_use=true,
+// ready=true` could be descheduled, then another thread unregisters that
+// slot and a new session reclaims it with a different `(connection_id,
+// stream_id)` before the scraper resumes and reads the identity/byte
+// fields -- producing an impossible mixed-identity sample. These tests
+// hammer the exact same array slot with rapid register/update/unregister
+// cycles under two distinct, fixed identity-to-bytes pairings while a
+// concurrent reader continuously snapshots, asserting every observed
+// sample's bytes match its own connection id's pairing -- any mismatch
+// proves the seqlock protection (`SessionSlot.seq`/`WriterQueueSlot.seq`)
+// failed to keep identity and bytes from the same mutation generation.
+test "session slot snapshots never mix identity across concurrent register/unregister reuse" {
+    resetForTesting();
+    const Reader = struct {
+        stop: *std.atomic.Value(bool),
+        mismatch: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            var buf: [8]SessionSlotSnapshot = undefined;
+            while (!self.stop.load(.acquire)) {
+                for (snapshotSessionSlots(&buf)) |slot| {
+                    // `(0, 0)` is the legitimate transient state between a
+                    // fresh `sessionSlotRegister` and its immediately
+                    // following `sessionSlotUpdate` -- not a mismatch. Any
+                    // *other* byte pairing under a given connection id can
+                    // only mean this snapshot mixed one identity with
+                    // another generation's bytes.
+                    const ok = switch (slot.connection_id) {
+                        111 => (slot.inbound_bytes == 0 and slot.outbound_bytes == 0) or (slot.inbound_bytes == 11 and slot.outbound_bytes == 22),
+                        222 => (slot.inbound_bytes == 0 and slot.outbound_bytes == 0) or (slot.inbound_bytes == 33 and slot.outbound_bytes == 44),
+                        else => false,
+                    };
+                    if (!ok) self.mismatch.store(true, .release);
+                }
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    var mismatch = std.atomic.Value(bool).init(false);
+    var reader = Reader{ .stop = &stop, .mismatch = &mismatch };
+    const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+
+    var i: usize = 0;
+    while (i < 2_000) : (i += 1) {
+        const h_a = sessionSlotRegister(111, 1) orelse return error.TestUnexpectedResult;
+        sessionSlotUpdate(h_a, 11, 22);
+        sessionSlotUnregister(h_a);
+        const h_b = sessionSlotRegister(222, 1) orelse return error.TestUnexpectedResult;
+        sessionSlotUpdate(h_b, 33, 44);
+        sessionSlotUnregister(h_b);
+    }
+    stop.store(true, .release);
+    reader_thread.join();
+    try std.testing.expect(!mismatch.load(.acquire));
+}
+
+test "writer queue slot snapshots never mix identity across concurrent register/unregister reuse" {
+    resetForTesting();
+    const Reader = struct {
+        stop: *std.atomic.Value(bool),
+        mismatch: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            var buf: [8]WriterQueueSlotSnapshot = undefined;
+            while (!self.stop.load(.acquire)) {
+                for (snapshotWriterQueueSlots(&buf)) |slot| {
+                    const ok = switch (slot.connection_id) {
+                        111 => slot.cap_bytes == 1_000,
+                        222 => slot.cap_bytes == 2_000,
+                        else => false,
+                    };
+                    if (!ok) self.mismatch.store(true, .release);
+                }
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    var mismatch = std.atomic.Value(bool).init(false);
+    var reader = Reader{ .stop = &stop, .mismatch = &mismatch };
+    const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+
+    var i: usize = 0;
+    while (i < 2_000) : (i += 1) {
+        const h_a = writerQueueSlotRegister(111, 1_000) orelse return error.TestUnexpectedResult;
+        writerQueueSlotChanged(h_a, 10);
+        writerQueueSlotUnregister(h_a);
+        const h_b = writerQueueSlotRegister(222, 2_000) orelse return error.TestUnexpectedResult;
+        writerQueueSlotChanged(h_b, 20);
+        writerQueueSlotUnregister(h_b);
+    }
+    stop.store(true, .release);
+    reader_thread.join();
+    try std.testing.expect(!mismatch.load(.acquire));
 }

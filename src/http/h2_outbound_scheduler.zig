@@ -64,6 +64,10 @@ pub const Scheduler = struct {
 
     pub fn deinit(self: *Scheduler) void {
         self.mutex.lock();
+        // #951 third review: the depth count (entries plus the in-flight
+        // `active` one, if any) needs the same teardown refund as the byte
+        // count below, computed before either list is actually freed.
+        const remaining_depth: i64 = @as(i64, @intCast(self.entries.items.len)) + @as(i64, @intFromBool(self.active != null));
         for (self.entries.items) |entry| self.allocator.free(entry.bytes);
         if (self.active) |active| self.allocator.free(active.entry.bytes);
         self.entries.deinit(self.allocator);
@@ -73,6 +77,9 @@ pub const Scheduler = struct {
         if (self.queued_bytes > 0) {
             h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(self.queued_bytes)));
             h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, -@as(i64, @intCast(self.queued_bytes)));
+        }
+        if (remaining_depth > 0) {
+            h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, -remaining_depth);
         }
         h2_transport_metrics.writerQueueSlotUnregister(self.metrics_slot);
         self.mutex.unlock();
@@ -173,11 +180,13 @@ pub const Scheduler = struct {
         self.queued_bytes += owned.bytes.len;
         h2_transport_metrics.writerQueueBytesChanged(@intCast(owned.bytes.len));
         h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, @intCast(owned.bytes.len));
+        h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, 1);
         if (!self.wake_pending.load(.acquire)) self.signalLocked() catch |err| {
             const removed = self.entries.pop().?;
             self.queued_bytes -= removed.bytes.len;
             h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(removed.bytes.len)));
             h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, -@as(i64, @intCast(removed.bytes.len)));
+            h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, -1);
             return err;
         };
         self.wake_pending.store(true, .release);
@@ -205,6 +214,7 @@ pub const Scheduler = struct {
                 self.queued_bytes -= removed.bytes.len;
                 h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(removed.bytes.len)));
                 h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, -@as(i64, @intCast(removed.bytes.len)));
+                h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, -1);
                 self.allocator.free(removed.bytes);
                 continue;
             }
@@ -217,6 +227,7 @@ pub const Scheduler = struct {
                 self.queued_bytes -= active.entry.bytes.len;
                 h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(active.entry.bytes.len)));
                 h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, -@as(i64, @intCast(active.entry.bytes.len)));
+                h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, -1);
                 self.allocator.free(active.entry.bytes);
             }
         }
@@ -259,6 +270,7 @@ pub const Scheduler = struct {
                 self.queued_bytes -= done.bytes.len;
                 h2_transport_metrics.writerQueueBytesChanged(-@as(i64, @intCast(done.bytes.len)));
                 h2_transport_metrics.writerQueueSlotChanged(self.metrics_slot, -@as(i64, @intCast(done.bytes.len)));
+                h2_transport_metrics.writerQueueSlotDepthChanged(self.metrics_slot, -1);
                 self.allocator.free(done.bytes);
             }
             self.mutex.unlock();
@@ -612,4 +624,46 @@ test "two connections each stay within their own writer-queue cap even though th
     // connection's cap without that being a failure -- the defect the old
     // aggregate-vs-single-cap comparison had.
     try std.testing.expect(h2_transport_metrics.snapshot().writer_queue_bytes_high_water > 256 * 1024);
+}
+
+test "writer queue depth high water is tracked independently of byte occupancy (#951 third review)" {
+    const BlockingWriter = struct {
+        fn write(_: *@This(), _: []const u8) error{WouldBlock}!usize {
+            return error.WouldBlock;
+        }
+    };
+    h2_transport_metrics.resetForTesting();
+    var scheduler_a = try Scheduler.init(std.testing.allocator, 30, 256 * 1024);
+    defer scheduler_a.deinit();
+    var scheduler_b = try Scheduler.init(std.testing.allocator, 40, 256 * 1024);
+    defer scheduler_b.deinit();
+    var writer_a = BlockingWriter{};
+    var writer_b = BlockingWriter{};
+
+    // Many tiny frames: byte occupancy stays trivially small (well under
+    // the cap) while the frame-intent depth is what actually grows large
+    // -- a scheduler holding thousands of tiny frames is deep and unfair
+    // even though it looks small by byte capacity alone.
+    const frame_count: u31 = 500;
+    var i: u31 = 0;
+    while (i < frame_count) : (i += 1) {
+        try scheduler_a.enqueueFrame(.data, 0, 1, &.{1});
+        try scheduler_b.enqueueFrame(.data, 0, 1, &.{1});
+    }
+    try scheduler_a.flush(&writer_a);
+    try scheduler_b.flush(&writer_b);
+
+    var buf: [8]h2_transport_metrics.WriterQueueSlotSnapshot = undefined;
+    const slots = h2_transport_metrics.snapshotWriterQueueSlots(&buf);
+    try std.testing.expectEqual(@as(usize, 2), slots.len);
+    for (slots) |slot| {
+        // Byte occupancy peak is tiny (one byte payload + a nine-byte
+        // header per frame, all still queued behind the blocked writer).
+        try std.testing.expect(slot.queued_bytes_high_water <= 10 * frame_count);
+        try std.testing.expect(slot.queued_bytes_high_water <= slot.cap_bytes);
+        // Depth peak reflects the real frame-intent count, a genuinely
+        // distinct dimension the byte-cap check above cannot see.
+        try std.testing.expectEqual(@as(u64, frame_count), slot.depth_high_water);
+        try std.testing.expectEqual(@as(u64, frame_count), slot.depth);
+    }
 }

@@ -24157,14 +24157,23 @@ const OpensslRawPeer = struct {
     /// contract to build required CI on (observed failing on CI's macOS
     /// runner as `error.ReadTimeout` with zero bytes ever read downstream).
     fn waitForRequestHead(self: *OpensslRawPeer, allocator: std.mem.Allocator, timeout_ms: u32) !void {
+        const head = try self.readRequestHead(allocator, timeout_ms);
+        allocator.free(head);
+    }
+
+    /// Reads and returns the complete request head relayed by the TLS peer.
+    /// Callers that need to synthesize a WebSocket `101` use the original
+    /// `Sec-WebSocket-Key` to produce the matching accept value.
+    fn readRequestHead(self: *OpensslRawPeer, allocator: std.mem.Allocator, timeout_ms: u32) ![]u8 {
         var buf = std.array_list.Managed(u8).init(allocator);
         defer buf.deinit();
         var tmp: [4096]u8 = undefined;
-        while (std.mem.find(u8, buf.items, "\r\n\r\n") == null) {
+        while (true) {
             const n = try readSocketWithPoll(self.child.stdout.?.handle, &tmp, @intCast(timeout_ms));
             if (n == 0) return error.UpstreamConnectionClosed;
             try buf.appendSlice(tmp[0..n]);
             if (buf.items.len > 64 * 1024) return error.StreamTooLong;
+            if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |end| return allocator.dupe(u8, buf.items[0 .. end + 4]);
         }
     }
 
@@ -27659,6 +27668,22 @@ const H2WebSocketConnect = struct {
     }
 };
 
+fn h2WaitForEndStream(conn: *H2WebSocketConnect, allocator: std.mem.Allocator, timeout_ms: u64) !void {
+    var frame_count: usize = 0;
+    while (frame_count < 32) : (frame_count += 1) {
+        var frame = try conn.client.readHttp2Frame(allocator, 64 * 1024, timeout_ms);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try conn.client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            continue;
+        }
+        if (frame.typ == 0x3) return error.UnexpectedH2RstStream;
+        if (frame.typ == 0x7) return error.UnexpectedH2Goaway;
+        if (frame.stream_id == conn.stream_id and (frame.flags & 0x1) != 0) return;
+    }
+    return error.H2EndStreamNotFound;
+}
+
 fn h2SendExtendedWebSocketConnect(client: *PureZigTlsClient, allocator: std.mem.Allocator, stream_id: u31, authority: []const u8, path: []const u8) !void {
     try h2SendHeaders(client, allocator, stream_id, false, &.{
         .{ .name = ":method", .value = "CONNECT" },
@@ -27771,6 +27796,104 @@ test "downstream HTTP/2 RFC 8441 CONNECT END_STREAM reaches the relay and settle
     var reopened = try H2WebSocketConnect.open(allocator, tardigrade.port, "tardigrade.test", "/ws/chat", &.{});
     defer reopened.conn.destroy();
     try std.testing.expectEqual(@as(u16, 200), reopened.status);
+}
+
+test "downstream HTTP/2 RFC 8441 flushes final wss:// bytes before END_STREAM (#952)" {
+    try requireGenericNativeTlsProfile();
+    try requireOpenssl(std.testing.allocator);
+    const allocator = std.testing.allocator;
+    const ca_cert = try upstreamTlsFixture("native_ed25519_ca.crt", allocator);
+    defer allocator.free(ca_cert);
+    const chain_cert = try upstreamTlsFixture("native_ed25519_chain.crt", allocator);
+    defer allocator.free(chain_cert);
+    const key = try upstreamTlsFixture("native_ed25519.key", allocator);
+    defer allocator.free(key);
+    var origin = try OpensslRawPeer.start(allocator, &.{ "-cert", chain_cert, "-key", key });
+    defer origin.stop();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /ws/ {{
+        \\    proxy_pass https://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port });
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = ca_cert },
+        },
+    });
+    defer tardigrade.stop();
+
+    const HandshakeCtx = struct {
+        origin: *OpensslRawPeer,
+        result: ?anyerror = null,
+        fn serve(self: *@This()) void {
+            self.serveFallible() catch |err| {
+                self.result = err;
+            };
+        }
+        fn serveFallible(self: *@This()) !void {
+            const head = try self.origin.readRequestHead(std.heap.page_allocator, 5_000);
+            defer std.heap.page_allocator.free(head);
+            const ws_key = headerValue(head, "Sec-WebSocket-Key") orelse return error.MissingKey;
+            var accept_buf: [28]u8 = undefined;
+            const accept = wsAcceptFor(ws_key, &accept_buf);
+            var response: [256]u8 = undefined;
+            const bytes = try std.fmt.bufPrint(&response, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
+            try self.origin.sendToClient(bytes);
+        }
+    };
+    var handshake = HandshakeCtx{ .origin = &origin };
+    const handshake_thread = try std.Thread.spawn(.{}, HandshakeCtx.serve, .{&handshake});
+    var opened = try H2WebSocketConnect.open(allocator, tardigrade.port, "tardigrade.test", "/ws/final", &.{});
+    defer opened.conn.destroy();
+    handshake_thread.join();
+    if (handshake.result) |err| return err;
+    try std.testing.expectEqual(@as(u16, 200), opened.status);
+
+    const payload = "q" ** 12_000;
+    const final_client_frame = try encodeWsFrame(allocator, .text, payload, true, true);
+    defer allocator.free(final_client_frame);
+    // Queue a real encrypted origin frame before the client half-closes. It
+    // must remain intact while the relay flushes the final client frame and
+    // sends TLS close_notify for the H2 END_STREAM below.
+    const origin_final = try encodeWsFrame(allocator, .text, "origin-final-after-wss-flush", true, false);
+    defer allocator.free(origin_final);
+    try origin.sendToClient(origin_final);
+    try h2SendData(opened.conn.client, opened.conn.stream_id, true, final_client_frame);
+
+    var received = try allocator.alloc(u8, final_client_frame.len);
+    defer allocator.free(received);
+    var offset: usize = 0;
+    while (offset < received.len) {
+        const n = try readSocketWithPoll(origin.child.stdout.?.handle, received[offset..], 5_000);
+        if (n == 0) return error.UpstreamConnectionClosed;
+        offset += n;
+    }
+    try std.testing.expectEqualSlices(u8, final_client_frame, received);
+
+    var final_frame = try opened.conn.readWsFrame(allocator, 5_000);
+    defer final_frame.deinit(allocator);
+    try std.testing.expectEqual(WebSocketOpCode.text, final_frame.opcode);
+    try std.testing.expectEqualStrings("origin-final-after-wss-flush", final_frame.payload);
+    origin.child.stdin.?.close(compat.io());
+    origin.child.stdin = null;
+    try h2WaitForEndStream(&opened.conn, allocator, 5_000);
 }
 
 test "downstream HTTP/2 RFC 8441 multiplexes two WebSockets with twenty REST siblings on one TLS connection (#864)" {

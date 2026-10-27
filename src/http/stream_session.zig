@@ -8,7 +8,7 @@
 const std = @import("std");
 const compat = @import("zig_compat");
 
-pub const Error = error{ QueueFull, Closed, InvalidCapacity, WakeFailed } || std.mem.Allocator.Error;
+pub const Error = error{ QueueFull, Closed, InvalidCapacity, WakeFailed, WriteFailed } || std.mem.Allocator.Error;
 
 pub const TerminalReason = enum { reset, connection_closed, shutdown };
 
@@ -74,6 +74,11 @@ pub const Session = struct {
     cancel_requested: bool = false,
     terminal: ?Terminal = null,
     wake_failed: bool = false,
+    /// A producer write has failed after it may have queued a prefix, or a
+    /// wake notification has been lost.  In either case a retry could
+    /// duplicate bytes or block forever, so the runtime must reset/detach
+    /// this session instead of draining it as a healthy stream.
+    write_failed: bool = false,
     runtime_attached: bool = true,
     consumer_attached: bool = true,
 
@@ -147,7 +152,7 @@ pub const Session = struct {
         self.inbound_bytes = 0;
         self.outbound_bytes = 0;
         self.cond.broadcast();
-        self.signalWakeLocked();
+        self.signalWakeLocked() catch {};
     }
 
     /// Reactor borrows outbound bytes and must commit exactly the bytes it
@@ -212,6 +217,14 @@ pub const Session = struct {
         return self.wake_failed;
     }
 
+    /// True once a producer write cannot be retried safely.  The reactor
+    /// must treat this as fatal and reset/detach the stream.
+    pub fn hasWriteFailure(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.write_failed;
+    }
+
     pub fn runtimeDetach(self: *Session) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -238,7 +251,7 @@ pub const Session = struct {
                     self.allocator.free(chunk.bytes);
                     _ = self.inbound.orderedRemove(0);
                 }
-                self.signalWakeLocked();
+                self.signalWakeLocked() catch {};
                 return .{ .data = n };
             }
             if (self.terminal) |terminal| return readTerminal(terminal);
@@ -250,8 +263,10 @@ pub const Session = struct {
     pub fn write(self: *Session, bytes: []const u8) Error!WriteResult {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.write_failed) return error.WriteFailed;
         var remaining = bytes;
         while (remaining.len > 0) {
+            if (self.write_failed) return error.WriteFailed;
             if (self.terminal) |terminal| return writeTerminal(terminal);
             if (self.local_end_requested) return .finished;
             const capacity = self.max_outbound_bytes -| self.outbound_bytes;
@@ -260,12 +275,18 @@ pub const Session = struct {
                 continue;
             }
             const n = @min(capacity, remaining.len);
-            const owned = try self.allocator.dupe(u8, remaining[0..n]);
-            errdefer self.allocator.free(owned);
-            try self.outbound.append(self.allocator, .{ .bytes = owned });
+            const owned = self.allocator.dupe(u8, remaining[0..n]) catch |err| {
+                self.failWriteLocked();
+                return err;
+            };
+            self.outbound.append(self.allocator, .{ .bytes = owned }) catch |err| {
+                self.allocator.free(owned);
+                self.failWriteLocked();
+                return err;
+            };
             self.outbound_bytes += n;
             remaining = remaining[n..];
-            self.signalWakeLocked();
+            try self.signalWakeLocked();
         }
         return .ok;
     }
@@ -274,7 +295,7 @@ pub const Session = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.local_end_requested = true;
-        self.signalWakeLocked();
+        self.signalWakeLocked() catch {};
     }
 
     pub fn requestCancel(self: *Session) void {
@@ -282,7 +303,7 @@ pub const Session = struct {
         defer self.mutex.unlock();
         if (self.terminal != null) return;
         self.cancel_requested = true;
-        self.signalWakeLocked();
+        self.signalWakeLocked() catch {};
     }
 
     pub fn consumerDetach(self: *Session) bool {
@@ -293,10 +314,23 @@ pub const Session = struct {
         return !self.runtime_attached;
     }
 
-    fn signalWakeLocked(self: *Session) void {
+    fn failWriteLocked(self: *Session) void {
+        self.write_failed = true;
+        self.cond.broadcast();
+        self.signalWakeLocked() catch {};
+    }
+
+    /// Notify the reactor while holding `mutex`.  A failed notification is
+    /// fail-closed: no producer may enter a capacity wait that only the
+    /// sleeping reactor could release, and the runtime can discover both
+    /// sticky failure flags on its next bounded servicing pass.
+    fn signalWakeLocked(self: *Session) Error!void {
         const wake = self.wake orelse return;
         wake.notify() catch {
             self.wake_failed = true;
+            self.write_failed = true;
+            self.cond.broadcast();
+            return error.WakeFailed;
         };
     }
 };
@@ -361,4 +395,85 @@ test "consumer cancellation and two party detach are explicit" {
     try std.testing.expect(!session.takeCancelRequest());
     try std.testing.expect(!session.consumerDetach());
     try std.testing.expect(session.runtimeDetach());
+}
+
+test "partial write allocation failure is sticky and cannot duplicate a retry" {
+    // The first chunk needs a duplicate and the outbound list's initial
+    // allocation.  Let those succeed, then fail the duplicate attempted
+    // after the reactor releases capacity for the second chunk.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var session = try Session.init(failing.allocator(), 4, 4, 4, null);
+    defer session.deinit();
+
+    const Ctx = struct {
+        session: *Session,
+        result: Error!WriteResult = undefined,
+
+        fn run(ctx: *@This()) void {
+            ctx.result = ctx.session.write("eightbyt");
+        }
+    };
+    var ctx = Ctx{ .session = &session };
+    const writer = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+
+    // The writer first queues exactly one bounded chunk, then waits for the
+    // reactor to commit it before attempting the allocation that fails.
+    while (session.peekOutbound(4) == null) {}
+    try std.testing.expectEqualStrings("eigh", session.peekOutbound(4).?);
+    session.commitOutboundSent(4);
+    writer.join();
+
+    try std.testing.expectError(error.OutOfMemory, ctx.result);
+    try std.testing.expect(session.hasWriteFailure());
+    try std.testing.expectEqual(@as(?[]const u8, null), session.peekOutbound(4));
+    try std.testing.expectError(error.WriteFailed, session.write("eightbyt"));
+}
+
+test "failed wake fails closed before an oversized write can block" {
+    const FailingWake = struct {
+        fn fail(_: *anyopaque) anyerror!void {
+            return error.BrokenWake;
+        }
+    };
+    var wake_ctx: u8 = 0;
+    var session = try Session.init(std.testing.allocator, 4, 4, 4, .{
+        .ctx = &wake_ctx,
+        .notify_fn = FailingWake.fail,
+    });
+    defer session.deinit();
+
+    // A 4-byte queue would otherwise make this call wait after its first
+    // chunk.  The failed wake must return immediately instead.
+    try std.testing.expectError(error.WakeFailed, session.write("eightbyt"));
+    try std.testing.expect(session.hasWakeFailure());
+    try std.testing.expect(session.hasWriteFailure());
+    try std.testing.expectError(error.WriteFailed, session.write("retry"));
+}
+
+test "failed consumer control wakes remain observable for runtime cleanup" {
+    const FailingWake = struct {
+        fn fail(_: *anyopaque) anyerror!void {
+            return error.BrokenWake;
+        }
+    };
+    var wake_ctx: u8 = 0;
+
+    var cancelled = try Session.init(std.testing.allocator, 4, 4, 4, .{
+        .ctx = &wake_ctx,
+        .notify_fn = FailingWake.fail,
+    });
+    defer cancelled.deinit();
+    cancelled.requestCancel();
+    try std.testing.expect(cancelled.takeCancelRequest());
+    try std.testing.expect(cancelled.hasWakeFailure());
+    try std.testing.expect(cancelled.hasWriteFailure());
+
+    var finished = try Session.init(std.testing.allocator, 4, 4, 4, .{
+        .ctx = &wake_ctx,
+        .notify_fn = FailingWake.fail,
+    });
+    defer finished.deinit();
+    finished.finishLocal();
+    try std.testing.expect(finished.hasWakeFailure());
+    try std.testing.expect(finished.hasWriteFailure());
 }

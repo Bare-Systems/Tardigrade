@@ -334,7 +334,7 @@ const SessionWriter = struct {
         // settled the tunnel, in which case this is a no-op.
         const deadline = event_loop.monotonicMs() +| @as(u64, self.close_flush_timeout_ms);
         while (!self.shared.isDone()) {
-            if (self.shared.session.localEndStreamSent()) {
+            if (self.shared.session.localEndStreamSent() and self.shared.session.remoteEndStreamReceived()) {
                 self.shared.finishGracefully(.upstream);
                 return;
             }
@@ -602,6 +602,45 @@ test "run preserves the origin's final bytes across a clean EOF, forcing RST onl
     try std.testing.expectEqual(CloseReason.upstream, ctx.stats.close_reason);
     try std.testing.expect(ctx.stats.duration_ms >= 200);
     try std.testing.expectEqual(@as(u64, "final-close-bytes".len), ctx.stats.upstream_to_client_bytes);
+}
+
+test "run completes clean upstream EOF without RST after both halves close (#952)" {
+    const allocator = std.testing.allocator;
+    var session = try h2_stream_session.Session.init(allocator, 1, 1, 64 * 1024, 64 * 1024);
+    defer session.deinit();
+
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    const origin_side = fds[0];
+    const test_side = fds[1];
+
+    const Ctx = struct {
+        session: *h2_stream_session.Session,
+        upstream: Upstream,
+        stats: Stats = undefined,
+        fn runRelay(ctx: *@This()) void {
+            ctx.stats = run(ctx.session, ctx.upstream, "", .{
+                .idle_timeout_ms = 5_000,
+                .shutdown_requested = neverShutdown,
+                .poll_interval_ms = 10,
+                .close_flush_timeout_ms = 200,
+            });
+        }
+    };
+    var ctx = Ctx{ .session = &session, .upstream = .{ .fd = origin_side, .tls = null } };
+    session.deliverRemoteEndStream();
+    const relay_thread = try std.Thread.spawn(.{}, Ctx.runRelay, .{&ctx});
+    _ = std.c.close(test_side);
+
+    // Stand in for the connection runtime draining the final empty
+    // END_STREAM frame after `SessionWriter.finishLocal`.
+    while (!session.outboundLocalEndPending()) compat.sleepNs(2 * std.time.ns_per_ms);
+    session.markLocalEndStreamSent();
+    relay_thread.join();
+
+    try std.testing.expectEqual(CloseReason.upstream, ctx.stats.close_reason);
+    try std.testing.expect(ctx.stats.duration_ms < 200);
+    try std.testing.expect(!session.takeCancelRequest());
 }
 
 test "run ends the whole tunnel once the origin closes" {

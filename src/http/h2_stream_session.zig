@@ -340,6 +340,16 @@ pub const Session = struct {
         return self.local_end_sent;
     }
 
+    /// True once the downstream peer has ended its half of the stream. A
+    /// relay may finish a clean upstream EOF without a RST only after both
+    /// halves have completed; otherwise its blocked `read` consumer still
+    /// needs cancellation to wake.
+    pub fn remoteEndStreamReceived(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.remote_end_stream;
+    }
+
     /// Drain and reset the receive-window credit earned by consumer reads
     /// since the last call. The runtime uses this to size WINDOW_UPDATE.
     pub fn takeReceiveCreditToReturn(self: *Session) usize {

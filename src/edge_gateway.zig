@@ -3613,7 +3613,14 @@ fn h2WriteSessionResponseHeaders(writer: anytype, allocator: std.mem.Allocator, 
 /// (`Sec-WebSocket-Protocol`/`-Extensions`); everything else about the
 /// origin's H1 handshake (its own `Upgrade`/`Connection`/`Sec-WebSocket-Accept`)
 /// is H1-specific framing that must never leak into an H2 response.
-fn h2WriteWebSocketAcceptedHeaders(writer: anytype, allocator: std.mem.Allocator, stream_id: u31, correlation_id: []const u8, upgraded: *const gp.UpgradedUpstream) !void {
+fn h2WriteWebSocketAcceptedHeaders(
+    writer: anytype,
+    allocator: std.mem.Allocator,
+    stream_id: u31,
+    correlation_id: []const u8,
+    upgraded: *const gp.UpgradedUpstream,
+    forward_auth_client_headers: []const gfa.Header,
+) !void {
     var headers = std.array_list.Managed(http.hpack.HeaderField).init(allocator);
     defer headers.deinit();
     var lowered_names = std.array_list.Managed([]u8).init(allocator);
@@ -3628,6 +3635,9 @@ fn h2WriteWebSocketAcceptedHeaders(writer: anytype, allocator: std.mem.Allocator
         } else if (std.ascii.eqlIgnoreCase(header.name, "sec-websocket-extensions")) {
             try headers.append(.{ .name = "sec-websocket-extensions", .value = header.value });
         }
+    }
+    for (forward_auth_client_headers) |header| {
+        try headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, header.name), .value = header.value });
     }
     try headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.REQUEST_HEADER_NAME), .value = correlation_id });
     try headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.HEADER_NAME), .value = correlation_id });
@@ -3770,7 +3780,7 @@ fn h2ApplyWebSocketAdmissionOutcome(
                 switched.deinit();
                 return err;
             };
-            h2WriteWebSocketAcceptedHeaders(writer, allocator, stream_id, correlation_id, switched.upgraded) catch |err| {
+            h2WriteWebSocketAcceptedHeaders(writer, allocator, stream_id, correlation_id, switched.upgraded, switched.forward_auth_grants.client_headers.items) catch |err| {
                 session.deinit();
                 allocator.destroy(session);
                 switched.deinit();
@@ -4008,6 +4018,22 @@ fn h2ProcessHeaderBlock(
         }
         if (streams.getPtr(stream_id)) |s| s.remoteEndStream() catch {};
         active_session.deliverRemoteEndStream();
+        return;
+    }
+
+    if (in_flight.get(stream_id) == .websocket_admission) {
+        // A second field section while an asynchronous CONNECT admission is
+        // pending is never another initial request. Reject and cancel this
+        // stream only; HPACK has already been decoded, so sibling streams
+        // retain a synchronized compression context.
+        try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+        if (handoff) |ho| _ = ho.cancelStream(stream_id) catch {};
+        if (handoff) |ho| if (executor) |ex| ex.cancelStreamSignals(ho, stream_id);
+        if (in_flight.fetchRemove(stream_id)) |removed| {
+            std.debug.assert(removed.value == .websocket_admission);
+            buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
+        }
+        _ = streams.remove(stream_id);
         return;
     }
 
@@ -17886,6 +17912,49 @@ test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
     try std.testing.expectEqual(@as(u8, 0x3), written[3]);
     const rst_stream_id: u32 = std.mem.readInt(u32, written[5..9], .big) & 0x7fff_ffff;
     try std.testing.expectEqual(@as(u32, 1), rst_stream_id);
+}
+
+test "H2 WebSocket admission rejects repeated HEADERS without affecting siblings" {
+    const allocator = std.testing.allocator;
+    var decoder = http.hpack.Decoder.init();
+    defer decoder.deinit(allocator);
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer pending.deinit();
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try streams.put(3, http.http2_stream.Stream.init(3, 65_535));
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer sessions.deinit();
+    var state: GatewayState = undefined;
+    state.h2_session_test_hook = null;
+    const cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    const block = try http.hpack.encodeLiteralHeaderBlock(allocator, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/socket" },
+        .{ .name = ":authority", .value = "example.test" },
+    });
+    defer allocator.free(block);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var buffered: usize = HTTP2_SESSION_RESERVED_BYTES;
+    var in_flight = std.AutoHashMap(u31, H2InFlightKind).init(allocator);
+    defer in_flight.deinit();
+    try in_flight.put(1, .websocket_admission);
+
+    try h2ProcessHeaderBlock(allocator, &decoder, &pending, &streams, &ready, &sessions, &state, 1, block, false, false, &out.writer, 1, 0, &buffered, "127.0.0.1", 1, &cfg, true, .{}, null, null, null, &in_flight);
+
+    try std.testing.expect(!in_flight.contains(1));
+    try std.testing.expect(!streams.contains(1));
+    try std.testing.expectEqual(@as(usize, 0), buffered);
+    try std.testing.expect(streams.contains(3));
+    const written = out.written();
+    try std.testing.expect(written.len >= 9);
+    try std.testing.expectEqual(@as(u8, 0x3), written[3]);
 }
 
 test "an actual parsed request with a bracketed Host never reaches the ACME challenge lookup (#877 review)" {

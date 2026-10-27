@@ -54,6 +54,10 @@ pub const Switched = struct {
     max_lifetime_ms: u32,
     drain_timeout_ms: u64,
     reload_drain: ?http.h2_websocket_relay.ReloadDrain,
+    /// Allowed forward-auth decisions stay owned until the downstream 200
+    /// has been serialized. Their upstream assertions were installed before
+    /// the origin handshake; their client headers decorate that 200.
+    forward_auth_grants: gfa.Grants,
     /// Lease on the configuration generation this tunnel was admitted under;
     /// `reload_drain.superseded_at_ms` points into it. Retained here (not
     /// merely borrowed) so a reload or connection teardown elsewhere can
@@ -66,6 +70,7 @@ pub const Switched = struct {
         self.state.recordUpstreamAttemptEnd(self.upstream_base_url);
         self.state.releaseWebSocketTunnel();
         if (self.config_lease) |*lease| lease.release();
+        self.forward_auth_grants.deinit(self.allocator);
         self.allocator.free(self.upstream_base_url);
         self.allocator.destroy(self);
     }
@@ -124,6 +129,11 @@ pub fn admit(
     }
 
     var matched = http.location_router.matchLocation(allocator, request.uri.path, route_cfg.location_blocks) orelse return .not_matched;
+    var forward_auth_grants: gfa.Grants = .{};
+    var grants_owned = true;
+    defer if (grants_owned) forward_auth_grants.deinit(allocator);
+    var client_view = ghandlers.H1ClientAuthView{};
+    defer client_view.deinit(allocator);
     var hops: usize = 1;
     // Match the ordinary H2 route resolver's rewrite semantics: every hop
     // gets its own identity, client-certificate, forward-auth and policy
@@ -150,16 +160,33 @@ pub fn admit(
                 .proto = if (edge_config.usesNativeTls(route_cfg)) "https" else "http",
                 .client_ip = client_ip,
                 .correlation_id = correlation_id,
-                .headers = &request.headers,
+                // Each rewrite hop's verifier sees the caller's original
+                // credentials, never identity headers a prior verifier
+                // asserted for the origin.
+                .headers = client_view.headers(request),
                 .body = null,
+                .asserted_names = client_view.asserted_names.items,
             });
-            defer decision.deinit();
+            var decision_owned = true;
+            defer if (decision_owned) decision.deinit();
             state.metricsRecordForwardAuth(.h2, decision.outcome);
             if (!decision.allowed()) {
+                forward_auth_grants.clear();
                 return .{ .refused = .{ .status_code = decision.status, .code = decision.errorCode() } };
             }
+            if (fa.upstream_headers.len > 0) {
+                // Preserve the unmodified client view before applying this
+                // hop's assertions. `applyUpstreamHeaders` first strips all
+                // configured names, so a forged client identity can never
+                // reach the origin.
+                try client_view.preserve(allocator, request);
+                try client_view.asserted_names.appendSlice(allocator, fa.upstream_headers);
+            }
+            try gfa.applyUpstreamHeaders(&request.headers, fa, &decision);
+            decision_owned = false;
+            try forward_auth_grants.add(allocator, decision);
         }
-        if (ga.evaluatePolicy(state, route_cfg, "CONNECT", request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |_| {
+        if (ga.evaluatePolicy(state, route_cfg, "CONNECT", request.uri.path, ctx.identity, ctx.device_id, client_view.headers(request))) |_| {
             return .{ .refused = .{ .status_code = 403, .code = "forbidden" } };
         }
         switch (matched.block.action) {
@@ -274,7 +301,9 @@ pub fn admit(
                 // timeout applies to it.
                 .reload_drain = gproxy_runtime.websocketReloadDrain(&websocket, route_cfg, config_superseded_at),
                 .config_lease = retained_lease,
+                .forward_auth_grants = forward_auth_grants,
             };
+            grants_owned = false;
             tunnel_admitted = true;
             attempt_ended = true; // ownership of the in-flight accounting moves to `Switched.deinit`.
             return .{ .switched = switched };

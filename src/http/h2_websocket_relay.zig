@@ -75,10 +75,11 @@ pub const Upstream = struct {
         _ = std.c.shutdown(self.fd, 2);
     }
 
-    /// The downstream H2 peer ended its send half. Once every queued byte
-    /// has reached the origin, mirror that half-close at the transport so an
-    /// origin waiting for EOF can complete its own WebSocket close path.
-    fn shutdownWrite(self: Upstream) void {
+    /// The downstream H2 peer ended its send half.  A TLS origin requires an
+    /// encrypted `close_notify`, not a raw TCP FIN; keep the read half alive
+    /// for its final WebSocket bytes.  Plaintext origins still use SHUT_WR.
+    fn shutdownWrite(self: Upstream) !void {
+        if (self.tls) |tls| return tls.shutdownWriteNonBlocking();
         _ = std.c.shutdown(self.fd, 1);
     }
 };
@@ -400,8 +401,14 @@ const Pump = struct {
             // after its already-accepted bytes are flushed, propagate that
             // half-close to the origin while continuing to receive its final
             // WebSocket bytes and EOF (#952 review).
-            if (!upstream_write_closed and self.shared.c2u.producerClosedAndEmpty()) {
-                self.shared.upstream.shutdownWrite();
+            if (!upstream_write_closed and self.shared.c2u.producerClosedAndEmpty() and !self.endpoint.pendingOutput()) {
+                self.shared.upstream.shutdownWrite() catch {
+                    self.shared.finishOnce(.upstream_error);
+                    return;
+                };
+                // TLS shutdown queues its close_notify, which must be driven
+                // to the socket before considering this side closed. The
+                // next iterations keep flushing it through `endpoint`.
                 upstream_write_closed = true;
                 progressed = true;
             }

@@ -488,6 +488,11 @@ pub const PureZigRecordStream = struct {
     lifecycle: Lifecycle = .handshaking,
     peer_closed: bool = false,
     carrier_eof: bool = false,
+    /// The local application has finished writing, but must continue reading
+    /// until the peer completes its side of the TLS connection.  This is
+    /// intentionally distinct from `lifecycle == .closing`: the latter is a
+    /// full TLS teardown and stops record input as well.
+    write_shutdown_requested: bool = false,
     close_notify_queued: bool = false,
     pending_terminal_read_error: ?Error = null,
     last_read_early_prefix_len: usize = 0,
@@ -706,6 +711,7 @@ pub const PureZigRecordStream = struct {
         self.lifecycle = .closed;
         self.peer_closed = true;
         self.carrier_eof = false;
+        self.write_shutdown_requested = false;
         self.close_notify_queued = false;
         self.pending_terminal_read_error = null;
         self.last_read_early_prefix_len = 0;
@@ -1558,7 +1564,7 @@ pub const PureZigRecordStream = struct {
     pub fn writePlaintext(self: *PureZigRecordStream, bytes: []const u8) Error!usize {
         if (self.failed) |err| return err;
         if (self.pending_terminal) |err| return err;
-        if (self.lifecycle == .closing or self.lifecycle == .closed or self.lifecycle == .failed) return error.StreamClosed;
+        if (self.lifecycle == .closing or self.lifecycle == .closed or self.lifecycle == .failed or self.write_shutdown_requested) return error.StreamClosed;
         if (self.pending_terminal_read_error) |err| return err;
         if (bytes.len == 0) return 0;
         const write_epoch: events.EncryptionEpoch = if (self.lifecycle == .open and self.bridge.handshake_complete)
@@ -1597,6 +1603,15 @@ pub const PureZigRecordStream = struct {
         const record = self.bridge.sealProtected(write_epoch, .application_data, bytes[0..n], &record_buf) catch |err| return self.fail(err);
         self.appendOutboundCiphertext(record) catch |err| return self.fail(err);
         return n;
+    }
+
+    /// Send an orderly TLS `close_notify` after already-queued application
+    /// records, while retaining the inbound half of the record layer.  This
+    /// is the TLS analogue of a transport write-half close: callers may no
+    /// longer write plaintext, but can continue receiving the peer's final
+    /// application records and its own closure alert.
+    pub fn closeWrite(self: *PureZigRecordStream) void {
+        if (self.lifecycle == .open) self.write_shutdown_requested = true;
     }
 
     pub fn drainCiphertext(self: *PureZigRecordStream, out: []u8) Error!usize {
@@ -1640,7 +1655,7 @@ pub const PureZigRecordStream = struct {
             .wants_read = !auth_pending and !self.carrier_eof and self.canAcceptCarrierRead(),
             .wants_write = self.outbound_ciphertext.len > 0 or (self.lifecycle == .closing and !self.close_notify_queued),
             .can_read_plaintext = self.inbound_plaintext.len > 0 or pending_terminal_read_ready,
-            .can_write_plaintext = self.pending_terminal_read_error == null and
+            .can_write_plaintext = !self.write_shutdown_requested and self.pending_terminal_read_error == null and
                 ((self.lifecycle == .open and self.bridge.handshake_complete) or zero_rtt_write_ready) and
                 !self.write_backpressured and
                 self.canReserveOutboundRecord(),
@@ -1714,6 +1729,7 @@ pub const PureZigRecordStream = struct {
             }
 
             if (try self.queueCloseNotify()) made_progress = true;
+            if (try self.queueWriteCloseNotify()) made_progress = true;
 
             var wrote_close_notify = false;
             while (self.outbound_ciphertext.len > 0 and written_total < drive_write_budget) {
@@ -2031,6 +2047,21 @@ pub const PureZigRecordStream = struct {
             self.closeCarrier();
             return true;
         }
+        if (self.outbound_ciphertext.len > 0) return false;
+        if (!self.canReserveOutboundRecord()) return false;
+        var alert_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+        const close_notify = self.bridge.sealProtected(.application, .alert, &.{ 1, 0 }, &alert_buf) catch |err| return self.fail(err);
+        self.appendOutboundCiphertext(close_notify) catch |err| return self.fail(err);
+        self.close_notify_queued = true;
+        return true;
+    }
+
+    fn queueWriteCloseNotify(self: *PureZigRecordStream) Error!bool {
+        if (!self.write_shutdown_requested or self.close_notify_queued) return false;
+        // `closeWrite` is only accepted after the handshake completed, but
+        // leave this defensive guard here so a future caller cannot create an
+        // application alert under missing write keys.
+        if (!self.bridge.handshake_complete) return false;
         if (self.outbound_ciphertext.len > 0) return false;
         if (!self.canReserveOutboundRecord()) return false;
         var alert_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
@@ -6826,6 +6857,47 @@ test "encrypted stream orderly close releases the handshake driver and its secre
         try testing.expectEqual(@as(usize, 1), backend.deinit_count);
         try testing.expectEqual(@as(usize, 1), carrier.close_count);
     }
+}
+
+test "encrypted stream write-half close sends close_notify while preserving peer reads" {
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    var client_backend = ScriptedRecordBackend{ .role = .client };
+    var server_backend = ScriptedRecordBackend{ .role = .server };
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    defer client.deinit();
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    defer server.deinit();
+
+    try driveBothUntil(&client, &server, bothComplete);
+    client.closeWrite();
+    try testing.expect(!client.readiness().can_write_plaintext);
+    try testing.expectError(error.StreamClosed, client.writePlaintext("after-close"));
+
+    var rounds: usize = 0;
+    while (!server.peer_closed and rounds < 64) : (rounds += 1) {
+        _ = try client.stream().drive();
+        _ = try server.stream().drive();
+    }
+    try testing.expect(rounds < 64);
+    try testing.expect(server.peer_closed);
+    try testing.expectEqual(Lifecycle.open, client.lifecycle);
+
+    try testing.expectEqual(@as(usize, 5), try server.writePlaintext("final"));
+    var received: [5]u8 = undefined;
+    rounds = 0;
+    while (rounds < 64) : (rounds += 1) {
+        _ = try server.stream().drive();
+        _ = try client.stream().drive();
+        if (client.readPlaintext(&received)) |n| {
+            try testing.expectEqualStrings("final", received[0..n]);
+            break;
+        } else |err| switch (err) {
+            error.WouldBlock => {},
+            else => return err,
+        }
+    }
+    try testing.expect(rounds < 64);
 }
 
 test "encrypted stream close is terminal and idempotent from every lifecycle state" {

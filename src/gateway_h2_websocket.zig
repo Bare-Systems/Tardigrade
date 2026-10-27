@@ -38,9 +38,14 @@ pub const Refused = struct {
 
 /// The dialed, handshake-verified upstream connection and the tunnel policy
 /// the admitting location carries, owned until the caller either tears it
-/// down (`deinit`) or hands it to the relay.
+/// down (`deinit`) or hands it to the relay. `deinit` is the *only* place
+/// that releases the tunnel slot, the upstream in-flight count and the
+/// configuration lease (#952 review): every caller -- the pre-spawn error
+/// paths in `edge_gateway.zig` and the relay's own close path -- just calls
+/// `deinit` exactly once, mirroring H1's `TunnelJob.releaseShared`.
 pub const Switched = struct {
     allocator: std.mem.Allocator,
+    state: *GatewayState,
     upgraded: *gp.UpgradedUpstream,
     upstream_base_url: []u8,
     circuit_permit: http.circuit_breaker.Permit,
@@ -49,9 +54,18 @@ pub const Switched = struct {
     max_lifetime_ms: u32,
     drain_timeout_ms: u64,
     reload_drain: ?http.h2_websocket_relay.ReloadDrain,
+    /// Lease on the configuration generation this tunnel was admitted under;
+    /// `reload_drain.superseded_at_ms` points into it. Retained here (not
+    /// merely borrowed) so a reload or connection teardown elsewhere can
+    /// never free it out from under the detached relay thread (#952 review,
+    /// mirrors H1's `TunnelJob.adoptConfigLease`).
+    config_lease: ?gs.ConfigLease,
 
     pub fn deinit(self: *Switched) void {
         self.upgraded.deinit();
+        self.state.recordUpstreamAttemptEnd(self.upstream_base_url);
+        self.state.releaseWebSocketTunnel();
+        if (self.config_lease) |*lease| lease.release();
         self.allocator.free(self.upstream_base_url);
         self.allocator.destroy(self);
     }
@@ -82,7 +96,7 @@ pub fn admit(
     connection_ip: []const u8,
     correlation_id: []const u8,
     transport_early: bool,
-    config_superseded_at: ?*const std.atomic.Value(u64),
+    config_lease: ?*gs.ConfigLease,
 ) !Outcome {
     var effective_cfg_storage = cfg.*;
     const route_cfg = routeConfig(cfg, request, &effective_cfg_storage) orelse cfg;
@@ -227,9 +241,18 @@ pub fn admit(
             errdefer upgraded.deinit();
             const owned_base_url = try allocator.dupe(u8, selected_base_url);
             errdefer allocator.free(owned_base_url);
+            // Retained (not merely borrowed), so the detached relay thread's
+            // `reload_drain.superseded_at_ms` pointer -- which reaches into
+            // this lease's `version` -- stays valid for the tunnel's whole
+            // life, however long after this admission call returns (#952
+            // review).
+            var retained_lease: ?gs.ConfigLease = if (config_lease) |lease| lease.retain() else null;
+            errdefer if (retained_lease) |*lease| lease.release();
+            const config_superseded_at: ?*const std.atomic.Value(u64) = if (retained_lease) |*lease| &lease.version.superseded_at_ms else null;
             const switched = try allocator.create(Switched);
             switched.* = .{
                 .allocator = allocator,
+                .state = state,
                 .upgraded = upgraded,
                 .upstream_base_url = owned_base_url,
                 .circuit_permit = circuit_permit,
@@ -243,9 +266,10 @@ pub fn admit(
                 // end the tunnel (drain) but never change which policy or
                 // timeout applies to it.
                 .reload_drain = gproxy_runtime.websocketReloadDrain(&websocket, route_cfg, config_superseded_at),
+                .config_lease = retained_lease,
             };
             tunnel_admitted = true;
-            attempt_ended = true; // ownership of the in-flight accounting moves to the tunnel's own close bookkeeping.
+            attempt_ended = true; // ownership of the in-flight accounting moves to `Switched.deinit`.
             return .{ .switched = switched };
         },
     }

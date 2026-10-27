@@ -27727,6 +27727,139 @@ test "downstream HTTP/2 RFC 8441 Extended CONNECT denied by Origin policy never 
     try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
 }
 
+test "downstream HTTP/2 RFC 8441 Extended CONNECT releases its tunnel slot and upstream in-flight count on close, so a later connect reuses it (#952)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", .value = "1" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var first = try H2WebSocketConnect.open(allocator, tardigrade.port, "tardigrade.test", "/ws/chat", &.{});
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+    first.conn.destroy();
+
+    const settle_deadline = compat.milliTimestamp() + 5_000;
+    while (true) {
+        var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+        defer metrics.deinit();
+        const active = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 1;
+        if (active == 0) break;
+        if (compat.milliTimestamp() > settle_deadline) return error.TunnelDidNotSettle;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+
+    // The slot and upstream in-flight count the first tunnel held were
+    // actually released -- not permanently consumed the way #952's review
+    // found them to be -- so a second connect under the same
+    // `max_tunnels = 1` succeeds instead of getting 503 `websocket_capacity`.
+    var second = try H2WebSocketConnect.open(allocator, tardigrade.port, "tardigrade.test", "/ws/chat", &.{});
+    defer second.conn.destroy();
+    try std.testing.expectEqual(@as(u16, 200), second.status);
+
+    var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u64, 0), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"capacity\""));
+}
+
+test "downstream HTTP/2 RFC 8441 Extended CONNECT denied by connection-memory capacity never dials the upstream (#952)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            // Smaller than one #867 session's reserved queue capacity but
+            // still comfortably large enough for the plain requests this
+            // test itself makes (the readiness probe, and the full
+            // `/status/metrics` response below), so the connection-memory
+            // budget gate trips only for the WebSocket admission -- before
+            // #952's fix, this still cost the origin a real H1 handshake
+            // first.
+            .{ .name = "TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES", .value = "1048576" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    // The connection-memory capacity gate refuses the stream with
+    // RST_STREAM (mirroring the identical gate for an ordinary #867 test-hook
+    // session attach a few lines below it in `h2ProcessHeaderBlock`), not a
+    // real HTTP status response -- so this drives the Extended CONNECT by
+    // hand instead of `H2WebSocketConnect.open`, which only recognizes a
+    // HEADERS reply.
+    try openExtendedConnectExpectingReset(allocator, tardigrade.port, "tardigrade.test", "/ws/chat");
+    try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
+
+    var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"capacity\""));
+}
+
+/// Sends an RFC 8441 Extended CONNECT and asserts the stream is refused with
+/// RST_STREAM (frame type `0x3`), never a HEADERS response -- the shape
+/// `h2AdmitWebSocketConnect`'s connection-memory capacity gate and its
+/// pre-#866-dispatch `not_matched`/overload refusals use.
+fn openExtendedConnectExpectingReset(allocator: std.mem.Allocator, port: u16, authority: []const u8, path: []const u8) !void {
+    const client = try PureZigTlsClient.create(allocator, port, "h2");
+    defer client.destroy();
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{}); // client SETTINGS
+
+    const request_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = ":path", .value = path },
+    };
+    const request_block = try hpack.encodeLiteralHeaderBlock(allocator, &request_headers);
+    defer allocator.free(request_block);
+    try client.writeHttp2Frame(0x1, 0x4, 1, request_block); // END_HEADERS only
+
+    var frame_count: usize = 0;
+    while (frame_count < 16) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        switch (frame.typ) {
+            0x4 => if ((frame.flags & 0x1) == 0) try client.writeHttp2Frame(0x4, 0x1, 0, &.{}), // SETTINGS ACK
+            0x3 => if (frame.stream_id == 1) return, // RST_STREAM: refused, as expected.
+            0x1 => if (frame.stream_id == 1) return error.UnexpectedHeadersResponse,
+            else => {},
+        }
+    }
+    return error.H2ExtendedConnectResponseNotFound;
+}
+
 test "proxy_websocket relays text, binary, ping/pong, fragments and large messages both ways (#812)" {
     const allocator = std.testing.allocator;
     const origin = try WsOrigin.start(allocator, .echo);

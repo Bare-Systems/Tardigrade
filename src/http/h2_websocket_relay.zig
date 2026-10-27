@@ -219,6 +219,24 @@ const Shared = struct {
         self.u2c.abort();
     }
 
+    /// Finish after a clean upstream EOF once the connection runtime has
+    /// sent END_STREAM.  Unlike `finishOnce`, this deliberately does not
+    /// request cancellation: a subsequent RST_STREAM would invalidate an
+    /// otherwise successful RFC 9113 graceful close.
+    fn finishGracefully(self: *Shared, reason: CloseReason) void {
+        self.mutex.lock();
+        const already_done = self.done;
+        if (!already_done) {
+            self.done = true;
+            self.reason = reason;
+        }
+        self.mutex.unlock();
+        if (already_done) return;
+        self.upstream.shutdownBoth();
+        self.c2u.abort();
+        self.u2c.abort();
+    }
+
     fn isDone(self: *Shared) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -316,6 +334,10 @@ const SessionWriter = struct {
         // settled the tunnel, in which case this is a no-op.
         const deadline = event_loop.monotonicMs() +| @as(u64, self.close_flush_timeout_ms);
         while (!self.shared.isDone()) {
+            if (self.shared.session.localEndStreamSent()) {
+                self.shared.finishGracefully(.upstream);
+                return;
+            }
             if (event_loop.monotonicMs() >= deadline) break;
             compat.sleepNs(5 * std.time.ns_per_ms);
         }

@@ -3756,7 +3756,15 @@ fn h2ApplyWebSocketAdmissionOutcome(
             if (streams.getPtr(stream_id)) |s| s.localEndStream() catch {};
         },
         .switched => |switched| {
-            const session = try allocator.create(http.h2_stream_session.Session);
+            // `outcome.switched` owns an already-open origin connection,
+            // its process-wide tunnel slot, upstream in-flight accounting,
+            // and a retained configuration lease.  Do not use `try` here:
+            // a failed first allocation would otherwise return before any
+            // of the cleanup below can run (#952 review).
+            const session = allocator.create(http.h2_stream_session.Session) catch |err| {
+                switched.deinit();
+                return err;
+            };
             session.* = http.h2_stream_session.Session.init(allocator, connection_id, stream_id, HTTP2_SESSION_MAX_INBOUND_BYTES, HTTP2_SESSION_MAX_OUTBOUND_BYTES) catch |err| {
                 allocator.destroy(session);
                 switched.deinit();
@@ -4069,6 +4077,18 @@ fn h2ProcessHeaderBlock(
     }
 
     if (is_extended_connect_websocket) {
+        // RFC 8441 CONNECT is still an HTTP/2 request.  Validate the same
+        // connection-specific/framing fields as the ordinary H2 path before
+        // it reaches synthesis, a worker, or an origin dial.  In particular
+        // H1 synthesis must never get a chance to reinterpret `connection`,
+        // `upgrade`, `transfer-encoding`, invalid `te`, or ambiguous
+        // Content-Length on this stream.
+        if (!h2RequestFramingIsValid(&ps)) {
+            try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+            if (streams.getPtr(stream_id)) |s| s.close();
+            ps.deinit(allocator);
+            return;
+        }
         // The normal (non-WebSocket) H2 path stamps this after
         // `h2ProcessHeaderBlock` returns, once the stream is in `pending`;
         // Extended CONNECT never enters `pending`, so it must be stamped
@@ -5506,6 +5526,25 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         if (streams.getPtr(frame.stream_id)) |s| s.remoteEndStream() catch {};
                         try h2AppendReadyStream(&ready_streams, frame.stream_id);
                     }
+                } else if (in_flight_jobs.contains(frame.stream_id)) {
+                    // A dispatched worker still owns this open stream. In
+                    // particular an RFC 8441 admission can be waiting on
+                    // forward-auth or an origin handshake while its peer
+                    // sends DATA. This is never a connection error: retire
+                    // this one stream, cancel its job/reservation, and keep
+                    // all sibling streams usable. The bytes have already
+                    // been charged above, so return only connection credit
+                    // as the stream is about to disappear.
+                    const charge: i64 = @intCast(frame.payload.len);
+                    const refunded = outbound.cancelStream(frame.stream_id);
+                    if (refunded > 0) conn_send_window +|= @intCast(@min(refunded, std.math.maxInt(i32)));
+                    try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.cancel.value());
+                    if (charge > 0) {
+                        try http.http2_frame.writeWindowUpdate(outbound_writer, 0, @intCast(charge));
+                        conn_recv_window += charge;
+                    }
+                    try h2ResetStreamState(outbound_writer, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, null, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
+                    continue;
                 } else {
                     try http.http2_frame.writeGoaway(outbound_writer, frame.stream_id, 1);
                     return;
@@ -6830,12 +6869,14 @@ const H2RequestJob = struct {
     correlation_id: []u8,
     connection_ip: []u8,
     lifecycle: http.request_lifecycle.RequestLifecycle,
-    /// Owned until this job transfers it into `Handoff.finish`.
-    completion: ?*H2JobCompletion,
+    /// Fully allocated before the handoff accepts this job. The worker only
+    /// fills the enclosed completion then transfers this wrapper, so OOM in
+    /// a worker can never silently drop an already-accepted stream.
+    completion_wrapper: ?*H2WorkerCompletion,
 
     fn destroy(self: *H2RequestJob) void {
         if (self.config_lease) |*lease| lease.release();
-        if (self.completion) |completion| completion.destroy();
+        if (self.completion_wrapper) |wrapper| wrapper.destroy();
         self.allocator.free(self.method);
         self.allocator.free(self.path);
         self.ps.deinit(self.allocator);
@@ -6901,19 +6942,20 @@ fn buildH2RequestJob(
     // Build the terminal envelope before the handoff accepts ownership.  The
     // worker only fills this object; it must never allocate to report a
     // terminal route outcome back to the connection owner.
-    const completion = try allocator.create(H2JobCompletion);
-    errdefer allocator.destroy(completion);
     const completion_method = try allocator.dupe(u8, method);
     errdefer allocator.free(completion_method);
     const completion_correlation_id = try allocator.dupe(u8, correlation_id);
     errdefer allocator.free(completion_correlation_id);
+    const completion = try allocator.create(H2JobCompletion);
+    errdefer allocator.destroy(completion);
     completion.* = .{
         .allocator = allocator,
         .method = completion_method,
         .correlation_id = completion_correlation_id,
         .transport_early = ps.transport_early,
     };
-    job.completion = completion;
+    const completion_wrapper = try wrapH2WorkerCompletion(allocator, .{ .request = completion });
+    job.completion_wrapper = completion_wrapper;
 
     job.lifecycle = lifecycle;
     job.lifecycle.request_id = job.correlation_id;
@@ -7034,12 +7076,13 @@ const H2WebSocketAdmissionJob = struct {
     ps: Http2PendingStream,
     correlation_id: []u8,
     connection_ip: []u8,
-    /// Owned until this job transfers it into `Handoff.finish`.
-    completion: ?*H2WebSocketJobCompletion,
+    /// Fully allocated before the handoff accepts this job; see
+    /// `H2RequestJob.completion_wrapper`.
+    completion_wrapper: ?*H2WorkerCompletion,
 
     fn destroy(self: *H2WebSocketAdmissionJob) void {
         if (self.config_lease) |*lease| lease.release();
-        if (self.completion) |completion| completion.destroy();
+        if (self.completion_wrapper) |wrapper| wrapper.destroy();
         self.allocator.free(self.method);
         self.allocator.free(self.path);
         self.ps.deinit(self.allocator);
@@ -7100,14 +7143,16 @@ fn buildH2WebSocketAdmissionJob(
     job.connection_ip = try allocator.dupe(u8, connection_ip);
     errdefer allocator.free(job.connection_ip);
 
+    const completion_correlation_id = try allocator.dupe(u8, correlation_id);
+    errdefer allocator.free(completion_correlation_id);
     const completion = try allocator.create(H2WebSocketJobCompletion);
     errdefer allocator.destroy(completion);
-    const completion_correlation_id = try allocator.dupe(u8, correlation_id);
     completion.* = .{
         .allocator = allocator,
         .correlation_id = completion_correlation_id,
     };
-    job.completion = completion;
+    const completion_wrapper = try wrapH2WorkerCompletion(allocator, .{ .websocket_admission = completion });
+    job.completion_wrapper = completion_wrapper;
 
     return job;
 }
@@ -7151,17 +7196,15 @@ fn executeH2RequestJobBody(job: *H2RequestJob, lease: *http.h2_request_handoff.L
         &early_data_refused,
     )) |result| .{ .routed = result } else |err| .{ .route_error = err };
 
-    const completion = job.completion.?;
-    job.completion = null;
+    const wrapped = job.completion_wrapper.?;
+    job.completion_wrapper = null;
+    const completion = switch (wrapped.payload) {
+        .request => |value| value,
+        .websocket_admission => unreachable,
+    };
     completion.forward_auth_grants = forward_auth_grants;
     completion.early_data_refused = early_data_refused;
     completion.outcome = outcome;
-    const wrapped = wrapH2WorkerCompletion(job.allocator, .{ .request = completion }) catch |err| {
-        completion.destroy();
-        std.log.err("H2 request completion wrap failed: {s}", .{@errorName(err)});
-        _ = handoff.finish(lease, null) catch {};
-        return;
-    };
     _ = handoff.finish(lease, .{ .payload = wrapped, .deinit_fn = H2WorkerCompletion.destroyOpaque }) catch |err| {
         // `finish` owns and releases the terminal object on error.  Do not
         // silently hide this exceptional wake failure: it is a connection
@@ -7173,15 +7216,13 @@ fn executeH2RequestJobBody(job: *H2RequestJob, lease: *http.h2_request_handoff.L
 fn executeH2WebSocketAdmissionJobBody(job: *H2WebSocketAdmissionJob, lease: *http.h2_request_handoff.Lease, handoff: *http.h2_request_handoff.Handoff) void {
     const finishWithOutcome = struct {
         fn run(inner_job: *H2WebSocketAdmissionJob, inner_lease: *http.h2_request_handoff.Lease, inner_handoff: *http.h2_request_handoff.Handoff, outcome: H2WebSocketRouteOutcome) void {
-            const completion = inner_job.completion.?;
-            inner_job.completion = null;
-            completion.outcome = outcome;
-            const wrapped = wrapH2WorkerCompletion(inner_job.allocator, .{ .websocket_admission = completion }) catch |err| {
-                completion.destroy();
-                std.log.err("H2 websocket admission completion wrap failed: {s}", .{@errorName(err)});
-                _ = inner_handoff.finish(inner_lease, null) catch {};
-                return;
+            const wrapped = inner_job.completion_wrapper.?;
+            inner_job.completion_wrapper = null;
+            const completion = switch (wrapped.payload) {
+                .websocket_admission => |value| value,
+                .request => unreachable,
             };
+            completion.outcome = outcome;
             _ = inner_handoff.finish(inner_lease, .{ .payload = wrapped, .deinit_fn = H2WorkerCompletion.destroyOpaque }) catch |err| {
                 std.log.err("H2 websocket admission completion handoff failed: {s}", .{@errorName(err)});
             };

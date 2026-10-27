@@ -330,6 +330,16 @@ pub const Session = struct {
         self.local_end_sent = true;
     }
 
+    /// True once the runtime has actually emitted the final END_STREAM.
+    /// A relay that observed a clean upstream EOF uses this to release its
+    /// upstream resources without turning a completed graceful close into a
+    /// late RST_STREAM.
+    pub fn localEndStreamSent(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.local_end_sent;
+    }
+
     /// Drain and reset the receive-window credit earned by consumer reads
     /// since the last call. The runtime uses this to size WINDOW_UPDATE.
     pub fn takeReceiveCreditToReturn(self: *Session) usize {
@@ -664,6 +674,7 @@ test "local END_STREAM is pending only after producer finishes and queue drains"
     try std.testing.expect(session.outboundLocalEndPending());
     session.markLocalEndStreamSent();
     try std.testing.expect(!session.outboundLocalEndPending());
+    try std.testing.expect(session.localEndStreamSent());
 }
 
 test "write after finishLocal is rejected before and after markLocalEndStreamSent" {

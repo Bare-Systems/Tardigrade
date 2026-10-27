@@ -123,55 +123,62 @@ pub fn admit(
         return .{ .refused = denial };
     }
 
-    const matched = http.location_router.matchLocation(allocator, request.uri.path, route_cfg.location_blocks) orelse return .not_matched;
+    var matched = http.location_router.matchLocation(allocator, request.uri.path, route_cfg.location_blocks) orelse return .not_matched;
+    var hops: usize = 1;
+    // Match the ordinary H2 route resolver's rewrite semantics: every hop
+    // gets its own identity, client-certificate, forward-auth and policy
+    // gates, and only the final proxy location needs WebSocket opt-in.
+    while (true) {
+        if (matched.block.auth == .required and !ctx.authenticated and ctx.identity == null) {
+            return .{ .refused = .{ .status_code = 401, .code = "unauthorized" } };
+        }
+        if (ghandlers.clientCertDenial(matched.block.client_cert, request.headers.client_cert)) |denial| {
+            return .{ .refused = .{ .status_code = 403, .code = denial.code } };
+        }
+        // Forward auth and an origin dial are both side effects a replayed
+        // early-data request must never cause.
+        if (transport_early or request.headers.hasEarlyDataMarker()) {
+            return .{ .refused = .{ .status_code = 425, .code = "too_early" } };
+        }
+        if (matched.block.forward_auth) |*fa| {
+            const target_with_query = if (request.uri.query) |q| try std.fmt.allocPrint(allocator, "{s}?{s}", .{ request.uri.path, q }) else try allocator.dupe(u8, request.uri.path);
+            defer allocator.free(target_with_query);
+            var decision = try gfa.authorize(allocator, route_cfg, fa, .{
+                .method = "CONNECT",
+                .uri = target_with_query,
+                .host = request.headers.get("host"),
+                .proto = if (edge_config.usesNativeTls(route_cfg)) "https" else "http",
+                .client_ip = client_ip,
+                .correlation_id = correlation_id,
+                .headers = &request.headers,
+                .body = null,
+            });
+            defer decision.deinit();
+            state.metricsRecordForwardAuth(.h2, decision.outcome);
+            if (!decision.allowed()) {
+                return .{ .refused = .{ .status_code = decision.status, .code = decision.errorCode() } };
+            }
+        }
+        if (ga.evaluatePolicy(state, route_cfg, "CONNECT", request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |_| {
+            return .{ .refused = .{ .status_code = 403, .code = "forbidden" } };
+        }
+        switch (matched.block.action) {
+            .proxy_pass => break,
+            .rewrite => |rule| {
+                if (hops >= gfa.MAX_ROUTE_HOPS) return .{ .refused = .{ .status_code = 508, .code = "rewrite_loop" } };
+                ghandlers.applyLocationRewrite(request, rule.replacement);
+                matched = http.location_router.matchLocation(allocator, request.uri.path, route_cfg.location_blocks) orelse return .not_matched;
+                hops += 1;
+            },
+            else => return .not_matched,
+        }
+    }
+
     const websocket = matched.block.websocket orelse return .not_matched;
     const target = switch (matched.block.action) {
         .proxy_pass => |value| value,
-        else => return .not_matched,
+        else => unreachable,
     };
-
-    if (matched.block.auth == .required and !ctx.authenticated and ctx.identity == null) {
-        return .{ .refused = .{ .status_code = 401, .code = "unauthorized" } };
-    }
-    if (ghandlers.clientCertDenial(matched.block.client_cert, request.headers.client_cert)) |denial| {
-        return .{ .refused = .{ .status_code = 403, .code = denial.code } };
-    }
-
-    // Opening an upstream connection is a side effect a replayed 0-RTT
-    // handshake must never cause (mirrors H1's `ctx.early_data.replayExposed()`
-    // gate and ordinary H2's `forward_auth` early-data refusal).
-    if (transport_early or request.headers.hasEarlyDataMarker()) {
-        return .{ .refused = .{ .status_code = 425, .code = "too_early" } };
-    }
-
-    var forward_auth_decision: ?gfa.Decision = null;
-    defer if (forward_auth_decision) |*d| d.deinit();
-    if (matched.block.forward_auth) |*fa| {
-        const target_with_query = if (request.uri.query) |q| try std.fmt.allocPrint(allocator, "{s}?{s}", .{ request.uri.path, q }) else try allocator.dupe(u8, request.uri.path);
-        defer allocator.free(target_with_query);
-        var decision = try gfa.authorize(allocator, route_cfg, fa, .{
-            .method = "CONNECT",
-            .uri = target_with_query,
-            .host = request.headers.get("host"),
-            .proto = if (edge_config.usesNativeTls(route_cfg)) "https" else "http",
-            .client_ip = client_ip,
-            .correlation_id = correlation_id,
-            .headers = &request.headers,
-            .body = null,
-        });
-        state.metricsRecordForwardAuth(.h2, decision.outcome);
-        if (!decision.allowed()) {
-            const status = decision.status;
-            const code = decision.errorCode();
-            forward_auth_decision = decision;
-            return .{ .refused = .{ .status_code = status, .code = code } };
-        }
-        forward_auth_decision = decision;
-    }
-
-    if (ga.evaluatePolicy(state, route_cfg, "CONNECT", request.uri.path, ctx.identity, ctx.device_id, &request.headers)) |_| {
-        return .{ .refused = .{ .status_code = 403, .code = "forbidden" } };
-    }
 
     if (!http.websocket.originAllowed(websocket.origins, request.headers.get("origin"))) {
         return .{ .refused = .{ .status_code = 403, .code = "websocket_origin_denied" } };

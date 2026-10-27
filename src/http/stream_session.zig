@@ -119,6 +119,27 @@ pub const Session = struct {
         self.cond.signal();
     }
 
+    /// Reactor-facing incremental inbound delivery that accepts as many
+    /// leading bytes of `bytes` as currently fit (possibly zero), rather
+    /// than requiring the whole slice to fit at once. The caller is
+    /// responsible for retrying the unaccepted suffix later; this is not an
+    /// error condition, just backpressure.
+    pub fn deliverInboundPartial(self: *Session, bytes: []const u8) Error!usize {
+        if (bytes.len == 0) return 0;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.terminal != null or self.remote_end_stream) return error.Closed;
+        const available = self.max_inbound_bytes -| self.inbound_bytes;
+        const n = @min(bytes.len, available);
+        if (n == 0) return 0;
+        const owned = try self.allocator.dupe(u8, bytes[0..n]);
+        errdefer self.allocator.free(owned);
+        try self.inbound.append(self.allocator, .{ .bytes = owned });
+        self.inbound_bytes += n;
+        self.cond.signal();
+        return n;
+    }
+
     pub fn deliverRemoteEndStream(self: *Session) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -225,6 +246,20 @@ pub const Session = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.terminal != null;
+    }
+
+    /// True once both directions of this session have ended cleanly: the
+    /// peer's half-close was delivered and this side's own final frame has
+    /// already been sent. Unlike `isSettled`, this is not a terminal/reset
+    /// condition -- the consumer may still be draining already-queued
+    /// inbound bytes via `read()` -- but once `local_end_sent` is true the
+    /// consumer itself already called `finishLocal()` and can never write
+    /// again, so a reactor may safely detach and reap a session in this
+    /// state without manufacturing a reset.
+    pub fn gracefulComplete(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.remote_end_stream and self.local_end_sent;
     }
 
     /// True once a producer write cannot be retried safely.  The reactor

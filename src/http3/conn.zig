@@ -352,6 +352,13 @@ pub fn Conn(comptime Transport: type) type {
             /// subsequent inbound DATA/FIN routes through `tunnel` (and
             /// `stream.tunnel_sink`) instead of this request's own buffering.
             tunnel: ?Tunnel = null,
+            /// Set once the caller refuses this stream's envelope via
+            /// `refuseExtendedConnect`. The runtime still owns driving that
+            /// refusal's response to completion (it may be backpressured and
+            /// parked across several `pump()` calls); while this is set,
+            /// `pumpRequests` must not read this stream as an ordinary
+            /// request or re-detect it as a fresh Extended CONNECT envelope.
+            extended_connect_refused: bool = false,
         };
 
         /// A borrowed bridge from an admitted Extended CONNECT stream to
@@ -1024,7 +1031,7 @@ pub fn Conn(comptime Transport: type) type {
                     self.pumpTunnelInbound(transport, id, request, &reset_requests) catch |err| return err;
                     continue;
                 }
-                if (request.extended_connect_pending) continue;
+                if (request.extended_connect_pending or request.extended_connect_refused) continue;
                 if (request.finished) {
                     // The peer must not send more stream data once we have
                     // already observed its FIN (RFC 9114 §4.1: e.g. a
@@ -1109,9 +1116,14 @@ pub fn Conn(comptime Transport: type) type {
         /// decoded but not yet delivered (held back by a prior backpressured
         /// sink) before reading anything new off the wire, so a stalled
         /// consumer bounds retained memory at the sink's own capacity
-        /// instead of growing `pending` unboundedly.
+        /// instead of growing `pending` unboundedly. Pre-admission body
+        /// bytes (buffered before `tunnel_sink` was attached) drain first,
+        /// since they precede anything in `pending` in stream order.
         fn pumpTunnelInbound(self: *Self, transport: *Transport, id: u64, request: *ServerRequest, reset_requests: *std.ArrayList(u64)) H3Error!void {
             const tunnel = &request.tunnel.?;
+            if (request.stream.body.items.len > 0) {
+                if (!(try self.drainTunnelBufferedBody(request))) return;
+            }
             var qpack_scratch: [4096]u8 = undefined;
             if (request.stream.pending.items.len > 0) {
                 if (!(try self.ingestTunnelData(request, "", &qpack_scratch))) return;
@@ -1126,21 +1138,51 @@ pub fn Conn(comptime Transport: type) type {
                 if (!(try self.ingestTunnelData(request, buf[0..result.len], &qpack_scratch))) return;
             }
             if (result.fin) {
+                // The peer's FIN only means a clean half-close once every
+                // byte it already sent has actually reached the tunnel
+                // sink: a complete-but-undelivered frame already returned
+                // above via `ingestTunnelData`'s backpressure check, so
+                // reaching here with a nonempty `pending` means a *partial*
+                // H3 frame was still outstanding when FIN arrived -- a
+                // framing violation, not a clean end of tunnel.
+                if (request.stream.pending.items.len != 0) return self.failRequestSessionError(error.BufferTooShort);
                 tunnel.remote_end_delivered = true;
                 tunnel.remoteEndStreamFn(tunnel.ctx);
             }
         }
 
+        /// Deliver any DATA the peer sent before this stream's tunnel sink
+        /// was attached. Returns `false` on sink backpressure (a leftover
+        /// suffix remains in `request.stream.body` for the next attempt) or
+        /// `true` once it fully drained.
+        fn drainTunnelBufferedBody(self: *Self, request: *ServerRequest) H3Error!bool {
+            const retained_before = request.stream.retainedBytes();
+            const drain_result = request.stream.drainBufferedBody();
+            const retained_after = request.stream.retainedBytes();
+            self.buffered_request_bytes -= @min(self.buffered_request_bytes, retained_before -| retained_after);
+            drain_result catch |err| {
+                if (err == error.TunnelBackpressure) return false;
+                return self.failRequestSessionError(err);
+            };
+            return true;
+        }
+
         /// Ingest `bytes` for an admitted tunnel stream. Returns `false` on
         /// sink backpressure (stop pumping this stream this tick; nothing
         /// was lost, just left in `request.stream.pending` for the next
-        /// attempt) or `true` once ingestion made it through.
+        /// attempt) or `true` once ingestion made it through. Enforces the
+        /// same aggregate `max_buffered_request_bytes` budget the ordinary
+        /// (non-tunnel) ingest path does: a DATA frame staged in `pending`
+        /// while its sink is backpressured still counts against it.
         fn ingestTunnelData(self: *Self, request: *ServerRequest, bytes: []const u8, qpack_scratch: []u8) H3Error!bool {
             const retained_before = request.stream.retainedBytes();
             const ingest_result = request.stream.ingestBytesWithObserver(bytes, qpack_scratch, null);
             const retained_after = request.stream.retainedBytes();
-            self.buffered_request_bytes -= @min(self.buffered_request_bytes, retained_before);
-            self.buffered_request_bytes += retained_after;
+            const other_retained = self.buffered_request_bytes -| @min(self.buffered_request_bytes, retained_before);
+            if (retained_after > self.max_buffered_request_bytes -| other_retained) {
+                return self.fail(.excessive_load);
+            }
+            self.buffered_request_bytes = other_retained + retained_after;
             _ = ingest_result catch |err| {
                 if (err == error.TunnelBackpressure) return false;
                 return self.failRequestSessionError(err);
@@ -1565,39 +1607,34 @@ pub fn Conn(comptime Transport: type) type {
             var header_frame: [8192]u8 = undefined;
             const encoded = try session.ResponseEncoder.encodeHeaders(status, headers, &header_frame);
             try self.writeAll(transport, stream_id, encoded, false);
-            if (request.stream.body.items.len > 0) try sink.deliver(request.stream.body.items);
-            // Freeing the now-delivered body here (not just on the next
-            // `ingestTunnelData` call) must still account for it against
-            // `buffered_request_bytes`, exactly like every other site that
-            // changes `request.stream`'s retained memory.
-            const retained_before = request.stream.retainedBytes();
-            request.stream.body.clearAndFree(self.allocator);
-            const retained_after = request.stream.retainedBytes();
-            self.buffered_request_bytes -= @min(self.buffered_request_bytes, retained_before -| retained_after);
             request.stream.tunnel_sink = sink;
             request.tunnel = tunnel;
             request.extended_connect_pending = false;
-            if (request.extended_connect_remote_fin) {
+            // Any body the peer already sent drains through the same
+            // bounded partial-delivery contract `pumpTunnelInbound` uses on
+            // every later tick: a leftover stays in `request.stream.body`
+            // for the connection's own next `pumpRequests` pass rather than
+            // being rejected (and the stream reset) outright.
+            const fully_drained = try self.drainTunnelBufferedBody(request);
+            if (request.extended_connect_remote_fin and fully_drained and request.stream.pending.items.len == 0) {
                 request.tunnel.?.remote_end_delivered = true;
                 request.tunnel.?.remoteEndStreamFn(request.tunnel.?.ctx);
             }
         }
 
-        /// Refuse a stream `pollExtendedConnect` returned with an ordinary,
-        /// non-101 response; the stream ends normally, exactly like any
-        /// other completed request.
-        pub fn refuseExtendedConnect(
-            self: *Self,
-            transport: *Transport,
-            stream_id: u64,
-            status: u16,
-            headers: []const stream_transport.Header,
-            body: []const u8,
-        ) !void {
+        /// Mark a stream `pollExtendedConnect` returned as refused. The
+        /// caller is still responsible for driving an ordinary, non-101
+        /// response to completion on this stream itself (e.g. via its own
+        /// resumable response-progress machinery) -- this call only takes
+        /// the stream out of further Extended CONNECT admission and
+        /// ordinary-request dispatch, so it is never re-surfaced or
+        /// re-parsed as a plain request while that response is still in
+        /// flight (including across QUIC write backpressure).
+        pub fn refuseExtendedConnect(self: *Self, stream_id: u64) !void {
             const request = self.requests.get(stream_id) orelse return error.UnknownStream;
             std.debug.assert(request.extended_connect_pending);
             request.extended_connect_pending = false;
-            try self.sendResponse(transport, stream_id, status, headers, body);
+            request.extended_connect_refused = true;
         }
 
         /// Drain every admitted tunnel's queued outbound bytes into H3 DATA
@@ -5379,6 +5416,247 @@ test "H3 conn: Extended CONNECT requires the peer setting and preserves its enve
     const incoming = server.pollExtendedConnect().?;
     try testing.expectEqualStrings("CONNECT", incoming.method);
     try testing.expectEqualStrings("websocket", incoming.protocol);
+}
+
+fn writeExtendedConnectHeaders(transport: *MockTransport, fin: bool) !u64 {
+    const request_id = try transport.openStream(.bidi);
+    var qpack_buf: [512]u8 = undefined;
+    const block = try qpack.encode(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+        .{ .name = ":path", .value = "/socket" },
+    }, &qpack_buf);
+    var wire: [1024]u8 = undefined;
+    const headers = try frame.encodeKnownFrame(.headers, block, &wire);
+    _ = try transport.writeStream(request_id, headers, fin);
+    return request_id;
+}
+
+fn noopTunnelRemoteEndStream(_: ?*anyopaque) void {}
+fn noopTunnelPeekOutbound(_: ?*anyopaque, _: usize) ?[]const u8 {
+    return null;
+}
+fn noopTunnelCommitOutboundSent(_: ?*anyopaque, _: usize) void {}
+fn noopTunnelOutboundLocalEndPending(_: ?*anyopaque) bool {
+    return false;
+}
+fn noopTunnelMarkLocalEndSent(_: ?*anyopaque) void {}
+
+fn noopTunnel() Conn(MockTransport).Tunnel {
+    return .{
+        .ctx = null,
+        .remoteEndStreamFn = noopTunnelRemoteEndStream,
+        .peekOutboundFn = noopTunnelPeekOutbound,
+        .commitOutboundSentFn = noopTunnelCommitOutboundSent,
+        .outboundLocalEndPendingFn = noopTunnelOutboundLocalEndPending,
+        .markLocalEndSentFn = noopTunnelMarkLocalEndSent,
+    };
+}
+
+fn zeroCapacityTunnelDeliver(_: ?*anyopaque, _: []const u8) session.SessionError!usize {
+    return 0;
+}
+
+const TunnelCapture = struct {
+    all_received: std.ArrayList(u8) = .empty,
+    window_used: usize = 0,
+    capacity: usize,
+
+    fn deliver(ctx: ?*anyopaque, bytes: []const u8) session.SessionError!usize {
+        const self: *TunnelCapture = @ptrCast(@alignCast(ctx.?));
+        const room = self.capacity -| self.window_used;
+        const n = @min(room, bytes.len);
+        self.all_received.appendSlice(testing.allocator, bytes[0..n]) catch return error.OutOfMemory;
+        self.window_used += n;
+        return n;
+    }
+
+    fn sink(self: *TunnelCapture) session.RequestStream.TunnelSink {
+        return .{ .ctx = self, .deliverFn = deliver };
+    }
+
+    fn deinit(self: *TunnelCapture) void {
+        self.all_received.deinit(testing.allocator);
+    }
+};
+
+test "H3 conn: truncated DATA frame followed by FIN fails an admitted tunnel instead of a clean half-close" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.initWithSettings(allocator, .server, .{ .enable_connect_protocol = true });
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const stream_id = try writeExtendedConnectHeaders(&client_transport, false);
+    try server.pump(&server_transport);
+    const incoming = server.pollExtendedConnect().?;
+    try testing.expectEqual(stream_id, incoming.stream_id);
+    try server.admitExtendedConnect(&server_transport, stream_id, 200, &.{}, .{}, noopTunnel());
+
+    // Declare a 100-byte DATA frame but only ever send 2 payload bytes,
+    // then the peer's QUIC FIN: the tunnel must reject this as incomplete
+    // framing, not report a clean end of tunnel.
+    var frame_header: [8]u8 = undefined;
+    var pos: usize = 0;
+    pos += try varint.encode(@intFromEnum(frame.FrameType.data), frame_header[pos..]);
+    pos += try varint.encode(100, frame_header[pos..]);
+    _ = try client_transport.writeStream(stream_id, frame_header[0..pos], false);
+    _ = try client_transport.writeStream(stream_id, "ab", true);
+
+    try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+    try testing.expectEqual(ErrorCode.frame_error.wire(), server.closeCode());
+}
+
+test "H3 conn: a complete DATA frame delivered under sink backpressure still reports a clean tunnel FIN exactly once" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.initWithSettings(allocator, .server, .{ .enable_connect_protocol = true });
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const stream_id = try writeExtendedConnectHeaders(&client_transport, false);
+    try server.pump(&server_transport);
+    _ = server.pollExtendedConnect().?;
+
+    var capture = TunnelCapture{ .capacity = 4 };
+    defer capture.deinit();
+    try server.admitExtendedConnect(&server_transport, stream_id, 200, &.{}, capture.sink(), noopTunnel());
+
+    var data_buf: [16]u8 = undefined;
+    const data_frame = try frame.encodeKnownFrame(.data, "hello", &data_buf);
+    _ = try client_transport.writeStream(stream_id, data_frame, true);
+
+    // The sink only has room for 4 of the 5 payload bytes: the connection
+    // must not fail or report FIN while bytes are still outstanding.
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(usize, 4), capture.all_received.items.len);
+
+    // Once the consumer drains its queue, the remaining byte delivers and
+    // the already-seen FIN is reported, exactly once.
+    capture.window_used = 0;
+    try server.pump(&server_transport);
+    try testing.expectEqualStrings("hello", capture.all_received.items);
+}
+
+test "H3 conn: a refused Extended CONNECT stream is never re-dispatched while more data arrives" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.initWithSettings(allocator, .server, .{ .enable_connect_protocol = true });
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const stream_id = try writeExtendedConnectHeaders(&client_transport, false);
+    try server.pump(&server_transport);
+    const incoming = server.pollExtendedConnect().?;
+    try server.refuseExtendedConnect(incoming.stream_id);
+
+    // The peer keeps sending bytes on the refused stream before the
+    // connection ever gets a chance to finish/send its own response.
+    var data_buf: [16]u8 = undefined;
+    const data_frame = try frame.encodeKnownFrame(.data, "late-bytes", &data_buf);
+    _ = try client_transport.writeStream(stream_id, data_frame, true);
+
+    try server.pump(&server_transport);
+    try testing.expect((try server.pollRequest()) == null);
+    try testing.expect(server.pollExtendedConnect() == null);
+
+    try server.sendResponse(&server_transport, stream_id, 404, &.{}, "");
+}
+
+test "H3 conn: aggregate request memory budget is enforced for backpressured tunnel streams" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.initWithSettings(allocator, .server, .{ .enable_connect_protocol = true });
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const zero_cap_sink = session.RequestStream.TunnelSink{ .ctx = null, .deliverFn = zeroCapacityTunnelDeliver };
+
+    const stream_a = try writeExtendedConnectHeaders(&client_transport, false);
+    try server.pump(&server_transport);
+    _ = server.pollExtendedConnect().?;
+    try server.admitExtendedConnect(&server_transport, stream_a, 200, &.{}, zero_cap_sink, noopTunnel());
+
+    // Stage a DATA frame a zero-capacity sink can never accept: it stays
+    // retained in `pending` (bounded only by the frame's own max size)
+    // exactly like the ordinary per-stream retained-memory path.
+    var frame_buf_a: [600]u8 = undefined;
+    const data_frame_a = try frame.encodeKnownFrame(.data, "a" ** 512, &frame_buf_a);
+    _ = try client_transport.writeStream(stream_a, data_frame_a, false);
+    try server.pump(&server_transport);
+    try testing.expect(server.buffered_request_bytes > 0);
+
+    // Admit a second, independent tunnel while the budget is still generous
+    // (its own HEADERS frame alone must not trip the ordinary pre-admission
+    // ingest path's own aggregate check).
+    const stream_b = try writeExtendedConnectHeaders(&client_transport, false);
+    try server.pump(&server_transport);
+    _ = server.pollExtendedConnect().?;
+    try server.admitExtendedConnect(&server_transport, stream_b, 200, &.{}, zero_cap_sink, noopTunnel());
+
+    // Now tighten the budget to barely more than both tunnels' current
+    // retained bytes: stream B's own backpressured DATA frame must still be
+    // bounded by this aggregate ceiling, not just its own session.
+    server.max_buffered_request_bytes = server.buffered_request_bytes + 1;
+    var frame_buf_b: [600]u8 = undefined;
+    const data_frame_b = try frame.encodeKnownFrame(.data, "b" ** 512, &frame_buf_b);
+    _ = try client_transport.writeStream(stream_b, data_frame_b, false);
+    try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+    try testing.expectEqual(ErrorCode.excessive_load.wire(), server.closeCode());
 }
 
 test "H3 conn: start rejects unsupported h3_datagram" {

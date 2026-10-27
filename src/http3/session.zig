@@ -84,6 +84,14 @@ pub const RequestStream = struct {
     /// `body`: the request's "body" is now a live tunnel, not a finite
     /// buffer the connection should retain unbounded.
     tunnel_sink: ?TunnelSink = null,
+    /// How many bytes of the current (head-of-`pending`) DATA frame's
+    /// payload have already reached `tunnel_sink`. Nonzero only while that
+    /// frame's delivery is still in progress across multiple
+    /// `ingestBytesWithObserver` calls: the frame's raw bytes stay in
+    /// `pending` (undiscarded) the whole time, so the exact same payload
+    /// slice can be re-decoded and resumed from this offset without
+    /// duplicating or dropping bytes.
+    tunnel_frame_delivered: usize = 0,
 
     /// A borrowed, caller-owned delivery target for a tunneled request
     /// stream's inbound DATA payloads. Deliberately a callback rather than a
@@ -91,10 +99,15 @@ pub const RequestStream = struct {
     /// session primitive (or test double) the embedder binds a tunnel to.
     pub const TunnelSink = struct {
         ctx: ?*anyopaque = null,
-        deliverFn: ?*const fn (?*anyopaque, []const u8) SessionError!void = null,
+        /// Returns how many leading bytes of `bytes` were accepted right
+        /// now; this may be fewer than `bytes.len` (including zero) when the
+        /// bound session is at capacity, which is not an error -- the caller
+        /// retries the unaccepted suffix once more room is available.
+        deliverFn: ?*const fn (?*anyopaque, []const u8) SessionError!usize = null,
 
-        pub fn deliver(self: TunnelSink, bytes: []const u8) SessionError!void {
-            if (self.deliverFn) |deliver_fn| try deliver_fn(self.ctx, bytes);
+        pub fn deliver(self: TunnelSink, bytes: []const u8) SessionError!usize {
+            if (self.deliverFn) |deliver_fn| return try deliver_fn(self.ctx, bytes);
+            return bytes.len;
         }
     };
 
@@ -181,7 +194,11 @@ pub const RequestStream = struct {
                 if (self.saw_trailers) return error.UnexpectedFrame;
                 self.saw_data = true;
                 if (self.tunnel_sink) |sink| {
-                    try sink.deliver(raw.payload);
+                    const remaining = raw.payload[self.tunnel_frame_delivered..];
+                    const accepted = try sink.deliver(remaining);
+                    self.tunnel_frame_delivered += accepted;
+                    if (accepted < remaining.len) return error.TunnelBackpressure;
+                    self.tunnel_frame_delivered = 0;
                 } else {
                     if (raw.payload.len > self.max_body_len -| self.body.items.len) return error.BodyTooLarge;
                     try self.body.appendSlice(self.allocator, raw.payload);
@@ -299,6 +316,20 @@ pub const RequestStream = struct {
             // whether that particular protocol was negotiated and admitted.
             if (!std.mem.eql(u8, method, "CONNECT") or !validH3Protocol(extended)) return error.InvalidHeader;
         }
+    }
+
+    /// Deliver any DATA payload the peer already sent on this stream before
+    /// `tunnel_sink` was attached (buffered in `body` under the ordinary
+    /// per-stream body cap, the same as any other pre-admission request
+    /// body). A leftover undelivered suffix is retained in `body` -- never
+    /// re-delivered from the start -- and reported as `TunnelBackpressure`
+    /// so the caller can retry once the sink has room again.
+    pub fn drainBufferedBody(self: *RequestStream) SessionError!void {
+        if (self.body.items.len == 0) return;
+        const sink = self.tunnel_sink orelse return;
+        const accepted = try sink.deliver(self.body.items);
+        discardPrefix(&self.body, accepted);
+        if (self.body.items.len != 0) return error.TunnelBackpressure;
     }
 
     /// Validate all properties that only become final once the request stream
@@ -1047,6 +1078,108 @@ test "request stream enforces body and content-length while ingesting" {
     try req.ingestFrame(.{ .typ = .data, .type_value = 0, .payload = "ab", .len = 4 }, &scratch);
     try testing.expectError(error.InvalidContentLength, req.finish());
     try testing.expectError(error.BodyTooLarge, req.ingestFrame(.{ .typ = .data, .type_value = 0, .payload = "c", .len = 3 }, &scratch));
+}
+
+const TunnelCapture = struct {
+    all_received: std.ArrayList(u8) = .empty,
+    window_used: usize = 0,
+    capacity: usize,
+
+    fn deliver(ctx: ?*anyopaque, bytes: []const u8) SessionError!usize {
+        const self: *TunnelCapture = @ptrCast(@alignCast(ctx.?));
+        const room = self.capacity -| self.window_used;
+        const n = @min(room, bytes.len);
+        self.all_received.appendSlice(testing.allocator, bytes[0..n]) catch return error.OutOfMemory;
+        self.window_used += n;
+        return n;
+    }
+
+    fn sink(self: *TunnelCapture) RequestStream.TunnelSink {
+        return .{ .ctx = self, .deliverFn = deliver };
+    }
+
+    fn deinit(self: *TunnelCapture) void {
+        self.all_received.deinit(testing.allocator);
+    }
+};
+
+fn extendedConnectHeadersBlock(scratch: []u8) ![]u8 {
+    return qpack.encode(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/socket" },
+    }, scratch);
+}
+
+test "request stream tunnel sink backpressure retains and resumes an oversized DATA frame without loss" {
+    const allocator = testing.allocator;
+    var qpack_buf: [512]u8 = undefined;
+    const block = try extendedConnectHeadersBlock(&qpack_buf);
+
+    var req = RequestStream.init(allocator, 0);
+    defer req.deinit();
+    var scratch: [512]u8 = undefined;
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch);
+
+    var capture = TunnelCapture{ .capacity = 4096 };
+    defer capture.deinit();
+    req.tunnel_sink = capture.sink();
+
+    const payload = try allocator.alloc(u8, 4097);
+    defer allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i);
+    const frame_buf = try allocator.alloc(u8, payload.len + 16);
+    defer allocator.free(frame_buf);
+    const data_frame = try frame.encodeKnownFrame(.data, payload, frame_buf);
+
+    // The bound session only has room for the first 4096 bytes: the frame
+    // is not dropped or treated as a protocol violation, just retained.
+    try testing.expectError(error.TunnelBackpressure, req.ingestBytesWithObserver(data_frame, &scratch, null));
+    try testing.expectEqual(@as(usize, 4096), capture.all_received.items.len);
+    try testing.expectEqual(data_frame.len, req.pending.items.len);
+
+    // The consumer drains its queue, freeing room for the final byte; the
+    // retry delivers only the undelivered suffix, not the whole frame again.
+    capture.window_used = 0;
+    try testing.expectEqual(@as(usize, 0), try req.ingestBytesWithObserver("", &scratch, null));
+    try testing.expectEqual(@as(usize, 0), req.pending.items.len);
+    try testing.expectEqualSlices(u8, payload, capture.all_received.items);
+}
+
+test "request stream drains a pre-admission buffered body over the tunnel sink's cap incrementally" {
+    const allocator = testing.allocator;
+    var qpack_buf: [512]u8 = undefined;
+    const block = try extendedConnectHeadersBlock(&qpack_buf);
+
+    var req = RequestStream.init(allocator, 0);
+    defer req.deinit();
+    var scratch: [512]u8 = undefined;
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch);
+
+    // Buffered the ordinary way, before any tunnel sink is attached --
+    // exactly how a pre-admission DATA frame lands in `body` today.
+    const payload = try allocator.alloc(u8, 4097);
+    defer allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i);
+    try req.ingestFrame(.{ .typ = .data, .type_value = 0, .payload = payload, .len = payload.len + 2 }, &scratch);
+    try testing.expectEqualSlices(u8, payload, req.body.items);
+
+    var capture = TunnelCapture{ .capacity = 4096 };
+    defer capture.deinit();
+    req.tunnel_sink = capture.sink();
+
+    // Admission does not fail outright just because the already-buffered
+    // body exceeds the newly bound session's capacity.
+    try testing.expectError(error.TunnelBackpressure, req.drainBufferedBody());
+    try testing.expectEqual(@as(usize, 1), req.body.items.len);
+    try testing.expectEqual(@as(usize, 4096), capture.all_received.items.len);
+
+    capture.window_used = 0;
+    try req.drainBufferedBody();
+    try testing.expectEqual(@as(usize, 0), req.body.items.len);
+    try testing.expectEqualSlices(u8, payload, capture.all_received.items);
 }
 
 test "request stream rejects uppercase and connection-specific fields" {

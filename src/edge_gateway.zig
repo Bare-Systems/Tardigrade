@@ -3806,7 +3806,12 @@ fn h2ApplyWebSocketAdmissionOutcome(
         .refused => |refused| {
             state.metricsRecordWebSocketUpgrade(refused.outcome);
             try h2WriteWebSocketRefusalHeaders(writer, allocator, stream_id, refused.status_code, correlation_id);
-            if (streams.getPtr(stream_id)) |s| s.localEndStream() catch {};
+            // A declined CONNECT may still have DATA in flight when the
+            // final refusal HEADERS reaches the peer. End this stream
+            // completely after the response so that later DATA is handled
+            // as stale stream-local traffic, never as an unowned live stream
+            // that can escalate to connection-wide GOAWAY.
+            try h2TerminateWebSocketRefusal(writer, streams, stream_id);
             if (provisional_session != null) {
                 try h2DiscardProvisionalWebSocketSession(writer, allocator, sessions, buffered_request_bytes, stream_id, conn_recv_window);
                 provisional_cleanup_needed = false;
@@ -3918,7 +3923,7 @@ fn h2AdmitWebSocketConnect(
     if (!connClientPolicyAdmitsHost(conn, policy_host)) {
         state.metricsRecordWebSocketUpgrade(.denied);
         try h2WriteWebSocketRefusalHeaders(writer, allocator, stream_id, 421, correlation_id);
-        if (streams.getPtr(stream_id)) |s| s.localEndStream() catch {};
+        try h2TerminateWebSocketRefusal(writer, streams, stream_id);
         return;
     }
 
@@ -3937,7 +3942,7 @@ fn h2AdmitWebSocketConnect(
     // an origin WebSocket before any one of them charges its session queues.
     buffered_request_bytes.* += HTTP2_SESSION_RESERVED_BYTES;
     var reservation_owned = true;
-    errdefer if (reservation_owned) {
+    defer if (reservation_owned) {
         buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
     };
 
@@ -4040,7 +4045,18 @@ fn h2RefuseWebSocketOverloaded(
 ) !void {
     state.metricsRecordWebSocketUpgrade(.capacity);
     try h2WriteWebSocketRefusalHeaders(writer, allocator, stream_id, 503, correlation_id);
-    if (streams.getPtr(stream_id)) |s| s.localEndStream() catch {};
+    try h2TerminateWebSocketRefusal(writer, streams, stream_id);
+}
+
+/// A refusal response finishes the downstream response half, but an Extended
+/// CONNECT peer is still allowed to have DATA in flight. Retire the stream
+/// immediately after serializing that response so later frames follow the
+/// existing stale-stream discard/refund path instead of reaching the generic
+/// "open stream without a consumer" GOAWAY case.
+fn h2TerminateWebSocketRefusal(writer: anytype, streams: *std.AutoHashMap(u31, http.http2_stream.Stream), stream_id: u31) !void {
+    try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.cancel.value());
+    if (streams.getPtr(stream_id)) |s| s.close();
+    _ = streams.remove(stream_id);
 }
 
 /// Decompresses and discards a header block for a stream this connection has
@@ -7411,16 +7427,22 @@ fn applyH2WebSocketAdmissionCompletion(
     conn_recv_window: *i64,
 ) anyerror!void {
     // Ownership transferred from `h2AdmitWebSocketConnect` as soon as the
-    // job was submitted. This completion may be stale after RST_STREAM, but
-    // it must still release the reservation in that case.
-    var reservation_retained = false;
-    defer if (!reservation_retained and !sessions.contains(stream_id)) {
+    // job was submitted. Keep that reservation in one explicit owner: a
+    // provisional Session returns it through `h2DetachSession`; otherwise
+    // this completion returns it directly. In particular, do not make the
+    // deferred fallback inspect a map after the Session was detached, or an
+    // admission error would refund the same share twice.
+    var reservation_owned_by_completion = true;
+    defer if (reservation_owned_by_completion) {
         buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
     };
     const outcome = payload.outcome orelse return error.H2MissingTerminalOutcome;
     switch (outcome) {
         .admit_error => |err| {
-            if (sessions.contains(stream_id)) try h2DiscardProvisionalWebSocketSession(writer, allocator, sessions, buffered_request_bytes, stream_id, conn_recv_window);
+            if (sessions.contains(stream_id)) {
+                reservation_owned_by_completion = false;
+                try h2DiscardProvisionalWebSocketSession(writer, allocator, sessions, buffered_request_bytes, stream_id, conn_recv_window);
+            }
             return err;
         },
         .admitted => {},
@@ -7432,7 +7454,7 @@ fn applyH2WebSocketAdmissionCompletion(
     // The outcome applier releases on refusal/error and retains on a
     // successfully attached session. It now owns this completion's
     // reservation for either result.
-    reservation_retained = true;
+    reservation_owned_by_completion = false;
     try h2ApplyWebSocketAdmissionOutcome(allocator, state, writer, stream_id, payload.correlation_id, admitted, connection_id, buffered_request_bytes, streams, sessions, conn_recv_window, true);
 }
 
@@ -18075,6 +18097,70 @@ test "H2 WebSocket admission rejects repeated HEADERS without affecting siblings
     const written = out.written();
     try std.testing.expect(written.len >= 9);
     try std.testing.expectEqual(@as(u8, 0x3), written[3]);
+}
+
+test "H2 WebSocket refusal retires only its stream for later in-flight DATA" {
+    const allocator = std.testing.allocator;
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try streams.put(3, http.http2_stream.Stream.init(3, 65_535));
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try h2TerminateWebSocketRefusal(&out.writer, &streams, 1);
+
+    // The rejected stream is no longer an open stream without a DATA
+    // consumer; a peer's already-in-flight DATA takes the stale-stream path
+    // while the sibling remains entirely usable.
+    try std.testing.expect(!streams.contains(1));
+    try std.testing.expect(streams.contains(3));
+    const frames = try h2DecodeFrames(allocator, out.written());
+    defer frames.deinit();
+    try std.testing.expectEqual(@as(usize, 1), frames.items.len);
+    try std.testing.expectEqual(http.http2_frame.Type.rst_stream, frames.items[0].typ);
+    try std.testing.expectEqual(@as(u31, 1), frames.items[0].stream_id);
+    try std.testing.expectEqual(http.http2_stream.ErrorCode.cancel.value(), std.mem.readInt(u32, frames.items[0].payload[0..4], .big));
+}
+
+test "H2 WebSocket admission error refunds its provisional reservation exactly once" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try streams.put(3, http.http2_stream.Stream.init(3, 65_535));
+    var sessions = std.AutoHashMap(u31, *http.h2_stream_session.Session).init(allocator);
+    defer {
+        var it = sessions.valueIterator();
+        while (it.next()) |session| {
+            session.*.deinit();
+            allocator.destroy(session.*);
+        }
+        sessions.deinit();
+    }
+    const failed_session = try allocator.create(http.h2_stream_session.Session);
+    failed_session.* = try http.h2_stream_session.Session.init(allocator, 1, 1, HTTP2_SESSION_MAX_INBOUND_BYTES, HTTP2_SESSION_MAX_OUTBOUND_BYTES);
+    try sessions.put(1, failed_session);
+    const live_session = try allocator.create(http.h2_stream_session.Session);
+    live_session.* = try http.h2_stream_session.Session.init(allocator, 1, 3, HTTP2_SESSION_MAX_INBOUND_BYTES, HTTP2_SESSION_MAX_OUTBOUND_BYTES);
+    try sessions.put(3, live_session);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var buffered = HTTP2_SESSION_RESERVED_BYTES * 2;
+    var conn_recv_window: i64 = 65_535;
+    var payload = H2WebSocketJobCompletion{
+        .allocator = allocator,
+        .correlation_id = try allocator.dupe(u8, "test"),
+        .outcome = .{ .admit_error = error.TestAdmissionFailure },
+    };
+    defer allocator.free(payload.correlation_id);
+
+    try std.testing.expectError(error.TestAdmissionFailure, applyH2WebSocketAdmissionCompletion(allocator, &state, &out.writer, 1, &payload, 1, &buffered, &streams, &sessions, &conn_recv_window));
+    try std.testing.expect(!sessions.contains(1));
+    try std.testing.expect(sessions.contains(3));
+    try std.testing.expectEqual(HTTP2_SESSION_RESERVED_BYTES, buffered);
 }
 
 test "an actual parsed request with a bracketed Host never reaches the ACME challenge lookup (#877 review)" {

@@ -1589,6 +1589,7 @@ fn setLinuxCpuAffinity(cpu: u32) !void {
 
 test {
     _ = @import("http.zig");
+    _ = http.stream_session;
     _ = @import("edge_config.zig");
     _ = @import("edge_gateway.zig");
     _ = @import("gateway_protocol_policy.zig");

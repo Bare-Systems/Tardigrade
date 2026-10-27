@@ -1532,6 +1532,10 @@ pub const Runtime = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, logger: *logger_mod.Logger, cfg: Config) Http3RuntimeError!Runtime {
+        // The low-level H3 connection can advertise RFC 9220 for envelope
+        // testing, but the production runtime has no stream consumer yet.
+        // Keep the gateway capability fail-closed until that consumer exists.
+        if (cfg.h3_settings.enable_connect_protocol) return error.InvalidH3Settings;
         const address = compat.parseIpAddress(cfg.listen_host, cfg.quic_port) catch |err| {
             logger.warn(null, "http3: listen address parse failed: {s}", .{@errorName(err)});
             return error.BindFailed;
@@ -3631,11 +3635,15 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
     var assembler = http3_session.StreamAssembler.init(allocator);
     defer assembler.deinit();
 
-    var fields: [131]http3_session.HeaderField = undefined;
+    var fields: [132]http3_session.HeaderField = undefined;
     fields[0] = .{ .name = ":method", .value = exchange.request.method };
     fields[1] = .{ .name = ":path", .value = exchange.request.path };
     fields[2] = .{ .name = ":authority", .value = exchange.request.authority };
     var count: usize = 3;
+    if (exchange.request.extended_protocol) |protocol| {
+        fields[count] = .{ .name = ":protocol", .value = protocol };
+        count += 1;
+    }
     for (exchange.request.headers) |header| {
         if (count == fields.len) return error.TooManyHeaders;
         fields[count] = .{ .name = header.name, .value = header.value };

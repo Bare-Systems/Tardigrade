@@ -60,6 +60,7 @@ pub const RequestStream = struct {
     scheme: ?[]u8 = null,
     authority: ?[]u8 = null,
     path: ?[]u8 = null,
+    extended_protocol: ?[]u8 = null,
     headers: std.ArrayList(stream_transport.Header) = .empty,
     body: std.ArrayList(u8) = .empty,
     priority: priority.Priority = priority.Priority.default,
@@ -85,6 +86,7 @@ pub const RequestStream = struct {
         if (self.scheme) |value| self.allocator.free(value);
         if (self.authority) |value| self.allocator.free(value);
         if (self.path) |value| self.allocator.free(value);
+        if (self.extended_protocol) |value| self.allocator.free(value);
         for (self.headers.items) |header| {
             self.allocator.free(header.name);
             self.allocator.free(header.value);
@@ -106,6 +108,7 @@ pub const RequestStream = struct {
         if (self.scheme) |value| total +|= value.len;
         if (self.authority) |value| total +|= value.len;
         if (self.path) |value| total +|= value.len;
+        if (self.extended_protocol) |value| total +|= value.len;
         for (self.headers.items) |header| {
             total +|= header.name.len;
             total +|= header.value.len;
@@ -228,6 +231,7 @@ pub const RequestStream = struct {
         if (std.mem.eql(u8, field.name, ":scheme")) return replaceOnce(self.allocator, &self.scheme, field.value);
         if (std.mem.eql(u8, field.name, ":authority")) return replaceOnce(self.allocator, &self.authority, field.value);
         if (std.mem.eql(u8, field.name, ":path")) return replaceOnce(self.allocator, &self.path, field.value);
+        if (std.mem.eql(u8, field.name, ":protocol")) return replaceOnce(self.allocator, &self.extended_protocol, field.value);
         return error.InvalidPseudoHeader;
     }
 
@@ -257,6 +261,13 @@ pub const RequestStream = struct {
         {
             return error.InvalidHeader;
         }
+        if (self.extended_protocol) |extended| {
+            // RFC 9220 §3: an Extended CONNECT request retains the normal
+            // request-target pseudo-fields and identifies its protocol with
+            // exactly one non-empty token.  The connection/gateway decides
+            // whether that particular protocol was negotiated and admitted.
+            if (!std.mem.eql(u8, method, "CONNECT") or !validH3Protocol(extended)) return error.InvalidHeader;
+        }
         for (self.headers.items) |header| {
             if (std.mem.eql(u8, header.name, "content-length")) {
                 const declared = std.fmt.parseInt(usize, header.value, 10) catch return error.InvalidContentLength;
@@ -278,6 +289,7 @@ pub const RequestStream = struct {
                 .scheme = scheme,
                 .authority = authority,
                 .path = path,
+                .extended_protocol = self.extended_protocol,
                 .headers = self.headers.items,
             },
             .body = if (self.body.items.len == 0) .none else .{ .buffered = self.body.items },
@@ -309,6 +321,10 @@ fn validH3Method(method: []const u8) bool {
         if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) != null)) return false;
     }
     return true;
+}
+
+fn validH3Protocol(extended: []const u8) bool {
+    return validH3Method(extended);
 }
 
 fn validH3Path(path: []const u8) bool {
@@ -574,6 +590,79 @@ test "request stream maps HEADERS and DATA onto stream_transport Exchange" {
     try testing.expectEqualStrings("content-type", exchange.request.headers[0].name);
     try testing.expectEqualStrings("application/json", exchange.request.headers[0].value);
     try testing.expectEqualStrings("{\"ok\":true}", exchange.body.buffered);
+}
+
+test "request stream preserves a valid RFC 9220 Extended CONNECT envelope" {
+    const allocator = testing.allocator;
+    var qpack_buf: [512]u8 = undefined;
+    const block = try qpack.encode(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/socket" },
+        .{ .name = "origin", .value = "https://app.example" },
+    }, &qpack_buf);
+
+    var req = RequestStream.init(allocator, 0);
+    defer req.deinit();
+    var scratch: [512]u8 = undefined;
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch);
+    const exchange = try req.finish();
+
+    try testing.expectEqualStrings("CONNECT", exchange.request.method);
+    try testing.expectEqualStrings("websocket", exchange.request.extended_protocol.?);
+    try testing.expectEqualStrings("https", exchange.request.scheme);
+    try testing.expectEqualStrings("/socket", exchange.request.path);
+    try testing.expectEqualStrings("origin", exchange.request.headers[0].name);
+}
+
+test "request stream rejects malformed RFC 9220 Extended CONNECT pseudo headers" {
+    const allocator = testing.allocator;
+    var qpack_buf: [512]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+
+    const wrong_method = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/socket" },
+    }, &qpack_buf);
+    var wrong_method_req = RequestStream.init(allocator, 0);
+    defer wrong_method_req.deinit();
+    try wrong_method_req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = wrong_method, .len = wrong_method.len + 2 }, &scratch);
+    try testing.expectError(error.InvalidHeader, wrong_method_req.finish());
+
+    const duplicate_protocol = try qpack.encode(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":protocol", .value = "webtransport" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/socket" },
+    }, &qpack_buf);
+    var duplicate_protocol_req = RequestStream.init(allocator, 4);
+    defer duplicate_protocol_req.deinit();
+    try testing.expectError(
+        error.DuplicatePseudoHeader,
+        duplicate_protocol_req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = duplicate_protocol, .len = duplicate_protocol.len + 2 }, &scratch),
+    );
+
+    const late_protocol = try qpack.encode(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/socket" },
+        .{ .name = "origin", .value = "https://app.example" },
+        .{ .name = ":protocol", .value = "websocket" },
+    }, &qpack_buf);
+    var late_protocol_req = RequestStream.init(allocator, 8);
+    defer late_protocol_req.deinit();
+    try testing.expectError(
+        error.PseudoHeaderAfterRegularHeader,
+        late_protocol_req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = late_protocol, .len = late_protocol.len + 2 }, &scratch),
+    );
 }
 
 test "request stream parses RFC 9218 priority header as a scheduling hint" {

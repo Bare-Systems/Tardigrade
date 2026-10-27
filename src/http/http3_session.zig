@@ -26,6 +26,8 @@ pub const StreamRequest = struct {
     method: []u8,
     path: []u8,
     authority: ?[]u8,
+    /// RFC 9220 `:protocol`, retained separately from normal request headers.
+    extended_protocol: ?[]u8 = null,
     headers: Headers,
     body: []u8,
     /// Authenticated transport peer address supplied by the QUIC runtime.
@@ -117,6 +119,7 @@ pub const StreamRequest = struct {
         self.allocator.free(self.method);
         self.allocator.free(self.path);
         if (self.authority) |authority| self.allocator.free(authority);
+        if (self.extended_protocol) |protocol| self.allocator.free(protocol);
         self.headers.deinit();
         self.allocator.free(self.body);
         if (self.client_ip) |client_ip| self.allocator.free(client_ip);
@@ -139,6 +142,7 @@ pub const StreamAssembler = struct {
     method: ?[]u8 = null,
     path: ?[]u8 = null,
     authority: ?[]u8 = null,
+    extended_protocol: ?[]u8 = null,
     headers: Headers,
     body: std.ArrayList(u8),
 
@@ -154,6 +158,7 @@ pub const StreamAssembler = struct {
         if (self.method) |value| self.allocator.free(value);
         if (self.path) |value| self.allocator.free(value);
         if (self.authority) |value| self.allocator.free(value);
+        if (self.extended_protocol) |value| self.allocator.free(value);
         self.headers.deinit();
         self.body.deinit(self.allocator);
         self.* = undefined;
@@ -171,6 +176,10 @@ pub const StreamAssembler = struct {
             }
             if (std.mem.eql(u8, field.name, ":authority")) {
                 try replaceOwnedString(self.allocator, &self.authority, field.value);
+                continue;
+            }
+            if (std.mem.eql(u8, field.name, ":protocol")) {
+                try replaceOwnedString(self.allocator, &self.extended_protocol, field.value);
                 continue;
             }
             if (field.name.len > 0 and field.name[0] == ':') continue;
@@ -201,6 +210,7 @@ pub const StreamAssembler = struct {
             .method = try self.allocator.dupe(u8, method),
             .path = try self.allocator.dupe(u8, path),
             .authority = if (self.authority) |authority| try self.allocator.dupe(u8, authority) else null,
+            .extended_protocol = if (self.extended_protocol) |protocol| try self.allocator.dupe(u8, protocol) else null,
             .headers = headers,
             .body = try self.body.toOwnedSlice(self.allocator),
             .transport_early = false,
@@ -354,6 +364,23 @@ test "http3 stream assembler builds request parts from split header and body fra
     try std.testing.expectEqualStrings("example.com", request.headers.get("Host").?);
     try std.testing.expectEqualStrings("application/json", request.headers.get("content-type").?);
     try std.testing.expectEqualStrings("{\"hello\":\"world\"}", request.body);
+}
+
+test "http3 stream assembler retains Extended CONNECT protocol separately" {
+    var assembler = StreamAssembler.init(std.testing.allocator);
+    defer assembler.deinit();
+
+    try assembler.appendHeaderBlock(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":path", .value = "/socket" },
+        .{ .name = ":authority", .value = "example.com" },
+    });
+    var request = try assembler.finish();
+    defer request.deinit();
+
+    try std.testing.expectEqualStrings("websocket", request.extended_protocol.?);
+    try std.testing.expect(request.headers.get(":protocol") == null);
 }
 
 test "http3 response header encoding includes status pseudo header" {

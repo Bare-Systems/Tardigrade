@@ -207,7 +207,12 @@ logs are written through `src/http/logger.zig`.
   `_queue_high_water` (handed-off tunnels awaiting adoption), and
   `tardigrade_websocket_tunnel_slots_high_water` (most tunnel slots held at
   once). None carry labels beyond the fixed enums above. Request-worker load stays in
-  the `tardigrade_worker_*` series.
+  the `tardigrade_worker_*` series. A downstream HTTP/2 RFC 8441 Extended
+  CONNECT tunnel (#864) shares the same unlabeled `upgrades_total`,
+  `tunnels_active`, `tunnel_bytes_total`, `tunnel_duration_seconds` and
+  `tunnel_closes_total` series as an H1 upgrade -- there is no protocol
+  label distinguishing them -- but is never handed to a reactor thread, so
+  it never appears in any `tardigrade_websocket_reactor_*` series.
 - native TLS/QUIC 0-RTT anti-replay store outcomes (#368):
   `tardigrade_tls_early_data_replay_total{outcome}` with fixed outcomes
   `accepted`, `duplicate`, `capacity_rejected`, `expired`, `unavailable`, and

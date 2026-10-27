@@ -24157,14 +24157,23 @@ const OpensslRawPeer = struct {
     /// contract to build required CI on (observed failing on CI's macOS
     /// runner as `error.ReadTimeout` with zero bytes ever read downstream).
     fn waitForRequestHead(self: *OpensslRawPeer, allocator: std.mem.Allocator, timeout_ms: u32) !void {
+        const head = try self.readRequestHead(allocator, timeout_ms);
+        allocator.free(head);
+    }
+
+    /// Reads and returns the complete request head relayed by the TLS peer.
+    /// Callers that need to synthesize a WebSocket `101` use the original
+    /// `Sec-WebSocket-Key` to produce the matching accept value.
+    fn readRequestHead(self: *OpensslRawPeer, allocator: std.mem.Allocator, timeout_ms: u32) ![]u8 {
         var buf = std.array_list.Managed(u8).init(allocator);
         defer buf.deinit();
         var tmp: [4096]u8 = undefined;
-        while (std.mem.find(u8, buf.items, "\r\n\r\n") == null) {
+        while (true) {
             const n = try readSocketWithPoll(self.child.stdout.?.handle, &tmp, @intCast(timeout_ms));
             if (n == 0) return error.UpstreamConnectionClosed;
             try buf.appendSlice(tmp[0..n]);
             if (buf.items.len > 64 * 1024) return error.StreamTooLong;
+            if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |end| return allocator.dupe(u8, buf.items[0 .. end + 4]);
         }
     }
 
@@ -27508,6 +27517,753 @@ fn wsMetricValue(body: []const u8, name: []const u8, label: []const u8) u64 {
 /// Room for the metrics and health requests the tests make while tunnels
 /// are opening.
 const ws_worker_env = EnvPair{ .name = "TARDIGRADE_WORKER_THREADS", .value = "8" };
+
+/// Decode one RFC 6455 frame from an accumulated byte buffer (the opaque
+/// bytes an RFC 8441 Extended CONNECT tunnel carries as H2 DATA), returning
+/// `null` if `buf` does not yet hold a complete frame. Mirrors `WsPeer`'s
+/// stream-based `readFrame` above, adapted to the caller's own
+/// `readHttp2Frame`-fed buffer instead of a socket.
+fn decodeWsFrameFromBuffer(allocator: std.mem.Allocator, buf: []const u8) !?WebSocketFrame {
+    if (buf.len < 2) return null;
+    const hdr0 = buf[0];
+    const hdr1 = buf[1];
+    var len: usize = hdr1 & 0x7F;
+    var offset: usize = 2;
+    if (len == 126) {
+        if (buf.len < 4) return null;
+        len = std.mem.readInt(u16, buf[2..4], .big);
+        offset = 4;
+    } else if (len == 127) {
+        if (buf.len < 10) return null;
+        len = @intCast(std.mem.readInt(u64, buf[2..10], .big));
+        offset = 10;
+    }
+    const masked = (hdr1 & 0x80) != 0;
+    var mask_key: [4]u8 = .{ 0, 0, 0, 0 };
+    if (masked) {
+        if (buf.len < offset + 4) return null;
+        @memcpy(&mask_key, buf[offset .. offset + 4]);
+        offset += 4;
+    }
+    if (buf.len < offset + len) return null;
+    const payload = try allocator.alloc(u8, len);
+    errdefer allocator.free(payload);
+    @memcpy(payload, buf[offset..][0..len]);
+    if (masked) for (payload, 0..) |*byte, i| {
+        byte.* ^= mask_key[i % 4];
+    };
+    return .{ .fin = (hdr0 & 0x80) != 0, .opcode = @enumFromInt(@as(u4, @truncate(hdr0))), .payload = payload };
+}
+
+/// An RFC 8441 Extended CONNECT WebSocket client over real native TLS/ALPN
+/// `h2`: sends the preface and an empty client SETTINGS, then drives a
+/// generic frame loop that ACKs the server's SETTINGS (capturing whether it
+/// advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL`), decodes the admission
+/// response HEADERS on `stream_id`, and otherwise ignores frames that are
+/// not relevant to this one stream (WINDOW_UPDATE, PING, unrelated streams).
+const H2WebSocketConnect = struct {
+    client: *PureZigTlsClient,
+    stream_id: u31,
+    saw_connect_protocol_setting: bool = false,
+    const OpenResult = struct { conn: H2WebSocketConnect, status: u16 };
+
+    fn open(allocator: std.mem.Allocator, port: u16, authority: []const u8, path: []const u8, extra_headers: []const hpack.HeaderField) !OpenResult {
+        return openWithEarlyData(allocator, port, authority, path, extra_headers, null);
+    }
+
+    fn openEnded(allocator: std.mem.Allocator, port: u16, authority: []const u8, path: []const u8, extra_headers: []const hpack.HeaderField) !OpenResult {
+        return openWithInitialEndStream(allocator, port, authority, path, extra_headers, null, true);
+    }
+
+    /// RFC 8441 permits a client to send DATA immediately after CONNECT
+    /// HEADERS; it need not wait for the server's 200.  Keep this separate
+    /// from `sendData` so integration coverage can put both frames on the
+    /// wire before the gateway has completed its asynchronous origin dial.
+    fn openWithEarlyData(allocator: std.mem.Allocator, port: u16, authority: []const u8, path: []const u8, extra_headers: []const hpack.HeaderField, early_data: ?[]const u8) !OpenResult {
+        return openWithInitialEndStream(allocator, port, authority, path, extra_headers, early_data, false);
+    }
+
+    fn openWithInitialEndStream(allocator: std.mem.Allocator, port: u16, authority: []const u8, path: []const u8, extra_headers: []const hpack.HeaderField, early_data: ?[]const u8, end_stream: bool) !OpenResult {
+        const client = try PureZigTlsClient.create(allocator, port, "h2");
+        errdefer client.destroy();
+        try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        try client.writeHttp2Frame(0x4, 0, 0, &.{}); // client SETTINGS
+
+        var request_headers = std.array_list.Managed(hpack.HeaderField).init(allocator);
+        defer request_headers.deinit();
+        try request_headers.appendSlice(&.{
+            .{ .name = ":method", .value = "CONNECT" },
+            .{ .name = ":protocol", .value = "websocket" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = authority },
+            .{ .name = ":path", .value = path },
+        });
+        try request_headers.appendSlice(extra_headers);
+        const request_block = try hpack.encodeLiteralHeaderBlock(allocator, request_headers.items);
+        defer allocator.free(request_block);
+        try client.writeHttp2Frame(0x1, if (end_stream) @as(u8, 0x1 | 0x4) else 0x4, 1, request_block);
+        if (early_data) |data| try client.writeHttp2Frame(0x0, 0, 1, data);
+
+        var self = H2WebSocketConnect{ .client = client, .stream_id = 1 };
+        var frame_count: usize = 0;
+        while (frame_count < 16) : (frame_count += 1) {
+            var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+            defer frame.deinit(allocator);
+            switch (frame.typ) {
+                0x4 => { // SETTINGS
+                    if ((frame.flags & 0x1) == 0) {
+                        var i: usize = 0;
+                        while (i + 6 <= frame.payload.len) : (i += 6) {
+                            const id = std.mem.readInt(u16, frame.payload[i..][0..2], .big);
+                            const value = std.mem.readInt(u32, frame.payload[i + 2 ..][0..4], .big);
+                            if (id == 0x8 and value == 1) self.saw_connect_protocol_setting = true;
+                        }
+                        try client.writeHttp2Frame(0x4, 0x1, 0, &.{}); // SETTINGS ACK
+                    }
+                },
+                0x1 => { // HEADERS
+                    if (frame.stream_id == self.stream_id) {
+                        var decoded = try hpack.decode(allocator, frame.payload);
+                        defer hpack.deinitDecoded(allocator, &decoded);
+                        var status: u16 = 0;
+                        for (decoded.headers) |h| {
+                            if (std.mem.eql(u8, h.name, ":status")) status = std.fmt.parseInt(u16, h.value, 10) catch 0;
+                        }
+                        return .{ .conn = self, .status = status };
+                    }
+                },
+                else => {},
+            }
+        }
+        return error.H2ExtendedConnectResponseNotFound;
+    }
+
+    fn destroy(self: *H2WebSocketConnect) void {
+        self.client.destroy();
+    }
+
+    fn sendData(self: *H2WebSocketConnect, bytes: []const u8) !void {
+        try self.client.writeHttp2Frame(0x0, 0, self.stream_id, bytes);
+    }
+
+    /// Accumulate DATA frames on this stream until `decodeWsFrameFromBuffer`
+    /// can decode one complete frame out of them.
+    fn readWsFrame(self: *H2WebSocketConnect, allocator: std.mem.Allocator, timeout_ms: u64) !WebSocketFrame {
+        var buf = std.array_list.Managed(u8).init(allocator);
+        defer buf.deinit();
+        var frame_count: usize = 0;
+        while (frame_count < 16) : (frame_count += 1) {
+            var frame = try self.client.readHttp2Frame(allocator, 16 * 1024, timeout_ms);
+            defer frame.deinit(allocator);
+            switch (frame.typ) {
+                0x0 => if (frame.stream_id == self.stream_id) {
+                    try buf.appendSlice(frame.payload);
+                    if (try decodeWsFrameFromBuffer(allocator, buf.items)) |decoded| return decoded;
+                },
+                0x4 => if ((frame.flags & 0x1) == 0) try self.client.writeHttp2Frame(0x4, 0x1, 0, &.{}),
+                else => {},
+            }
+        }
+        return error.WsFrameNotFound;
+    }
+};
+
+fn h2WaitForEndStream(conn: *H2WebSocketConnect, allocator: std.mem.Allocator, timeout_ms: u64) !void {
+    var frame_count: usize = 0;
+    while (frame_count < 32) : (frame_count += 1) {
+        var frame = try conn.client.readHttp2Frame(allocator, 64 * 1024, timeout_ms);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try conn.client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            continue;
+        }
+        if (frame.typ == 0x3) return error.UnexpectedH2RstStream;
+        if (frame.typ == 0x7) return error.UnexpectedH2Goaway;
+        if (frame.stream_id == conn.stream_id and (frame.flags & 0x1) != 0) return;
+    }
+    return error.H2EndStreamNotFound;
+}
+
+fn h2SendExtendedWebSocketConnect(client: *PureZigTlsClient, allocator: std.mem.Allocator, stream_id: u31, authority: []const u8, path: []const u8) !void {
+    try h2SendHeaders(client, allocator, stream_id, false, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = ":path", .value = path },
+    });
+}
+
+test "downstream HTTP/2 RFC 8441 Extended CONNECT WebSocket echoes through a fresh H1 origin handshake (#864)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var opened = try H2WebSocketConnect.open(allocator, tardigrade.port, "tardigrade.test", "/ws/chat", &.{});
+    defer opened.conn.destroy();
+    // The server must have advertised the capability before admitting this
+    // stream at all (RFC 8441 §3); this is the production SETTINGS frame,
+    // not a synthetic one.
+    try std.testing.expect(opened.conn.saw_connect_protocol_setting);
+    // RFC 8441 §4 maps the origin's H1 `101` to a downstream `200`, since
+    // HTTP/2 HEADERS has no 101.
+    try std.testing.expectEqual(@as(u16, 200), opened.status);
+
+    const payload = "hello-over-h2-extended-connect";
+    const client_frame = try encodeWsFrame(allocator, .text, payload, true, true);
+    defer allocator.free(client_frame);
+    try opened.conn.sendData(client_frame);
+    var echoed = try opened.conn.readWsFrame(allocator, 5_000);
+    defer echoed.deinit(allocator);
+    try std.testing.expectEqual(WebSocketOpCode.text, echoed.opcode);
+    try std.testing.expect(echoed.fin);
+    try std.testing.expectEqualStrings(payload, echoed.payload);
+
+    // The admitted tunnel ran a real fresh H1 upgrade handshake against the
+    // origin, exactly once.
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+
+    var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+    defer metrics.deinit();
+    try std.testing.expect(wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"relayed\"") >= 1);
+}
+
+test "downstream HTTP/2 RFC 8441 CONNECT END_STREAM reaches the relay and settles its tunnel (#952)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "    proxy_websocket_max_tunnels 1;\n");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var ended = try H2WebSocketConnect.openEnded(allocator, tardigrade.port, "tardigrade.test", "/ws/chat", &.{});
+    defer ended.conn.destroy();
+    try std.testing.expectEqual(@as(u16, 200), ended.status);
+
+    var saw_end_stream = false;
+    var frames: usize = 0;
+    while (!saw_end_stream and frames < 32) : (frames += 1) {
+        var frame = try ended.conn.client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try ended.conn.client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            continue;
+        }
+        if (frame.typ == 0x3) return error.UnexpectedH2RstStream;
+        if (frame.typ == 0x7) return error.UnexpectedH2Goaway;
+        if (frame.stream_id == 1 and (frame.flags & 0x1) != 0) saw_end_stream = true;
+    }
+    try std.testing.expect(saw_end_stream);
+
+    // A second connection demonstrates that the first half-closed relay did
+    // not leave its process-wide tunnel slot or upstream attempt owned.
+    var reopened = try H2WebSocketConnect.open(allocator, tardigrade.port, "tardigrade.test", "/ws/chat", &.{});
+    defer reopened.conn.destroy();
+    try std.testing.expectEqual(@as(u16, 200), reopened.status);
+}
+
+test "downstream HTTP/2 RFC 8441 flushes final wss:// bytes before END_STREAM (#952)" {
+    try requireGenericNativeTlsProfile();
+    try requireOpenssl(std.testing.allocator);
+    const allocator = std.testing.allocator;
+    const ca_cert = try upstreamTlsFixture("native_ed25519_ca.crt", allocator);
+    defer allocator.free(ca_cert);
+    const chain_cert = try upstreamTlsFixture("native_ed25519_chain.crt", allocator);
+    defer allocator.free(chain_cert);
+    const key = try upstreamTlsFixture("native_ed25519.key", allocator);
+    defer allocator.free(key);
+    var origin = try OpensslRawPeer.start(allocator, &.{ "-cert", chain_cert, "-key", key });
+    defer origin.stop();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /ws/ {{
+        \\    proxy_pass https://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port });
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            ws_worker_env,
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = ca_cert },
+        },
+    });
+    defer tardigrade.stop();
+
+    const HandshakeCtx = struct {
+        origin: *OpensslRawPeer,
+        result: ?anyerror = null,
+        fn serve(self: *@This()) void {
+            self.serveFallible() catch |err| {
+                self.result = err;
+            };
+        }
+        fn serveFallible(self: *@This()) !void {
+            const head = try self.origin.readRequestHead(std.heap.page_allocator, 5_000);
+            defer std.heap.page_allocator.free(head);
+            const ws_key = headerValue(head, "Sec-WebSocket-Key") orelse return error.MissingKey;
+            var accept_buf: [28]u8 = undefined;
+            const accept = wsAcceptFor(ws_key, &accept_buf);
+            var response: [256]u8 = undefined;
+            const bytes = try std.fmt.bufPrint(&response, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
+            try self.origin.sendToClient(bytes);
+        }
+    };
+    var handshake = HandshakeCtx{ .origin = &origin };
+    const handshake_thread = try std.Thread.spawn(.{}, HandshakeCtx.serve, .{&handshake});
+    var opened = try H2WebSocketConnect.open(allocator, tardigrade.port, "tardigrade.test", "/ws/final", &.{});
+    defer opened.conn.destroy();
+    handshake_thread.join();
+    if (handshake.result) |err| return err;
+    try std.testing.expectEqual(@as(u16, 200), opened.status);
+
+    const payload = "q" ** 12_000;
+    const final_client_frame = try encodeWsFrame(allocator, .text, payload, true, true);
+    defer allocator.free(final_client_frame);
+    // Queue a real encrypted origin frame before the client half-closes. It
+    // must remain intact while the relay flushes the final client frame and
+    // sends TLS close_notify for the H2 END_STREAM below.
+    const origin_final = try encodeWsFrame(allocator, .text, "origin-final-after-wss-flush", true, false);
+    defer allocator.free(origin_final);
+    try origin.sendToClient(origin_final);
+    try h2SendData(opened.conn.client, opened.conn.stream_id, true, final_client_frame);
+
+    var received = try allocator.alloc(u8, final_client_frame.len);
+    defer allocator.free(received);
+    var offset: usize = 0;
+    while (offset < received.len) {
+        const n = try readSocketWithPoll(origin.child.stdout.?.handle, received[offset..], 5_000);
+        if (n == 0) return error.UpstreamConnectionClosed;
+        offset += n;
+    }
+    try std.testing.expectEqualSlices(u8, final_client_frame, received);
+
+    var final_frame = try opened.conn.readWsFrame(allocator, 5_000);
+    defer final_frame.deinit(allocator);
+    try std.testing.expectEqual(WebSocketOpCode.text, final_frame.opcode);
+    try std.testing.expectEqualStrings("origin-final-after-wss-flush", final_frame.payload);
+    origin.child.stdin.?.close(compat.io());
+    origin.child.stdin = null;
+    try h2WaitForEndStream(&opened.conn, allocator, 5_000);
+}
+
+test "downstream HTTP/2 RFC 8441 multiplexes two WebSockets with twenty REST siblings on one TLS connection (#864)" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /ws/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+        \\
+        \\location = /ordinary {{
+        \\    return 200 ok;
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            // Two concurrent tunnel Sessions each reserve about 1.3 MiB;
+            // keep the default connection cap from turning this multiplexing
+            // test into a deliberate capacity-refusal test.
+            .{ .name = "TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES", .value = "8388608" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{});
+    try completeH2SettingsHandshake(client, allocator);
+
+    // Put both CONNECTs and all REST requests on the wire before reading any
+    // admission response. This keeps the frame reader under real concurrent
+    // admission load rather than serializing the requests in the test.
+    try h2SendExtendedWebSocketConnect(client, allocator, 1, "tardigrade.test", "/ws/one");
+    try h2SendExtendedWebSocketConnect(client, allocator, 3, "tardigrade.test", "/ws/two");
+    var rest_index: usize = 0;
+    while (rest_index < 20) : (rest_index += 1) {
+        const stream_id: u31 = @intCast(5 + rest_index * 2);
+        try h2SendHeaders(client, allocator, stream_id, true, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/ordinary" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "tardigrade.test" },
+        });
+    }
+
+    var websocket_status = [_]?u16{ null, null };
+    var rest_status = [_]?u16{null} ** 20;
+    var rest_done = [_]bool{false} ** 20;
+    var rest_bodies: [20]std.array_list.Managed(u8) = undefined;
+    for (&rest_bodies) |*body| body.* = .init(allocator);
+    defer for (&rest_bodies) |*body| body.deinit();
+    var completed_rest: usize = 0;
+    var frames: usize = 0;
+    while ((websocket_status[0] == null or websocket_status[1] == null or completed_rest < 20) and frames < 256) : (frames += 1) {
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            continue;
+        }
+        if (frame.typ == 0x7) return error.UnexpectedH2Goaway;
+        if (frame.typ == 0x3) return error.UnexpectedH2RstStream;
+        if (frame.stream_id == 1 or frame.stream_id == 3) {
+            if (frame.typ != 0x1) continue;
+            var decoded = try hpack.decode(allocator, frame.payload);
+            defer hpack.deinitDecoded(allocator, &decoded);
+            for (decoded.headers) |header| if (std.mem.eql(u8, header.name, ":status")) {
+                websocket_status[(frame.stream_id - 1) / 2] = std.fmt.parseInt(u16, header.value, 10) catch null;
+            };
+            continue;
+        }
+        if (frame.stream_id < 5 or frame.stream_id > 43 or (frame.stream_id & 1) == 0) continue;
+        const index: usize = @intCast((frame.stream_id - 5) / 2);
+        switch (frame.typ) {
+            0x1 => {
+                var decoded = try hpack.decode(allocator, frame.payload);
+                defer hpack.deinitDecoded(allocator, &decoded);
+                for (decoded.headers) |header| if (std.mem.eql(u8, header.name, ":status")) {
+                    rest_status[index] = std.fmt.parseInt(u16, header.value, 10) catch null;
+                };
+                if ((frame.flags & 0x1) != 0 and !rest_done[index]) {
+                    rest_done[index] = true;
+                    completed_rest += 1;
+                }
+            },
+            0x0 => {
+                try rest_bodies[index].appendSlice(frame.payload);
+                if ((frame.flags & 0x1) != 0 and !rest_done[index]) {
+                    rest_done[index] = true;
+                    completed_rest += 1;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(?u16, 200), websocket_status[0]);
+    try std.testing.expectEqual(@as(?u16, 200), websocket_status[1]);
+    try std.testing.expectEqual(@as(usize, 20), completed_rest);
+    for (rest_status, rest_bodies) |status, body| {
+        try std.testing.expectEqual(@as(?u16, 200), status);
+        try std.testing.expectEqualStrings("ok", body.items);
+    }
+
+    const first_frame = try encodeWsFrame(allocator, .text, "first-multiplexed-websocket", true, true);
+    defer allocator.free(first_frame);
+    const second_frame = try encodeWsFrame(allocator, .text, "second-multiplexed-websocket", true, true);
+    defer allocator.free(second_frame);
+    try h2SendData(client, 1, false, first_frame);
+    try h2SendData(client, 3, false, second_frame);
+
+    var echo_buffers = [_]std.array_list.Managed(u8){ .init(allocator), .init(allocator) };
+    defer for (&echo_buffers) |*buffer| buffer.deinit();
+    var got_echo = [_]bool{ false, false };
+    frames = 0;
+    while ((!got_echo[0] or !got_echo[1]) and frames < 64) : (frames += 1) {
+        var frame = try client.readHttp2Frame(allocator, 64 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ == 0x4 and (frame.flags & 0x1) == 0) {
+            try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            continue;
+        }
+        if (frame.typ == 0x7) return error.UnexpectedH2Goaway;
+        if (frame.typ == 0x3) return error.UnexpectedH2RstStream;
+        if (frame.typ != 0x0 or (frame.stream_id != 1 and frame.stream_id != 3)) continue;
+        const index: usize = @intCast((frame.stream_id - 1) / 2);
+        try echo_buffers[index].appendSlice(frame.payload);
+        if (try decodeWsFrameFromBuffer(allocator, echo_buffers[index].items)) |decoded_echo| {
+            var echoed = decoded_echo;
+            defer echoed.deinit(allocator);
+            const expected = if (index == 0) "first-multiplexed-websocket" else "second-multiplexed-websocket";
+            try std.testing.expectEqual(WebSocketOpCode.text, echoed.opcode);
+            try std.testing.expectEqualStrings(expected, echoed.payload);
+            got_echo[index] = true;
+        }
+    }
+    try std.testing.expect(got_echo[0]);
+    try std.testing.expect(got_echo[1]);
+    try std.testing.expectEqual(@as(u32, 2), origin.handshakeCount());
+}
+
+test "downstream HTTP/2 RFC 8441 Extended CONNECT preserves DATA sent before its 200 admission response (#952)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    const payload = "websocket-data-before-connect-response";
+    const early_frame = try encodeWsFrame(allocator, .text, payload, true, true);
+    defer allocator.free(early_frame);
+    // Write DATA immediately behind CONNECT HEADERS.  Before this fix the
+    // asynchronous admission path reset stream 1 before it could dial the
+    // origin; a conforming client must instead receive the normal 200 and
+    // have the opaque frame relayed in-order once admission succeeds.
+    var opened = try H2WebSocketConnect.openWithEarlyData(allocator, tardigrade.port, "tardigrade.test", "/ws/chat", &.{}, early_frame);
+    defer opened.conn.destroy();
+    try std.testing.expect(opened.conn.saw_connect_protocol_setting);
+    try std.testing.expectEqual(@as(u16, 200), opened.status);
+
+    var echoed = try opened.conn.readWsFrame(allocator, 5_000);
+    defer echoed.deinit(allocator);
+    try std.testing.expectEqual(WebSocketOpCode.text, echoed.opcode);
+    try std.testing.expect(echoed.fin);
+    try std.testing.expectEqualStrings(payload, echoed.payload);
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+}
+
+test "downstream HTTP/2 RFC 8441 Extended CONNECT denied by Origin policy never dials the upstream (#864)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "proxy_websocket_origins https://allowed.test;");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var opened = try H2WebSocketConnect.open(allocator, tardigrade.port, "tardigrade.test", "/ws/chat", &.{
+        .{ .name = "origin", .value = "https://evil.test" },
+    });
+    defer opened.conn.destroy();
+    try std.testing.expect(opened.conn.saw_connect_protocol_setting);
+    try std.testing.expectEqual(@as(u16, 403), opened.status);
+    try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
+}
+
+test "downstream HTTP/2 RFC 8441 Extended CONNECT releases its tunnel slot and upstream in-flight count on close, so a later connect reuses it (#952)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", .value = "1" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var first = try H2WebSocketConnect.open(allocator, tardigrade.port, "tardigrade.test", "/ws/chat", &.{});
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+    first.conn.destroy();
+
+    const settle_deadline = compat.milliTimestamp() + 5_000;
+    while (true) {
+        var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+        defer metrics.deinit();
+        const active = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 1;
+        if (active == 0) break;
+        if (compat.milliTimestamp() > settle_deadline) return error.TunnelDidNotSettle;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+
+    // The slot and upstream in-flight count the first tunnel held were
+    // actually released -- not permanently consumed the way #952's review
+    // found them to be -- so a second connect under the same
+    // `max_tunnels = 1` succeeds instead of getting 503 `websocket_capacity`.
+    var second = try H2WebSocketConnect.open(allocator, tardigrade.port, "tardigrade.test", "/ws/chat", &.{});
+    defer second.conn.destroy();
+    try std.testing.expectEqual(@as(u16, 200), second.status);
+
+    var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u64, 0), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"capacity\""));
+}
+
+test "downstream HTTP/2 RFC 8441 Extended CONNECT denied by connection-memory capacity never dials the upstream (#952)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            // Smaller than one #867 session's reserved queue capacity but
+            // still comfortably large enough for the plain requests this
+            // test itself makes (the readiness probe, and the full
+            // `/status/metrics` response below), so the connection-memory
+            // budget gate trips only for the WebSocket admission -- before
+            // #952's fix, this still cost the origin a real H1 handshake
+            // first.
+            .{ .name = "TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES", .value = "1048576" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    // The connection-memory capacity gate refuses the stream with
+    // RST_STREAM (mirroring the identical gate for an ordinary #867 test-hook
+    // session attach a few lines below it in `h2ProcessHeaderBlock`), not a
+    // real HTTP status response -- so this drives the Extended CONNECT by
+    // hand instead of `H2WebSocketConnect.open`, which only recognizes a
+    // HEADERS reply.
+    try openExtendedConnectExpectingReset(allocator, tardigrade.port, "tardigrade.test", "/ws/chat");
+    try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
+
+    var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u64, 1), wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"capacity\""));
+}
+
+/// Sends an RFC 8441 Extended CONNECT and asserts the stream is refused with
+/// RST_STREAM (frame type `0x3`), never a HEADERS response -- the shape
+/// `h2AdmitWebSocketConnect`'s connection-memory capacity gate and its
+/// pre-#866-dispatch `not_matched`/overload refusals use.
+fn openExtendedConnectExpectingReset(allocator: std.mem.Allocator, port: u16, authority: []const u8, path: []const u8) !void {
+    const client = try PureZigTlsClient.create(allocator, port, "h2");
+    defer client.destroy();
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{}); // client SETTINGS
+
+    const request_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = ":path", .value = path },
+    };
+    const request_block = try hpack.encodeLiteralHeaderBlock(allocator, &request_headers);
+    defer allocator.free(request_block);
+    try client.writeHttp2Frame(0x1, 0x4, 1, request_block); // END_HEADERS only
+
+    var frame_count: usize = 0;
+    while (frame_count < 16) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        switch (frame.typ) {
+            0x4 => if ((frame.flags & 0x1) == 0) try client.writeHttp2Frame(0x4, 0x1, 0, &.{}), // SETTINGS ACK
+            0x3 => if (frame.stream_id == 1) return, // RST_STREAM: refused, as expected.
+            0x1 => if (frame.stream_id == 1) return error.UnexpectedHeadersResponse,
+            else => {},
+        }
+    }
+    return error.H2ExtendedConnectResponseNotFound;
+}
 
 test "proxy_websocket relays text, binary, ping/pong, fragments and large messages both ways (#812)" {
     const allocator = std.testing.allocator;

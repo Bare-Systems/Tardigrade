@@ -2723,7 +2723,7 @@ const ProductionBufferedProxyAttemptExecutor = struct {
 /// location's own `proxy_websocket_reload*` override, else the admission
 /// configuration's top-level value. `preserve` yields null (never ended by a
 /// reload).
-fn websocketReloadDrain(
+pub fn websocketReloadDrain(
     websocket: *const http.location_router.WebSocketProxy,
     cfg: *const edge_config.EdgeConfig,
     superseded_at: ?*const std.atomic.Value(u64),

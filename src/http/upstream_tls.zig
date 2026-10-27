@@ -478,6 +478,21 @@ pub const UpstreamTlsConn = struct {
         return boundedFlush(&self.state.record, tunnel_drive_budget, &self.drive_budget_exhausted);
     }
 
+    /// Start a TLS-level write-half close.  Unlike a raw `SHUT_WR`, this
+    /// queues the required encrypted `close_notify` and deliberately keeps
+    /// the record layer available to receive the peer's final bytes.
+    /// Callers must continue driving `flushNonBlocking` until
+    /// `hasQueuedOutput()` is false.
+    pub fn shutdownWriteNonBlocking(self: *UpstreamTlsConn) TlsError!void {
+        self.state.record.closeWrite();
+        // `closeWrite` only records the intent. Drive once to seal the alert
+        // (and possibly write a prefix); `boundedFlush` alone would see an
+        // initially-empty ciphertext queue and never give the record layer a
+        // chance to create it.
+        _ = self.state.record.drive() catch return error.TlsWriteFailed;
+        try self.flushNonBlocking();
+    }
+
     /// Ciphertext is queued for the socket.
     pub fn hasQueuedOutput(self: *const UpstreamTlsConn) bool {
         return self.state.record.queuedCiphertextLen() > 0;

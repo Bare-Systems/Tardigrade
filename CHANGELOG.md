@@ -19,6 +19,23 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Added
 
+- **Downstream HTTP/2 WebSocket proxying via RFC 8441 Extended CONNECT
+  (#864).** A connection advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`
+  once any location has `proxy_websocket on`; a validated Extended CONNECT
+  (`:method: CONNECT`, `:protocol: websocket`, with the ordinary
+  `:scheme`/`:authority`/`:path` triple) then runs the identical admission
+  pipeline an HTTP/1.1 WebSocket upgrade already enforces -- route opt-in,
+  auth/ACL/`forward_auth`/rate limits, Origin policy, 0-RTT replay safety,
+  and tunnel capacity -- before translating to a fresh, never-pooled
+  HTTP/1.1 `ws://`/`wss://` origin handshake and answering the stream with a
+  downstream `:status: 200`. There is no upstream HTTP/2 WebSocket support
+  yet. An admitted tunnel relays opaque H2 DATA against the upstream socket
+  on its own dedicated thread pair, independent of the HTTP/1.1 path's
+  reactor-thread pool, and shares its upgrade/tunnel metrics and close
+  semantics (idle, lifetime, shutdown, reload preserve/drain, RST_STREAM,
+  GOAWAY). A non-negotiated or malformed Extended CONNECT is rejected with
+  zero upstream side effects. HTTP/3 (RFC 9220) extended CONNECT remains
+  unsupported.
 - **Synchronous stale revalidation and bounded collapsed fills for the generic
   response cache (#934).** An expired in-memory `GET` representation with an
   `ETag` or `Last-Modified` validator now sends an origin-only conditional

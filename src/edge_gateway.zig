@@ -3285,13 +3285,22 @@ fn h2ResetStreamState(
     }
     if (handoff) |ho| _ = ho.cancelStream(stream_id) catch {};
     if (handoff) |ho| if (executor) |ex| ex.cancelStreamSignals(ho, stream_id);
+    // An asynchronous WebSocket admission installs a bounded Session before
+    // its worker starts dialing.  That Session owns the one pre-reserved
+    // connection-memory share while it stages RFC 8441 DATA, so a reset must
+    // not return the same reservation once through `in_flight` and again
+    // through `sessions`.
+    var resetting_provisional_websocket_session = false;
     if (in_flight.fetchRemove(stream_id)) |removed| {
         if (removed.value == .websocket_admission) {
             // A queued job is destroyed immediately by `cancelStream`; an
             // active job eventually destroys its cancelled completion. In
             // neither case will `applyH2WebSocketAdmissionCompletion` run,
             // so the connection thread returns its pre-dial reservation here.
-            buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
+            resetting_provisional_websocket_session = sessions.contains(stream_id);
+            if (!resetting_provisional_websocket_session) {
+                buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
+            }
         }
     }
     if (sessions.fetchRemove(stream_id)) |removed| {
@@ -3304,6 +3313,11 @@ fn h2ResetStreamState(
         // `deliverReset` below settles (and zeroes) any bytes still queued
         // -- a fixed reserved-capacity decrement here would double count.
         session.deliverReset(.cancel);
+        // A provisional admission session has no relay consumer yet.  Drop
+        // that prospective consumer reference here so the normal runtime
+        // detach below can free it instead of leaving an unowned Session
+        // behind after a client reset races the admission worker.
+        if (resetting_provisional_websocket_session) _ = session.consumerDetach();
         // Unread inbound bytes already charged the peer's connection-level
         // receive window (see `Session.settleLocked`). The stream itself is
         // gone, so return that credit with a stream-0-only WINDOW_UPDATE
@@ -3726,6 +3740,25 @@ const H2WebSocketTunnel = struct {
     }
 };
 
+/// A WebSocket admission session is attached to the H2 runtime before the
+/// worker has completed forward-auth/origin negotiation.  It is therefore a
+/// real, bounded receive endpoint for RFC 8441 early DATA, but has no relay
+/// consumer until admission succeeds.  Refusal/error paths must release both
+/// references and return any receive credit accumulated while it was staged.
+fn h2DiscardProvisionalWebSocketSession(
+    writer: anytype,
+    allocator: std.mem.Allocator,
+    sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
+    buffered_request_bytes: *usize,
+    stream_id: u31,
+    conn_recv_window: ?*i64,
+) !void {
+    const session = sessions.get(stream_id) orelse return;
+    session.deliverReset(.cancel);
+    _ = session.consumerDetach();
+    try h2DetachSession(writer, allocator, sessions, buffered_request_bytes, stream_id, conn_recv_window);
+}
+
 /// Apply the terminal outcome of a WebSocket admission attempt (#864),
 /// whether it was computed synchronously on this connection's frame-reading
 /// thread or relayed from a worker's completion (#866, #952 review): writes
@@ -3745,25 +3778,39 @@ fn h2ApplyWebSocketAdmissionOutcome(
     buffered_request_bytes: *usize,
     streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
     sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
+    conn_recv_window: ?*i64,
     /// The connection thread reserves one session's bounded queues before
     /// scheduling admission. This remains charged only if a session is
     /// successfully attached below; every refusal, error, and stale worker
     /// completion rolls it back before returning (#952 review).
     connection_memory_reserved: bool,
 ) !void {
+    const provisional_session = sessions.get(stream_id);
+    var provisional_cleanup_needed = provisional_session != null;
+    errdefer if (provisional_cleanup_needed) {
+        h2DiscardProvisionalWebSocketSession(writer, allocator, sessions, buffered_request_bytes, stream_id, conn_recv_window) catch {};
+    };
     var reservation_retained = false;
-    defer if (connection_memory_reserved and !reservation_retained) {
+    defer if (connection_memory_reserved and provisional_session == null and !reservation_retained) {
         buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
     };
     switch (outcome) {
         .not_matched => {
             try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.refused_stream.value());
             if (streams.getPtr(stream_id)) |s| s.close();
+            if (provisional_session != null) {
+                try h2DiscardProvisionalWebSocketSession(writer, allocator, sessions, buffered_request_bytes, stream_id, conn_recv_window);
+                provisional_cleanup_needed = false;
+            }
         },
         .refused => |refused| {
             state.metricsRecordWebSocketUpgrade(refused.outcome);
             try h2WriteWebSocketRefusalHeaders(writer, allocator, stream_id, refused.status_code, correlation_id);
             if (streams.getPtr(stream_id)) |s| s.localEndStream() catch {};
+            if (provisional_session != null) {
+                try h2DiscardProvisionalWebSocketSession(writer, allocator, sessions, buffered_request_bytes, stream_id, conn_recv_window);
+                provisional_cleanup_needed = false;
+            }
         },
         .switched => |switched| {
             // `outcome.switched` owns an already-open origin connection,
@@ -3771,22 +3818,29 @@ fn h2ApplyWebSocketAdmissionOutcome(
             // and a retained configuration lease.  Do not use `try` here:
             // a failed first allocation would otherwise return before any
             // of the cleanup below can run (#952 review).
-            const session = allocator.create(http.h2_stream_session.Session) catch |err| {
+            const session = provisional_session orelse allocator.create(http.h2_stream_session.Session) catch |err| {
                 switched.deinit();
                 return err;
             };
-            session.* = http.h2_stream_session.Session.init(allocator, connection_id, stream_id, HTTP2_SESSION_MAX_INBOUND_BYTES, HTTP2_SESSION_MAX_OUTBOUND_BYTES) catch |err| {
-                allocator.destroy(session);
-                switched.deinit();
-                return err;
-            };
+            const session_created_here = provisional_session == null;
+            if (session_created_here) {
+                session.* = http.h2_stream_session.Session.init(allocator, connection_id, stream_id, HTTP2_SESSION_MAX_INBOUND_BYTES, HTTP2_SESSION_MAX_OUTBOUND_BYTES) catch |err| {
+                    allocator.destroy(session);
+                    switched.deinit();
+                    return err;
+                };
+            }
             h2WriteWebSocketAcceptedHeaders(writer, allocator, stream_id, correlation_id, switched.upgraded, switched.forward_auth_grants.client_headers.items) catch |err| {
-                session.deinit();
-                allocator.destroy(session);
+                if (session_created_here) {
+                    session.deinit();
+                    allocator.destroy(session);
+                } else {
+                    h2DiscardProvisionalWebSocketSession(writer, allocator, sessions, buffered_request_bytes, stream_id, conn_recv_window) catch {};
+                }
                 switched.deinit();
                 return err;
             };
-            sessions.put(stream_id, session) catch |err| {
+            if (session_created_here) sessions.put(stream_id, session) catch |err| {
                 session.deinit();
                 allocator.destroy(session);
                 switched.deinit();
@@ -3798,7 +3852,7 @@ fn h2ApplyWebSocketAdmissionOutcome(
             // cannot all pass the same capacity check.
             if (!connection_memory_reserved) buffered_request_bytes.* += HTTP2_SESSION_RESERVED_BYTES;
             reservation_retained = true;
-            http.h2_transport_metrics.sessionAttached();
+            if (session_created_here) http.h2_transport_metrics.sessionAttached();
             state.metricsRecordWebSocketUpgrade(.relayed);
             H2WebSocketTunnel.spawn(allocator, state, session, switched, correlation_id) catch |err| {
                 // The 200 is already committed and the session already
@@ -3813,6 +3867,7 @@ fn h2ApplyWebSocketAdmissionOutcome(
                 switched.deinit();
                 state.logger.err(correlation_id, "failed to spawn H2 websocket relay thread: {s}", .{@errorName(err)});
             };
+            provisional_cleanup_needed = false;
         },
     }
 }
@@ -3893,6 +3948,37 @@ fn h2AdmitWebSocketConnect(
         in_flight.ensureUnusedCapacity(1) catch {
             return h2RefuseWebSocketOverloaded(allocator, state, writer, stream_id, correlation_id, streams);
         };
+        // RFC 8441 permits DATA as soon as CONNECT HEADERS has been sent;
+        // clients need not wait for our 200.  Install the normal bounded
+        // stream receive endpoint before scheduling the slow auth/dial job,
+        // so that early bytes retain their ordering and flow-control credit
+        // rather than being reset merely because admission is still running.
+        sessions.ensureUnusedCapacity(1) catch {
+            return h2RefuseWebSocketOverloaded(allocator, state, writer, stream_id, correlation_id, streams);
+        };
+        const provisional_session = allocator.create(http.h2_stream_session.Session) catch {
+            return h2RefuseWebSocketOverloaded(allocator, state, writer, stream_id, correlation_id, streams);
+        };
+        provisional_session.* = http.h2_stream_session.Session.init(allocator, connection_id, stream_id, HTTP2_SESSION_MAX_INBOUND_BYTES, HTTP2_SESSION_MAX_OUTBOUND_BYTES) catch {
+            allocator.destroy(provisional_session);
+            return h2RefuseWebSocketOverloaded(allocator, state, writer, stream_id, correlation_id, streams);
+        };
+        sessions.putAssumeCapacity(stream_id, provisional_session);
+        http.h2_transport_metrics.sessionAttached();
+        var provisional_session_owned = true;
+        defer if (provisional_session_owned) {
+            // No peer frame can be delivered until this function returns, so
+            // there is no receive credit to emit on a failed submission.
+            _ = sessions.remove(stream_id);
+            provisional_session.deliverReset(.cancel);
+            _ = provisional_session.consumerDetach();
+            if (provisional_session.runtimeDetach()) {
+                provisional_session.deinit();
+                allocator.destroy(provisional_session);
+            }
+            http.h2_transport_metrics.sessionDetached();
+            http.h2_transport_metrics.sessionClosed(.detached);
+        };
         if (buildH2WebSocketAdmissionJob(allocator, state, cfg, config_lease, method, path, ps, correlation_id, connection_ip)) |job| {
             const wrapped = wrapH2WorkerJob(allocator, .{ .websocket_admission = job }) catch {
                 H2WebSocketAdmissionJob.destroyOpaque(job);
@@ -3915,6 +4001,10 @@ fn h2AdmitWebSocketConnect(
                 // The completion owns the reservation from here, including
                 // if the peer resets the stream before it can be drained.
                 reservation_owned = false;
+                // The runtime owns the provisional receive endpoint until a
+                // successful completion transfers its consumer side to the
+                // relay, or until reset/refusal tears it down.
+                provisional_session_owned = false;
                 return;
             }
         } else |_| {}
@@ -3937,7 +4027,7 @@ fn h2AdmitWebSocketConnect(
     };
     // `h2Apply...` owns the reservation even on its error paths.
     reservation_owned = false;
-    try h2ApplyWebSocketAdmissionOutcome(allocator, state, writer, stream_id, correlation_id, outcome, connection_id, buffered_request_bytes, streams, sessions, true);
+    try h2ApplyWebSocketAdmissionOutcome(allocator, state, writer, stream_id, correlation_id, outcome, connection_id, buffered_request_bytes, streams, sessions, null, true);
 }
 
 fn h2RefuseWebSocketOverloaded(
@@ -4000,12 +4090,33 @@ fn h2ProcessHeaderBlock(
     handoff: ?*http.h2_request_handoff.Handoff,
     executor: ?*http.h2_request_executor.Executor,
     in_flight: *std.AutoHashMap(u31, H2InFlightKind),
+    conn_recv_window: ?*i64,
 ) !void {
     var decoded = decoder.decode(allocator, header_block) catch {
         try http.http2_frame.writeGoaway(writer, last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
         return error.Http2CompressionError;
     };
     defer http.hpack.deinitDecoded(allocator, &decoded);
+
+    if (in_flight.get(stream_id) == .websocket_admission) {
+        // A second field section while an asynchronous CONNECT admission is
+        // pending is never another initial request. Reject and cancel this
+        // stream only; HPACK has already been decoded, so sibling streams
+        // retain a synchronized compression context.
+        try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+        if (handoff) |ho| _ = ho.cancelStream(stream_id) catch {};
+        if (handoff) |ho| if (executor) |ex| ex.cancelStreamSignals(ho, stream_id);
+        if (in_flight.fetchRemove(stream_id)) |removed| {
+            std.debug.assert(removed.value == .websocket_admission);
+            if (sessions.contains(stream_id)) {
+                try h2DiscardProvisionalWebSocketSession(writer, allocator, sessions, buffered_request_bytes, stream_id, conn_recv_window);
+            } else {
+                buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
+            }
+        }
+        _ = streams.remove(stream_id);
+        return;
+    }
 
     if (sessions.get(stream_id)) |active_session| {
         // A second HEADERS frame on an attached #867 session stream can
@@ -4018,22 +4129,6 @@ fn h2ProcessHeaderBlock(
         }
         if (streams.getPtr(stream_id)) |s| s.remoteEndStream() catch {};
         active_session.deliverRemoteEndStream();
-        return;
-    }
-
-    if (in_flight.get(stream_id) == .websocket_admission) {
-        // A second field section while an asynchronous CONNECT admission is
-        // pending is never another initial request. Reject and cancel this
-        // stream only; HPACK has already been decoded, so sibling streams
-        // retain a synchronized compression context.
-        try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.protocol_error.value());
-        if (handoff) |ho| _ = ho.cancelStream(stream_id) catch {};
-        if (handoff) |ho| if (executor) |ex| ex.cancelStreamSignals(ho, stream_id);
-        if (in_flight.fetchRemove(stream_id)) |removed| {
-            std.debug.assert(removed.value == .websocket_admission);
-            buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
-        }
-        _ = streams.remove(stream_id);
         return;
     }
 
@@ -4856,6 +4951,21 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             .connection_closed;
         h2SettleAllSessions(allocator, &sessions, reason);
     }
+    // A staged WebSocket admission has a Session runtime reference but no
+    // relay thread yet.  On connection teardown its worker completion may be
+    // discarded after the session registry is gone, so release that future
+    // consumer reference before `h2SettleAllSessions` detaches the runtime
+    // side.  Established relays are no longer in `in_flight_jobs` and keep
+    // their consumer reference until their own thread exits.
+    defer {
+        var it = in_flight_jobs.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .websocket_admission) continue;
+            if (sessions.get(entry.key_ptr.*)) |provisional_session| {
+                _ = provisional_session.consumerDetach();
+            }
+        }
+    }
 
     const DrainCtx = struct {
         conn: @TypeOf(conn),
@@ -4870,6 +4980,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
         in_flight: *std.AutoHashMap(u31, H2InFlightKind),
         sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
         buffered_request_bytes: *usize,
+        conn_recv_window: *i64,
         connection_id: u64,
 
         /// Woken whenever a worker's completion arrives while this connection
@@ -4904,6 +5015,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         self.buffered_request_bytes,
                         self.streams,
                         self.sessions,
+                        self.conn_recv_window,
                     ),
                 }
                 // A successful WebSocket admission completion attaches a
@@ -4936,6 +5048,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
         .in_flight = &in_flight_jobs,
         .sessions = &sessions,
         .buffered_request_bytes = &buffered_request_bytes,
+        .conn_recv_window = &conn_recv_window,
         .connection_id = connection_id,
     };
     h2InstallRequestHandoff(conn, &handoff, DrainCtx.drain, &drain_ctx);
@@ -5368,6 +5481,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         &handoff,
                         executor,
                         &in_flight_jobs,
+                        &conn_recv_window,
                     );
                     if (pending.getPtr(frame.stream_id)) |stamped| stamped.headers.client_cert = connClientCertificate(conn);
                 }
@@ -5695,6 +5809,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                             &handoff,
                             executor,
                             &in_flight_jobs,
+                            &conn_recv_window,
                         );
                         if (pending.getPtr(stream_id)) |stamped| stamped.headers.client_cert = connClientCertificate(conn);
                     }
@@ -7293,17 +7408,21 @@ fn applyH2WebSocketAdmissionCompletion(
     buffered_request_bytes: *usize,
     streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
     sessions: *std.AutoHashMap(u31, *http.h2_stream_session.Session),
+    conn_recv_window: *i64,
 ) anyerror!void {
     // Ownership transferred from `h2AdmitWebSocketConnect` as soon as the
     // job was submitted. This completion may be stale after RST_STREAM, but
     // it must still release the reservation in that case.
     var reservation_retained = false;
-    defer if (!reservation_retained) {
+    defer if (!reservation_retained and !sessions.contains(stream_id)) {
         buffered_request_bytes.* -= @min(buffered_request_bytes.*, HTTP2_SESSION_RESERVED_BYTES);
     };
     const outcome = payload.outcome orelse return error.H2MissingTerminalOutcome;
     switch (outcome) {
-        .admit_error => |err| return err,
+        .admit_error => |err| {
+            if (sessions.contains(stream_id)) try h2DiscardProvisionalWebSocketSession(writer, allocator, sessions, buffered_request_bytes, stream_id, conn_recv_window);
+            return err;
+        },
         .admitted => {},
     }
     if (!streams.contains(stream_id)) return;
@@ -7314,7 +7433,7 @@ fn applyH2WebSocketAdmissionCompletion(
     // successfully attached session. It now owns this completion's
     // reservation for either result.
     reservation_retained = true;
-    try h2ApplyWebSocketAdmissionOutcome(allocator, state, writer, stream_id, payload.correlation_id, admitted, connection_id, buffered_request_bytes, streams, sessions, true);
+    try h2ApplyWebSocketAdmissionOutcome(allocator, state, writer, stream_id, payload.correlation_id, admitted, connection_id, buffered_request_bytes, streams, sessions, conn_recv_window, true);
 }
 
 fn h2EvaluateRequestPolicy(
@@ -17894,6 +18013,7 @@ test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
         null,
         null,
         &in_flight,
+        null,
     );
 
     // No request was assembled and nothing was queued for dispatch.
@@ -17946,7 +18066,7 @@ test "H2 WebSocket admission rejects repeated HEADERS without affecting siblings
     defer in_flight.deinit();
     try in_flight.put(1, .websocket_admission);
 
-    try h2ProcessHeaderBlock(allocator, &decoder, &pending, &streams, &ready, &sessions, &state, 1, block, false, false, &out.writer, 1, 0, &buffered, "127.0.0.1", 1, &cfg, true, .{}, null, null, null, &in_flight);
+    try h2ProcessHeaderBlock(allocator, &decoder, &pending, &streams, &ready, &sessions, &state, 1, block, false, false, &out.writer, 1, 0, &buffered, "127.0.0.1", 1, &cfg, true, .{}, null, null, null, &in_flight, null);
 
     try std.testing.expect(!in_flight.contains(1));
     try std.testing.expect(!streams.contains(1));

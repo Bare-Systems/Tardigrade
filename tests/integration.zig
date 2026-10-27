@@ -27558,6 +27558,14 @@ const H2WebSocketConnect = struct {
     saw_connect_protocol_setting: bool = false,
 
     fn open(allocator: std.mem.Allocator, port: u16, authority: []const u8, path: []const u8, extra_headers: []const hpack.HeaderField) !struct { conn: H2WebSocketConnect, status: u16 } {
+        return openWithEarlyData(allocator, port, authority, path, extra_headers, null);
+    }
+
+    /// RFC 8441 permits a client to send DATA immediately after CONNECT
+    /// HEADERS; it need not wait for the server's 200.  Keep this separate
+    /// from `sendData` so integration coverage can put both frames on the
+    /// wire before the gateway has completed its asynchronous origin dial.
+    fn openWithEarlyData(allocator: std.mem.Allocator, port: u16, authority: []const u8, path: []const u8, extra_headers: []const hpack.HeaderField, early_data: ?[]const u8) !struct { conn: H2WebSocketConnect, status: u16 } {
         const client = try PureZigTlsClient.create(allocator, port, "h2");
         errdefer client.destroy();
         try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
@@ -27576,6 +27584,7 @@ const H2WebSocketConnect = struct {
         const request_block = try hpack.encodeLiteralHeaderBlock(allocator, request_headers.items);
         defer allocator.free(request_block);
         try client.writeHttp2Frame(0x1, 0x4, 1, request_block); // END_HEADERS only; the stream stays open
+        if (early_data) |data| try client.writeHttp2Frame(0x0, 0, 1, data);
 
         var self = H2WebSocketConnect{ .client = client, .stream_id = 1 };
         var frame_count: usize = 0;
@@ -27692,6 +27701,50 @@ test "downstream HTTP/2 RFC 8441 Extended CONNECT WebSocket echoes through a fre
     var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
     defer metrics.deinit();
     try std.testing.expect(wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"relayed\"") >= 1);
+}
+
+test "downstream HTTP/2 RFC 8441 Extended CONNECT preserves DATA sent before its 200 admission response (#952)" {
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    const payload = "websocket-data-before-connect-response";
+    const early_frame = try encodeWsFrame(allocator, .text, payload, true, true);
+    defer allocator.free(early_frame);
+    // Write DATA immediately behind CONNECT HEADERS.  Before this fix the
+    // asynchronous admission path reset stream 1 before it could dial the
+    // origin; a conforming client must instead receive the normal 200 and
+    // have the opaque frame relayed in-order once admission succeeds.
+    var opened = try H2WebSocketConnect.openWithEarlyData(allocator, tardigrade.port, "tardigrade.test", "/ws/chat", &.{}, early_frame);
+    defer opened.conn.destroy();
+    try std.testing.expect(opened.conn.saw_connect_protocol_setting);
+    try std.testing.expectEqual(@as(u16, 200), opened.status);
+
+    var echoed = try opened.conn.readWsFrame(allocator, 5_000);
+    defer echoed.deinit(allocator);
+    try std.testing.expectEqual(WebSocketOpCode.text, echoed.opcode);
+    try std.testing.expect(echoed.fin);
+    try std.testing.expectEqualStrings(payload, echoed.payload);
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
 }
 
 test "downstream HTTP/2 RFC 8441 Extended CONNECT denied by Origin policy never dials the upstream (#864)" {

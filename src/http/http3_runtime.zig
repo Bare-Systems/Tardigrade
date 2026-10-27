@@ -26,6 +26,7 @@ const http3_session = @import("http3_session.zig");
 const logger_mod = @import("logger.zig");
 const metrics_mod = @import("metrics.zig");
 const response_mod = @import("response.zig");
+const stream_session = @import("stream_session.zig");
 const stream_transport = @import("stream_transport");
 const quic = @import("quic");
 const http3 = @import("http3");
@@ -70,6 +71,57 @@ pub const RequestHandler = *const fn (
     response: *response_mod.Response,
     user_data: ?*anyopaque,
 ) anyerror!void;
+
+/// A validated, capability-negotiated RFC 9220 Extended CONNECT envelope,
+/// observed before the request stream's FIN (which a live tunnel may never
+/// send). Borrowed from the connection's own request state; valid only for
+/// the duration of the `ExtendedConnectHandler` call that receives it.
+pub const ExtendedConnectView = struct {
+    stream_id: u64,
+    method: []const u8,
+    scheme: []const u8,
+    authority: []const u8,
+    path: []const u8,
+    protocol: []const u8,
+    headers: []const stream_transport.Header,
+    buffered_body: []const u8,
+    transport_early: bool,
+    client_ip: []const u8,
+};
+
+pub const ExtendedConnectRefusal = struct {
+    status: u16,
+    headers: []const stream_transport.Header = &.{},
+    body: []const u8 = "",
+};
+
+pub const ExtendedConnectAdmission = struct {
+    status: u16 = 200,
+    headers: []const stream_transport.Header = &.{},
+    max_inbound_bytes: usize,
+    max_outbound_bytes: usize,
+    /// Called once the session is admitted and attached to its QUIC stream.
+    /// The embedder should spawn its own relay thread here. `*stream_session.
+    /// Session` follows the primitive's own two-party detach contract: the
+    /// runtime calls `runtimeDetach()` once it settles/reaps the tunnel, the
+    /// embedder's relay thread calls `consumerDetach()` once it stops using
+    /// the handle, and whichever call observes the other side already
+    /// detached is the one that must `deinit()`/`allocator.destroy()` it --
+    /// `allocator` here is always the exact allocator it was created with.
+    on_admitted: *const fn (std.mem.Allocator, *stream_session.Session, ?*anyopaque) void,
+    on_admitted_ctx: ?*anyopaque = null,
+};
+
+pub const ExtendedConnectDecision = union(enum) {
+    refuse: ExtendedConnectRefusal,
+    admit: ExtendedConnectAdmission,
+};
+
+pub const ExtendedConnectHandler = *const fn (
+    allocator: std.mem.Allocator,
+    request: *const ExtendedConnectView,
+    user_data: ?*anyopaque,
+) ExtendedConnectDecision;
 
 pub const Config = struct {
     listen_host: []const u8,
@@ -143,6 +195,11 @@ pub const Config = struct {
     ecn_enabled: bool = true,
     request_handler: ?RequestHandler = null,
     request_handler_ctx: ?*anyopaque = null,
+    /// #957: admits or refuses an RFC 9220 Extended CONNECT envelope before
+    /// its stream's FIN. `null` (the default) refuses every such envelope
+    /// with 404, identical to today's behavior of never surfacing one.
+    extended_connect_handler: ?ExtendedConnectHandler = null,
+    extended_connect_handler_ctx: ?*anyopaque = null,
     early_data_compat_metrics_ctx: ?*anyopaque = null,
     early_data_compat_metrics_cb: ?*const fn (*anyopaque, metrics_mod.H3EarlyDataCompatDecision) void = null,
     /// #523: the QUIC/H3 server's authoritative 0-RTT accept/reject decision
@@ -1059,14 +1116,56 @@ const ConnEntry = struct {
     pending_h3_responses: std.ArrayList(PendingH3Response) = .empty,
     active_request_stream_id: ?u64 = null,
     active_request_cancel_token: ?*cancellation.CancellationToken = null,
+    /// #957: admitted Extended CONNECT tunnels' sessions, owned here (not by
+    /// `h3`, which only holds the borrowed vtable bridge to each one) and
+    /// keyed by QUIC stream id. `settleAndReapTunnels` is the only place
+    /// that removes/destroys entries during ordinary operation; this is the
+    /// defensive last resort so a connection torn down with tunnels still
+    /// attached cannot leak them.
+    tunnel_sessions: std.AutoHashMap(u64, *stream_session.Session) = undefined,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
+        self.deinitWithTunnelReason(allocator, .connection_closed);
+    }
+
+    /// Torn down administratively (`RemovalReason.administrative`, e.g. a
+    /// server shutdown/drain via `Runtime.removeAllConnections`), as
+    /// opposed to an abrupt peer/transport connection loss: every admitted
+    /// tunnel must settle with `stream_session.TerminalReason.shutdown`
+    /// instead of `.connection_closed` so its consumer can tell the two
+    /// apart, exactly as `stream_session.Session.deliverShutdown` exists to
+    /// let it (#957).
+    fn deinitAdministrative(self: *ConnEntry, allocator: std.mem.Allocator) void {
+        self.deinitWithTunnelReason(allocator, .shutdown);
+    }
+
+    fn deinitWithTunnelReason(self: *ConnEntry, allocator: std.mem.Allocator, tunnel_reason: stream_session.TerminalReason) void {
         for (self.parked_h3_retries.items) |*parked| parked.deinit(allocator);
         self.parked_h3_retries.deinit(allocator);
         for (self.parked_h3_cache_fills.items) |*parked| parked.cancelAndDeinit(allocator, .shutdown);
         self.parked_h3_cache_fills.deinit(allocator);
         for (self.pending_h3_responses.items) |*pending| pending.deinit(allocator);
         self.pending_h3_responses.deinit(allocator);
+        var tunnel_it = self.tunnel_sessions.valueIterator();
+        while (tunnel_it.next()) |session_ptr| {
+            // The session is a fully self-contained primitive (no reference
+            // back into `self.conn`/`self.h3`), so settling and detaching it
+            // here is safe even though the connection itself is about to go
+            // away. If the embedder's relay thread (the "consumer" side of
+            // the two-party contract) already detached, this side's
+            // `runtimeDetach` is the second one and must free it; otherwise
+            // the relay thread is still running against an already-settled
+            // session and will free it itself once it detaches.
+            switch (tunnel_reason) {
+                .shutdown => session_ptr.*.deliverShutdown(),
+                .reset, .connection_closed => session_ptr.*.deliverConnectionClosed(),
+            }
+            if (session_ptr.*.runtimeDetach()) {
+                session_ptr.*.deinit();
+                allocator.destroy(session_ptr.*);
+            }
+        }
+        self.tunnel_sessions.deinit();
         self.h3.deinit();
         self.conn.deinit();
         allocator.destroy(self.backend);
@@ -1457,6 +1556,8 @@ pub const Runtime = struct {
     local_address: quic.udp.Address,
     request_handler: ?RequestHandler,
     request_handler_ctx: ?*anyopaque,
+    extended_connect_handler: ?ExtendedConnectHandler,
+    extended_connect_handler_ctx: ?*anyopaque,
     credential_provider: ?tls_core.credentials.CredentialProvider,
     resumption_runtime: ?*tls_core.resumption_runtime.Runtime,
     early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
@@ -1595,6 +1696,8 @@ pub const Runtime = struct {
             .local_address = local_address,
             .request_handler = cfg.request_handler,
             .request_handler_ctx = cfg.request_handler_ctx,
+            .extended_connect_handler = cfg.extended_connect_handler,
+            .extended_connect_handler_ctx = cfg.extended_connect_handler_ctx,
             .credential_provider = cfg.credential_provider,
             .resumption_runtime = cfg.resumption_runtime,
             .early_data_replay_gate = cfg.early_data_replay_gate,
@@ -2046,6 +2149,7 @@ pub const Runtime = struct {
             .backend = backend,
             .conn = conn,
             .h3 = h3,
+            .tunnel_sessions = std.AutoHashMap(u64, *stream_session.Session).init(allocator),
             .quic_observer = .{
                 .runtime = self,
                 .connection_handle = handle,
@@ -2211,7 +2315,7 @@ pub const Runtime = struct {
                     close(artifact_ctx, handle);
                 }
             }
-            kv.value.deinit(self.allocator);
+            if (reason == .administrative) kv.value.deinitAdministrative(self.allocator) else kv.value.deinit(self.allocator);
             self.allocator.destroy(kv.value);
             self.noteConnectionClosed();
             self.recordQuicConnectionsActive(connections.count());
@@ -2370,6 +2474,197 @@ pub const Runtime = struct {
                 }
             }
             self.serveRequest(entry, incoming, now);
+        }
+        while (entry.h3.pollExtendedConnect()) |incoming| {
+            self.serveExtendedConnect(entry, incoming, now);
+        }
+        entry.h3.pumpTunnelsOutbound(entry.conn);
+        self.reconcileTunnels(entry);
+    }
+
+    /// Admit or refuse a validated, negotiated Extended CONNECT envelope
+    /// surfaced before its stream's FIN (#957). Unlike `serveRequest`, this
+    /// never runs on the bounded worker pool: the embedder's own handler is
+    /// expected to make a synchronous go/no-go decision and hand off its own
+    /// relay (if admitted) to its own thread, exactly like today's H2
+    /// Extended CONNECT admission already does.
+    fn serveExtendedConnect(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingExtendedConnect, now: u64) void {
+        const handler = self.extended_connect_handler orelse {
+            self.refuseExtendedConnect(entry, incoming.stream_id, now, 404, &.{}, "");
+            return;
+        };
+        const client_ip = formatAddressHostAlloc(self.allocator, entry.conn.activePathKey().remote) catch {
+            self.refuseExtendedConnect(entry, incoming.stream_id, now, 500, &.{}, "");
+            return;
+        };
+        defer self.allocator.free(client_ip);
+        const view = ExtendedConnectView{
+            .stream_id = incoming.stream_id,
+            .method = incoming.method,
+            .scheme = incoming.scheme,
+            .authority = incoming.authority,
+            .path = incoming.path,
+            .protocol = incoming.protocol,
+            .headers = incoming.headers,
+            .buffered_body = incoming.buffered_body,
+            .transport_early = incoming.transport_early,
+            .client_ip = client_ip,
+        };
+        switch (handler(self.allocator, &view, self.extended_connect_handler_ctx)) {
+            // #957 requires every Extended CONNECT outcome to be an ordinary,
+            // non-101 HTTP/3 response: reject any embedder-supplied status
+            // that would violate that (e.g. an HTTP/1.1 WebSocket handler's
+            // 101 reused verbatim) rather than forwarding it onto the wire.
+            .refuse => |refusal| {
+                const status = if (refusal.status == 101 or refusal.status < 200 or refusal.status > 599) 500 else refusal.status;
+                self.refuseExtendedConnect(entry, incoming.stream_id, now, status, refusal.headers, refusal.body);
+            },
+            .admit => |admission| {
+                if (admission.status < 200 or admission.status >= 300) {
+                    self.refuseExtendedConnect(entry, incoming.stream_id, now, 500, &.{}, "");
+                    return;
+                }
+                self.admitTunnel(entry, incoming.stream_id, admission, now);
+            },
+        }
+    }
+
+    /// Mark `stream_id` refused and drive its response through the same
+    /// resumable `queueH3Response`/`resumePendingH3Responses` machinery
+    /// every other H3 response uses: a congested stream parks the response
+    /// and retries it on a later `pump()` instead of losing a partially
+    /// written HEADERS/DATA frame to a swallowed `StreamBackpressure`.
+    fn refuseExtendedConnect(
+        self: *Runtime,
+        entry: *ConnEntry,
+        stream_id: u64,
+        now: u64,
+        status: u16,
+        headers: []const stream_transport.Header,
+        body: []const u8,
+    ) void {
+        entry.h3.refuseExtendedConnect(stream_id) catch return;
+        self.queueH3Response(entry, stream_id, now, status, headers, body, "extended-connect-refusal");
+    }
+
+    fn admitTunnel(self: *Runtime, entry: *ConnEntry, stream_id: u64, admission: ExtendedConnectAdmission, now: u64) void {
+        const session_ptr = self.allocator.create(stream_session.Session) catch {
+            self.refuseExtendedConnect(entry, stream_id, now, 503, &.{}, "");
+            return;
+        };
+        session_ptr.* = stream_session.Session.init(self.allocator, stream_id, admission.max_inbound_bytes, admission.max_outbound_bytes, null) catch {
+            self.allocator.destroy(session_ptr);
+            self.refuseExtendedConnect(entry, stream_id, now, 503, &.{}, "");
+            return;
+        };
+        entry.tunnel_sessions.put(stream_id, session_ptr) catch {
+            session_ptr.deinit();
+            self.allocator.destroy(session_ptr);
+            self.refuseExtendedConnect(entry, stream_id, now, 503, &.{}, "");
+            return;
+        };
+        const sink = http3.session.RequestStream.TunnelSink{ .ctx = session_ptr, .deliverFn = tunnelDeliverInbound };
+        const tunnel = H3.Tunnel{
+            .ctx = session_ptr,
+            .remoteEndStreamFn = tunnelRemoteEndStream,
+            .peekOutboundFn = tunnelPeekOutbound,
+            .commitOutboundSentFn = tunnelCommitOutboundSent,
+            .outboundLocalEndPendingFn = tunnelOutboundLocalEndPending,
+            .markLocalEndSentFn = tunnelMarkLocalEndSent,
+        };
+        entry.h3.admitExtendedConnect(entry.conn, stream_id, admission.status, admission.headers, sink, tunnel) catch {
+            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3 internal_error-equivalent QUIC application code; best effort
+            // `admitExtendedConnect` may have already attached `sink`/`tunnel`
+            // (borrowed pointers into `session_ptr`) before failing, e.g. during
+            // buffered-body drain. Remove the request so no later pump
+            // (`pumpTunnelsOutbound`/`pumpTunnelInbound`) can reach those
+            // callbacks after `session_ptr` is destroyed below.
+            entry.h3.finishRequest(stream_id);
+            _ = entry.tunnel_sessions.remove(stream_id);
+            session_ptr.deinit();
+            self.allocator.destroy(session_ptr);
+            return;
+        };
+        admission.on_admitted(self.allocator, session_ptr, admission.on_admitted_ctx);
+    }
+
+    /// Returns how many leading bytes of `bytes` the bound session accepted
+    /// right now (possibly zero -- backpressure, not an error). A session
+    /// already settled (e.g. by a peer reset observed at the QUIC event
+    /// layer) also reports zero: `reconcileTunnels` reaps it shortly.
+    fn tunnelDeliverInbound(ctx: ?*anyopaque, bytes: []const u8) http3.session.SessionError!usize {
+        const session_ptr: *stream_session.Session = @ptrCast(@alignCast(ctx.?));
+        return session_ptr.deliverInboundPartial(bytes) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return 0;
+        };
+    }
+
+    fn tunnelRemoteEndStream(ctx: ?*anyopaque) void {
+        const session_ptr: *stream_session.Session = @ptrCast(@alignCast(ctx.?));
+        session_ptr.deliverRemoteEndStream();
+    }
+
+    fn tunnelPeekOutbound(ctx: ?*anyopaque, max_len: usize) ?[]const u8 {
+        const session_ptr: *stream_session.Session = @ptrCast(@alignCast(ctx.?));
+        return session_ptr.peekOutbound(max_len);
+    }
+
+    fn tunnelCommitOutboundSent(ctx: ?*anyopaque, n: usize) void {
+        const session_ptr: *stream_session.Session = @ptrCast(@alignCast(ctx.?));
+        session_ptr.commitOutboundSent(n);
+    }
+
+    fn tunnelOutboundLocalEndPending(ctx: ?*anyopaque) bool {
+        const session_ptr: *stream_session.Session = @ptrCast(@alignCast(ctx.?));
+        return session_ptr.outboundLocalEndPending();
+    }
+
+    fn tunnelMarkLocalEndSent(ctx: ?*anyopaque) void {
+        const session_ptr: *stream_session.Session = @ptrCast(@alignCast(ctx.?));
+        session_ptr.markLocalEndStreamSent();
+    }
+
+    /// Answer a tunnel session's own `requestCancel()` with a real
+    /// RST_STREAM before settling it, exactly like every other consumer-
+    /// initiated cancellation in this codebase (mirrors `h2_websocket_relay`
+    /// 's documented `takeCancelRequest` -> `deliverReset` pairing). Then
+    /// reap any session that has settled (by this or any other reason) once
+    /// the embedder's own relay thread has also detached.
+    fn reconcileTunnels(self: *Runtime, entry: *ConnEntry) void {
+        var reap: std.ArrayList(u64) = .empty;
+        defer reap.deinit(self.allocator);
+        var it = entry.tunnel_sessions.iterator();
+        while (it.next()) |kv| {
+            const stream_id = kv.key_ptr.*;
+            const session_ptr = kv.value_ptr.*;
+            if (session_ptr.takeCancelRequest()) {
+                entry.conn.resetStream(stream_id, 0x010c) catch {}; // H3_REQUEST_CANCELLED
+                session_ptr.deliverReset(0x010c);
+            }
+            if (session_ptr.hasWakeFailure() or session_ptr.hasWriteFailure()) {
+                entry.conn.resetStream(stream_id, 0x0102) catch {}; // internal_error
+                session_ptr.deliverReset(0x0102);
+            }
+            // `gracefulComplete()` covers the ordinary success path a
+            // terminal/reset state never does: both FIN halves landing
+            // cleanly (peer half-close delivered, this side's own final
+            // frame already sent) with no reset/connection-close/shutdown
+            // involved at all. Without also reaping on it, a client that
+            // opens and cleanly closes many tunnels on one long-lived H3
+            // connection would accumulate entries here and in `h3.requests`
+            // for the connection's entire lifetime.
+            if (session_ptr.isSettled() or session_ptr.gracefulComplete()) {
+                entry.h3.finishRequest(stream_id);
+                reap.append(self.allocator, stream_id) catch continue;
+            }
+        }
+        for (reap.items) |stream_id| {
+            const session_ptr = (entry.tunnel_sessions.fetchRemove(stream_id) orelse continue).value;
+            if (session_ptr.runtimeDetach()) {
+                session_ptr.deinit();
+                self.allocator.destroy(session_ptr);
+            }
         }
     }
 
@@ -3186,10 +3481,16 @@ pub const Runtime = struct {
         }
         switch (event) {
             .stream_reset => |reset| {
-                if (!reset.local) cancelActiveH3Request(observer, reset.id);
+                if (!reset.local) {
+                    cancelActiveH3Request(observer, reset.id);
+                    settleTunnelSessionIfAny(observer, reset.id, reset.error_code);
+                }
             },
             .stop_sending => |stop| {
-                if (!stop.local) cancelActiveH3Request(observer, stop.id);
+                if (!stop.local) {
+                    cancelActiveH3Request(observer, stop.id);
+                    settleTunnelSessionIfAny(observer, stop.id, stop.error_code);
+                }
             },
             .state => |state| {
                 if (state == .established) observer.handshake_succeeded = true;
@@ -3256,6 +3557,18 @@ pub const Runtime = struct {
             },
             else => {},
         }
+    }
+
+    /// A peer-initiated RESET_STREAM/STOP_SENDING on an admitted Extended
+    /// CONNECT stream (#957) settles its bound session immediately, at the
+    /// QUIC event itself rather than waiting for the next bounded reactor
+    /// tick's `readStream` to independently discover the same reset --
+    /// `Session.settle` is idempotent, so this and `reconcileTunnels`'s own
+    /// later observation of the same stream can never double-settle it.
+    fn settleTunnelSessionIfAny(observer: *ConnEntry.QuicObserver, stream_id: u64, error_code: u64) void {
+        const entry = observer.entry orelse return;
+        const session_ptr = entry.tunnel_sessions.get(stream_id) orelse return;
+        session_ptr.deliverReset(error_code);
     }
 
     fn cancelActiveH3Request(observer: *ConnEntry.QuicObserver, stream_id: u64) void {
@@ -4757,6 +5070,7 @@ const RuntimeCidHarness = struct {
             .backend = server_backend,
             .conn = server,
             .h3 = H3.initWithSettings(allocator, .server, .{}),
+            .tunnel_sessions = std.AutoHashMap(u64, *stream_session.Session).init(allocator),
             .quic_observer = .{ .runtime = undefined, .connection_handle = 0 },
             .h3_observer = .{ .runtime = undefined, .connection_handle = 0 },
             .admission_source_ip = 0x0100007f,
@@ -4797,6 +5111,343 @@ const RuntimeCidHarness = struct {
         try testing.expect(self.entry.conn.isEstablished());
     }
 };
+
+const TunnelAdmitCapture = struct {
+    session: ?*stream_session.Session = null,
+};
+
+fn testExtendedConnectHandler(
+    _: std.mem.Allocator,
+    request: *const ExtendedConnectView,
+    user_data: ?*anyopaque,
+) ExtendedConnectDecision {
+    if (!std.mem.eql(u8, request.protocol, "websocket")) return .{ .refuse = .{ .status = 404 } };
+    return .{ .admit = .{
+        .max_inbound_bytes = 4096,
+        .max_outbound_bytes = 4096,
+        .on_admitted = recordAdmittedTunnelSession,
+        .on_admitted_ctx = user_data,
+    } };
+}
+
+fn recordAdmittedTunnelSession(_: std.mem.Allocator, session_ptr: *stream_session.Session, ctx: ?*anyopaque) void {
+    const capture: *TunnelAdmitCapture = @ptrCast(@alignCast(ctx.?));
+    capture.session = session_ptr;
+}
+
+fn testInvalidStatusExtendedConnectHandler(
+    _: std.mem.Allocator,
+    request: *const ExtendedConnectView,
+    user_data: ?*anyopaque,
+) ExtendedConnectDecision {
+    // Reused HTTP/1.1 WebSocket-handshake status codes are exactly the
+    // mistake #957's non-101 guarantee has to catch at the boundary, so
+    // this intentionally mirrors that embedder bug for both outcomes.
+    if (std.mem.eql(u8, request.protocol, "refuse-101")) return .{ .refuse = .{ .status = 101 } };
+    if (std.mem.eql(u8, request.protocol, "admit-101")) return .{ .admit = .{
+        .status = 101,
+        .max_inbound_bytes = 4096,
+        .max_outbound_bytes = 4096,
+        .on_admitted = recordAdmittedTunnelSession,
+        .on_admitted_ctx = user_data,
+    } };
+    return .{ .refuse = .{ .status = 404 } };
+}
+
+fn readResponseStatus(allocator: std.mem.Allocator, client: anytype, stream_id: u64) !u16 {
+    var client_bytes: std.ArrayList(u8) = .empty;
+    defer client_bytes.deinit(allocator);
+    var client_read_buf: [256]u8 = undefined;
+    while (true) {
+        const result = try client.readStream(stream_id, &client_read_buf);
+        if (result.len == 0) break;
+        try client_bytes.appendSlice(allocator, client_read_buf[0..result.len]);
+    }
+    const headers_frame = try http3.frame.decodeFrameWithLimit(client_bytes.items, 4096);
+    try testing.expectEqual(http3.frame.FrameType.headers, headers_frame.typ);
+    var decoded_fields: [8]http3.qpack.HeaderField = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    _ = try http3.qpack.decode(headers_frame.payload, &decoded_fields, &decode_scratch);
+    try testing.expectEqualStrings(":status", decoded_fields[0].name);
+    return try std.fmt.parseInt(u16, decoded_fields[0].value, 10);
+}
+
+test "http3 runtime (#957): an embedder-supplied status 101 is sanitized on both the admit and refuse paths" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-extended-connect-status-101-test");
+    var capture = TunnelAdmitCapture{};
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .extended_connect_handler = testInvalidStatusExtendedConnectHandler,
+        .extended_connect_handler_ctx = &capture,
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(allocator, fixed.provider());
+    defer harness.deinit(allocator);
+
+    harness.entry.quic_observer.runtime = &runtime;
+    harness.entry.quic_observer.entry = harness.entry;
+    harness.entry.conn.events = .{ .context = &harness.entry.quic_observer, .emitFn = Runtime.quicConnectionEvent };
+    harness.entry.h3.local_settings.enable_connect_protocol = true;
+
+    const openExtendedConnectStream = struct {
+        fn call(client: anytype, protocol: []const u8) !u64 {
+            var fields = [_]http3.qpack.HeaderField{
+                .{ .name = ":method", .value = "CONNECT" },
+                .{ .name = ":protocol", .value = protocol },
+                .{ .name = ":scheme", .value = "https" },
+                .{ .name = ":authority", .value = "tardigrade.test" },
+                .{ .name = ":path", .value = "/socket" },
+            };
+            var qpack_block: [256]u8 = undefined;
+            const header_block = http3.qpack.encode(&fields, &qpack_block) catch unreachable;
+            var frame_buf: [512]u8 = undefined;
+            const header_frame = http3.frame.encodeKnownFrame(.headers, header_block, &frame_buf) catch unreachable;
+            const stream_id = try client.openStream(.bidi);
+            _ = try client.writeStream(stream_id, header_frame, false);
+            return stream_id;
+        }
+    }.call;
+
+    const refuse_stream_id = try openExtendedConnectStream(harness.client, "refuse-101");
+    const admit_stream_id = try openExtendedConnectStream(harness.client, "admit-101");
+    try harness.pump();
+    runtime.pumpH3(harness.entry, harness.now_us);
+    try harness.pump();
+
+    // Neither outcome may ever put :status 101 on the wire, and the invalid
+    // admission must be refused rather than silently opening a tunnel.
+    try testing.expectEqual(@as(u16, 500), try readResponseStatus(allocator, harness.client, refuse_stream_id));
+    try testing.expectEqual(@as(u16, 500), try readResponseStatus(allocator, harness.client, admit_stream_id));
+    try testing.expectEqual(@as(usize, 0), harness.entry.tunnel_sessions.count());
+    try testing.expect(capture.session == null);
+}
+
+test "http3 runtime (#957): a live QUIC/H3 Extended CONNECT tunnel relays bytes both ways and settles on peer reset" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-extended-connect-tunnel-test");
+    var capture = TunnelAdmitCapture{};
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .extended_connect_handler = testExtendedConnectHandler,
+        .extended_connect_handler_ctx = &capture,
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(allocator, fixed.provider());
+    defer harness.deinit(allocator);
+
+    // The harness wires neither of these by default (most of its tests
+    // never need a peer-initiated QUIC event observed at all): a settled
+    // tunnel session depends on exactly this path for RESET_STREAM/
+    // STOP_SENDING, so it must point at the real `runtime` under test.
+    harness.entry.quic_observer.runtime = &runtime;
+    harness.entry.quic_observer.entry = harness.entry;
+    harness.entry.conn.events = .{ .context = &harness.entry.quic_observer, .emitFn = Runtime.quicConnectionEvent };
+
+    // The harness's server H3 session is built independently of `runtime`
+    // (it drives its own deterministic QUIC pair, not `runtime`'s socket),
+    // so the capability this test depends on is set directly here, before
+    // the first `pumpH3` call sends it out in SETTINGS.
+    harness.entry.h3.local_settings.enable_connect_protocol = true;
+
+    var fields = [_]http3.qpack.HeaderField{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+        .{ .name = ":path", .value = "/socket" },
+    };
+    var qpack_block: [256]u8 = undefined;
+    const header_block = http3.qpack.encode(&fields, &qpack_block) catch unreachable;
+    var frame_buf: [512]u8 = undefined;
+    const header_frame = http3.frame.encodeKnownFrame(.headers, header_block, &frame_buf) catch unreachable;
+    const stream_id = try harness.client.openStream(.bidi);
+    _ = try harness.client.writeStream(stream_id, header_frame, false);
+    try harness.pump();
+    runtime.pumpH3(harness.entry, harness.now_us);
+
+    const session_ptr = capture.session.?;
+    try testing.expectEqual(@as(usize, 1), harness.entry.tunnel_sessions.count());
+
+    // Client -> tunnel: a DATA frame reaches the bound session incrementally,
+    // not the ordinary (unbounded, FIN-only) request body buffer.
+    var data_buf: [64]u8 = undefined;
+    const data_frame = http3.frame.encodeKnownFrame(.data, "hello-server", &data_buf) catch unreachable;
+    _ = try harness.client.writeStream(stream_id, data_frame, false);
+    try harness.pump();
+    runtime.pumpH3(harness.entry, harness.now_us);
+
+    var read_buf: [32]u8 = undefined;
+    try testing.expectEqual(stream_session.ReadResult{ .data = "hello-server".len }, session_ptr.read(&read_buf));
+    try testing.expectEqualStrings("hello-server", read_buf[0.."hello-server".len]);
+
+    // Tunnel -> client: bytes written to the session reach the client as H3
+    // DATA frames riding the already-sent (:status 200, no FIN) response.
+    try testing.expectEqual(stream_session.WriteResult.ok, try session_ptr.write("hello-client"));
+    runtime.pumpH3(harness.entry, harness.now_us);
+    try harness.pump();
+
+    var client_bytes: std.ArrayList(u8) = .empty;
+    defer client_bytes.deinit(allocator);
+    var client_read_buf: [256]u8 = undefined;
+    while (true) {
+        const result = try harness.client.readStream(stream_id, &client_read_buf);
+        if (result.len == 0) break;
+        try client_bytes.appendSlice(allocator, client_read_buf[0..result.len]);
+    }
+    const headers_frame = http3.frame.decodeFrameWithLimit(client_bytes.items, 4096) catch unreachable;
+    try testing.expectEqual(http3.frame.FrameType.headers, headers_frame.typ);
+    var decoded_fields: [8]http3.qpack.HeaderField = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    _ = try http3.qpack.decode(headers_frame.payload, &decoded_fields, &decode_scratch);
+    try testing.expectEqualStrings(":status", decoded_fields[0].name);
+    try testing.expectEqualStrings("200", decoded_fields[0].value);
+    const data_response_frame = http3.frame.decodeFrameWithLimit(client_bytes.items[headers_frame.len..], 4096) catch unreachable;
+    try testing.expectEqual(http3.frame.FrameType.data, data_response_frame.typ);
+    try testing.expectEqualStrings("hello-client", data_response_frame.payload);
+
+    // A peer RESET_STREAM settles the bound session with the right reason
+    // immediately (via the QUIC event hook), and the next reactor tick's
+    // reconciliation reaps the now-settled tunnel.
+    try harness.client.resetStream(stream_id, 0x42);
+    try harness.pump();
+    runtime.pumpH3(harness.entry, harness.now_us);
+    try testing.expectEqual(stream_session.ReadResult{ .reset = 0x42 }, session_ptr.read(&read_buf));
+    try testing.expectEqual(@as(usize, 0), harness.entry.tunnel_sessions.count());
+
+    // This test stands in for the embedder's relay thread, the consumer
+    // side of the two-party detach contract: the runtime already detached
+    // (via `reconcileTunnels`) once it reaped the settled tunnel above, so
+    // this detach is the second one and is responsible for freeing it.
+    try testing.expect(session_ptr.consumerDetach());
+    session_ptr.deinit();
+    allocator.destroy(session_ptr);
+}
+
+test "http3 runtime (#957): a cleanly completed tunnel is reaped by graceful completion, not a reset" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-extended-connect-tunnel-graceful-test");
+    var capture = TunnelAdmitCapture{};
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .extended_connect_handler = testExtendedConnectHandler,
+        .extended_connect_handler_ctx = &capture,
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(allocator, fixed.provider());
+    defer harness.deinit(allocator);
+
+    harness.entry.quic_observer.runtime = &runtime;
+    harness.entry.quic_observer.entry = harness.entry;
+    harness.entry.conn.events = .{ .context = &harness.entry.quic_observer, .emitFn = Runtime.quicConnectionEvent };
+    harness.entry.h3.local_settings.enable_connect_protocol = true;
+
+    var fields = [_]http3.qpack.HeaderField{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+        .{ .name = ":path", .value = "/socket" },
+    };
+    var qpack_block: [256]u8 = undefined;
+    const header_block = http3.qpack.encode(&fields, &qpack_block) catch unreachable;
+    var frame_buf: [512]u8 = undefined;
+    const header_frame = http3.frame.encodeKnownFrame(.headers, header_block, &frame_buf) catch unreachable;
+    const stream_id = try harness.client.openStream(.bidi);
+    _ = try harness.client.writeStream(stream_id, header_frame, false);
+    try harness.pump();
+    runtime.pumpH3(harness.entry, harness.now_us);
+
+    const session_ptr = capture.session.?;
+    try testing.expectEqual(@as(usize, 1), harness.entry.tunnel_sessions.count());
+
+    // The peer cleanly half-closes its side (ordinary QUIC FIN, no reset).
+    _ = try harness.client.writeStream(stream_id, "", true);
+    try harness.pump();
+    runtime.pumpH3(harness.entry, harness.now_us);
+    var read_buf: [8]u8 = undefined;
+    try testing.expectEqual(stream_session.ReadResult.end_stream, session_ptr.read(&read_buf));
+
+    // This call stands in for the embedder's relay thread finishing its own
+    // local half; the reactor then drains that to a final FIN DATA frame
+    // within the very same `pumpH3` tick (`pumpTunnelsOutbound` runs before
+    // `reconcileTunnels`), so no reset ever touches this stream.
+    session_ptr.finishLocal();
+    runtime.pumpH3(harness.entry, harness.now_us);
+
+    try testing.expectEqual(@as(usize, 0), harness.entry.tunnel_sessions.count());
+    try testing.expect(session_ptr.consumerDetach());
+    session_ptr.deinit();
+    allocator.destroy(session_ptr);
+}
+
+test "http3 runtime (#957): administrative connection teardown settles an admitted tunnel with .shutdown" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-extended-connect-tunnel-shutdown-test");
+    var capture = TunnelAdmitCapture{};
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .extended_connect_handler = testExtendedConnectHandler,
+        .extended_connect_handler_ctx = &capture,
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(allocator, fixed.provider());
+
+    harness.entry.quic_observer.runtime = &runtime;
+    harness.entry.quic_observer.entry = harness.entry;
+    harness.entry.conn.events = .{ .context = &harness.entry.quic_observer, .emitFn = Runtime.quicConnectionEvent };
+    harness.entry.h3.local_settings.enable_connect_protocol = true;
+
+    var fields = [_]http3.qpack.HeaderField{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+        .{ .name = ":path", .value = "/socket" },
+    };
+    var qpack_block: [256]u8 = undefined;
+    const header_block = http3.qpack.encode(&fields, &qpack_block) catch unreachable;
+    var frame_buf: [512]u8 = undefined;
+    const header_frame = http3.frame.encodeKnownFrame(.headers, header_block, &frame_buf) catch unreachable;
+    const stream_id = try harness.client.openStream(.bidi);
+    _ = try harness.client.writeStream(stream_id, header_frame, false);
+    try harness.pump();
+    runtime.pumpH3(harness.entry, harness.now_us);
+
+    const session_ptr = capture.session.?;
+    try testing.expectEqual(@as(usize, 1), harness.entry.tunnel_sessions.count());
+
+    // `Runtime.removeAllConnections`/`removeConnection(.administrative)` goes
+    // through exactly this path (`ConnEntry.deinitAdministrative`) during a
+    // server shutdown/drain -- distinct from an abrupt peer/transport loss,
+    // which stays `.connection_closed` (already covered by the reset-based
+    // tunnel test above).
+    harness.entry.deinitAdministrative(allocator);
+    var read_buf: [8]u8 = undefined;
+    try testing.expectEqual(stream_session.ReadResult{ .closed = .shutdown }, session_ptr.read(&read_buf));
+    try testing.expect(session_ptr.consumerDetach());
+    session_ptr.deinit();
+    allocator.destroy(session_ptr);
+    allocator.destroy(harness.entry);
+    harness.client.deinit();
+    allocator.destroy(harness);
+}
 
 test "http3 runtime metrics: bulk cleanup flushes final transport deltas and clears active gauge" {
     const allocator = testing.allocator;

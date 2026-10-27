@@ -4054,8 +4054,17 @@ fn h2RefuseWebSocketOverloaded(
 /// existing stale-stream discard/refund path instead of reaching the generic
 /// "open stream without a consumer" GOAWAY case.
 fn h2TerminateWebSocketRefusal(writer: anytype, streams: *std.AutoHashMap(u31, http.http2_stream.Stream), stream_id: u31) !void {
-    try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.cancel.value());
-    if (streams.getPtr(stream_id)) |s| s.close();
+    if (streams.getPtr(stream_id)) |s| {
+        // The END_STREAM refusal response is already complete. RFC 9113
+        // permits us to stop an unread request half with NO_ERROR, which
+        // tells clients to retain the response status; CANCEL does not carry
+        // that guarantee. If the peer already ended its half, no reset is
+        // needed at all.
+        if (s.canReceive()) {
+            try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.no_error.value());
+        }
+        s.close();
+    }
     _ = streams.remove(stream_id);
 }
 
@@ -4225,6 +4234,13 @@ fn h2ProcessHeaderBlock(
             if (streams.getPtr(stream_id)) |s| s.close();
             ps.deinit(allocator);
             return;
+        }
+        // Keep the stream state in sync with the END_STREAM bit before a
+        // synchronous refusal can serialize its own END_STREAM response.
+        // `h2TerminateWebSocketRefusal` then knows whether there is an
+        // unread request half to stop with RST_STREAM(NO_ERROR).
+        if (end_stream) {
+            if (streams.getPtr(stream_id)) |s| s.remoteEndStream() catch {};
         }
         // The normal (non-WebSocket) H2 path stamps this after
         // `h2ProcessHeaderBlock` returns, once the stream is in `pending`;
@@ -4921,8 +4937,15 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     // admitted or dispatched. Tracked the same way as `continuation_stream_id`
     // because RFC 9113 forbids interleaving another stream's HEADERS/
     // CONTINUATION sequence while one is in flight, so only one stream can
-    // ever be pending discard at a time.
-    var discard_header_block_for_stream: ?u31 = null;
+    // ever be pending discard at a time. Some discards still need their
+    // first refusal RST after decode (the graceful-shutdown boundary); other
+    // discards are trailing fields on a stream already reset after a complete
+    // response and must not emit another reset.
+    const DiscardHeaderBlock = struct {
+        stream_id: u31,
+        send_refusal_reset: bool,
+    };
+    var discard_header_block_for_stream: ?DiscardHeaderBlock = null;
     defer {
         var it = pending.iterator();
         while (it.next()) |entry| {
@@ -5381,27 +5404,36 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
                     return error.InvalidHttp2StreamId;
                 }
-                if (frame.stream_id <= last_client_stream_id and !streams.contains(frame.stream_id)) {
-                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
-                    continue;
-                }
-                last_client_stream_id = @max(last_client_stream_id, frame.stream_id);
-                // The stream state machine is the lifecycle authority, NOT
-                // `pending`. `h2DispatchReadyStreams` removes a request from
-                // `pending` as soon as it dispatches, while deliberately
-                // keeping the `streams` entry alive when a response is parked
-                // on send-credit exhaustion. If the client already sent
-                // END_STREAM, that stream is half_closed_remote: treating
-                // "absent from pending" as "this is a new request" would let
-                // another HEADERS frame on the same id be constructed as a
-                // SECOND request, duplicating route/auth/handler execution
-                // while the first response is still outstanding.
-                if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
-                    try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
-                    continue;
+                const closed_stream_headers = frame.stream_id <= last_client_stream_id and !streams.contains(frame.stream_id);
+                if (closed_stream_headers) {
+                    // This stream was already reset/reaped, but its field
+                    // section can still update the connection-scoped HPACK
+                    // table. Assemble and decode it before ignoring it;
+                    // emitting another RST here would also obscure the
+                    // already-complete refusal response.
+                    discard_header_block_for_stream = .{
+                        .stream_id = frame.stream_id,
+                        .send_refusal_reset = false,
+                    };
+                } else {
+                    last_client_stream_id = @max(last_client_stream_id, frame.stream_id);
+                    // The stream state machine is the lifecycle authority, NOT
+                    // `pending`. `h2DispatchReadyStreams` removes a request from
+                    // `pending` as soon as it dispatches, while deliberately
+                    // keeping the `streams` entry alive when a response is parked
+                    // on send-credit exhaustion. If the client already sent
+                    // END_STREAM, that stream is half_closed_remote: treating
+                    // "absent from pending" as "this is a new request" would let
+                    // another HEADERS frame on the same id be constructed as a
+                    // SECOND request, duplicating route/auth/handler execution
+                    // while the first response is still outstanding.
+                    if (!h2StreamAcceptsInboundFrame(&streams, frame.stream_id)) {
+                        try h2WriteStreamClosedReset(outbound_writer, &outbound, allocator, &streams, &pending, &pending_responses, &ready_streams, &sessions, &buffered_request_bytes, frame.stream_id, &handoff, executor, &in_flight_jobs, &conn_recv_window, &conn_send_window);
+                        continue;
+                    }
                 }
                 var boundary_refused = false;
-                if (!streams.contains(frame.stream_id)) {
+                if (!closed_stream_headers and !streams.contains(frame.stream_id)) {
                     if (shutdown_goaway_last_stream_id) |boundary| {
                         if (frame.stream_id > boundary) {
                             // #863 graceful drain: this connection already
@@ -5420,7 +5452,10 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                             // completes, instead of refusing right here
                             // before any of it has been read.
                             boundary_refused = true;
-                            discard_header_block_for_stream = frame.stream_id;
+                            discard_header_block_for_stream = .{
+                                .stream_id = frame.stream_id,
+                                .send_refusal_reset = true,
+                            };
                         }
                     }
                     if (!boundary_refused and streams.count() >= HTTP2_MAX_CONCURRENT_STREAMS) {
@@ -5467,9 +5502,13 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     try http.http2_frame.writeGoaway(outbound_writer, last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
                     return error.Http2CompressionError;
                 }
-                if (discard_header_block_for_stream == frame.stream_id) {
+                const discarding_header_block = if (discard_header_block_for_stream) |discard| discard.stream_id == frame.stream_id else false;
+                if (discarding_header_block) {
+                    const discard = discard_header_block_for_stream.?;
                     try h2DiscardHeaderBlock(allocator, &decoder, headers_payload.fragment, outbound_writer, last_client_stream_id);
-                    try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.refused_stream.value());
+                    if (discard.send_refusal_reset) {
+                        try http.http2_frame.writeRstStream(outbound_writer, frame.stream_id, http.http2_stream.ErrorCode.refused_stream.value());
+                    }
                     discard_header_block_for_stream = null;
                 } else {
                     try h2ProcessHeaderBlock(
@@ -5795,9 +5834,13 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 };
                 if ((frame.flags & http.http2_frame.Flags.END_HEADERS) != 0) {
                     const stream_id = continuation_stream_id orelse return error.InvalidHttp2FrameSequence;
-                    if (discard_header_block_for_stream == stream_id) {
+                    const discarding_header_block = if (discard_header_block_for_stream) |discard| discard.stream_id == stream_id else false;
+                    if (discarding_header_block) {
+                        const discard = discard_header_block_for_stream.?;
                         try h2DiscardHeaderBlock(allocator, &decoder, continuation_block.items, outbound_writer, last_client_stream_id);
-                        try http.http2_frame.writeRstStream(outbound_writer, stream_id, http.http2_stream.ErrorCode.refused_stream.value());
+                        if (discard.send_refusal_reset) {
+                            try http.http2_frame.writeRstStream(outbound_writer, stream_id, http.http2_stream.ErrorCode.refused_stream.value());
+                        }
                         discard_header_block_for_stream = null;
                     } else {
                         try h2ProcessHeaderBlock(
@@ -18120,7 +18163,25 @@ test "H2 WebSocket refusal retires only its stream for later in-flight DATA" {
     try std.testing.expectEqual(@as(usize, 1), frames.items.len);
     try std.testing.expectEqual(http.http2_frame.Type.rst_stream, frames.items[0].typ);
     try std.testing.expectEqual(@as(u31, 1), frames.items[0].stream_id);
-    try std.testing.expectEqual(http.http2_stream.ErrorCode.cancel.value(), std.mem.readInt(u32, frames.items[0].payload[0..4], .big));
+    try std.testing.expectEqual(http.http2_stream.ErrorCode.no_error.value(), std.mem.readInt(u32, frames.items[0].payload[0..4], .big));
+}
+
+test "H2 WebSocket refusal does not reset a request that already ended" {
+    const allocator = std.testing.allocator;
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try streams.getPtr(1).?.remoteEndStream();
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try h2TerminateWebSocketRefusal(&out.writer, &streams, 1);
+
+    // The peer has no remaining request half to stop. The status response
+    // already carried END_STREAM, so a follow-up RST is neither needed nor
+    // permitted to replace that successful terminal state.
+    try std.testing.expect(!streams.contains(1));
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
 }
 
 test "H2 WebSocket admission error refunds its provisional reservation exactly once" {

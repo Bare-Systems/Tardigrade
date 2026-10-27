@@ -2511,8 +2511,21 @@ pub const Runtime = struct {
             .client_ip = client_ip,
         };
         switch (handler(self.allocator, &view, self.extended_connect_handler_ctx)) {
-            .refuse => |refusal| self.refuseExtendedConnect(entry, incoming.stream_id, now, refusal.status, refusal.headers, refusal.body),
-            .admit => |admission| self.admitTunnel(entry, incoming.stream_id, admission, now),
+            // #957 requires every Extended CONNECT outcome to be an ordinary,
+            // non-101 HTTP/3 response: reject any embedder-supplied status
+            // that would violate that (e.g. an HTTP/1.1 WebSocket handler's
+            // 101 reused verbatim) rather than forwarding it onto the wire.
+            .refuse => |refusal| {
+                const status = if (refusal.status == 101 or refusal.status < 200 or refusal.status > 599) 500 else refusal.status;
+                self.refuseExtendedConnect(entry, incoming.stream_id, now, status, refusal.headers, refusal.body);
+            },
+            .admit => |admission| {
+                if (admission.status < 200 or admission.status >= 300) {
+                    self.refuseExtendedConnect(entry, incoming.stream_id, now, 500, &.{}, "");
+                    return;
+                }
+                self.admitTunnel(entry, incoming.stream_id, admission, now);
+            },
         }
     }
 
@@ -2560,10 +2573,16 @@ pub const Runtime = struct {
             .markLocalEndSentFn = tunnelMarkLocalEndSent,
         };
         entry.h3.admitExtendedConnect(entry.conn, stream_id, admission.status, admission.headers, sink, tunnel) catch {
+            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3 internal_error-equivalent QUIC application code; best effort
+            // `admitExtendedConnect` may have already attached `sink`/`tunnel`
+            // (borrowed pointers into `session_ptr`) before failing, e.g. during
+            // buffered-body drain. Remove the request so no later pump
+            // (`pumpTunnelsOutbound`/`pumpTunnelInbound`) can reach those
+            // callbacks after `session_ptr` is destroyed below.
+            entry.h3.finishRequest(stream_id);
             _ = entry.tunnel_sessions.remove(stream_id);
             session_ptr.deinit();
             self.allocator.destroy(session_ptr);
-            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3 internal_error-equivalent QUIC application code; best effort
             return;
         };
         admission.on_admitted(self.allocator, session_ptr, admission.on_admitted_ctx);
@@ -5114,6 +5133,98 @@ fn testExtendedConnectHandler(
 fn recordAdmittedTunnelSession(_: std.mem.Allocator, session_ptr: *stream_session.Session, ctx: ?*anyopaque) void {
     const capture: *TunnelAdmitCapture = @ptrCast(@alignCast(ctx.?));
     capture.session = session_ptr;
+}
+
+fn testInvalidStatusExtendedConnectHandler(
+    _: std.mem.Allocator,
+    request: *const ExtendedConnectView,
+    user_data: ?*anyopaque,
+) ExtendedConnectDecision {
+    // Reused HTTP/1.1 WebSocket-handshake status codes are exactly the
+    // mistake #957's non-101 guarantee has to catch at the boundary, so
+    // this intentionally mirrors that embedder bug for both outcomes.
+    if (std.mem.eql(u8, request.protocol, "refuse-101")) return .{ .refuse = .{ .status = 101 } };
+    if (std.mem.eql(u8, request.protocol, "admit-101")) return .{ .admit = .{
+        .status = 101,
+        .max_inbound_bytes = 4096,
+        .max_outbound_bytes = 4096,
+        .on_admitted = recordAdmittedTunnelSession,
+        .on_admitted_ctx = user_data,
+    } };
+    return .{ .refuse = .{ .status = 404 } };
+}
+
+fn readResponseStatus(allocator: std.mem.Allocator, client: anytype, stream_id: u64) !u16 {
+    var client_bytes: std.ArrayList(u8) = .empty;
+    defer client_bytes.deinit(allocator);
+    var client_read_buf: [256]u8 = undefined;
+    while (true) {
+        const result = try client.readStream(stream_id, &client_read_buf);
+        if (result.len == 0) break;
+        try client_bytes.appendSlice(allocator, client_read_buf[0..result.len]);
+    }
+    const headers_frame = try http3.frame.decodeFrameWithLimit(client_bytes.items, 4096);
+    try testing.expectEqual(http3.frame.FrameType.headers, headers_frame.typ);
+    var decoded_fields: [8]http3.qpack.HeaderField = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    _ = try http3.qpack.decode(headers_frame.payload, &decoded_fields, &decode_scratch);
+    try testing.expectEqualStrings(":status", decoded_fields[0].name);
+    return try std.fmt.parseInt(u16, decoded_fields[0].value, 10);
+}
+
+test "http3 runtime (#957): an embedder-supplied status 101 is sanitized on both the admit and refuse paths" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-extended-connect-status-101-test");
+    var capture = TunnelAdmitCapture{};
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .extended_connect_handler = testInvalidStatusExtendedConnectHandler,
+        .extended_connect_handler_ctx = &capture,
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(allocator, fixed.provider());
+    defer harness.deinit(allocator);
+
+    harness.entry.quic_observer.runtime = &runtime;
+    harness.entry.quic_observer.entry = harness.entry;
+    harness.entry.conn.events = .{ .context = &harness.entry.quic_observer, .emitFn = Runtime.quicConnectionEvent };
+    harness.entry.h3.local_settings.enable_connect_protocol = true;
+
+    const openExtendedConnectStream = struct {
+        fn call(client: anytype, protocol: []const u8) !u64 {
+            var fields = [_]http3.qpack.HeaderField{
+                .{ .name = ":method", .value = "CONNECT" },
+                .{ .name = ":protocol", .value = protocol },
+                .{ .name = ":scheme", .value = "https" },
+                .{ .name = ":authority", .value = "tardigrade.test" },
+                .{ .name = ":path", .value = "/socket" },
+            };
+            var qpack_block: [256]u8 = undefined;
+            const header_block = http3.qpack.encode(&fields, &qpack_block) catch unreachable;
+            var frame_buf: [512]u8 = undefined;
+            const header_frame = http3.frame.encodeKnownFrame(.headers, header_block, &frame_buf) catch unreachable;
+            const stream_id = try client.openStream(.bidi);
+            _ = try client.writeStream(stream_id, header_frame, false);
+            return stream_id;
+        }
+    }.call;
+
+    const refuse_stream_id = try openExtendedConnectStream(harness.client, "refuse-101");
+    const admit_stream_id = try openExtendedConnectStream(harness.client, "admit-101");
+    try harness.pump();
+    runtime.pumpH3(harness.entry, harness.now_us);
+    try harness.pump();
+
+    // Neither outcome may ever put :status 101 on the wire, and the invalid
+    // admission must be refused rather than silently opening a tunnel.
+    try testing.expectEqual(@as(u16, 500), try readResponseStatus(allocator, harness.client, refuse_stream_id));
+    try testing.expectEqual(@as(u16, 500), try readResponseStatus(allocator, harness.client, admit_stream_id));
+    try testing.expectEqual(@as(usize, 0), harness.entry.tunnel_sessions.count());
+    try testing.expect(capture.session == null);
 }
 
 test "http3 runtime (#957): a live QUIC/H3 Extended CONNECT tunnel relays bytes both ways and settles on peer reset" {

@@ -5459,6 +5459,10 @@ fn zeroCapacityTunnelDeliver(_: ?*anyopaque, _: []const u8) session.SessionError
     return 0;
 }
 
+fn oomTunnelDeliver(_: ?*anyopaque, _: []const u8) session.SessionError!usize {
+    return error.OutOfMemory;
+}
+
 const TunnelCapture = struct {
     all_received: std.ArrayList(u8) = .empty,
     window_used: usize = 0,
@@ -5657,6 +5661,56 @@ test "H3 conn: aggregate request memory budget is enforced for backpressured tun
     _ = try client_transport.writeStream(stream_b, data_frame_b, false);
     try testing.expectError(error.ProtocolError, server.pump(&server_transport));
     try testing.expectEqual(ErrorCode.excessive_load.wire(), server.closeCode());
+}
+
+test "H3 conn: a failed buffered-body drain during admission still leaves the request cleanly removable" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.initWithSettings(allocator, .server, .{ .enable_connect_protocol = true });
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const stream_id = try writeExtendedConnectHeaders(&client_transport, false);
+    // A DATA frame arrives in the same read as HEADERS, before admission:
+    // it buffers in `request.stream.body` as ordinary pre-admission body,
+    // exactly the case `admitExtendedConnect` drains through its fallible
+    // `drainTunnelBufferedBody` call after already attaching the tunnel.
+    var data_buf: [16]u8 = undefined;
+    const data_frame = try frame.encodeKnownFrame(.data, "hello", &data_buf);
+    _ = try client_transport.writeStream(stream_id, data_frame, false);
+    try server.pump(&server_transport);
+    const incoming = server.pollExtendedConnect().?;
+    try testing.expect(incoming.buffered_body.len > 0);
+
+    const oom_sink = session.RequestStream.TunnelSink{ .ctx = null, .deliverFn = oomTunnelDeliver };
+    try testing.expectError(error.ProtocolError, server.admitExtendedConnect(&server_transport, stream_id, 200, &.{}, oom_sink, noopTunnel()));
+
+    // The tunnel callbacks are already attached despite the failure: a
+    // caller that destroys its owned session on this error (as
+    // `Runtime.admitTunnel` does) must remove the request first -- via
+    // `finishRequest`, exactly like this -- or a later `pumpTunnelsOutbound`/
+    // `pumpTunnelInbound` could still reach the now-freed session through
+    // these borrowed pointers.
+    const request = server.requests.get(stream_id).?;
+    try testing.expect(request.tunnel != null);
+    try testing.expect(request.stream.tunnel_sink != null);
+
+    server.finishRequest(stream_id);
+    try testing.expect(server.requests.get(stream_id) == null);
+    server.pumpTunnelsOutbound(&server_transport);
 }
 
 test "H3 conn: start rejects unsupported h3_datagram" {

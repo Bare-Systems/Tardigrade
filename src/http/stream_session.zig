@@ -217,6 +217,16 @@ pub const Session = struct {
         return self.wake_failed;
     }
 
+    /// True once either side has settled this session for good (reset,
+    /// connection close, or shutdown). A reactor uses this to decide when it
+    /// can stop pumping a stream and reap the session, without needing to
+    /// race a consumer `read`/`write` to discover the same terminal state.
+    pub fn isSettled(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.terminal != null;
+    }
+
     /// True once a producer write cannot be retried safely.  The reactor
     /// must treat this as fatal and reset/detach the stream.
     pub fn hasWriteFailure(self: *Session) bool {

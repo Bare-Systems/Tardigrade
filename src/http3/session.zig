@@ -38,6 +38,12 @@ pub const SessionError = error{
     BodyTooLarge,
     OutputOverflow,
     OutOfMemory,
+    /// A tunnel sink (see `RequestStream.tunnel_sink`) could not accept a
+    /// DATA frame's payload right now (its bound session is at capacity).
+    /// The frame is not consumed: a caller that sees this from
+    /// `ingestFrame`/`ingestBytesWithObserver` must retry the exact same
+    /// bytes later rather than treat it as a protocol violation.
+    TunnelBackpressure,
 };
 
 pub const Metrics = struct {
@@ -72,6 +78,25 @@ pub const RequestStream = struct {
     saw_trailers: bool = false,
     finished: bool = false,
     max_body_len: usize = default_max_body_len,
+    /// Once set (by the connection, after admitting an Extended CONNECT
+    /// envelope via `validateHeadersComplete`), every subsequent DATA
+    /// frame's payload is delivered here instead of being appended to
+    /// `body`: the request's "body" is now a live tunnel, not a finite
+    /// buffer the connection should retain unbounded.
+    tunnel_sink: ?TunnelSink = null,
+
+    /// A borrowed, caller-owned delivery target for a tunneled request
+    /// stream's inbound DATA payloads. Deliberately a callback rather than a
+    /// concrete type: this package stays decoupled from whatever bounded
+    /// session primitive (or test double) the embedder binds a tunnel to.
+    pub const TunnelSink = struct {
+        ctx: ?*anyopaque = null,
+        deliverFn: ?*const fn (?*anyopaque, []const u8) SessionError!void = null,
+
+        pub fn deliver(self: TunnelSink, bytes: []const u8) SessionError!void {
+            if (self.deliverFn) |deliver_fn| try deliver_fn(self.ctx, bytes);
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator, stream_id: u64) RequestStream {
         return .{ .allocator = allocator, .stream_id = stream_id };
@@ -155,8 +180,12 @@ pub const RequestStream = struct {
                 if (!self.saw_headers) return error.InvalidRequestFrame;
                 if (self.saw_trailers) return error.UnexpectedFrame;
                 self.saw_data = true;
-                if (raw.payload.len > self.max_body_len -| self.body.items.len) return error.BodyTooLarge;
-                try self.body.appendSlice(self.allocator, raw.payload);
+                if (self.tunnel_sink) |sink| {
+                    try sink.deliver(raw.payload);
+                } else {
+                    if (raw.payload.len > self.max_body_len -| self.body.items.len) return error.BodyTooLarge;
+                    try self.body.appendSlice(self.allocator, raw.payload);
+                }
             },
             .goaway => return error.InvalidRequestFrame,
             .priority_update_request, .priority_update_push => return error.UnexpectedFrame,
@@ -243,12 +272,14 @@ pub const RequestStream = struct {
         try self.headers.append(self.allocator, .{ .name = owned_name, .value = owned_value });
     }
 
-    /// Validate all properties that only become final once the request stream
-    /// reaches FIN. This does not consume or finalize the exchange, so the H3
-    /// connection can reject a malformed completed request immediately while
-    /// leaving `finish` to transfer the borrowed request to the application.
-    pub fn validateComplete(self: *const RequestStream) SessionError!void {
-        if (self.pending.items.len != 0) return error.BufferTooShort;
+    /// Validate every pseudo-header/method/scheme/path/authority property
+    /// that is already final as soon as the initial HEADERS frame has been
+    /// fully decoded (`saw_headers`), without requiring stream FIN or a
+    /// final content-length-vs-body check. An RFC 9220 Extended CONNECT
+    /// envelope has no FIN until its tunnel ends, so this is the check the
+    /// connection uses to admit (or reject) it before that point; ordinary
+    /// requests still go through `validateComplete`/`finish` at FIN.
+    pub fn validateHeadersComplete(self: *const RequestStream) SessionError!void {
         if (!self.saw_headers) return error.IncompleteRequest;
         const method = self.method orelse return error.MissingRequiredPseudoHeader;
         const scheme = self.scheme orelse return error.MissingRequiredPseudoHeader;
@@ -268,6 +299,15 @@ pub const RequestStream = struct {
             // whether that particular protocol was negotiated and admitted.
             if (!std.mem.eql(u8, method, "CONNECT") or !validH3Protocol(extended)) return error.InvalidHeader;
         }
+    }
+
+    /// Validate all properties that only become final once the request stream
+    /// reaches FIN. This does not consume or finalize the exchange, so the H3
+    /// connection can reject a malformed completed request immediately while
+    /// leaving `finish` to transfer the borrowed request to the application.
+    pub fn validateComplete(self: *const RequestStream) SessionError!void {
+        if (self.pending.items.len != 0) return error.BufferTooShort;
+        try self.validateHeadersComplete();
         for (self.headers.items) |header| {
             if (std.mem.eql(u8, header.name, "content-length")) {
                 const declared = std.fmt.parseInt(usize, header.value, 10) catch return error.InvalidContentLength;

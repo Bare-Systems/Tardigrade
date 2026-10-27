@@ -330,7 +330,73 @@ pub fn Conn(comptime Transport: type) type {
             transport_early: bool = false,
             priority_metrics_recorded: bool = false,
             pending_priority_update: ?priority.Priority = null,
+            /// Set once this stream's headers are complete, validated as an
+            /// RFC 9220 Extended CONNECT envelope, and the capability is
+            /// negotiated -- before FIN, which a live tunnel may never send.
+            /// While set, `pumpRequests` stops reading this stream at all
+            /// (the peer's own QUIC flow-control window applies the
+            /// backpressure) until the caller admits or refuses it.
+            extended_connect_pending: bool = false,
+            /// Set once `pollExtendedConnect` has returned this stream, so a
+            /// later poll does not re-surface the same envelope while an
+            /// admission decision is still in flight.
+            extended_connect_dispatched: bool = false,
+            /// True if the peer's QUIC STREAM FIN arrived in the very same
+            /// transport read that completed this envelope's headers --
+            /// before any admission decision landed, so `pumpRequests` broke
+            /// out without ever reaching its own `result.fin` check for that
+            /// read. `admitExtendedConnect` delivers it to the bridge itself
+            /// once a tunnel is attached, exactly like `buffered_body`.
+            extended_connect_remote_fin: bool = false,
+            /// Set once the caller admits this stream's envelope: every
+            /// subsequent inbound DATA/FIN routes through `tunnel` (and
+            /// `stream.tunnel_sink`) instead of this request's own buffering.
+            tunnel: ?Tunnel = null,
         };
+
+        /// A borrowed bridge from an admitted Extended CONNECT stream to
+        /// whatever bounded, bidirectional session primitive the embedder
+        /// bound it to. Deliberately a vtable of borrowed function pointers,
+        /// not a concrete type: this package stays decoupled from any
+        /// particular session/gateway implementation, exactly like
+        /// `session.RequestStream.TunnelSink` (which carries the inbound
+        /// half of this same bridge).
+        pub const Tunnel = struct {
+            ctx: ?*anyopaque = null,
+            /// The peer sent QUIC STREAM FIN: its half of the tunnel ended
+            /// cleanly. There is no peer-reset/STOP_SENDING equivalent here
+            /// -- those are QUIC connection-level events the embedder
+            /// observes directly and settles its own session with, not
+            /// something this generic protocol layer re-derives.
+            remoteEndStreamFn: *const fn (?*anyopaque) void,
+            /// Borrow up to `max_len` contiguous outbound bytes queued for
+            /// this stream, or null if none are ready. Mirrors
+            /// `stream_session.Session.peekOutbound`.
+            peekOutboundFn: *const fn (?*anyopaque, usize) ?[]const u8,
+            /// Release `n` bytes already written to the wire.
+            commitOutboundSentFn: *const fn (?*anyopaque, usize) void,
+            /// True once local production has finished and every queued
+            /// outbound byte has drained: the connection should send a
+            /// final empty DATA frame with FIN and call `markLocalEndSentFn`.
+            outboundLocalEndPendingFn: *const fn (?*anyopaque) bool,
+            markLocalEndSentFn: *const fn (?*anyopaque) void,
+            /// Set once the peer's FIN has already been delivered, so a
+            /// later pump does not call `remoteEndStreamFn` twice.
+            remote_end_delivered: bool = false,
+            /// `pumpTunnelsOutbound`'s own in-progress H3 DATA frame: the
+            /// bridge's `peekOutboundFn` yields raw payload bytes, which
+            /// must be framed (type+length prefix) before reaching the
+            /// wire. A frame is committed back to the bridge only once
+            /// fully written, so a `writeStream` backpressured mid-frame
+            /// never reports a partial source-byte count to the session.
+            pending_frame_buf: [tunnel_frame_buf_len]u8 = undefined,
+            pending_frame_len: usize = 0,
+            pending_frame_written: usize = 0,
+            pending_source_len: usize = 0,
+        };
+
+        const tunnel_outbound_chunk_len: usize = 4096;
+        const tunnel_frame_buf_len: usize = tunnel_outbound_chunk_len + 16;
 
         fn transportStreamTransportEarly(transport: *Transport, stream_id: u64) bool {
             if (comptime @hasDecl(Transport, "streamTransportEarly")) {
@@ -954,6 +1020,11 @@ pub fn Conn(comptime Transport: type) type {
             while (it.next()) |entry| {
                 const id = entry.key_ptr.*;
                 const request = entry.value_ptr.*;
+                if (request.tunnel != null) {
+                    self.pumpTunnelInbound(transport, id, request, &reset_requests) catch |err| return err;
+                    continue;
+                }
+                if (request.extended_connect_pending) continue;
                 if (request.finished) {
                     // The peer must not send more stream data once we have
                     // already observed its FIN (RFC 9114 §4.1: e.g. a
@@ -996,6 +1067,12 @@ pub fn Conn(comptime Transport: type) type {
                         _ = ingest_result catch |err| return self.failRequestSessionError(err);
                         self.recordPriorityHeaderMetrics(request);
                         self.applyPendingPriorityUpdate(id, request);
+                        if (request.stream.extended_protocol != null and self.headersValidAsExtendedConnect(request)) {
+                            if (!self.local_settings.enable_connect_protocol) return self.fail(.message_error);
+                            request.extended_connect_pending = true;
+                            request.extended_connect_remote_fin = result.fin;
+                            break;
+                        }
                     }
                     if (result.fin) {
                         request.stream.validateComplete() catch |err| return self.failRequestSessionError(err);
@@ -1013,6 +1090,62 @@ pub fn Conn(comptime Transport: type) type {
                 }
             }
             for (reset_requests.items) |id| self.finishRequest(id);
+        }
+
+        /// Whether `request.stream`'s headers are already complete and valid
+        /// as an RFC 9220 Extended CONNECT envelope (method/pseudo-header
+        /// shape only -- negotiation is the caller's separate check). Does
+        /// not consume anything; an invalid envelope is left for FIN-time
+        /// `validateComplete` to reject with the identical error, exactly as
+        /// an ordinary malformed request already is.
+        fn headersValidAsExtendedConnect(self: *Self, request: *ServerRequest) bool {
+            _ = self;
+            if (!request.stream.saw_headers) return false;
+            request.stream.validateHeadersComplete() catch return false;
+            return true;
+        }
+
+        /// Pump one admitted tunnel's inbound half: flush any DATA already
+        /// decoded but not yet delivered (held back by a prior backpressured
+        /// sink) before reading anything new off the wire, so a stalled
+        /// consumer bounds retained memory at the sink's own capacity
+        /// instead of growing `pending` unboundedly.
+        fn pumpTunnelInbound(self: *Self, transport: *Transport, id: u64, request: *ServerRequest, reset_requests: *std.ArrayList(u64)) H3Error!void {
+            const tunnel = &request.tunnel.?;
+            var qpack_scratch: [4096]u8 = undefined;
+            if (request.stream.pending.items.len > 0) {
+                if (!(try self.ingestTunnelData(request, "", &qpack_scratch))) return;
+            }
+            if (tunnel.remote_end_delivered) return;
+            var buf: [2048]u8 = undefined;
+            const result = transport.readStream(id, &buf) catch |err| {
+                if (err == error.StreamReset) reset_requests.append(self.allocator, id) catch return error.OutOfMemory;
+                return;
+            };
+            if (result.len > 0) {
+                if (!(try self.ingestTunnelData(request, buf[0..result.len], &qpack_scratch))) return;
+            }
+            if (result.fin) {
+                tunnel.remote_end_delivered = true;
+                tunnel.remoteEndStreamFn(tunnel.ctx);
+            }
+        }
+
+        /// Ingest `bytes` for an admitted tunnel stream. Returns `false` on
+        /// sink backpressure (stop pumping this stream this tick; nothing
+        /// was lost, just left in `request.stream.pending` for the next
+        /// attempt) or `true` once ingestion made it through.
+        fn ingestTunnelData(self: *Self, request: *ServerRequest, bytes: []const u8, qpack_scratch: []u8) H3Error!bool {
+            const retained_before = request.stream.retainedBytes();
+            const ingest_result = request.stream.ingestBytesWithObserver(bytes, qpack_scratch, null);
+            const retained_after = request.stream.retainedBytes();
+            self.buffered_request_bytes -= @min(self.buffered_request_bytes, retained_before);
+            self.buffered_request_bytes += retained_after;
+            _ = ingest_result catch |err| {
+                if (err == error.TunnelBackpressure) return false;
+                return self.failRequestSessionError(err);
+            };
+            return true;
         }
 
         fn applyPendingPriorityUpdate(self: *Self, stream_id: u64, request: *ServerRequest) void {
@@ -1365,6 +1498,139 @@ pub fn Conn(comptime Transport: type) type {
                 };
             }
             return null;
+        }
+
+        pub const IncomingExtendedConnect = struct {
+            stream_id: u64,
+            method: []const u8,
+            scheme: []const u8,
+            authority: []const u8,
+            path: []const u8,
+            protocol: []const u8,
+            headers: []const stream_transport.Header,
+            /// DATA the peer already sent on this stream before this
+            /// admission decision landed (RFC 9220's tunnel "body" starts
+            /// flowing immediately after the envelope, not after a 101-style
+            /// round trip). Borrowed from the request's own buffer; a caller
+            /// that admits delivers it to the tunnel sink itself, so this is
+            /// only valid until the next `pump()`/`pollExtendedConnect` call.
+            buffered_body: []const u8,
+            transport_early: bool,
+        };
+
+        /// Pop the next stream whose headers are complete, validated as an
+        /// RFC 9220 Extended CONNECT envelope, and whose capability is
+        /// negotiated -- before the stream's FIN, which a live tunnel may
+        /// never send. Each stream is returned at most once; the caller must
+        /// `admitExtendedConnect` or `refuseExtendedConnect` it.
+        pub fn pollExtendedConnect(self: *Self) ?IncomingExtendedConnect {
+            var it = self.requests.iterator();
+            while (it.next()) |entry| {
+                const request = entry.value_ptr.*;
+                if (!request.extended_connect_pending or request.extended_connect_dispatched) continue;
+                request.extended_connect_dispatched = true;
+                return .{
+                    .stream_id = entry.key_ptr.*,
+                    .method = request.stream.method.?,
+                    .scheme = request.stream.scheme.?,
+                    .authority = request.stream.authority.?,
+                    .path = request.stream.path.?,
+                    .protocol = request.stream.extended_protocol.?,
+                    .headers = request.stream.headers.items,
+                    .buffered_body = request.stream.body.items,
+                    .transport_early = request.transport_early,
+                };
+            }
+            return null;
+        }
+
+        /// Admit a stream `pollExtendedConnect` returned: send `status`
+        /// (without FIN, keeping the stream open) and bind its inbound DATA
+        /// to `sink`/outbound draining to `tunnel` for the rest of its life.
+        /// Any body bytes the peer already sent (`IncomingExtendedConnect.
+        /// buffered_body`) are delivered to `sink` here, before the stream's
+        /// own buffer is released, so nothing arrives out of order.
+        pub fn admitExtendedConnect(
+            self: *Self,
+            transport: *Transport,
+            stream_id: u64,
+            status: u16,
+            headers: []const stream_transport.Header,
+            sink: session.RequestStream.TunnelSink,
+            tunnel: Tunnel,
+        ) !void {
+            const request = self.requests.get(stream_id) orelse return error.UnknownStream;
+            std.debug.assert(request.extended_connect_pending);
+            std.debug.assert(request.tunnel == null);
+            var header_frame: [8192]u8 = undefined;
+            const encoded = try session.ResponseEncoder.encodeHeaders(status, headers, &header_frame);
+            try self.writeAll(transport, stream_id, encoded, false);
+            if (request.stream.body.items.len > 0) try sink.deliver(request.stream.body.items);
+            // Freeing the now-delivered body here (not just on the next
+            // `ingestTunnelData` call) must still account for it against
+            // `buffered_request_bytes`, exactly like every other site that
+            // changes `request.stream`'s retained memory.
+            const retained_before = request.stream.retainedBytes();
+            request.stream.body.clearAndFree(self.allocator);
+            const retained_after = request.stream.retainedBytes();
+            self.buffered_request_bytes -= @min(self.buffered_request_bytes, retained_before -| retained_after);
+            request.stream.tunnel_sink = sink;
+            request.tunnel = tunnel;
+            request.extended_connect_pending = false;
+            if (request.extended_connect_remote_fin) {
+                request.tunnel.?.remote_end_delivered = true;
+                request.tunnel.?.remoteEndStreamFn(request.tunnel.?.ctx);
+            }
+        }
+
+        /// Refuse a stream `pollExtendedConnect` returned with an ordinary,
+        /// non-101 response; the stream ends normally, exactly like any
+        /// other completed request.
+        pub fn refuseExtendedConnect(
+            self: *Self,
+            transport: *Transport,
+            stream_id: u64,
+            status: u16,
+            headers: []const stream_transport.Header,
+            body: []const u8,
+        ) !void {
+            const request = self.requests.get(stream_id) orelse return error.UnknownStream;
+            std.debug.assert(request.extended_connect_pending);
+            request.extended_connect_pending = false;
+            try self.sendResponse(transport, stream_id, status, headers, body);
+        }
+
+        /// Drain every admitted tunnel's queued outbound bytes into H3 DATA
+        /// frames, applying the same per-stream backpressure contract
+        /// `sendResponseProgress` already has (a `writeStream` returning 0
+        /// bytes stops that stream for this call; it retries next pump).
+        pub fn pumpTunnelsOutbound(self: *Self, transport: *Transport) void {
+            var it = self.requests.iterator();
+            while (it.next()) |entry| {
+                const request = entry.value_ptr.*;
+                if (request.tunnel) |*tunnel| {
+                    const stream_id = entry.key_ptr.*;
+                    while (true) {
+                        if (tunnel.pending_frame_len == 0) {
+                            const chunk = tunnel.peekOutboundFn(tunnel.ctx, tunnel_outbound_chunk_len) orelse break;
+                            const encoded = session.ResponseEncoder.encodeData(chunk, &tunnel.pending_frame_buf) catch break;
+                            tunnel.pending_frame_len = encoded.len;
+                            tunnel.pending_frame_written = 0;
+                            tunnel.pending_source_len = chunk.len;
+                        }
+                        const n = transport.writeStream(stream_id, tunnel.pending_frame_buf[tunnel.pending_frame_written..tunnel.pending_frame_len], false) catch break;
+                        if (n == 0) break;
+                        tunnel.pending_frame_written += n;
+                        if (tunnel.pending_frame_written < tunnel.pending_frame_len) break;
+                        tunnel.commitOutboundSentFn(tunnel.ctx, tunnel.pending_source_len);
+                        tunnel.pending_frame_len = 0;
+                    }
+                    if (tunnel.pending_frame_len == 0 and tunnel.outboundLocalEndPendingFn(tunnel.ctx)) {
+                        _ = transport.writeStream(stream_id, "", true) catch continue;
+                        tunnel.markLocalEndSentFn(tunnel.ctx);
+                    }
+                }
+            }
         }
 
         /// Encode and send a response with optional body, closing the stream.
@@ -5070,9 +5336,9 @@ test "H3 conn: server accepts Extended CONNECT only when locally negotiated" {
         _ = try writeExtendedConnectRequest(&client_transport);
 
         try server.pump(&server_transport);
-        const incoming = (try server.pollRequest()).?;
-        try testing.expectEqualStrings("CONNECT", incoming.exchange.request.method);
-        try testing.expectEqualStrings("websocket", incoming.exchange.request.extended_protocol.?);
+        const incoming = server.pollExtendedConnect().?;
+        try testing.expectEqualStrings("CONNECT", incoming.method);
+        try testing.expectEqualStrings("websocket", incoming.protocol);
         server.finishRequest(incoming.stream_id);
     }
 }
@@ -5110,9 +5376,9 @@ test "H3 conn: Extended CONNECT requires the peer setting and preserves its enve
         .extended_protocol = "websocket",
     });
     try server.pump(&server_transport);
-    const incoming = (try server.pollRequest()).?;
-    try testing.expectEqualStrings("CONNECT", incoming.exchange.request.method);
-    try testing.expectEqualStrings("websocket", incoming.exchange.request.extended_protocol.?);
+    const incoming = server.pollExtendedConnect().?;
+    try testing.expectEqualStrings("CONNECT", incoming.method);
+    try testing.expectEqualStrings("websocket", incoming.protocol);
 }
 
 test "H3 conn: start rejects unsupported h3_datagram" {

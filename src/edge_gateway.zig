@@ -3797,7 +3797,7 @@ fn h2ApplyWebSocketAdmissionOutcome(
     switch (outcome) {
         .not_matched => {
             try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.refused_stream.value());
-            if (streams.getPtr(stream_id)) |s| s.close();
+            _ = streams.remove(stream_id);
             if (provisional_session != null) {
                 try h2DiscardProvisionalWebSocketSession(writer, allocator, sessions, buffered_request_bytes, stream_id, conn_recv_window);
                 provisional_cleanup_needed = false;
@@ -3858,6 +3858,13 @@ fn h2ApplyWebSocketAdmissionOutcome(
             if (!connection_memory_reserved) buffered_request_bytes.* += HTTP2_SESSION_RESERVED_BYTES;
             reservation_retained = true;
             if (session_created_here) http.h2_transport_metrics.sessionAttached();
+            // The initial CONNECT HEADERS is allowed to carry END_STREAM.
+            // It reaches the H2 stream state before admission is handed to a
+            // worker, so reflect that already-observed half-close in the
+            // Session before its relay can block in `read()` (#952 review).
+            if (streams.get(stream_id)) |stream| {
+                if (!stream.canReceive()) session.deliverRemoteEndStream();
+            }
             state.metricsRecordWebSocketUpgrade(.relayed);
             H2WebSocketTunnel.spawn(allocator, state, session, switched, correlation_id) catch |err| {
                 // The 200 is already committed and the session already
@@ -3933,7 +3940,7 @@ fn h2AdmitWebSocketConnect(
     // few lines below this one in `h2ProcessHeaderBlock`.
     if (max_connection_memory_bytes > 0 and HTTP2_SESSION_RESERVED_BYTES > max_connection_memory_bytes -| buffered_request_bytes.*) {
         try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.refused_stream.value());
-        if (streams.getPtr(stream_id)) |s| s.close();
+        _ = streams.remove(stream_id);
         state.metricsRecordWebSocketUpgrade(.capacity);
         return;
     }
@@ -4027,7 +4034,7 @@ fn h2AdmitWebSocketConnect(
     defer synthesized.deinit(allocator);
     const outcome = gh2ws.admit(allocator, cfg, state, &synthesized.request, connection_ip, correlation_id, ps.transport_early, config_lease) catch |err| {
         try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.internal_error.value());
-        if (streams.getPtr(stream_id)) |s| s.close();
+        _ = streams.remove(stream_id);
         return err;
     };
     // `h2Apply...` owns the reservation even on its error paths.
@@ -4189,7 +4196,7 @@ fn h2ProcessHeaderBlock(
         // a generic error instead of answering the one stream. Other streams on
         // this connection are unaffected.
         try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.refused_stream.value());
-        if (streams.getPtr(stream_id)) |s| s.close();
+        _ = streams.remove(stream_id);
         return;
     }
 
@@ -4231,7 +4238,7 @@ fn h2ProcessHeaderBlock(
         // Content-Length on this stream.
         if (!h2RequestFramingIsValid(&ps)) {
             try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.protocol_error.value());
-            if (streams.getPtr(stream_id)) |s| s.close();
+            _ = streams.remove(stream_id);
             ps.deinit(allocator);
             return;
         }

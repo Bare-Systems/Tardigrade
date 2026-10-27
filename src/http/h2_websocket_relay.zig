@@ -74,6 +74,13 @@ pub const Upstream = struct {
         // directly, mirroring `upstream_h2.zig`'s `SHUT_RDWR` teardown.
         _ = std.c.shutdown(self.fd, 2);
     }
+
+    /// The downstream H2 peer ended its send half. Once every queued byte
+    /// has reached the origin, mirror that half-close at the transport so an
+    /// origin waiting for EOF can complete its own WebSocket close path.
+    fn shutdownWrite(self: Upstream) void {
+        _ = std.c.shutdown(self.fd, 1);
+    }
 };
 
 /// A single-item, bounded byte mailbox between exactly one producer thread
@@ -177,6 +184,14 @@ const Channel = struct {
             self.offset = 0;
             self.cond.signal();
         }
+    }
+
+    /// True only after the producer has finished and the consumer drained
+    /// every byte it had already accepted.
+    fn producerClosedAndEmpty(self: *Channel) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.closed and self.len == 0;
     }
 };
 
@@ -361,6 +376,7 @@ const Pump = struct {
     fn run(self: *Pump) void {
         self.endpoint.begin();
         var scratch: [relay_chunk_bytes]u8 = undefined;
+        var upstream_write_closed = false;
         while (!self.shared.isDone()) {
             var progressed = false;
 
@@ -378,6 +394,17 @@ const Pump = struct {
                 self.shared.finishOnce(.upstream_error);
                 return;
             };
+
+            // `SessionToUpstream` closes `c2u` when the downstream sends
+            // END_STREAM. Do not leave an origin's read side parked forever:
+            // after its already-accepted bytes are flushed, propagate that
+            // half-close to the origin while continuing to receive its final
+            // WebSocket bytes and EOF (#952 review).
+            if (!upstream_write_closed and self.shared.c2u.producerClosedAndEmpty()) {
+                self.shared.upstream.shutdownWrite();
+                upstream_write_closed = true;
+                progressed = true;
+            }
 
             if (self.shared.u2c.hasRoom()) {
                 const n = self.endpoint.read(&scratch) catch {

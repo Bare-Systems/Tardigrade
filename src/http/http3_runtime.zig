@@ -1532,6 +1532,10 @@ pub const Runtime = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, logger: *logger_mod.Logger, cfg: Config) Http3RuntimeError!Runtime {
+        // The low-level H3 connection can advertise RFC 9220 for envelope
+        // testing, but the production runtime has no stream consumer yet.
+        // Keep the gateway capability fail-closed until that consumer exists.
+        if (cfg.h3_settings.enable_connect_protocol) return error.InvalidH3Settings;
         const address = compat.parseIpAddress(cfg.listen_host, cfg.quic_port) catch |err| {
             logger.warn(null, "http3: listen address parse failed: {s}", .{@errorName(err)});
             return error.BindFailed;

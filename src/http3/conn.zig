@@ -999,6 +999,13 @@ pub fn Conn(comptime Transport: type) type {
                     }
                     if (result.fin) {
                         request.stream.validateComplete() catch |err| return self.failRequestSessionError(err);
+                        // RFC 9220 permits an Extended CONNECT envelope only
+                        // after this endpoint advertises SETTINGS_ENABLE_CONNECT_PROTOCOL.
+                        // Do not let an unnegotiated envelope reach the
+                        // application-facing pollRequest boundary.
+                        if (request.stream.extended_protocol != null and !self.local_settings.enable_connect_protocol) {
+                            return self.fail(.message_error);
+                        }
                         request.finished = true;
                         break;
                     }
@@ -4996,6 +5003,78 @@ test "H3 conn: start advertises enable_connect_protocol when configured" {
     try testing.expectEqual(stream.data.items.len, try control.ingest(allocator, stream.data.items));
     try testing.expect(control.saw_settings);
     try testing.expect(control.settings.enable_connect_protocol);
+}
+
+fn writeExtendedConnectRequest(transport: *MockTransport) !u64 {
+    const request_id = try transport.openStream(.bidi);
+    var qpack_buf: [512]u8 = undefined;
+    const block = try qpack.encode(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+        .{ .name = ":path", .value = "/socket" },
+    }, &qpack_buf);
+    var wire: [1024]u8 = undefined;
+    const headers = try frame.encodeKnownFrame(.headers, block, &wire);
+    _ = try transport.writeStream(request_id, headers, true);
+    return request_id;
+}
+
+test "H3 conn: server accepts Extended CONNECT only when locally negotiated" {
+    const allocator = testing.allocator;
+
+    {
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+
+        const H3 = Conn(MockTransport);
+        var client = H3.init(allocator, .client);
+        defer client.deinit();
+        var server = H3.init(allocator, .server);
+        defer server.deinit();
+
+        try client.start(&client_transport);
+        try server.start(&server_transport);
+        try server.pump(&server_transport);
+        try client.pump(&client_transport);
+        _ = try writeExtendedConnectRequest(&client_transport);
+
+        try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+        try testing.expectEqual(ErrorCode.message_error.wire(), server.closeCode());
+        try testing.expect((try server.pollRequest()) == null);
+    }
+
+    {
+        var client_transport = MockTransport.init(allocator, true);
+        defer client_transport.deinit();
+        var server_transport = MockTransport.init(allocator, false);
+        defer server_transport.deinit();
+        client_transport.peer = &server_transport;
+        server_transport.peer = &client_transport;
+
+        const H3 = Conn(MockTransport);
+        var client = H3.init(allocator, .client);
+        defer client.deinit();
+        var server = H3.initWithSettings(allocator, .server, .{ .enable_connect_protocol = true });
+        defer server.deinit();
+
+        try client.start(&client_transport);
+        try server.start(&server_transport);
+        try server.pump(&server_transport);
+        try client.pump(&client_transport);
+        _ = try writeExtendedConnectRequest(&client_transport);
+
+        try server.pump(&server_transport);
+        const incoming = (try server.pollRequest()).?;
+        try testing.expectEqualStrings("CONNECT", incoming.exchange.request.method);
+        try testing.expectEqualStrings("websocket", incoming.exchange.request.extended_protocol.?);
+        server.finishRequest(incoming.stream_id);
+    }
 }
 
 test "H3 conn: Extended CONNECT requires the peer setting and preserves its envelope" {

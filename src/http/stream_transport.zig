@@ -57,6 +57,9 @@ pub const RequestHead = struct {
     scheme: []const u8,
     authority: []const u8,
     path: []const u8,
+    /// RFC 8441 / RFC 9220 Extended CONNECT's `:protocol` pseudo-header.
+    /// Null for ordinary HTTP requests and generic CONNECT.
+    extended_protocol: ?[]const u8 = null,
     headers: []const Header = &.{},
 };
 

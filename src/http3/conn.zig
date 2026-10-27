@@ -137,6 +137,7 @@ pub const H3Error = error{
     ResponseTooLarge,
     UnknownStream,
     UnsupportedH3Setting,
+    ExtendedConnectNotNegotiated,
 };
 
 /// HTTP/3 wire error codes (RFC 9114 §8.1). Zig errors carry no payload, so
@@ -1084,6 +1085,7 @@ pub fn Conn(comptime Transport: type) type {
             scheme: []const u8 = "https",
             authority: []const u8,
             path: []const u8,
+            extended_protocol: ?[]const u8 = null,
             headers: []const qpack.HeaderField = &.{},
             body: []const u8 = "",
         };
@@ -1092,24 +1094,33 @@ pub fn Conn(comptime Transport: type) type {
         pub fn sendRequest(self: *Self, transport: *Transport, request: Request) !u64 {
             std.debug.assert(self.role == .client);
             if (self.peer_goaway_id != null) return error.GoawayReceived;
+            if (request.extended_protocol != null and (!self.peer_control_view.saw_settings or !self.peer_control_view.settings.enable_connect_protocol)) {
+                return error.ExtendedConnectNotNegotiated;
+            }
             const id = try transport.openStream(.bidi);
             self.events.emit(.{ .stream_type_set = .{ .stream_id = id, .stream_type = .request } });
 
-            var fields_buf: [68]qpack.HeaderField = undefined;
+            var fields_buf: [69]qpack.HeaderField = undefined;
             fields_buf[0] = .{ .name = ":method", .value = request.method };
-            fields_buf[1] = .{ .name = ":scheme", .value = request.scheme };
-            fields_buf[2] = .{ .name = ":authority", .value = request.authority };
-            fields_buf[3] = .{ .name = ":path", .value = request.path };
-            if (request.headers.len > fields_buf.len - 4) return error.TooManyHeaders;
-            for (request.headers, 0..) |header, i| fields_buf[4 + i] = header;
+            var pseudo_count: usize = 1;
+            if (request.extended_protocol) |protocol| {
+                fields_buf[pseudo_count] = .{ .name = ":protocol", .value = protocol };
+                pseudo_count += 1;
+            }
+            fields_buf[pseudo_count] = .{ .name = ":scheme", .value = request.scheme };
+            fields_buf[pseudo_count + 1] = .{ .name = ":authority", .value = request.authority };
+            fields_buf[pseudo_count + 2] = .{ .name = ":path", .value = request.path };
+            pseudo_count += 3;
+            if (request.headers.len > fields_buf.len - pseudo_count) return error.TooManyHeaders;
+            for (request.headers, 0..) |header, i| fields_buf[pseudo_count + i] = header;
 
             var block: [4096]u8 = undefined;
-            const header_block = try qpack.encode(fields_buf[0 .. 4 + request.headers.len], &block);
+            const header_block = try qpack.encode(fields_buf[0 .. pseudo_count + request.headers.len], &block);
             var wire: [8192]u8 = undefined;
             var len: usize = 0;
             const headers_frame = try frame.encodeKnownFrame(.headers, header_block, wire[len..]);
             len += headers_frame.len;
-            self.events.emit(.{ .frame_created = .{ .stream_id = id, .frame = .{ .headers = .{ .fields = fields_buf[0 .. 4 + request.headers.len], .raw_length = headers_frame.len } } } });
+            self.events.emit(.{ .frame_created = .{ .stream_id = id, .frame = .{ .headers = .{ .fields = fields_buf[0 .. pseudo_count + request.headers.len], .raw_length = headers_frame.len } } } });
             var data_frame_len: usize = 0;
             if (request.body.len > 0) {
                 const data_frame = try frame.encodeKnownFrame(.data, request.body, wire[len..]);
@@ -4965,16 +4976,64 @@ test "H3 conn: start rejects unsupported qpack_blocked_streams" {
     try testing.expectError(error.UnsupportedH3Setting, server.start(&server_transport));
 }
 
-test "H3 conn: start rejects unsupported enable_connect_protocol" {
+test "H3 conn: start advertises enable_connect_protocol when configured" {
     const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
     var server_transport = MockTransport.init(allocator, false);
     defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
 
     const H3 = Conn(MockTransport);
     var server = H3.initWithSettings(allocator, .server, .{ .enable_connect_protocol = true });
     defer server.deinit();
 
-    try testing.expectError(error.UnsupportedH3Setting, server.start(&server_transport));
+    try server.start(&server_transport);
+    const stream = client_transport.streams.get(server.control_out.?) orelse return error.TestExpectedEqual;
+    var control = frame.ControlStream{};
+    defer control.deinit(allocator);
+    try testing.expectEqual(stream.data.items.len, try control.ingest(allocator, stream.data.items));
+    try testing.expect(control.saw_settings);
+    try testing.expect(control.settings.enable_connect_protocol);
+}
+
+test "H3 conn: Extended CONNECT requires the peer setting and preserves its envelope" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.initWithSettings(allocator, .server, .{ .enable_connect_protocol = true });
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try testing.expectError(error.ExtendedConnectNotNegotiated, client.sendRequest(&client_transport, .{
+        .method = "CONNECT",
+        .authority = "tardigrade.test",
+        .path = "/socket",
+        .extended_protocol = "websocket",
+    }));
+
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+    _ = try client.sendRequest(&client_transport, .{
+        .method = "CONNECT",
+        .authority = "tardigrade.test",
+        .path = "/socket",
+        .extended_protocol = "websocket",
+    });
+    try server.pump(&server_transport);
+    const incoming = (try server.pollRequest()).?;
+    try testing.expectEqualStrings("CONNECT", incoming.exchange.request.method);
+    try testing.expectEqualStrings("websocket", incoming.exchange.request.extended_protocol.?);
 }
 
 test "H3 conn: start rejects unsupported h3_datagram" {

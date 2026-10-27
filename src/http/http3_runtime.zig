@@ -3631,11 +3631,15 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
     var assembler = http3_session.StreamAssembler.init(allocator);
     defer assembler.deinit();
 
-    var fields: [131]http3_session.HeaderField = undefined;
+    var fields: [132]http3_session.HeaderField = undefined;
     fields[0] = .{ .name = ":method", .value = exchange.request.method };
     fields[1] = .{ .name = ":path", .value = exchange.request.path };
     fields[2] = .{ .name = ":authority", .value = exchange.request.authority };
     var count: usize = 3;
+    if (exchange.request.extended_protocol) |protocol| {
+        fields[count] = .{ .name = ":protocol", .value = protocol };
+        count += 1;
+    }
     for (exchange.request.headers) |header| {
         if (count == fields.len) return error.TooManyHeaders;
         fields[count] = .{ .name = header.name, .value = header.value };

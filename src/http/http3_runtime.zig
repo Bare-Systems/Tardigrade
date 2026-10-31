@@ -1326,6 +1326,149 @@ const PendingH3Response = struct {
 const async_h3_worker_count = 8;
 const async_h3_queue_capacity = 256;
 
+/// Deep-owned RFC 9220 envelope. Extended CONNECT is surfaced as borrowing
+/// H3 request storage, but gateway admission can open an upstream connection
+/// or call forward auth. Workers therefore receive this snapshot rather than
+/// touching a live H3 connection or its request buffers.
+const OwnedExtendedConnect = struct {
+    stream_id: u64,
+    method: []u8,
+    scheme: []u8,
+    authority: []u8,
+    path: []u8,
+    protocol: []u8,
+    headers: []stream_transport.Header,
+    buffered_body: []u8,
+    transport_early: bool,
+    client_ip: []u8,
+    client_cert: ?OwnedClientCertificate = null,
+    client_auth_policy_fingerprint: ?u64 = null,
+
+    const OwnedClientCertificate = struct {
+        fingerprint_sha256: []u8,
+        subject: []u8,
+        issuer: []u8,
+        serial: []u8,
+        san_dns: []u8,
+        san_email: []u8,
+        san_uri: []u8,
+
+        fn init(allocator: std.mem.Allocator, certificate: headers_mod.ClientCertificate) !OwnedClientCertificate {
+            const fingerprint_sha256 = try allocator.dupe(u8, certificate.fingerprint_sha256);
+            errdefer allocator.free(fingerprint_sha256);
+            const subject = try allocator.dupe(u8, certificate.subject);
+            errdefer allocator.free(subject);
+            const issuer = try allocator.dupe(u8, certificate.issuer);
+            errdefer allocator.free(issuer);
+            const serial = try allocator.dupe(u8, certificate.serial);
+            errdefer allocator.free(serial);
+            const san_dns = try allocator.dupe(u8, certificate.san_dns);
+            errdefer allocator.free(san_dns);
+            const san_email = try allocator.dupe(u8, certificate.san_email);
+            errdefer allocator.free(san_email);
+            const san_uri = try allocator.dupe(u8, certificate.san_uri);
+            return .{ .fingerprint_sha256 = fingerprint_sha256, .subject = subject, .issuer = issuer, .serial = serial, .san_dns = san_dns, .san_email = san_email, .san_uri = san_uri };
+        }
+
+        fn deinit(self: *OwnedClientCertificate, allocator: std.mem.Allocator) void {
+            allocator.free(self.fingerprint_sha256);
+            allocator.free(self.subject);
+            allocator.free(self.issuer);
+            allocator.free(self.serial);
+            allocator.free(self.san_dns);
+            allocator.free(self.san_email);
+            allocator.free(self.san_uri);
+            self.* = undefined;
+        }
+
+        fn view(self: *const OwnedClientCertificate) headers_mod.ClientCertificate {
+            return .{ .fingerprint_sha256 = self.fingerprint_sha256, .subject = self.subject, .issuer = self.issuer, .serial = self.serial, .san_dns = self.san_dns, .san_email = self.san_email, .san_uri = self.san_uri };
+        }
+    };
+
+    fn init(allocator: std.mem.Allocator, request: *const ExtendedConnectView) !OwnedExtendedConnect {
+        const method = try allocator.dupe(u8, request.method);
+        errdefer allocator.free(method);
+        const scheme = try allocator.dupe(u8, request.scheme);
+        errdefer allocator.free(scheme);
+        const authority = try allocator.dupe(u8, request.authority);
+        errdefer allocator.free(authority);
+        const path = try allocator.dupe(u8, request.path);
+        errdefer allocator.free(path);
+        const protocol = try allocator.dupe(u8, request.protocol);
+        errdefer allocator.free(protocol);
+        const buffered_body = try allocator.dupe(u8, request.buffered_body);
+        errdefer allocator.free(buffered_body);
+        const client_ip = try allocator.dupe(u8, request.client_ip);
+        errdefer allocator.free(client_ip);
+        const headers = try allocator.alloc(stream_transport.Header, request.headers.len);
+        errdefer allocator.free(headers);
+        var initialized: usize = 0;
+        errdefer for (headers[0..initialized]) |header| {
+            allocator.free(header.name);
+            allocator.free(header.value);
+        };
+        for (request.headers, 0..) |header, index| {
+            const name = try allocator.dupe(u8, header.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, header.value);
+            headers[index] = .{ .name = name, .value = value };
+            initialized += 1;
+        }
+        var client_cert: ?OwnedClientCertificate = null;
+        if (request.client_cert) |certificate| client_cert = try OwnedClientCertificate.init(allocator, certificate);
+        errdefer if (client_cert) |*certificate| certificate.deinit(allocator);
+        return .{
+            .stream_id = request.stream_id,
+            .method = method,
+            .scheme = scheme,
+            .authority = authority,
+            .path = path,
+            .protocol = protocol,
+            .headers = headers,
+            .buffered_body = buffered_body,
+            .transport_early = request.transport_early,
+            .client_ip = client_ip,
+            .client_cert = client_cert,
+            .client_auth_policy_fingerprint = request.client_auth_policy_fingerprint,
+        };
+    }
+
+    fn view(self: *const OwnedExtendedConnect) ExtendedConnectView {
+        return .{
+            .stream_id = self.stream_id,
+            .method = self.method,
+            .scheme = self.scheme,
+            .authority = self.authority,
+            .path = self.path,
+            .protocol = self.protocol,
+            .headers = self.headers,
+            .buffered_body = self.buffered_body,
+            .transport_early = self.transport_early,
+            .client_ip = self.client_ip,
+            .client_cert = if (self.client_cert) |*certificate| certificate.view() else null,
+            .client_auth_policy_fingerprint = self.client_auth_policy_fingerprint,
+        };
+    }
+
+    fn deinit(self: *OwnedExtendedConnect, allocator: std.mem.Allocator) void {
+        allocator.free(self.method);
+        allocator.free(self.scheme);
+        allocator.free(self.authority);
+        allocator.free(self.path);
+        allocator.free(self.protocol);
+        for (self.headers) |header| {
+            allocator.free(header.name);
+            allocator.free(header.value);
+        }
+        allocator.free(self.headers);
+        allocator.free(self.buffered_body);
+        allocator.free(self.client_ip);
+        if (self.client_cert) |*certificate| certificate.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 /// An owned H3 handler invocation. Workers may touch only this job and the
 /// process-shared handler context; connection/QUIC/H3 state remains reactor
 /// owned. Completion is observed with acquire/release ordering before the
@@ -1338,6 +1481,11 @@ const AsyncH3Job = struct {
             request: http3_session.StreamRequest,
         },
         cache_fill_resume: http3_session.StreamRequest.CacheFillContinuation,
+        extended_connect: struct {
+            handler: ExtendedConnectHandler,
+            handler_ctx: ?*anyopaque,
+            request: OwnedExtendedConnect,
+        },
     };
 
     allocator: std.mem.Allocator,
@@ -1351,6 +1499,7 @@ const AsyncH3Job = struct {
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     result_error: ?anyerror = null,
     parked_cache_fill: ?http3_session.StreamRequest.CacheFillContinuation = null,
+    extended_connect_decision: ?ExtendedConnectDecision = null,
 
     fn initRequest(
         allocator: std.mem.Allocator,
@@ -1402,6 +1551,29 @@ const AsyncH3Job = struct {
         return job;
     }
 
+    fn initExtendedConnect(
+        allocator: std.mem.Allocator,
+        connection_handle: u64,
+        stream_id: u64,
+        started_us: u64,
+        handler: ExtendedConnectHandler,
+        handler_ctx: ?*anyopaque,
+        request: *const ExtendedConnectView,
+    ) !*AsyncH3Job {
+        var owned = try OwnedExtendedConnect.init(allocator, request);
+        errdefer owned.deinit(allocator);
+        const job = try allocator.create(AsyncH3Job);
+        job.* = .{
+            .allocator = allocator,
+            .connection_handle = connection_handle,
+            .stream_id = stream_id,
+            .started_us = started_us,
+            .work = .{ .extended_connect = .{ .handler = handler, .handler_ctx = handler_ctx, .request = owned } },
+            .response = response_mod.Response.init(allocator),
+        };
+        return job;
+    }
+
     fn parkCacheFill(ctx: *anyopaque, continuation: http3_session.StreamRequest.CacheFillContinuation) anyerror!void {
         const self: *AsyncH3Job = @ptrCast(@alignCast(ctx));
         if (self.parked_cache_fill != null) return error.Http3DuplicateCacheFillPark;
@@ -1426,6 +1598,10 @@ const AsyncH3Job = struct {
             .cache_fill_resume => |continuation| continuation.run(self.allocator, &self.response) catch |err| {
                 self.result_error = err;
             },
+            .extended_connect => |*owned| {
+                const request = owned.request.view();
+                self.extended_connect_decision = owned.handler(self.allocator, &request, owned.handler_ctx);
+            },
         }
         self.done.store(true, .release);
     }
@@ -1435,6 +1611,7 @@ const AsyncH3Job = struct {
         switch (self.work) {
             .request => self.cancel_token.cancel(reason),
             .cache_fill_resume => |continuation| continuation.cancel(reason),
+            .extended_connect => {},
         }
     }
 
@@ -1445,6 +1622,7 @@ const AsyncH3Job = struct {
     }
 
     fn deinit(self: *AsyncH3Job) void {
+        self.discardExtendedConnectDecision();
         if (self.parked_cache_fill) |continuation| {
             continuation.cancel(.shutdown);
             continuation.deinit(self.allocator);
@@ -1452,9 +1630,18 @@ const AsyncH3Job = struct {
         switch (self.work) {
             .request => |*owned| owned.request.deinit(),
             .cache_fill_resume => |continuation| continuation.deinit(self.allocator),
+            .extended_connect => |*owned| owned.request.deinit(self.allocator),
         }
         self.response.deinit();
         self.allocator.destroy(self);
+    }
+
+    fn discardExtendedConnectDecision(self: *AsyncH3Job) void {
+        if (self.extended_connect_decision) |decision| switch (decision) {
+            .admit => |admission| if (admission.on_admission_failed) |failed| failed(admission.on_admitted_ctx),
+            .refuse => {},
+        };
+        self.extended_connect_decision = null;
     }
 };
 
@@ -2492,12 +2679,11 @@ pub const Runtime = struct {
         self.reconcileTunnels(entry);
     }
 
-    /// Admit or refuse a validated, negotiated Extended CONNECT envelope
-    /// surfaced before its stream's FIN (#957). Unlike `serveRequest`, this
-    /// never runs on the bounded worker pool: the embedder's own handler is
-    /// expected to make a synchronous go/no-go decision and hand off its own
-    /// relay (if admitted) to its own thread, exactly like today's H2
-    /// Extended CONNECT admission already does.
+    /// Queue a validated, negotiated Extended CONNECT envelope surfaced
+    /// before its stream's FIN (#957). Gateway admission may run forward
+    /// auth and an H1 origin upgrade, neither of which may block the UDP
+    /// reactor. Workers receive a deep snapshot; the reactor applies a
+    /// completed decision only if the stream is still awaiting admission.
     fn serveExtendedConnect(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingExtendedConnect, now: u64) void {
         const handler = self.extended_connect_handler orelse {
             self.refuseExtendedConnect(entry, incoming.stream_id, now, 404, &.{}, "");
@@ -2535,21 +2721,57 @@ pub const Runtime = struct {
             .client_cert = client_cert,
             .client_auth_policy_fingerprint = if (entry.client_snapshot != null) entry.client_policy_fingerprint else null,
         };
-        switch (handler(self.allocator, &view, self.extended_connect_handler_ctx)) {
+        if (!self.async_h3_executor.initialized) {
+            // Deterministic in-process unit harnesses construct a Runtime
+            // without starting its reactor thread. They own the connection
+            // synchronously and exercise the same reactor-only apply path;
+            // a running UDP runtime can never take this branch (start()
+            // starts the executor before the reactor thread).
+            if (self.thread == null) {
+                self.applyExtendedConnectDecision(entry, incoming.stream_id, handler(self.allocator, &view, self.extended_connect_handler_ctx), now);
+                return;
+            }
+            self.refuseExtendedConnect(entry, incoming.stream_id, now, 503, &.{}, "");
+            return;
+        }
+        const job = AsyncH3Job.initExtendedConnect(
+            self.allocator,
+            entry.quic_observer.connection_handle,
+            incoming.stream_id,
+            now,
+            handler,
+            self.extended_connect_handler_ctx,
+            &view,
+        ) catch {
+            self.refuseExtendedConnect(entry, incoming.stream_id, now, 503, &.{}, "");
+            return;
+        };
+        self.submitAsyncH3Job(job) catch |err| {
+            job.deinit();
+            self.logger.warn(null, "http3: extended CONNECT executor admission failed: {s}", .{@errorName(err)});
+            self.refuseExtendedConnect(entry, incoming.stream_id, now, 503, &.{}, "");
+        };
+    }
+
+    /// Apply a completed admission on the reactor: both outcomes mutate the
+    /// H3/QUIC connection and must never run in an admission worker.
+    fn applyExtendedConnectDecision(self: *Runtime, entry: *ConnEntry, stream_id: u64, decision: ExtendedConnectDecision, now: u64) void {
+        switch (decision) {
             // #957 requires every Extended CONNECT outcome to be an ordinary,
             // non-101 HTTP/3 response: reject any embedder-supplied status
             // that would violate that (e.g. an HTTP/1.1 WebSocket handler's
             // 101 reused verbatim) rather than forwarding it onto the wire.
             .refuse => |refusal| {
                 const status = if (refusal.status == 101 or refusal.status < 200 or refusal.status > 599) 500 else refusal.status;
-                self.refuseExtendedConnect(entry, incoming.stream_id, now, status, refusal.headers, refusal.body);
+                self.refuseExtendedConnect(entry, stream_id, now, status, refusal.headers, refusal.body);
             },
             .admit => |admission| {
                 if (admission.status < 200 or admission.status >= 300) {
-                    self.refuseExtendedConnect(entry, incoming.stream_id, now, 500, &.{}, "");
+                    if (admission.on_admission_failed) |failed| failed(admission.on_admitted_ctx);
+                    self.refuseExtendedConnect(entry, stream_id, now, 500, &.{}, "");
                     return;
                 }
-                self.admitTunnel(entry, incoming.stream_id, admission, now);
+                self.admitTunnel(entry, stream_id, admission, now);
             },
         }
     }
@@ -2858,6 +3080,27 @@ pub const Runtime = struct {
             }
             _ = self.async_h3_jobs.orderedRemove(index);
             defer job.deinit();
+
+            if (job.work == .extended_connect) {
+                const decision = job.extended_connect_decision orelse {
+                    self.logger.warn(null, "http3: extended CONNECT admission worker returned no decision", .{});
+                    continue;
+                };
+                // Move the decision out before attachment. A stale decision
+                // goes back into the job so `deinit` invokes its explicit
+                // failure callback and releases the upstream reservation.
+                job.extended_connect_decision = null;
+                const extended_entry = connections.get(job.connection_handle) orelse {
+                    job.extended_connect_decision = decision;
+                    continue;
+                };
+                if (job.cancelled.load(.acquire) or !extended_entry.h3.hasPendingExtendedConnect(job.stream_id)) {
+                    job.extended_connect_decision = decision;
+                    continue;
+                }
+                self.applyExtendedConnectDecision(extended_entry, job.stream_id, decision, job.started_us);
+                continue;
+            }
 
             const entry = connections.get(job.connection_handle) orelse {
                 if (job.takeParkedCacheFill()) |continuation| {
@@ -5143,6 +5386,88 @@ const RuntimeCidHarness = struct {
 const TunnelAdmitCapture = struct {
     session: ?*stream_session.Session = null,
 };
+
+const AsyncAdmissionCapture = struct {
+    observed_path: [32]u8 = undefined,
+    observed_path_len: usize = 0,
+    failed: usize = 0,
+
+    fn handler(_: std.mem.Allocator, request: *const ExtendedConnectView, ctx: ?*anyopaque) ExtendedConnectDecision {
+        const self: *AsyncAdmissionCapture = @ptrCast(@alignCast(ctx.?));
+        self.observed_path_len = request.path.len;
+        @memcpy(self.observed_path[0..request.path.len], request.path);
+        return .{ .admit = .{
+            .max_inbound_bytes = 64,
+            .max_outbound_bytes = 64,
+            .on_admitted = unexpectedAsyncAdmission,
+            .on_admitted_ctx = ctx,
+            .on_admission_failed = admissionFailed,
+        } };
+    }
+
+    fn unexpectedAsyncAdmission(_: std.mem.Allocator, _: *stream_session.Session, _: ?*anyopaque) void {
+        unreachable;
+    }
+
+    fn admissionFailed(ctx: ?*anyopaque) void {
+        const self: *AsyncAdmissionCapture = @ptrCast(@alignCast(ctx.?));
+        self.failed += 1;
+    }
+};
+
+test "http3 runtime (#821): queued Extended CONNECT admission snapshots request bytes and disposes stale results" {
+    const allocator = testing.allocator;
+    var path = [_]u8{ '/', 'o', 'l', 'd' };
+    var header_name = [_]u8{ 'x', '-', 't', 'e', 's', 't' };
+    var header_value = [_]u8{ 'o', 'l', 'd' };
+    var body = [_]u8{ 'o', 'l', 'd' };
+    var client_ip = [_]u8{ '1', '2', '7', '.', '0', '.', '0', '.', '1' };
+    var certificate_fingerprint = [_]u8{ 'a', 'b', 'c' };
+    const headers = [_]stream_transport.Header{.{ .name = &header_name, .value = &header_value }};
+    const view = ExtendedConnectView{
+        .stream_id = 4,
+        .method = "CONNECT",
+        .scheme = "https",
+        .authority = "tardigrade.test",
+        .path = &path,
+        .protocol = "websocket",
+        .headers = &headers,
+        .buffered_body = &body,
+        .transport_early = false,
+        .client_ip = &client_ip,
+        .client_cert = .{ .fingerprint_sha256 = &certificate_fingerprint },
+    };
+    var capture = AsyncAdmissionCapture{};
+    const job = try AsyncH3Job.initExtendedConnect(allocator, 99, view.stream_id, 1, AsyncAdmissionCapture.handler, &capture, &view);
+    path[1] = 'n';
+    header_value[0] = 'n';
+    body[0] = 'n';
+    certificate_fingerprint[0] = 'n';
+    job.run();
+    try testing.expectEqualStrings("/old", capture.observed_path[0..capture.observed_path_len]);
+
+    // A completed worker can race a client reset or connection teardown. A
+    // live connection whose stream is no longer pending must not attach an
+    // upstream tunnel; instead its one-shot failure callback releases it.
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-extended-connect-stale-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(allocator, fixed.provider());
+    defer harness.deinit(allocator);
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer connections.deinit();
+    try connections.put(99, harness.entry);
+    try runtime.async_h3_jobs.append(allocator, job);
+    runtime.drainCompletedAsyncH3Jobs(&connections);
+    try testing.expectEqual(@as(usize, 1), capture.failed);
+    try testing.expectEqual(@as(usize, 0), runtime.async_h3_jobs.items.len);
+}
 
 fn testExtendedConnectHandler(
     _: std.mem.Allocator,

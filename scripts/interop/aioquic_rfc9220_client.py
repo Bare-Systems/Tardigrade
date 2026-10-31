@@ -3,6 +3,7 @@
 
 Usage: aioquic_rfc9220_client.py HOST PORT PATH PAYLOAD [AUTHORITY]
        [--header NAME:VALUE] [--expect-status STATUS] [--reset-after-200]
+       [--isolation-path PATH]
 
 This deliberately uses aioquic's QUIC + HTTP/3 stack rather than the native
 test client.  It performs the RFC 9220 non-FIN CONNECT/`:protocol` exchange,
@@ -33,7 +34,14 @@ def masked_text_frame(payload: bytes) -> bytes:
 
 
 class RFC9220Client(QuicConnectionProtocol):
-    def __init__(self, payload: bytes, expected_status: int, reset_after_200: bool, *args, **kwargs):
+    def __init__(
+        self,
+        payload: bytes,
+        expected_status: int,
+        reset_after_200: bool,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.http = H3Connection(self._quic)
         self.payload = payload
@@ -44,6 +52,9 @@ class RFC9220Client(QuicConnectionProtocol):
         self.received = b""
         self.done = asyncio.Event()
         self.failure = None
+        self.connect_stream_ids = set()
+        self.isolation_stream_id = None
+        self.isolation_status = None
 
     def quic_event_received(self, event: QuicEvent) -> None:
         if isinstance(event, ConnectionTerminated):
@@ -51,6 +62,19 @@ class RFC9220Client(QuicConnectionProtocol):
             self.done.set()
             return
         for http_event in self.http.handle_event(event):
+            if isinstance(http_event, HeadersReceived) and http_event.stream_id == self.isolation_stream_id:
+                self.isolation_status = next(
+                    (int(value) for name, value in http_event.headers if name == b":status"),
+                    None,
+                )
+                if self.isolation_status != 200:
+                    self.failure = f"expected isolated GET status 200, got {self.isolation_status}"
+                    self.done.set()
+                continue
+            if isinstance(http_event, DataReceived) and http_event.stream_id == self.isolation_stream_id:
+                if http_event.stream_ended:
+                    self.done.set()
+                continue
             if isinstance(http_event, HeadersReceived) and http_event.stream_id == self.stream_id:
                 self.status = next((int(value) for name, value in http_event.headers if name == b":status"), None)
                 if self.status != self.expected_status:
@@ -93,6 +117,7 @@ async def main(
     headers: list[tuple[bytes, bytes]],
     expected_status: int,
     reset_after_200: bool,
+    isolation_path: str | None,
 ) -> int:
     configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
     configuration.verify_mode = ssl.CERT_NONE
@@ -107,6 +132,52 @@ async def main(
     try:
         protocol.connect((host, port))
         await asyncio.wait_for(protocol.wait_connected(), timeout=10)
+        if isolation_path:
+            # Saturate the dedicated CONNECT-admission executor with two
+            # upgrades whose origins deliberately never answer. A healthy
+            # gateway must still dispatch this ordinary H3 request on its
+            # separate REST executor without waiting for either upgrade.
+            for _ in range(2):
+                stream_id = protocol._quic.get_next_available_stream_id()
+                protocol.connect_stream_ids.add(stream_id)
+                protocol.http.send_headers(
+                    stream_id,
+                    [
+                        (b":method", b"CONNECT"),
+                        (b":protocol", b"websocket"),
+                        (b":scheme", b"https"),
+                        (b":authority", authority.encode()),
+                        (b":path", path.encode()),
+                    ] + headers,
+                    end_stream=False,
+                )
+            protocol.transmit()
+            # Give both blocking Upgrade reads a chance to enter the two
+            # dedicated admission workers before the ordinary request is
+            # issued. The integration harness also observes two origin
+            # handshakes, so this is not merely a queued-work assertion.
+            await asyncio.sleep(0.25)
+            protocol.isolation_stream_id = protocol._quic.get_next_available_stream_id()
+            protocol.http.send_headers(
+                protocol.isolation_stream_id,
+                [
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", authority.encode()),
+                    (b":path", isolation_path.encode()),
+                ],
+                end_stream=True,
+            )
+            protocol.transmit()
+            await asyncio.wait_for(protocol.done.wait(), timeout=5)
+            if protocol.failure:
+                print(protocol.failure)
+                return 1
+            print(f"isolated GET status: {protocol.isolation_status}")
+            protocol.close()
+            await protocol.wait_closed()
+            return 0 if protocol.isolation_status == 200 else 1
+
         protocol.stream_id = protocol._quic.get_next_available_stream_id()
         protocol.http.send_headers(
             protocol.stream_id,
@@ -143,6 +214,7 @@ if __name__ == "__main__":
     parser.add_argument("--header", action="append", default=[])
     parser.add_argument("--expect-status", type=int, default=200)
     parser.add_argument("--reset-after-200", action="store_true")
+    parser.add_argument("--isolation-path")
     args = parser.parse_args()
     headers = []
     for item in args.header:
@@ -160,4 +232,5 @@ if __name__ == "__main__":
         headers,
         args.expect_status,
         args.reset_after_200,
+        args.isolation_path,
     )))

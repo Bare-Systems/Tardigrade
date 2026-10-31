@@ -4060,6 +4060,7 @@ const AioquicExtendedConnectOptions = struct {
     headers: []const []const u8 = &.{},
     expected_status: u16 = 200,
     reset_after_200: bool = false,
+    isolation_path: ?[]const u8 = null,
 };
 
 fn runAioquicH3ExtendedConnectWithOptions(
@@ -4095,6 +4096,10 @@ fn runAioquicH3ExtendedConnectWithOptions(
         try argv.append(expected_status);
     }
     if (options.reset_after_200) try argv.append("--reset-after-200");
+    if (options.isolation_path) |isolation_path| {
+        try argv.append("--isolation-path");
+        try argv.append(isolation_path);
+    }
     return bounded_process.run(allocator, .{
         .argv = argv.items,
         .stdout_limit = 64 * 1024,
@@ -27353,6 +27358,10 @@ const WsOriginMode = enum {
     bad_accept,
     /// A plain 403 with a body.
     refuse,
+    /// Accept and read the upgrade but deliberately never answer it. Used to
+    /// hold the bounded H3 CONNECT-admission executor while testing that its
+    /// separate REST executor keeps making progress.
+    stall,
 };
 
 /// A minimal RFC 6455 origin: one thread per connection, so several tunnels
@@ -27490,6 +27499,10 @@ fn wsOriginHandle(origin: *WsOrigin, stream: compat.NetStream) !void {
         .bad_accept => {
             try stream.writeAll("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n");
             peer.expectClosed(5_000) catch {};
+            return;
+        },
+        .stall => {
+            while (!origin.stop_flag.load(.seq_cst)) compat.sleepNs(10 * std.time.ns_per_ms);
             return;
         },
         .echo => {},
@@ -28014,6 +28027,47 @@ test "h3interop.rfc9220.gateway aioquic external client reset and STOP_SENDING r
     defer recovered.deinit(allocator);
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(recovered.outcome));
     try assertContains(recovered.stdout, "recovered-after-reset");
+    try std.testing.expectEqual(@as(u32, 2), origin.handshakeCount());
+}
+
+test "h3interop.rfc9220.gateway aioquic external client keeps REST live while both CONNECT workers stall (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .stall);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var client = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/stalled", "unused", .{
+        .isolation_path = "/healthz",
+    });
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "isolated GET status: 200");
     try std.testing.expectEqual(@as(u32, 2), origin.handshakeCount());
 }
 

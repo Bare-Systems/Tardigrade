@@ -2437,9 +2437,11 @@ const H3WebSocketAdmission = struct {
 
     fn create(allocator: std.mem.Allocator, switched: *gh2ws.Switched, correlation_id: []const u8) !*H3WebSocketAdmission {
         const self = try allocator.create(H3WebSocketAdmission);
-        errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .switched = switched };
-        errdefer self.headers.deinit(allocator);
+        // `appendHeader` owns each name/value independently.  On any later
+        // allocation failure use the complete owner teardown, not merely the
+        // ArrayList backing-store deinit.
+        errdefer self.deinit(false);
         for (switched.upgraded.head.headers) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "sec-websocket-protocol") or std.ascii.eqlIgnoreCase(header.name, "sec-websocket-extensions")) {
                 try self.appendHeader(header.name, header.value);
@@ -2494,6 +2496,7 @@ const H3WebSocketTunnel = struct {
             return;
         }));
         const switched = admission.switched;
+        const state = switched.state;
         const self = allocator.create(H3WebSocketTunnel) catch {
             session.requestCancel();
             admission.deinit(true);
@@ -2507,8 +2510,8 @@ const H3WebSocketTunnel = struct {
             switched.deinit();
             return;
         };
+        state.metricsRecordWebSocketUpgrade(.relayed);
         thread.detach();
-        switched.state.metricsRecordWebSocketUpgrade(.relayed);
     }
 
     fn run(self: *H3WebSocketTunnel) void {

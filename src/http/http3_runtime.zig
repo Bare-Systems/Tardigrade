@@ -22,6 +22,7 @@ const compat = @import("zig_compat");
 const std = @import("std");
 const cancellation = @import("cancellation.zig");
 const early_data_policy = @import("early_data.zig");
+const headers_mod = @import("headers.zig");
 const http3_session = @import("http3_session.zig");
 const logger_mod = @import("logger.zig");
 const metrics_mod = @import("metrics.zig");
@@ -87,6 +88,12 @@ pub const ExtendedConnectView = struct {
     buffered_body: []const u8,
     transport_early: bool,
     client_ip: []const u8,
+    /// Verified mTLS identity is out-of-band, exactly as on the ordinary H3
+    /// request path; no peer-supplied field can populate this value.
+    client_cert: ?headers_mod.ClientCertificate = null,
+    /// The SNI policy selected during the QUIC handshake.  The gateway uses
+    /// this to reject an authority governed by a different policy.
+    client_auth_policy_fingerprint: ?u64 = null,
 };
 
 pub const ExtendedConnectRefusal = struct {
@@ -110,6 +117,10 @@ pub const ExtendedConnectAdmission = struct {
     /// `allocator` here is always the exact allocator it was created with.
     on_admitted: *const fn (std.mem.Allocator, *stream_session.Session, ?*anyopaque) void,
     on_admitted_ctx: ?*anyopaque = null,
+    /// Releases application-owned admission state when the runtime cannot
+    /// attach the stream. This is distinct from `on_admitted`: callers often
+    /// own an already-open upstream connection and capacity reservation.
+    on_admission_failed: ?*const fn (?*anyopaque) void = null,
 };
 
 pub const ExtendedConnectDecision = union(enum) {
@@ -1633,10 +1644,9 @@ pub const Runtime = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, logger: *logger_mod.Logger, cfg: Config) Http3RuntimeError!Runtime {
-        // The low-level H3 connection can advertise RFC 9220 for envelope
-        // testing, but the production runtime has no stream consumer yet.
-        // Keep the gateway capability fail-closed until that consumer exists.
-        if (cfg.h3_settings.enable_connect_protocol) return error.InvalidH3Settings;
+        // RFC 9220 can only be advertised alongside an actual stream
+        // consumer.  Leaving the setting off remains the safe default.
+        if (cfg.h3_settings.enable_connect_protocol and cfg.extended_connect_handler == null) return error.InvalidH3Settings;
         const address = compat.parseIpAddress(cfg.listen_host, cfg.quic_port) catch |err| {
             logger.warn(null, "http3: listen address parse failed: {s}", .{@errorName(err)});
             return error.BindFailed;
@@ -2498,6 +2508,19 @@ pub const Runtime = struct {
             return;
         };
         defer self.allocator.free(client_ip);
+        var client_cert: ?headers_mod.ClientCertificate = null;
+        if (entry.client_auth_mode != .disabled) {
+            const identity = entry.clientIdentity(self.allocator) catch {
+                self.refuseExtendedConnect(entry, incoming.stream_id, now, 500, &.{}, "");
+                return;
+            };
+            if (identity) |verified| {
+                client_cert = clientCertificateView(verified);
+            } else if (entry.client_auth_mode == .required) {
+                self.refuseExtendedConnect(entry, incoming.stream_id, now, 403, &.{}, "");
+                return;
+            }
+        }
         const view = ExtendedConnectView{
             .stream_id = incoming.stream_id,
             .method = incoming.method,
@@ -2509,6 +2532,8 @@ pub const Runtime = struct {
             .buffered_body = incoming.buffered_body,
             .transport_early = incoming.transport_early,
             .client_ip = client_ip,
+            .client_cert = client_cert,
+            .client_auth_policy_fingerprint = if (entry.client_snapshot != null) entry.client_policy_fingerprint else null,
         };
         switch (handler(self.allocator, &view, self.extended_connect_handler_ctx)) {
             // #957 requires every Extended CONNECT outcome to be an ordinary,
@@ -2548,6 +2573,8 @@ pub const Runtime = struct {
     }
 
     fn admitTunnel(self: *Runtime, entry: *ConnEntry, stream_id: u64, admission: ExtendedConnectAdmission, now: u64) void {
+        var transferred = false;
+        defer if (!transferred) if (admission.on_admission_failed) |failed| failed(admission.on_admitted_ctx);
         const session_ptr = self.allocator.create(stream_session.Session) catch {
             self.refuseExtendedConnect(entry, stream_id, now, 503, &.{}, "");
             return;
@@ -2586,6 +2613,7 @@ pub const Runtime = struct {
             return;
         };
         admission.on_admitted(self.allocator, session_ptr, admission.on_admitted_ctx);
+        transferred = true;
     }
 
     /// Returns how many leading bytes of `bytes` the bound session accepted

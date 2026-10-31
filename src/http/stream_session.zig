@@ -216,6 +216,23 @@ pub const Session = struct {
         self.local_end_sent = true;
     }
 
+    /// Observed by a relay after it requests `finishLocal()`: the H3
+    /// connection runtime has emitted the final DATA/FIN for this stream.
+    pub fn localEndStreamSent(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.local_end_sent;
+    }
+
+    /// Whether the peer has cleanly half-closed its request stream.  Together
+    /// with `localEndStreamSent`, this is the graceful-completion condition a
+    /// relay uses to avoid converting a successful close into RESET_STREAM.
+    pub fn remoteEndStreamReceived(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.remote_end_stream;
+    }
+
     pub fn takeReceiveCreditToReturn(self: *Session) usize {
         self.mutex.lock();
         defer self.mutex.unlock();

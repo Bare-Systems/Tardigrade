@@ -797,8 +797,14 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
                 .send_bytes = if (cfg.http3_udp_send_buffer_bytes > 0) cfg.http3_udp_send_buffer_bytes else null,
             },
             .ecn_enabled = cfg.http3_ecn_enabled,
+            // RFC 9220 is advertised only when a route explicitly opts in
+            // to proxy_websocket; otherwise malformed/unsupported CONNECT
+            // envelopes fail at the H3 capability boundary.
+            .h3_settings = .{ .enable_connect_protocol = configRelaysWebSockets(cfg) },
             .request_handler = ghandlers.handleHttp3Request,
             .request_handler_ctx = &http3_dispatch_ctx,
+            .extended_connect_handler = if (configRelaysWebSockets(cfg)) ghandlers.handleHttp3ExtendedConnect else null,
+            .extended_connect_handler_ctx = if (configRelaysWebSockets(cfg)) &http3_dispatch_ctx else null,
             .early_data_compat_metrics_ctx = &state,
             .early_data_compat_metrics_cb = recordHttp3EarlyDataCompatFromRuntime,
             .quic_early_data_decision_metrics_ctx = &state,

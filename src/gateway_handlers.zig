@@ -2378,6 +2378,7 @@ pub fn handleHttp3ExtendedConnect(
         correlation_id,
         view.transport_early,
         &cfg_lease,
+        view.cancel_token,
     ) catch {
         return .{ .refuse = .{ .status = 502 } };
     };

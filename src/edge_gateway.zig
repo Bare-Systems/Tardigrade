@@ -4038,7 +4038,7 @@ fn h2AdmitWebSocketConnect(
     // behavior exactly.
     var synthesized = try synthesizeHttp2Request(allocator, method, path, ps);
     defer synthesized.deinit(allocator);
-    const outcome = gh2ws.admit(allocator, cfg, state, &synthesized.request, connection_ip, correlation_id, ps.transport_early, config_lease) catch |err| {
+    const outcome = gh2ws.admit(allocator, cfg, state, &synthesized.request, connection_ip, correlation_id, ps.transport_early, config_lease, null) catch |err| {
         try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.internal_error.value());
         _ = streams.remove(stream_id);
         return err;
@@ -7457,6 +7457,7 @@ fn executeH2WebSocketAdmissionJobBody(job: *H2WebSocketAdmissionJob, lease: *htt
         job.correlation_id,
         job.ps.transport_early,
         if (job.config_lease) |*lease2| lease2 else null,
+        null,
     )) |result| .{ .admitted = result } else |err| .{ .admit_error = err };
     finishWithOutcome(job, lease, handoff, outcome);
 }

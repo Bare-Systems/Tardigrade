@@ -513,6 +513,7 @@ pub fn build(b: *std.Build) void {
         "forward_auth responses are never shared-cacheable over h1",
         "generic proxy response cache collapses concurrent misses to one origin fill (#934)",
         "h3interop.cache_fill_reset releases waiter and unrelated QUIC request progresses before owner (#934)",
+        "h3interop.rfc9220.gateway",
     };
     const integration_smoke_step = b.step("test-integration-smoke", "Run the curated PR-smoke live-process integration subset (#945), including deterministic H1/H3 cache-collapse acceptance; fails closed if any named case matches nothing");
     for (integration_smoke_filters) |filter_name| {

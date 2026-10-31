@@ -90,9 +90,9 @@ pub const Outcome = union(enum) {
 
 /// Run every WebSocket admission gate for `request` (already synthesized
 /// from the Extended CONNECT's pseudo-headers) and, if admitted, dial and
-/// handshake the upstream. Runs synchronously on the caller's thread: see
-/// the call site in `edge_gateway.zig` for why that is an acceptable,
-/// explicitly scoped tradeoff for this phase.
+/// handshake the upstream. HTTP/3 runs this on its bounded admission pool;
+/// `cancel_token` is propagated into the origin handshake so a peer
+/// reset does not retain a pool worker until the normal network timeout.
 pub fn admit(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
@@ -102,7 +102,9 @@ pub fn admit(
     correlation_id: []const u8,
     transport_early: bool,
     config_lease: ?*gs.ConfigLease,
+    cancel_token: ?*const http.cancellation.CancellationToken,
 ) !Outcome {
+    if (cancel_token) |token| if (token.isStopped()) return error.RequestCancelled;
     var effective_cfg_storage = cfg.*;
     const route_cfg = routeConfig(cfg, request, &effective_cfg_storage) orelse cfg;
 
@@ -151,6 +153,7 @@ pub fn admit(
             return .{ .refused = .{ .status_code = 425, .code = "too_early" } };
         }
         if (matched.block.forward_auth) |*fa| {
+            if (cancel_token) |token| if (token.isStopped()) return error.RequestCancelled;
             const target_with_query = if (request.uri.query) |q| try std.fmt.allocPrint(allocator, "{s}?{s}", .{ request.uri.path, q }) else try allocator.dupe(u8, request.uri.path);
             defer allocator.free(target_with_query);
             var decision = try gfa.authorize(allocator, route_cfg, fa, .{
@@ -166,7 +169,12 @@ pub fn admit(
                 .headers = client_view.headers(request),
                 .body = null,
                 .asserted_names = client_view.asserted_names.items,
+                .cancel_token = cancel_token,
             });
+            if (cancel_token) |token| if (token.isStopped()) {
+                decision.deinit();
+                return error.RequestCancelled;
+            };
             var decision_owned = true;
             defer if (decision_owned) decision.deinit();
             state.metricsRecordForwardAuth(.h2, decision.outcome);
@@ -251,7 +259,7 @@ pub fn admit(
             .auth_device_id = ctx.device_id,
             .auth_scopes = ctx.scopes,
         },
-        null,
+        cancel_token,
         state.proxyBufferObserver(),
         state.proxyBufferGlobalAccount(),
         &state.upstream_pool,
@@ -273,6 +281,7 @@ pub fn admit(
         .switched => |upgraded| {
             recordDialOutcome(state, route_cfg, selected_base_url, absolute_target, circuit_permit, true);
             errdefer upgraded.deinit();
+            if (cancel_token) |token| if (token.isStopped()) return error.RequestCancelled;
             const owned_base_url = try allocator.dupe(u8, selected_base_url);
             errdefer allocator.free(owned_base_url);
             // Retained (not merely borrowed), so the detached relay thread's

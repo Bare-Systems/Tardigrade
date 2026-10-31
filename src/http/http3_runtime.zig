@@ -117,6 +117,10 @@ pub const ExtendedConnectAdmission = struct {
     /// `allocator` here is always the exact allocator it was created with.
     on_admitted: *const fn (std.mem.Allocator, *stream_session.Session, ?*anyopaque) void,
     on_admitted_ctx: ?*anyopaque = null,
+    /// Releases application-owned admission state when the runtime cannot
+    /// attach the stream. This is distinct from `on_admitted`: callers often
+    /// own an already-open upstream connection and capacity reservation.
+    on_admission_failed: ?*const fn (?*anyopaque) void = null,
 };
 
 pub const ExtendedConnectDecision = union(enum) {
@@ -2569,6 +2573,8 @@ pub const Runtime = struct {
     }
 
     fn admitTunnel(self: *Runtime, entry: *ConnEntry, stream_id: u64, admission: ExtendedConnectAdmission, now: u64) void {
+        var transferred = false;
+        defer if (!transferred) if (admission.on_admission_failed) |failed| failed(admission.on_admitted_ctx);
         const session_ptr = self.allocator.create(stream_session.Session) catch {
             self.refuseExtendedConnect(entry, stream_id, now, 503, &.{}, "");
             return;
@@ -2607,6 +2613,7 @@ pub const Runtime = struct {
             return;
         };
         admission.on_admitted(self.allocator, session_ptr, admission.on_admitted_ctx);
+        transferred = true;
     }
 
     /// Returns how many leading bytes of `bytes` the bound session accepted

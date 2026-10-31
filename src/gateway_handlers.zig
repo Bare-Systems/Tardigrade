@@ -2387,13 +2387,21 @@ pub fn handleHttp3ExtendedConnect(
             ctx.state.metricsRecordWebSocketUpgrade(refused.outcome);
             break :blk .{ .refuse = .{ .status = refused.status_code } };
         },
-        .switched => |switched| .{ .admit = .{
-            .status = 200,
-            .max_inbound_bytes = 1024 * 1024,
-            .max_outbound_bytes = 256 * 1024,
-            .on_admitted = H3WebSocketTunnel.onAdmitted,
-            .on_admitted_ctx = switched,
-        } },
+        .switched => |switched| blk: {
+            const admission = H3WebSocketAdmission.create(allocator, switched, correlation_id) catch {
+                switched.deinit();
+                break :blk .{ .refuse = .{ .status = 503 } };
+            };
+            break :blk .{ .admit = .{
+                .status = 200,
+                .headers = admission.headers.items,
+                .max_inbound_bytes = 1024 * 1024,
+                .max_outbound_bytes = 256 * 1024,
+                .on_admitted = H3WebSocketTunnel.onAdmitted,
+                .on_admitted_ctx = admission,
+                .on_admission_failed = H3WebSocketAdmission.onAdmissionFailed,
+            } };
+        },
     };
 }
 
@@ -2419,6 +2427,58 @@ fn h3ExtendedConnectRequest(allocator: std.mem.Allocator, view: *const http.http
     };
 }
 
+/// Owns the response headers until the reactor serializes the accepted H3
+/// HEADERS, then transfers the upgraded origin to the relay or frees it on
+/// every attachment failure.
+const H3WebSocketAdmission = struct {
+    allocator: std.mem.Allocator,
+    switched: *gh2ws.Switched,
+    headers: std.ArrayList(http.stream_transport.Header) = .empty,
+
+    fn create(allocator: std.mem.Allocator, switched: *gh2ws.Switched, correlation_id: []const u8) !*H3WebSocketAdmission {
+        const self = try allocator.create(H3WebSocketAdmission);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .switched = switched };
+        errdefer self.headers.deinit(allocator);
+        for (switched.upgraded.head.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "sec-websocket-protocol") or std.ascii.eqlIgnoreCase(header.name, "sec-websocket-extensions")) {
+                try self.appendHeader(header.name, header.value);
+            }
+        }
+        for (switched.forward_auth_grants.client_headers.items) |header| try self.appendHeader(header.name, header.value);
+        try self.appendHeader(http.correlation.REQUEST_HEADER_NAME, correlation_id);
+        try self.appendHeader(http.correlation.HEADER_NAME, correlation_id);
+        return self;
+    }
+
+    fn appendHeader(self: *H3WebSocketAdmission, name: []const u8, value: []const u8) !void {
+        // Response headers traverse QPACK, not HTTP/1 serialization. Reject
+        // connection-specific and pseudo fields before they reach H3.
+        if (name.len == 0 or name[0] == ':' or std.ascii.eqlIgnoreCase(name, "connection") or std.ascii.eqlIgnoreCase(name, "upgrade")) return;
+        const owned_name = try self.allocator.alloc(u8, name.len);
+        errdefer self.allocator.free(owned_name);
+        for (name, 0..) |byte, index| owned_name[index] = std.ascii.toLower(byte);
+        const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
+        try self.headers.append(self.allocator, .{ .name = owned_name, .value = owned_value });
+    }
+
+    fn deinit(self: *H3WebSocketAdmission, release_switched: bool) void {
+        for (self.headers.items) |header| {
+            self.allocator.free(@constCast(header.name));
+            self.allocator.free(@constCast(header.value));
+        }
+        self.headers.deinit(self.allocator);
+        if (release_switched) self.switched.deinit();
+        self.allocator.destroy(self);
+    }
+
+    fn onAdmissionFailed(callback_ctx: ?*anyopaque) void {
+        const self: *H3WebSocketAdmission = @ptrCast(@alignCast(callback_ctx orelse return));
+        self.deinit(true);
+    }
+};
+
 /// Detached relay owner for an admitted RFC 9220 stream.  It owns the
 /// upstream connection and admission lease; the H3 runtime retains ownership
 /// of the QUIC stream/session and reaps it after this consumer detaches.
@@ -2429,15 +2489,17 @@ const H3WebSocketTunnel = struct {
     switched: *gh2ws.Switched,
 
     fn onAdmitted(allocator: std.mem.Allocator, session: *http.stream_session.Session, callback_ctx: ?*anyopaque) void {
-        const switched: *gh2ws.Switched = @ptrCast(@alignCast(callback_ctx orelse {
+        const admission: *H3WebSocketAdmission = @ptrCast(@alignCast(callback_ctx orelse {
             session.requestCancel();
             return;
         }));
+        const switched = admission.switched;
         const self = allocator.create(H3WebSocketTunnel) catch {
             session.requestCancel();
-            switched.deinit();
+            admission.deinit(true);
             return;
         };
+        admission.deinit(false);
         self.* = .{ .allocator = allocator, .state = switched.state, .session = session, .switched = switched };
         const thread = std.Thread.spawn(.{}, H3WebSocketTunnel.run, .{self}) catch {
             allocator.destroy(self);
@@ -2446,6 +2508,7 @@ const H3WebSocketTunnel = struct {
             return;
         };
         thread.detach();
+        switched.state.metricsRecordWebSocketUpgrade(.relayed);
     }
 
     fn run(self: *H3WebSocketTunnel) void {

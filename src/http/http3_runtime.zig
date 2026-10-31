@@ -1167,8 +1167,7 @@ const ConnEntry = struct {
         self.parked_h3_cache_fills.deinit(allocator);
         for (self.pending_h3_responses.items) |*pending| pending.deinit(allocator);
         self.pending_h3_responses.deinit(allocator);
-        for (self.pending_h3_extended_connects.items) |*pending| pending.releaseFailed(allocator);
-        self.pending_h3_extended_connects.deinit(allocator);
+        releasePendingH3ExtendedConnects(allocator, &self.tunnel_sessions, &self.pending_h3_extended_connects);
         var tunnel_it = self.tunnel_sessions.valueIterator();
         while (tunnel_it.next()) |session_ptr| {
             // The session is a fully self-contained primitive (no reference
@@ -1364,6 +1363,62 @@ const PendingH3ExtendedConnect = struct {
         self.* = undefined;
     }
 };
+
+/// A parked accepted response and the session registry temporarily share the
+/// same session pointer.  Remove the registry entry before releasing the
+/// pending record, otherwise connection teardown would dereference the freed
+/// pointer again while settling attached tunnels.
+fn releasePendingH3ExtendedConnects(
+    allocator: std.mem.Allocator,
+    tunnel_sessions: *std.AutoHashMap(u64, *stream_session.Session),
+    pending_connects: *std.ArrayList(PendingH3ExtendedConnect),
+) void {
+    for (pending_connects.items) |*pending| {
+        const removed = tunnel_sessions.fetchRemove(pending.stream_id) orelse unreachable;
+        std.debug.assert(removed.value == pending.session_ptr);
+        pending.releaseFailed(allocator);
+    }
+    pending_connects.deinit(allocator);
+}
+
+test "pending H3 Extended CONNECT teardown removes the session registry entry first" {
+    const allocator = testing.allocator;
+    const Capture = struct {
+        failures: usize = 0,
+
+        fn admitted(_: std.mem.Allocator, _: *stream_session.Session, _: ?*anyopaque) void {
+            unreachable;
+        }
+
+        fn failed(ctx: ?*anyopaque) void {
+            const capture: *@This() = @ptrCast(@alignCast(ctx.?));
+            capture.failures += 1;
+        }
+    };
+
+    var capture = Capture{};
+    const session_ptr = try allocator.create(stream_session.Session);
+    errdefer allocator.destroy(session_ptr);
+    session_ptr.* = try stream_session.Session.init(allocator, 4, 64, 64, null);
+    errdefer session_ptr.deinit();
+
+    var tunnel_sessions = std.AutoHashMap(u64, *stream_session.Session).init(allocator);
+    defer tunnel_sessions.deinit();
+    try tunnel_sessions.put(4, session_ptr);
+
+    var pending_connects: std.ArrayList(PendingH3ExtendedConnect) = .empty;
+    try pending_connects.append(allocator, PendingH3ExtendedConnect.init(4, .{
+        .max_inbound_bytes = 64,
+        .max_outbound_bytes = 64,
+        .on_admitted = Capture.admitted,
+        .on_admitted_ctx = &capture,
+        .on_admission_failed = Capture.failed,
+    }, session_ptr));
+
+    releasePendingH3ExtendedConnects(allocator, &tunnel_sessions, &pending_connects);
+    try testing.expectEqual(@as(usize, 0), tunnel_sessions.count());
+    try testing.expectEqual(@as(usize, 1), capture.failures);
+}
 
 const async_h3_worker_count = 8;
 const async_h3_queue_capacity = 256;

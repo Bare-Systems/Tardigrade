@@ -240,6 +240,7 @@ pub fn authorize(
         null,
         null,
         false,
+        input.cancel_token,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         var failed = failWith(decision, classifyTransportError(err), fa.failure_status);

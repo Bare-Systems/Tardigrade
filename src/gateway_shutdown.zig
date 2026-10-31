@@ -681,7 +681,7 @@ pub fn http3ListenerConfigChanged(
         // A reload that changes whether any route relays WebSockets cannot
         // update that SETTINGS value or the runtime handler safely in place,
         // so make the existing restart-required listener contract explicit.
-        configRelaysWebSockets(current) != configRelaysWebSockets(proposed) or
+        (current.http3_enabled and configRelaysWebSockets(current) != configRelaysWebSockets(proposed)) or
         !std.mem.eql(u8, current.http3_qlog_dir, proposed.http3_qlog_dir) or
         // #763: client-auth policy is chosen per handshake from the shared
         // SNI-keyed policy set (H1, H2 and H3 alike), so it is hot-reloadable.
@@ -987,8 +987,10 @@ test "http3ListenerConfigChanged permits advertisement-only reloads" {
     // startup/connection-owned. Adding the first WebSocket route therefore
     // rejects an in-place reload rather than publishing a config the running
     // H3 listener cannot honour; the operator restarts to rotate listeners.
-    const original_locations = proposed.location_blocks;
-    defer proposed.location_blocks = original_locations;
+    const original_base_locations = base.location_blocks;
+    const original_proposed_locations = proposed.location_blocks;
+    defer base.location_blocks = original_base_locations;
+    defer proposed.location_blocks = original_proposed_locations;
     var websocket_locations = [_]edge_config.EdgeConfig.LocationBlock{.{
         .match_type = .prefix,
         .pattern = "/ws",
@@ -997,6 +999,31 @@ test "http3ListenerConfigChanged permits advertisement-only reloads" {
         .websocket = .{},
     }};
     proposed.location_blocks = &websocket_locations;
+    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+
+    // Once H3 remains enabled and both configurations retain RFC 9220
+    // capability, normal edits within existing WebSocket routes stay live.
+    var edited_websocket_locations = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/ws",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "edited" } },
+        .websocket = .{},
+    }};
+    base.location_blocks = &websocket_locations;
+    proposed.location_blocks = &edited_websocket_locations;
+    try std.testing.expect(!http3ListenerConfigChanged(&base, &proposed));
+
+    // H1/H2-only listeners do not own an H3 SETTINGS flight, so changing
+    // WebSocket routes remains hot-reloadable when H3 is disabled. Turning
+    // H3 back on restores the restart-required capability boundary.
+    base.location_blocks = original_base_locations;
+    proposed.location_blocks = &websocket_locations;
+    base.http3_enabled = false;
+    proposed.http3_enabled = false;
+    try std.testing.expect(!http3ListenerConfigChanged(&base, &proposed));
+    base.http3_enabled = true;
+    proposed.http3_enabled = true;
     try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
 }
 

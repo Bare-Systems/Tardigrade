@@ -2,6 +2,7 @@
 """External aioquic RFC 9220 WebSocket client for the gateway interop gate.
 
 Usage: aioquic_rfc9220_client.py HOST PORT PATH PAYLOAD [AUTHORITY]
+       [--header NAME:VALUE] [--expect-status STATUS] [--reset-after-200]
 
 This deliberately uses aioquic's QUIC + HTTP/3 stack rather than the native
 test client.  It performs the RFC 9220 non-FIN CONNECT/`:protocol` exchange,
@@ -9,6 +10,7 @@ then sends one masked RFC 6455 text frame through the H3 tunnel and requires
 the echoed frame before exiting successfully.
 """
 
+import argparse
 import asyncio
 import socket
 import ssl
@@ -31,10 +33,12 @@ def masked_text_frame(payload: bytes) -> bytes:
 
 
 class RFC9220Client(QuicConnectionProtocol):
-    def __init__(self, payload: bytes, *args, **kwargs):
+    def __init__(self, payload: bytes, expected_status: int, reset_after_200: bool, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.http = H3Connection(self._quic)
         self.payload = payload
+        self.expected_status = expected_status
+        self.reset_after_200 = reset_after_200
         self.stream_id = None
         self.status = None
         self.received = b""
@@ -49,8 +53,24 @@ class RFC9220Client(QuicConnectionProtocol):
         for http_event in self.http.handle_event(event):
             if isinstance(http_event, HeadersReceived) and http_event.stream_id == self.stream_id:
                 self.status = next((int(value) for name, value in http_event.headers if name == b":status"), None)
+                if self.status != self.expected_status:
+                    self.failure = f"expected status {self.expected_status}, got {self.status}"
+                    self.done.set()
+                    continue
                 if self.status != 200:
-                    self.failure = f"expected status 200, got {self.status}"
+                    # A denial response does not establish a WebSocket byte
+                    # stream. Seeing its final status is enough for this
+                    # client; the integration harness independently checks
+                    # that no origin handshake occurred.
+                    self.done.set()
+                    continue
+                if self.reset_after_200:
+                    # Exercise real QUIC receive/send cancellation after the
+                    # non-FIN 200 HEADERS, when the gateway owns an admitted
+                    # tunnel. Both directions are deliberately aborted.
+                    self._quic.stop_stream(self.stream_id, 0)
+                    self._quic.reset_stream(self.stream_id, 0)
+                    self.transmit()
                     self.done.set()
                     continue
                 self.http.send_data(self.stream_id, masked_text_frame(self.payload), end_stream=False)
@@ -64,7 +84,16 @@ class RFC9220Client(QuicConnectionProtocol):
                     self.done.set()
 
 
-async def main(host: str, port: int, path: str, payload: str, authority: str) -> int:
+async def main(
+    host: str,
+    port: int,
+    path: str,
+    payload: str,
+    authority: str,
+    headers: list[tuple[bytes, bytes]],
+    expected_status: int,
+    reset_after_200: bool,
+) -> int:
     configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
     configuration.verify_mode = ssl.CERT_NONE
     configuration.server_name = authority
@@ -73,7 +102,7 @@ async def main(host: str, port: int, path: str, payload: str, authority: str) ->
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", 0))
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: RFC9220Client(payload.encode(), connection), sock=sock
+        lambda: RFC9220Client(payload.encode(), expected_status, reset_after_200, connection), sock=sock
     )
     try:
         protocol.connect((host, port))
@@ -87,7 +116,7 @@ async def main(host: str, port: int, path: str, payload: str, authority: str) ->
                 (b":scheme", b"https"),
                 (b":authority", authority.encode()),
                 (b":path", path.encode()),
-            ],
+            ] + headers,
             end_stream=False,
         )
         protocol.transmit()
@@ -105,6 +134,30 @@ async def main(host: str, port: int, path: str, payload: str, authority: str) ->
 
 
 if __name__ == "__main__":
-    host, port, path, payload = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-    authority = sys.argv[5] if len(sys.argv) > 5 else host
-    sys.exit(asyncio.run(main(host, port, path, payload, authority)))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("host")
+    parser.add_argument("port", type=int)
+    parser.add_argument("path")
+    parser.add_argument("payload")
+    parser.add_argument("authority", nargs="?")
+    parser.add_argument("--header", action="append", default=[])
+    parser.add_argument("--expect-status", type=int, default=200)
+    parser.add_argument("--reset-after-200", action="store_true")
+    args = parser.parse_args()
+    headers = []
+    for item in args.header:
+        name, sep, value = item.partition(":")
+        if not sep or not name:
+            parser.error("--header must be NAME:VALUE")
+        headers.append((name.encode(), value.encode()))
+    authority = args.authority or args.host
+    sys.exit(asyncio.run(main(
+        args.host,
+        args.port,
+        args.path,
+        args.payload,
+        authority,
+        headers,
+        args.expect_status,
+        args.reset_after_200,
+    )))

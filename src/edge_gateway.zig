@@ -15759,7 +15759,12 @@ test "H2 live: graceful shutdown stays bounded with an actively echoing session,
     const shutdown_elapsed_ms = compat.milliTimestamp() - shutdown_started;
     try std.testing.expect(shutdown_elapsed_ms <= 2_000);
     server_ctx.result catch |err| {
-        try std.testing.expect(isBenignDisconnect(err) or err == error.SocketWriteFailed);
+        // This fixture intentionally leaves the config's drain timeout at
+        // zero. Depending on whether the shutdown wake or the queued PING
+        // wins the poll race, the real loop either returns after settling
+        // sessions or reports the documented immediate-drain timeout. Both
+        // are bounded shutdown outcomes; neither may hang the connection.
+        try std.testing.expect(isBenignDisconnect(err) or err == error.SocketWriteFailed or err == error.Http2ShutdownDrainTimeout);
     };
     hook_ctx.joinAll();
 }

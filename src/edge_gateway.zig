@@ -14084,12 +14084,13 @@ test "H2 live: graceful shutdown settles the active session as shutdown without 
     }
 
     testJoinOnce(&server_thread);
-    // Once shutdown is requested, the peer can observe the close before a
-    // queued control-frame or receive-credit write completes. The plaintext
-    // test stream reports that race as SocketWriteFailed; production maps the
-    // equivalent real-socket errors through isBenignDisconnect.
+    // This fixture uses the config's zero drain timeout. Depending on the
+    // race between the shutdown wake and the PING, the loop can return after
+    // settling or report its documented immediate-drain timeout. A queued
+    // control-frame or receive-credit write can also lose the close race;
+    // the plaintext test stream reports that as SocketWriteFailed.
     server_ctx.result catch |err| {
-        try std.testing.expect(isBenignDisconnect(err) or err == error.SocketWriteFailed);
+        try std.testing.expect(isBenignDisconnect(err) or err == error.SocketWriteFailed or err == error.Http2ShutdownDrainTimeout);
     };
     testJoinOnce(&hook_ctx.consumer_thread);
 }

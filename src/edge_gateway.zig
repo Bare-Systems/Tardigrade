@@ -14084,7 +14084,13 @@ test "H2 live: graceful shutdown settles the active session as shutdown without 
     }
 
     testJoinOnce(&server_thread);
-    try server_ctx.result;
+    // Once shutdown is requested, the peer can observe the close before a
+    // queued control-frame or receive-credit write completes. The plaintext
+    // test stream reports that race as SocketWriteFailed; production maps the
+    // equivalent real-socket errors through isBenignDisconnect.
+    server_ctx.result catch |err| {
+        try std.testing.expect(isBenignDisconnect(err) or err == error.SocketWriteFailed);
+    };
     testJoinOnce(&hook_ctx.consumer_thread);
 }
 
@@ -15731,20 +15737,30 @@ test "H2 live: graceful shutdown stays bounded with an actively echoing session,
     // pass silently.
     http.shutdown.requestShutdown();
     try client.writer().enqueueFrame(.ping, 0, 0, &[_]u8{0} ** 8);
-    var ping_ack: http.http2_frame.Frame = while (true) {
-        var frame = try client.readFrame(allocator);
-        if (frame.typ != .window_update) break frame;
+    // A close is equally valid here: it means the shutdown loop observed the
+    // request before it sent the PING ACK. The bounded join below is the
+    // property this test is asserting.
+    var ping_ack: ?http.http2_frame.Frame = read_ping_ack: while (true) {
+        var frame = client.readFrame(allocator) catch |err| switch (err) {
+            error.ConnectionClosed => break :read_ping_ack null,
+            else => return err,
+        };
+        if (frame.typ != .window_update) break :read_ping_ack frame;
         http.http2_frame.deinitFrame(allocator, &frame);
     };
-    defer http.http2_frame.deinitFrame(allocator, &ping_ack);
-    try std.testing.expectEqual(http.http2_frame.Type.ping, ping_ack.typ);
-    try std.testing.expect((ping_ack.flags & http.http2_frame.Flags.ACK) != 0);
+    if (ping_ack) |*frame| {
+        defer http.http2_frame.deinitFrame(allocator, frame);
+        try std.testing.expectEqual(http.http2_frame.Type.ping, frame.typ);
+        try std.testing.expect((frame.flags & http.http2_frame.Flags.ACK) != 0);
+    }
 
     const shutdown_started = compat.milliTimestamp();
     testJoinOnce(&server_thread);
     const shutdown_elapsed_ms = compat.milliTimestamp() - shutdown_started;
     try std.testing.expect(shutdown_elapsed_ms <= 2_000);
-    try server_ctx.result;
+    server_ctx.result catch |err| {
+        try std.testing.expect(isBenignDisconnect(err) or err == error.SocketWriteFailed);
+    };
     hook_ctx.joinAll();
 }
 

@@ -14066,17 +14066,22 @@ test "H2 live: graceful shutdown settles the active session as shutdown without 
     // The connection loop only rechecks the shutdown flag between frame
     // reads; nudge it with a harmless PING so it wakes up and observes it.
     try client.writer().enqueueFrame(.ping, 0, 0, &[_]u8{0} ** 8);
-    // The "alive" echo above earned the consumer receive credit, which may
-    // surface as its own WINDOW_UPDATE(s) interleaved before the PING ACK;
-    // skip those rather than assume the very next frame is the ack.
-    var ping_ack: http.http2_frame.Frame = while (true) {
-        var frame = try client.readFrame(allocator);
-        if (frame.typ != .window_update) break frame;
+    // The shutdown path may either acknowledge this PING before closing or
+    // close immediately once it observes the flag. Both outcomes prove the
+    // live session settled; the join below verifies the server succeeded.
+    var ping_ack: ?http.http2_frame.Frame = read_ping_ack: while (true) {
+        var frame = client.readFrame(allocator) catch |err| switch (err) {
+            error.ConnectionClosed => break :read_ping_ack null,
+            else => return err,
+        };
+        if (frame.typ != .window_update) break :read_ping_ack frame;
         http.http2_frame.deinitFrame(allocator, &frame);
     };
-    defer http.http2_frame.deinitFrame(allocator, &ping_ack);
-    try std.testing.expectEqual(http.http2_frame.Type.ping, ping_ack.typ);
-    try std.testing.expect((ping_ack.flags & http.http2_frame.Flags.ACK) != 0);
+    if (ping_ack) |*frame| {
+        defer http.http2_frame.deinitFrame(allocator, frame);
+        try std.testing.expectEqual(http.http2_frame.Type.ping, frame.typ);
+        try std.testing.expect((frame.flags & http.http2_frame.Flags.ACK) != 0);
+    }
 
     testJoinOnce(&server_thread);
     try server_ctx.result;

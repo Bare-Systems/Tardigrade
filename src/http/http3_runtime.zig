@@ -112,6 +112,10 @@ pub const ExtendedConnectAdmission = struct {
     headers: []const stream_transport.Header = &.{},
     max_inbound_bytes: usize,
     max_outbound_bytes: usize,
+    /// Optional policy snapshot for connection-owned H3 tunnel queues.  The
+    /// embedding supplies it only when its upstream relay has fixed buffers
+    /// that must share the same configured proxy-buffer budget.
+    queue_budget: ?stream_session.QueueBudget = null,
     /// Called once the session is admitted and attached to its QUIC stream.
     /// The embedder should spawn its own relay thread here. `*stream_session.
     /// Session` follows the primitive's own two-party detach contract: the
@@ -2926,7 +2930,7 @@ pub const Runtime = struct {
             self.refuseExtendedConnect(entry, stream_id, now, 503, &.{}, "");
             return;
         };
-        session_ptr.* = stream_session.Session.init(self.allocator, stream_id, admission.max_inbound_bytes, admission.max_outbound_bytes, null) catch {
+        session_ptr.* = stream_session.Session.initWithQueueBudget(self.allocator, stream_id, admission.max_inbound_bytes, admission.max_outbound_bytes, null, admission.queue_budget) catch {
             self.allocator.destroy(session_ptr);
             if (admission.on_admission_failed) |failed| failed(admission.on_admitted_ctx);
             self.refuseExtendedConnect(entry, stream_id, now, 503, &.{}, "");

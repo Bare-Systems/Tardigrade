@@ -4448,6 +4448,40 @@ pub const UpgradedUpstream = struct {
     to_upstream_reservation: ProxyBufferReservation,
     to_client_reservation: ProxyBufferReservation,
 
+    /// The H3 relay is the only WebSocket consumer that cannot use
+    /// `UpgradedUpstream.relay`: it has a connection-owned stream session in
+    /// place of an H1 socket. Transfer the already allocated, already sized
+    /// relay buffers to that session instead of creating two additional 16 KiB
+    /// mailboxes. Their old reservation is released here and immediately
+    /// re-established by `stream_session.Session.initWithQueueBudget`, where
+    /// the mailboxes and dynamically queued bytes share one policy snapshot.
+    pub const H3RelayBuffers = struct {
+        to_upstream: []u8,
+        to_client: []u8,
+        budget: http.stream_session.QueueBudget,
+    };
+
+    pub fn takeH3RelayBuffers(self: *UpgradedUpstream) H3RelayBuffers {
+        const budget = http.stream_session.QueueBudget{
+            .limits = self.to_upstream_reservation.account.limits,
+            .observer = self.to_upstream_reservation.observer,
+            .capacity = self.to_upstream_reservation.capacity,
+            .fixed_inbound_bytes = self.to_upstream_buf.len,
+            .fixed_outbound_bytes = self.to_client_buf.len,
+        };
+        // The session now owns the accounting for these still-live buffers.
+        // `deinit` remains responsible for their storage, but both old
+        // reservations are empty before that happens, so they cannot be
+        // released twice.
+        self.to_upstream_reservation.releaseAll();
+        self.to_client_reservation.releaseAll();
+        return .{
+            .to_upstream = self.to_upstream_buf,
+            .to_client = self.to_client_buf,
+            .budget = budget,
+        };
+    }
+
     pub fn deinit(self: *UpgradedUpstream) void {
         const allocator = self.allocator;
         if (self.tls) |tls| {

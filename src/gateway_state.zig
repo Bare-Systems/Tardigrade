@@ -4463,14 +4463,16 @@ pub const GatewayState = struct {
     /// This is deliberately a separate series from
     /// `tardigrade_buffered_bytes_current{scope="global"}`: that gauge is a
     /// roll-up of every proxy-owned buffer (bounded buffered responses, HTTP/1
-    /// relay buffers, request-side buffers, HTTP/2 queues), whereas
+    /// relay buffers, request-side buffers, HTTP/2 queues and HTTP/3
+    /// WebSocket tunnel queues), whereas
     /// `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` is currently enforced
-    /// only against HTTP/2 streaming response queues. Comparing the roll-up
+    /// against HTTP/2 streaming response queues and HTTP/3 WebSocket tunnel
+    /// queues. Comparing the roll-up
     /// with the limit would mislead under mixed traffic; this series is the one
     /// an operator can put next to the configured limit.
     fn appendProxyBufferAggregatePrometheus(self: *GatewayState, out: *std.array_list.Managed(u8)) !void {
         try out.appendSlice(
-            \\# HELP tardigrade_proxy_buffer_aggregate_bytes_current Bytes reserved at the aggregate scope the configured hard limit is enforced against (HTTP/2 stream queues, HTTP/1 relay buffers, and request-direction upload buffers)
+            \\# HELP tardigrade_proxy_buffer_aggregate_bytes_current Bytes reserved at the aggregate scope the configured hard limit is enforced against (HTTP/2 stream queues, HTTP/3 WebSocket tunnel queues, HTTP/1 relay buffers, and request-direction upload buffers)
             \\# TYPE tardigrade_proxy_buffer_aggregate_bytes_current gauge
             \\
         );

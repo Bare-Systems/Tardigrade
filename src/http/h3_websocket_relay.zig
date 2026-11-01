@@ -47,6 +47,11 @@ pub const Options = struct {
     /// END_STREAM on its own before forcing an immediate RST_STREAM
     /// teardown (#952 review; mirrors `tunnel.Options.close_flush_timeout_ms`).
     close_flush_timeout_ms: u32 = 1_000,
+    /// The handshake's existing, accounting-covered relay storage. H3 passes
+    /// these instead of allocating duplicate mailboxes. Unit callers may omit
+    /// them and receive stack-local test storage.
+    to_upstream_buffer: ?[]u8 = null,
+    to_client_buffer: ?[]u8 = null,
 };
 
 /// The upgraded upstream WebSocket connection's transport: a plain TCP/Unix
@@ -91,12 +96,17 @@ pub const Upstream = struct {
 const Channel = struct {
     mutex: compat.Mutex = .{},
     cond: compat.Condition = .{},
-    buf: [relay_chunk_bytes]u8 = undefined,
+    buf: []u8,
     len: usize = 0,
     offset: usize = 0,
     /// The producer will never place another item (end of stream, or
     /// `abort`). Bytes already queued are left for the consumer to drain.
     closed: bool = false,
+
+    fn init(buf: []u8) Channel {
+        std.debug.assert(buf.len >= relay_chunk_bytes);
+        return .{ .buf = buf };
+    }
 
     /// Blocking producer: waits for the slot to be free, or for `abort`.
     /// False means the channel closed before anything could be queued.
@@ -105,6 +115,7 @@ const Channel = struct {
         defer self.mutex.unlock();
         while (self.len > 0 and !self.closed) self.cond.wait(&self.mutex);
         if (self.closed) return false;
+        std.debug.assert(data.len <= self.buf.len);
         @memcpy(self.buf[0..data.len], data);
         self.len = data.len;
         self.offset = 0;
@@ -118,6 +129,7 @@ const Channel = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.len > 0 or self.closed) return false;
+        std.debug.assert(data.len <= self.buf.len);
         @memcpy(self.buf[0..data.len], data);
         self.len = data.len;
         self.offset = 0;
@@ -212,9 +224,9 @@ const Shared = struct {
     session: *stream_session.Session,
     upstream: Upstream,
     /// Session -> upstream bytes, drained exclusively by `Pump`.
-    c2u: Channel = .{},
+    c2u: Channel,
     /// Upstream -> session bytes, produced exclusively by `Pump`.
-    u2c: Channel = .{},
+    u2c: Channel,
 
     fn touch(self: *Shared) void {
         self.last_activity_ms.store(event_loop.monotonicMs(), .monotonic);
@@ -455,10 +467,14 @@ const Pump = struct {
 /// read bytes.
 pub fn run(session: *stream_session.Session, upstream: Upstream, initial_to_client: []const u8, opts: Options) Stats {
     const started = event_loop.monotonicMs();
+    var fallback_to_upstream: [relay_chunk_bytes]u8 = undefined;
+    var fallback_to_client: [relay_chunk_bytes]u8 = undefined;
     var shared = Shared{
         .last_activity_ms = std.atomic.Value(u64).init(started),
         .session = session,
         .upstream = upstream,
+        .c2u = Channel.init(opts.to_upstream_buffer orelse &fallback_to_upstream),
+        .u2c = Channel.init(opts.to_client_buffer orelse &fallback_to_client),
     };
 
     if (initial_to_client.len > 0) {
@@ -571,10 +587,14 @@ test "Pump safely observes shutdown between hasRoom and tryPut" {
         }
     };
     var race = Race{};
+    var c2u_buf: [relay_chunk_bytes]u8 = undefined;
+    var u2c_buf: [relay_chunk_bytes]u8 = undefined;
     var shared = Shared{
         .last_activity_ms = std.atomic.Value(u64).init(event_loop.monotonicMs()),
         .session = &session,
         .upstream = .{ .fd = origin_side, .tls = null },
+        .c2u = Channel.init(&c2u_buf),
+        .u2c = Channel.init(&u2c_buf),
     };
     var pump = Pump{
         .shared = &shared,
@@ -601,7 +621,8 @@ test "Pump safely observes shutdown between hasRoom and tryPut" {
 }
 
 test "Channel backpressure never exceeds one relay chunk" {
-    var channel = Channel{};
+    var buf: [relay_chunk_bytes]u8 = undefined;
+    var channel = Channel.init(&buf);
     var chunk: [relay_chunk_bytes]u8 = undefined;
     @memset(&chunk, 'b');
 

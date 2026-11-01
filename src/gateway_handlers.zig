@@ -662,6 +662,12 @@ fn minimalHttp3ProxyConfig(blocks: []http.location_router.LocationBlock) edge_co
         .per_origin_hard_limit = 0,
         .global_hard_limit = 0,
     };
+    // `minimalAuthConfig` intentionally constructs only the common auth
+    // fixture fields. Keep the optional response cache disabled here instead
+    // of letting this proxy fixture read an uninitialized TTL when an
+    // anonymous request is cache-eligible.
+    cfg.proxy_cache_ttl_seconds = 0;
+    cfg.proxy_cache_stale_while_revalidate_seconds = 0;
     cfg.upstream_pool_enabled = false;
     cfg.upstream_pool_max_idle_per_host = 0;
     cfg.upstream_pool_idle_timeout_ms = 0;

@@ -18105,10 +18105,10 @@ test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
     try std.testing.expect(!pending.contains(1));
     try std.testing.expectEqual(@as(usize, 0), ready.items.len);
     try std.testing.expectEqual(@as(usize, 0), buffered);
-    // The stream is closed, so the new lifecycle gate refuses follow-up frames
-    // on it, while an unrelated stream keeps working.
-    try std.testing.expectEqual(http.http2_stream.StreamState.closed, streams.get(1).?.state);
-    try std.testing.expect(!h2StreamAcceptsInboundFrame(&streams, 1));
+    // The refusal retires its bookkeeping, so repeated refused CONNECTs do
+    // not exhaust the connection's bounded stream map. The frame loop treats
+    // later DATA on this already-observed stream as stale stream-local input.
+    try std.testing.expect(!streams.contains(1));
     try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 3));
     // A RST_STREAM frame (type 0x3) for stream 1 was written, not a GOAWAY
     // (type 0x7): the connection survives.

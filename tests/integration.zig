@@ -4070,8 +4070,10 @@ const AioquicExtendedConnectOptions = struct {
     slow_receive_delay: ?[]const u8 = null,
     max_stream_data: ?[]const u8 = null,
     reload_signal_pid: ?[]const u8 = null,
+    lifecycle_signal: ?[]const u8 = null,
     post_reload_payload: ?[]const u8 = null,
     expect_terminal_after_signal: bool = false,
+    expected_greeting_bytes: ?[]const u8 = null,
 };
 
 fn runAioquicH3ExtendedConnectWithOptions(
@@ -4138,11 +4140,19 @@ fn runAioquicH3ExtendedConnectWithOptions(
         try argv.append("--reload-signal-pid");
         try argv.append(reload_signal_pid);
     }
+    if (options.lifecycle_signal) |lifecycle_signal| {
+        try argv.append("--lifecycle-signal");
+        try argv.append(lifecycle_signal);
+    }
     if (options.post_reload_payload) |post_reload_payload| {
         try argv.append("--post-reload-payload");
         try argv.append(post_reload_payload);
     }
     if (options.expect_terminal_after_signal) try argv.append("--expect-terminal-after-signal");
+    if (options.expected_greeting_bytes) |expected_greeting_bytes| {
+        try argv.append("--expect-greeting-bytes");
+        try argv.append(expected_greeting_bytes);
+    }
     return bounded_process.run(allocator, .{
         .argv = argv.items,
         .stdout_limit = 64 * 1024,
@@ -27468,6 +27478,12 @@ const WsOrigin = struct {
         return self.handshakes;
     }
 
+    fn activeConnectionCount(self: *WsOrigin) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.conn_fds.items.len;
+    }
+
     /// Value of `name` on the last handshake the origin received, or null.
     fn handshakeHeader(self: *WsOrigin, allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
         self.mutex.lock();
@@ -28334,11 +28350,13 @@ test "h3interop.rfc9220.gateway aioquic external client resumes a bounded slow r
     var client = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/slow", "slow-window-echo", .{
         .max_stream_data = "2048",
         .slow_receive_delay = "0.75",
+        .expected_greeting_bytes = "32768",
     });
     defer client.deinit(allocator);
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
     try assertContains(client.stdout, "status: 200");
     try assertContains(client.stdout, "slow receive pause elapsed; echo completed");
+    try assertContains(client.stdout, "received complete ordered greeting: 32768 bytes");
     try assertContains(client.stdout, "slow-window-echo");
     try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
 }
@@ -28485,6 +28503,64 @@ test "h3interop.rfc9220.gateway aioquic external client drains an admitted tunne
     try assertContains(client.stdout, "tunnel ended after lifecycle signal");
     try waitForLogSubstring(allocator, tardigrade.log_path, "configuration hot-reload applied", 5_000);
     try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+}
+
+test "h3interop.rfc9220.gateway aioquic external client drains an admitted tunnel on graceful shutdown (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS", .value = "350" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+    const pid = try std.fmt.allocPrint(allocator, "{d}", .{tardigrade.child.id orelse return error.MissingTardigradePid});
+    defer allocator.free(pid);
+
+    // The external peer signals the shipping process only after a live H3
+    // CONNECT has completed an echo.  It remains connected until the server
+    // ends the stream, so a client-side close cannot masquerade as drain.
+    var client = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/shutdown", "before-shutdown", .{
+        .reload_signal_pid = pid,
+        .lifecycle_signal = "TERM",
+        .expect_terminal_after_signal = true,
+    });
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "before-shutdown");
+    try assertContains(client.stdout, "tunnel ended after lifecycle signal");
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+
+    const origin_close_deadline = compat.milliTimestamp() + 5_000;
+    while (origin.activeConnectionCount() != 0) {
+        if (compat.milliTimestamp() >= origin_close_deadline) return error.H3OriginDidNotCloseDuringShutdown;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+    try waitForPortClosed(tardigrade.port, 5_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "Graceful shutdown complete", 5_000);
 }
 
 test "h3interop.rfc9220.gateway aioquic external client verifies SETTINGS disabled without a WebSocket route (#821)" {

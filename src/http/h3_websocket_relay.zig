@@ -372,6 +372,19 @@ const Pump = struct {
     shared: *Shared,
     endpoint: tunnel.AnyEndpoint,
     idle_sleep_ns: u64,
+    // Test-only synchronization point for the cancellation race below.  It
+    // stays null in production, so the relay never calls through it there.
+    before_u2c_try_put: ?*const fn (?*anyopaque) void = null,
+    before_u2c_try_put_ctx: ?*anyopaque = null,
+
+    /// `hasRoom` is only a read-side backpressure hint: another relay worker
+    /// can abort this mailbox before this producer reacquires its mutex.  A
+    /// failed put is therefore normal cancellation, never an assertion.
+    fn queueUpstreamBytes(self: *Pump, bytes: []const u8) bool {
+        if (self.shared.u2c.tryPut(bytes)) return true;
+        if (!self.shared.isDone()) self.shared.finishOnce(.upstream_error);
+        return false;
+    }
 
     fn run(self: *Pump) void {
         self.endpoint.begin();
@@ -421,9 +434,8 @@ const Pump = struct {
                     if (nn == 0) {
                         self.shared.u2c.closeProducer();
                     } else {
-                        // `hasRoom` just confirmed the slot is free, and
-                        // this is `u2c`'s only producer, so this cannot fail.
-                        std.debug.assert(self.shared.u2c.tryPut(scratch[0..nn]));
+                        if (self.before_u2c_try_put) |before| before(self.before_u2c_try_put_ctx);
+                        if (!self.queueUpstreamBytes(scratch[0..nn])) return;
                         progressed = true;
                     }
                 }
@@ -536,6 +548,70 @@ fn statsFor(shared: *Shared, s2u: *const SessionToUpstream, writer: *const Sessi
 fn cancelResponder(session: *stream_session.Session) void {
     while (!session.takeCancelRequest()) compat.sleepNs(2 * std.time.ns_per_ms);
     session.deliverReset(0x010c);
+}
+
+test "Pump safely observes shutdown between hasRoom and tryPut" {
+    const allocator = std.testing.allocator;
+    var session = try stream_session.Session.init(allocator, 1, 64 * 1024, 64 * 1024, null);
+    defer session.deinit();
+
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    const origin_side = fds[0];
+    const test_side = fds[1];
+    defer _ = std.c.close(test_side);
+
+    const Race = struct {
+        stage: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+        fn waitBeforePut(ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.stage.store(1, .release);
+            while (self.stage.load(.acquire) != 2) compat.sleepNs(std.time.ns_per_ms);
+        }
+    };
+    var race = Race{};
+    var shared = Shared{
+        .last_activity_ms = std.atomic.Value(u64).init(event_loop.monotonicMs()),
+        .session = &session,
+        .upstream = .{ .fd = origin_side, .tls = null },
+    };
+    var pump = Pump{
+        .shared = &shared,
+        .endpoint = shared.upstream.endpoint(),
+        .idle_sleep_ns = std.time.ns_per_ms,
+        .before_u2c_try_put = Race.waitBeforePut,
+        .before_u2c_try_put_ctx = &race,
+    };
+    const pump_thread = try std.Thread.spawn(.{}, Pump.run, .{&pump});
+
+    try writeAllBlocking(test_side, "race");
+    while (race.stage.load(.acquire) != 1) compat.sleepNs(std.time.ns_per_ms);
+    // This is the deterministic interleaving: `hasRoom` has returned and
+    // `Pump` is paused immediately before `tryPut`, then a watchdog-style
+    // administrative shutdown aborts the mailbox.
+    shared.finishOnce(.shutdown);
+    race.stage.store(2, .release);
+    pump_thread.join();
+
+    try std.testing.expect(shared.isDone());
+    try std.testing.expectEqual(CloseReason.shutdown, shared.reason);
+    try std.testing.expect(!shared.u2c.hasRoom());
+    session.deliverShutdown();
+}
+
+test "Channel backpressure never exceeds one relay chunk" {
+    var channel = Channel{};
+    var chunk: [relay_chunk_bytes]u8 = undefined;
+    @memset(&chunk, 'b');
+
+    try std.testing.expect(channel.tryPut(&chunk));
+    try std.testing.expect(!channel.hasRoom());
+    // A full mailbox rejects a second item; `Pump` consequently does not
+    // perform another upstream read until this entire fixed-size chunk drains.
+    try std.testing.expect(!channel.tryPut("one byte too many"));
+    channel.advance(chunk.len);
+    try std.testing.expect(channel.hasRoom());
 }
 
 test "run relays bytes both ways and reports idle close" {

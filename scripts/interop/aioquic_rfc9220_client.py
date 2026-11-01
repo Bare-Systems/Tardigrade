@@ -47,9 +47,11 @@ class RFC9220Client(QuicConnectionProtocol):
         drop_transport_after_200: bool,
         slow_receive_delay: float | None,
         reload_signal_pid: int | None,
+        lifecycle_signal: int,
         post_reload_payload: bytes | None,
         post_reload_delay: float,
         expect_terminal_after_signal: bool,
+        expected_greeting_bytes: int,
         path: str,
         authority: str,
         *args,
@@ -64,9 +66,11 @@ class RFC9220Client(QuicConnectionProtocol):
         self.drop_transport_after_200 = drop_transport_after_200
         self.slow_receive_delay = slow_receive_delay
         self.reload_signal_pid = reload_signal_pid
+        self.lifecycle_signal = lifecycle_signal
         self.post_reload_payload = post_reload_payload
         self.post_reload_delay = post_reload_delay
         self.expect_terminal_after_signal = expect_terminal_after_signal
+        self.expected_greeting = b"b" * expected_greeting_bytes
         self.path = path
         self.authority = authority
         self.stream_id = None
@@ -114,7 +118,17 @@ class RFC9220Client(QuicConnectionProtocol):
         self.transmit()
 
     def signal_gateway(self) -> None:
-        os.kill(self.reload_signal_pid, signal.SIGHUP)
+        os.kill(self.reload_signal_pid, self.lifecycle_signal)
+
+    def received_expected_greeting(self) -> bool:
+        # The origin greeting is an unmasked server WebSocket frame.  Looking
+        # for this complete contiguous payload proves that H3 DATA preserved
+        # every byte and order across the intentionally tiny receive window;
+        # the separately asserted echo proves later traffic still progresses.
+        return not self.expected_greeting or self.expected_greeting in self.received
+
+    def initial_exchange_complete(self) -> bool:
+        return self.payload in self.received and self.received_expected_greeting()
 
     def start_reset_recovery_connect(self) -> None:
         # Do this only after the unrelated GET completes.  Keeping this QUIC
@@ -287,7 +301,7 @@ class RFC9220Client(QuicConnectionProtocol):
                 if self.post_reload_sent and self.post_reload_payload in self.received:
                     self.post_reload_echo_completed = True
                     self.done.set()
-                elif self.payload in self.received:
+                elif self.initial_exchange_complete():
                     if self.reload_signal_pid is not None and not self.reload_signaled:
                         self.signal_gateway()
                         self.reload_signaled = True
@@ -300,7 +314,7 @@ class RFC9220Client(QuicConnectionProtocol):
                     if self.expect_terminal_after_signal and self.reload_signaled:
                         self.terminal_after_signal = True
                     else:
-                        self.failure = "tunnel ended before echo"
+                        self.failure = "tunnel ended before complete greeting and echo"
                     self.done.set()
 
 
@@ -319,9 +333,11 @@ async def main(
     slow_receive_delay: float | None,
     max_stream_data: int | None,
     reload_signal_pid: int | None,
+    lifecycle_signal: int,
     post_reload_payload: str | None,
     post_reload_delay: float,
     expect_terminal_after_signal: bool,
+    expected_greeting_bytes: int,
     isolation_path: str | None,
     expect_connect_protocol: bool,
     settings_only: bool,
@@ -348,9 +364,11 @@ async def main(
             drop_transport_after_200,
             slow_receive_delay,
             reload_signal_pid,
+            lifecycle_signal,
             post_reload_payload.encode() if post_reload_payload is not None else None,
             post_reload_delay,
             expect_terminal_after_signal,
+            expected_greeting_bytes,
             path,
             authority,
             connection,
@@ -487,6 +505,11 @@ async def main(
             print(protocol.reset_recovery_connect_received.decode(errors="replace"))
         if protocol.slow_receive_pause_completed:
             print("slow receive pause elapsed; echo completed")
+        if protocol.expected_greeting:
+            if not protocol.received_expected_greeting():
+                print(f"missing complete ordered greeting: {len(protocol.expected_greeting)} bytes")
+                return 1
+            print(f"received complete ordered greeting: {len(protocol.expected_greeting)} bytes")
         if protocol.post_reload_echo_completed:
             print("post-reload tunnel echo completed")
         if protocol.terminal_after_signal:
@@ -515,9 +538,11 @@ if __name__ == "__main__":
     parser.add_argument("--slow-receive-delay", type=float)
     parser.add_argument("--max-stream-data", type=int)
     parser.add_argument("--reload-signal-pid", type=int)
+    parser.add_argument("--lifecycle-signal", choices=("HUP", "TERM"), default="HUP")
     parser.add_argument("--post-reload-payload")
     parser.add_argument("--post-reload-delay", type=float, default=0.5)
     parser.add_argument("--expect-terminal-after-signal", action="store_true")
+    parser.add_argument("--expect-greeting-bytes", type=int, default=0)
     parser.add_argument("--isolation-path")
     parser.add_argument("--expect-connect-protocol", type=int, choices=(0, 1), default=1)
     parser.add_argument("--settings-only", action="store_true")
@@ -552,9 +577,11 @@ if __name__ == "__main__":
         args.slow_receive_delay,
         args.max_stream_data,
         args.reload_signal_pid,
+        getattr(signal, "SIG" + args.lifecycle_signal),
         args.post_reload_payload,
         args.post_reload_delay,
         args.expect_terminal_after_signal,
+        args.expect_greeting_bytes,
         args.isolation_path,
         bool(args.expect_connect_protocol),
         args.settings_only,

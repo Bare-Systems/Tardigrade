@@ -2193,6 +2193,12 @@ pub const Runtime = struct {
                     self.drainConnectionTransmits(entry, now);
                     const handshake_timed_out = handshakeTimedOutForRemoval(entry, now);
                     if (drain_expired and !handshake_timed_out) {
+                        // A relay that observed the process shutdown asks its
+                        // Session runtime to cancel.  Reconcile that request
+                        // before closing the QUIC connection so the peer sees
+                        // a terminal stream signal instead of a silent UDP
+                        // disappearance at the outer process deadline.
+                        self.reconcileTunnels(entry);
                         self.closeForDrainDeadline(entry, now);
                     } else if (!drain_expired) {
                         self.pumpH3(entry, now);

@@ -1374,7 +1374,13 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     // the reactor owns to reach their drain deadline.
     tunnel_reactor.stopAndJoin();
     if (http3_runtime) |*runtime| {
-        while (!runtime.isDrained() and http.http3_runtime.Runtime.nowUsPublic() < h3_deadline_us) {
+        // At the deadline the H3 reactor first reconciles any relay-driven
+        // RST_STREAM and queues CONNECTION_CLOSE.  Leave it one bounded
+        // reactor tick to transmit those terminal packets before `deinit`
+        // stops the listener thread; otherwise a live QUIC peer can see an
+        // unexplained UDP silence even though the configured drain elapsed.
+        const h3_terminal_flush_deadline_us = h3_deadline_us + 100 * std.time.us_per_ms;
+        while (!runtime.isDrained() and http.http3_runtime.Runtime.nowUsPublic() < h3_terminal_flush_deadline_us) {
             std.Io.sleep(compat.io(), .fromMilliseconds(10), .awake) catch {};
         }
     }

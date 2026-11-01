@@ -28366,10 +28366,17 @@ test "h3interop.rfc9220.gateway aioquic external client resumes a bounded slow r
     try assertContains(client.stdout, "received complete ordered greeting: 32768 bytes");
     try assertContains(client.stdout, "slow-window-echo");
     try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
-    var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", quic_interop_server_name);
-    defer metrics.deinit();
-    try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"downstream_to_upstream\"", "scope=\"global\"" }) orelse return error.MissingProxyBufferAggregateMetric);
-    try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"upstream_to_downstream\"", "scope=\"global\"" }) orelse return error.MissingProxyBufferAggregateMetric);
+    const settle_deadline = compat.milliTimestamp() + 5_000;
+    while (true) {
+        var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", quic_interop_server_name);
+        defer metrics.deinit();
+        const active = prometheusMetricValue(metrics.body, "tardigrade_http3_active_streams") orelse 1;
+        const inbound = prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"downstream_to_upstream\"", "scope=\"global\"" }) orelse return error.MissingProxyBufferAggregateMetric;
+        const outbound = prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"upstream_to_downstream\"", "scope=\"global\"" }) orelse return error.MissingProxyBufferAggregateMetric;
+        if (active == 0 and inbound == 0 and outbound == 0) break;
+        if (compat.milliTimestamp() >= settle_deadline) return error.H3TunnelBufferReservationsDidNotSettle;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
 }
 
 test "h3interop.rfc9220.gateway aioquic external client preserves an admitted tunnel across SIGHUP (#821)" {

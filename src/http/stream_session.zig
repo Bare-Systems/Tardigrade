@@ -214,9 +214,11 @@ pub const Session = struct {
 
     fn freeChunks(self: *Session, chunks: *std.ArrayList(Chunk), direction: proxy_buffer_account.Direction) void {
         for (chunks.items) |chunk| {
-            const remaining = chunk.bytes.len - chunk.offset;
             self.allocator.free(chunk.bytes);
-            self.release(direction, remaining);
+            // The accounting tracks retained allocations, not logical bytes
+            // remaining in a partially consumed chunk. The backing storage
+            // cannot be reused until this whole allocation is freed.
+            self.release(direction, chunk.bytes.len);
         }
         chunks.deinit(self.allocator);
     }
@@ -239,6 +241,22 @@ pub const Session = struct {
             };
             reservation.release(bytes);
         }
+    }
+
+    /// A failed reservation belongs to this session when its own retained
+    /// allocations already reach the stream hard limit. A writer can wait for
+    /// its reactor to free a whole chunk in that case; aggregate failures stay
+    /// controlled admission failures because another session owns the bytes.
+    fn streamBudgetFull(self: *Session, direction: proxy_buffer_account.Direction, bytes: usize) bool {
+        if (self.accounting) |*accounting| {
+            const reservation = switch (direction) {
+                .downstream_to_upstream => &accounting.inbound,
+                .upstream_to_downstream => &accounting.outbound,
+            };
+            const snapshot = reservation.account.snapshot();
+            return bytes > reservation.account.limits.per_stream_hard_limit -| snapshot.current;
+        }
+        return false;
     }
 
     /// Reactor-facing incremental inbound delivery.  A full queue means the
@@ -347,10 +365,11 @@ pub const Session = struct {
             chunk.offset += consumed;
             remaining -= consumed;
             self.outbound_bytes -= consumed;
-            self.release(.upstream_to_downstream, consumed);
             if (chunk.offset == chunk.bytes.len) {
-                self.allocator.free(chunk.bytes);
+                const owned = chunk.bytes;
                 _ = self.outbound.orderedRemove(0);
+                self.allocator.free(owned);
+                self.release(.upstream_to_downstream, owned.len);
             }
         }
         self.cond.broadcast();
@@ -460,11 +479,12 @@ pub const Session = struct {
                 @memcpy(buf[0..n], src[0..n]);
                 chunk.offset += n;
                 self.inbound_bytes -= n;
-                self.release(.downstream_to_upstream, n);
                 self.inbound_credit_to_return += n;
                 if (chunk.offset == chunk.bytes.len) {
-                    self.allocator.free(chunk.bytes);
+                    const owned = chunk.bytes;
                     _ = self.inbound.orderedRemove(0);
+                    self.allocator.free(owned);
+                    self.release(.downstream_to_upstream, owned.len);
                 }
                 self.signalWakeLocked() catch {};
                 return .{ .data = n };
@@ -490,8 +510,15 @@ pub const Session = struct {
                 continue;
             }
             const n = @min(capacity, remaining.len);
+            const stream_budget_full = self.streamBudgetFull(.upstream_to_downstream, n);
             self.reserve(.upstream_to_downstream, n) catch |err| switch (err) {
-                error.QueueFull => return error.QueueFull,
+                error.QueueFull => {
+                    if (stream_budget_full) {
+                        self.cond.wait(&self.mutex);
+                        continue;
+                    }
+                    return error.QueueFull;
+                },
                 else => return err,
             };
             const owned = self.allocator.dupe(u8, remaining[0..n]) catch |err| {
@@ -699,18 +726,18 @@ test "failed consumer control wakes remain observable for runtime cleanup" {
     try std.testing.expect(finished.hasWriteFailure());
 }
 
-test "queue budget charges fixed relay storage and releases session bytes" {
+test "queue budget retains partial chunks until allocation frees" {
     const Observer = struct {
         fn record(_: *anyopaque, _: proxy_buffer_account.Direction, _: usize, _: bool, _: bool) void {}
         fn release(_: *anyopaque, _: proxy_buffer_account.Direction, _: usize) void {}
     };
     var observer_ctx: u8 = 0;
     const limits = proxy_buffer_account.Limits{
-        .per_stream_low_watermark = 4,
-        .per_stream_high_watermark = 8,
-        .per_stream_hard_limit = 16,
+        .per_stream_low_watermark = 8 * 1024,
+        .per_stream_high_watermark = 16 * 1024,
+        .per_stream_hard_limit = 32 * 1024,
         .per_origin_hard_limit = 0,
-        .global_hard_limit = 16,
+        .global_hard_limit = 32 * 1024,
     };
     var global = proxy_buffer_account.Aggregate.init(.global, limits.global_hard_limit);
     const budget = QueueBudget{
@@ -721,28 +748,46 @@ test "queue budget charges fixed relay storage and releases session bytes" {
             .releaseReservationFn = Observer.release,
         },
         .capacity = .{ .global = &global },
-        .fixed_inbound_bytes = 8,
-        .fixed_outbound_bytes = 8,
+        .fixed_inbound_bytes = 16 * 1024,
+        .fixed_outbound_bytes = 16 * 1024,
     };
     {
-        var session = try Session.initWithQueueBudget(std.testing.allocator, 4, 64, 64, null, budget);
+        var session = try Session.initWithQueueBudget(std.testing.allocator, 4, 64 * 1024, 64 * 1024, null, budget);
         defer session.deinit();
 
-        // The fixed relay mailbox consumes half the configured budget before any
-        // copied DATA is queued. A second chunk is held at the flow-control
-        // boundary rather than allocated past the hard limit.
-        try std.testing.expectEqual(@as(usize, 8), global.currentBytes(.downstream_to_upstream));
-        try std.testing.expectEqual(@as(usize, 8), try session.deliverInboundPartial("12345678"));
-        try std.testing.expectEqual(@as(usize, 16), global.currentBytes(.downstream_to_upstream));
-        try std.testing.expectEqual(@as(usize, 0), try session.deliverInboundPartial("x"));
+        var full: [16 * 1024]u8 = undefined;
+        @memset(&full, 'a');
+        var partial: [2 * 1024]u8 = undefined;
+        @memset(&partial, 'b');
 
-        var buf: [8]u8 = undefined;
-        try std.testing.expectEqual(ReadResult{ .data = 8 }, session.read(&buf));
-        try std.testing.expectEqual(@as(usize, 8), global.currentBytes(.downstream_to_upstream));
-        try std.testing.expectEqual(WriteResult.ok, try session.write("12345678"));
-        try std.testing.expectEqual(@as(usize, 16), global.currentBytes(.upstream_to_downstream));
-        session.commitOutboundSent(8);
-        try std.testing.expectEqual(@as(usize, 8), global.currentBytes(.upstream_to_downstream));
+        // Partial reads and sends drain logical queue bytes but do not free a
+        // backing allocation. Keeping that reservation prevents the apparent
+        // 2 KiB of logical capacity from allocating a physical third buffer.
+        try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.downstream_to_upstream));
+        try std.testing.expectEqual(@as(usize, 16 * 1024), try session.deliverInboundPartial(&full));
+        try std.testing.expectEqual(@as(usize, 32 * 1024), global.currentBytes(.downstream_to_upstream));
+        var read_partial: [2 * 1024]u8 = undefined;
+        try std.testing.expectEqual(ReadResult{ .data = read_partial.len }, session.read(&read_partial));
+        try std.testing.expectEqual(@as(usize, 32 * 1024), global.currentBytes(.downstream_to_upstream));
+        try std.testing.expectEqual(@as(usize, 0), try session.deliverInboundPartial(&partial));
+        var read_rest: [14 * 1024]u8 = undefined;
+        try std.testing.expectEqual(ReadResult{ .data = read_rest.len }, session.read(&read_rest));
+        try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.downstream_to_upstream));
+        try std.testing.expectEqual(@as(usize, partial.len), try session.deliverInboundPartial(&partial));
+        try std.testing.expectEqual(@as(usize, 18 * 1024), global.currentBytes(.downstream_to_upstream));
+
+        try std.testing.expectEqual(WriteResult.ok, try session.write(&full));
+        try std.testing.expectEqual(@as(usize, 32 * 1024), global.currentBytes(.upstream_to_downstream));
+        session.commitOutboundSent(partial.len);
+        try std.testing.expectEqual(@as(usize, 32 * 1024), global.currentBytes(.upstream_to_downstream));
+        session.commitOutboundSent(full.len - partial.len);
+        try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.upstream_to_downstream));
+        try std.testing.expectEqual(WriteResult.ok, try session.write(&partial));
+        try std.testing.expectEqual(@as(usize, 18 * 1024), global.currentBytes(.upstream_to_downstream));
+
+        session.deliverReset(0);
+        try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.downstream_to_upstream));
+        try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.upstream_to_downstream));
     }
     try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
     try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));

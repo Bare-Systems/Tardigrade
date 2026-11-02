@@ -64,15 +64,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
+      # Limit scarce GitHub-hosted macOS runner contention during full CI.
+      # Run ARM64 first: it is the release-critical leg whose hosted runner
+      # failed to provision before the 0.9.0 push CI gate completed.
+      max-parallel: 1
       fail-fast: false
       matrix:
         include:
-          - os: macos-15-intel
-            archive_name: tardigrade-darwin-x86_64
-            expected_arch: x86_64
           - os: macos-15
             archive_name: tardigrade-darwin-arm64
             expected_arch: arm64
+          - os: macos-15-intel
+            archive_name: tardigrade-darwin-x86_64
+            expected_arch: x86_64
 
     steps:
       - name: Checkout

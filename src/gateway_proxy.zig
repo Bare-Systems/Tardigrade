@@ -214,7 +214,71 @@ const ProxyBufferReservation = struct {
         if (current == 0) return;
         self.release(current);
     }
+
+    /// Transfer a still-live allocation's accounting to an H3 admission
+    /// owner. Reset only this local bookkeeping: the account's aggregate
+    /// charge and retained-byte metrics remain continuously owned by the
+    /// returned value until its session releases them.
+    fn takeForH3(self: *ProxyBufferReservation) http.stream_session.AdoptedReservation {
+        const adopted = http.stream_session.AdoptedReservation{
+            .account = self.account,
+            .observer = self.observer,
+            .capacity = self.capacity,
+        };
+        self.account.releaseAll();
+        self.active = false;
+        return adopted;
+    }
 };
+
+test "H3 relay reservation transfer keeps aggregate capacity charged across admission" {
+    const Observer = struct {
+        fn record(_: *anyopaque, _: proxy_buffer_account.Direction, _: usize, _: bool, _: bool) void {}
+        fn release(_: *anyopaque, _: proxy_buffer_account.Direction, _: usize) void {}
+    };
+    var observer_ctx: u8 = 0;
+    const limits = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 8,
+        .per_stream_high_watermark = 16,
+        .per_stream_hard_limit = 32,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 32,
+    };
+    const observer = proxy_buffer_account.Observer{
+        .context = &observer_ctx,
+        .recordReservationFn = Observer.record,
+        .releaseReservationFn = Observer.release,
+    };
+    var global = proxy_buffer_account.Aggregate.init(.global, limits.global_hard_limit);
+    const capacity = proxy_buffer_account.AggregateCapacity{ .global = &global };
+    var original = ProxyBufferReservation.init(.downstream_to_upstream, limits, observer, capacity);
+    try original.reserve(16);
+
+    // This represents an H1 upgrade worker completing while the H3 reactor
+    // has not yet applied its queued admission. The aggregate is never
+    // released in that interval, so another worker cannot over-admit.
+    var adopted = original.takeForH3();
+    try std.testing.expectEqual(@as(usize, 16), global.currentBytes(.downstream_to_upstream));
+    var competing = ProxyBufferReservation.init(.downstream_to_upstream, limits, observer, capacity);
+    try std.testing.expectError(error.ProxyBufferCapacityUnavailable, competing.reserve(17));
+
+    const budget = http.stream_session.QueueBudget{
+        .limits = limits,
+        .observer = observer,
+        .capacity = capacity,
+        .fixed_inbound_bytes = 16,
+        .adopted_inbound = &adopted,
+    };
+    {
+        var session = try http.stream_session.Session.initWithQueueBudget(std.testing.allocator, 4, 16, 16, null, budget);
+        defer session.deinit();
+        try std.testing.expectEqual(@as(usize, 16), global.currentBytes(.downstream_to_upstream));
+        try std.testing.expectError(error.ProxyBufferCapacityUnavailable, competing.reserve(17));
+    }
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+    try competing.reserve(17);
+    competing.releaseAll();
+}
 
 /// Reserve request-direction relay bytes with the failure semantics #140 defines
 /// for the pre-commitment side of the boundary. The two refusals mean different
@@ -4452,33 +4516,50 @@ pub const UpgradedUpstream = struct {
     /// `UpgradedUpstream.relay`: it has a connection-owned stream session in
     /// place of an H1 socket. Transfer the already allocated, already sized
     /// relay buffers to that session instead of creating two additional 16 KiB
-    /// mailboxes. Their old reservation is released here and immediately
-    /// re-established by `stream_session.Session.initWithQueueBudget`, where
-    /// the mailboxes and dynamically queued bytes share one policy snapshot.
+    /// mailboxes. Their live reservations transfer continuously to the H3
+    /// admission/session, where the mailboxes and queued bytes share one
+    /// policy snapshot without a release/re-reserve accounting gap.
+    const H3RelayReservationOwner = struct {
+        inbound: http.stream_session.AdoptedReservation,
+        outbound: http.stream_session.AdoptedReservation,
+    };
+
     pub const H3RelayBuffers = struct {
+        allocator: std.mem.Allocator,
         to_upstream: []u8,
         to_client: []u8,
         budget: http.stream_session.QueueBudget,
+        reservations: *H3RelayReservationOwner,
+
+        pub fn deinit(self: *H3RelayBuffers) void {
+            self.reservations.inbound.releaseAll();
+            self.reservations.outbound.releaseAll();
+            self.allocator.destroy(self.reservations);
+            self.* = undefined;
+        }
     };
 
-    pub fn takeH3RelayBuffers(self: *UpgradedUpstream) H3RelayBuffers {
+    pub fn takeH3RelayBuffers(self: *UpgradedUpstream) !H3RelayBuffers {
+        const reservations = try self.allocator.create(H3RelayReservationOwner);
+        reservations.* = .{
+            .inbound = self.to_upstream_reservation.takeForH3(),
+            .outbound = self.to_client_reservation.takeForH3(),
+        };
         const budget = http.stream_session.QueueBudget{
-            .limits = self.to_upstream_reservation.account.limits,
-            .observer = self.to_upstream_reservation.observer,
-            .capacity = self.to_upstream_reservation.capacity,
+            .limits = reservations.inbound.account.limits,
+            .observer = reservations.inbound.observer,
+            .capacity = reservations.inbound.capacity,
             .fixed_inbound_bytes = self.to_upstream_buf.len,
             .fixed_outbound_bytes = self.to_client_buf.len,
+            .adopted_inbound = &reservations.inbound,
+            .adopted_outbound = &reservations.outbound,
         };
-        // The session now owns the accounting for these still-live buffers.
-        // `deinit` remains responsible for their storage, but both old
-        // reservations are empty before that happens, so they cannot be
-        // released twice.
-        self.to_upstream_reservation.releaseAll();
-        self.to_client_reservation.releaseAll();
         return .{
+            .allocator = self.allocator,
             .to_upstream = self.to_upstream_buf,
             .to_client = self.to_client_buf,
             .budget = budget,
+            .reservations = reservations,
         };
     }
 

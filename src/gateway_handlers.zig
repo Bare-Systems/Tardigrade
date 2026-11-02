@@ -2396,11 +2396,16 @@ pub fn handleHttp3ExtendedConnect(
             break :blk .{ .refuse = .{ .status = refused.status_code } };
         },
         .switched => |switched| blk: {
-            const relay_buffers = switched.upgraded.takeH3RelayBuffers();
-            const admission = H3WebSocketAdmission.create(allocator, switched, correlation_id, relay_buffers) catch {
+            var relay_buffers: ?gp.UpgradedUpstream.H3RelayBuffers = switched.upgraded.takeH3RelayBuffers() catch {
                 switched.deinit();
                 break :blk .{ .refuse = .{ .status = 503 } };
             };
+            const admission = H3WebSocketAdmission.create(allocator, switched, correlation_id, &relay_buffers) catch {
+                if (relay_buffers) |*buffers| buffers.deinit();
+                switched.deinit();
+                break :blk .{ .refuse = .{ .status = 503 } };
+            };
+            const budget = admission.relay_buffers.?.budget;
             break :blk .{
                 .admit = .{
                     .status = 200,
@@ -2408,9 +2413,9 @@ pub fn handleHttp3ExtendedConnect(
                     // Preserve the H3-specific queue caps, while the session
                     // additionally clamps them to this policy snapshot after
                     // reserving the transferred H1-origin relay buffers.
-                    .max_inbound_bytes = @min(1024 * 1024, relay_buffers.budget.limits.per_stream_hard_limit),
-                    .max_outbound_bytes = @min(256 * 1024, relay_buffers.budget.limits.per_stream_hard_limit),
-                    .queue_budget = relay_buffers.budget,
+                    .max_inbound_bytes = @min(1024 * 1024, budget.limits.per_stream_hard_limit),
+                    .max_outbound_bytes = @min(256 * 1024, budget.limits.per_stream_hard_limit),
+                    .queue_budget = budget,
                     .on_admitted = H3WebSocketTunnel.onAdmitted,
                     .on_admitted_ctx = admission,
                     .on_admission_failed = H3WebSocketAdmission.onAdmissionFailed,
@@ -2449,11 +2454,12 @@ const H3WebSocketAdmission = struct {
     allocator: std.mem.Allocator,
     switched: *gh2ws.Switched,
     headers: std.ArrayList(http.stream_transport.Header) = .empty,
-    relay_buffers: gp.UpgradedUpstream.H3RelayBuffers,
+    relay_buffers: ?gp.UpgradedUpstream.H3RelayBuffers,
 
-    fn create(allocator: std.mem.Allocator, switched: *gh2ws.Switched, correlation_id: []const u8, relay_buffers: gp.UpgradedUpstream.H3RelayBuffers) !*H3WebSocketAdmission {
+    fn create(allocator: std.mem.Allocator, switched: *gh2ws.Switched, correlation_id: []const u8, relay_buffers: *?gp.UpgradedUpstream.H3RelayBuffers) !*H3WebSocketAdmission {
         const self = try allocator.create(H3WebSocketAdmission);
-        self.* = .{ .allocator = allocator, .switched = switched, .relay_buffers = relay_buffers };
+        self.* = .{ .allocator = allocator, .switched = switched, .relay_buffers = relay_buffers.* };
+        relay_buffers.* = null;
         // `appendHeader` owns each name/value independently.  On any later
         // allocation failure use the complete owner teardown, not merely the
         // ArrayList backing-store deinit.
@@ -2487,6 +2493,7 @@ const H3WebSocketAdmission = struct {
             self.allocator.free(@constCast(header.value));
         }
         self.headers.deinit(self.allocator);
+        if (self.relay_buffers) |*buffers| buffers.deinit();
         if (release_switched) self.switched.deinit();
         self.allocator.destroy(self);
     }
@@ -2514,15 +2521,17 @@ const H3WebSocketTunnel = struct {
         }));
         const switched = admission.switched;
         const state = switched.state;
-        const relay_buffers = admission.relay_buffers;
         const self = allocator.create(H3WebSocketTunnel) catch {
             session.requestCancel();
             admission.deinit(true);
             return;
         };
+        const relay_buffers = admission.relay_buffers.?;
+        admission.relay_buffers = null;
         admission.deinit(false);
         self.* = .{ .allocator = allocator, .state = switched.state, .session = session, .switched = switched, .relay_buffers = relay_buffers };
         const thread = std.Thread.spawn(.{}, H3WebSocketTunnel.run, .{self}) catch {
+            self.relay_buffers.deinit();
             allocator.destroy(self);
             session.requestCancel();
             switched.deinit();
@@ -2549,6 +2558,7 @@ const H3WebSocketTunnel = struct {
             self.allocator.destroy(self.session);
         }
         self.switched.deinit();
+        self.relay_buffers.deinit();
         self.allocator.destroy(self);
     }
 };

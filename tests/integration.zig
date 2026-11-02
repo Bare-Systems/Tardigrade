@@ -28370,11 +28370,18 @@ test "h3interop.rfc9220.gateway aioquic external client resumes a bounded slow r
     while (true) {
         var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", quic_interop_server_name);
         defer metrics.deinit();
-        const active = prometheusMetricValue(metrics.body, "tardigrade_http3_active_streams") orelse 1;
+        // `http3_active_streams` describes request-stream bookkeeping and can
+        // outlive the detached relay briefly. The actual tunnel gauge plus
+        // both retained-allocation gauges is the lifecycle contract here.
+        const active_h3_streams = prometheusMetricValue(metrics.body, "tardigrade_http3_active_streams") orelse 1;
+        const active_tunnels = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 1;
         const inbound = prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"downstream_to_upstream\"", "scope=\"global\"" }) orelse return error.MissingProxyBufferAggregateMetric;
         const outbound = prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"upstream_to_downstream\"", "scope=\"global\"" }) orelse return error.MissingProxyBufferAggregateMetric;
-        if (active == 0 and inbound == 0 and outbound == 0) break;
-        if (compat.milliTimestamp() >= settle_deadline) return error.H3TunnelBufferReservationsDidNotSettle;
+        if (active_tunnels == 0 and inbound == 0 and outbound == 0) break;
+        if (compat.milliTimestamp() >= settle_deadline) {
+            std.debug.print("h3 slow-window settlement timed out: active_h3_streams={d} active_tunnels={d} inbound_reserved={d} outbound_reserved={d}\n", .{ active_h3_streams, active_tunnels, inbound, outbound });
+            return error.H3TunnelBufferReservationsDidNotSettle;
+        }
         compat.sleepNs(25 * std.time.ns_per_ms);
     }
 }

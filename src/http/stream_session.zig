@@ -55,6 +55,29 @@ pub const QueueBudget = struct {
     capacity: proxy_buffer_account.AggregateCapacity,
     fixed_inbound_bytes: usize = 0,
     fixed_outbound_bytes: usize = 0,
+    /// Existing relay-buffer reservations may cross an asynchronous admission
+    /// boundary. They are moved, rather than released and re-reserved, so the
+    /// aggregate accounting never has a gap while their storage is live.
+    adopted_inbound: ?*AdoptedReservation = null,
+    adopted_outbound: ?*AdoptedReservation = null,
+};
+
+/// A retained allocation's accounting ownership while it moves from an H1
+/// upgrade worker to an H3 stream session. The aggregate charge remains live
+/// until this value is either adopted by a `Session` or explicitly released.
+pub const AdoptedReservation = struct {
+    account: proxy_buffer_account.Account,
+    observer: proxy_buffer_account.Observer,
+    capacity: proxy_buffer_account.AggregateCapacity,
+
+    pub fn releaseAll(self: *AdoptedReservation) void {
+        const bytes = self.account.snapshot().current;
+        if (bytes == 0) return;
+        self.account.release(bytes) catch unreachable;
+        self.capacity.release(self.account.direction, bytes);
+        self.observer.releaseReservation(self.account.direction, bytes);
+        self.observer.releaseRetainedBytes(self.account.direction, bytes);
+    }
 };
 
 const Reservation = struct {
@@ -71,6 +94,19 @@ const Reservation = struct {
             .observer = budget.observer,
             .capacity = budget.capacity,
         };
+    }
+
+    /// Move a live reservation without touching the aggregate counters. The
+    /// source is left empty so an admission-failure cleanup cannot release it
+    /// twice after this session becomes the owner.
+    fn take(adopted: *AdoptedReservation) Reservation {
+        const result = Reservation{
+            .account = adopted.account,
+            .observer = adopted.observer,
+            .capacity = adopted.capacity,
+        };
+        adopted.account.releaseAll();
+        return result;
     }
 
     fn reserve(self: *Reservation, bytes: usize) !void {
@@ -183,16 +219,24 @@ pub const Session = struct {
         };
         if (budget) |policy| {
             var accounting = Accounting{
-                .inbound = Reservation.init(.downstream_to_upstream, policy),
-                .outbound = Reservation.init(.upstream_to_downstream, policy),
+                .inbound = if (policy.adopted_inbound) |adopted| Reservation.take(adopted) else Reservation.init(.downstream_to_upstream, policy),
+                .outbound = if (policy.adopted_outbound) |adopted| Reservation.take(adopted) else Reservation.init(.upstream_to_downstream, policy),
             };
-            accounting.inbound.reserve(policy.fixed_inbound_bytes) catch return error.QueueFull;
             errdefer accounting.inbound.releaseAll();
-            accounting.outbound.reserve(policy.fixed_outbound_bytes) catch return error.QueueFull;
+            errdefer accounting.outbound.releaseAll();
+            if (policy.adopted_inbound) |_| {
+                if (accounting.inbound.account.snapshot().current != policy.fixed_inbound_bytes) return error.InvalidCapacity;
+            } else {
+                accounting.inbound.reserve(policy.fixed_inbound_bytes) catch return error.QueueFull;
+            }
+            if (policy.adopted_outbound) |_| {
+                if (accounting.outbound.account.snapshot().current != policy.fixed_outbound_bytes) return error.InvalidCapacity;
+            } else {
+                accounting.outbound.reserve(policy.fixed_outbound_bytes) catch return error.QueueFull;
+            }
             const inbound_available = policy.limits.per_stream_hard_limit -| policy.fixed_inbound_bytes;
             const outbound_available = policy.limits.per_stream_hard_limit -| policy.fixed_outbound_bytes;
             if (inbound_available == 0 or outbound_available == 0) {
-                accounting.outbound.releaseAll();
                 return error.InvalidCapacity;
             }
             self.max_inbound_bytes = @min(self.max_inbound_bytes, inbound_available);

@@ -64,7 +64,7 @@ PRs (#945).
 **Full** = smoke, but with `test`/`test-integration`/
 `test-integration -Dacme-experimental` run unfiltered instead of the smoke
 subsets above, plus everything else: unit / native-TLS tests on
-`ubuntu-24.04-arm` and `macos-14`, appliance-profile tests (all OSes), the
+`ubuntu-24.04-arm` and `macos-15`, appliance-profile tests (all OSes), the
 Debug/ReleaseSafe/ReleaseFast build matrix, macOS binary audit, PKI
 differential, packaging (DEB/RPM/Docker/install), Homebrew formula smoke,
 performance smoke, crypto benchmarks, H3 resumption/0-RTT peer interop, the

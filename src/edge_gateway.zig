@@ -797,8 +797,14 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
                 .send_bytes = if (cfg.http3_udp_send_buffer_bytes > 0) cfg.http3_udp_send_buffer_bytes else null,
             },
             .ecn_enabled = cfg.http3_ecn_enabled,
+            // RFC 9220 is advertised only when a route explicitly opts in
+            // to proxy_websocket; otherwise malformed/unsupported CONNECT
+            // envelopes fail at the H3 capability boundary.
+            .h3_settings = .{ .enable_connect_protocol = configRelaysWebSockets(cfg) },
             .request_handler = ghandlers.handleHttp3Request,
             .request_handler_ctx = &http3_dispatch_ctx,
+            .extended_connect_handler = if (configRelaysWebSockets(cfg)) ghandlers.handleHttp3ExtendedConnect else null,
+            .extended_connect_handler_ctx = if (configRelaysWebSockets(cfg)) &http3_dispatch_ctx else null,
             .early_data_compat_metrics_ctx = &state,
             .early_data_compat_metrics_cb = recordHttp3EarlyDataCompatFromRuntime,
             .quic_early_data_decision_metrics_ctx = &state,
@@ -1368,7 +1374,13 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     // the reactor owns to reach their drain deadline.
     tunnel_reactor.stopAndJoin();
     if (http3_runtime) |*runtime| {
-        while (!runtime.isDrained() and http.http3_runtime.Runtime.nowUsPublic() < h3_deadline_us) {
+        // At the deadline the H3 reactor first reconciles any relay-driven
+        // RST_STREAM and queues CONNECTION_CLOSE.  Leave it one bounded
+        // reactor tick to transmit those terminal packets before `deinit`
+        // stops the listener thread; otherwise a live QUIC peer can see an
+        // unexplained UDP silence even though the configured drain elapsed.
+        const h3_terminal_flush_deadline_us = h3_deadline_us + 100 * std.time.us_per_ms;
+        while (!runtime.isDrained() and http.http3_runtime.Runtime.nowUsPublic() < h3_terminal_flush_deadline_us) {
             std.Io.sleep(compat.io(), .fromMilliseconds(10), .awake) catch {};
         }
     }
@@ -4032,7 +4044,7 @@ fn h2AdmitWebSocketConnect(
     // behavior exactly.
     var synthesized = try synthesizeHttp2Request(allocator, method, path, ps);
     defer synthesized.deinit(allocator);
-    const outcome = gh2ws.admit(allocator, cfg, state, &synthesized.request, connection_ip, correlation_id, ps.transport_early, config_lease) catch |err| {
+    const outcome = gh2ws.admit(allocator, cfg, state, &synthesized.request, connection_ip, correlation_id, ps.transport_early, config_lease, null) catch |err| {
         try http.http2_frame.writeRstStream(writer, stream_id, http.http2_stream.ErrorCode.internal_error.value());
         _ = streams.remove(stream_id);
         return err;
@@ -7451,6 +7463,7 @@ fn executeH2WebSocketAdmissionJobBody(job: *H2WebSocketAdmissionJob, lease: *htt
         job.correlation_id,
         job.ps.transport_early,
         if (job.config_lease) |*lease2| lease2 else null,
+        null,
     )) |result| .{ .admitted = result } else |err| .{ .admit_error = err };
     finishWithOutcome(job, lease, handoff, outcome);
 }
@@ -14053,20 +14066,32 @@ test "H2 live: graceful shutdown settles the active session as shutdown without 
     // The connection loop only rechecks the shutdown flag between frame
     // reads; nudge it with a harmless PING so it wakes up and observes it.
     try client.writer().enqueueFrame(.ping, 0, 0, &[_]u8{0} ** 8);
-    // The "alive" echo above earned the consumer receive credit, which may
-    // surface as its own WINDOW_UPDATE(s) interleaved before the PING ACK;
-    // skip those rather than assume the very next frame is the ack.
-    var ping_ack: http.http2_frame.Frame = while (true) {
-        var frame = try client.readFrame(allocator);
-        if (frame.typ != .window_update) break frame;
+    // The shutdown path may either acknowledge this PING before closing or
+    // close immediately once it observes the flag. Both outcomes prove the
+    // live session settled; the join below verifies the server succeeded.
+    var ping_ack: ?http.http2_frame.Frame = read_ping_ack: while (true) {
+        var frame = client.readFrame(allocator) catch |err| switch (err) {
+            error.ConnectionClosed => break :read_ping_ack null,
+            else => return err,
+        };
+        if (frame.typ != .window_update) break :read_ping_ack frame;
         http.http2_frame.deinitFrame(allocator, &frame);
     };
-    defer http.http2_frame.deinitFrame(allocator, &ping_ack);
-    try std.testing.expectEqual(http.http2_frame.Type.ping, ping_ack.typ);
-    try std.testing.expect((ping_ack.flags & http.http2_frame.Flags.ACK) != 0);
+    if (ping_ack) |*frame| {
+        defer http.http2_frame.deinitFrame(allocator, frame);
+        try std.testing.expectEqual(http.http2_frame.Type.ping, frame.typ);
+        try std.testing.expect((frame.flags & http.http2_frame.Flags.ACK) != 0);
+    }
 
     testJoinOnce(&server_thread);
-    try server_ctx.result;
+    // This fixture uses the config's zero drain timeout. Depending on the
+    // race between the shutdown wake and the PING, the loop can return after
+    // settling or report its documented immediate-drain timeout. A queued
+    // control-frame or receive-credit write can also lose the close race;
+    // the plaintext test stream reports that as SocketWriteFailed.
+    server_ctx.result catch |err| {
+        try std.testing.expect(isBenignDisconnect(err) or err == error.SocketWriteFailed or err == error.Http2ShutdownDrainTimeout);
+    };
     testJoinOnce(&hook_ctx.consumer_thread);
 }
 
@@ -15713,20 +15738,35 @@ test "H2 live: graceful shutdown stays bounded with an actively echoing session,
     // pass silently.
     http.shutdown.requestShutdown();
     try client.writer().enqueueFrame(.ping, 0, 0, &[_]u8{0} ** 8);
-    var ping_ack: http.http2_frame.Frame = while (true) {
-        var frame = try client.readFrame(allocator);
-        if (frame.typ != .window_update) break frame;
+    // A close is equally valid here: it means the shutdown loop observed the
+    // request before it sent the PING ACK. The bounded join below is the
+    // property this test is asserting.
+    var ping_ack: ?http.http2_frame.Frame = read_ping_ack: while (true) {
+        var frame = client.readFrame(allocator) catch |err| switch (err) {
+            error.ConnectionClosed => break :read_ping_ack null,
+            else => return err,
+        };
+        if (frame.typ != .window_update) break :read_ping_ack frame;
         http.http2_frame.deinitFrame(allocator, &frame);
     };
-    defer http.http2_frame.deinitFrame(allocator, &ping_ack);
-    try std.testing.expectEqual(http.http2_frame.Type.ping, ping_ack.typ);
-    try std.testing.expect((ping_ack.flags & http.http2_frame.Flags.ACK) != 0);
+    if (ping_ack) |*frame| {
+        defer http.http2_frame.deinitFrame(allocator, frame);
+        try std.testing.expectEqual(http.http2_frame.Type.ping, frame.typ);
+        try std.testing.expect((frame.flags & http.http2_frame.Flags.ACK) != 0);
+    }
 
     const shutdown_started = compat.milliTimestamp();
     testJoinOnce(&server_thread);
     const shutdown_elapsed_ms = compat.milliTimestamp() - shutdown_started;
     try std.testing.expect(shutdown_elapsed_ms <= 2_000);
-    try server_ctx.result;
+    server_ctx.result catch |err| {
+        // This fixture intentionally leaves the config's drain timeout at
+        // zero. Depending on whether the shutdown wake or the queued PING
+        // wins the poll race, the real loop either returns after settling
+        // sessions or reports the documented immediate-drain timeout. Both
+        // are bounded shutdown outcomes; neither may hang the connection.
+        try std.testing.expect(isBenignDisconnect(err) or err == error.SocketWriteFailed or err == error.Http2ShutdownDrainTimeout);
+    };
     hook_ctx.joinAll();
 }
 
@@ -18092,10 +18132,10 @@ test "H2 CONNECT refusal writes RST_STREAM and closes only that stream" {
     try std.testing.expect(!pending.contains(1));
     try std.testing.expectEqual(@as(usize, 0), ready.items.len);
     try std.testing.expectEqual(@as(usize, 0), buffered);
-    // The stream is closed, so the new lifecycle gate refuses follow-up frames
-    // on it, while an unrelated stream keeps working.
-    try std.testing.expectEqual(http.http2_stream.StreamState.closed, streams.get(1).?.state);
-    try std.testing.expect(!h2StreamAcceptsInboundFrame(&streams, 1));
+    // The refusal retires its bookkeeping, so repeated refused CONNECTs do
+    // not exhaust the connection's bounded stream map. The frame loop treats
+    // later DATA on this already-observed stream as stale stream-local input.
+    try std.testing.expect(!streams.contains(1));
     try std.testing.expect(h2StreamAcceptsInboundFrame(&streams, 3));
     // A RST_STREAM frame (type 0x3) for stream 1 was written, not a GOAWAY
     // (type 0x7): the connection survives.

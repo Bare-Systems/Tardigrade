@@ -4022,6 +4022,149 @@ fn runNativeH3Client(
     });
 }
 
+/// A separate native-H3 process exercising RFC 9220 against the production
+/// gateway. Unlike the ordinary request helper, this keeps the request stream
+/// open and considers the non-FIN 2xx response HEADERS the success boundary.
+fn runNativeH3ExtendedConnect(allocator: std.mem.Allocator, quic_port: u16, path: []const u8, echo: []const u8) !bounded_process.Result {
+    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(port_str);
+    return bounded_process.run(allocator, .{
+        .argv = &.{
+            integration_options.h3_interop_tool_path,
+            "client",
+            "--host",
+            test_host,
+            "--port",
+            port_str,
+            "--authority",
+            quic_interop_server_name,
+            "--path",
+            path,
+            "--extended-connect-websocket",
+            "--websocket-echo",
+            echo,
+            "--insecure",
+            "--timeout-ms",
+            "5000",
+        },
+        .stdout_limit = 64 * 1024,
+        .stderr_limit = 64 * 1024,
+        .deadline_ms = 10_000,
+    });
+}
+
+/// The RFC 9220 release gate must not use Tardigrade's own H3 implementation
+/// on both sides. CI supplies `AIOQUIC_PYTHON` from a provisioned virtualenv;
+/// local default integration runs skip this optional external dependency.
+const AioquicExtendedConnectOptions = struct {
+    headers: []const []const u8 = &.{},
+    expected_response_headers: []const []const u8 = &.{},
+    expected_status: u16 = 200,
+    reset_after_200: bool = false,
+    isolation_path: ?[]const u8 = null,
+    expect_connect_protocol: bool = true,
+    settings_only: bool = false,
+    capacity_probe: bool = false,
+    drop_transport_after_200: bool = false,
+    idle_timeout: ?[]const u8 = null,
+    slow_receive_delay: ?[]const u8 = null,
+    max_stream_data: ?[]const u8 = null,
+    reload_signal_pid: ?[]const u8 = null,
+    lifecycle_signal: ?[]const u8 = null,
+    post_reload_payload: ?[]const u8 = null,
+    expect_terminal_after_signal: bool = false,
+    expected_greeting_bytes: ?[]const u8 = null,
+};
+
+fn runAioquicH3ExtendedConnectWithOptions(
+    allocator: std.mem.Allocator,
+    quic_port: u16,
+    path: []const u8,
+    echo: []const u8,
+    options: AioquicExtendedConnectOptions,
+) !bounded_process.Result {
+    const python = compat.getEnvVarOwned(allocator, "AIOQUIC_PYTHON") catch return error.SkipZigTest;
+    defer allocator.free(python);
+    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(port_str);
+    const expected_status = try std.fmt.allocPrint(allocator, "{d}", .{options.expected_status});
+    defer allocator.free(expected_status);
+    var argv = std.array_list.Managed([]const u8).init(allocator);
+    defer argv.deinit();
+    try argv.appendSlice(&.{
+        python,
+        "scripts/interop/aioquic_rfc9220_client.py",
+        test_host,
+        port_str,
+        path,
+        echo,
+        quic_interop_server_name,
+    });
+    for (options.headers) |header| {
+        try argv.append("--header");
+        try argv.append(header);
+    }
+    for (options.expected_response_headers) |header| {
+        try argv.append("--expect-response-header");
+        try argv.append(header);
+    }
+    if (options.expected_status != 200) {
+        try argv.append("--expect-status");
+        try argv.append(expected_status);
+    }
+    if (options.reset_after_200) try argv.append("--reset-after-200");
+    if (options.isolation_path) |isolation_path| {
+        try argv.append("--isolation-path");
+        try argv.append(isolation_path);
+    }
+    if (!options.expect_connect_protocol) {
+        try argv.append("--expect-connect-protocol");
+        try argv.append("0");
+    }
+    if (options.settings_only) try argv.append("--settings-only");
+    if (options.capacity_probe) try argv.append("--capacity-probe");
+    if (options.drop_transport_after_200) try argv.append("--drop-transport-after-200");
+    if (options.idle_timeout) |idle_timeout| {
+        try argv.append("--idle-timeout");
+        try argv.append(idle_timeout);
+    }
+    if (options.slow_receive_delay) |slow_receive_delay| {
+        try argv.append("--slow-receive-delay");
+        try argv.append(slow_receive_delay);
+    }
+    if (options.max_stream_data) |max_stream_data| {
+        try argv.append("--max-stream-data");
+        try argv.append(max_stream_data);
+    }
+    if (options.reload_signal_pid) |reload_signal_pid| {
+        try argv.append("--reload-signal-pid");
+        try argv.append(reload_signal_pid);
+    }
+    if (options.lifecycle_signal) |lifecycle_signal| {
+        try argv.append("--lifecycle-signal");
+        try argv.append(lifecycle_signal);
+    }
+    if (options.post_reload_payload) |post_reload_payload| {
+        try argv.append("--post-reload-payload");
+        try argv.append(post_reload_payload);
+    }
+    if (options.expect_terminal_after_signal) try argv.append("--expect-terminal-after-signal");
+    if (options.expected_greeting_bytes) |expected_greeting_bytes| {
+        try argv.append("--expect-greeting-bytes");
+        try argv.append(expected_greeting_bytes);
+    }
+    return bounded_process.run(allocator, .{
+        .argv = argv.items,
+        .stdout_limit = 64 * 1024,
+        .stderr_limit = 64 * 1024,
+        .deadline_ms = 15_000,
+    });
+}
+
+fn runAioquicH3ExtendedConnect(allocator: std.mem.Allocator, quic_port: u16, path: []const u8, echo: []const u8) !bounded_process.Result {
+    return runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, path, echo, .{});
+}
+
 fn ngtcp2SessionPath(allocator: std.mem.Allocator, port: u16, tag: []const u8) ![]u8 {
     const dir = try interopSecretsDir(allocator);
     defer allocator.free(dir);
@@ -4240,7 +4383,7 @@ test "h3interop.forward_auth.deny_then_allow" {
     try upstream.run();
 
     const config_text = try std.fmt.allocPrint(allocator,
-        \\location = /healthz {{
+        \\location = /healthz {
         \\    return 200 alive;
         \\}}
         \\
@@ -27268,6 +27411,10 @@ const WsOriginMode = enum {
     bad_accept,
     /// A plain 403 with a body.
     refuse,
+    /// Accept and read the upgrade but deliberately never answer it. Used to
+    /// hold the bounded H3 CONNECT-admission executor while testing that its
+    /// separate REST executor keeps making progress.
+    stall,
 };
 
 /// A minimal RFC 6455 origin: one thread per connection, so several tunnels
@@ -27329,6 +27476,12 @@ const WsOrigin = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.handshakes;
+    }
+
+    fn activeConnectionCount(self: *WsOrigin) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.conn_fds.items.len;
     }
 
     /// Value of `name` on the last handshake the origin received, or null.
@@ -27405,6 +27558,10 @@ fn wsOriginHandle(origin: *WsOrigin, stream: compat.NetStream) !void {
         .bad_accept => {
             try stream.writeAll("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n");
             peer.expectClosed(5_000) catch {};
+            return;
+        },
+        .stall => {
+            while (!origin.stop_flag.load(.seq_cst)) compat.sleepNs(10 * std.time.ns_per_ms);
             return;
         },
         .echo => {},
@@ -27745,6 +27902,774 @@ test "downstream HTTP/2 RFC 8441 Extended CONNECT WebSocket echoes through a fre
     var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", "tardigrade.test");
     defer metrics.deinit();
     try std.testing.expect(wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"relayed\"") >= 1);
+}
+
+test "h3interop.rfc9220.gateway Extended CONNECT reaches the H1 WebSocket origin (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var client = try runNativeH3ExtendedConnect(allocator, quic_port, "/ws/chat", "hello-over-rfc9220");
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "status: 200");
+    try assertContains(client.stdout, "echo: hello-over-rfc9220");
+    // The external client reaching a non-FIN 200 alone is not enough: this
+    // proves the gateway performed exactly one real H1 Upgrade handshake.
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+
+    var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", quic_interop_server_name);
+    defer metrics.deinit();
+    try std.testing.expect(wsMetricValue(metrics.body, "tardigrade_websocket_upgrades_total", "outcome=\"relayed\"") >= 1);
+}
+
+test "h3interop.rfc9220.gateway aioquic external client reaches the H1 WebSocket origin (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var client = try runAioquicH3ExtendedConnect(allocator, quic_port, "/ws/chat", "hello-over-aioquic-rfc9220");
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "status: 200");
+    try assertContains(client.stdout, "hello-over-aioquic-rfc9220");
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+}
+
+test "h3interop.rfc9220.gateway aioquic external client Origin denial never reaches the WebSocket origin (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "    proxy_websocket_origins https://allowed.test;\n");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var client = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/chat", "unused", .{
+        .headers = &.{"origin:https://evil.test"},
+        .expected_status = 403,
+    });
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "status: 403");
+    try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
+}
+
+test "h3interop.rfc9220.gateway aioquic external client enforces forward auth before the origin (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+    var auth = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 403, .body = "denied", .connection_header = "close" },
+        .{ .status_code = 200, .body = "", .connection_header = "close", .headers = &.{
+            .{ .name = "X-Auth-Request-User", .value = "aioquic-alice" },
+            .{ .name = "Set-Cookie", .value = "aioquic-auth=1" },
+        } },
+    });
+    defer auth.stop();
+    try auth.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /fa/ {{
+        \\    forward_auth http://{s}:{d}/verify;
+        \\    forward_auth_upstream_headers X-Auth-Request-User;
+        \\    forward_auth_client_headers Set-Cookie;
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, auth.port(), test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var denied = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/fa/chat", "unused", .{ .expected_status = 403 });
+    defer denied.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(denied.outcome));
+    try assertContains(denied.stdout, "status: 403");
+    try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
+
+    var allowed = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/fa/chat", "forward-auth-allowed", .{
+        .expected_response_headers = &.{"set-cookie:aioquic-auth=1"},
+    });
+    defer allowed.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(allowed.outcome));
+    try assertContains(allowed.stdout, "header: set-cookie: aioquic-auth=1");
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+    const asserted = (try origin.handshakeHeader(allocator, "X-Auth-Request-User")).?;
+    defer allocator.free(asserted);
+    try std.testing.expectEqualStrings("aioquic-alice", asserted);
+}
+
+test "h3interop.rfc9220.gateway aioquic external client enforces bearer auth before the origin (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /auth/ {{
+        \\    auth required;
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var denied = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/auth/chat", "unused", .{ .expected_status = 401 });
+    defer denied.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(denied.outcome));
+    try assertContains(denied.stdout, "status: 401");
+    try std.testing.expectEqual(@as(u32, 0), origin.handshakeCount());
+
+    var allowed = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/auth/chat", "bearer-auth-allowed", .{
+        .headers = &.{"authorization:Bearer " ++ valid_bearer_token},
+    });
+    defer allowed.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(allowed.outcome));
+    try assertContains(allowed.stdout, "bearer-auth-allowed");
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+}
+
+test "h3interop.rfc9220.gateway aioquic external client enforces concurrent tunnel capacity (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", .value = "1" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var client = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/capacity", "unused", .{ .capacity_probe = true });
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "capacity probe statuses: [200, 503]");
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+}
+
+test "h3interop.rfc9220.gateway aioquic external client reset and STOP_SENDING release an admitted tunnel (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", .value = "1" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var cancelled = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/chat", "unused", .{
+        .reset_after_200 = true,
+    });
+    defer cancelled.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(cancelled.outcome));
+    try assertContains(cancelled.stdout, "status: 200");
+    try assertContains(cancelled.stdout, "reset recovery GET status: 200");
+    try assertContains(cancelled.stdout, "reset recovery CONNECT status: 200");
+    try assertContains(cancelled.stdout, "recovered-after-stream-reset");
+    // The client issues that second accepted CONNECT on the same still-live
+    // QUIC connection before it closes, so the first stream must have released
+    // its one-slot admission lease without connection teardown masking it.
+    try std.testing.expectEqual(@as(u32, 2), origin.handshakeCount());
+}
+
+test "h3interop.rfc9220.gateway aioquic external client abrupt UDP loss settles an admitted tunnel (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_PROXY_WEBSOCKET_MAX_TUNNELS", .value = "1" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    // aioquic advertises the short peer idle timeout, then closes its UDP
+    // transport immediately after the 200 response without a QUIC close.
+    // The gateway must therefore release the admitted upstream lease on its
+    // negotiated idle timeout, not only from graceful connection teardown.
+    var dropped = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/chat", "unused", .{
+        .drop_transport_after_200 = true,
+        .idle_timeout = "0.25",
+    });
+    defer dropped.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(dropped.outcome));
+    try assertContains(dropped.stdout, "UDP transport dropped without QUIC CONNECTION_CLOSE");
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+
+    const settle_deadline = compat.milliTimestamp() + 5_000;
+    while (true) {
+        var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", quic_interop_server_name);
+        defer metrics.deinit();
+        if ((prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 1) == 0) break;
+        if (compat.milliTimestamp() >= settle_deadline) return error.H3TunnelDidNotSettleAfterAbruptQuicLoss;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+
+    var recovered = try runAioquicH3ExtendedConnect(allocator, quic_port, "/ws/chat", "recovered-after-udp-loss");
+    defer recovered.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(recovered.outcome));
+    try assertContains(recovered.stdout, "recovered-after-udp-loss");
+    try std.testing.expectEqual(@as(u32, 2), origin.handshakeCount());
+}
+
+test "h3interop.rfc9220.gateway aioquic external client resumes a bounded slow receive window (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const greeting = try allocator.alloc(u8, 32 * 1024);
+    defer allocator.free(greeting);
+    @memset(greeting, 'b');
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    origin.greeting = greeting;
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            // A deliberately small but valid configured budget: the H3
+            // session must charge its transferred 16 KiB relay mailbox plus
+            // queued bytes to this same per-stream/origin/global policy. The
+            // peer below advertises only 2 KiB then pauses its UDP reads.
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "16384" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES", .value = "8192" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES", .value = "16384" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES", .value = "32768" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES", .value = "32768" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES", .value = "32768" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var client = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/slow", "slow-window-echo", .{
+        .max_stream_data = "2048",
+        .slow_receive_delay = "0.75",
+        .expected_greeting_bytes = "32768",
+    });
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "status: 200");
+    try assertContains(client.stdout, "slow receive pause elapsed; echo completed");
+    try assertContains(client.stdout, "received complete ordered greeting: 32768 bytes");
+    try assertContains(client.stdout, "slow-window-echo");
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+    const settle_deadline = compat.milliTimestamp() + 5_000;
+    while (true) {
+        var metrics = try sendPureZigTlsHttp1RequestWithServerName(allocator, tardigrade.port, "/status/metrics", quic_interop_server_name);
+        defer metrics.deinit();
+        // `http3_active_streams` describes request-stream bookkeeping and can
+        // outlive the detached relay briefly. The actual tunnel gauge plus
+        // both retained-allocation gauges is the lifecycle contract here.
+        const active_h3_streams = prometheusMetricValue(metrics.body, "tardigrade_http3_active_streams") orelse 1;
+        const active_tunnels = prometheusMetricValue(metrics.body, "tardigrade_websocket_tunnels_active") orelse 1;
+        const inbound = prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"downstream_to_upstream\"", "scope=\"global\"" }) orelse return error.MissingProxyBufferAggregateMetric;
+        const outbound = prometheusLabeledMetricValue(metrics.body, "tardigrade_proxy_buffer_aggregate_bytes_current", &.{ "direction=\"upstream_to_downstream\"", "scope=\"global\"" }) orelse return error.MissingProxyBufferAggregateMetric;
+        if (active_tunnels == 0 and inbound == 0 and outbound == 0) break;
+        if (compat.milliTimestamp() >= settle_deadline) {
+            std.debug.print("h3 slow-window settlement timed out: active_h3_streams={d} active_tunnels={d} inbound_reserved={d} outbound_reserved={d}\n", .{ active_h3_streams, active_tunnels, inbound, outbound });
+            return error.H3TunnelBufferReservationsDidNotSettle;
+        }
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+}
+
+test "h3interop.rfc9220.gateway aioquic external client preserves an admitted tunnel across SIGHUP (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const initial_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /ws/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\    proxy_websocket_reload preserve;
+        \\}}
+        \\location /keep-h3-connect/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port(), test_host, origin.port() });
+    defer allocator.free(initial_config);
+    const reloaded_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /keep-h3-connect/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(reloaded_config);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = initial_config,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+    try tardigrade.rewriteConfig(reloaded_config);
+    const pid = try std.fmt.allocPrint(allocator, "{d}", .{tardigrade.child.id orelse return error.MissingTardigradePid});
+    defer allocator.free(pid);
+
+    // The external peer sends SIGHUP only after the first successful echo,
+    // then sends another frame on that same H3 CONNECT stream. This exercises
+    // a live native-QUIC preserved-generation tunnel, not an H1-only reload.
+    var client = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/chat", "before-reload", .{
+        .reload_signal_pid = pid,
+        .post_reload_payload = "after-reload",
+    });
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "before-reload");
+    try assertContains(client.stdout, "after-reload");
+    try assertContains(client.stdout, "post-reload tunnel echo completed");
+    try waitForLogSubstring(allocator, tardigrade.log_path, "configuration hot-reload applied", 5_000);
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+}
+
+test "h3interop.rfc9220.gateway aioquic external client drains an admitted tunnel across SIGHUP (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const initial_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /ws/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\    proxy_websocket_reload drain;
+        \\    proxy_websocket_reload_timeout_ms 100;
+        \\}}
+        \\location /keep-h3-connect/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port(), test_host, origin.port() });
+    defer allocator.free(initial_config);
+    const reloaded_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /keep-h3-connect/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_websocket on;
+        \\}}
+    , .{ test_host, origin.port() });
+    defer allocator.free(reloaded_config);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = initial_config,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+    try tardigrade.rewriteConfig(reloaded_config);
+    const pid = try std.fmt.allocPrint(allocator, "{d}", .{tardigrade.child.id orelse return error.MissingTardigradePid});
+    defer allocator.free(pid);
+
+    var client = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/chat", "before-drain", .{
+        .reload_signal_pid = pid,
+        .expect_terminal_after_signal = true,
+    });
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "tunnel ended after lifecycle signal");
+    try waitForLogSubstring(allocator, tardigrade.log_path, "configuration hot-reload applied", 5_000);
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+}
+
+test "h3interop.rfc9220.gateway aioquic external client drains an admitted tunnel on graceful shutdown (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .echo);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS", .value = "350" },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+    const pid = try std.fmt.allocPrint(allocator, "{d}", .{tardigrade.child.id orelse return error.MissingTardigradePid});
+    defer allocator.free(pid);
+
+    // The external peer signals the shipping process only after a live H3
+    // CONNECT has completed an echo.  It remains connected until the server
+    // ends the stream, so a client-side close cannot masquerade as drain.
+    var client = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/shutdown", "before-shutdown", .{
+        .reload_signal_pid = pid,
+        .lifecycle_signal = "TERM",
+        .expect_terminal_after_signal = true,
+    });
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "before-shutdown");
+    try assertContains(client.stdout, "tunnel ended after lifecycle signal");
+    try std.testing.expectEqual(@as(u32, 1), origin.handshakeCount());
+
+    const origin_close_deadline = compat.milliTimestamp() + 5_000;
+    while (origin.activeConnectionCount() != 0) {
+        if (compat.milliTimestamp() >= origin_close_deadline) return error.H3OriginDidNotCloseDuringShutdown;
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+    try waitForPortClosed(tardigrade.port, 5_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "Graceful shutdown complete", 5_000);
+}
+
+test "h3interop.rfc9220.gateway aioquic external client verifies SETTINGS disabled without a WebSocket route (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const config_text =
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}
+        \\location /plain/ {
+        \\    return 200 plain;
+        \\}
+    ;
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var client = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/plain/", "unused", .{
+        .expect_connect_protocol = false,
+        .settings_only = true,
+    });
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "SETTINGS_ENABLE_CONNECT_PROTOCOL: 0");
+}
+
+test "h3interop.rfc9220.gateway aioquic external client keeps REST live while both CONNECT workers stall (#821)" {
+    try requireGenericNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    const origin = try WsOrigin.start(allocator, .stall);
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try wsProxyConfig(allocator, origin.port(), "");
+    defer allocator.free(config_text);
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            ws_worker_env,
+        },
+    });
+    defer tardigrade.stop();
+
+    var client = try runAioquicH3ExtendedConnectWithOptions(allocator, quic_port, "/ws/stalled", "unused", .{
+        .isolation_path = "/healthz",
+    });
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(client.outcome));
+    try assertContains(client.stdout, "isolated GET status: 200");
+    try std.testing.expectEqual(@as(u32, 2), origin.handshakeCount());
 }
 
 test "downstream HTTP/2 RFC 8441 CONNECT END_STREAM reaches the relay and settles its tunnel (#952)" {

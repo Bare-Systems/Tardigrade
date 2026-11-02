@@ -7,6 +7,7 @@
 //! or QUIC connection with a relay.
 const std = @import("std");
 const compat = @import("zig_compat");
+const proxy_buffer_account = @import("proxy_buffer_account.zig");
 
 pub const Error = error{ QueueFull, Closed, InvalidCapacity, WakeFailed, WriteFailed } || std.mem.Allocator.Error;
 
@@ -43,6 +44,116 @@ pub const Wake = struct {
     }
 };
 
+/// Accounting policy held by an admitted tunnel for its complete lifetime.
+/// `fixed_*_bytes` are backing buffers that already exist (the H1-origin
+/// WebSocket relay buffers in the H3 embedding); charging them here makes the
+/// queue and its relay mailbox share one configured per-stream/origin/global
+/// budget rather than silently multiplying it.
+pub const QueueBudget = struct {
+    limits: proxy_buffer_account.Limits,
+    observer: proxy_buffer_account.Observer,
+    capacity: proxy_buffer_account.AggregateCapacity,
+    fixed_inbound_bytes: usize = 0,
+    fixed_outbound_bytes: usize = 0,
+    /// Existing relay-buffer reservations may cross an asynchronous admission
+    /// boundary. They are moved, rather than released and re-reserved, so the
+    /// aggregate accounting never has a gap while their storage is live.
+    adopted_inbound: ?*AdoptedReservation = null,
+    adopted_outbound: ?*AdoptedReservation = null,
+};
+
+/// A retained allocation's accounting ownership while it moves from an H1
+/// upgrade worker to an H3 stream session. The aggregate charge remains live
+/// until this value is either adopted by a `Session` or explicitly released.
+pub const AdoptedReservation = struct {
+    account: proxy_buffer_account.Account,
+    observer: proxy_buffer_account.Observer,
+    capacity: proxy_buffer_account.AggregateCapacity,
+
+    pub fn releaseAll(self: *AdoptedReservation) void {
+        const bytes = self.account.snapshot().current;
+        if (bytes == 0) return;
+        self.account.release(bytes) catch unreachable;
+        self.capacity.release(self.account.direction, bytes);
+        self.observer.releaseReservation(self.account.direction, bytes);
+        self.observer.releaseRetainedBytes(self.account.direction, bytes);
+    }
+};
+
+const Reservation = struct {
+    account: proxy_buffer_account.Account,
+    observer: proxy_buffer_account.Observer,
+    capacity: proxy_buffer_account.AggregateCapacity,
+
+    fn init(
+        direction: proxy_buffer_account.Direction,
+        budget: QueueBudget,
+    ) Reservation {
+        return .{
+            .account = proxy_buffer_account.Account.init(direction, .stream, budget.limits),
+            .observer = budget.observer,
+            .capacity = budget.capacity,
+        };
+    }
+
+    /// Move a live reservation without touching the aggregate counters. The
+    /// source is left empty so an admission-failure cleanup cannot release it
+    /// twice after this session becomes the owner.
+    fn take(adopted: *AdoptedReservation) Reservation {
+        const result = Reservation{
+            .account = adopted.account,
+            .observer = adopted.observer,
+            .capacity = adopted.capacity,
+        };
+        adopted.account.releaseAll();
+        return result;
+    }
+
+    fn reserve(self: *Reservation, bytes: usize) !void {
+        const before = self.account.snapshot();
+        self.account.reserve(bytes) catch |err| {
+            const after = self.account.snapshot();
+            if (after.limit_exceeded_events > before.limit_exceeded_events) {
+                self.observer.recordReservation(self.account.direction, 0, false, true);
+            }
+            return err;
+        };
+        self.capacity.reserve(self.account.direction, bytes) catch |err| {
+            self.account.release(bytes) catch unreachable;
+            self.observer.recordAggregateLimitExceeded(
+                self.account.direction,
+                proxy_buffer_account.aggregateFailureScope(err),
+            );
+            return error.QueueFull;
+        };
+        const after = self.account.snapshot();
+        self.observer.recordReservation(
+            self.account.direction,
+            bytes,
+            after.high_watermark_events > before.high_watermark_events,
+            after.limit_exceeded_events > before.limit_exceeded_events,
+        );
+        self.observer.recordRetainedBytes(self.account.direction, bytes);
+    }
+
+    fn release(self: *Reservation, bytes: usize) void {
+        if (bytes == 0) return;
+        self.account.release(bytes) catch unreachable;
+        self.capacity.release(self.account.direction, bytes);
+        self.observer.releaseReservation(self.account.direction, bytes);
+        self.observer.releaseRetainedBytes(self.account.direction, bytes);
+    }
+
+    fn releaseAll(self: *Reservation) void {
+        self.release(self.account.snapshot().current);
+    }
+};
+
+const Accounting = struct {
+    inbound: Reservation,
+    outbound: Reservation,
+};
+
 const Chunk = struct {
     bytes: []u8,
     offset: usize = 0,
@@ -58,6 +169,7 @@ pub const Session = struct {
     max_inbound_bytes: usize,
     max_outbound_bytes: usize,
     wake: ?Wake,
+    accounting: ?Accounting = null,
 
     mutex: compat.Mutex = .{},
     cond: compat.Condition = .{},
@@ -83,25 +195,112 @@ pub const Session = struct {
     consumer_attached: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, stream_id: u64, max_inbound_bytes: usize, max_outbound_bytes: usize, wake: ?Wake) Error!Session {
+        return initWithQueueBudget(allocator, stream_id, max_inbound_bytes, max_outbound_bytes, wake, null);
+    }
+
+    /// Like `init`, with queue accounting attached before any H3 bytes are
+    /// admitted. Fixed relay mailboxes are reserved first, so a configured
+    /// hard limit can reject the admission without allocating queue chunks.
+    pub fn initWithQueueBudget(
+        allocator: std.mem.Allocator,
+        stream_id: u64,
+        max_inbound_bytes: usize,
+        max_outbound_bytes: usize,
+        wake: ?Wake,
+        budget: ?QueueBudget,
+    ) Error!Session {
         if (max_inbound_bytes == 0 or max_outbound_bytes == 0) return error.InvalidCapacity;
-        return .{
+        var self = Session{
             .allocator = allocator,
             .stream_id = stream_id,
             .max_inbound_bytes = max_inbound_bytes,
             .max_outbound_bytes = max_outbound_bytes,
             .wake = wake,
         };
+        if (budget) |policy| {
+            var accounting = Accounting{
+                .inbound = if (policy.adopted_inbound) |adopted| Reservation.take(adopted) else Reservation.init(.downstream_to_upstream, policy),
+                .outbound = if (policy.adopted_outbound) |adopted| Reservation.take(adopted) else Reservation.init(.upstream_to_downstream, policy),
+            };
+            errdefer accounting.inbound.releaseAll();
+            errdefer accounting.outbound.releaseAll();
+            if (policy.adopted_inbound) |_| {
+                if (accounting.inbound.account.snapshot().current != policy.fixed_inbound_bytes) return error.InvalidCapacity;
+            } else {
+                accounting.inbound.reserve(policy.fixed_inbound_bytes) catch return error.QueueFull;
+            }
+            if (policy.adopted_outbound) |_| {
+                if (accounting.outbound.account.snapshot().current != policy.fixed_outbound_bytes) return error.InvalidCapacity;
+            } else {
+                accounting.outbound.reserve(policy.fixed_outbound_bytes) catch return error.QueueFull;
+            }
+            const inbound_available = policy.limits.per_stream_hard_limit -| policy.fixed_inbound_bytes;
+            const outbound_available = policy.limits.per_stream_hard_limit -| policy.fixed_outbound_bytes;
+            if (inbound_available == 0 or outbound_available == 0) {
+                return error.InvalidCapacity;
+            }
+            self.max_inbound_bytes = @min(self.max_inbound_bytes, inbound_available);
+            self.max_outbound_bytes = @min(self.max_outbound_bytes, outbound_available);
+            self.accounting = accounting;
+        }
+        return self;
     }
 
     pub fn deinit(self: *Session) void {
-        self.freeChunks(&self.inbound);
-        self.freeChunks(&self.outbound);
+        self.freeChunks(&self.inbound, .downstream_to_upstream);
+        self.freeChunks(&self.outbound, .upstream_to_downstream);
+        if (self.accounting) |*accounting| {
+            accounting.inbound.releaseAll();
+            accounting.outbound.releaseAll();
+        }
         self.* = undefined;
     }
 
-    fn freeChunks(self: *Session, chunks: *std.ArrayList(Chunk)) void {
-        for (chunks.items) |chunk| self.allocator.free(chunk.bytes);
+    fn freeChunks(self: *Session, chunks: *std.ArrayList(Chunk), direction: proxy_buffer_account.Direction) void {
+        for (chunks.items) |chunk| {
+            self.allocator.free(chunk.bytes);
+            // The accounting tracks retained allocations, not logical bytes
+            // remaining in a partially consumed chunk. The backing storage
+            // cannot be reused until this whole allocation is freed.
+            self.release(direction, chunk.bytes.len);
+        }
         chunks.deinit(self.allocator);
+    }
+
+    fn reserve(self: *Session, direction: proxy_buffer_account.Direction, bytes: usize) Error!void {
+        if (self.accounting) |*accounting| {
+            const reservation = switch (direction) {
+                .downstream_to_upstream => &accounting.inbound,
+                .upstream_to_downstream => &accounting.outbound,
+            };
+            reservation.reserve(bytes) catch return error.QueueFull;
+        }
+    }
+
+    fn release(self: *Session, direction: proxy_buffer_account.Direction, bytes: usize) void {
+        if (self.accounting) |*accounting| {
+            const reservation = switch (direction) {
+                .downstream_to_upstream => &accounting.inbound,
+                .upstream_to_downstream => &accounting.outbound,
+            };
+            reservation.release(bytes);
+        }
+    }
+
+    /// A failed reservation belongs to this session when its own retained
+    /// allocations already reach the stream hard limit. A writer can wait for
+    /// its reactor to free a whole chunk in that case; aggregate failures stay
+    /// controlled admission failures because another session owns the bytes.
+    fn streamBudgetFull(self: *Session, direction: proxy_buffer_account.Direction, bytes: usize) bool {
+        if (self.accounting) |*accounting| {
+            const reservation = switch (direction) {
+                .downstream_to_upstream => &accounting.inbound,
+                .upstream_to_downstream => &accounting.outbound,
+            };
+            const snapshot = reservation.account.snapshot();
+            return bytes > reservation.account.limits.per_stream_hard_limit -| snapshot.current;
+        }
+        return false;
     }
 
     /// Reactor-facing incremental inbound delivery.  A full queue means the
@@ -112,8 +311,15 @@ pub const Session = struct {
         defer self.mutex.unlock();
         if (self.terminal != null or self.remote_end_stream) return error.Closed;
         if (bytes.len > self.max_inbound_bytes -| self.inbound_bytes) return error.QueueFull;
-        const owned = try self.allocator.dupe(u8, bytes);
-        errdefer self.allocator.free(owned);
+        try self.reserve(.downstream_to_upstream, bytes.len);
+        const owned = self.allocator.dupe(u8, bytes) catch |err| {
+            self.release(.downstream_to_upstream, bytes.len);
+            return err;
+        };
+        errdefer {
+            self.allocator.free(owned);
+            self.release(.downstream_to_upstream, bytes.len);
+        }
         try self.inbound.append(self.allocator, .{ .bytes = owned });
         self.inbound_bytes += owned.len;
         self.cond.signal();
@@ -132,8 +338,15 @@ pub const Session = struct {
         const available = self.max_inbound_bytes -| self.inbound_bytes;
         const n = @min(bytes.len, available);
         if (n == 0) return 0;
-        const owned = try self.allocator.dupe(u8, bytes[0..n]);
-        errdefer self.allocator.free(owned);
+        self.reserve(.downstream_to_upstream, n) catch return 0;
+        const owned = self.allocator.dupe(u8, bytes[0..n]) catch |err| {
+            self.release(.downstream_to_upstream, n);
+            return err;
+        };
+        errdefer {
+            self.allocator.free(owned);
+            self.release(.downstream_to_upstream, n);
+        }
         try self.inbound.append(self.allocator, .{ .bytes = owned });
         self.inbound_bytes += n;
         self.cond.signal();
@@ -166,8 +379,8 @@ pub const Session = struct {
         if (self.terminal != null) return;
         self.terminal = terminal;
         self.inbound_credit_to_return += self.inbound_bytes;
-        self.freeChunks(&self.inbound);
-        self.freeChunks(&self.outbound);
+        self.freeChunks(&self.inbound, .downstream_to_upstream);
+        self.freeChunks(&self.outbound, .upstream_to_downstream);
         self.inbound = .empty;
         self.outbound = .empty;
         self.inbound_bytes = 0;
@@ -197,8 +410,10 @@ pub const Session = struct {
             remaining -= consumed;
             self.outbound_bytes -= consumed;
             if (chunk.offset == chunk.bytes.len) {
-                self.allocator.free(chunk.bytes);
+                const owned = chunk.bytes;
                 _ = self.outbound.orderedRemove(0);
+                self.allocator.free(owned);
+                self.release(.upstream_to_downstream, owned.len);
             }
         }
         self.cond.broadcast();
@@ -214,6 +429,23 @@ pub const Session = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.local_end_sent = true;
+    }
+
+    /// Observed by a relay after it requests `finishLocal()`: the H3
+    /// connection runtime has emitted the final DATA/FIN for this stream.
+    pub fn localEndStreamSent(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.local_end_sent;
+    }
+
+    /// Whether the peer has cleanly half-closed its request stream.  Together
+    /// with `localEndStreamSent`, this is the graceful-completion condition a
+    /// relay uses to avoid converting a successful close into RESET_STREAM.
+    pub fn remoteEndStreamReceived(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.remote_end_stream;
     }
 
     pub fn takeReceiveCreditToReturn(self: *Session) usize {
@@ -293,8 +525,10 @@ pub const Session = struct {
                 self.inbound_bytes -= n;
                 self.inbound_credit_to_return += n;
                 if (chunk.offset == chunk.bytes.len) {
-                    self.allocator.free(chunk.bytes);
+                    const owned = chunk.bytes;
                     _ = self.inbound.orderedRemove(0);
+                    self.allocator.free(owned);
+                    self.release(.downstream_to_upstream, owned.len);
                 }
                 self.signalWakeLocked() catch {};
                 return .{ .data = n };
@@ -320,12 +554,25 @@ pub const Session = struct {
                 continue;
             }
             const n = @min(capacity, remaining.len);
+            const stream_budget_full = self.streamBudgetFull(.upstream_to_downstream, n);
+            self.reserve(.upstream_to_downstream, n) catch |err| switch (err) {
+                error.QueueFull => {
+                    if (stream_budget_full) {
+                        self.cond.wait(&self.mutex);
+                        continue;
+                    }
+                    return error.QueueFull;
+                },
+                else => return err,
+            };
             const owned = self.allocator.dupe(u8, remaining[0..n]) catch |err| {
+                self.release(.upstream_to_downstream, n);
                 self.failWriteLocked();
                 return err;
             };
             self.outbound.append(self.allocator, .{ .bytes = owned }) catch |err| {
                 self.allocator.free(owned);
+                self.release(.upstream_to_downstream, n);
                 self.failWriteLocked();
                 return err;
             };
@@ -521,4 +768,71 @@ test "failed consumer control wakes remain observable for runtime cleanup" {
     finished.finishLocal();
     try std.testing.expect(finished.hasWakeFailure());
     try std.testing.expect(finished.hasWriteFailure());
+}
+
+test "queue budget retains partial chunks until allocation frees" {
+    const Observer = struct {
+        fn record(_: *anyopaque, _: proxy_buffer_account.Direction, _: usize, _: bool, _: bool) void {}
+        fn release(_: *anyopaque, _: proxy_buffer_account.Direction, _: usize) void {}
+    };
+    var observer_ctx: u8 = 0;
+    const limits = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 8 * 1024,
+        .per_stream_high_watermark = 16 * 1024,
+        .per_stream_hard_limit = 32 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 32 * 1024,
+    };
+    var global = proxy_buffer_account.Aggregate.init(.global, limits.global_hard_limit);
+    const budget = QueueBudget{
+        .limits = limits,
+        .observer = .{
+            .context = &observer_ctx,
+            .recordReservationFn = Observer.record,
+            .releaseReservationFn = Observer.release,
+        },
+        .capacity = .{ .global = &global },
+        .fixed_inbound_bytes = 16 * 1024,
+        .fixed_outbound_bytes = 16 * 1024,
+    };
+    {
+        var session = try Session.initWithQueueBudget(std.testing.allocator, 4, 64 * 1024, 64 * 1024, null, budget);
+        defer session.deinit();
+
+        var full: [16 * 1024]u8 = undefined;
+        @memset(&full, 'a');
+        var partial: [2 * 1024]u8 = undefined;
+        @memset(&partial, 'b');
+
+        // Partial reads and sends drain logical queue bytes but do not free a
+        // backing allocation. Keeping that reservation prevents the apparent
+        // 2 KiB of logical capacity from allocating a physical third buffer.
+        try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.downstream_to_upstream));
+        try std.testing.expectEqual(@as(usize, 16 * 1024), try session.deliverInboundPartial(&full));
+        try std.testing.expectEqual(@as(usize, 32 * 1024), global.currentBytes(.downstream_to_upstream));
+        var read_partial: [2 * 1024]u8 = undefined;
+        try std.testing.expectEqual(ReadResult{ .data = read_partial.len }, session.read(&read_partial));
+        try std.testing.expectEqual(@as(usize, 32 * 1024), global.currentBytes(.downstream_to_upstream));
+        try std.testing.expectEqual(@as(usize, 0), try session.deliverInboundPartial(&partial));
+        var read_rest: [14 * 1024]u8 = undefined;
+        try std.testing.expectEqual(ReadResult{ .data = read_rest.len }, session.read(&read_rest));
+        try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.downstream_to_upstream));
+        try std.testing.expectEqual(@as(usize, partial.len), try session.deliverInboundPartial(&partial));
+        try std.testing.expectEqual(@as(usize, 18 * 1024), global.currentBytes(.downstream_to_upstream));
+
+        try std.testing.expectEqual(WriteResult.ok, try session.write(&full));
+        try std.testing.expectEqual(@as(usize, 32 * 1024), global.currentBytes(.upstream_to_downstream));
+        session.commitOutboundSent(partial.len);
+        try std.testing.expectEqual(@as(usize, 32 * 1024), global.currentBytes(.upstream_to_downstream));
+        session.commitOutboundSent(full.len - partial.len);
+        try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.upstream_to_downstream));
+        try std.testing.expectEqual(WriteResult.ok, try session.write(&partial));
+        try std.testing.expectEqual(@as(usize, 18 * 1024), global.currentBytes(.upstream_to_downstream));
+
+        session.deliverReset(0);
+        try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.downstream_to_upstream));
+        try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.upstream_to_downstream));
+    }
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
 }

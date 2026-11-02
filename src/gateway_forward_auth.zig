@@ -55,6 +55,10 @@ pub const Input = struct {
     /// credentials remain available to later verifiers from that view, while
     /// asserted identity headers are withheld.
     asserted_names: []const []const u8 = &.{},
+    /// Admission workers may be cancelled when their downstream stream is
+    /// reset. Forward auth honours a pre/post-flight cancellation and clamps
+    /// its bounded transport timeouts to the request deadline.
+    cancel_token: ?*const http.cancellation.CancellationToken = null,
 };
 
 pub const Header = http.security_headers.ScopedHeader;
@@ -177,7 +181,8 @@ pub fn authorize(
     cfg: *const edge_config.EdgeConfig,
     fa: *const ForwardAuth,
     input: Input,
-) error{OutOfMemory}!Decision {
+) error{ OutOfMemory, RequestCancelled }!Decision {
+    if (input.cancel_token) |token| if (token.isStopped()) return error.RequestCancelled;
     var decision = Decision{ .arena = std.heap.ArenaAllocator.init(allocator), .outcome = .invalid_response };
     errdefer decision.arena.deinit();
     const arena = decision.arena.allocator();
@@ -214,7 +219,11 @@ pub fn authorize(
     // empty POST must still be explicitly framed (RFC 9110 §8.6).
     if (forwards_body and send_body.len == 0) try headers.append(.{ .name = "Content-Length", .value = "0" });
 
-    const timeout_ms = effectiveTimeoutMs(cfg, fa);
+    const configured_timeout_ms = effectiveTimeoutMs(cfg, fa);
+    const timeout_ms = if (input.cancel_token) |token|
+        token.effectiveTimeoutMs(configured_timeout_ms)
+    else
+        configured_timeout_ms;
     var response = gp.executeBoundedBufferedTcpHttpRequest(
         allocator,
         host,
@@ -231,6 +240,7 @@ pub fn authorize(
         null,
         null,
         false,
+        input.cancel_token,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         var failed = failWith(decision, classifyTransportError(err), fa.failure_status);
@@ -238,6 +248,7 @@ pub fn authorize(
         return failed;
     };
     defer response.deinit(allocator);
+    if (input.cancel_token) |token| if (token.isStopped()) return error.RequestCancelled;
 
     const status = response.status_code;
     if (status >= 200 and status < 300) {

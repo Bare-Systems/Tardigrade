@@ -22,6 +22,7 @@ const compat = @import("zig_compat");
 const std = @import("std");
 const cancellation = @import("cancellation.zig");
 const early_data_policy = @import("early_data.zig");
+const headers_mod = @import("headers.zig");
 const http3_session = @import("http3_session.zig");
 const logger_mod = @import("logger.zig");
 const metrics_mod = @import("metrics.zig");
@@ -87,6 +88,17 @@ pub const ExtendedConnectView = struct {
     buffered_body: []const u8,
     transport_early: bool,
     client_ip: []const u8,
+    /// Verified mTLS identity is out-of-band, exactly as on the ordinary H3
+    /// request path; no peer-supplied field can populate this value.
+    client_cert: ?headers_mod.ClientCertificate = null,
+    /// The SNI policy selected during the QUIC handshake.  The gateway uses
+    /// this to reject an authority governed by a different policy.
+    client_auth_policy_fingerprint: ?u64 = null,
+    /// Worker-owned cancellation for an admission that outlives the reactor
+    /// turn which observed it.  A peer reset/STOP_SENDING cancels this token;
+    /// gateway forward-auth and origin handshakes must pass it to their
+    /// bounded network operations.
+    cancel_token: ?*const cancellation.CancellationToken = null,
 };
 
 pub const ExtendedConnectRefusal = struct {
@@ -100,6 +112,10 @@ pub const ExtendedConnectAdmission = struct {
     headers: []const stream_transport.Header = &.{},
     max_inbound_bytes: usize,
     max_outbound_bytes: usize,
+    /// Optional policy snapshot for connection-owned H3 tunnel queues.  The
+    /// embedding supplies it only when its upstream relay has fixed buffers
+    /// that must share the same configured proxy-buffer budget.
+    queue_budget: ?stream_session.QueueBudget = null,
     /// Called once the session is admitted and attached to its QUIC stream.
     /// The embedder should spawn its own relay thread here. `*stream_session.
     /// Session` follows the primitive's own two-party detach contract: the
@@ -110,6 +126,10 @@ pub const ExtendedConnectAdmission = struct {
     /// `allocator` here is always the exact allocator it was created with.
     on_admitted: *const fn (std.mem.Allocator, *stream_session.Session, ?*anyopaque) void,
     on_admitted_ctx: ?*anyopaque = null,
+    /// Releases application-owned admission state when the runtime cannot
+    /// attach the stream. This is distinct from `on_admitted`: callers often
+    /// own an already-open upstream connection and capacity reservation.
+    on_admission_failed: ?*const fn (?*anyopaque) void = null,
 };
 
 pub const ExtendedConnectDecision = union(enum) {
@@ -1114,6 +1134,11 @@ const ConnEntry = struct {
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
     parked_h3_cache_fills: std.ArrayList(ParkedH3CacheFill) = .empty,
     pending_h3_responses: std.ArrayList(PendingH3Response) = .empty,
+    /// Accepted RFC 9220 streams whose non-FIN 2xx HEADERS are waiting for
+    /// QUIC flow-control credit.  Until that HEADERS frame is fully queued,
+    /// the H3 request owns no borrowed tunnel callbacks and the gateway owns
+    /// the upstream admission through `on_admission_failed`.
+    pending_h3_extended_connects: std.ArrayList(PendingH3ExtendedConnect) = .empty,
     active_request_stream_id: ?u64 = null,
     active_request_cancel_token: ?*cancellation.CancellationToken = null,
     /// #957: admitted Extended CONNECT tunnels' sessions, owned here (not by
@@ -1146,6 +1171,7 @@ const ConnEntry = struct {
         self.parked_h3_cache_fills.deinit(allocator);
         for (self.pending_h3_responses.items) |*pending| pending.deinit(allocator);
         self.pending_h3_responses.deinit(allocator);
+        releasePendingH3ExtendedConnects(allocator, &self.tunnel_sessions, &self.pending_h3_extended_connects);
         var tunnel_it = self.tunnel_sessions.valueIterator();
         while (tunnel_it.next()) |session_ptr| {
             // The session is a fully self-contained primitive (no reference
@@ -1312,8 +1338,242 @@ const PendingH3Response = struct {
     }
 };
 
+/// The acceptance half of a tunnel is deliberately a separate parked state
+/// from ordinary H3 responses: an RFC 9220 2xx response must not FIN its
+/// stream, and it must not bind a session until its response HEADERS have
+/// actually been accepted by the QUIC stream writer.
+const PendingH3ExtendedConnect = struct {
+    stream_id: u64,
+    admission: ExtendedConnectAdmission,
+    session_ptr: *stream_session.Session,
+    send_state: H3.ExtendedConnectResponseState,
+
+    fn init(stream_id: u64, admission: ExtendedConnectAdmission, session_ptr: *stream_session.Session) PendingH3ExtendedConnect {
+        return .{
+            .stream_id = stream_id,
+            .admission = admission,
+            .session_ptr = session_ptr,
+            .send_state = H3.ExtendedConnectResponseState.init(admission.status, admission.headers),
+        };
+    }
+
+    /// The admission callback owns upstream state (and normally the copied
+    /// header storage), while the runtime owns this not-yet-attached session.
+    /// This is used on every abandonment path, including connection teardown.
+    fn releaseFailed(self: *PendingH3ExtendedConnect, allocator: std.mem.Allocator) void {
+        if (self.admission.on_admission_failed) |failed| failed(self.admission.on_admitted_ctx);
+        self.session_ptr.deinit();
+        allocator.destroy(self.session_ptr);
+        self.* = undefined;
+    }
+};
+
+/// A parked accepted response and the session registry temporarily share the
+/// same session pointer.  Remove the registry entry before releasing the
+/// pending record, otherwise connection teardown would dereference the freed
+/// pointer again while settling attached tunnels.
+fn releasePendingH3ExtendedConnects(
+    allocator: std.mem.Allocator,
+    tunnel_sessions: *std.AutoHashMap(u64, *stream_session.Session),
+    pending_connects: *std.ArrayList(PendingH3ExtendedConnect),
+) void {
+    for (pending_connects.items) |*pending| {
+        const removed = tunnel_sessions.fetchRemove(pending.stream_id) orelse unreachable;
+        std.debug.assert(removed.value == pending.session_ptr);
+        pending.releaseFailed(allocator);
+    }
+    pending_connects.deinit(allocator);
+}
+
+test "pending H3 Extended CONNECT teardown removes the session registry entry first" {
+    const allocator = testing.allocator;
+    const Capture = struct {
+        failures: usize = 0,
+
+        fn admitted(_: std.mem.Allocator, _: *stream_session.Session, _: ?*anyopaque) void {
+            unreachable;
+        }
+
+        fn failed(ctx: ?*anyopaque) void {
+            const capture: *@This() = @ptrCast(@alignCast(ctx.?));
+            capture.failures += 1;
+        }
+    };
+
+    var capture = Capture{};
+    const session_ptr = try allocator.create(stream_session.Session);
+    errdefer allocator.destroy(session_ptr);
+    session_ptr.* = try stream_session.Session.init(allocator, 4, 64, 64, null);
+    errdefer session_ptr.deinit();
+
+    var tunnel_sessions = std.AutoHashMap(u64, *stream_session.Session).init(allocator);
+    defer tunnel_sessions.deinit();
+    try tunnel_sessions.put(4, session_ptr);
+
+    var pending_connects: std.ArrayList(PendingH3ExtendedConnect) = .empty;
+    try pending_connects.append(allocator, PendingH3ExtendedConnect.init(4, .{
+        .max_inbound_bytes = 64,
+        .max_outbound_bytes = 64,
+        .on_admitted = Capture.admitted,
+        .on_admitted_ctx = &capture,
+        .on_admission_failed = Capture.failed,
+    }, session_ptr));
+
+    releasePendingH3ExtendedConnects(allocator, &tunnel_sessions, &pending_connects);
+    try testing.expectEqual(@as(usize, 0), tunnel_sessions.count());
+    try testing.expectEqual(@as(usize, 1), capture.failures);
+}
+
 const async_h3_worker_count = 8;
 const async_h3_queue_capacity = 256;
+// Origin/auth admission can wait on remote handshakes for seconds. Keep it
+// separately bounded so stalled WebSocket CONNECTs never occupy REST workers.
+const async_h3_connect_worker_count = 2;
+const async_h3_connect_queue_capacity = 64;
+
+/// Deep-owned RFC 9220 envelope. Extended CONNECT is surfaced as borrowing
+/// H3 request storage, but gateway admission can open an upstream connection
+/// or call forward auth. Workers therefore receive this snapshot rather than
+/// touching a live H3 connection or its request buffers.
+const OwnedExtendedConnect = struct {
+    stream_id: u64,
+    method: []u8,
+    scheme: []u8,
+    authority: []u8,
+    path: []u8,
+    protocol: []u8,
+    headers: []stream_transport.Header,
+    buffered_body: []u8,
+    transport_early: bool,
+    client_ip: []u8,
+    client_cert: ?OwnedClientCertificate = null,
+    client_auth_policy_fingerprint: ?u64 = null,
+
+    const OwnedClientCertificate = struct {
+        fingerprint_sha256: []u8,
+        subject: []u8,
+        issuer: []u8,
+        serial: []u8,
+        san_dns: []u8,
+        san_email: []u8,
+        san_uri: []u8,
+
+        fn init(allocator: std.mem.Allocator, certificate: headers_mod.ClientCertificate) !OwnedClientCertificate {
+            const fingerprint_sha256 = try allocator.dupe(u8, certificate.fingerprint_sha256);
+            errdefer allocator.free(fingerprint_sha256);
+            const subject = try allocator.dupe(u8, certificate.subject);
+            errdefer allocator.free(subject);
+            const issuer = try allocator.dupe(u8, certificate.issuer);
+            errdefer allocator.free(issuer);
+            const serial = try allocator.dupe(u8, certificate.serial);
+            errdefer allocator.free(serial);
+            const san_dns = try allocator.dupe(u8, certificate.san_dns);
+            errdefer allocator.free(san_dns);
+            const san_email = try allocator.dupe(u8, certificate.san_email);
+            errdefer allocator.free(san_email);
+            const san_uri = try allocator.dupe(u8, certificate.san_uri);
+            return .{ .fingerprint_sha256 = fingerprint_sha256, .subject = subject, .issuer = issuer, .serial = serial, .san_dns = san_dns, .san_email = san_email, .san_uri = san_uri };
+        }
+
+        fn deinit(self: *OwnedClientCertificate, allocator: std.mem.Allocator) void {
+            allocator.free(self.fingerprint_sha256);
+            allocator.free(self.subject);
+            allocator.free(self.issuer);
+            allocator.free(self.serial);
+            allocator.free(self.san_dns);
+            allocator.free(self.san_email);
+            allocator.free(self.san_uri);
+            self.* = undefined;
+        }
+
+        fn view(self: *const OwnedClientCertificate) headers_mod.ClientCertificate {
+            return .{ .fingerprint_sha256 = self.fingerprint_sha256, .subject = self.subject, .issuer = self.issuer, .serial = self.serial, .san_dns = self.san_dns, .san_email = self.san_email, .san_uri = self.san_uri };
+        }
+    };
+
+    fn init(allocator: std.mem.Allocator, request: *const ExtendedConnectView) !OwnedExtendedConnect {
+        const method = try allocator.dupe(u8, request.method);
+        errdefer allocator.free(method);
+        const scheme = try allocator.dupe(u8, request.scheme);
+        errdefer allocator.free(scheme);
+        const authority = try allocator.dupe(u8, request.authority);
+        errdefer allocator.free(authority);
+        const path = try allocator.dupe(u8, request.path);
+        errdefer allocator.free(path);
+        const protocol = try allocator.dupe(u8, request.protocol);
+        errdefer allocator.free(protocol);
+        const buffered_body = try allocator.dupe(u8, request.buffered_body);
+        errdefer allocator.free(buffered_body);
+        const client_ip = try allocator.dupe(u8, request.client_ip);
+        errdefer allocator.free(client_ip);
+        const headers = try allocator.alloc(stream_transport.Header, request.headers.len);
+        errdefer allocator.free(headers);
+        var initialized: usize = 0;
+        errdefer for (headers[0..initialized]) |header| {
+            allocator.free(header.name);
+            allocator.free(header.value);
+        };
+        for (request.headers, 0..) |header, index| {
+            const name = try allocator.dupe(u8, header.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, header.value);
+            headers[index] = .{ .name = name, .value = value };
+            initialized += 1;
+        }
+        var client_cert: ?OwnedClientCertificate = null;
+        if (request.client_cert) |certificate| client_cert = try OwnedClientCertificate.init(allocator, certificate);
+        errdefer if (client_cert) |*certificate| certificate.deinit(allocator);
+        return .{
+            .stream_id = request.stream_id,
+            .method = method,
+            .scheme = scheme,
+            .authority = authority,
+            .path = path,
+            .protocol = protocol,
+            .headers = headers,
+            .buffered_body = buffered_body,
+            .transport_early = request.transport_early,
+            .client_ip = client_ip,
+            .client_cert = client_cert,
+            .client_auth_policy_fingerprint = request.client_auth_policy_fingerprint,
+        };
+    }
+
+    fn view(self: *const OwnedExtendedConnect, cancel_token: ?*const cancellation.CancellationToken) ExtendedConnectView {
+        return .{
+            .stream_id = self.stream_id,
+            .method = self.method,
+            .scheme = self.scheme,
+            .authority = self.authority,
+            .path = self.path,
+            .protocol = self.protocol,
+            .headers = self.headers,
+            .buffered_body = self.buffered_body,
+            .transport_early = self.transport_early,
+            .client_ip = self.client_ip,
+            .client_cert = if (self.client_cert) |*certificate| certificate.view() else null,
+            .client_auth_policy_fingerprint = self.client_auth_policy_fingerprint,
+            .cancel_token = cancel_token,
+        };
+    }
+
+    fn deinit(self: *OwnedExtendedConnect, allocator: std.mem.Allocator) void {
+        allocator.free(self.method);
+        allocator.free(self.scheme);
+        allocator.free(self.authority);
+        allocator.free(self.path);
+        allocator.free(self.protocol);
+        for (self.headers) |header| {
+            allocator.free(header.name);
+            allocator.free(header.value);
+        }
+        allocator.free(self.headers);
+        allocator.free(self.buffered_body);
+        allocator.free(self.client_ip);
+        if (self.client_cert) |*certificate| certificate.deinit(allocator);
+        self.* = undefined;
+    }
+};
 
 /// An owned H3 handler invocation. Workers may touch only this job and the
 /// process-shared handler context; connection/QUIC/H3 state remains reactor
@@ -1327,6 +1587,11 @@ const AsyncH3Job = struct {
             request: http3_session.StreamRequest,
         },
         cache_fill_resume: http3_session.StreamRequest.CacheFillContinuation,
+        extended_connect: struct {
+            handler: ExtendedConnectHandler,
+            handler_ctx: ?*anyopaque,
+            request: OwnedExtendedConnect,
+        },
     };
 
     allocator: std.mem.Allocator,
@@ -1340,6 +1605,7 @@ const AsyncH3Job = struct {
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     result_error: ?anyerror = null,
     parked_cache_fill: ?http3_session.StreamRequest.CacheFillContinuation = null,
+    extended_connect_decision: ?ExtendedConnectDecision = null,
 
     fn initRequest(
         allocator: std.mem.Allocator,
@@ -1391,6 +1657,29 @@ const AsyncH3Job = struct {
         return job;
     }
 
+    fn initExtendedConnect(
+        allocator: std.mem.Allocator,
+        connection_handle: u64,
+        stream_id: u64,
+        started_us: u64,
+        handler: ExtendedConnectHandler,
+        handler_ctx: ?*anyopaque,
+        request: *const ExtendedConnectView,
+    ) !*AsyncH3Job {
+        var owned = try OwnedExtendedConnect.init(allocator, request);
+        errdefer owned.deinit(allocator);
+        const job = try allocator.create(AsyncH3Job);
+        job.* = .{
+            .allocator = allocator,
+            .connection_handle = connection_handle,
+            .stream_id = stream_id,
+            .started_us = started_us,
+            .work = .{ .extended_connect = .{ .handler = handler, .handler_ctx = handler_ctx, .request = owned } },
+            .response = response_mod.Response.init(allocator),
+        };
+        return job;
+    }
+
     fn parkCacheFill(ctx: *anyopaque, continuation: http3_session.StreamRequest.CacheFillContinuation) anyerror!void {
         const self: *AsyncH3Job = @ptrCast(@alignCast(ctx));
         if (self.parked_cache_fill != null) return error.Http3DuplicateCacheFillPark;
@@ -1415,6 +1704,10 @@ const AsyncH3Job = struct {
             .cache_fill_resume => |continuation| continuation.run(self.allocator, &self.response) catch |err| {
                 self.result_error = err;
             },
+            .extended_connect => |*owned| {
+                const request = owned.request.view(&self.cancel_token);
+                self.extended_connect_decision = owned.handler(self.allocator, &request, owned.handler_ctx);
+            },
         }
         self.done.store(true, .release);
     }
@@ -1424,6 +1717,7 @@ const AsyncH3Job = struct {
         switch (self.work) {
             .request => self.cancel_token.cancel(reason),
             .cache_fill_resume => |continuation| continuation.cancel(reason),
+            .extended_connect => self.cancel_token.cancel(reason),
         }
     }
 
@@ -1433,7 +1727,12 @@ const AsyncH3Job = struct {
         return continuation;
     }
 
+    fn isExtendedConnect(self: *const AsyncH3Job) bool {
+        return self.work == .extended_connect;
+    }
+
     fn deinit(self: *AsyncH3Job) void {
+        self.discardExtendedConnectDecision();
         if (self.parked_cache_fill) |continuation| {
             continuation.cancel(.shutdown);
             continuation.deinit(self.allocator);
@@ -1441,9 +1740,18 @@ const AsyncH3Job = struct {
         switch (self.work) {
             .request => |*owned| owned.request.deinit(),
             .cache_fill_resume => |continuation| continuation.deinit(self.allocator),
+            .extended_connect => |*owned| owned.request.deinit(self.allocator),
         }
         self.response.deinit();
         self.allocator.destroy(self);
+    }
+
+    fn discardExtendedConnectDecision(self: *AsyncH3Job) void {
+        if (self.extended_connect_decision) |decision| switch (decision) {
+            .admit => |admission| if (admission.on_admission_failed) |failed| failed(admission.on_admitted_ctx),
+            .refuse => {},
+        };
+        self.extended_connect_decision = null;
     }
 };
 
@@ -1621,6 +1929,10 @@ pub const Runtime = struct {
     /// refusal is enough to know marking will never work here.
     ecn_send_enabled: bool = false,
     async_h3_executor: AsyncH3Executor = .{},
+    /// Dedicated, independently bounded origin/auth executor for RFC 9220
+    /// admission. Ordinary H3 request/cache work must retain its own worker
+    /// capacity even if CONNECT origins are slow or unavailable.
+    async_h3_connect_executor: AsyncH3Executor = .{},
     /// Reactor-owned registry. Worker threads only mutate each job's owned
     /// result and `done` flag; they never append/remove registry entries.
     async_h3_jobs: std.ArrayList(*AsyncH3Job) = .empty,
@@ -1633,10 +1945,9 @@ pub const Runtime = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, logger: *logger_mod.Logger, cfg: Config) Http3RuntimeError!Runtime {
-        // The low-level H3 connection can advertise RFC 9220 for envelope
-        // testing, but the production runtime has no stream consumer yet.
-        // Keep the gateway capability fail-closed until that consumer exists.
-        if (cfg.h3_settings.enable_connect_protocol) return error.InvalidH3Settings;
+        // RFC 9220 can only be advertised alongside an actual stream
+        // consumer.  Leaving the setting off remains the safe default.
+        if (cfg.h3_settings.enable_connect_protocol and cfg.extended_connect_handler == null) return error.InvalidH3Settings;
         const address = compat.parseIpAddress(cfg.listen_host, cfg.quic_port) catch |err| {
             logger.warn(null, "http3: listen address parse failed: {s}", .{@errorName(err)});
             return error.BindFailed;
@@ -1782,14 +2093,23 @@ pub const Runtime = struct {
             self.logger.warn(null, "http3: bounded request executor unavailable: {s}", .{@errorName(err)});
             return;
         };
+        self.async_h3_connect_executor.init(self.allocator, async_h3_connect_worker_count, async_h3_connect_queue_capacity) catch |err| {
+            self.logger.warn(null, "http3: bounded extended CONNECT executor unavailable: {s}", .{@errorName(err)});
+            self.async_h3_executor.shutdownAndJoin();
+            return;
+        };
         self.thread = std.Thread.spawn(.{}, loopMain, .{self}) catch null;
-        if (self.thread == null) self.async_h3_executor.shutdownAndJoin();
+        if (self.thread == null) {
+            self.async_h3_connect_executor.shutdownAndJoin();
+            self.async_h3_executor.shutdownAndJoin();
+        }
     }
 
     pub fn deinit(self: *Runtime) void {
         self.stopping.store(true, .release);
         if (self.thread) |thread| thread.join();
         for (self.async_h3_jobs.items) |job| job.cancel(.shutdown);
+        self.async_h3_connect_executor.shutdownAndJoin();
         self.async_h3_executor.shutdownAndJoin();
         for (self.async_h3_jobs.items) |job| job.deinit();
         self.async_h3_jobs.deinit(self.allocator);
@@ -1877,6 +2197,12 @@ pub const Runtime = struct {
                     self.drainConnectionTransmits(entry, now);
                     const handshake_timed_out = handshakeTimedOutForRemoval(entry, now);
                     if (drain_expired and !handshake_timed_out) {
+                        // A relay that observed the process shutdown asks its
+                        // Session runtime to cancel.  Reconcile that request
+                        // before closing the QUIC connection so the peer sees
+                        // a terminal stream signal instead of a silent UDP
+                        // disappearance at the outer process deadline.
+                        self.reconcileTunnels(entry);
                         self.closeForDrainDeadline(entry, now);
                     } else if (!drain_expired) {
                         self.pumpH3(entry, now);
@@ -2455,6 +2781,7 @@ pub const Runtime = struct {
             return;
         };
         self.resumePendingH3Responses(entry, now);
+        self.resumePendingH3ExtendedConnects(entry);
         self.resumeParkedH3CacheFills(entry, now);
         self.resumeParkedH3Retries(entry);
         while (true) {
@@ -2482,12 +2809,11 @@ pub const Runtime = struct {
         self.reconcileTunnels(entry);
     }
 
-    /// Admit or refuse a validated, negotiated Extended CONNECT envelope
-    /// surfaced before its stream's FIN (#957). Unlike `serveRequest`, this
-    /// never runs on the bounded worker pool: the embedder's own handler is
-    /// expected to make a synchronous go/no-go decision and hand off its own
-    /// relay (if admitted) to its own thread, exactly like today's H2
-    /// Extended CONNECT admission already does.
+    /// Queue a validated, negotiated Extended CONNECT envelope surfaced
+    /// before its stream's FIN (#957). Gateway admission may run forward
+    /// auth and an H1 origin upgrade, neither of which may block the UDP
+    /// reactor. Workers receive a deep snapshot; the reactor applies a
+    /// completed decision only if the stream is still awaiting admission.
     fn serveExtendedConnect(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingExtendedConnect, now: u64) void {
         const handler = self.extended_connect_handler orelse {
             self.refuseExtendedConnect(entry, incoming.stream_id, now, 404, &.{}, "");
@@ -2498,6 +2824,19 @@ pub const Runtime = struct {
             return;
         };
         defer self.allocator.free(client_ip);
+        var client_cert: ?headers_mod.ClientCertificate = null;
+        if (entry.client_auth_mode != .disabled) {
+            const identity = entry.clientIdentity(self.allocator) catch {
+                self.refuseExtendedConnect(entry, incoming.stream_id, now, 500, &.{}, "");
+                return;
+            };
+            if (identity) |verified| {
+                client_cert = clientCertificateView(verified);
+            } else if (entry.client_auth_mode == .required) {
+                self.refuseExtendedConnect(entry, incoming.stream_id, now, 403, &.{}, "");
+                return;
+            }
+        }
         const view = ExtendedConnectView{
             .stream_id = incoming.stream_id,
             .method = incoming.method,
@@ -2509,22 +2848,60 @@ pub const Runtime = struct {
             .buffered_body = incoming.buffered_body,
             .transport_early = incoming.transport_early,
             .client_ip = client_ip,
+            .client_cert = client_cert,
+            .client_auth_policy_fingerprint = if (entry.client_snapshot != null) entry.client_policy_fingerprint else null,
         };
-        switch (handler(self.allocator, &view, self.extended_connect_handler_ctx)) {
+        if (!self.async_h3_connect_executor.initialized) {
+            // Deterministic in-process unit harnesses construct a Runtime
+            // without starting its reactor thread. They own the connection
+            // synchronously and exercise the same reactor-only apply path;
+            // a running UDP runtime can never take this branch (start()
+            // starts the executor before the reactor thread).
+            if (self.thread == null) {
+                self.applyExtendedConnectDecision(entry, incoming.stream_id, handler(self.allocator, &view, self.extended_connect_handler_ctx), now);
+                return;
+            }
+            self.refuseExtendedConnect(entry, incoming.stream_id, now, 503, &.{}, "");
+            return;
+        }
+        const job = AsyncH3Job.initExtendedConnect(
+            self.allocator,
+            entry.quic_observer.connection_handle,
+            incoming.stream_id,
+            now,
+            handler,
+            self.extended_connect_handler_ctx,
+            &view,
+        ) catch {
+            self.refuseExtendedConnect(entry, incoming.stream_id, now, 503, &.{}, "");
+            return;
+        };
+        self.submitAsyncH3Job(job) catch |err| {
+            job.deinit();
+            self.logger.warn(null, "http3: extended CONNECT executor admission failed: {s}", .{@errorName(err)});
+            self.refuseExtendedConnect(entry, incoming.stream_id, now, 503, &.{}, "");
+        };
+    }
+
+    /// Apply a completed admission on the reactor: both outcomes mutate the
+    /// H3/QUIC connection and must never run in an admission worker.
+    fn applyExtendedConnectDecision(self: *Runtime, entry: *ConnEntry, stream_id: u64, decision: ExtendedConnectDecision, now: u64) void {
+        switch (decision) {
             // #957 requires every Extended CONNECT outcome to be an ordinary,
             // non-101 HTTP/3 response: reject any embedder-supplied status
             // that would violate that (e.g. an HTTP/1.1 WebSocket handler's
             // 101 reused verbatim) rather than forwarding it onto the wire.
             .refuse => |refusal| {
                 const status = if (refusal.status == 101 or refusal.status < 200 or refusal.status > 599) 500 else refusal.status;
-                self.refuseExtendedConnect(entry, incoming.stream_id, now, status, refusal.headers, refusal.body);
+                self.refuseExtendedConnect(entry, stream_id, now, status, refusal.headers, refusal.body);
             },
             .admit => |admission| {
                 if (admission.status < 200 or admission.status >= 300) {
-                    self.refuseExtendedConnect(entry, incoming.stream_id, now, 500, &.{}, "");
+                    if (admission.on_admission_failed) |failed| failed(admission.on_admitted_ctx);
+                    self.refuseExtendedConnect(entry, stream_id, now, 500, &.{}, "");
                     return;
                 }
-                self.admitTunnel(entry, incoming.stream_id, admission, now);
+                self.admitTunnel(entry, stream_id, admission, now);
             },
         }
     }
@@ -2549,43 +2926,117 @@ pub const Runtime = struct {
 
     fn admitTunnel(self: *Runtime, entry: *ConnEntry, stream_id: u64, admission: ExtendedConnectAdmission, now: u64) void {
         const session_ptr = self.allocator.create(stream_session.Session) catch {
+            if (admission.on_admission_failed) |failed| failed(admission.on_admitted_ctx);
             self.refuseExtendedConnect(entry, stream_id, now, 503, &.{}, "");
             return;
         };
-        session_ptr.* = stream_session.Session.init(self.allocator, stream_id, admission.max_inbound_bytes, admission.max_outbound_bytes, null) catch {
+        session_ptr.* = stream_session.Session.initWithQueueBudget(self.allocator, stream_id, admission.max_inbound_bytes, admission.max_outbound_bytes, null, admission.queue_budget) catch {
             self.allocator.destroy(session_ptr);
+            if (admission.on_admission_failed) |failed| failed(admission.on_admitted_ctx);
             self.refuseExtendedConnect(entry, stream_id, now, 503, &.{}, "");
             return;
         };
         entry.tunnel_sessions.put(stream_id, session_ptr) catch {
             session_ptr.deinit();
             self.allocator.destroy(session_ptr);
+            if (admission.on_admission_failed) |failed| failed(admission.on_admitted_ctx);
             self.refuseExtendedConnect(entry, stream_id, now, 503, &.{}, "");
             return;
         };
-        const sink = http3.session.RequestStream.TunnelSink{ .ctx = session_ptr, .deliverFn = tunnelDeliverInbound };
+        var pending = PendingH3ExtendedConnect.init(stream_id, admission, session_ptr);
+        const headers_queued = entry.h3.sendExtendedConnectResponseProgress(entry.conn, stream_id, &pending.send_state) catch |err| {
+            self.logger.warn(null, "http3: accepted extended CONNECT response failed: {s}", .{@errorName(err)});
+            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3 internal_error-equivalent QUIC application code; best effort
+            entry.h3.finishRequest(stream_id);
+            _ = entry.tunnel_sessions.remove(stream_id);
+            pending.releaseFailed(self.allocator);
+            return;
+        };
+        if (headers_queued) {
+            self.completeExtendedConnectAdmission(entry, &pending);
+            return;
+        }
+        entry.pending_h3_extended_connects.append(self.allocator, pending) catch |err| {
+            self.logger.warn(null, "http3: failed to park accepted extended CONNECT response: {s}", .{@errorName(err)});
+            entry.conn.resetStream(stream_id, 0x0102) catch {};
+            entry.h3.finishRequest(stream_id);
+            _ = entry.tunnel_sessions.remove(stream_id);
+            pending.releaseFailed(self.allocator);
+        };
+    }
+
+    /// Attach callbacks only after the 2xx HEADERS write is fully accepted.
+    /// Before this point a cancellation or connection removal can safely free
+    /// the admission/session without leaving H3 with dangling callbacks.
+    fn completeExtendedConnectAdmission(self: *Runtime, entry: *ConnEntry, pending: *PendingH3ExtendedConnect) void {
+        const stream_id = pending.stream_id;
+        const sink = http3.session.RequestStream.TunnelSink{ .ctx = pending.session_ptr, .deliverFn = tunnelDeliverInbound };
         const tunnel = H3.Tunnel{
-            .ctx = session_ptr,
+            .ctx = pending.session_ptr,
             .remoteEndStreamFn = tunnelRemoteEndStream,
             .peekOutboundFn = tunnelPeekOutbound,
             .commitOutboundSentFn = tunnelCommitOutboundSent,
             .outboundLocalEndPendingFn = tunnelOutboundLocalEndPending,
             .markLocalEndSentFn = tunnelMarkLocalEndSent,
         };
-        entry.h3.admitExtendedConnect(entry.conn, stream_id, admission.status, admission.headers, sink, tunnel) catch {
-            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3 internal_error-equivalent QUIC application code; best effort
-            // `admitExtendedConnect` may have already attached `sink`/`tunnel`
-            // (borrowed pointers into `session_ptr`) before failing, e.g. during
-            // buffered-body drain. Remove the request so no later pump
-            // (`pumpTunnelsOutbound`/`pumpTunnelInbound`) can reach those
-            // callbacks after `session_ptr` is destroyed below.
+        entry.h3.attachExtendedConnect(stream_id, sink, tunnel) catch |err| {
+            self.logger.warn(null, "http3: accepted extended CONNECT attach failed: {s}", .{@errorName(err)});
+            entry.conn.resetStream(stream_id, 0x0102) catch {};
             entry.h3.finishRequest(stream_id);
             _ = entry.tunnel_sessions.remove(stream_id);
-            session_ptr.deinit();
-            self.allocator.destroy(session_ptr);
+            pending.releaseFailed(self.allocator);
             return;
         };
-        admission.on_admitted(self.allocator, session_ptr, admission.on_admitted_ctx);
+        pending.admission.on_admitted(self.allocator, pending.session_ptr, pending.admission.on_admitted_ctx);
+        // `on_admitted` now owns the application/upstream half and the tunnel
+        // session is owned by `entry.tunnel_sessions` under the detach
+        // contract. This record owns neither and can be discarded as-is.
+        pending.* = undefined;
+    }
+
+    fn resumePendingH3ExtendedConnects(self: *Runtime, entry: *ConnEntry) void {
+        var index: usize = 0;
+        while (index < entry.pending_h3_extended_connects.items.len) {
+            const stream_id = entry.pending_h3_extended_connects.items[index].stream_id;
+            if (!entry.h3.hasPendingExtendedConnect(stream_id)) {
+                var abandoned = entry.pending_h3_extended_connects.orderedRemove(index);
+                _ = entry.tunnel_sessions.remove(stream_id);
+                abandoned.releaseFailed(self.allocator);
+                continue;
+            }
+            const done = entry.h3.sendExtendedConnectResponseProgress(
+                entry.conn,
+                stream_id,
+                &entry.pending_h3_extended_connects.items[index].send_state,
+            ) catch |err| {
+                self.logger.warn(null, "http3: parked accepted extended CONNECT response failed: {s}", .{@errorName(err)});
+                entry.conn.resetStream(stream_id, 0x0102) catch {};
+                entry.h3.finishRequest(stream_id);
+                var failed = entry.pending_h3_extended_connects.orderedRemove(index);
+                _ = entry.tunnel_sessions.remove(stream_id);
+                failed.releaseFailed(self.allocator);
+                continue;
+            };
+            if (!done) {
+                index += 1;
+                continue;
+            }
+            var completed = entry.pending_h3_extended_connects.orderedRemove(index);
+            self.completeExtendedConnectAdmission(entry, &completed);
+        }
+    }
+
+    fn cancelPendingH3ExtendedConnectForEntry(self: *Runtime, entry: anytype, stream_id: u64) bool {
+        var index: usize = 0;
+        while (index < entry.pending_h3_extended_connects.items.len) : (index += 1) {
+            if (entry.pending_h3_extended_connects.items[index].stream_id != stream_id) continue;
+            var abandoned = entry.pending_h3_extended_connects.orderedRemove(index);
+            entry.h3.finishRequest(stream_id);
+            _ = entry.tunnel_sessions.remove(stream_id);
+            abandoned.releaseFailed(self.allocator);
+            return true;
+        }
+        return false;
     }
 
     /// Returns how many leading bytes of `bytes` the bound session accepted
@@ -2814,7 +3265,8 @@ pub const Runtime = struct {
 
     fn submitAsyncH3Job(self: *Runtime, job: *AsyncH3Job) !void {
         try self.async_h3_jobs.append(self.allocator, job);
-        self.async_h3_executor.submit(job) catch |err| {
+        const executor = if (job.isExtendedConnect()) &self.async_h3_connect_executor else &self.async_h3_executor;
+        executor.submit(job) catch |err| {
             _ = self.async_h3_jobs.pop();
             return err;
         };
@@ -2830,6 +3282,27 @@ pub const Runtime = struct {
             }
             _ = self.async_h3_jobs.orderedRemove(index);
             defer job.deinit();
+
+            if (job.work == .extended_connect) {
+                const decision = job.extended_connect_decision orelse {
+                    self.logger.warn(null, "http3: extended CONNECT admission worker returned no decision", .{});
+                    continue;
+                };
+                // Move the decision out before attachment. A stale decision
+                // goes back into the job so `deinit` invokes its explicit
+                // failure callback and releases the upstream reservation.
+                job.extended_connect_decision = null;
+                const extended_entry = connections.get(job.connection_handle) orelse {
+                    job.extended_connect_decision = decision;
+                    continue;
+                };
+                if (job.cancelled.load(.acquire) or !extended_entry.h3.hasPendingExtendedConnect(job.stream_id)) {
+                    job.extended_connect_decision = decision;
+                    continue;
+                }
+                self.applyExtendedConnectDecision(extended_entry, job.stream_id, decision, job.started_us);
+                continue;
+            }
 
             const entry = connections.get(job.connection_handle) orelse {
                 if (job.takeParkedCacheFill()) |continuation| {
@@ -3578,6 +4051,7 @@ pub const Runtime = struct {
         }
         _ = observer.runtime.cancelAsyncH3Job(observer.connection_handle, stream_id, .client_disconnect);
         _ = observer.runtime.cancelParkedH3CacheFillForEntry(entry, stream_id, .client_disconnect);
+        _ = observer.runtime.cancelPendingH3ExtendedConnectForEntry(entry, stream_id);
     }
 
     fn cancelParkedH3CacheFillForEntry(
@@ -5115,6 +5589,88 @@ const RuntimeCidHarness = struct {
 const TunnelAdmitCapture = struct {
     session: ?*stream_session.Session = null,
 };
+
+const AsyncAdmissionCapture = struct {
+    observed_path: [32]u8 = undefined,
+    observed_path_len: usize = 0,
+    failed: usize = 0,
+
+    fn handler(_: std.mem.Allocator, request: *const ExtendedConnectView, ctx: ?*anyopaque) ExtendedConnectDecision {
+        const self: *AsyncAdmissionCapture = @ptrCast(@alignCast(ctx.?));
+        self.observed_path_len = request.path.len;
+        @memcpy(self.observed_path[0..request.path.len], request.path);
+        return .{ .admit = .{
+            .max_inbound_bytes = 64,
+            .max_outbound_bytes = 64,
+            .on_admitted = unexpectedAsyncAdmission,
+            .on_admitted_ctx = ctx,
+            .on_admission_failed = admissionFailed,
+        } };
+    }
+
+    fn unexpectedAsyncAdmission(_: std.mem.Allocator, _: *stream_session.Session, _: ?*anyopaque) void {
+        unreachable;
+    }
+
+    fn admissionFailed(ctx: ?*anyopaque) void {
+        const self: *AsyncAdmissionCapture = @ptrCast(@alignCast(ctx.?));
+        self.failed += 1;
+    }
+};
+
+test "http3 runtime (#821): queued Extended CONNECT admission snapshots request bytes and disposes stale results" {
+    const allocator = testing.allocator;
+    var path = [_]u8{ '/', 'o', 'l', 'd' };
+    var header_name = [_]u8{ 'x', '-', 't', 'e', 's', 't' };
+    var header_value = [_]u8{ 'o', 'l', 'd' };
+    var body = [_]u8{ 'o', 'l', 'd' };
+    var client_ip = [_]u8{ '1', '2', '7', '.', '0', '.', '0', '.', '1' };
+    var certificate_fingerprint = [_]u8{ 'a', 'b', 'c' };
+    const headers = [_]stream_transport.Header{.{ .name = &header_name, .value = &header_value }};
+    const view = ExtendedConnectView{
+        .stream_id = 4,
+        .method = "CONNECT",
+        .scheme = "https",
+        .authority = "tardigrade.test",
+        .path = &path,
+        .protocol = "websocket",
+        .headers = &headers,
+        .buffered_body = &body,
+        .transport_early = false,
+        .client_ip = &client_ip,
+        .client_cert = .{ .fingerprint_sha256 = &certificate_fingerprint },
+    };
+    var capture = AsyncAdmissionCapture{};
+    const job = try AsyncH3Job.initExtendedConnect(allocator, 99, view.stream_id, 1, AsyncAdmissionCapture.handler, &capture, &view);
+    path[1] = 'n';
+    header_value[0] = 'n';
+    body[0] = 'n';
+    certificate_fingerprint[0] = 'n';
+    job.run();
+    try testing.expectEqualStrings("/old", capture.observed_path[0..capture.observed_path_len]);
+
+    // A completed worker can race a client reset or connection teardown. A
+    // live connection whose stream is no longer pending must not attach an
+    // upstream tunnel; instead its one-shot failure callback releases it.
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-extended-connect-stale-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(allocator, fixed.provider());
+    defer harness.deinit(allocator);
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer connections.deinit();
+    try connections.put(99, harness.entry);
+    try runtime.async_h3_jobs.append(allocator, job);
+    runtime.drainCompletedAsyncH3Jobs(&connections);
+    try testing.expectEqual(@as(usize, 1), capture.failed);
+    try testing.expectEqual(@as(usize, 0), runtime.async_h3_jobs.items.len);
+}
 
 fn testExtendedConnectHandler(
     _: std.mem.Allocator,
@@ -7427,6 +7983,7 @@ test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT cap
         .backend = backend,
         .conn = server_conn,
         .h3 = H3.initWithSettings(allocator, .server, .{}),
+        .tunnel_sessions = std.AutoHashMap(u64, *stream_session.Session).init(allocator),
         .admission_source_ip = 0,
         .cid_len = odcid.len,
         .accepted_at_us = 1_000_000,
@@ -7745,6 +8302,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .backend = backend1,
         .conn = server_conn1,
         .h3 = H3.initWithSettings(allocator, .server, .{}),
+        .tunnel_sessions = std.AutoHashMap(u64, *stream_session.Session).init(allocator),
         .admission_source_ip = 0,
         .cid_len = odcid.len,
         .accepted_at_us = 1_000_000,
@@ -7894,6 +8452,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .backend = backend2,
         .conn = server_conn2,
         .h3 = H3.initWithSettings(allocator, .server, .{}),
+        .tunnel_sessions = std.AutoHashMap(u64, *stream_session.Session).init(allocator),
         .admission_source_ip = 0,
         .cid_len = odcid.len,
         .accepted_at_us = 2_000_000,
@@ -8278,6 +8837,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .backend = backend1,
         .conn = server_conn1,
         .h3 = H3.initWithSettings(allocator, .server, .{}),
+        .tunnel_sessions = std.AutoHashMap(u64, *stream_session.Session).init(allocator),
         .admission_source_ip = 0,
         .cid_len = odcid.len,
         .accepted_at_us = 1_000_000,
@@ -8416,6 +8976,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         // this live value, so phase 2's actual H3 session must run under
         // those same (mutated) SETTINGS, not silently fall back to defaults.
         .h3 = H3.initWithSettings(allocator, .server, runtime.h3_settings),
+        .tunnel_sessions = std.AutoHashMap(u64, *stream_session.Session).init(allocator),
         .admission_source_ip = 0,
         .cid_len = odcid.len,
         .accepted_at_us = 2_000_000,

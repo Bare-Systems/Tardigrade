@@ -323,7 +323,7 @@ am I to the limit" overstates pressure.
 The series to put next to the limit is
 `tardigrade_proxy_buffer_aggregate_bytes_current{direction,scope="global"}`,
 which is read directly from the account that performs the enforcement. It
-covers HTTP/2 stream queues, HTTP/1 relay buffers in both directions, and
+covers HTTP/2 stream queues, HTTP/3 WebSocket tunnel queues, HTTP/1 relay buffers in both directions, and
 request-direction upload buffers on both protocols.
 
 The per-origin equivalents are

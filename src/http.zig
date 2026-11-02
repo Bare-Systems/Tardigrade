@@ -76,6 +76,7 @@ pub const h2_stream_session = @import("http/h2_stream_session.zig");
 /// Bounded connection-owned byte session for future H3 long-lived streams.
 pub const stream_session = @import("http/stream_session.zig");
 pub const h2_websocket_relay = @import("http/h2_websocket_relay.zig");
+pub const h3_websocket_relay = @import("http/h3_websocket_relay.zig");
 pub const h2_request_executor = @import("http/h2_request_executor.zig");
 pub const upstream_h2 = @import("http/upstream_h2.zig");
 pub const stream_transport = @import("stream_transport");

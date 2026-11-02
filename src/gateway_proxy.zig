@@ -214,7 +214,71 @@ const ProxyBufferReservation = struct {
         if (current == 0) return;
         self.release(current);
     }
+
+    /// Transfer a still-live allocation's accounting to an H3 admission
+    /// owner. Reset only this local bookkeeping: the account's aggregate
+    /// charge and retained-byte metrics remain continuously owned by the
+    /// returned value until its session releases them.
+    fn takeForH3(self: *ProxyBufferReservation) http.stream_session.AdoptedReservation {
+        const adopted = http.stream_session.AdoptedReservation{
+            .account = self.account,
+            .observer = self.observer,
+            .capacity = self.capacity,
+        };
+        self.account.releaseAll();
+        self.active = false;
+        return adopted;
+    }
 };
+
+test "H3 relay reservation transfer keeps aggregate capacity charged across admission" {
+    const Observer = struct {
+        fn record(_: *anyopaque, _: proxy_buffer_account.Direction, _: usize, _: bool, _: bool) void {}
+        fn release(_: *anyopaque, _: proxy_buffer_account.Direction, _: usize) void {}
+    };
+    var observer_ctx: u8 = 0;
+    const limits = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 8,
+        .per_stream_high_watermark = 16,
+        .per_stream_hard_limit = 32,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 32,
+    };
+    const observer = proxy_buffer_account.Observer{
+        .context = &observer_ctx,
+        .recordReservationFn = Observer.record,
+        .releaseReservationFn = Observer.release,
+    };
+    var global = proxy_buffer_account.Aggregate.init(.global, limits.global_hard_limit);
+    const capacity = proxy_buffer_account.AggregateCapacity{ .global = &global };
+    var original = ProxyBufferReservation.init(.downstream_to_upstream, limits, observer, capacity);
+    try original.reserve(16);
+
+    // This represents an H1 upgrade worker completing while the H3 reactor
+    // has not yet applied its queued admission. The aggregate is never
+    // released in that interval, so another worker cannot over-admit.
+    var adopted = original.takeForH3();
+    try std.testing.expectEqual(@as(usize, 16), global.currentBytes(.downstream_to_upstream));
+    var competing = ProxyBufferReservation.init(.downstream_to_upstream, limits, observer, capacity);
+    try std.testing.expectError(error.ProxyBufferCapacityUnavailable, competing.reserve(17));
+
+    const budget = http.stream_session.QueueBudget{
+        .limits = limits,
+        .observer = observer,
+        .capacity = capacity,
+        .fixed_inbound_bytes = 16,
+        .adopted_inbound = &adopted,
+    };
+    {
+        var session = try http.stream_session.Session.initWithQueueBudget(std.testing.allocator, 4, 16, 16, null, budget);
+        defer session.deinit();
+        try std.testing.expectEqual(@as(usize, 16), global.currentBytes(.downstream_to_upstream));
+        try std.testing.expectError(error.ProxyBufferCapacityUnavailable, competing.reserve(17));
+    }
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+    try competing.reserve(17);
+    competing.releaseAll();
+}
 
 /// Reserve request-direction relay bytes with the failure semantics #140 defines
 /// for the pre-commitment side of the boundary. The two refusals mean different
@@ -514,6 +578,7 @@ pub fn executeBoundedBufferedUnixSocketHttpRequest(
             response_timeout_ms,
             false,
             null,
+            null,
         );
     }
 
@@ -547,7 +612,7 @@ pub fn executeBoundedBufferedUnixSocketHttpRequest(
         const fd = conn.stream.handle;
 
         var reusable = false;
-        const result = exchangeBoundedBufferedHttpRequest(allocator, compat.netStreamFromFd(fd), fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, timeout_ms, response_timeout_ms, true, &reusable);
+        const result = exchangeBoundedBufferedHttpRequest(allocator, compat.netStreamFromFd(fd), fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, timeout_ms, response_timeout_ms, true, &reusable, null);
 
         if (result) |resp| {
             p.release(key, conn, reusable, http.event_loop.monotonicMs());
@@ -637,7 +702,11 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     /// `TARDIGRADE_UPSTREAM_PROTOCOL=h2c` — there is no negotiation on
     /// cleartext, so an h1-only origin would break under it. Ignored for TLS.
     h2c_prior_knowledge: bool,
+    /// Live cancellation for bounded control-plane requests (notably
+    /// forward-auth). HTTP/1 response waits observe it in short polls.
+    cancel_token: ?*const CancellationToken,
 ) !BufferedUpstreamResponse {
+    if (cancelStopped(cancel_token)) return error.RequestCancelled;
     // HTTP/2 upstream (#145): when the caller asked to offer h2 (TLS only),
     // multiplex over a shared per-origin connection when an h2 pool is provided,
     // else fall back to a fresh single-stream connection. h1 origins are
@@ -676,11 +745,11 @@ pub fn executeBoundedBufferedTcpHttpRequest(
         if (tls_options) |opts| {
             var tls_conn = try http.upstream_tls.UpstreamTlsConn.connect(fd, host, opts);
             defer tls_conn.deinit();
-            const resp = try exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, null);
+            const resp = try exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, null, cancel_token);
             if (pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
             return resp;
         }
-        const resp = try exchangeBoundedBufferedHttpRequest(allocator, compat.netStreamFromFd(fd), fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, null);
+        const resp = try exchangeBoundedBufferedHttpRequest(allocator, compat.netStreamFromFd(fd), fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, null, cancel_token);
         if (pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
         return resp;
     }
@@ -747,9 +816,9 @@ pub fn executeBoundedBufferedTcpHttpRequest(
         var reusable = false;
         const exchange_start_ms = http.event_loop.monotonicMs();
         const result = if (conn.tls) |tls|
-            exchangeBoundedBufferedHttpRequest(allocator, tls, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, true, &reusable)
+            exchangeBoundedBufferedHttpRequest(allocator, tls, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, true, &reusable, cancel_token)
         else
-            exchangeBoundedBufferedHttpRequest(allocator, compat.netStreamFromFd(fd), fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, true, &reusable);
+            exchangeBoundedBufferedHttpRequest(allocator, compat.netStreamFromFd(fd), fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, true, &reusable, cancel_token);
 
         if (result) |resp| {
             p.release(key, conn, reusable, http.event_loop.monotonicMs());
@@ -830,7 +899,7 @@ fn executeBufferedH2OrH1Fresh(
     if (pool) |p| p.recordProtocol(false);
     var reusable = false;
     const start_ms = http.event_loop.monotonicMs();
-    const resp = try exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, &reusable);
+    const resp = try exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, &reusable, null);
     if (pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
     return resp;
 }
@@ -885,7 +954,7 @@ fn executeBufferedViaH2Pool(
                 if (h1_pool) |p| p.recordProtocol(false);
                 var reusable = false;
                 const start_ms = http.event_loop.monotonicMs();
-                const resp = try exchangeBoundedBufferedHttpRequest(allocator, tls_ptr, tls_ptr.fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, &reusable);
+                const resp = try exchangeBoundedBufferedHttpRequest(allocator, tls_ptr, tls_ptr.fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, &reusable, null);
                 if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
                 return resp;
             },
@@ -1787,7 +1856,9 @@ fn exchangeBoundedBufferedHttpRequest(
     /// this exchange: HTTP/1.1, no `Connection: close` in the response,
     /// definitively framed body, and the socket left in sync.
     reusable: ?*bool,
+    cancel_token: ?*const CancellationToken,
 ) !BufferedUpstreamResponse {
+    if (cancelStopped(cancel_token)) return error.RequestCancelled;
     if (reusable) |r| r.* = false;
     if (send_timeout_ms > 0) {
         try setSocketTimeoutMs(fd, send_timeout_ms, send_timeout_ms);
@@ -1838,6 +1909,7 @@ fn exchangeBoundedBufferedHttpRequest(
     }
 
     try writeUpstreamRequest(transport, req_aw.written());
+    if (cancelStopped(cancel_token)) return error.RequestCancelled;
 
     // Bound the wait for the response with poll() rather than SO_RCVTIMEO:
     // SO_RCVTIMEO is reliably honored on AF_UNIX sockets but is silently ignored
@@ -1939,7 +2011,7 @@ fn exchangeBoundedBufferedHttpRequest(
             }
         }
 
-        if (read_deadline_ms > 0 and !transportHasBufferedInput(transport) and !try pollFdReadable(fd, read_deadline_ms)) {
+        if (read_deadline_ms > 0 and !transportHasBufferedInput(transport) and !try pollFdReadableCancellable(fd, read_deadline_ms, cancel_token)) {
             return error.Timeout;
         }
         const n = try transport.read(&read_buf);
@@ -2327,6 +2399,23 @@ fn pollFdReadable(fd: std.posix.fd_t, timeout_ms: u32) !bool {
         else => return err,
     };
     return ready != 0;
+}
+
+/// Cancellation-aware form used by forward-auth's bounded HTTP/1 exchange.
+/// `poll(2)` itself cannot be woken by a user-space token, so split a long
+/// response timeout into small waits and observe the job-owned token between
+/// them. This bounds a peer RESET_STREAM to this interval while retaining the
+/// configured total response timeout for a live request.
+const cancellation_poll_interval_ms: u32 = 50;
+fn pollFdReadableCancellable(fd: std.posix.fd_t, timeout_ms: u32, cancel_token: ?*const CancellationToken) !bool {
+    var remaining = timeout_ms;
+    while (true) {
+        if (cancelStopped(cancel_token)) return error.RequestCancelled;
+        const slice = @min(remaining, cancellation_poll_interval_ms);
+        if (try pollFdReadable(fd, slice)) return true;
+        if (remaining <= slice) return false;
+        remaining -= slice;
+    }
 }
 
 const ResponseReadiness = enum { upstream, client_closed, client_data, timeout };
@@ -2910,6 +2999,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
         pool,
         h2_pool,
         cfg.upstream_protocol.h2cPriorKnowledge(),
+        cancel_token,
     );
 }
 
@@ -4422,6 +4512,57 @@ pub const UpgradedUpstream = struct {
     to_upstream_reservation: ProxyBufferReservation,
     to_client_reservation: ProxyBufferReservation,
 
+    /// The H3 relay is the only WebSocket consumer that cannot use
+    /// `UpgradedUpstream.relay`: it has a connection-owned stream session in
+    /// place of an H1 socket. Transfer the already allocated, already sized
+    /// relay buffers to that session instead of creating two additional 16 KiB
+    /// mailboxes. Their live reservations transfer continuously to the H3
+    /// admission/session, where the mailboxes and queued bytes share one
+    /// policy snapshot without a release/re-reserve accounting gap.
+    const H3RelayReservationOwner = struct {
+        inbound: http.stream_session.AdoptedReservation,
+        outbound: http.stream_session.AdoptedReservation,
+    };
+
+    pub const H3RelayBuffers = struct {
+        allocator: std.mem.Allocator,
+        to_upstream: []u8,
+        to_client: []u8,
+        budget: http.stream_session.QueueBudget,
+        reservations: *H3RelayReservationOwner,
+
+        pub fn deinit(self: *H3RelayBuffers) void {
+            self.reservations.inbound.releaseAll();
+            self.reservations.outbound.releaseAll();
+            self.allocator.destroy(self.reservations);
+            self.* = undefined;
+        }
+    };
+
+    pub fn takeH3RelayBuffers(self: *UpgradedUpstream) !H3RelayBuffers {
+        const reservations = try self.allocator.create(H3RelayReservationOwner);
+        reservations.* = .{
+            .inbound = self.to_upstream_reservation.takeForH3(),
+            .outbound = self.to_client_reservation.takeForH3(),
+        };
+        const budget = http.stream_session.QueueBudget{
+            .limits = reservations.inbound.account.limits,
+            .observer = reservations.inbound.observer,
+            .capacity = reservations.inbound.capacity,
+            .fixed_inbound_bytes = self.to_upstream_buf.len,
+            .fixed_outbound_bytes = self.to_client_buf.len,
+            .adopted_inbound = &reservations.inbound,
+            .adopted_outbound = &reservations.outbound,
+        };
+        return .{
+            .allocator = self.allocator,
+            .to_upstream = self.to_upstream_buf,
+            .to_client = self.to_client_buf,
+            .budget = budget,
+            .reservations = reservations,
+        };
+    }
+
     pub fn deinit(self: *UpgradedUpstream) void {
         const allocator = self.allocator;
         if (self.tls) |tls| {
@@ -5109,6 +5250,7 @@ test "exchangeBoundedBufferedHttpRequest parses a buffered response from a peer"
         1_000,
         false,
         null,
+        null,
     );
     defer resp.deinit(allocator);
 
@@ -5157,6 +5299,7 @@ fn captureBufferedRequestBytesWithHeaders(allocator: std.mem.Allocator, url: []c
         1_000,
         1_000,
         false,
+        null,
         null,
     );
     resp.deinit(allocator);
@@ -5234,6 +5377,7 @@ test "exchangeBoundedBufferedHttpRequest enforces the response read timeout when
         200, // response timeout: short — this must fire on the silent peer
         false,
         null,
+        null,
     );
     const elapsed_ms = http.event_loop.monotonicMs() - start_ms;
 
@@ -5278,6 +5422,7 @@ fn exchangeAgainstKeepAlivePeer(allocator: std.mem.Allocator, method: []const u8
         1_000,
         1_000,
         false,
+        null,
         null,
     );
 }
@@ -5381,6 +5526,7 @@ test "exchange never marks a keep-alive connection reusable after a bodiless res
         1_000,
         true,
         &reusable,
+        null,
     );
     defer resp.deinit(allocator);
     try std.testing.expectEqual(@as(u16, 204), resp.status_code);
@@ -5475,6 +5621,7 @@ test "exchange refuses reuse when bytes trail a chunked body's terminator (#673 
         1_000,
         true,
         &reusable,
+        null,
     );
     defer resp.deinit(allocator);
     try std.testing.expectEqualStrings("hello", resp.body);
@@ -7291,6 +7438,7 @@ test "connectBlockingTcp + exchange round-trips a real TCP origin" {
         null,
         null,
         false,
+        null,
     );
     defer resp.deinit(allocator);
 
@@ -7327,11 +7475,79 @@ test "buffered proxy exchange reaches a host-name upstream (#786)" {
         null,
         null,
         false,
+        null,
     );
     defer resp.deinit(allocator);
 
     try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     try std.testing.expectEqualStrings("hello", resp.body);
+}
+
+fn stalledHttpResponder(listen_fd: std.posix.fd_t, accepted: *std.atomic.Value(bool)) void {
+    const conn = std.c.accept(listen_fd, null, null);
+    if (conn < 0) return;
+    defer _ = std.c.close(conn);
+    var buf: [1024]u8 = undefined;
+    _ = std.c.read(conn, &buf, buf.len);
+    accepted.store(true, .release);
+    // Keep the request open until the client cancellation closes it.
+    while (std.c.read(conn, &buf, buf.len) > 0) {}
+}
+
+test "bounded buffered HTTP request observes cancellation while waiting for response" {
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+    var accepted = std.atomic.Value(bool).init(false);
+    const responder = try std.Thread.spawn(.{}, stalledHttpResponder, .{ listener.fd, &accepted });
+    defer responder.join();
+
+    var token = CancellationToken.init(0);
+    const Ctx = struct {
+        port: u16,
+        token: *CancellationToken,
+        result: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            const uri = std.Uri.parse("http://127.0.0.1/") catch {
+                ctx.result = error.InvalidUri;
+                return;
+            };
+            var response = executeBoundedBufferedTcpHttpRequest(
+                std.heap.page_allocator,
+                "127.0.0.1",
+                ctx.port,
+                null,
+                uri,
+                "GET",
+                &.{},
+                "",
+                null,
+                1024,
+                5_000,
+                5_000,
+                null,
+                null,
+                false,
+                ctx.token,
+            ) catch |err| {
+                ctx.result = err;
+                return;
+            };
+            response.deinit(std.heap.page_allocator);
+            ctx.result = error.ExpectedCancellation;
+        }
+    };
+    var ctx = Ctx{ .port = listener.port, .token = &token };
+    const request = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+
+    const wait_until = compat.milliTimestamp() + 1_000;
+    while (!accepted.load(.acquire) and compat.milliTimestamp() < wait_until) compat.sleepNs(std.time.ns_per_ms);
+    try std.testing.expect(accepted.load(.acquire));
+    const cancelled_at = compat.milliTimestamp();
+    token.cancel(.client_disconnect);
+    request.join();
+    try std.testing.expect(compat.milliTimestamp() - cancelled_at < 500);
+    try std.testing.expectEqual(error.RequestCancelled, ctx.result.?);
 }
 
 /// Raw blocking keep-alive responder: accepts one connection and serves `n`
@@ -9176,7 +9392,7 @@ fn seedPooledConn(pool: *http.upstream_pool.UpstreamPool, key: []const u8, clien
 
 fn postThroughPool(allocator: std.mem.Allocator, pool: *http.upstream_pool.UpstreamPool, port: u16, method: []const u8, body: []const u8) !BufferedUpstreamResponse {
     const uri = try std.Uri.parse("http://127.0.0.1/");
-    return executeBoundedBufferedTcpHttpRequest(allocator, "127.0.0.1", port, null, uri, method, &.{}, body, null, 1 << 20, 2_000, 2_000, pool, null, false);
+    return executeBoundedBufferedTcpHttpRequest(allocator, "127.0.0.1", port, null, uri, method, &.{}, body, null, 1 << 20, 2_000, 2_000, pool, null, false, null);
 }
 
 test "stale pooled conn: zero-byte send failure replays POST once on a fresh conn (#785)" {

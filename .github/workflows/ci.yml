@@ -1179,6 +1179,14 @@ jobs:
       - name: Print Zig version
         run: zig version
 
+      # RFC 9220 needs an independently implemented HTTP/3 client. Keep this
+      # provisioned in the integration job (rather than silently using the
+      # native test client) and pass its exact interpreter to the gate below.
+      - name: Provision aioquic RFC 9220 interoperability peer
+        run: |
+          python3 -m venv "$RUNNER_TEMP/aioquic-rfc9220"
+          "$RUNNER_TEMP/aioquic-rfc9220/bin/pip" install --disable-pip-version-check "aioquic>=1.2,<2"
+
       - name: Run WebSocket reactor smoke (#830)
         env:
           TARDIGRADE_WS_REACTOR_EVIDENCE: ${{ runner.temp }}/websocket-reactor-smoke.json
@@ -1203,6 +1211,11 @@ jobs:
           else
             zig build test-integration-smoke --summary all
           fi
+
+      - name: "Run external aioquic RFC 9220 gateway interoperability gate (#821)"
+        env:
+          AIOQUIC_PYTHON: ${{ runner.temp }}/aioquic-rfc9220/bin/python
+        run: zig build test-integration -Dintegration-test-filter='h3interop.rfc9220.gateway aioquic external client' --summary all
 
       # #863 review: the real-process H2 transport validation gate's
       # test-only session hook only compiles into the `tardi` binary with

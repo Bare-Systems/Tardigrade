@@ -1270,7 +1270,22 @@ pub fn Conn(comptime Transport: type) type {
             extended_protocol: ?[]const u8 = null,
             headers: []const qpack.HeaderField = &.{},
             body: []const u8 = "",
+            /// RFC 9220 tunnels keep the request stream open after its
+            /// envelope (and any eagerly-sent DATA) instead of ending it.
+            end_stream: bool = true,
         };
+
+        pub const ResponseHead = struct {
+            status: u16,
+            headers: []const qpack.HeaderField,
+        };
+
+        /// True after the peer has advertised SETTINGS_ENABLE_CONNECT_PROTOCOL.
+        /// Clients use this before sending an RFC 9220 request because the
+        /// request itself is forbidden until that setting is received.
+        pub fn peerSupportsExtendedConnect(self: *const Self) bool {
+            return self.peer_control_view.saw_settings and self.peer_control_view.settings.enable_connect_protocol;
+        }
 
         /// Encode and send one request; returns the request stream id.
         pub fn sendRequest(self: *Self, transport: *Transport, request: Request) !u64 {
@@ -1312,7 +1327,7 @@ pub fn Conn(comptime Transport: type) type {
             }
             var written: usize = 0;
             while (written < len) {
-                written += try transport.writeStream(id, wire[written..len], true);
+                written += try transport.writeStream(id, wire[written..len], request.end_stream);
             }
 
             const response = self.allocator.create(ClientResponse) catch return error.OutOfMemory;
@@ -1459,6 +1474,75 @@ pub fn Conn(comptime Transport: type) type {
             };
         }
 
+        /// Decode the final response headers without requiring the peer to
+        /// FIN the stream. RFC 9220's successful Extended CONNECT response
+        /// is a 2xx HEADERS frame followed by a bidirectional tunnel, so a
+        /// conventional `pollResponse` (which waits for FIN) cannot observe
+        /// its admission result.
+        pub fn pollResponseHead(self: *Self, id: u64) H3Error!?ResponseHead {
+            const response = self.responses.get(id) orelse return error.UnknownStream;
+            var offset: usize = 0;
+            while (offset < response.buffer.items.len) {
+                const raw = frame.decodeFrameWithLimit(response.buffer.items[offset..], max_response_len) catch |err| switch (err) {
+                    error.BufferTooShort => return null,
+                    else => return self.fail(.frame_error),
+                };
+                if (raw.typ != .headers) return self.fail(.frame_unexpected);
+                const field_count = qpack.decode(raw.payload, &response.fields, response.scratch[0..]) catch return self.fail(.qpack_decompression_failed);
+                const validated = session.validateResponseHeaders(response.fields[0..field_count]) catch return self.fail(.message_error);
+                if (validated.status == 101) return self.fail(.message_error);
+                if (validated.status >= 200) return .{ .status = validated.status, .headers = response.fields[1..field_count] };
+                offset += raw.len;
+            }
+            return null;
+        }
+
+        /// Send opaque RFC 9220 tunnel bytes as one H3 DATA frame while
+        /// keeping the request stream open.
+        pub fn sendTunnelData(self: *Self, transport: *Transport, id: u64, bytes: []const u8) H3Error!void {
+            if (!self.responses.contains(id)) return error.UnknownStream;
+            var frame_buf: [8192]u8 = undefined;
+            const encoded = frame.encodeKnownFrame(.data, bytes, &frame_buf) catch return error.ResponseTooLarge;
+            var written: usize = 0;
+            while (written < encoded.len) {
+                written += transport.writeStream(id, encoded[written..], false) catch return error.ProtocolError;
+            }
+        }
+
+        /// Return all complete tunnel DATA currently received after final
+        /// response headers. The caller owns the returned allocation. `null`
+        /// means the non-FIN response has not carried any complete DATA yet.
+        pub fn pollTunnelData(self: *Self, id: u64, allocator: std.mem.Allocator) H3Error!?[]u8 {
+            const response = self.responses.get(id) orelse return error.UnknownStream;
+            var bytes: std.ArrayList(u8) = .empty;
+            errdefer bytes.deinit(allocator);
+            var offset: usize = 0;
+            var saw_final_headers = false;
+            while (offset < response.buffer.items.len) {
+                const raw = frame.decodeFrameWithLimit(response.buffer.items[offset..], max_response_len) catch |err| switch (err) {
+                    error.BufferTooShort => return null,
+                    else => return self.fail(.frame_error),
+                };
+                switch (raw.typ) {
+                    .headers => {
+                        if (saw_final_headers) return self.fail(.frame_unexpected);
+                        const field_count = qpack.decode(raw.payload, &response.fields, response.scratch[0..]) catch return self.fail(.qpack_decompression_failed);
+                        const validated = session.validateResponseHeaders(response.fields[0..field_count]) catch return self.fail(.message_error);
+                        if (validated.status == 101) return self.fail(.message_error);
+                        if (validated.status >= 200) saw_final_headers = true;
+                    },
+                    .data => {
+                        if (!saw_final_headers) return self.fail(.frame_unexpected);
+                        bytes.appendSlice(allocator, raw.payload) catch return error.OutOfMemory;
+                    },
+                    else => return self.fail(.frame_unexpected),
+                }
+                offset += raw.len;
+            }
+            if (!saw_final_headers or bytes.items.len == 0) return null;
+            return try bytes.toOwnedSlice(allocator);
+        }
+
         pub fn releaseResponse(self: *Self, id: u64) void {
             if (self.responses.fetchRemove(id)) |entry| {
                 entry.value.buffer.deinit(self.allocator);
@@ -1586,6 +1670,84 @@ pub fn Conn(comptime Transport: type) type {
             return null;
         }
 
+        /// Whether `stream_id` is still awaiting the decision returned from
+        /// `pollExtendedConnect`.  The runtime uses this when a bounded
+        /// admission worker completes: a reset, refusal, or connection close
+        /// may have made that decision stale while origin/auth I/O ran.
+        pub fn hasPendingExtendedConnect(self: *const Self, stream_id: u64) bool {
+            const request = self.requests.get(stream_id) orelse return false;
+            return request.extended_connect_pending and
+                request.extended_connect_dispatched and
+                request.tunnel == null and
+                !request.extended_connect_refused;
+        }
+
+        /// Resumable, non-FIN response HEADERS for an admitted RFC 9220
+        /// stream. This is intentionally separate from `ResponseSendState`:
+        /// ordinary response completion finishes the request, while a 2xx
+        /// CONNECT response must leave it open for tunnel DATA.
+        pub const ExtendedConnectResponseState = struct {
+            status: u16,
+            headers: []const stream_transport.Header,
+            frame_buf: [8192]u8 = undefined,
+            frame_len: usize = 0,
+            frame_written: usize = 0,
+
+            pub fn init(status: u16, headers: []const stream_transport.Header) ExtendedConnectResponseState {
+                return .{ .status = status, .headers = headers };
+            }
+        };
+
+        /// Queue exactly one non-FIN response HEADERS frame, preserving its
+        /// byte offset across normal QUIC flow-control backpressure.
+        pub fn sendExtendedConnectResponseProgress(
+            self: *Self,
+            transport: *Transport,
+            stream_id: u64,
+            state: *ExtendedConnectResponseState,
+        ) !bool {
+            const request = self.requests.get(stream_id) orelse return error.UnknownStream;
+            if (!request.extended_connect_pending or request.tunnel != null or request.extended_connect_refused) return error.UnknownStream;
+            if (state.frame_len == 0) {
+                const frame_bytes = try session.ResponseEncoder.encodeHeaders(state.status, state.headers, &state.frame_buf);
+                state.frame_len = frame_bytes.len;
+                var event_fields: [129]qpack.HeaderField = undefined;
+                var status_buf: [3]u8 = undefined;
+                const status_text = std.fmt.bufPrint(&status_buf, "{d}", .{state.status}) catch "500";
+                event_fields[0] = .{ .name = ":status", .value = status_text };
+                if (state.headers.len > event_fields.len - 1) return error.TooManyHeaders;
+                for (state.headers, 0..) |header, index| event_fields[index + 1] = .{ .name = header.name, .value = header.value };
+                self.events.emit(.{ .frame_created = .{ .stream_id = stream_id, .frame = .{ .headers = .{ .fields = event_fields[0 .. state.headers.len + 1], .raw_length = state.frame_len } } } });
+            }
+            while (state.frame_written < state.frame_len) {
+                const written = try transport.writeStream(stream_id, state.frame_buf[state.frame_written..state.frame_len], false);
+                if (written == 0) return false;
+                state.frame_written += written;
+            }
+            return true;
+        }
+
+        /// Bind a successfully queued 2xx CONNECT response to its tunnel.
+        /// Call only after `sendExtendedConnectResponseProgress` returns true.
+        pub fn attachExtendedConnect(
+            self: *Self,
+            stream_id: u64,
+            sink: session.RequestStream.TunnelSink,
+            tunnel: Tunnel,
+        ) !void {
+            const request = self.requests.get(stream_id) orelse return error.UnknownStream;
+            std.debug.assert(request.extended_connect_pending);
+            std.debug.assert(request.tunnel == null);
+            request.stream.tunnel_sink = sink;
+            request.tunnel = tunnel;
+            request.extended_connect_pending = false;
+            const fully_drained = try self.drainTunnelBufferedBody(request);
+            if (request.extended_connect_remote_fin and fully_drained and request.stream.pending.items.len == 0) {
+                request.tunnel.?.remote_end_delivered = true;
+                request.tunnel.?.remoteEndStreamFn(request.tunnel.?.ctx);
+            }
+        }
+
         /// Admit a stream `pollExtendedConnect` returned: send `status`
         /// (without FIN, keeping the stream open) and bind its inbound DATA
         /// to `sink`/outbound draining to `tunnel` for the rest of its life.
@@ -1601,25 +1763,9 @@ pub fn Conn(comptime Transport: type) type {
             sink: session.RequestStream.TunnelSink,
             tunnel: Tunnel,
         ) !void {
-            const request = self.requests.get(stream_id) orelse return error.UnknownStream;
-            std.debug.assert(request.extended_connect_pending);
-            std.debug.assert(request.tunnel == null);
-            var header_frame: [8192]u8 = undefined;
-            const encoded = try session.ResponseEncoder.encodeHeaders(status, headers, &header_frame);
-            try self.writeAll(transport, stream_id, encoded, false);
-            request.stream.tunnel_sink = sink;
-            request.tunnel = tunnel;
-            request.extended_connect_pending = false;
-            // Any body the peer already sent drains through the same
-            // bounded partial-delivery contract `pumpTunnelInbound` uses on
-            // every later tick: a leftover stays in `request.stream.body`
-            // for the connection's own next `pumpRequests` pass rather than
-            // being rejected (and the stream reset) outright.
-            const fully_drained = try self.drainTunnelBufferedBody(request);
-            if (request.extended_connect_remote_fin and fully_drained and request.stream.pending.items.len == 0) {
-                request.tunnel.?.remote_end_delivered = true;
-                request.tunnel.?.remoteEndStreamFn(request.tunnel.?.ctx);
-            }
+            var response = ExtendedConnectResponseState.init(status, headers);
+            if (!try self.sendExtendedConnectResponseProgress(transport, stream_id, &response)) return error.StreamBackpressure;
+            try self.attachExtendedConnect(stream_id, sink, tunnel);
         }
 
         /// Mark a stream `pollExtendedConnect` returned as refused. The
@@ -1946,6 +2092,9 @@ const MockTransport = struct {
     accepted: std.ArrayList(u64) = .empty,
     write_calls: usize = 0,
     fail_writes_after: ?usize = null,
+    /// Simulated flow-control exhaustion: unlike a write error, a zero-byte
+    /// write is resumable and must preserve an in-flight response frame.
+    zero_writes_after: ?usize = null,
     /// Live unidirectional streams this transport may hold open at once.
     /// Real QUIC does not let a peer open unbounded unidirectional streams:
     /// MAX_STREAMS grants a cumulative lifetime allowance, and an endpoint
@@ -2046,6 +2195,9 @@ const MockTransport = struct {
     pub fn writeStream(self: *MockTransport, id: u64, bytes: []const u8, fin: bool) !usize {
         if (self.fail_writes_after) |limit| {
             if (self.write_calls >= limit) return error.StreamBackpressure;
+        }
+        if (self.zero_writes_after) |limit| {
+            if (self.write_calls >= limit) return 0;
         }
         self.write_calls += 1;
         const target = self.peer orelse return error.UnknownStream;
@@ -5568,6 +5720,49 @@ test "H3 conn: a complete DATA frame delivered under sink backpressure still rep
     capture.window_used = 0;
     try server.pump(&server_transport);
     try testing.expectEqualStrings("hello", capture.all_received.items);
+}
+
+test "H3 conn: accepted Extended CONNECT waits for 2xx HEADERS credit before attaching tunnel callbacks" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.initWithSettings(allocator, .server, .{ .enable_connect_protocol = true });
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const stream_id = try writeExtendedConnectHeaders(&client_transport, false);
+    try server.pump(&server_transport);
+    _ = server.pollExtendedConnect().?;
+
+    // A normal QUIC writer reports zero when out of stream credit. The 200
+    // response must remain resumable and must not yet expose callbacks that
+    // borrow the tunnel session.
+    server_transport.zero_writes_after = server_transport.write_calls;
+    var response = H3.ExtendedConnectResponseState.init(200, &.{});
+    try testing.expect(!(try server.sendExtendedConnectResponseProgress(&server_transport, stream_id, &response)));
+    try testing.expect(server.hasPendingExtendedConnect(stream_id));
+    const pending_request = server.requests.get(stream_id).?;
+    try testing.expect(pending_request.tunnel == null);
+    try testing.expect(pending_request.stream.tunnel_sink == null);
+
+    server_transport.zero_writes_after = null;
+    try testing.expect(try server.sendExtendedConnectResponseProgress(&server_transport, stream_id, &response));
+    try server.attachExtendedConnect(stream_id, .{}, noopTunnel());
+    const attached_request = server.requests.get(stream_id).?;
+    try testing.expect(attached_request.tunnel != null);
+    try testing.expect(attached_request.stream.tunnel_sink != null);
 }
 
 test "H3 conn: a refused Extended CONNECT stream is never re-dispatched while more data arrives" {

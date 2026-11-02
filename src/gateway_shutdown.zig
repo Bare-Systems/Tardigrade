@@ -200,7 +200,7 @@ pub fn hotReloadConfig(
             state.last_reload_error_len = msg.len;
             state.reload_mutex.unlock();
             state.metricsRecordReloadFailure();
-            state.logger.warn(null, "config reload rejected: HTTP/3 listener-owned configuration changed; restart the process to change http3_enabled, quic_port, migration, Retry, 0-RTT, datagram sizing, ECN, or observability artifact destinations", .{});
+            state.logger.warn(null, "config reload rejected: HTTP/3 listener-owned configuration changed; restart the process to change http3_enabled, RFC 9220 route enablement, quic_port, migration, Retry, 0-RTT, datagram sizing, ECN, or observability artifact destinations", .{});
             return;
         }
     }
@@ -677,10 +677,23 @@ pub fn http3ListenerConfigChanged(
         // fd at bind time, and the transport's marking decision is fixed per
         // connection at creation.
         current.http3_ecn_enabled != proposed.http3_ecn_enabled or
+        // RFC 9220 SETTINGS are emitted once per H3 connection at startup.
+        // A reload that changes whether any route relays WebSockets cannot
+        // update that SETTINGS value or the runtime handler safely in place,
+        // so make the existing restart-required listener contract explicit.
+        (current.http3_enabled and configRelaysWebSockets(current) != configRelaysWebSockets(proposed)) or
         !std.mem.eql(u8, current.http3_qlog_dir, proposed.http3_qlog_dir) or
         // #763: client-auth policy is chosen per handshake from the shared
         // SNI-keyed policy set (H1, H2 and H3 alike), so it is hot-reloadable.
         !std.mem.eql(u8, current.http3_keylog_path, proposed.http3_keylog_path);
+}
+
+fn configRelaysWebSockets(cfg: *const edge_config.EdgeConfig) bool {
+    for (cfg.location_blocks) |block| if (block.websocket != null) return true;
+    for (cfg.server_blocks) |server| {
+        for (server.location_blocks) |block| if (block.websocket != null) return true;
+    }
+    return false;
 }
 
 pub fn listenerShardConfigChanged(
@@ -967,6 +980,50 @@ test "http3ListenerConfigChanged permits advertisement-only reloads" {
     // #256-E: the ECN receive option is socket state too, and every live
     // connection's marking decision was made when it was created.
     proposed.http3_ecn_enabled = !base.http3_ecn_enabled;
+    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+    proposed.http3_ecn_enabled = base.http3_ecn_enabled;
+
+    // RFC 9220's SETTINGS_ENABLE_CONNECT_PROTOCOL and its handler are
+    // startup/connection-owned. Adding the first WebSocket route therefore
+    // rejects an in-place reload rather than publishing a config the running
+    // H3 listener cannot honour; the operator restarts to rotate listeners.
+    const original_base_locations = base.location_blocks;
+    const original_proposed_locations = proposed.location_blocks;
+    defer base.location_blocks = original_base_locations;
+    defer proposed.location_blocks = original_proposed_locations;
+    var websocket_locations = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/ws",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "" } },
+        .websocket = .{},
+    }};
+    proposed.location_blocks = &websocket_locations;
+    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+
+    // Once H3 remains enabled and both configurations retain RFC 9220
+    // capability, normal edits within existing WebSocket routes stay live.
+    var edited_websocket_locations = [_]edge_config.EdgeConfig.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/ws",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "edited" } },
+        .websocket = .{},
+    }};
+    base.location_blocks = &websocket_locations;
+    proposed.location_blocks = &edited_websocket_locations;
+    try std.testing.expect(!http3ListenerConfigChanged(&base, &proposed));
+
+    // H1/H2-only listeners do not own an H3 SETTINGS flight, so changing
+    // WebSocket routes remains hot-reloadable when H3 is disabled. Turning
+    // H3 back on restores the restart-required capability boundary.
+    base.location_blocks = original_base_locations;
+    proposed.location_blocks = &websocket_locations;
+    base.http3_enabled = false;
+    proposed.http3_enabled = false;
+    try std.testing.expect(!http3ListenerConfigChanged(&base, &proposed));
+    base.http3_enabled = true;
+    proposed.http3_enabled = true;
     try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
 }
 

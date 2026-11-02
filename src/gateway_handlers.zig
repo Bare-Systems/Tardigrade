@@ -17,6 +17,7 @@ const gpc = @import("gateway_proxy_cache.zig");
 const gs = @import("gateway_state.zig");
 const tls_core_client_trust = @import("tls_core").client_trust;
 const gstatic = @import("gateway_static_runtime.zig");
+const gh2ws = @import("gateway_h2_websocket.zig");
 
 const JSON_CONTENT_TYPE = "application/json";
 const MIRROR_MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -661,6 +662,12 @@ fn minimalHttp3ProxyConfig(blocks: []http.location_router.LocationBlock) edge_co
         .per_origin_hard_limit = 0,
         .global_hard_limit = 0,
     };
+    // `minimalAuthConfig` intentionally constructs only the common auth
+    // fixture fields. Keep the optional response cache disabled here instead
+    // of letting this proxy fixture read an uninitialized TTL when an
+    // anonymous request is cache-eligible.
+    cfg.proxy_cache_ttl_seconds = 0;
+    cfg.proxy_cache_stale_while_revalidate_seconds = 0;
     cfg.upstream_pool_enabled = false;
     cfg.upstream_pool_max_idle_per_host = 0;
     cfg.upstream_pool_idle_timeout_ms = 0;
@@ -2249,6 +2256,7 @@ fn executeMirrorRequest(
         null,
         null,
         false,
+        null,
     );
     response.deinit(allocator);
 }
@@ -2339,6 +2347,248 @@ pub const Http3DispatchContext = struct {
     /// HTTP/3 runtime for the complete synchronous handler invocation.
     cancel_token: ?*const http.cancellation.CancellationToken = null,
 };
+
+/// RFC 9220 admission is deliberately separate from the ordinary H3 request
+/// handler: a tunnel has no FIN-delimited request body and remains owned by
+/// its QUIC stream for its entire lifetime.  The shared Extended CONNECT
+/// admission helper already performs the route, auth, Origin, rate, capacity,
+/// forward-auth, and upstream-H1 handshake work used by H2; this small
+/// adapter supplies H3's request envelope and stream-owned relay.
+pub fn handleHttp3ExtendedConnect(
+    allocator: std.mem.Allocator,
+    view: *const http.http3_runtime.ExtendedConnectView,
+    user_data: ?*anyopaque,
+) http.http3_runtime.ExtendedConnectDecision {
+    const ctx: *Http3DispatchContext = @ptrCast(@alignCast(user_data orelse return .{ .refuse = .{ .status = 500 } }));
+    if (!std.mem.eql(u8, view.method, "CONNECT") or !std.mem.eql(u8, view.protocol, "websocket")) {
+        return .{ .refuse = .{ .status = 404 } };
+    }
+
+    var request = h3ExtendedConnectRequest(allocator, view) catch return .{ .refuse = .{ .status = 400 } };
+    defer request.deinit();
+    var cfg_lease = ctx.config_store.acquire();
+    defer cfg_lease.release();
+    if (view.client_auth_policy_fingerprint) |handshake_fp| {
+        const admitted = if (cfg_lease.version.client_policies) |policies|
+            tls_core_client_trust.hostAdmitted(handshake_fp, policies.fingerprintForHost(view.authority))
+        else
+            false;
+        if (!admitted) return .{ .refuse = .{ .status = 421 } };
+    }
+    const correlation_id = request.headers.get(http.correlation.REQUEST_HEADER_NAME) orelse request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+    const outcome = gh2ws.admit(
+        allocator,
+        cfg_lease.cfg,
+        ctx.state,
+        &request,
+        view.client_ip,
+        correlation_id,
+        view.transport_early,
+        &cfg_lease,
+        view.cancel_token,
+    ) catch {
+        return .{ .refuse = .{ .status = 502 } };
+    };
+    return switch (outcome) {
+        .not_matched => .{ .refuse = .{ .status = 404 } },
+        .refused => |refused| blk: {
+            ctx.state.metricsRecordWebSocketUpgrade(refused.outcome);
+            break :blk .{ .refuse = .{ .status = refused.status_code } };
+        },
+        .switched => |switched| blk: {
+            var relay_buffers: ?gp.UpgradedUpstream.H3RelayBuffers = switched.upgraded.takeH3RelayBuffers() catch {
+                switched.deinit();
+                break :blk .{ .refuse = .{ .status = 503 } };
+            };
+            const admission = H3WebSocketAdmission.create(allocator, switched, correlation_id, &relay_buffers) catch {
+                if (relay_buffers) |*buffers| buffers.deinit();
+                switched.deinit();
+                break :blk .{ .refuse = .{ .status = 503 } };
+            };
+            const budget = admission.relay_buffers.?.budget;
+            break :blk .{
+                .admit = .{
+                    .status = 200,
+                    .headers = admission.headers.items,
+                    // Preserve the H3-specific queue caps, while the session
+                    // additionally clamps them to this policy snapshot after
+                    // reserving the transferred H1-origin relay buffers.
+                    .max_inbound_bytes = @min(1024 * 1024, budget.limits.per_stream_hard_limit),
+                    .max_outbound_bytes = @min(256 * 1024, budget.limits.per_stream_hard_limit),
+                    .queue_budget = budget,
+                    .on_admitted = H3WebSocketTunnel.onAdmitted,
+                    .on_admitted_ctx = admission,
+                    .on_admission_failed = H3WebSocketAdmission.onAdmissionFailed,
+                },
+            };
+        },
+    };
+}
+
+fn h3ExtendedConnectRequest(allocator: std.mem.Allocator, view: *const http.http3_runtime.ExtendedConnectView) !http.Request {
+    var headers = http.Headers.init(allocator);
+    errdefer headers.deinit();
+    for (view.headers) |header| {
+        // Pseudo-fields have already been parsed into `view`; forwarding one
+        // into an H1-origin request would create an invalid/injectable header.
+        if (header.name.len > 0 and header.name[0] == ':') continue;
+        try headers.append(header.name, header.value);
+    }
+    if (headers.get("host") == null) try headers.append("host", view.authority);
+    headers.client_cert = view.client_cert;
+    const split = splitHttp3PathAndQuery(view.path);
+    return .{
+        .allocator = allocator,
+        .method = .CONNECT,
+        .uri = .{ .raw = view.path, .path = split[0], .query = split[1], .scheme = view.scheme, .authority = view.authority },
+        .version = .http11,
+        .headers = headers,
+        .body = null,
+    };
+}
+
+/// Owns the response headers until the reactor serializes the accepted H3
+/// HEADERS, then transfers the upgraded origin to the relay or frees it on
+/// every attachment failure.
+const H3WebSocketAdmission = struct {
+    allocator: std.mem.Allocator,
+    switched: *gh2ws.Switched,
+    headers: std.ArrayList(http.stream_transport.Header) = .empty,
+    relay_buffers: ?gp.UpgradedUpstream.H3RelayBuffers,
+
+    fn create(allocator: std.mem.Allocator, switched: *gh2ws.Switched, correlation_id: []const u8, relay_buffers: *?gp.UpgradedUpstream.H3RelayBuffers) !*H3WebSocketAdmission {
+        const self = try allocator.create(H3WebSocketAdmission);
+        self.* = .{ .allocator = allocator, .switched = switched, .relay_buffers = relay_buffers.* };
+        relay_buffers.* = null;
+        // `appendHeader` owns each name/value independently.  On any later
+        // allocation failure use the complete owner teardown, not merely the
+        // ArrayList backing-store deinit.
+        errdefer self.deinit(false);
+        for (switched.upgraded.head.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "sec-websocket-protocol") or std.ascii.eqlIgnoreCase(header.name, "sec-websocket-extensions")) {
+                try self.appendHeader(header.name, header.value);
+            }
+        }
+        for (switched.forward_auth_grants.client_headers.items) |header| try self.appendHeader(header.name, header.value);
+        try self.appendHeader(http.correlation.REQUEST_HEADER_NAME, correlation_id);
+        try self.appendHeader(http.correlation.HEADER_NAME, correlation_id);
+        return self;
+    }
+
+    fn appendHeader(self: *H3WebSocketAdmission, name: []const u8, value: []const u8) !void {
+        // Response headers traverse QPACK, not HTTP/1 serialization. Reject
+        // connection-specific and pseudo fields before they reach H3.
+        if (name.len == 0 or name[0] == ':' or std.ascii.eqlIgnoreCase(name, "connection") or std.ascii.eqlIgnoreCase(name, "upgrade")) return;
+        const owned_name = try self.allocator.alloc(u8, name.len);
+        errdefer self.allocator.free(owned_name);
+        for (name, 0..) |byte, index| owned_name[index] = std.ascii.toLower(byte);
+        const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
+        try self.headers.append(self.allocator, .{ .name = owned_name, .value = owned_value });
+    }
+
+    fn deinit(self: *H3WebSocketAdmission, release_switched: bool) void {
+        for (self.headers.items) |header| {
+            self.allocator.free(@constCast(header.name));
+            self.allocator.free(@constCast(header.value));
+        }
+        self.headers.deinit(self.allocator);
+        if (self.relay_buffers) |*buffers| buffers.deinit();
+        if (release_switched) self.switched.deinit();
+        self.allocator.destroy(self);
+    }
+
+    fn onAdmissionFailed(callback_ctx: ?*anyopaque) void {
+        const self: *H3WebSocketAdmission = @ptrCast(@alignCast(callback_ctx orelse return));
+        self.deinit(true);
+    }
+};
+
+/// Detached relay owner for an admitted RFC 9220 stream.  It owns the
+/// upstream connection and admission lease; the H3 runtime retains ownership
+/// of the QUIC stream/session and reaps it after this consumer detaches.
+const H3WebSocketTunnel = struct {
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    session: *http.stream_session.Session,
+    switched: *gh2ws.Switched,
+    relay_buffers: gp.UpgradedUpstream.H3RelayBuffers,
+
+    fn onAdmitted(allocator: std.mem.Allocator, session: *http.stream_session.Session, callback_ctx: ?*anyopaque) void {
+        const admission: *H3WebSocketAdmission = @ptrCast(@alignCast(callback_ctx orelse {
+            session.requestCancel();
+            return;
+        }));
+        const switched = admission.switched;
+        const state = switched.state;
+        const self = allocator.create(H3WebSocketTunnel) catch {
+            session.requestCancel();
+            admission.deinit(true);
+            return;
+        };
+        const relay_buffers = admission.relay_buffers.?;
+        admission.relay_buffers = null;
+        admission.deinit(false);
+        self.* = .{ .allocator = allocator, .state = switched.state, .session = session, .switched = switched, .relay_buffers = relay_buffers };
+        const thread = std.Thread.spawn(.{}, H3WebSocketTunnel.run, .{self}) catch {
+            self.relay_buffers.deinit();
+            allocator.destroy(self);
+            session.requestCancel();
+            switched.deinit();
+            return;
+        };
+        state.metricsRecordWebSocketUpgrade(.relayed);
+        thread.detach();
+    }
+
+    fn run(self: *H3WebSocketTunnel) void {
+        const upstream = http.h3_websocket_relay.Upstream{ .fd = self.switched.upgraded.fd, .tls = self.switched.upgraded.tls };
+        const stats = http.h3_websocket_relay.run(self.session, upstream, self.switched.upgraded.early_upstream_bytes, .{
+            .idle_timeout_ms = self.switched.idle_timeout_ms,
+            .max_lifetime_ms = self.switched.max_lifetime_ms,
+            .drain_timeout_ms = self.switched.drain_timeout_ms,
+            .shutdown_requested = http.shutdown.isShutdownRequested,
+            .reload_drain = self.switched.reload_drain,
+            .to_upstream_buffer = self.relay_buffers.to_upstream,
+            .to_client_buffer = self.relay_buffers.to_client,
+        });
+        self.state.metricsRecordWebSocketTunnelClosed(stats);
+        if (self.session.consumerDetach()) {
+            self.session.deinit();
+            self.allocator.destroy(self.session);
+        }
+        self.switched.deinit();
+        self.relay_buffers.deinit();
+        self.allocator.destroy(self);
+    }
+};
+
+test "H3 Extended CONNECT request synthesis strips pseudo fields and preserves route metadata" {
+    const headers = [_]http.stream_transport.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = "origin", .value = "https://app.example.test" },
+        .{ .name = "sec-websocket-protocol", .value = "chat" },
+    };
+    const view = http.http3_runtime.ExtendedConnectView{
+        .stream_id = 4,
+        .method = "CONNECT",
+        .scheme = "https",
+        .authority = "gateway.example.test",
+        .path = "/socket?room=one",
+        .protocol = "websocket",
+        .headers = &headers,
+        .buffered_body = "",
+        .transport_early = false,
+        .client_ip = "127.0.0.1",
+    };
+    var request = try h3ExtendedConnectRequest(std.testing.allocator, &view);
+    defer request.deinit();
+    try std.testing.expectEqual(http.Method.CONNECT, request.method);
+    try std.testing.expectEqualStrings("/socket", request.uri.path);
+    try std.testing.expectEqualStrings("room=one", request.uri.query.?);
+    try std.testing.expectEqualStrings("gateway.example.test", request.headers.get("host").?);
+    try std.testing.expect(request.headers.get(":method") == null);
+}
 
 const Http3LocationOutcome = union(enum) {
     not_handled,

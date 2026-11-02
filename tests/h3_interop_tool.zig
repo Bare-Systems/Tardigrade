@@ -10,7 +10,7 @@
 //!       [--response-body STR] [--requests N] [--expect-hrr] [--verbose] \
 //!       [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]
 //!   h3_interop_tool client --host A.B.C.D --port N --authority NAME \
-//!       --path /p [--body STR] [--empty-initial-key-share] \
+//!       --path /p [--body STR] [--extended-connect-websocket [--websocket-echo STR]] [--empty-initial-key-share] \
 //!       [--reset-after-request] \
 //!       [--expect-hrr] [--insecure | --pin cert.der] [--verbose] \
 //!       [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]
@@ -283,6 +283,10 @@ const Args = struct {
     /// observes cancellation without waiting for idle timeout.
     reset_after_request: bool = false,
     reset_after_request_delay_ms: u64 = 0,
+    /// Send a real RFC 9220 CONNECT + :protocol=websocket request and wait
+    /// only for its non-FIN 2xx response HEADERS.
+    extended_connect_websocket: bool = false,
+    websocket_echo: []const u8 = "",
     qlog_dir: []const u8 = "",
     /// #625: `.current` (default) is the standard `QlogFileSeq` header; pass
     /// `--qlog-dialect qvis-legacy` only when the artifact is meant to be
@@ -365,6 +369,11 @@ fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
             args.expect_hrr = true;
         } else if (std.mem.eql(u8, arg, "--reset-after-request")) {
             args.reset_after_request = true;
+        } else if (std.mem.eql(u8, arg, "--extended-connect-websocket")) {
+            args.extended_connect_websocket = true;
+        } else if (std.mem.eql(u8, arg, "--websocket-echo")) {
+            args.websocket_echo = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
+            args.extended_connect_websocket = true;
         } else if (std.mem.eql(u8, arg, "--reset-after-request-ms")) {
             args.reset_after_request = true;
             args.reset_after_request_delay_ms = try std.fmt.parseInt(u64, it.next() orelse return error.MissingValue, 10);
@@ -806,7 +815,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print(
             "h3-interop: bad arguments ({s})\n" ++
                 "usage: h3_interop_tool server --port N --cert cert.pem --key key.pem [--requests N] [--expect-hrr] [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]\n" ++
-                "       h3_interop_tool client --host IP --port N --authority NAME --path /p [--reset-after-request] [--empty-initial-key-share] [--expect-hrr] [--insecure|--pin cert.der] [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]\n" ++
+                "       h3_interop_tool client --host IP --port N --authority NAME --path /p [--extended-connect-websocket [--websocket-echo STR]] [--reset-after-request] [--empty-initial-key-share] [--expect-hrr] [--insecure|--pin cert.der] [--qlog-dir DIR] [--qlog-dialect current|qvis-legacy] [--keylog-path FILE]\n" ++
                 "\nnegotiation (#338, shared vocabulary with tls_interop_tool):\n" ++
                 matrix.flag_usage,
             .{@errorName(err)},
@@ -883,11 +892,16 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     });
     defer client.deinit();
 
-    var h3 = H3.init(allocator, .client);
+    var h3 = H3.initWithSettings(allocator, .client, .{
+        .enable_connect_protocol = args.extended_connect_websocket,
+    });
     defer h3.deinit();
     if (artifacts.qlog_file != null) h3.setEventSink(artifacts.h3Sink());
 
     var request_id: ?u64 = null;
+    var h3_started = false;
+    var extended_head_received = false;
+    var websocket_echo_sent = false;
     var request_sent_at_us: ?u64 = null;
     var reset_sent_at_us: ?u64 = null;
     const deadline = nowUs() + args.timeout_ms * 1_000;
@@ -911,17 +925,23 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
 
         if (client.state() == .closed or client.state() == .draining) break;
         if (client.isEstablished()) {
-            if (request_id == null) {
+            if (!h3_started) {
                 std.debug.print("h3-interop: established, alpn_h3={}\n", .{client.negotiatedH3()});
                 try h3.start(client);
+                h3_started = true;
+            }
+            try h3.pump(client);
+            if (request_id == null and (!args.extended_connect_websocket or h3.peerSupportsExtendedConnect())) {
                 request_id = try h3.sendRequest(client, .{
+                    .method = if (args.extended_connect_websocket) "CONNECT" else "GET",
                     .authority = args.authority,
                     .path = args.path,
+                    .extended_protocol = if (args.extended_connect_websocket) "websocket" else null,
                     .body = args.body,
+                    .end_stream = !args.extended_connect_websocket,
                 });
                 request_sent_at_us = nowUs();
             }
-            try h3.pump(client);
             if (args.reset_after_request and reset_sent_at_us == null) {
                 if (nowUs() -| request_sent_at_us.? >= args.reset_after_request_delay_ms * std.time.us_per_ms) {
                     try client.stopSending(request_id.?, 0x010c); // H3_REQUEST_CANCELLED
@@ -937,6 +957,51 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
                 continue;
             }
             if (request_id) |id| {
+                if (args.extended_connect_websocket) {
+                    if (!extended_head_received) {
+                        if (try h3.pollResponseHead(id)) |response| {
+                            var line: [8192]u8 = undefined;
+                            writeStdout(std.fmt.bufPrint(&line, "status: {d}\n", .{response.status}) catch "");
+                            for (response.headers) |header| {
+                                writeStdout(std.fmt.bufPrint(&line, "{s}: {s}\n", .{ header.name, header.value }) catch "");
+                            }
+                            writeStdout("\n");
+                            if (response.status < 200 or response.status >= 300) {
+                                success = true;
+                                break;
+                            }
+                            extended_head_received = true;
+                        }
+                    }
+                    if (extended_head_received and args.websocket_echo.len == 0) {
+                        success = true;
+                        break;
+                    }
+                    if (extended_head_received and !websocket_echo_sent) {
+                        var frame: [512]u8 = undefined;
+                        if (args.websocket_echo.len > 125) return error.WebSocketEchoTooLarge;
+                        frame[0] = 0x81; // FIN + text
+                        frame[1] = 0x80 | @as(u8, @intCast(args.websocket_echo.len));
+                        const mask = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+                        @memcpy(frame[2..6], &mask);
+                        for (args.websocket_echo, 0..) |byte, index| frame[6 + index] = byte ^ mask[index % mask.len];
+                        try h3.sendTunnelData(client, id, frame[0 .. 6 + args.websocket_echo.len]);
+                        websocket_echo_sent = true;
+                    }
+                    if (websocket_echo_sent) {
+                        if (try h3.pollTunnelData(id, allocator)) |bytes| {
+                            defer allocator.free(bytes);
+                            if (bytes.len != args.websocket_echo.len + 2 or bytes[0] != 0x81 or bytes[1] != args.websocket_echo.len or !std.mem.eql(u8, bytes[2..], args.websocket_echo)) {
+                                return error.WebSocketEchoMismatch;
+                            }
+                            var echo_line: [512]u8 = undefined;
+                            writeStdout(std.fmt.bufPrint(&echo_line, "echo: {s}\n", .{args.websocket_echo}) catch "");
+                            success = true;
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 if (try h3.pollResponse(id)) |response| {
                     var line: [8192]u8 = undefined;
                     writeStdout(std.fmt.bufPrint(&line, "status: {d}\n", .{response.status}) catch "");

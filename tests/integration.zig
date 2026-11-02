@@ -2970,7 +2970,8 @@ fn sendPureZigTlsHttp1RequestWithServerName(allocator: std.mem.Allocator, port: 
     );
     try client.writeAllPlain(request.items);
 
-    const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    // /status/metrics alone now exceeds 64 KiB.
+    const raw = try client.readPlainToEnd(allocator, 512 * 1024, 5_000);
     errdefer allocator.free(raw);
     return httpResponseFromOwnedRaw(allocator, raw);
 }
@@ -4383,7 +4384,7 @@ test "h3interop.forward_auth.deny_then_allow" {
     try upstream.run();
 
     const config_text = try std.fmt.allocPrint(allocator,
-        \\location = /healthz {
+        \\location = /healthz {{
         \\    return 200 alive;
         \\}}
         \\
@@ -6995,8 +6996,11 @@ test "interop.h2.window_update_zero_increment_connection_goaway_and_stream_rst" 
         try client.writeHttp2Frame(0x8, 0, 1, inc_zero[0..]);
         try expectH2RstStream(client, allocator, 1, 0x1); // PROTOCOL_ERROR
 
+        // HEADERS on the stream we just reset are decoded (to keep the
+        // connection's HPACK table in sync) and then discarded without a
+        // second RST (#952). The follow-up request below proves the
+        // connection stays usable.
         try client.writeHttp2Frame(0x1, 0x1 | 0x4, 1, request_block);
-        try expectH2RstStream(client, allocator, 1, 0x5); // STREAM_CLOSED
 
         const headers3 = [_]hpack.HeaderField{
             .{ .name = ":method", .value = "GET" },

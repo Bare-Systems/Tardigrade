@@ -4,13 +4,19 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-01
+
+WebSocket release: WebSocket proxying now works over HTTP/1.1 Upgrade,
+HTTP/2 (RFC 8441), and HTTP/3 (RFC 9220), alongside the generic response
+cache, ACME automatic HTTPS, and the other changes below.
+
 ### Documentation
 
 - **Native automatic HTTPS design (#831).** New `docs/ACME_AUTOMATIC_HTTPS.md`
   specifies the ACME architecture for #759: code audit, operator config
   grammar, issuance/renewal state machine, secret/trust boundary, credential
-  generation integration, and the A2–A7 work split. Design only: ACME remains
-  unsupported and `TARDIGRADE_TLS_ACME_ENABLED` is still rejected.
+  generation integration, and the A2–A7 work split. The design landed ahead of
+  the implementation; see the ACME entries under Added for what shipped.
 - **`proxy_pass` URI rewriting semantics (#800).** `docs/PROXY_SECURITY.md` §6a
   now documents how request paths map onto `proxy_pass` targets, including the
   intentional nginx divergences (non-segment prefix joins, prefix stripping for
@@ -34,8 +40,21 @@ All notable user-facing changes to Tardigrade are documented here.
   reactor-thread pool, and shares its upgrade/tunnel metrics and close
   semantics (idle, lifetime, shutdown, reload preserve/drain, RST_STREAM,
   GOAWAY). A non-negotiated or malformed Extended CONNECT is rejected with
-  zero upstream side effects. HTTP/3 (RFC 9220) extended CONNECT remains
-  unsupported.
+  zero upstream side effects. HTTP/3 (RFC 9220) extended CONNECT is covered
+  by the entry below.
+- **Downstream HTTP/3 WebSocket proxying via RFC 9220 Extended CONNECT
+  (#821, #957).** A negotiated HTTP/3 Extended CONNECT (`:protocol:
+  websocket`) is now admitted under the same gates as the HTTP/1.1 and
+  HTTP/2 paths -- route opt-in (`proxy_websocket on`), auth/ACL/`forward_auth`,
+  rate limits, Origin policy, 0-RTT replay safety, tunnel capacity, and the
+  circuit breaker -- then translated to a fresh, never-pooled HTTP/1.1
+  `ws://`/`wss://` origin handshake. An admitted stream is bound to a bounded
+  stream-owned session and relayed on a dedicated coordinator, with partial
+  delivery under backpressure, charges against the connection's buffered-byte
+  budget, and QUIC `RESET_STREAM`/`STOP_SENDING`/connection-close, reload
+  (`preserve`/`drain`), and shutdown cleanup. Refused handshakes are answered
+  with an ordinary HTTP/3 response and no upstream side effects. A new
+  aioquic-based RFC 9220 interop client exercises the path in CI.
 - **Synchronous stale revalidation and bounded collapsed fills for the generic
   response cache (#934).** An expired in-memory `GET` representation with an
   `ETag` or `Last-Modified` validator now sends an origin-only conditional

@@ -979,7 +979,10 @@ jobs:
     name: H3 resumption/0-RTT interop
     needs: mode
     if: needs.mode.outputs.mode == 'full'
-    runs-on: ubuntu-latest
+    # The pinned external peer needs LLVM 19 and GCC 14's C++23 headers.
+    # Its apt.llvm.org installer targets Ubuntu 24.04; ubuntu-latest advanced
+    # to 26.04, whose llvm-toolchain-resolute-19 repository returns 404.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
 
     steps:

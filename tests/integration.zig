@@ -4383,7 +4383,7 @@ test "h3interop.forward_auth.deny_then_allow" {
     try upstream.run();
 
     const config_text = try std.fmt.allocPrint(allocator,
-        \\location = /healthz {
+        \\location = /healthz {{
         \\    return 200 alive;
         \\}}
         \\

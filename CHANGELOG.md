@@ -2,6 +2,10 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [0.9.1] - 2026-11-01
+
+Version bump
+
 ## [0.9.0] - 2026-11-01
 
 WebSocket release: WebSocket proxying now works over HTTP/1.1 Upgrade,

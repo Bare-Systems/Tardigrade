@@ -32,8 +32,8 @@ release gates for the same evidence.
 ### Required On Main
 
 - CI runs in smoke or full mode chosen from `CHANGELOG.md`; a new numbered
-  release heading selects **full** (see [CI.md](CI.md)). Require only the
-  `CI result` check in branch protection.
+  release heading, or an untagged top-release retry, selects **full** (see
+  [CI.md](CI.md)). Require only the `CI result` check in branch protection.
 - The unprofiled Linux integration job (`zig build test-integration --summary
   all`) runs in both modes.
 - `.github/workflows/release.yml` auto-promotes only a successful,

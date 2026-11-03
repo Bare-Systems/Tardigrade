@@ -18,6 +18,7 @@ only git, never the GitHub API, and runs identically locally.
 | --- | --- |
 | PR, no changelog change / edits only under `## [Unreleased]` | `smoke` |
 | PR adds a numbered heading, e.g. `## [0.7.4] - YYYY-MM-DD`, not present at the merge base | `full` |
+| PR changes the top release to an untagged version | `full` (retries an interrupted release promotion) |
 | Push to `main` | same comparison, `before` vs `after`; release promotion = `full` |
 | `workflow_dispatch` `mode=smoke` / `mode=full` | that mode, on any ref |
 | `workflow_dispatch` `mode=auto` | same detector against `origin/main` |
@@ -26,7 +27,9 @@ only git, never the GitHub API, and runs identically locally.
 The comparison is the changelog at the **merge base** versus at head, so a
 release that landed on `main` after the PR branched is not counted as new,
 pre-existing numbered sections and a retained empty `[Unreleased]` heading
-never trigger `full`, and re-dating an existing section does not either.
+never trigger `full`, and re-dating an existing section does not either. The
+sole retry exception is changing the top release to a version without its
+`vX.Y.Z` tag, which intentionally reruns the missed release promotion.
 Ambiguous input (unresolvable refs, shallow clone, missing/empty/heading-less
 changelog, invalid `--override`) **fails the run** instead of guessing
 `smoke`. Try it locally:

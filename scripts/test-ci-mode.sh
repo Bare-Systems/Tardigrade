@@ -60,6 +60,15 @@ expect "historical section edited/re-dated" smoke --base "$base" --head "$head"
 write_changelog "" 0.7.4 0.7.3 0.7.2; head=$(commit promote)
 expect "new release, empty [Unreleased] retained" full --base "$base" --head "$head"
 
+# If a release promotion was interrupted before its tag was published, an
+# accidental newer top version can be removed to retry the untagged release.
+write_changelog "" 0.7.5 0.7.4 0.7.3; retry_base=$(commit interrupted-promotion)
+git -C "$repo" tag v0.7.5 "$retry_base"
+write_changelog "" 0.7.4 0.7.3; retry_head=$(commit retry-untagged-release)
+expect "top untagged release retry" full --base "$retry_base" --head "$retry_head"
+git -C "$repo" tag v0.7.4 "$retry_head"
+expect "top tagged release is not retried" smoke --base "$retry_base" --head "$retry_head"
+
 # promotion with a prerelease suffix
 write_changelog "" 0.8.0-rc.1 0.7.3 0.7.2; head=$(commit promote-rc)
 expect "new prerelease heading is rejected" error --base "$base" --head "$head"

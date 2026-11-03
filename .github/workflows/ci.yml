@@ -26,8 +26,8 @@ on:
 
 # Two validation modes only (#806), chosen by scripts/ci-mode.sh:
 #   smoke  ordinary unreleased work (no numbered changelog release added).
-#   full   a new `## [X.Y.Z]` changelog heading vs the base (release
-#          promotion), a manual `mode=full` dispatch, or the scheduled
+#   full   a new `## [X.Y.Z]` changelog heading vs the base, an untagged top
+#          release retry, a manual `mode=full` dispatch, or the scheduled
 #          weekly run against `main` (#945).
 # `ci-result` is the single stable branch-protection-required check.
 permissions:
@@ -828,6 +828,9 @@ jobs:
       - name: Build ReleaseFast binary
         run: zig build -Doptimize=ReleaseFast
 
+      - name: Test performance-smoke metric parsing
+        run: ./benchmarks/ci-smoke.sh --self-test
+
       - name: Run performance smoke benchmark
         run: ./benchmarks/ci-smoke.sh --save benchmarks/results/ci-smoke.json
 
@@ -846,7 +849,11 @@ jobs:
         if: always()
         run: |
           mkdir -p "$RUNNER_TEMP/perf-artifacts"
-          cp benchmarks/results/ci-smoke.json "$RUNNER_TEMP/perf-artifacts/ci-smoke.json"
+          if [[ -f benchmarks/results/ci-smoke.json ]]; then
+            cp benchmarks/results/ci-smoke.json "$RUNNER_TEMP/perf-artifacts/ci-smoke.json"
+          else
+            echo "Performance-smoke results were not produced; preserving the primary failure."
+          fi
 
       - name: Upload perf smoke results
         if: always()
@@ -854,7 +861,7 @@ jobs:
         with:
           name: perf-smoke-results
           path: ${{ runner.temp }}/perf-artifacts/ci-smoke.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
 
   # ── Crypto benchmark trend ────────────────────────────────────────────────────

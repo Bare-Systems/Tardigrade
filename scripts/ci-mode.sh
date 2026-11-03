@@ -10,9 +10,11 @@
 #
 # Rule (override=auto): the mode is `full` iff the changelog at <head>
 # contains a numbered release heading (`## [X.Y.Z] - ...`) that is absent from
-# the changelog at the merge base of <base> and <head>. This deliberately
-# matches scripts/release-metadata.sh; prerelease and malformed headings are
-# rejected instead of selecting a release which that script cannot publish.
+# the changelog at the merge base of <base> and <head>, or its top release was
+# changed to an untagged version so a previously interrupted promotion retries.
+# This deliberately matches scripts/release-metadata.sh; prerelease and
+# malformed headings are rejected instead of selecting a release which that
+# script cannot publish.
 # Edits under `## [Unreleased]`, pre-existing release sections and a retained
 # empty `[Unreleased]` heading never select `full`. `--override smoke|full`
 # returns that mode without reading git or the changelog.
@@ -100,17 +102,36 @@ release_versions() {
     sort -u
 }
 
+top_release_version() {
+  local content="$1"
+  awk '
+    /^## \[[0-9]+\.[0-9]+\.[0-9]+\] - / {
+      line = $0
+      sub(/^## \[/, "", line)
+      sub(/\].*$/, "", line)
+      print line
+      exit
+    }
+  ' <<<"$content"
+}
+
 base_content=$(read_changelog "$merge_base")
 head_content=$(read_changelog "$head_sha")
 validate_changelog "$merge_base" "$base_content"
 validate_changelog "$head_sha" "$head_content"
 base_versions=$(release_versions "$base_content")
 head_versions=$(release_versions "$head_content")
+base_top_version=$(top_release_version "$base_content")
+head_top_version=$(top_release_version "$head_content")
 
 new_versions=$(comm -13 <(printf '%s\n' "$base_versions") <(printf '%s\n' "$head_versions") | sed '/^$/d')
 
 if [ -n "$new_versions" ]; then
   echo "ci-mode: new release heading(s): $(echo "$new_versions" | tr '\n' ' ')-> full" >&2
+  echo full
+elif [ "$head_top_version" != "$base_top_version" ] &&
+  ! git rev-parse --verify --quiet "refs/tags/v${head_top_version}" >/dev/null; then
+  echo "ci-mode: top release changed to unpublished v${head_top_version} -> full" >&2
   echo full
 else
   echo "ci-mode: no new numbered release heading -> smoke" >&2

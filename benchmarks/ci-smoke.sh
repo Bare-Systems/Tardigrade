@@ -20,6 +20,21 @@ TMP_DIR=""
 UPSTREAM_PID=""
 TARDIGRADE_PID=""
 RESULTS_FILE=""
+SELF_TEST=0
+
+metric_value() {
+    local metric_name="$1"
+    local metrics="$2"
+
+    # Do not exit awk early here. With pipefail enabled, the former
+    # `printf | awk ... exit` form made printf fail with SIGPIPE whenever the
+    # metrics response exceeded the pipe buffer, even though the metric was
+    # found successfully.
+    awk -v metric_name="$metric_name" '
+        $1 == metric_name { value = $2 }
+        END { if (value != "") print value }
+    ' <<<"$metrics"
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -31,13 +46,28 @@ while [[ $# -gt 0 ]]; do
         --threads)      THREADS="$2";      shift 2 ;;
         --save)         SAVE_FILE="$2";    shift 2 ;;
         --meta-file)    META_FILE="$2";    shift 2 ;;
+        --self-test)    SELF_TEST=1;        shift ;;
         --help)
-            sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,/^$/ { s/^# \{0,1\}//; p; }' "$0"
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+if [[ "$SELF_TEST" -eq 1 ]]; then
+    # Make this substantially larger than a typical pipe buffer so it guards
+    # against reintroducing the pipefail/SIGPIPE regression above.
+    self_test_metrics="$(awk 'BEGIN {
+        for (i = 0; i < 32768; i += 1) print "tardigrade_unrelated_metric 1"
+        print "tardigrade_upstream_connections_reused_total 80"
+        print "tardigrade_upstream_connections_new_total 20"
+    }')"
+    [[ "$(metric_value tardigrade_upstream_connections_reused_total "$self_test_metrics")" == "80" ]]
+    [[ "$(metric_value tardigrade_upstream_connections_new_total "$self_test_metrics")" == "20" ]]
+    echo "ci-smoke metric parsing self-test passed"
+    exit 0
+fi
 
 cleanup() {
     local status=$?
@@ -52,13 +82,13 @@ cleanup() {
     if [[ $status -ne 0 && -n "$TMP_DIR" ]]; then
         if [[ -f "${TMP_DIR}/upstream.log" ]]; then
             echo ""
-            echo "---- upstream.log ----"
-            cat "${TMP_DIR}/upstream.log"
+            echo "---- upstream.log (last 200 lines) ----"
+            tail -n 200 "${TMP_DIR}/upstream.log"
         fi
         if [[ -f "${TMP_DIR}/tardigrade.log" ]]; then
             echo ""
-            echo "---- tardigrade.log ----"
-            cat "${TMP_DIR}/tardigrade.log"
+            echo "---- tardigrade.log (last 200 lines) ----"
+            tail -n 200 "${TMP_DIR}/tardigrade.log"
         fi
     fi
     [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
@@ -140,8 +170,8 @@ jq -e '
 # (the failure mode that motivated the pool — see #196/#141). Uses the global
 # pool counters exposed on the metrics endpoint while the gateway is still up.
 reuse_metrics="$(curl -fsS "http://127.0.0.1:${LISTEN_PORT}/status/metrics")"
-reused="$(printf '%s\n' "$reuse_metrics" | awk '/^tardigrade_upstream_connections_reused_total /{print $2; exit}')"
-new_conns="$(printf '%s\n' "$reuse_metrics" | awk '/^tardigrade_upstream_connections_new_total /{print $2; exit}')"
+reused="$(metric_value tardigrade_upstream_connections_reused_total "$reuse_metrics")"
+new_conns="$(metric_value tardigrade_upstream_connections_new_total "$reuse_metrics")"
 reused="${reused:-0}"; new_conns="${new_conns:-0}"
 reuse_total=$((reused + new_conns))
 if [[ "$reuse_total" -le 0 ]]; then

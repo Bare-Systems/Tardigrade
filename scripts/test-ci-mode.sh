@@ -146,5 +146,14 @@ else
   ok "gate rejects skipped dependency review on PR"
 fi
 
+# A repaired release pipeline must rerun full CI, which lets it retry a release
+# whose tag was created before the publisher failed.
+mkdir -p "$repo/.github/workflows"
+printf 'name: Release\n' >"$repo/.github/workflows/release.yml"
+pipeline_base=$(commit release-pipeline-base)
+printf '# publisher repair\n' >>"$repo/.github/workflows/release.yml"
+pipeline_head=$(commit release-pipeline-repair)
+expect "release pipeline change" full --base "$pipeline_base" --head "$pipeline_head"
+
 echo "ci-mode tests: $pass passed, $failed failed"
 [ "$failed" -eq 0 ]

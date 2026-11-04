@@ -10,8 +10,10 @@
 #
 # Rule (override=auto): the mode is `full` iff the changelog at <head>
 # contains a numbered release heading (`## [X.Y.Z] - ...`) that is absent from
-# the changelog at the merge base of <base> and <head>, or its top release was
-# changed to an untagged version so a previously interrupted promotion retries.
+# the changelog at the merge base of <base> and <head>, its top release was
+# changed to an untagged version so a previously interrupted promotion retries,
+# or release-pipeline inputs changed. The last case lets a failed, tagged-but-
+# unpublished release retry after its publisher is repaired.
 # This deliberately matches scripts/release-metadata.sh; prerelease and
 # malformed headings are rejected instead of selecting a release which that
 # script cannot publish.
@@ -132,6 +134,9 @@ if [ -n "$new_versions" ]; then
 elif [ "$head_top_version" != "$base_top_version" ] &&
   ! git rev-parse --verify --quiet "refs/tags/v${head_top_version}" >/dev/null; then
   echo "ci-mode: top release changed to unpublished v${head_top_version} -> full" >&2
+  echo full
+elif ! git diff --quiet "$merge_base" "$head_sha" -- .github/workflows/release.yml scripts/install-trivy.sh; then
+  echo "ci-mode: release pipeline input changed -> full" >&2
   echo full
 else
   echo "ci-mode: no new numbered release heading -> smoke" >&2

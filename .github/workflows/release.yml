@@ -101,6 +101,8 @@ jobs:
         id: meta
         if: github.event_name == 'workflow_dispatch' || steps.ci_decision.outputs.mode == 'full'
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -111,7 +113,14 @@ jobs:
 
           if git rev-parse "$tag" >/dev/null 2>&1; then
             tag_commit="$(git rev-list -n 1 "$tag")"
-            if [ "$tag_commit" != "$release_sha" ]; then
+            if [ "$tag_commit" != "$release_sha" ] &&
+              git merge-base --is-ancestor "$tag_commit" "$release_sha" &&
+              ! gh release view "$tag" >/dev/null 2>&1; then
+              # A previous publish can create the tag before a later step
+              # fails. Rebuild the tagged source only while no GitHub Release
+              # exists; do not move a release tag to a newer commit.
+              release_sha="$tag_commit"
+            elif [ "$tag_commit" != "$release_sha" ] || gh release view "$tag" >/dev/null 2>&1; then
               should_publish="false"
             fi
           fi
@@ -451,6 +460,63 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Download release notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/publish-release/release-notes
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/publish-release/dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        env:
+          DIST_DIR: ${{ runner.temp }}/publish-release/dist
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIST_DIR"
+          install -m 0755 scripts/install.sh "$DIST_DIR/install.sh"
+          find "$DIST_DIR" -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' -o -name 'install.sh' \) -print0 | sort -z | xargs -0 sha256sum > "$DIST_DIR/tardigrade-checksums.txt"
+
+      - name: Verify checksums
+        env:
+          CHECKSUMS_PATH: ${{ runner.temp }}/publish-release/dist/tardigrade-checksums.txt
+        run: sha256sum --check "$CHECKSUMS_PATH"
+
+      - name: Install pinned Trivy
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly version="0.70.0"
+          readonly archive="trivy_${version}_Linux-64bit.tar.gz"
+          readonly expected_sha256="8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
+          readonly url="https://github.com/aquasecurity/trivy/releases/download/v${version}/${archive}"
+          download_dir="$RUNNER_TEMP/trivy-download"
+          install_dir="$RUNNER_TEMP/trivy-bin"
+          mkdir -p "$download_dir" "$install_dir"
+          curl --fail --location --silent --show-error \
+            --retry 4 --retry-all-errors --connect-timeout 15 \
+            --output "$download_dir/$archive" "$url"
+          printf '%s  %s\n' "$expected_sha256" "$download_dir/$archive" | sha256sum --check --status
+          tar --extract --gzip --file "$download_dir/$archive" --directory "$install_dir" trivy
+          chmod 0755 "$install_dir/trivy"
+
+      - name: Scan release archives for vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CMD: ${{ runner.temp }}/trivy-bin/trivy
+        with:
+          skip-setup-trivy: true
+          scan-type: fs
+          scan-ref: ${{ runner.temp }}/publish-release/dist/
+          format: table
+          severity: CRITICAL
+          exit-code: 0
+
       - name: Ensure release tag
         shell: bash
         env:
@@ -481,42 +547,6 @@ jobs:
               -f ref="refs/tags/$TAG" \
               -f sha="$tag_object_sha" >/dev/null
           fi
-
-      - name: Download release notes
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: release-notes
-          path: ${{ runner.temp }}/publish-release/release-notes
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          path: ${{ runner.temp }}/publish-release/dist
-          merge-multiple: true
-
-      - name: Generate checksums
-        shell: bash
-        env:
-          DIST_DIR: ${{ runner.temp }}/publish-release/dist
-        run: |
-          set -euo pipefail
-          mkdir -p "$DIST_DIR"
-          install -m 0755 scripts/install.sh "$DIST_DIR/install.sh"
-          find "$DIST_DIR" -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' -o -name 'install.sh' \) -print0 | sort -z | xargs -0 sha256sum > "$DIST_DIR/tardigrade-checksums.txt"
-
-      - name: Verify checksums
-        env:
-          CHECKSUMS_PATH: ${{ runner.temp }}/publish-release/dist/tardigrade-checksums.txt
-        run: sha256sum --check "$CHECKSUMS_PATH"
-
-      - name: Scan release archives for vulnerabilities
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: ${{ runner.temp }}/publish-release/dist/
-          format: table
-          severity: CRITICAL
-          exit-code: 0
 
       - name: Publish release assets
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3

@@ -937,9 +937,15 @@ jobs:
       - name: Secret scanning
         run: gitleaks detect --source . --config .gitleaks.toml --log-level warn
 
+      - name: Install pinned Trivy
+        run: scripts/install-trivy.sh "$RUNNER_TEMP/trivy-bin"
+
       - name: Filesystem vulnerability scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CMD: ${{ runner.temp }}/trivy-bin/trivy
         with:
+          skip-setup-trivy: true
           scan-type: fs
           scan-ref: .
           format: sarif

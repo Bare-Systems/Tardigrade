@@ -65,6 +65,16 @@ pub const ListenerProtocolPolicy = struct {
     }
 
     pub fn nativeTlsPolicy(self: ListenerProtocolPolicy) tls.policy.Policy {
+        var policy = self.nativeTlsAlpnPolicy();
+        // The SNI credential provider can select an RSA-PSS identity whenever
+        // the peer offers it; the policy must allow every scheme it can pick,
+        // or `inspectSelectedCredential` rejects the selection and the
+        // handshake dies with `CredentialProviderFailed`.
+        policy.signature_schemes = &server_signature_schemes;
+        return policy;
+    }
+
+    fn nativeTlsAlpnPolicy(self: ListenerProtocolPolicy) tls.policy.Policy {
         if (self.http2_enabled and self.http1_enabled) {
             var policy = tls.policy.Policy.recordDefault();
             policy.allow_absent_alpn = self.allow_http1_without_alpn;
@@ -80,6 +90,12 @@ pub const ListenerProtocolPolicy = struct {
         }
         return tls.policy.Policy.recordHttp1Only(self.allow_http1_without_alpn);
     }
+};
+
+const server_signature_schemes = [_]tls.algorithms.SignatureScheme{
+    .ed25519,
+    .ecdsa_secp256r1_sha256,
+    .rsa_pss_rsae_sha256,
 };
 
 const dual_protocol_preference = [_]tls.algorithms.ProtocolName{

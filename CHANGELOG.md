@@ -4,6 +4,12 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Native TLS listeners now allow RSA-PSS (`rsa_pss_rsae_sha256`) server
+  signatures, so a multi-SNI deployment with an RSA identity no longer fails
+  every handshake with `error.CredentialProviderFailed` (#969).
+
 ## [0.9.0] - 2026-11-01
 
 WebSocket release: WebSocket proxying now works over HTTP/1.1 Upgrade,

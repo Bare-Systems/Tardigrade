@@ -951,6 +951,14 @@ test "native TLS policy follows listener preference and fallback" {
     }).nativeTlsPolicy();
     try std.testing.expectEqual(@as(usize, 0), disabled.alpn_protocols.len);
     try std.testing.expect(!disabled.allow_absent_alpn);
+
+    // Every scheme the SNI provider can select must be policy-legal, RSA-PSS
+    // included (#969).
+    for ([_]tls.algorithms.SignatureScheme{ .ed25519, .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha256 }) |scheme| {
+        try std.testing.expect(dual.containsSignatureScheme(scheme));
+        try std.testing.expect(h2_only.containsSignatureScheme(scheme));
+        try std.testing.expect(disabled.containsSignatureScheme(scheme));
+    }
 }
 
 test "native readiness maps directly to event-loop interest" {

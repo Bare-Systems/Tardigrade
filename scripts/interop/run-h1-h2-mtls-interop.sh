@@ -16,6 +16,8 @@
 #   - per-SNI: two hosts / two unrelated CAs over real TCP, cross-CA refusal in
 #     both directions, and 421 when Host/:authority maps to a different policy
 #     than the SNI the connection was admitted under;
+#   - rsa-sni (#969): default Ed25519 + named RSA SNI identity both complete
+#     handshakes and serve HTTP, including an RSA-PSS-only client;
 #   - trust rotation: rewriting the CA bundle and reloading (SIGHUP) swaps the
 #     trusted CA atomically, and a bundle that fails to load rejects the whole
 #     reload while the serving trust set keeps verifying.
@@ -386,6 +388,44 @@ if wait_flip h1 client serve; then
 else
   bad "rotate: recovery reload never took effect"; tail -5 "$work/rot.log"
 fi
+
+# ----------------------------------------------------------------- rsa-sni --
+# #969 regression: a default Ed25519 identity plus a named RSA SNI identity, no
+# client verification. The SNI provider picks RSA-PSS whenever the peer offers
+# it, so the listener signature policy must allow it; otherwise every handshake
+# to the RSA host dies with CredentialProviderFailed.
+rsa_fix="$root/tests/fixtures/tls"
+rsa_sni=rsa.tardigrade.test
+echo "$location" >"$work/rsa.body"
+tcp_port="$(free_port)"
+{ echo "pid $work/rsa.pid;"; cat "$work/rsa.body"; } >"$work/rsa.conf"
+TARDIGRADE_CONFIG_PATH="$work/rsa.conf" \
+TARDIGRADE_LISTEN_HOST=127.0.0.1 TARDIGRADE_LISTEN_PORT="$tcp_port" \
+TARDIGRADE_TLS_CERT_PATH="$work/server.crt" \
+TARDIGRADE_TLS_KEY_PATH="$work/server.key" \
+TARDIGRADE_TLS_SERVER_NAME=a.test \
+TARDIGRADE_TLS_SNI_CERTS="$rsa_sni:$rsa_fix/native_rsa.crt:$rsa_fix/native_rsa.key" \
+TARDIGRADE_WORKER_THREADS=1 TARDIGRADE_ERROR_LOG_PATH="$work/rsa.log" \
+"$tardi" >"$work/rsa.out" 2>&1 &
+gw_pid=$!
+pids="$pids $gw_pid"
+wait_ready h1 a.test - || { echo "error: rsa-sni gateway not ready" >&2; tail -5 "$work/rsa.log" >&2; exit 2; }
+
+expect_served "rsa-sni/h1: default Ed25519 identity still served" h1 a.test -
+expect_served "rsa-sni/h2: default Ed25519 identity still served" h2 a.test -
+# Ordinary clients offer several schemes including RSA-PSS.
+expect_served "rsa-sni/h1: RSA identity served to a standard ClientHello" h1 "$rsa_sni" -
+expect_served "rsa-sni/h2: RSA identity served to a standard ClientHello" h2 "$rsa_sni" -
+expect_served "rsa-sni/openssl: RSA identity served to a standard ClientHello" openssl "$rsa_sni" -
+# A client offering only RSA-PSS must complete with an RSA-PSS CertificateVerify.
+with_timeout 15 openssl s_client -connect "127.0.0.1:$tcp_port" -tls1_3 -servername "$rsa_sni" \
+  -alpn http/1.1 -sigalgs rsa_pss_rsae_sha256 -brief </dev/null >"$work/rsa-sni.log" 2>&1
+if grep -q 'Protocol version: TLSv1.3' "$work/rsa-sni.log" && grep -qiE 'Signature type: (RSA-PSS|rsa_pss_rsae_sha256)' "$work/rsa-sni.log"; then
+  ok "rsa-sni/openssl: RSA-PSS-only client completes TLS 1.3 with an RSA-PSS signature"
+else
+  bad "rsa-sni/openssl: RSA-PSS-only handshake failed"; cat "$work/rsa-sni.log"; tail -5 "$work/rsa.log"
+fi
+kill "$gw_pid" 2>/dev/null
 
 echo "h1/h2 mTLS interop: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

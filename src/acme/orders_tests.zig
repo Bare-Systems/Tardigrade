@@ -534,6 +534,31 @@ test "ACME orders: an authorization identifier that changes mid-poll fails close
     try env.expectStoreEmpty();
 }
 
+test "ACME orders: an unsupported tokenless challenge type alongside a valid http-01 still succeeds" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.extra_tokenless_challenge = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    var issued = try orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options());
+    defer issued.deinit(testing.allocator);
+    try env.expectStoreEmpty();
+}
+
+test "ACME orders: a selected http-01 challenge missing its own token fails closed" {
+    var env = try Env.init();
+    defer env.deinit();
+    const session = try env.openSession();
+    defer session.close();
+    env.ca.script.authz.http01_missing_token = true;
+
+    const names = [_][]const u8{"a.example.com"};
+    try testing.expectError(error.BadAuthorizationResponse, orders_mod.obtain(testing.allocator, &session.client, &env.store, &names, env.options()));
+    try env.expectStoreEmpty();
+}
+
 test "ACME orders: a duplicate http-01 challenge fails closed without publishing anything" {
     var env = try Env.init();
     defer env.deinit();

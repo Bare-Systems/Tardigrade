@@ -474,7 +474,15 @@ fn newOrder(allocator: std.mem.Allocator, client: *client_mod.Client, order_grou
 const ChallengeJson = struct {
     type: []const u8,
     url: []const u8,
-    token: []const u8,
+    /// Optional, not per RFC 8555 (which mandates it for every challenge
+    /// type it defines): real-world authorization responses can list
+    /// challenge types this client never selects -- newer IETF-draft types
+    /// like `dns-persist-01` carry an `accounturi`/`issuer-domain-names`
+    /// pair instead of a token (#975, found by #941's independent-CA
+    /// harness against real Pebble). A required field here would fail the
+    /// whole authorization parse before ever reaching the `http-01` entry
+    /// this client actually wants.
+    token: ?[]const u8 = null,
 };
 
 /// RFC 8555 §7.5.1 requires the response to a challenge acknowledgement to
@@ -553,7 +561,8 @@ fn fetchAuthorization(
     for (v.challenges) |c| {
         if (std.mem.eql(u8, c.type, "http-01")) {
             if (http01 != null) return error.BadAuthorizationResponse;
-            http01 = .{ .url = c.url, .token = c.token };
+            const token = c.token orelse return error.BadAuthorizationResponse;
+            http01 = .{ .url = c.url, .token = token };
         }
     }
 

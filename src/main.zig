@@ -143,10 +143,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // (#379): operators and release audits verify from this line
             // which backend a binary was built with. Every supported
             // production build is native-only (#649) -- there is no
-            // foreign-implementation backend left to report.
-            try stdout.print("{s} (tls-profile={s}, tls-backend=native)\n", .{
+            // foreign-implementation backend left to report. `commit` and
+            // `acme-experimental` let an external harness (e.g. #941's
+            // independent-CA interop script) confirm a given binary was
+            // actually built from a specific source commit with a specific
+            // build option, rather than trusting an arbitrary executable
+            // bit on a possibly stale/differently-configured artifact.
+            try stdout.print("{s} (tls-profile={s}, tls-backend=native, commit={s}, acme-experimental={})\n", .{
                 http.SERVER_VERSION,
                 build_options.tls_profile,
+                build_options.commit,
+                build_options.acme_experimental,
             });
             try stdout.flush();
         },

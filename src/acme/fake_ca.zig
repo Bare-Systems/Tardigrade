@@ -131,6 +131,16 @@ pub const AuthzBehavior = struct {
     /// `challenges[]` contains two distinct `http-01` entries (different
     /// URLs/tokens), so the client cannot tell which one is actually bound.
     duplicate_http01: bool = false,
+    /// `challenges[]` also lists an unsupported IETF-draft challenge type
+    /// (`dns-persist-01`) with no `token` member, alongside a normal,
+    /// token-bearing `http-01` entry (#975: real Pebble authorizations can
+    /// include challenge types this client never selects, and those may
+    /// omit `token` entirely).
+    extra_tokenless_challenge: bool = false,
+    /// The selected `http-01` challenge itself omits `token`: this must
+    /// still fail closed with `BadAuthorizationResponse`, unlike an
+    /// unselected challenge type omitting it.
+    http01_missing_token: bool = false,
     /// Every authorization reports the identifier of the very first
     /// authorization ever created, simulating two distinct authorization
     /// URLs that both claim to cover the same requested name.
@@ -1104,18 +1114,25 @@ pub const FakeCa = struct {
         try buf.print(allocator, "{{\"status\":\"{s}\",\"identifier\":{{\"type\":\"dns\",\"value\":\"{s}\"}}", .{ status_str, identifier_value });
         if (b.expires_override) |expires| try buf.print(allocator, ",\"expires\":\"{s}\"", .{expires});
         try buf.appendSlice(allocator, ",\"challenges\":[");
+        var wrote_first = false;
         if (!b.no_http01) {
             if (b.cross_host_challenge) {
                 try buf.print(allocator, "{{\"type\":\"http-01\",\"url\":\"https://evil.test/authz/{d}/http-01\",\"token\":\"{s}\"}}", .{ id, authz.token });
+            } else if (b.http01_missing_token) {
+                try buf.print(allocator, "{{\"type\":\"http-01\",\"url\":\"{s}/authz/{d}/http-01\"}}", .{ self.base, id });
             } else {
                 try buf.print(allocator, "{{\"type\":\"http-01\",\"url\":\"{s}/authz/{d}/http-01\",\"token\":\"{s}\"}}", .{ self.base, id, authz.token });
             }
+            wrote_first = true;
             if (b.duplicate_http01) {
                 // A second, distinct http-01 entry: different URL and token,
                 // so a client that just takes "the first one" would trigger
                 // and poll the wrong challenge without ever noticing.
                 try buf.print(allocator, ",{{\"type\":\"http-01\",\"url\":\"{s}/authz/{d}/http-01-dup\",\"token\":\"{s}-dup\"}}", .{ self.base, id, authz.token });
             }
+        }
+        if (b.extra_tokenless_challenge) {
+            try buf.print(allocator, "{s}{{\"type\":\"dns-persist-01\",\"url\":\"{s}/authz/{d}/dns-persist-01\",\"accounturi\":\"{s}/account/1\"}}", .{ if (wrote_first) "," else "", self.base, id, self.base });
         }
         try buf.appendSlice(allocator, "]}");
 

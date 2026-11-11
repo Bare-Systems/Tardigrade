@@ -410,3 +410,49 @@ zig build
 CURL=/opt/homebrew/opt/curl/bin/curl scripts/interop/run-h1-h2-mtls-interop.sh   # needs curl with OpenSSL + HTTP/2
 ```
 
+## #941: independent local-CA ACME shipping-gateway harness
+
+`run-acme-local-ca.sh` runs the real `tardi run` binary (`-Dacme-experimental`,
+general profile) against the upstream **Pebble** RFC 8555 test CA, pinned by
+digest and started as a separate Docker container -- not `src/acme/fake_ca.zig`
+or `src/acme/live_ca_server.zig`, which back the existing in-tree component
+suites (`src/acme/orders_tests.zig`, `src/acme/live_http01_tests.zig`,
+`tests/integration.zig`'s `acme-experimental` cases). Pebble's own HTTP-01
+validation request reaches the real shipping `acme_http01_listener.Listener`
+over the Docker bridge (`--add-host NAME:host-gateway`); there is no shared
+code between the CA and the system under test.
+
+Modes: `a3 | a4 | a5 | a6 | all`. Only `a3` is implemented today:
+
+```sh
+zig build -Dacme-experimental
+scripts/interop/run-acme-local-ca.sh a3
+```
+
+It stands up Pebble, issues a real multi-SAN certificate for two test
+hostnames entirely through the shipping HTTP-01 path, then independently
+verifies (via `openssl`/`curl`, never the production ACME client) the served
+certificate's SAN and chain-of-trust against Pebble's own freshly fetched
+issuing root, that an unmanaged SNI gets no credential, that the HTTP-01
+listener leaves no challenge residue, and that a restart recovers the same
+certificate with the CA process stopped (no network).
+
+`a4`/`a5`/`a6` are explicit "not yet available" gates -- running them reports
+`FAIL` and a nonzero exit, never a silent skip or a false pass. They are
+deferred follow-up work (certificate publication/rotation/recovery evidence,
+successive live-renewal/restart/fault evidence, and TLS-ALPN-01 once
+#938/#939/#940 land), along with CI wiring and the full adversarial/fault-
+injection matrix (bad nonce, CA outage, concurrent distinct-hostname orders,
+cancel-mid-poll) from the harness's own backlog in #941.
+
+```sh
+KEEP_LOGS=1 ACME_INTEROP_RESULTS_DIR=/tmp/acme-evidence scripts/interop/run-acme-local-ca.sh a3
+```
+
+`KEEP_LOGS=1` keeps the per-run work directory (Pebble's extracted test
+tree, the gateway's own log, the fetched CA roots and served certificate
+chains). JSON and JUnit evidence (source SHA, Pebble image digest, Zig
+version, OS, per-case pass/fail) is always written to
+`ACME_INTEROP_RESULTS_DIR` (default `.zig-cache/acme-interop/`), independent
+of `KEEP_LOGS`.
+

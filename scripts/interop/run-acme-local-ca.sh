@@ -95,11 +95,13 @@ PY
 # currently up.
 a3_work=""
 a3_pebble_name=""
+a3_extract_name=""
 a3_tardi_pid=""
 a3_tap_pid=""
 cleanup() {
   [ -n "$a3_tardi_pid" ] && kill "$a3_tardi_pid" 2>/dev/null
   [ -n "$a3_tap_pid" ] && kill "$a3_tap_pid" 2>/dev/null
+  [ -n "$a3_extract_name" ] && docker rm -f "$a3_extract_name" >/dev/null 2>&1
   [ -n "$a3_pebble_name" ] && docker rm -f "$a3_pebble_name" >/dev/null 2>&1
   wait 2>/dev/null
   if [ -n "$a3_work" ]; then
@@ -225,8 +227,8 @@ run_a3() {
   # deliberately prepared artifact, so it skips the rebuild but is still
   # required to prove its own commit/acme-experimental provenance below.
   if [ -z "${TARDI_BIN:-}" ]; then
-    if ! (cd "$root" && zig build -Dacme-experimental) >"$work/build.log" 2>&1; then
-      bad "a3: prerequisites" "zig build -Dacme-experimental failed: $(tail -20 "$work/build.log")"
+    if ! (cd "$root" && with_timeout 180 zig build -Dacme-experimental) >"$work/build.log" 2>&1; then
+      bad "a3: prerequisites" "bounded experimental build failed or timed out: $(tail -20 "$work/build.log")"
       return
     fi
   fi
@@ -276,14 +278,20 @@ run_a3() {
   fi
 
   # --- stand up the independent CA as a separate process ------------------
+  # Named (not anonymous) and tracked in a3_extract_name *before* the
+  # `docker create` call returns, so the EXIT trap can remove it even if a
+  # signal arrives during creation or the subsequent `docker cp`, instead of
+  # leaking an orphaned extraction container on interruption.
   local extract_cid
-  extract_cid="$(docker create "$pebble_image" 2>"$work/pebble-pull.log")"
+  a3_extract_name="tardi-acme-extract-$$"
+  extract_cid="$(docker create --name "$a3_extract_name" "$pebble_image" 2>"$work/pebble-pull.log")"
   if [ -z "$extract_cid" ]; then
     bad "a3: pebble image" "docker create failed: $(cat "$work/pebble-pull.log")"
     return
   fi
   docker cp "$extract_cid:/test" "$work/pebble-root" >/dev/null 2>&1
-  docker rm "$extract_cid" >/dev/null 2>&1
+  docker rm -f "$a3_extract_name" >/dev/null 2>&1
+  a3_extract_name=""
   if [ ! -f "$work/pebble-root/config/pebble-config.json" ]; then
     bad "a3: pebble image" "could not extract test/config/pebble-config.json from $pebble_image"
     return
@@ -618,11 +626,27 @@ PY
   fi
 
   # --- restart recovery with the CA process stopped: no network needed ---
-  local fingerprint_before fingerprint_after
+  local fingerprint_before fingerprint_after fingerprint_before_h2 fingerprint_after_h2
   fingerprint_before="$(openssl x509 -in "$work/chain-h1-0.pem" -noout -fingerprint -sha256 2>/dev/null)"
+  chain_for "$h2" "chain-h2" >/dev/null 2>&1
+  fingerprint_before_h2="$(openssl x509 -in "$work/chain-h2-0.pem" -noout -fingerprint -sha256 2>/dev/null)"
   local old_tardi_pid="$a3_tardi_pid"
   kill "$old_tardi_pid" 2>/dev/null; wait "$old_tardi_pid" 2>/dev/null; a3_tardi_pid=""
-  docker stop "$pebble_name" >/dev/null 2>&1
+
+  # The offline-restart claim only means something if the CA is actually
+  # down: a failed or unconfirmed `docker stop` could leave Pebble reachable
+  # and have it unintentionally re-serve the old certificate, falsely
+  # passing a test that's supposed to prove recovery with no CA reachable.
+  if ! docker stop --time 5 "$pebble_name" >/dev/null 2>"$work/pebble-stop.err"; then
+    bad "a3: a restart recovers and serves the same committed certificate with the CA process stopped" \
+      "could not stop the independent CA container to prove the restart test is actually offline: $(cat "$work/pebble-stop.err")"
+    return
+  fi
+  if [ "$(docker inspect -f '{{.State.Running}}' "$pebble_name" 2>/dev/null)" != false ]; then
+    bad "a3: a restart recovers and serves the same committed certificate with the CA process stopped" \
+      "the independent CA container is not confirmed stopped; restart test would not prove offline recovery"
+    return
+  fi
 
   start_tardi
   if kill -0 "$old_tardi_pid" 2>/dev/null; then
@@ -634,6 +658,20 @@ PY
       ok "a3: a restart recovers and serves the same committed certificate with the CA process stopped"
     else
       bad "a3: a restart recovers and serves the same committed certificate with the CA process stopped" "fingerprint changed or was empty across restart"
+    fi
+
+    # A regression in startup rehydration could restore only the first SNI;
+    # independently confirm the second managed name also survives.
+    if ! wait_served "$h2" 15; then
+      bad "a3: a restart recovers and serves the second managed name's certificate with the CA process stopped" "$h2 not served after restart"
+    else
+      chain_for "$h2" "chain-h2-restart" >/dev/null 2>&1
+      fingerprint_after_h2="$(openssl x509 -in "$work/chain-h2-restart-0.pem" -noout -fingerprint -sha256 2>/dev/null)"
+      if [ -n "$fingerprint_before_h2" ] && [ "$fingerprint_before_h2" = "$fingerprint_after_h2" ]; then
+        ok "a3: a restart recovers and serves the second managed name's certificate with the CA process stopped"
+      else
+        bad "a3: a restart recovers and serves the second managed name's certificate with the CA process stopped" "fingerprint differs or is missing for $h2 across restart"
+      fi
     fi
   else
     bad "a3: a restart recovers and serves the same committed certificate with the CA process stopped" "gateway did not serve $h1 again after a restart with no CA reachable; $(tail -10 "$work/tardi.log" 2>/dev/null)"

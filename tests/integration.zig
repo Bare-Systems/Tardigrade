@@ -15026,6 +15026,15 @@ const tardigrade_test_alpns = [_]tls_core.algorithms.ProtocolName{.{ .bytes = "t
 // #939: an exclusive, single-protocol offer -- exactly the shape a real RFC
 // 8737 TLS-ALPN-01 validation client sends.
 const acme_tls_alpn_test_alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.acme_tls_1};
+/// Failure diagnostic: dump the tail of a Tardigrade process's error log so a
+/// CI-only listener stall shows what the server side was doing.
+fn dumpTardigradeLogTail(allocator: std.mem.Allocator, log_path: []const u8) void {
+    const bytes = compat.cwd().readFileAlloc(allocator, log_path, 1024 * 1024) catch return;
+    defer allocator.free(bytes);
+    const tail = if (bytes.len > 16 * 1024) bytes[bytes.len - 16 * 1024 ..] else bytes;
+    std.debug.print("---- tardigrade log tail ({s}) ----\n{s}\n---- end log ----\n", .{ log_path, tail });
+}
+
 /// Writes a minimal, well-formed TLS 1.3 ClientHello record (X25519 share,
 /// Ed25519 + ECDSA P-256 signature schemes, caller-chosen ALPN vector and SNI) to a real TCP
 /// socket and reports the content type of the first record the server sends
@@ -23929,6 +23938,7 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
         },
     });
     defer tardigrade.stop();
+    errdefer dumpTardigradeLogTail(allocator, tardigrade.log_path);
 
     // 1. Ordinary HTTPS on the exact same listener, same port, is unaffected
     //    by the ACME-ALPN wrapper (#939 requirement: never changes ordinary

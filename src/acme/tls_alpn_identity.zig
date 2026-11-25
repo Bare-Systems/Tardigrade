@@ -33,13 +33,21 @@
 //! * On success the caller owns the `ChallengeIdentity` and must call
 //!   `deinit` exactly once: it wipes the private key, frees
 //!   `certificate_der` with the allocator passed to `build`, and releases one
-//!   of `tls_alpn_challenges.max_live_identities` slots. The `Registry` MUST
-//!   outlive every identity built from it.
+//!   of `tls_alpn_challenges.max_live_identities` slots. The identity holds a
+//!   refcounted `IdentityGate`, not the registry, so `deinit` is safe even
+//!   after `Registry.deinit` (which closes the gate to new identities).
+//! * Authorization is linearized with cancellation: `confirmAndAcquire` runs
+//!   under the registry lock and checks the lease's activation generation, so
+//!   a lease whose activation was cancelled is refused even if an identical
+//!   activation was re-published; a build already admitted drains (#932).
 //! * `key.key.signingKey()` yields the `crypto.provider.SigningKey` handle the
 //!   native TLS 1.3 signer consumes (ecdsa_secp256r1_sha256); it borrows the
 //!   identity.
-//! * Entropy: `zig_compat.randomBytes` (OS CSPRNG) has no error path; key
-//!   generation redraws invalid scalars and fails with `KeyGenFailed`.
+//! * Entropy: the caller injects a fallible `crypto.provider.Entropy` (the
+//!   composition root passes the same OS source the native TLS provider
+//!   uses). Every draw -- key scalar, serial, signature noise -- propagates
+//!   `EntropyFailure`; invalid scalars are redrawn a bounded number of times
+//!   (`KeyGenFailed`). Partially filled buffers are wiped on failure.
 //! * Lifetime: validity is `[now, min(lease.expires_at, now + max_validity_s)]`
 //!   and can never exceed the authorized lifetime. The certificate is only
 //!   reachable through the returned value, never ordinary HTTPS lookup.
@@ -71,6 +79,8 @@ pub const Error = error{
     /// Lease binding differs from `expected_binding`, or the registry does not
     /// vouch for the lease (forged, cancelled, replaced).
     NotAuthorized,
+    /// The injected entropy source failed (key scalar, serial or noise draw).
+    EntropyFailure,
     /// The registry's authorization has expired at `now`.
     Expired,
     /// `max_live_identities` identities are already live.
@@ -79,9 +89,11 @@ pub const Error = error{
     SignFailed,
 };
 
-/// Structurally `account.AccountKey` (OS-entropy P-256 generation, scalar
-/// validation, wipe-on-`deinit`).
+/// Structurally `account.AccountKey` (scalar validation, wipe-on-`deinit`);
+/// generated here from the injected entropy, never via `AccountKey.generate`.
 pub const ChallengeKey = account_mod.AccountKey;
+const SigningKey = crypto.pure_zig.SoftwareEcdsaP256SigningKey;
+const max_keygen_attempts = 16;
 
 /// Same bound `acme_challenge_store` enforces for the HTTP-01 value.
 pub const max_key_authorization_len: usize = challenge_store_mod.max_key_authorization_len;
@@ -109,7 +121,7 @@ const GENERALIZED_TIME = Tag.universal(24, false);
 
 pub const ChallengeIdentity = struct {
     allocator: std.mem.Allocator,
-    registry: *challenges_mod.Registry,
+    gate: *challenges_mod.IdentityGate,
     /// DER X.509 leaf. Not secret -- it is what a validating client receives.
     certificate_der: []u8,
     /// Ephemeral signing key matching `certificate_der`'s public key.
@@ -119,13 +131,12 @@ pub const ChallengeIdentity = struct {
     pub fn deinit(self: *ChallengeIdentity) void {
         self.key.deinit();
         self.allocator.free(self.certificate_der);
-        self.registry.releaseIdentity();
+        self.gate.release();
     }
 };
 
 /// Test-only fault injection; production `build` always passes `.{}`.
 const Faults = struct {
-    fail_keygen: bool = false,
     fail_sign: bool = false,
 };
 
@@ -134,17 +145,19 @@ const Faults = struct {
 pub fn build(
     registry: *challenges_mod.Registry,
     allocator: std.mem.Allocator,
+    entropy: crypto.provider.Entropy,
     lease: challenges_mod.Lease,
     expected_host: []const u8,
     expected_binding: challenges_mod.Binding,
     now: i64,
 ) Error!ChallengeIdentity {
-    return buildWithFaults(registry, allocator, lease, expected_host, expected_binding, now, .{});
+    return buildWithFaults(registry, allocator, entropy, lease, expected_host, expected_binding, now, .{});
 }
 
 fn buildWithFaults(
     registry: *challenges_mod.Registry,
     allocator: std.mem.Allocator,
+    entropy: crypto.provider.Entropy,
     lease: challenges_mod.Lease,
     expected_host: []const u8,
     expected_binding: challenges_mod.Binding,
@@ -159,10 +172,13 @@ fn buildWithFaults(
     if (!isValidKeyAuthorization(owned_lease.material)) return error.InvalidKeyAuthorization;
     if (now < 0 or now >= max_unix_time - max_validity_s) return error.InvalidValidity;
     if (!std.mem.eql(u8, &owned_lease.binding, &expected_binding)) return error.NotAuthorized;
-    registry.confirm(&owned_lease, now) catch |err| return switch (err) {
+    const gate = registry.confirmAndAcquire(&owned_lease, now) catch |err| return switch (err) {
         error.NotAuthorized => error.NotAuthorized,
         error.Expired => error.Expired,
+        error.TooManyIdentities => error.TooManyIdentities,
+        error.OutOfMemory => error.OutOfMemory,
     };
+    errdefer gate.release();
 
     const not_after = @min(owned_lease.expires_at, now + max_validity_s);
     if (not_after <= now) return error.InvalidValidity;
@@ -170,20 +186,30 @@ fn buildWithFaults(
     var digest: [32]u8 = undefined;
     Sha256.hash(owned_lease.material, &digest, .{});
 
-    if (!registry.acquireIdentity()) return error.TooManyIdentities;
-    errdefer registry.releaseIdentity();
-
-    var key = (if (faults.fail_keygen) error.KeyGenFailed else ChallengeKey.generate()) catch return error.KeyGenFailed;
+    var key = try generateKey(entropy);
     errdefer key.deinit();
 
     var arena_inst = std.heap.ArenaAllocator.init(allocator);
     defer arena_inst.deinit();
-    const der = try buildCertificate(arena_inst.allocator(), &key, owned_lease.host, &digest, now, not_after, faults);
+    const der = try buildCertificate(arena_inst.allocator(), entropy, &key, owned_lease.host, &digest, now, not_after, faults);
     const owned_der = allocator.dupe(u8, der) catch return error.OutOfMemory;
 
-    const result: ChallengeIdentity = .{ .allocator = allocator, .registry = registry, .certificate_der = owned_der, .key = key };
+    const result: ChallengeIdentity = .{ .allocator = allocator, .gate = gate, .certificate_der = owned_der, .key = key };
     secrets.secureZero(&key.key.key_pair.secret_key.bytes); // wipe the frame-local copy
     return result;
+}
+
+/// Fresh P-256 key from the injected entropy; rejects out-of-range scalars
+/// by redrawing a bounded number of times.
+fn generateKey(entropy: crypto.provider.Entropy) Error!ChallengeKey {
+    var attempts: u8 = 0;
+    while (attempts < max_keygen_attempts) : (attempts += 1) {
+        var scalar: [32]u8 = undefined;
+        defer secrets.secureZero(&scalar);
+        entropy.fill(&scalar) catch return error.EntropyFailure;
+        if (SigningKey.fromScalarBytes(&scalar)) |key| return .{ .key = key } else |_| {}
+    }
+    return error.KeyGenFailed;
 }
 
 /// RFC 8555 S8.1 shape: `token "." thumbprint`, both base64url, thumbprint
@@ -199,7 +225,14 @@ fn isValidKeyAuthorization(value: []const u8) bool {
         if (idx == dot) continue;
         if (!isBase64UrlChar(c)) return false;
     }
-    return true;
+    // The thumbprint must be the canonical unpadded base64url of a 32-byte
+    // SHA-256 digest: 43 alphabet characters alone allow nonzero pad bits.
+    const codec = std.base64.url_safe_no_pad;
+    var raw: [32]u8 = undefined;
+    codec.Decoder.decode(&raw, thumbprint) catch return false;
+    var again: [account_mod.thumbprint_len]u8 = undefined;
+    _ = codec.Encoder.encode(&again, &raw);
+    return std.mem.eql(u8, &again, thumbprint);
 }
 
 fn isBase64UrlChar(c: u8) bool {
@@ -258,9 +291,9 @@ fn versionTlv(allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
 /// 16 random bytes with the top two bits forced to `01`: always positive
 /// (RFC 5280 S4.1.2.2), never zero, and minimally encoded (first byte
 /// 0x40..0x7f), at the cost of 2 of 128 bits of entropy.
-fn randomSerial() [16]u8 {
+fn randomSerial(entropy: crypto.provider.Entropy) Error![16]u8 {
     var raw: [16]u8 = undefined;
-    zig_compat.randomBytes(&raw);
+    entropy.fill(&raw) catch return error.EntropyFailure;
     raw[0] = (raw[0] & 0x3f) | 0x40;
     return raw;
 }
@@ -380,8 +413,8 @@ fn extensionsTlv(allocator: std.mem.Allocator, host: []const u8, digest: *const 
     return tlv(allocator, Tag.contextSpecific(3, true), &.{entries});
 }
 
-fn buildTbs(allocator: std.mem.Allocator, key: *const ChallengeKey, host: []const u8, digest: *const [32]u8, not_before: i64, not_after: i64) Error![]u8 {
-    const serial = randomSerial();
+fn buildTbs(allocator: std.mem.Allocator, entropy: crypto.provider.Entropy, key: *const ChallengeKey, host: []const u8, digest: *const [32]u8, not_before: i64, not_after: i64) Error![]u8 {
+    const serial = try randomSerial(entropy);
     const name = try challengeName(allocator);
     return tlv(allocator, SEQUENCE, &.{
         try versionTlv(allocator),
@@ -395,12 +428,12 @@ fn buildTbs(allocator: std.mem.Allocator, key: *const ChallengeKey, host: []cons
     });
 }
 
-fn buildCertificate(allocator: std.mem.Allocator, key: *const ChallengeKey, host: []const u8, digest: *const [32]u8, not_before: i64, not_after: i64, faults: Faults) Error![]u8 {
-    const tbs = try buildTbs(allocator, key, host, digest, not_before, not_after);
+fn buildCertificate(allocator: std.mem.Allocator, entropy: crypto.provider.Entropy, key: *const ChallengeKey, host: []const u8, digest: *const [32]u8, not_before: i64, not_after: i64, faults: Faults) Error![]u8 {
+    const tbs = try buildTbs(allocator, entropy, key, host, digest, not_before, not_after);
 
     var noise: [Ecdsa.noise_length]u8 = undefined;
     defer secrets.secureZero(&noise);
-    zig_compat.randomBytes(&noise);
+    entropy.fill(&noise) catch return error.EntropyFailure;
     if (faults.fail_sign) return error.SignFailed;
     const signature = key.key.key_pair.sign(tbs, noise) catch return error.SignFailed;
     // Defense in depth: never ship a certificate whose signature does not
@@ -428,8 +461,23 @@ const StdCertificate = std.crypto.Certificate;
 const binding_a: challenges_mod.Binding = [_]u8{0xAB} ** 32;
 const binding_b: challenges_mod.Binding = [_]u8{0xCD} ** 32;
 const valid_token = "a" ** 32;
-const valid_thumbprint = "b" ** account_mod.thumbprint_len;
+fn canonicalThumbprint(comptime fill: u8) [account_mod.thumbprint_len]u8 {
+    var out: [account_mod.thumbprint_len]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&out, &([_]u8{fill} ** 32));
+    return out;
+}
+const valid_thumbprint = canonicalThumbprint(0x42);
+const other_thumbprint = canonicalThumbprint(0x43);
 const valid_key_authorization = valid_token ++ "." ++ valid_thumbprint;
+const test_entropy: crypto.provider.Entropy = .{ .context = @constCast(&test_entropy_ctx), .fillFn = testFill };
+const test_entropy_ctx: u8 = 0;
+fn testFill(_: *anyopaque, buffer: []u8) crypto.provider.EntropyError!void {
+    zig_compat.randomBytes(buffer);
+}
+
+fn tbuild(registry: *challenges_mod.Registry, allocator: std.mem.Allocator, lease: challenges_mod.Lease, host: []const u8, binding: challenges_mod.Binding, now: i64) Error!ChallengeIdentity {
+    return build(registry, allocator, test_entropy, lease, host, binding, now);
+}
 const challenge_alpn = [_][]const u8{challenges_mod.protocol};
 
 /// A real lease: published into `registry` and fetched back via `lookup`.
@@ -443,7 +491,7 @@ fn forgedLease(allocator: std.mem.Allocator, host: []const u8, binding: challeng
     const owned_host = try allocator.dupe(u8, host);
     errdefer allocator.free(owned_host);
     const owned_material = try allocator.dupe(u8, material);
-    return .{ .allocator = allocator, .host = owned_host, .binding = binding, .material = owned_material, .expires_at = expires_at };
+    return .{ .allocator = allocator, .host = owned_host, .binding = binding, .material = owned_material, .expires_at = expires_at, .generation = 0 };
 }
 
 fn expectDigestExtensionBytes(der: []const u8, key_authorization: []const u8) !void {
@@ -507,7 +555,7 @@ test "ACME TLS-ALPN identity: independent decode of every acceptance property" {
     defer registry.deinit();
     const now: i64 = 1_800_000_000;
     const lease = try realLease(&registry, testing.allocator, "a.example.test", binding_a, valid_key_authorization, now, now + 100);
-    var identity = try build(&registry, testing.allocator, lease, "a.example.test", binding_a, now);
+    var identity = try tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, now);
     defer identity.deinit();
 
     try expectFullyValid(identity.certificate_der, "a.example.test", valid_key_authorization, now, now + 100);
@@ -527,19 +575,13 @@ test "ACME TLS-ALPN identity: native TLS signer handle signs under the certifica
     var registry = challenges_mod.Registry.init(testing.allocator);
     defer registry.deinit();
     const lease = try realLease(&registry, testing.allocator, "a.example.test", binding_a, valid_key_authorization, 1000, 1100);
-    var identity = try build(&registry, testing.allocator, lease, "a.example.test", binding_a, 1000);
+    var identity = try tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, 1000);
     defer identity.deinit();
 
     const handle = identity.key.key.signingKey();
     try testing.expectEqual(crypto.provider.SignatureScheme.ecdsa_secp256r1_sha256, handle.scheme());
-    var entropy_ctx: u8 = 0;
-    const entropy: crypto.provider.Entropy = .{ .context = &entropy_ctx, .fillFn = struct {
-        fn fill(_: *anyopaque, buffer: []u8) crypto.provider.EntropyError!void {
-            zig_compat.randomBytes(buffer);
-        }
-    }.fill };
     var out: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
-    const n = try handle.sign("CertificateVerify transcript", entropy, &out);
+    const n = try handle.sign("CertificateVerify transcript", test_entropy, &out);
     var cert = try pki.x509.Certificate.parse(testing.allocator, identity.certificate_der, pki.x509.default_limits);
     defer cert.deinit(testing.allocator);
     var sec1: [65]u8 = undefined;
@@ -550,7 +592,7 @@ test "ACME TLS-ALPN identity: native TLS signer handle signs under the certifica
 test "ACME TLS-ALPN identity: hostname, order and key authorization each bind independently" {
     var registry = challenges_mod.Registry.init(testing.allocator);
     defer registry.deinit();
-    const other_ka = valid_token ++ "." ++ ("c" ** account_mod.thumbprint_len);
+    const other_ka = valid_token ++ "." ++ other_thumbprint;
     const cases = [_]struct { host: []const u8, ka: []const u8, binding: challenges_mod.Binding }{
         .{ .host = "a.example.test", .ka = valid_key_authorization, .binding = binding_a },
         .{ .host = "b.example.test", .ka = valid_key_authorization, .binding = binding_a },
@@ -559,7 +601,7 @@ test "ACME TLS-ALPN identity: hostname, order and key authorization each bind in
     var keys: [cases.len][65]u8 = undefined;
     for (cases, 0..) |c, idx| {
         const lease = try realLease(&registry, testing.allocator, c.host, c.binding, c.ka, 1_800_000_000, 1_800_000_500);
-        var identity = try build(&registry, testing.allocator, lease, c.host, c.binding, 1_800_000_000);
+        var identity = try tbuild(&registry, testing.allocator, lease, c.host, c.binding, 1_800_000_000);
         defer identity.deinit();
         try expectFullyValid(identity.certificate_der, c.host, c.ka, 1_800_000_000, 1_800_000_500);
         keys[idx] = identity.key.key.key_pair.public_key.toUncompressedSec1();
@@ -582,50 +624,50 @@ test "ACME TLS-ALPN identity: unauthorized leases are rejected, wiped, and leave
     {
         const lease = try forgedLease(allocator, "b.example.test", binding_a, valid_key_authorization, now + 100);
         detector.watch(lease.material);
-        try testing.expectError(error.NotAuthorized, build(&registry, testing.allocator, lease, "b.example.test", binding_a, now));
+        try testing.expectError(error.NotAuthorized, tbuild(&registry, testing.allocator, lease, "b.example.test", binding_a, now));
     }
     // forged: right host, wrong binding / wrong material / wrong expiry
     {
         const lease = try forgedLease(allocator, "a.example.test", binding_b, valid_key_authorization, now + 100);
         detector.watch(lease.material);
-        try testing.expectError(error.NotAuthorized, build(&registry, testing.allocator, lease, "a.example.test", binding_b, now));
+        try testing.expectError(error.NotAuthorized, tbuild(&registry, testing.allocator, lease, "a.example.test", binding_b, now));
     }
     {
-        const lease = try forgedLease(allocator, "a.example.test", binding_a, valid_token ++ "." ++ ("c" ** account_mod.thumbprint_len), now + 100);
+        const lease = try forgedLease(allocator, "a.example.test", binding_a, valid_token ++ "." ++ other_thumbprint, now + 100);
         detector.watch(lease.material);
-        try testing.expectError(error.NotAuthorized, build(&registry, testing.allocator, lease, "a.example.test", binding_a, now));
+        try testing.expectError(error.NotAuthorized, tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, now));
     }
     {
         const lease = try forgedLease(allocator, "a.example.test", binding_a, valid_key_authorization, now + 101);
         detector.watch(lease.material);
-        try testing.expectError(error.NotAuthorized, build(&registry, testing.allocator, lease, "a.example.test", binding_a, now));
+        try testing.expectError(error.NotAuthorized, tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, now));
     }
     // caller's expected host / binding must match the (genuine) lease
     {
         const lease = (try registry.lookup(allocator, now, "a.example.test", &challenge_alpn)).?;
         detector.watch(lease.material);
-        try testing.expectError(error.InvalidHost, build(&registry, testing.allocator, lease, "b.example.test", binding_a, now));
+        try testing.expectError(error.InvalidHost, tbuild(&registry, testing.allocator, lease, "b.example.test", binding_a, now));
     }
     {
         const lease = (try registry.lookup(allocator, now, "a.example.test", &challenge_alpn)).?;
         detector.watch(lease.material);
-        try testing.expectError(error.NotAuthorized, build(&registry, testing.allocator, lease, "a.example.test", binding_b, now));
+        try testing.expectError(error.NotAuthorized, tbuild(&registry, testing.allocator, lease, "a.example.test", binding_b, now));
     }
     // cancelled after lookup: the lease survives but is no longer authorization
     {
         const lease = (try registry.lookup(allocator, now, "a.example.test", &challenge_alpn)).?;
         detector.watch(lease.material);
         try testing.expectEqual(.closed, registry.remove("a.example.test", binding_a));
-        try testing.expectError(error.NotAuthorized, build(&registry, testing.allocator, lease, "a.example.test", binding_a, now));
+        try testing.expectError(error.NotAuthorized, tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, now));
     }
     // expired after lookup
     {
         const lease = try realLease(&registry, allocator, "a.example.test", binding_a, valid_key_authorization, now, now + 50);
         detector.watch(lease.material);
-        try testing.expectError(error.NotAuthorized, build(&registry, testing.allocator, lease, "a.example.test", binding_a, now + 50));
+        try testing.expectError(error.Expired, tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, now + 50));
     }
     try testing.expect(detector.allWatchedWiped());
-    try testing.expectEqual(@as(u32, 0), registry.live_identities.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), registry.liveIdentities());
 }
 
 test "ACME TLS-ALPN identity: invalid hosts and key authorizations are rejected and wiped" {
@@ -637,12 +679,12 @@ test "ACME TLS-ALPN identity: invalid hosts and key authorizations are rejected 
     const bad_hosts = [_][]const u8{ "", "A.example.test", "*.example.test", "a.example.test.", "xn--.example.test", "a b.example.test", "-a.example.test", "a" ** 64 ++ ".example.test", "127.0.0.1", ("a." ** 130) ++ "test" };
     for (bad_hosts) |host| {
         const lease = try forgedLease(testing.allocator, host, binding_a, valid_key_authorization, 100);
-        try testing.expectError(error.InvalidHost, build(&registry, testing.allocator, lease, host, binding_a, 0));
+        try testing.expectError(error.InvalidHost, tbuild(&registry, testing.allocator, lease, host, binding_a, 0));
     }
     // One watched lease: host rejection wipes the material too.
     const bad_lease = try forgedLease(allocator, "A.example.test", binding_a, valid_key_authorization, 100);
     detector.watch(bad_lease.material);
-    try testing.expectError(error.InvalidHost, build(&registry, testing.allocator, bad_lease, "A.example.test", binding_a, 0));
+    try testing.expectError(error.InvalidHost, tbuild(&registry, testing.allocator, bad_lease, "A.example.test", binding_a, 0));
     try testing.expect(detector.allWatchedWiped());
     var detector2 = crypto.secrets.CredentialWipeDetector.init(testing.allocator);
     const allocator2 = detector2.allocator();
@@ -659,9 +701,23 @@ test "ACME TLS-ALPN identity: invalid hosts and key authorizations are rejected 
     for (bad_key_authorizations) |bad| {
         const lease = try forgedLease(allocator2, "a.example.test", binding_a, bad, 100);
         if (bad.len != 0) detector2.watch(lease.material); // nothing to wipe in an empty buffer
-        try testing.expectError(error.InvalidKeyAuthorization, build(&registry, testing.allocator, lease, "a.example.test", binding_a, 0));
+        try testing.expectError(error.InvalidKeyAuthorization, tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, 0));
     }
     try testing.expect(detector2.allWatchedWiped());
+
+    // Alphabet-valid, 43-char thumbprints whose final character carries nonzero
+    // pad bits are REGISTERED (the registry accepts any material) and must be
+    // refused by syntax alone.
+    for ([_][]const u8{ "b", "B", "-", "_", "1" }) |last| {
+        var bad: [valid_token.len + 1 + account_mod.thumbprint_len]u8 = undefined;
+        @memcpy(bad[0..valid_key_authorization.len], valid_key_authorization);
+        bad[bad.len - 1] = last[0];
+        try testing.expect(!isValidKeyAuthorization(&bad));
+        const lease = try realLease(&registry, testing.allocator, "a.example.test", binding_a, &bad, 0, 100);
+        try testing.expectError(error.InvalidKeyAuthorization, tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, 0));
+        _ = registry.remove("a.example.test", binding_a);
+    }
+    try testing.expect(isValidKeyAuthorization(valid_key_authorization));
 }
 
 test "ACME TLS-ALPN identity: timestamp boundaries and ASN.1 time encoding" {
@@ -682,56 +738,148 @@ test "ACME TLS-ALPN identity: timestamp boundaries and ASN.1 time encoding" {
     // Unrepresentable `now` values are rejected before touching the registry.
     for ([_]i64{ -1, std.math.minInt(i64), std.math.maxInt(i64), max_unix_time, max_unix_time - max_validity_s }) |bad_now| {
         const lease = try forgedLease(testing.allocator, "a.example.test", binding_a, valid_key_authorization, std.math.maxInt(i64));
-        try testing.expectError(error.InvalidValidity, build(&registry, testing.allocator, lease, "a.example.test", binding_a, bad_now));
+        try testing.expectError(error.InvalidValidity, tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, bad_now));
     }
 
     // Across the 2049/2050 boundary: notBefore is UTCTime, notAfter GeneralizedTime,
     // and an independent parser agrees on both instants.
     const now = generalized_time_from - 5;
     const lease = try realLease(&registry, testing.allocator, "a.example.test", binding_a, valid_key_authorization, now, now + 100);
-    var identity = try build(&registry, testing.allocator, lease, "a.example.test", binding_a, now);
+    var identity = try tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, now);
     defer identity.deinit();
     try expectFullyValid(identity.certificate_der, "a.example.test", valid_key_authorization, now, now + 100);
     try testing.expect(std.mem.indexOf(u8, identity.certificate_der, "\x17\x0d491231235955Z\x18\x0f20500101000135Z") != null);
 
-    // Validity is capped at max_validity_s even for a distant (clamped) lease expiry.
-    const capped_lease = try forgedLease(testing.allocator, "b.example.test", binding_a, valid_key_authorization, std.math.maxInt(i64));
-    try testing.expectError(error.NotAuthorized, build(&registry, testing.allocator, capped_lease, "b.example.test", binding_a, 10));
+    // A far-future requested expiry is clamped to 600s by the registry, and an
+    // identity built later in the window is capped by the remaining lease life.
+    const far = try realLease(&registry, testing.allocator, "b.example.test", binding_a, valid_key_authorization, 1_800_000_000, std.math.maxInt(i64));
+    var capped = try tbuild(&registry, testing.allocator, far, "b.example.test", binding_a, 1_800_000_100);
+    defer capped.deinit();
+    try expectFullyValid(capped.certificate_der, "b.example.test", valid_key_authorization, 1_800_000_100, 1_800_000_000 + max_validity_s);
 }
 
 test "ACME TLS-ALPN identity: live identities are bounded and slots are returned" {
     var registry = challenges_mod.Registry.init(testing.allocator);
     defer registry.deinit();
-    var held: u32 = 0;
-    while (held < challenges_mod.max_live_identities) : (held += 1) try testing.expect(registry.acquireIdentity());
-    try testing.expect(!registry.acquireIdentity());
+    var identities: [challenges_mod.max_live_identities]ChallengeIdentity = undefined;
+    var host_buf: [challenges_mod.max_live_identities][24]u8 = undefined;
+    for (&identities, 0..) |*slot, idx| {
+        const host = try std.fmt.bufPrint(&host_buf[idx], "h{d}.example.test", .{idx});
+        const lease = try realLease(&registry, testing.allocator, host, binding_a, valid_key_authorization, 0, 100);
+        slot.* = try tbuild(&registry, testing.allocator, lease, host, binding_a, 0);
+    }
+    try testing.expectEqual(challenges_mod.max_live_identities, registry.liveIdentities());
 
-    const lease = try realLease(&registry, testing.allocator, "a.example.test", binding_a, valid_key_authorization, 0, 100);
-    try testing.expectError(error.TooManyIdentities, build(&registry, testing.allocator, lease, "a.example.test", binding_a, 0));
-    registry.releaseIdentity();
-    const lease2 = (try registry.lookup(testing.allocator, 0, "a.example.test", &challenge_alpn)).?;
-    var identity = try build(&registry, testing.allocator, lease2, "a.example.test", binding_a, 0);
-    try testing.expect(!registry.acquireIdentity());
-    identity.deinit();
-    try testing.expect(registry.acquireIdentity());
-    registry.releaseIdentity();
-    while (held > 1) : (held -= 1) registry.releaseIdentity();
-    try testing.expectEqual(@as(u32, 0), registry.live_identities.load(.monotonic));
+    var detector = crypto.secrets.CredentialWipeDetector.init(testing.allocator);
+    const allocator = detector.allocator();
+    _ = registry.remove("h0.example.test", binding_a);
+    const over = try realLease(&registry, allocator, "h0.example.test", binding_a, valid_key_authorization, 0, 100);
+    detector.watch(over.material);
+    try testing.expectError(error.TooManyIdentities, tbuild(&registry, testing.allocator, over, "h0.example.test", binding_a, 0));
+    try testing.expect(detector.allWatchedWiped());
+
+    identities[0].deinit();
+    const again = (try registry.lookup(testing.allocator, 0, "h0.example.test", &challenge_alpn)).?;
+    var replacement = try tbuild(&registry, testing.allocator, again, "h0.example.test", binding_a, 0);
+    replacement.deinit();
+    for (identities[1..]) |*identity| identity.deinit();
+    try testing.expectEqual(@as(u32, 0), registry.liveIdentities());
 }
 
-test "ACME TLS-ALPN identity: key-generation and signing failures wipe the lease and release the slot" {
+/// Entropy that fails on the `fail_at`-th draw, optionally after writing part
+/// of the buffer.
+const FlakyEntropy = struct {
+    calls: usize = 0,
+    fail_at: usize,
+    partial: bool,
+
+    fn entropy(self: *FlakyEntropy) crypto.provider.Entropy {
+        return .{ .context = self, .fillFn = fill };
+    }
+
+    fn fill(context: *anyopaque, buffer: []u8) crypto.provider.EntropyError!void {
+        const self: *FlakyEntropy = @ptrCast(@alignCast(context));
+        defer self.calls += 1;
+        if (self.calls == self.fail_at) {
+            if (self.partial) zig_compat.randomBytes(buffer[0 .. buffer.len / 2]);
+            return error.EntropyFailure;
+        }
+        zig_compat.randomBytes(buffer);
+    }
+};
+
+test "ACME TLS-ALPN identity: entropy failure on every draw yields no identity, wiped lease, released slot" {
     var detector = crypto.secrets.CredentialWipeDetector.init(testing.allocator);
     const allocator = detector.allocator();
     var registry = challenges_mod.Registry.init(testing.allocator);
     defer registry.deinit();
-    for ([_]Faults{ .{ .fail_keygen = true }, .{ .fail_sign = true } }, [_]anyerror{ error.KeyGenFailed, error.SignFailed }) |faults, expected| {
-        const lease = try realLease(&registry, allocator, "a.example.test", binding_a, valid_key_authorization, 0, 100);
-        detector.watch(lease.material);
-        try testing.expectError(expected, buildWithFaults(&registry, testing.allocator, lease, "a.example.test", binding_a, 0, faults));
-        try testing.expectEqual(@as(u32, 0), registry.live_identities.load(.monotonic));
-        _ = registry.remove("a.example.test", binding_a);
+    // Draws: 0 = key scalar, 1 = serial, 2 = signature noise.
+    var failures: usize = 0;
+    for ([_]bool{ false, true }) |partial| {
+        for (0..3) |fail_at| {
+            var flaky: FlakyEntropy = .{ .fail_at = fail_at, .partial = partial };
+            const lease = try realLease(&registry, allocator, "a.example.test", binding_a, valid_key_authorization, 0, 100);
+            detector.watch(lease.material);
+            try testing.expectError(error.EntropyFailure, build(&registry, testing.allocator, flaky.entropy(), lease, "a.example.test", binding_a, 0));
+            try testing.expectEqual(fail_at + 1, flaky.calls);
+            try testing.expectEqual(@as(u32, 0), registry.liveIdentities());
+            _ = registry.remove("a.example.test", binding_a);
+            failures += 1;
+            if (failures % 6 == 0) {
+                try testing.expect(detector.allWatchedWiped());
+                detector = crypto.secrets.CredentialWipeDetector.init(testing.allocator);
+            }
+        }
     }
+    // No draw fails: three draws are all a successful build needs.
+    var ok: FlakyEntropy = .{ .fail_at = 99, .partial = false };
+    const lease = try realLease(&registry, testing.allocator, "a.example.test", binding_a, valid_key_authorization, 0, 100);
+    var identity = try build(&registry, testing.allocator, ok.entropy(), lease, "a.example.test", binding_a, 0);
+    identity.deinit();
+    try testing.expectEqual(@as(usize, 3), ok.calls);
+}
+
+test "ACME TLS-ALPN identity: signing failure wipes the lease, key slot and releases capacity" {
+    var detector = crypto.secrets.CredentialWipeDetector.init(testing.allocator);
+    const allocator = detector.allocator();
+    var registry = challenges_mod.Registry.init(testing.allocator);
+    defer registry.deinit();
+    const lease = try realLease(&registry, allocator, "a.example.test", binding_a, valid_key_authorization, 0, 100);
+    detector.watch(lease.material);
+    try testing.expectError(error.SignFailed, buildWithFaults(&registry, testing.allocator, test_entropy, lease, "a.example.test", binding_a, 0, .{ .fail_sign = true }));
+    try testing.expectEqual(@as(u32, 0), registry.liveIdentities());
     try testing.expect(detector.allWatchedWiped());
+}
+
+test "ACME TLS-ALPN identity: a cancelled activation cannot be resurrected by an identical re-publish (ABA)" {
+    const t0: i64 = 1_800_000_000;
+    var registry = challenges_mod.Registry.init(testing.allocator);
+    defer registry.deinit();
+    const lease = try realLease(&registry, testing.allocator, "a.example.test", binding_a, valid_key_authorization, t0, t0 + 100);
+    try testing.expectEqual(.closed, registry.remove("a.example.test", binding_a));
+    try registry.put(t0 + 1, "a.example.test", binding_a, valid_key_authorization, t0 + 100);
+    try testing.expectError(error.NotAuthorized, tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, t0 + 1));
+
+    // The fresh activation's own lease is accepted; a build admitted BEFORE a
+    // later cancellation drains and stays usable.
+    const fresh = (try registry.lookup(testing.allocator, t0 + 1, "a.example.test", &challenge_alpn)).?;
+    var identity = try tbuild(&registry, testing.allocator, fresh, "a.example.test", binding_a, t0 + 1);
+    try testing.expectEqual(.closed, registry.remove("a.example.test", binding_a));
+    try expectFullyValid(identity.certificate_der, "a.example.test", valid_key_authorization, t0 + 1, t0 + 100);
+    identity.deinit();
+    try testing.expectEqual(@as(u32, 0), registry.liveIdentities());
+}
+
+test "ACME TLS-ALPN identity: an identity outlives registry shutdown and still releases safely" {
+    const t0: i64 = 1_800_000_000;
+    var registry = challenges_mod.Registry.init(testing.allocator);
+    const lease = try realLease(&registry, testing.allocator, "a.example.test", binding_a, valid_key_authorization, t0, t0 + 100);
+    var identity = try tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, t0);
+    const key_bytes = &identity.key.key.key_pair.secret_key.bytes;
+    registry.deinit(); // teardown with a live identity: closes the gate, no dangling pointer
+    try expectFullyValid(identity.certificate_der, "a.example.test", valid_key_authorization, t0, t0 + 100);
+    identity.deinit(); // frees the gate (testing.allocator verifies no leak)
+    for (key_bytes) |b| try testing.expectEqual(@as(u8, 0), b);
 }
 
 test "ACME TLS-ALPN identity: deinit wipes the key; the consumed lease is wiped on success" {
@@ -742,7 +890,7 @@ test "ACME TLS-ALPN identity: deinit wipes the key; the consumed lease is wiped 
     const lease = try realLease(&registry, allocator, "a.example.test", binding_a, valid_key_authorization, 0, 100);
     detector.watch(lease.material);
 
-    var identity = try build(&registry, allocator, lease, "a.example.test", binding_a, 0);
+    var identity = try tbuild(&registry, allocator, lease, "a.example.test", binding_a, 0);
     // Lease material is already wiped while the identity is still live.
     try testing.expect(detector.allWatchedWiped());
     var nonzero: u8 = 0;
@@ -759,13 +907,13 @@ test "ACME TLS-ALPN identity: no leaks or double frees under allocation failure"
             var registry = challenges_mod.Registry.init(allocator);
             defer registry.deinit();
             const lease = try realLease(&registry, allocator, "a.example.test", binding_a, valid_key_authorization, 0, 100);
-            var identity = try build(&registry, allocator, lease, "a.example.test", binding_a, 0);
+            var identity = try tbuild(&registry, allocator, lease, "a.example.test", binding_a, 0);
             identity.deinit();
         }
     }.run, .{});
 }
 
-test "ACME TLS-ALPN identity: DER length encoding boundaries round-trip" {
+test "ACME TLS-ALPN identity: DER length encoding boundaries round-trip and malformed lengths are rejected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     for ([_]usize{ 0, 1, 127, 128, 255, 256, 65535, 65536 }) |len| {
@@ -775,20 +923,55 @@ test "ACME TLS-ALPN identity: DER length encoding boundaries round-trip" {
         var reader = pki.der.Reader.init(encoded, .{ .max_element_len = 1 << 20 });
         try testing.expectEqualSlices(u8, content, try reader.readOctetString());
         try reader.expectEnd();
+        if (len > 0) { // truncated body
+            var short = pki.der.Reader.init(encoded[0 .. encoded.len - 1], .{ .max_element_len = 1 << 20 });
+            try testing.expectError(error.LengthBeyondInput, short.readOctetString());
+        }
     }
+    // Overlong (length claims more than present) and non-minimal length forms.
+    var overlong = pki.der.Reader.init(&[_]u8{ 0x04, 0x82, 0x01, 0x00, 0x00 }, .{});
+    try testing.expectError(error.LengthBeyondInput, overlong.readOctetString());
+    var non_minimal = pki.der.Reader.init(&[_]u8{ 0x04, 0x81, 0x01, 0x00 }, .{});
+    try testing.expect(std.meta.isError(non_minimal.readOctetString()));
+    // encodeLength itself refuses a too-small output buffer rather than overflow.
+    var tiny: [1]u8 = undefined;
+    try testing.expect(std.meta.isError(pki.der.encodeLength(300, &tiny)));
+}
+
+test "ACME TLS-ALPN identity: maximum-length hostname crosses DER length transitions" {
+    var registry = challenges_mod.Registry.init(testing.allocator);
+    defer registry.deinit();
+    const l63 = "a" ** 63;
+    const host = l63 ++ "." ++ l63 ++ "." ++ l63 ++ "." ++ ("a" ** 61);
+    try testing.expectEqual(@as(usize, 253), host.len);
+    const lease = try realLease(&registry, testing.allocator, host, binding_a, valid_key_authorization, 1_800_000_000, 1_800_000_100);
+    var identity = try tbuild(&registry, testing.allocator, lease, host, binding_a, 1_800_000_000);
+    defer identity.deinit();
+    try expectFullyValid(identity.certificate_der, host, valid_key_authorization, 1_800_000_000, 1_800_000_100);
+    try testing.expect(identity.certificate_der.len < 1024);
 }
 
 fn fuzzIdentity(_: void, smith: *testing.Smith) !void {
     var buf: [512]u8 = undefined;
     const len = smith.slice(&buf);
+    const material = buf[0..len];
     var registry = challenges_mod.Registry.init(testing.allocator);
     defer registry.deinit();
-    const lease = forgedLease(testing.allocator, "a.example.test", binding_a, buf[0..len], 100) catch return;
-    var identity = build(&registry, testing.allocator, lease, "a.example.test", binding_a, 0) catch return;
-    identity.deinit();
+    registry.put(1_800_000_000, "a.example.test", binding_a, material, 1_800_000_100) catch return;
+    const lease = (try registry.lookup(testing.allocator, 1_800_000_000, "a.example.test", &challenge_alpn)).?;
+    if (tbuild(&registry, testing.allocator, lease, "a.example.test", binding_a, 1_800_000_000)) |built| {
+        var identity = built;
+        defer identity.deinit();
+        try testing.expect(isValidKeyAuthorization(material));
+        try expectFullyValid(identity.certificate_der, "a.example.test", material, 1_800_000_000, 1_800_000_100);
+    } else |err| {
+        try testing.expectEqual(error.InvalidKeyAuthorization, err);
+        try testing.expect(!isValidKeyAuthorization(material));
+    }
+    try testing.expectEqual(@as(u32, 0), registry.liveIdentities());
 }
 
-test "fuzz: ACME TLS-ALPN identity construction is bounded for arbitrary key-authorization bytes" {
+test "fuzz: ACME TLS-ALPN identity construction constructs-and-verifies valid input and rejects the rest" {
     try testing.fuzz({}, fuzzIdentity, .{ .corpus = &.{
         "",
         valid_key_authorization,

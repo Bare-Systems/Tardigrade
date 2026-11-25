@@ -11702,6 +11702,7 @@ test "#939: a pinned server credential is released on bad Finished and stalled t
         var client = tls_backend.Tls13Backend.initClient(clientEntropy(), client_provider_storage.init(client_provider_seed), .{ .pinned_certificate = tls_backend.testdata.certificate_der }, .record);
         defer client.deinit();
         var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), server_provider_storage.init(server_provider_seed), provider.provider(), .record);
+        errdefer server.deinit();
         var client_sink = DirectSink{};
         defer client_sink.deinit();
         var server_sink = DirectSink{};
@@ -11715,6 +11716,9 @@ test "#939: a pinned server credential is released on bad Finished and stalled t
             @memcpy(malformed[0..flight.len], flight);
             malformed[flight.len - 1] ^= 0xff;
             try std.testing.expectError(error.DecryptError, deliverClientFlightToServer(&server, &server_sink, malformed[0..flight.len], false));
+            // Terminal handshake failure must release the pin immediately;
+            // deinit below is only the idempotent fallback, not the release.
+            try std.testing.expectEqual(@as(usize, 1), provider.release_count);
         }
         server.deinit();
         try std.testing.expectEqual(@as(usize, 1), provider.release_count);

@@ -600,24 +600,25 @@ pub fn build(b: *std.Build) void {
         const missing_acme_experimental = b.addFail("test-integration-acme-smoke requires -Dacme-experimental -Dacme-tls-alpn-test-hook; its target cases otherwise skip or cannot activate the test-only TLS-ALPN challenge");
         integration_acme_smoke_step.dependOn(&missing_acme_experimental.step);
     } else {
-        // Same zero-match guard as `test-integration-smoke` above, for a
-        // rename/removal of the named case once -Dacme-experimental is set.
-        const integration_acme_smoke_probe = b.addTest(.{
-            .root_module = integration_mod,
-            .filters = integration_acme_smoke_filters,
-            .test_runner = .{
-                .path = b.path("scripts/count_named_exe_test_matches.zig"),
-                .mode = .simple,
-            },
-        });
-        const run_integration_acme_smoke_probe = b.addRunArtifact(integration_acme_smoke_probe);
+        // Guard every curated case independently.  An aggregate probe could
+        // still pass when one of the two filters was renamed or removed.
+        for (integration_acme_smoke_filters) |filter_name| {
+            const probe = b.addTest(.{
+                .root_module = integration_mod,
+                .filters = &.{filter_name},
+                .test_runner = .{
+                    .path = b.path("scripts/count_named_exe_test_matches.zig"),
+                    .mode = .simple,
+                },
+            });
+            integration_acme_smoke_step.dependOn(&b.addRunArtifact(probe).step);
+        }
         const integration_acme_smoke_tests = b.addTest(.{
             .root_module = integration_mod,
             .filters = integration_acme_smoke_filters,
         });
         const run_integration_acme_smoke_tests = b.addRunArtifact(integration_acme_smoke_tests);
         run_integration_acme_smoke_tests.step.dependOn(b.getInstallStep());
-        integration_acme_smoke_step.dependOn(&run_integration_acme_smoke_probe.step);
         integration_acme_smoke_step.dependOn(&run_integration_acme_smoke_tests.step);
     }
 

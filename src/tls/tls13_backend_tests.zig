@@ -11656,6 +11656,71 @@ test "#939: a real ClientHello's complete offered ALPN list reaches credential s
     try std.testing.expectEqualStrings("acme-tls/1", offered[1]);
 }
 
+// The ACME provider opts into this lifecycle for its registry lease.  Keep the
+// engine test independent of ACME certificate construction, but pause a real
+// two-sided TLS exchange at precisely the boundary which used to release the
+// lease too early: after the server flight and before peer Finished.
+test "#939: a pinned server credential drains only after success, failure, or teardown" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_provider_storage: ProviderStorage = .{};
+    var provider = credentials.MockCredentialProvider.init(fixtureIdentity());
+    provider.pin_until_handshake_complete = true;
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(), client_provider_storage.init(client_provider_seed),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der }, .record,
+    );
+    defer client.deinit();
+    var server = tls_backend.Tls13Backend.initServerWithProvider(
+        serverEntropy(), server_provider_storage.init(server_provider_seed), provider.provider(), .record,
+    );
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+    // The server already emitted CertificateVerify and Finished, but its
+    // selected credential must remain live while this peer can still stall.
+    try std.testing.expectEqual(@as(usize, 0), provider.release_count);
+
+    var flight_buf: [8192]u8 = undefined;
+    const flight = collectHandshakeCrypto(&client_sink, &flight_buf);
+    try deliverClientFlightToServer(&server, &server_sink, flight, false);
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.complete, server.core.handshake_lifecycle);
+    try std.testing.expectEqual(@as(usize, 1), provider.release_count);
+    // Repeated teardown is idempotent.
+    server.deinit();
+    try std.testing.expectEqual(@as(usize, 1), provider.release_count);
+}
+
+test "#939: a pinned server credential is released on bad Finished and stalled teardown" {
+    inline for ([_]bool{ true, false }) |bad_finished| {
+        var client_provider_storage: ProviderStorage = .{};
+        var server_provider_storage: ProviderStorage = .{};
+        var provider = credentials.MockCredentialProvider.init(fixtureIdentity());
+        provider.pin_until_handshake_complete = true;
+        var client = tls_backend.Tls13Backend.initClient(clientEntropy(), client_provider_storage.init(client_provider_seed), .{ .pinned_certificate = tls_backend.testdata.certificate_der }, .record);
+        defer client.deinit();
+        var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), server_provider_storage.init(server_provider_seed), provider.provider(), .record);
+        var client_sink = DirectSink{};
+        defer client_sink.deinit();
+        var server_sink = DirectSink{};
+        defer server_sink.deinit();
+        try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+        try std.testing.expectEqual(@as(usize, 0), provider.release_count);
+        if (bad_finished) {
+            var flight_buf: [8192]u8 = undefined;
+            const flight = collectHandshakeCrypto(&client_sink, &flight_buf);
+            var malformed: [8192]u8 = undefined;
+            @memcpy(malformed[0..flight.len], flight);
+            malformed[flight.len - 1] ^= 0xff;
+            try std.testing.expectError(error.DecryptError, deliverClientFlightToServer(&server, &server_sink, malformed[0..flight.len], false));
+        }
+        server.deinit();
+        try std.testing.expectEqual(@as(usize, 1), provider.release_count);
+    }
+}
+
 /// Caller-owned storage (#490 second review pass) — see the matching
 /// comment on `serverWithProvider`.
 fn serverRequestingClientAuth(storage: *ProviderStorage, mode: tls_backend.ClientAuthMode, verifier: credentials.PeerVerifier) tls_backend.Tls13Backend {

@@ -1058,6 +1058,9 @@ pub const MockCredentialProvider = struct {
     select_count: usize = 0,
     sign_count: usize = 0,
     release_count: usize = 0,
+    /// Test-only opt-in for a selected handle whose owner needs to remain
+    /// alive until the peer Finished, rather than merely through signing.
+    pin_until_handshake_complete: bool = false,
     /// The last SNI selection saw, copied into mock-owned storage — the
     /// `SelectionContext.server_name` slice is only valid during `select`, so a
     /// mock that wants to remember it MUST NOT retain the borrowed slice.
@@ -1104,7 +1107,7 @@ pub const MockCredentialProvider = struct {
     }
 
     pub fn selectedCredential(self: *MockCredentialProvider) SelectedCredential {
-        return .{ .handle = self, .scheme = self.selectedScheme(), .vtable = &credential_vtable };
+        return .{ .handle = self, .scheme = self.selectedScheme(), .vtable = &credential_vtable, .pin_until_handshake_complete = self.pin_until_handshake_complete };
     }
 
     fn selectedScheme(self: *const MockCredentialProvider) SignatureScheme {

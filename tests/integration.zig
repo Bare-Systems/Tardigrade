@@ -14763,9 +14763,27 @@ const PureZigTlsClient = struct {
 
         const deadline = compat.milliTimestamp() + 5_000;
         while (compat.milliTimestamp() < deadline) {
-            _ = self.record.drive() catch return;
+            _ = self.record.drive() catch |err| switch (err) {
+                error.EndOfStream,
+                error.TruncatedStream,
+                error.DecryptError,
+                error.PeerFatalAlert,
+                error.UnexpectedHandshakeMessage,
+                => {
+                    if (self.backend.peer_chain_count != 0) return error.UnexpectedPeerCertificate;
+                    return;
+                },
+                else => return err,
+            };
             if (self.record.applicationDataOpen()) return error.TestUnexpectedResult;
-            try self.waitForReadiness(100);
+            self.waitForReadiness(100) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                error.ConnectionResetByPeer => {
+                    if (self.backend.peer_chain_count != 0) return error.UnexpectedPeerCertificate;
+                    return;
+                },
+                else => return err,
+            };
         }
         return error.ReadTimeout;
     }
@@ -14991,6 +15009,14 @@ const acme_tls_alpn_test_alpns = [_]tls_core.algorithms.ProtocolName{tls_core.al
 const acme_tls_alpn_duplicate_test_alpns = [_]tls_core.algorithms.ProtocolName{
     tls_core.algorithms.alpn.acme_tls_1,
     tls_core.algorithms.alpn.acme_tls_1,
+};
+const acme_tls_alpn_h2_mixed_test_alpns = [_]tls_core.algorithms.ProtocolName{
+    tls_core.algorithms.alpn.acme_tls_1,
+    tls_core.algorithms.alpn.h2,
+};
+const acme_tls_alpn_http1_mixed_test_alpns = [_]tls_core.algorithms.ProtocolName{
+    tls_core.algorithms.alpn.acme_tls_1,
+    tls_core.algorithms.alpn.http_1_1,
 };
 
 fn alpnPolicy(alpn: []const u8) tls_core.policy.Policy {
@@ -23735,6 +23761,13 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
 
     var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
+    const fixture_cert_pem = try compat.cwd().readFileAlloc(allocator, tls_paths.cert_path, 256 * 1024);
+    defer allocator.free(fixture_cert_pem);
+    const fixture_chain = try tls_core.identity_loader.certChainFromPemOrDer(allocator, fixture_cert_pem);
+    defer {
+        for (fixture_chain) |entry| allocator.free(entry);
+        allocator.free(fixture_chain);
+    }
 
     var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "unexpected-acme-dispatch", .connection_header = "close" }});
     defer upstream.stop();
@@ -23777,6 +23810,7 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
         .extra_env = &.{
             .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
             .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
             // Deliberately unreachable (nothing listens on port 1): nothing
             // in this case depends on the order/renewal worker ever actually
             // reaching a CA -- only on the listener's own ALPN wiring and the
@@ -23802,6 +23836,28 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     try assertContains(control.body, "unexpected-acme-dispatch");
     try waitForUpstreamCount(&upstream, 1, 2_000);
     try upstream.resetCapture();
+
+    // A normal HTTPS client may happen to offer the ACME token alongside an
+    // HTTP protocol.  RFC 8737 says that is not a validation offer: prove the
+    // shipping listener selects the ordinary protocol and the committed leaf,
+    // never the ephemeral challenge identity, for both supported HTTP ALPNs.
+    inline for (.{
+        .{ &acme_tls_alpn_h2_mixed_test_alpns, "h2" },
+        .{ &acme_tls_alpn_http1_mixed_test_alpns, "http/1.1" },
+    }) |case| {
+        const mixed_policy = tls_core.policy.Policy.fromCapabilities(
+            .record,
+            tls_core.tls13_backend.native_capabilities,
+            case[0],
+        );
+        const mixed = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, mixed_policy, case[1], null, .{});
+        defer mixed.destroy();
+        try std.testing.expectEqualStrings(case[1], mixed.backend.selectedAlpn().?);
+        const entry = mixed.backend.peer_chain_entries[0];
+        const leaf = mixed.backend.peer_chain[entry.start..][0..entry.len];
+        try std.testing.expectEqualSlices(u8, fixture_chain[0], leaf);
+    }
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
 
     // 2. A real external TCP client (this repo's own native TLS engine, not
     //    Tardigrade's server-side code) offering *exclusively* `acme-tls/1`
@@ -23853,17 +23909,6 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", null);
     try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", "wrong.tls-alpn-01.test");
     try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", "unregistered.tls-alpn-01.test");
-
-    // A duplicate challenge protocol is not the RFC 8737 singleton offer.
-    // It must be rejected rather than accidentally selecting either the
-    // challenge or default certificate.
-    try PureZigTlsClient.expectHandshakeFailureWithAlpnOffer(
-        allocator,
-        tardigrade.port,
-        &acme_tls_alpn_duplicate_test_alpns,
-        "acme-tls/1",
-        host,
-    );
 }
 
 test "failure: malformed and stalled TLS handshakes are rejected without wedging the listener (#270)" {

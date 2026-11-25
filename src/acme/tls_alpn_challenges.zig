@@ -271,6 +271,22 @@ pub const Registry = struct {
         return .closed;
     }
 
+    /// Binding-scoped order completion seam.  The order owner calls this once
+    /// a TLS-ALPN-01 authorization reaches a terminal valid state; it removes
+    /// only the exact authorization it admitted, never a replacement that
+    /// reused the hostname.  Already-admitted handshake identities keep their
+    /// independent gate lease and drain normally.
+    pub fn complete(self: *Registry, host: []const u8, binding: Binding) CloseOutcome {
+        return self.remove(host, binding);
+    }
+
+    /// Binding-scoped order revocation seam.  Cancellation, expiry handling,
+    /// and replacement use the same linearized primitive as completion so a
+    /// stale worker cannot tear down a newer authorization for the hostname.
+    pub fn revoke(self: *Registry, host: []const u8, binding: Binding) CloseOutcome {
+        return self.remove(host, binding);
+    }
+
     pub fn expire(self: *Registry, now: i64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -368,14 +384,14 @@ test "TLS-ALPN registry rejects conflicting, malformed, and excessive challenges
     try testing.expectError(error.StoreFull, registry.put(0, "overflow.example.test", binding_a, "value", 1));
 }
 
-test "TLS-ALPN registry cancellation is scoped to the owning binding" {
+test "TLS-ALPN registry completion and revocation are scoped to the owning binding" {
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
     const challenge_alpn = [_][]const u8{protocol};
 
     // A mismatched binding cannot cancel an active challenge.
     try registry.put(0, "a.example.test", binding_a, "first", 600);
-    try testing.expectEqual(.not_found, registry.remove("a.example.test", binding_b));
+    try testing.expectEqual(.not_found, registry.revoke("a.example.test", binding_b));
     {
         var lease = (try registry.lookup(testing.allocator, 1, "a.example.test", &challenge_alpn)).?;
         defer lease.deinit();
@@ -383,12 +399,12 @@ test "TLS-ALPN registry cancellation is scoped to the owning binding" {
         try testing.expectEqualStrings("first", lease.material);
     }
 
-    // The owning binding cancels it.
-    try testing.expectEqual(.closed, registry.remove("a.example.test", binding_a));
+    // The owning binding completes it.
+    try testing.expectEqual(.closed, registry.complete("a.example.test", binding_a));
 
-    // Stale cancellation from the retired order cannot retire its replacement.
+    // Stale revocation from the retired order cannot retire its replacement.
     try registry.put(0, "a.example.test", binding_b, "second", 600);
-    try testing.expectEqual(.not_found, registry.remove("a.example.test", binding_a));
+    try testing.expectEqual(.not_found, registry.revoke("a.example.test", binding_a));
     var lease = (try registry.lookup(testing.allocator, 1, "a.example.test", &challenge_alpn)).?;
     defer lease.deinit();
     try testing.expectEqual(binding_b, lease.binding);

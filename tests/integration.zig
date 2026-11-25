@@ -14831,12 +14831,21 @@ const PureZigTlsClient = struct {
         };
     }
 
+    /// A single poll slice with no data is not a failure: the caller's own
+    /// overall deadline decides when the handshake has genuinely stalled.
+    fn waitForReadinessOrRetry(self: *PureZigTlsClient, slice_ms: u64) !void {
+        self.waitForReadiness(slice_ms) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return err,
+        };
+    }
+
     fn driveUntilOpen(self: *PureZigTlsClient, timeout_ms: u64) !void {
         const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
         while (compat.milliTimestamp() < deadline) {
             const driven = try self.record.drive();
             if (self.record.applicationDataOpen()) return;
-            if (!driven.made_progress) try self.waitForReadiness(100);
+            if (!driven.made_progress) try self.waitForReadinessOrRetry(100);
         }
         return error.ReadTimeout;
     }
@@ -14847,7 +14856,7 @@ const PureZigTlsClient = struct {
             const driven = try self.record.drive();
             if (self.backend.earlyDataAttempted() and self.record.stream().readiness().can_write_plaintext) return;
             if (self.record.applicationDataOpen()) return error.EarlyDataNotAttempted;
-            if (!driven.made_progress) try self.waitForReadiness(100);
+            if (!driven.made_progress) try self.waitForReadinessOrRetry(100);
         }
         return error.ReadTimeout;
     }

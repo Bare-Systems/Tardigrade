@@ -18,9 +18,11 @@
 //!
 //! A `Registry.Lease` is a plain value and proves nothing by itself: it can
 //! be forged, and by design it outlives `remove`/expiry. `build` therefore
-//! requires the owning `*Registry` and calls `Registry.confirm`, which
-//! succeeds only if a live (unexpired, uncancelled) slot exists for the same
-//! host with identical order/account `binding`, material and expiry. The
+//! requires the owning `*Registry` and calls `Registry.confirmAndAcquire`,
+//! which succeeds only if a live (unexpired, uncancelled) slot exists for the
+//! same host with the lease's exact activation id (process-wide unique, so
+//! neither re-publication nor registry reload can revive it) and identical
+//! order/account `binding`, material and expiry. The
 //! caller additionally passes the `expected_host` (the SNI it looked the
 //! lease up with) and `expected_binding` (the order it is serving); both must
 //! match the lease byte-for-byte. No separate registry exists.
@@ -35,7 +37,9 @@
 //!   `certificate_der` with the allocator passed to `build`, and releases one
 //!   of `tls_alpn_challenges.max_live_identities` slots. The identity holds a
 //!   refcounted `IdentityGate`, not the registry, so `deinit` is safe even
-//!   after `Registry.deinit` (which closes the gate to new identities).
+//!   after `Registry.deinit` (which closes the gate to new identities). The
+//!   gate is allocated from the registry's allocator, which must therefore
+//!   outlive the LAST identity, not merely the registry.
 //! * Authorization is linearized with cancellation: `confirmAndAcquire` runs
 //!   under the registry lock and checks the lease's activation generation, so
 //!   a lease whose activation was cancelled is refused even if an identical
@@ -982,4 +986,59 @@ test "fuzz: ACME TLS-ALPN identity construction constructs-and-verifies valid in
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "ACME TLS-ALPN identity: activation ids are unique across registries, reload and reused storage" {
+    const t0: i64 = 1_800_000_000;
+    var registry_a = challenges_mod.Registry.init(testing.allocator);
+    const stale = try realLease(&registry_a, testing.allocator, "a.example.test", binding_a, valid_key_authorization, t0, t0 + 100);
+    registry_a.deinit();
+
+    // Reload into the same stack storage and publish the identical tuple first.
+    registry_a = challenges_mod.Registry.init(testing.allocator);
+    defer registry_a.deinit();
+    const fresh = try realLease(&registry_a, testing.allocator, "a.example.test", binding_a, valid_key_authorization, t0, t0 + 100);
+    try testing.expect(stale.generation != fresh.generation);
+    try testing.expectError(error.NotAuthorized, tbuild(&registry_a, testing.allocator, stale, "a.example.test", binding_a, t0));
+
+    // A concurrently live second registry with the identical tuple also rejects it.
+    var registry_b = challenges_mod.Registry.init(testing.allocator);
+    defer registry_b.deinit();
+    const other = try realLease(&registry_b, testing.allocator, "a.example.test", binding_a, valid_key_authorization, t0, t0 + 100);
+    try testing.expect(other.generation != fresh.generation);
+    var cross = try forgedLease(testing.allocator, "a.example.test", binding_a, valid_key_authorization, t0 + 100);
+    cross.generation = fresh.generation;
+    try testing.expectError(error.NotAuthorized, tbuild(&registry_b, testing.allocator, cross, "a.example.test", binding_a, t0));
+
+    var ok_a = try tbuild(&registry_a, testing.allocator, fresh, "a.example.test", binding_a, t0);
+    ok_a.deinit();
+    var ok_b = try tbuild(&registry_b, testing.allocator, other, "a.example.test", binding_a, t0);
+    ok_b.deinit();
+}
+
+fn gateHammer(registry: *challenges_mod.Registry, lease: *const challenges_mod.Lease, t0: i64) void {
+    for (0..5000) |_| {
+        const gate = registry.confirmAndAcquire(lease, t0) catch continue;
+        gate.release();
+    }
+}
+
+test "ACME TLS-ALPN identity: concurrent acquire/release never loses capacity" {
+    const t0: i64 = 1_800_000_000;
+    var registry = challenges_mod.Registry.init(testing.allocator);
+    defer registry.deinit();
+    var lease = try realLease(&registry, testing.allocator, "a.example.test", binding_a, valid_key_authorization, t0, t0 + 100);
+    defer lease.deinit();
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, gateHammer, .{ &registry, &lease, t0 });
+    for (threads) |thread| thread.join();
+    try testing.expectEqual(@as(u32, 0), registry.liveIdentities());
+
+    // Full capacity is still available afterwards (and exactly that much).
+    var gates: [challenges_mod.max_live_identities]*challenges_mod.IdentityGate = undefined;
+    for (&gates) |*gate| gate.* = try registry.confirmAndAcquire(&lease, t0);
+    try testing.expectError(error.TooManyIdentities, registry.confirmAndAcquire(&lease, t0));
+    for (gates) |gate| gate.release();
+    try testing.expectEqual(@as(u32, 0), registry.liveIdentities());
 }

@@ -50,9 +50,10 @@ pub const Lease = struct {
     binding: Binding,
     material: []u8,
     expires_at: i64,
-    /// Registry-assigned activation id (unique, never reused, assigned under
-    /// the registry lock). A lease only confirms against the exact activation
-    /// it was looked up from, so remove + identical re-put cannot resurrect it.
+    /// Process-wide unique activation id (see `next_activation`). A lease only
+    /// confirms against the exact activation it was looked up from, so
+    /// remove + identical re-put, or reload into a new `Registry`, cannot
+    /// resurrect it.
     generation: u64,
 
     pub fn deinit(self: *Lease) void {
@@ -70,9 +71,24 @@ const Slot = struct {
     generation: u64,
 };
 
+/// Non-wrapping, process-wide activation-id source. Global (not per
+/// `Registry`) so ids stay unique across registry reload/reinit and across
+/// concurrently live registries; never reused for the process lifetime.
+var next_activation: std.atomic.Value(u64) = .init(1);
+
+fn allocateActivation() error{StoreFull}!u64 {
+    var current = next_activation.load(.monotonic);
+    while (true) {
+        const next = std.math.add(u64, current, 1) catch return error.StoreFull;
+        current = next_activation.cmpxchgWeak(current, next, .monotonic, .monotonic) orelse return current;
+    }
+}
+
 /// Refcounted, separately allocated identity-capacity accounting (#938). The
 /// registry holds one reference and every live `ChallengeIdentity` holds one,
 /// so an identity can be deinitialized safely even after `Registry.deinit`.
+/// The gate is allocated from the registry's allocator, which therefore must
+/// outlive the LAST identity, not merely the registry.
 pub const IdentityGate = struct {
     allocator: std.mem.Allocator,
     refs: std.atomic.Value(u32) = .init(1), // the registry's reference
@@ -82,9 +98,12 @@ pub const IdentityGate = struct {
     /// Caller holds the registry mutex (which also orders `closed`).
     fn tryAcquire(self: *IdentityGate) bool {
         if (self.closed.load(.acquire)) return false;
-        const live = self.live.load(.monotonic);
-        if (live >= max_live_identities) return false;
-        self.live.store(live + 1, .monotonic);
+        // Acquisitions are serialized by the registry mutex, but `release`
+        // is lock-free and may run concurrently: it can only DECREASE
+        // `live`, so after this check an atomic RMW add stays <= max and
+        // cannot lose a concurrent release (a plain store could).
+        if (self.live.load(.acquire) >= max_live_identities) return false;
+        _ = self.live.fetchAdd(1, .acq_rel);
         _ = self.refs.fetchAdd(1, .monotonic);
         return true;
     }
@@ -107,7 +126,6 @@ pub const Registry = struct {
     allocator: std.mem.Allocator,
     mutex: compat.Mutex = .{},
     slots: std.ArrayList(Slot) = .empty,
-    next_generation: u64 = 1,
     gate: ?*IdentityGate = null,
 
     pub fn init(allocator: std.mem.Allocator) Registry {
@@ -152,8 +170,7 @@ pub const Registry = struct {
         if (self.findIndex(host) != null) return error.DuplicateHost;
         if (self.slots.items.len >= max_entries) return error.StoreFull;
 
-        const generation = self.next_generation;
-        const next_generation = std.math.add(u64, generation, 1) catch return error.StoreFull;
+        const generation = try allocateActivation();
         const owned_host = try self.allocator.dupe(u8, host);
         errdefer self.allocator.free(owned_host);
         const owned_material = try self.allocator.dupe(u8, material);
@@ -165,7 +182,6 @@ pub const Registry = struct {
             .expires_at = effective_expiry,
             .generation = generation,
         });
-        self.next_generation = next_generation;
     }
 
     /// Returns an independent, owned lease only for a ClientHello that offers

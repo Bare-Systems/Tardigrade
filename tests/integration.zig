@@ -14637,11 +14637,16 @@ const PureZigTlsClient = struct {
     }
 
     fn expectHandshakeFailureWithAlpnOffer(allocator: std.mem.Allocator, port: u16, offered: []const tls_core.algorithms.ProtocolName, expected: []const u8, server_name: ?[]const u8) !void {
-        const self = try allocator.create(PureZigTlsClient);
-        // From here onward `destroy` owns both the allocation and the socket.
+        // Connect before allocating so a failed connect leaks nothing; once the
+        // client exists `destroy` owns both the allocation and the socket.
         // Keep one cleanup owner: a failed handshake is the expected outcome
         // for this helper, and a second errdefer would double-free it.
-        self.* = .{ .allocator = allocator, .stream = try compat.tcpConnectToHost(allocator, test_host, port) };
+        var stream = try compat.tcpConnectToHost(allocator, test_host, port);
+        const self = allocator.create(PureZigTlsClient) catch |err| {
+            stream.close();
+            return err;
+        };
+        self.* = .{ .allocator = allocator, .stream = stream };
         defer self.destroy();
         try setNonBlockingFd(self.stream.handle);
         self.crypto_provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
@@ -23825,6 +23830,8 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     const host = "a.tls-alpn-01.test";
     const challenge_value = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ host, key_authorization });
     defer allocator.free(challenge_value);
+    const sni_certs = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ host, tls_paths.cert_path, tls_paths.key_path });
+    defer allocator.free(sni_certs);
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
         .config_text = config_text,
@@ -23846,6 +23853,10 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
             .{ .name = "TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", .value = "src/pki/testdata/ecdsa_p256_ca.crt" },
             .{ .name = "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", .value = http01_listen },
             .{ .name = "TARDIGRADE_ACME_TEST_TLS_ALPN_CHALLENGE", .value = challenge_value },
+            // An explicit ordinary SNI mapping for the challenge host (same
+            // committed fixture identity) so ordinary offers naming it are
+            // served the committed leaf; production SNI policy is untouched.
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
         },
     });
     defer tardigrade.stop();
@@ -23875,7 +23886,7 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
             tls_core.tls13_backend.native_capabilities,
             case[0],
         );
-        const mixed = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, mixed_policy, case[1], null, .{});
+        const mixed = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, mixed_policy, case[1], host, .{});
         defer mixed.destroy();
         try std.testing.expectEqualStrings(case[1], mixed.backend.selectedAlpn().?);
         const entry = mixed.backend.peer_chain_entries[0];
@@ -23884,24 +23895,34 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     }
     try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
 
-    // The same mixed offers carrying the seeded challenge SNI must never be
-    // handed the ephemeral challenge identity.  The ordinary credential has no
-    // identity for that host, so the listener rejects before any certificate.
-    inline for (.{
-        .{ &acme_tls_alpn_h2_mixed_test_alpns, "h2" },
-        .{ &h2_acme_tls_alpn_mixed_test_alpns, "h2" },
-        .{ &acme_tls_alpn_http1_mixed_test_alpns, "http/1.1" },
-        .{ &http1_acme_tls_alpn_mixed_test_alpns, "http/1.1" },
-    }) |case| {
-        try PureZigTlsClient.expectHandshakeFailureWithAlpnOffer(allocator, tardigrade.port, case[0], case[1], host);
-    }
-
     // 2. A real external TCP client (this repo's own native TLS engine, not
     //    Tardigrade's server-side code) offering *exclusively* `acme-tls/1`
     //    for the seeded host completes a full TLS 1.3 handshake through the
     //    actual shipping listener and SNI/credential-selection path.
     const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "acme-tls/1", host);
     defer client.destroy();
+
+    // The challenge handshake is still pinned (client Finished not yet
+    // flushed).  Ordinary traffic overlapping it must keep its committed
+    // identity: a mixed-offer handshake naming the challenge host and a plain
+    // HTTP/1.1 request.
+    {
+        const overlap_policy = tls_core.policy.Policy.fromCapabilities(
+            .record,
+            tls_core.tls13_backend.native_capabilities,
+            &h2_acme_tls_alpn_mixed_test_alpns,
+        );
+        const overlap = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, overlap_policy, "h2", host, .{});
+        defer overlap.destroy();
+        const overlap_entry = overlap.backend.peer_chain_entries[0];
+        try std.testing.expectEqualSlices(u8, fixture_chain[0], overlap.backend.peer_chain[overlap_entry.start..][0..overlap_entry.len]);
+        var overlap_http = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
+        defer overlap_http.deinit();
+        try std.testing.expectEqual(@as(u16, 200), overlap_http.status_code);
+        try waitForUpstreamCount(&upstream, 1, 2_000);
+        try upstream.resetCapture();
+    }
+
     // `applicationDataOpen` is reached after the client constructs Finished;
     // drive once more to flush it so the server can verify it and take its
     // terminal challenge-close path.

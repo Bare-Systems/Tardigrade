@@ -14633,6 +14633,42 @@ const PureZigTlsClient = struct {
     }
 
     fn createWithOptions(allocator: std.mem.Allocator, port: u16, alpn: []const u8, server_name: ?[]const u8, options: Options) !*PureZigTlsClient {
+        return createWithPolicy(allocator, port, alpnPolicy(alpn), alpn, server_name, options);
+    }
+
+    fn expectHandshakeFailureWithAlpnOffer(allocator: std.mem.Allocator, port: u16, offered: []const tls_core.algorithms.ProtocolName, expected: []const u8, server_name: ?[]const u8) !void {
+        const self = try allocator.create(PureZigTlsClient);
+        // From here onward `destroy` owns both the allocation and the socket.
+        // Keep one cleanup owner: a failed handshake is the expected outcome
+        // for this helper, and a second errdefer would double-free it.
+        self.* = .{ .allocator = allocator, .stream = try compat.tcpConnectToHost(allocator, test_host, port) };
+        defer self.destroy();
+        try setNonBlockingFd(self.stream.handle);
+        self.crypto_provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
+        const policy = tls_core.policy.Policy.fromCapabilities(.record, tls_core.tls13_backend.native_capabilities, offered);
+        self.backend = tls_core.tls13_backend.Tls13Backend.initClientConfigured(
+            try tls_core.production_crypto.freshHandshakeEntropy(),
+            self.cryptoProviderState().cryptoProvider(),
+            .insecure_no_verification,
+            tls_core.tls13_backend.recordConfig(policy),
+            .{ .server_name = server_name },
+        );
+        self.record = try tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(allocator, .client, self.cryptoProviderState().cryptoProvider(), .tls_aes_128_gcm_sha256, self.carrier(), self.backend.backend());
+        self.record.allow_unverified_certificate = true;
+        try self.record.setExpectedAlpn(expected);
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            _ = self.record.drive() catch return;
+            if (self.record.applicationDataOpen()) return error.TestUnexpectedResult;
+            self.waitForReadiness(100) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return,
+            };
+        }
+        return error.ReadTimeout;
+    }
+
+    fn createWithPolicy(allocator: std.mem.Allocator, port: u16, policy: tls_core.policy.Policy, expected_alpn: []const u8, server_name: ?[]const u8, options: Options) !*PureZigTlsClient {
         const self = try allocator.create(PureZigTlsClient);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -14647,7 +14683,7 @@ const PureZigTlsClient = struct {
             try tls_core.production_crypto.freshHandshakeEntropy(),
             self.cryptoProviderState().cryptoProvider(),
             .insecure_no_verification,
-            tls_core.tls13_backend.recordConfig(alpnPolicy(alpn)),
+            tls_core.tls13_backend.recordConfig(policy),
             .{ .server_name = server_name },
         );
         if (options.ticket_consumer != null or options.psk_lease != null or options.psk_offers != null) {
@@ -14683,7 +14719,7 @@ const PureZigTlsClient = struct {
             self.backend.backend(),
         );
         self.record.allow_unverified_certificate = true;
-        try self.record.setExpectedAlpn(alpn);
+        try self.record.setExpectedAlpn(expected_alpn);
         if (options.return_after_early_data_ready) {
             try self.driveUntilEarlyDataReady(5_000);
             return self;
@@ -14952,6 +14988,10 @@ const tardigrade_test_alpns = [_]tls_core.algorithms.ProtocolName{.{ .bytes = "t
 // #939: an exclusive, single-protocol offer -- exactly the shape a real RFC
 // 8737 TLS-ALPN-01 validation client sends.
 const acme_tls_alpn_test_alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.acme_tls_1};
+const acme_tls_alpn_duplicate_test_alpns = [_]tls_core.algorithms.ProtocolName{
+    tls_core.algorithms.alpn.acme_tls_1,
+    tls_core.algorithms.alpn.acme_tls_1,
+};
 
 fn alpnPolicy(alpn: []const u8) tls_core.policy.Policy {
     if (std.mem.eql(u8, alpn, "h2")) return tls_core.policy.Policy.recordH2Only();
@@ -23804,6 +23844,26 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     try client.expectTransportClose(1_000);
     compat.sleepNs(100 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    // 4. The exclusive protocol is a commitment, not a way to obtain a
+    // default certificate.  Exercise the actual TCP listener for no SNI,
+    // wrong SNI, and an unregistered name; each must fail before HTTP
+    // dispatch.  This deliberately uses the same ClientHello shape as the
+    // successful validation above.
+    try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", null);
+    try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", "wrong.tls-alpn-01.test");
+    try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", "unregistered.tls-alpn-01.test");
+
+    // A duplicate challenge protocol is not the RFC 8737 singleton offer.
+    // It must be rejected rather than accidentally selecting either the
+    // challenge or default certificate.
+    try PureZigTlsClient.expectHandshakeFailureWithAlpnOffer(
+        allocator,
+        tardigrade.port,
+        &acme_tls_alpn_duplicate_test_alpns,
+        "acme-tls/1",
+        host,
+    );
 }
 
 test "failure: malformed and stalled TLS handshakes are rejected without wedging the listener (#270)" {

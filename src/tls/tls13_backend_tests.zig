@@ -11666,12 +11666,17 @@ test "#939: a pinned server credential drains only after success, failure, or te
     var provider = credentials.MockCredentialProvider.init(fixtureIdentity());
     provider.pin_until_handshake_complete = true;
     var client = tls_backend.Tls13Backend.initClient(
-        clientEntropy(), client_provider_storage.init(client_provider_seed),
-        .{ .pinned_certificate = tls_backend.testdata.certificate_der }, .record,
+        clientEntropy(),
+        client_provider_storage.init(client_provider_seed),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
     );
     defer client.deinit();
     var server = tls_backend.Tls13Backend.initServerWithProvider(
-        serverEntropy(), server_provider_storage.init(server_provider_seed), provider.provider(), .record,
+        serverEntropy(),
+        server_provider_storage.init(server_provider_seed),
+        provider.provider(),
+        .record,
     );
     var client_sink = DirectSink{};
     defer client_sink.deinit();

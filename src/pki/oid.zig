@@ -172,6 +172,9 @@ pub const well_known = struct {
     /// RFC 6960 §4.2.2.2.1: a responder certificate that need not itself be
     /// revocation-checked.
     pub const ocsp_no_check = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 48, 1, 5 };
+    /// RFC 8737 §3: `id-pe-acmeIdentifier`, the critical TLS-ALPN-01
+    /// validation-certificate extension carrying SHA-256(keyAuthorization).
+    pub const acme_identifier = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 1, 31 };
 
     // Certificate-policy qualifiers.
     pub const policy_qualifier_cps = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 2, 1 };

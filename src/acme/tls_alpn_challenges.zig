@@ -34,6 +34,14 @@ pub const LookupError = error{OutOfMemory};
 
 pub const CloseOutcome = enum { closed, not_found };
 
+/// Why `Registry.confirmAndAcquire` refused to vouch for a `Lease`.
+pub const ConfirmAcquireError = error{ NotAuthorized, Expired, TooManyIdentities, OutOfMemory };
+
+/// Upper bound on simultaneously live challenge identities (#938). Each
+/// `Registry` slot can have at most one in-flight identity at a time under
+/// normal operation; this is the hard memory bound regardless.
+pub const max_live_identities: u32 = max_entries;
+
 /// An owned, immutable handshake selection. `material` is challenge-private
 /// and must be deinitialized after the handshake consumes it.
 pub const Lease = struct {
@@ -42,6 +50,11 @@ pub const Lease = struct {
     binding: Binding,
     material: []u8,
     expires_at: i64,
+    /// Process-wide unique activation id (see `next_activation`). A lease only
+    /// confirms against the exact activation it was looked up from, so
+    /// remove + identical re-put, or reload into a new `Registry`, cannot
+    /// resurrect it.
+    generation: u64,
 
     pub fn deinit(self: *Lease) void {
         self.allocator.free(self.host);
@@ -55,6 +68,55 @@ const Slot = struct {
     binding: Binding,
     material: []u8,
     expires_at: i64,
+    generation: u64,
+};
+
+/// Non-wrapping, process-wide activation-id source. Global (not per
+/// `Registry`) so ids stay unique across registry reload/reinit and across
+/// concurrently live registries; never reused for the process lifetime.
+var next_activation: std.atomic.Value(u64) = .init(1);
+
+fn allocateActivation() error{StoreFull}!u64 {
+    var current = next_activation.load(.monotonic);
+    while (true) {
+        const next = std.math.add(u64, current, 1) catch return error.StoreFull;
+        current = next_activation.cmpxchgWeak(current, next, .monotonic, .monotonic) orelse return current;
+    }
+}
+
+/// Refcounted, separately allocated identity-capacity accounting (#938). The
+/// registry holds one reference and every live `ChallengeIdentity` holds one,
+/// so an identity can be deinitialized safely even after `Registry.deinit`.
+/// The gate is allocated from the registry's allocator, which therefore must
+/// outlive the LAST identity, not merely the registry.
+pub const IdentityGate = struct {
+    allocator: std.mem.Allocator,
+    refs: std.atomic.Value(u32) = .init(1), // the registry's reference
+    live: std.atomic.Value(u32) = .init(0),
+    closed: std.atomic.Value(bool) = .init(false),
+
+    /// Caller holds the registry mutex (which also orders `closed`).
+    fn tryAcquire(self: *IdentityGate) bool {
+        if (self.closed.load(.acquire)) return false;
+        // Acquisitions are serialized by the registry mutex, but `release`
+        // is lock-free and may run concurrently: it can only DECREASE
+        // `live`, so after this check an atomic RMW add stays <= max and
+        // cannot lose a concurrent release (a plain store could).
+        if (self.live.load(.acquire) >= max_live_identities) return false;
+        _ = self.live.fetchAdd(1, .acq_rel);
+        _ = self.refs.fetchAdd(1, .monotonic);
+        return true;
+    }
+
+    /// Returns one identity's capacity and its reference.
+    pub fn release(self: *IdentityGate) void {
+        _ = self.live.fetchSub(1, .acq_rel);
+        self.unref();
+    }
+
+    fn unref(self: *IdentityGate) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) self.allocator.destroy(self);
+    }
 };
 
 /// Fixed-capacity registry of live TLS-ALPN-01 authorizations. It accepts
@@ -64,6 +126,7 @@ pub const Registry = struct {
     allocator: std.mem.Allocator,
     mutex: compat.Mutex = .{},
     slots: std.ArrayList(Slot) = .empty,
+    gate: ?*IdentityGate = null,
 
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{ .allocator = allocator };
@@ -74,6 +137,13 @@ pub const Registry = struct {
         defer self.mutex.unlock();
         for (self.slots.items) |*slot| self.freeSlot(slot);
         self.slots.deinit(self.allocator);
+        // Refuse new identities; outstanding ones keep the gate alive and
+        // release into it safely after this returns.
+        if (self.gate) |gate| {
+            gate.closed.store(true, .release);
+            gate.unref();
+            self.gate = null;
+        }
     }
 
     /// Activates one authorization. A host may have only one live challenge;
@@ -100,6 +170,7 @@ pub const Registry = struct {
         if (self.findIndex(host) != null) return error.DuplicateHost;
         if (self.slots.items.len >= max_entries) return error.StoreFull;
 
+        const generation = try allocateActivation();
         const owned_host = try self.allocator.dupe(u8, host);
         errdefer self.allocator.free(owned_host);
         const owned_material = try self.allocator.dupe(u8, material);
@@ -109,6 +180,7 @@ pub const Registry = struct {
             .binding = binding,
             .material = owned_material,
             .expires_at = effective_expiry,
+            .generation = generation,
         });
     }
 
@@ -141,7 +213,45 @@ pub const Registry = struct {
             .binding = slot.binding,
             .material = owned_material,
             .expires_at = slot.expires_at,
+            .generation = slot.generation,
         };
+    }
+
+    /// Proves a `Lease` is still backed by the exact live activation it was
+    /// looked up from AND reserves one identity slot, atomically under the
+    /// registry lock (so cancellation either happens-before this and the
+    /// lease is refused, or happens-after and the admitted build drains, as
+    /// #932 intends for in-flight handshakes). A `Lease` is a plain value: it
+    /// can be forged, and outlives `remove`/expiry. Succeeds only if a slot
+    /// for `lease.host` has the same generation, binding, material and expiry
+    /// and has not expired at `now`. The returned gate reference must be
+    /// released exactly once via `IdentityGate.release`.
+    pub fn confirmAndAcquire(self: *Registry, lease: *const Lease, now: i64) ConfirmAcquireError!*IdentityGate {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const index = self.findIndex(lease.host) orelse return error.NotAuthorized;
+        const slot = self.slots.items[index];
+        if (slot.generation != lease.generation) return error.NotAuthorized;
+        if (!std.mem.eql(u8, &slot.binding, &lease.binding)) return error.NotAuthorized;
+        if (!std.mem.eql(u8, slot.material, lease.material)) return error.NotAuthorized;
+        if (slot.expires_at != lease.expires_at) return error.NotAuthorized;
+        if (slot.expires_at <= now) return error.Expired;
+        if (self.gate == null) {
+            const gate = try self.allocator.create(IdentityGate);
+            gate.* = .{ .allocator = self.allocator };
+            self.gate = gate;
+        }
+        const gate = self.gate.?;
+        if (!gate.tryAcquire()) return error.TooManyIdentities;
+        return gate;
+    }
+
+    /// Currently live identities (diagnostics/tests).
+    pub fn liveIdentities(self: *Registry) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const gate = self.gate orelse return 0;
+        return gate.live.load(.acquire);
     }
 
     /// Cancels a pending authorization, but only if it is still owned by

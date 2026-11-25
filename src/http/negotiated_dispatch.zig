@@ -10,6 +10,12 @@ const encrypted_stream_connection = @import("encrypted_stream_connection.zig");
 pub const NegotiatedProtocol = enum {
     http1_1,
     http2,
+    /// RFC 8737 TLS-ALPN-01 (#939): the downstream listener negotiated the
+    /// exclusive `acme-tls/1` offer. Never produced for the upstream client
+    /// (`upstream_tls.zig` never offers it) -- terminal for the downstream
+    /// listener too: the handshake itself *is* the validation, so the
+    /// connection closes without any HTTP dispatch.
+    acme_challenge,
 };
 
 pub const AlpnFallbackPolicy = enum {
@@ -27,6 +33,15 @@ pub const ListenerProtocolPolicy = struct {
     http1_enabled: bool = true,
     http2_enabled: bool = true,
     allow_http1_without_alpn: bool = false,
+    /// #939: the native TCP listener additionally recognizes an exclusive
+    /// `acme-tls/1` ClientHello offer (RFC 8737 TLS-ALPN-01) and negotiates
+    /// it -- but ONLY when the client's entire offered ALPN list is that one
+    /// protocol; an absent, ordinary, mixed, or duplicated offer negotiates
+    /// ordinary HTTP exactly as if this were false (`Policy.
+    /// exclusive_only_alpn_protocols`). Never applies to QUIC/H3, which has
+    /// its own, separate policy. Defaults to false: every existing listener
+    /// negotiates exactly as before.
+    acme_tls_alpn_enabled: bool = false,
 
     pub fn fallbackPolicy(self: ListenerProtocolPolicy) AlpnFallbackPolicy {
         return if (self.http1_enabled and self.allow_http1_without_alpn)
@@ -43,6 +58,10 @@ pub const ListenerProtocolPolicy = struct {
         return switch (protocol) {
             .http1_1 => self.http1_enabled,
             .http2 => self.http2_enabled,
+            // Already gated by `acme_tls_alpn_enabled` at negotiation time
+            // (see `selectNegotiatedProtocol`): reaching here at all means
+            // the engine's own policy already required it.
+            .acme_challenge => true,
         };
     }
 
@@ -78,19 +97,38 @@ pub const ListenerProtocolPolicy = struct {
         if (self.http2_enabled and self.http1_enabled) {
             var policy = tls.policy.Policy.recordDefault();
             policy.allow_absent_alpn = self.allow_http1_without_alpn;
+            if (self.acme_tls_alpn_enabled) self.addAcmeTlsAlpn(&policy, &dual_protocol_with_acme);
             return policy;
         }
         if (self.http2_enabled) {
-            return tls.policy.Policy.recordH2Only();
+            var policy = tls.policy.Policy.recordH2Only();
+            if (self.acme_tls_alpn_enabled) self.addAcmeTlsAlpn(&policy, &h2_only_with_acme);
+            return policy;
         }
         if (!self.http1_enabled) {
             var policy = tls.policy.Policy.recordDefault();
             policy.alpn_protocols = &.{};
+            // Neither HTTP protocol is enabled; `createWithOptions` already
+            // refuses this configuration before it can reach the engine, so
+            // `acme_tls_alpn_enabled` is moot here.
             return policy;
         }
-        return tls.policy.Policy.recordHttp1Only(self.allow_http1_without_alpn);
+        var policy = tls.policy.Policy.recordHttp1Only(self.allow_http1_without_alpn);
+        if (self.acme_tls_alpn_enabled) self.addAcmeTlsAlpn(&policy, &http1_only_with_acme);
+        return policy;
+    }
+
+    fn addAcmeTlsAlpn(_: ListenerProtocolPolicy, policy: *tls.policy.Policy, with_acme: []const tls.algorithms.ProtocolName) void {
+        policy.alpn_protocols = with_acme;
+        policy.exclusive_only_alpn_protocols = &acme_only_alpn;
     }
 };
+
+const acme_tls_alpn = tls.algorithms.alpn.acme_tls_1;
+const acme_only_alpn = [_]tls.algorithms.ProtocolName{acme_tls_alpn};
+const dual_protocol_with_acme = [_]tls.algorithms.ProtocolName{ tls.algorithms.alpn.h2, tls.algorithms.alpn.http_1_1, acme_tls_alpn };
+const h2_only_with_acme = [_]tls.algorithms.ProtocolName{ tls.algorithms.alpn.h2, acme_tls_alpn };
+const http1_only_with_acme = [_]tls.algorithms.ProtocolName{ tls.algorithms.alpn.http_1_1, acme_tls_alpn };
 
 const server_signature_schemes = [_]tls.algorithms.SignatureScheme{
     .ed25519,
@@ -129,6 +167,17 @@ pub fn selectNegotiatedProtocol(
     negotiated_alpn: ?[]const u8,
     policy: ListenerProtocolPolicy,
 ) Error!NegotiatedProtocol {
+    // #939: checked ahead of the ordinary h2/http1.1 mapping so it can never
+    // be shadowed by it. Reaching this with `negotiated_alpn` equal to
+    // `acme-tls/1` already means the engine's own policy was built with
+    // `acme_tls_alpn_enabled` (only then does `acme-tls/1` ever appear in
+    // the ALPN policy `negotiateServerHello` selected from); the flag check
+    // here is belt-and-suspenders, not load-bearing.
+    if (policy.acme_tls_alpn_enabled) {
+        if (negotiated_alpn) |alpn| {
+            if (std.mem.eql(u8, alpn, acme_tls_alpn.bytes)) return .acme_challenge;
+        }
+    }
     const protocol = try mapNegotiatedHttpProtocol(negotiated_alpn, policy.negotiatedFallbackPolicy());
     try policy.validateSelected(protocol);
     return protocol;
@@ -152,6 +201,11 @@ pub fn dispatchToRuntime(
                 .close => break .close,
             }
         },
+        // #939: never actually reached in production -- the native listener
+        // closes a completed challenge connection itself, before any
+        // `dispatchToRuntime` call, per the module doc on `.acme_challenge`.
+        // Required for exhaustiveness and kept terminal to match that intent.
+        .acme_challenge => .close,
     };
 }
 
@@ -176,6 +230,45 @@ test "pinned listener policy validates selected protocol and fallback" {
     try std.testing.expectError(error.NoApplicationProtocol, selectNegotiatedProtocol(null, .{ .allow_http1_without_alpn = false }));
     try std.testing.expectEqual(NegotiatedProtocol.http1_1, try selectNegotiatedProtocol(null, .{ .allow_http1_without_alpn = true }));
     try std.testing.expectError(error.NoApplicationProtocol, selectNegotiatedProtocol(null, .{ .http1_enabled = false, .allow_http1_without_alpn = true }));
+}
+
+test "ACME-disabled listener policy never offers acme-tls/1 in the engine policy" {
+    const policy = (ListenerProtocolPolicy{}).nativeTlsPolicy();
+    try std.testing.expect(!policy.containsAlpn(acme_tls_alpn.bytes));
+    try std.testing.expectEqual(@as(usize, 0), policy.exclusive_only_alpn_protocols.len);
+}
+
+test "ACME-enabled listener policy offers acme-tls/1 as exclusive-only, for every http1/h2 combination" {
+    for ([_]ListenerProtocolPolicy{
+        .{ .acme_tls_alpn_enabled = true },
+        .{ .acme_tls_alpn_enabled = true, .http1_enabled = false },
+        .{ .acme_tls_alpn_enabled = true, .http2_enabled = false },
+    }) |listener_policy| {
+        const policy = listener_policy.nativeTlsPolicy();
+        try std.testing.expect(policy.containsAlpn(acme_tls_alpn.bytes));
+        try std.testing.expectEqual(@as(usize, 1), policy.exclusive_only_alpn_protocols.len);
+        try std.testing.expect(policy.exclusive_only_alpn_protocols[0].eql(acme_tls_alpn));
+    }
+}
+
+test "selectNegotiatedProtocol recognizes acme-tls/1 only when the listener enabled it" {
+    try std.testing.expectEqual(
+        NegotiatedProtocol.acme_challenge,
+        try selectNegotiatedProtocol(acme_tls_alpn.bytes, .{ .acme_tls_alpn_enabled = true }),
+    );
+    // Belt-and-suspenders (module doc): even if somehow negotiated without
+    // the flag, it is treated as any other unrecognized ALPN value, never
+    // silently granted the challenge outcome.
+    try std.testing.expectError(
+        error.NoApplicationProtocol,
+        selectNegotiatedProtocol(acme_tls_alpn.bytes, .{ .acme_tls_alpn_enabled = false }),
+    );
+    // acme_challenge is unconditionally allowed once negotiated -- it is not
+    // gated by http1_enabled/http2_enabled the way ordinary protocols are.
+    try std.testing.expectEqual(
+        NegotiatedProtocol.acme_challenge,
+        try selectNegotiatedProtocol(acme_tls_alpn.bytes, .{ .acme_tls_alpn_enabled = true, .http1_enabled = false, .http2_enabled = false }),
+    );
 }
 
 test "shared runtime dispatch accepts generic and EncryptedStream connection shapes" {

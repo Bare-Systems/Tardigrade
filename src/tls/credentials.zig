@@ -176,6 +176,18 @@ pub const SelectedCredential = struct {
     /// provider guarantees it is compatible with the selection context.
     scheme: SignatureScheme,
     vtable: *const VTable,
+    /// When true, the server-role engine does not call `release` as soon as
+    /// this credential's signature has been used (the ordinary, immediate
+    /// lifecycle) -- it instead holds the handle until the handshake's actual
+    /// terminus (the peer's verified Finished, or teardown on failure/
+    /// cancellation/timeout) and releases it exactly once there. For a
+    /// provider whose `release` frees more than just signing material --
+    /// e.g. a single-use authorization slot that must stay claimed for the
+    /// whole handshake, not merely through signing -- the ordinary immediate
+    /// release would let that slot be reused while this handshake is still
+    /// in flight. Defaults to false: every other credential's lifecycle is
+    /// unchanged.
+    pin_until_handshake_complete: bool = false,
 
     pub const VTable = struct {
         /// Return the credential's public DER chain as a borrowed view valid

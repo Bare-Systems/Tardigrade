@@ -14938,12 +14938,18 @@ const PureZigTlsClient = struct {
 };
 
 const tardigrade_test_alpns = [_]tls_core.algorithms.ProtocolName{.{ .bytes = "tardigrade-test" }};
+// #939: an exclusive, single-protocol offer -- exactly the shape a real RFC
+// 8737 TLS-ALPN-01 validation client sends.
+const acme_tls_alpn_test_alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.acme_tls_1};
 
 fn alpnPolicy(alpn: []const u8) tls_core.policy.Policy {
     if (std.mem.eql(u8, alpn, "h2")) return tls_core.policy.Policy.recordH2Only();
     if (std.mem.eql(u8, alpn, "http/1.1")) return tls_core.policy.Policy.recordHttp1Only(false);
     if (std.mem.eql(u8, alpn, "tardigrade-test")) {
         return tls_core.policy.Policy.fromCapabilities(.record, tls_core.tls13_backend.native_capabilities, &tardigrade_test_alpns);
+    }
+    if (std.mem.eql(u8, alpn, "acme-tls/1")) {
+        return tls_core.policy.Policy.fromCapabilities(.record, tls_core.tls13_backend.native_capabilities, &acme_tls_alpn_test_alpns);
     }
     var policy = tls_core.policy.Policy.recordDefault();
     policy.alpn_protocols = &.{};
@@ -23665,6 +23671,112 @@ test "native TLS listener rejects unsupported ALPN before HTTP dispatch" {
     try std.testing.expectEqual(@as(u16, 200), control.status_code);
     try assertContains(control.body, "negative-control");
     try waitForUpstreamCount(&upstream, 1, 2_000);
+}
+
+test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge and closes without HTTP dispatch (#939)" {
+    // ACME is never valid on the appliance profile, and enabling it here
+    // (even just to populate the test-only registry seam) requires the same
+    // `-Dacme-experimental` gate every other live ACME integration case does.
+    try requireGenericNativeTlsProfile();
+    if (!integration_options.acme_experimental) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const state_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-acme-tls-alpn-{d}", .{compat.nanoTimestamp()});
+    defer allocator.free(state_rel);
+    try compat.cwd().makePath(state_rel);
+    defer compat.cwd().deleteTree(state_rel) catch {};
+
+    const http01_port = try findFreePort();
+    const http01_listen = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{http01_port});
+    defer allocator.free(http01_listen);
+
+    // RFC 8555 S8.1 shape: `token "." thumbprint`. The thumbprint must be the
+    // canonical unpadded base64url encoding of a 32-byte digest -- producing
+    // it through the real encoder (rather than a hand-picked literal)
+    // guarantees that round-trip property.
+    const token = "a" ** 32;
+    const thumbprint_bytes: [32]u8 = [_]u8{0x7a} ** 32;
+    var thumbprint: [43]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&thumbprint, &thumbprint_bytes);
+    const key_authorization = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ token, thumbprint });
+    defer allocator.free(key_authorization);
+    const host = "a.tls-alpn-01.test";
+    const challenge_value = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ host, key_authorization });
+    defer allocator.free(challenge_value);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            // Deliberately unreachable (nothing listens on port 1): nothing
+            // in this case depends on the order/renewal worker ever actually
+            // reaching a CA -- only on the listener's own ALPN wiring and the
+            // test-only registry seam below.
+            .{ .name = "TARDIGRADE_TLS_AUTOMATIC_HTTPS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_AGREE_TOS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_STATE_DIR", .value = state_rel },
+            .{ .name = "TARDIGRADE_TLS_ACME_DOMAINS", .value = "example.com" },
+            .{ .name = "TARDIGRADE_TLS_ACME_DIRECTORY_URL", .value = "https://127.0.0.1:1/directory" },
+            .{ .name = "TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", .value = "src/pki/testdata/ecdsa_p256_ca.crt" },
+            .{ .name = "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", .value = http01_listen },
+            .{ .name = "TARDIGRADE_ACME_TEST_TLS_ALPN_CHALLENGE", .value = challenge_value },
+        },
+    });
+    defer tardigrade.stop();
+
+    // 1. Ordinary HTTPS on the exact same listener, same port, is unaffected
+    //    by the ACME-ALPN wrapper (#939 requirement: never changes ordinary
+    //    ALPN behavior).
+    var control = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
+    defer control.deinit();
+    try std.testing.expectEqual(@as(u16, 200), control.status_code);
+    try assertContains(control.body, "alive");
+
+    // 2. A real external TCP client (this repo's own native TLS engine, not
+    //    Tardigrade's server-side code) offering *exclusively* `acme-tls/1`
+    //    for the seeded host completes a full TLS 1.3 handshake through the
+    //    actual shipping listener and SNI/credential-selection path.
+    const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "acme-tls/1", host);
+    defer client.destroy();
+
+    const served_entry = client.backend.peer_chain_entries[0];
+    const served_leaf = client.backend.peer_chain[served_entry.start..][0..served_entry.len];
+
+    // Independent decode: Zig std's own X.509 parser (never Tardigrade's),
+    // self-verifying the signature under the certificate's own embedded key
+    // and checking the exact hostname and validity window.
+    const std_cert = std.crypto.Certificate{ .buffer = served_leaf, .index = 0 };
+    const parsed = try std_cert.parse();
+    try parsed.verify(parsed, compat.unixTimestamp());
+    try parsed.verifyHostName(host);
+
+    // RFC 8737 S3: the critical `id-pe-acmeIdentifier` extension (OID
+    // 1.3.6.1.5.5.7.1.31) carries exactly SHA-256(keyAuthorization) as its
+    // DER OCTET STRING payload. Checked as a raw byte pattern -- independent
+    // of any x509 parser, Tardigrade's or std's -- exactly as
+    // `tls_alpn_identity.zig`'s own unit tests independently verify it.
+    var expected_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key_authorization, &expected_digest, .{});
+    const acme_identifier_prefix = [_]u8{ 0x30, 0x00, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x1f, 0x01, 0x01, 0xff, 0x04, 0x22, 0x04, 0x20 };
+    var acme_identifier_pattern: [acme_identifier_prefix.len + 32]u8 = undefined;
+    @memcpy(acme_identifier_pattern[0..acme_identifier_prefix.len], &acme_identifier_prefix);
+    @memcpy(acme_identifier_pattern[acme_identifier_prefix.len..], &expected_digest);
+    acme_identifier_pattern[1] = @intCast(acme_identifier_pattern.len - 2);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, served_leaf, &acme_identifier_pattern));
+
+    // 3. The handshake itself *is* the validation (#939): the server never
+    //    dispatches to HTTP on this connection. No bytes ever arrive.
+    try std.testing.expectError(error.ReadTimeout, client.readPlainToEnd(allocator, 4096, 1_000));
 }
 
 test "failure: malformed and stalled TLS handshakes are rejected without wedging the listener (#270)" {

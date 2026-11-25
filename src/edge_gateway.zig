@@ -131,6 +131,24 @@ fn prepareCurrentAcmeCredentials(
     return prepared;
 }
 
+/// #939 test-only activation seam: parses `TARDIGRADE_ACME_TEST_TLS_ALPN_CHALLENGE`
+/// (`host:keyAuthorization`) and publishes it into the registry exactly as a
+/// real order/activation would, standing in for the order orchestration that
+/// is still a later child. Returns an error (never a partial/best-effort
+/// registration) for a malformed value or a registry rejection, so a typo'd
+/// test value fails startup loudly rather than silently leaving the registry
+/// empty.
+fn seedAcmeTlsAlpnTestChallenge(
+    registry: *http.acme.tls_alpn_challenges.Registry,
+    raw: []const u8,
+) !void {
+    const sep = std.mem.indexOfScalar(u8, raw, ':') orelse return error.InvalidAcmeTestTlsAlpnChallenge;
+    const host = raw[0..sep];
+    const key_authorization = raw[sep + 1 ..];
+    const now = compat.unixTimestamp();
+    try registry.put(now, host, std.mem.zeroes(http.acme.tls_alpn_challenges.Binding), key_authorization, std.math.maxInt(i64));
+}
+
 /// Takes a mutable config because the startup generation publishes its parsed
 /// ACL back onto it (`EdgeConfig.parsed_access_control`), which is what pairs
 /// authorization state with the configuration generation a request leases.
@@ -664,6 +682,12 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
                     native_credentials.?.entropy_source.entropy(),
                 );
                 native_tls_provider = acme_tls_alpn_provider.credentialProvider();
+                if (cfg.tls_acme_test_tls_alpn_challenge.len > 0) {
+                    seedAcmeTlsAlpnTestChallenge(&acme_tls_alpn_registry, cfg.tls_acme_test_tls_alpn_challenge) catch |err| {
+                        state.logger.err(null, "TARDIGRADE_ACME_TEST_TLS_ALPN_CHALLENGE rejected at startup ({s}); refusing to start", .{@errorName(err)});
+                        return err;
+                    };
+                }
             }
         }
     }
@@ -2402,6 +2426,11 @@ fn advanceNativeHandshake(ctx: *WorkerContext, managed: *http.downstream_connect
                 rearmActiveConnection(ctx, managed, .{ .read = true });
             }
         },
+        // #939: the RFC 8737 TLS-ALPN-01 handshake itself *is* the
+        // validation -- the validating CA never sends or expects any HTTP
+        // request/response on this connection. Close it immediately rather
+        // than entering either HTTP phase.
+        .acme_challenge => managed.deinit(),
     }
 }
 

@@ -103,12 +103,22 @@ pub const Provider = struct {
     /// `null` means "not an exclusive acme-tls/1 offer" -- the caller must
     /// fall through to `inner` unchanged. A non-null return (success or
     /// error) is always terminal; see the module doc.
+    ///
+    /// Requires BOTH the exact singleton offer AND that the connection
+    /// actually negotiated `acme-tls/1` (`selection.application_protocol`),
+    /// not merely that it was offered: an offered-but-unnegotiated protocol
+    /// proves nothing about what this connection will actually speak, and a
+    /// missing/mismatched negotiated value with an exclusive offer is a
+    /// contradiction this provider must never paper over by issuing the
+    /// validation identity anyway (#939).
     fn decide(
         self: *Provider,
         selection: *const credentials.SelectionContext,
     ) credentials.SelectError!?credentials.Progress(credentials.SelectedCredential) {
         if (selection.role != .server) return null;
         if (!challenges.isChallengeAlpnOffer(selection.offered_alpn_protocols)) return null;
+        const negotiated = selection.application_protocol orelse return error.NoCredentialAvailable;
+        if (!std.mem.eql(u8, negotiated, challenges.protocol)) return error.NoCredentialAvailable;
         return try self.selectChallenge(selection);
     }
 
@@ -136,7 +146,17 @@ pub const Provider = struct {
             .allocator = self.allocator,
             .chain_entry = .{identity.certificate_der},
         };
-        return .{ .complete = .{ .handle = handle, .scheme = .ecdsa_secp256r1_sha256, .vtable = &ChallengeHandle.vtable } };
+        return .{
+            .complete = .{
+                .handle = handle,
+                .scheme = .ecdsa_secp256r1_sha256,
+                .vtable = &ChallengeHandle.vtable,
+                // #939: the registry's gate slot must stay claimed through the
+                // whole handshake (success, failure, or timeout), not merely
+                // until the signature is used -- see `pin_until_handshake_complete`.
+                .pin_until_handshake_complete = true,
+            },
+        };
     }
 };
 
@@ -220,17 +240,24 @@ fn syncSelect(provider: credentials.CredentialProvider, selection: *const creden
     };
 }
 
-fn baseSelection(host: ?[]const u8, offered_alpn: []const []const u8) credentials.SelectionContext {
+fn baseSelection(host: ?[]const u8, offered_alpn: []const []const u8, negotiated: ?[]const u8) credentials.SelectionContext {
     return .{
         .role = .server,
         .server_name = host,
         .peer_signature_schemes = &.{ 0x0403, 0x0807 }, // ecdsa_secp256r1_sha256, ed25519
         .negotiated_version = 0x0304,
         .cipher_suite = 0x1301,
-        .application_protocol = null,
+        .application_protocol = negotiated,
         .auth_policy = .{},
         .offered_alpn_protocols = offered_alpn,
     };
+}
+
+/// As `baseSelection`, but for an exclusive `acme-tls/1` offer that actually
+/// negotiated it -- the only context `decide` may ever issue the validation
+/// identity for (#939).
+fn exclusiveSelection(host: ?[]const u8) credentials.SelectionContext {
+    return baseSelection(host, &exclusive_alpn, challenges.protocol);
 }
 
 test "selects exactly the registry's RFC 8737 identity for an exact SNI and exclusive acme-tls/1 offer" {
@@ -242,7 +269,7 @@ test "selects exactly the registry's RFC 8737 identity for an exact SNI and excl
     var provider = Provider.init(inner.provider(), &registry, testing.allocator, test_entropy);
     provider.clock = .{ .ctx = null, .nowFn = fixedNow1000 };
 
-    const selection = baseSelection("a.example.test", &exclusive_alpn);
+    const selection = exclusiveSelection("a.example.test");
     const credential = try syncSelect(provider.credentialProvider(), &selection);
     defer credential.release();
     try testing.expectEqual(credentials.SignatureScheme.ecdsa_secp256r1_sha256, credential.scheme);
@@ -279,14 +306,43 @@ test "falls through to the wrapped provider whenever the offered ALPN is not exc
     provider.clock = .{ .ctx = null, .nowFn = fixedNow1000 };
 
     const empty_alpn: []const []const u8 = &.{};
-    for ([_][]const []const u8{ &mixed_alpn, &h2_alpn, empty_alpn }) |offer| {
+    // Each offer is non-exclusive, so `decide` must fall through before ever
+    // consulting `application_protocol` -- each is paired with the ordinary
+    // protocol the real engine would actually have negotiated for it.
+    const cases = [_]struct { offer: []const []const u8, negotiated: ?[]const u8 }{
+        .{ .offer = &mixed_alpn, .negotiated = "h2" },
+        .{ .offer = &h2_alpn, .negotiated = "h2" },
+        .{ .offer = empty_alpn, .negotiated = null },
+    };
+    for (cases) |case| {
         inner.select_count = 0;
-        const selection = baseSelection("a.example.test", offer);
+        const selection = baseSelection("a.example.test", case.offer, case.negotiated);
         const credential = try syncSelect(provider.credentialProvider(), &selection);
         defer credential.release();
         try testing.expectEqual(@as(usize, 1), inner.select_count);
         try testing.expectEqualSlices(u8, credentials.testdata.certificate_der, credential.certificateChain().leaf().?);
     }
+}
+
+test "never issues the validation identity when the offer was exclusive but negotiation disagrees" {
+    var registry = challenges.Registry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.put(1000, "a.example.test", binding_a, valid_key_authorization, 1100);
+
+    var inner = credentials.MockCredentialProvider.init(testInnerIdentity());
+    var provider = Provider.init(inner.provider(), &registry, testing.allocator, test_entropy);
+    provider.clock = .{ .ctx = null, .nowFn = fixedNow1000 };
+
+    // An exclusive offer the registry would gladly serve, but whose
+    // negotiated protocol is missing or disagrees with it -- a contradiction
+    // that must fail closed, never fall through to the ordinary provider nor
+    // issue the validation certificate anyway (#939).
+    for ([_]?[]const u8{ null, "h2", "http/1.1" }) |negotiated| {
+        const selection = baseSelection("a.example.test", &exclusive_alpn, negotiated);
+        try testing.expectError(error.NoCredentialAvailable, provider.credentialProvider().selectCredential(&selection));
+    }
+    try testing.expectEqual(@as(usize, 0), inner.select_count);
+    try testing.expectEqual(@as(u32, 0), registry.liveIdentities());
 }
 
 test "canonicalizes SNI case before matching the registry's lowercase-only host" {
@@ -298,7 +354,7 @@ test "canonicalizes SNI case before matching the registry's lowercase-only host"
     var provider = Provider.init(inner.provider(), &registry, testing.allocator, test_entropy);
     provider.clock = .{ .ctx = null, .nowFn = fixedNow1000 };
 
-    const selection = baseSelection("A.Example.Test", &exclusive_alpn);
+    const selection = exclusiveSelection("A.Example.Test");
     const credential = try syncSelect(provider.credentialProvider(), &selection);
     defer credential.release();
     var cert = try pki.x509.Certificate.parse(testing.allocator, credential.certificateChain().leaf().?, pki.x509.default_limits);
@@ -325,7 +381,7 @@ test "fails closed, never falling through, for an exclusive offer with no live a
     for (cases) |case| {
         var now = case.now;
         provider.clock = .{ .ctx = @ptrCast(&now), .nowFn = readCtxNow };
-        const selection = baseSelection(case.host, &exclusive_alpn);
+        const selection = exclusiveSelection(case.host);
         try testing.expectError(error.NoCredentialAvailable, provider.credentialProvider().selectCredential(&selection));
     }
     try testing.expectEqual(@as(usize, 0), inner.select_count);
@@ -340,7 +396,7 @@ test "never attempts challenge selection for the client role, regardless of the 
     var provider = Provider.init(inner.provider(), &registry, testing.allocator, test_entropy);
     provider.clock = .{ .ctx = null, .nowFn = fixedNow1000 };
 
-    var selection = baseSelection("a.example.test", &exclusive_alpn);
+    var selection = exclusiveSelection("a.example.test");
     selection.role = .client;
     const credential = try syncSelect(provider.credentialProvider(), &selection);
     defer credential.release();
@@ -356,7 +412,7 @@ test "release wipes the identity and returns exactly one registry slot" {
     var provider = Provider.init(inner.provider(), &registry, testing.allocator, test_entropy);
     provider.clock = .{ .ctx = null, .nowFn = fixedNow1000 };
 
-    const selection = baseSelection("a.example.test", &exclusive_alpn);
+    const selection = exclusiveSelection("a.example.test");
     const credential = try syncSelect(provider.credentialProvider(), &selection);
     try testing.expectEqual(@as(u32, 1), registry.liveIdentities());
     credential.release();
@@ -372,7 +428,7 @@ test "allocation failure sweep through registry lookup, identity build, and hand
             var inner = credentials.MockCredentialProvider.init(testInnerIdentity());
             var provider = Provider.init(inner.provider(), &registry, allocator, test_entropy);
             provider.clock = .{ .ctx = null, .nowFn = fixedNow1000 };
-            const selection = baseSelection("a.example.test", &exclusive_alpn);
+            const selection = exclusiveSelection("a.example.test");
             const credential = try syncSelect(provider.credentialProvider(), &selection);
             credential.release();
         }

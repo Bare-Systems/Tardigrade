@@ -58,6 +58,15 @@ pub const Policy = struct {
     alpn_protocols: []const ProtocolName,
     require_sni: bool = false,
     allow_absent_alpn: bool = false,
+    /// Protocols that may only be negotiated when the ClientHello's *entire*
+    /// offered ALPN list is exactly that one protocol (#939, RFC 8737
+    /// TLS-ALPN-01): never for an absent, ordinary, mixed, or duplicated
+    /// offer. Every entry here must also appear in `alpn_protocols` (so the
+    /// ordinary encode-length/duplicate validation already covers it); this
+    /// list only narrows *when* `negotiateServerHello` is willing to select
+    /// it. Empty by default -- every existing policy negotiates exactly as
+    /// before.
+    exclusive_only_alpn_protocols: []const ProtocolName = &.{},
     /// The `record_size_limit` this endpoint advertises (RFC 8449, #359): the
     /// largest `TLSInnerPlaintext` it is willing to *receive*. Defaults to the
     /// TLS 1.3 protocol maximum, so the extension is offered but constrains

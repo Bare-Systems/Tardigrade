@@ -6,6 +6,10 @@ pub fn listenerPolicyFromConfig(cfg: *const edge_config.EdgeConfig) http.negotia
         .http1_enabled = cfg.http1_enabled,
         .http2_enabled = cfg.http2_enabled,
         .allow_http1_without_alpn = cfg.tls_http1_no_alpn_fallback,
+        // #939: TLS-ALPN-01 is a native TCP TLS handshake (RFC 8737 S3),
+        // never QUIC/H3 -- gated on the same flag that wires the registry
+        // and credential provider in `edge_gateway.zig`.
+        .acme_tls_alpn_enabled = cfg.tls_acme_enabled,
     };
 }
 

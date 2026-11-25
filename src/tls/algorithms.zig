@@ -87,6 +87,9 @@ pub const alpn = struct {
     pub const h3: ProtocolName = .{ .bytes = "h3" };
     pub const h2: ProtocolName = .{ .bytes = "h2" };
     pub const http_1_1: ProtocolName = .{ .bytes = "http/1.1" };
+    /// RFC 8737 TLS-ALPN-01 (#939): never negotiated for a mixed or
+    /// duplicated offer -- see `policy.Policy.exclusive_only_alpn_protocols`.
+    pub const acme_tls_1: ProtocolName = .{ .bytes = "acme-tls/1" };
 };
 
 pub fn fromInt(comptime T: type, value: u16) ?T {

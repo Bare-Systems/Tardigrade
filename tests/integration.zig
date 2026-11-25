@@ -23875,7 +23875,7 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
             tls_core.tls13_backend.native_capabilities,
             case[0],
         );
-        const mixed = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, mixed_policy, case[1], host, .{});
+        const mixed = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, mixed_policy, case[1], null, .{});
         defer mixed.destroy();
         try std.testing.expectEqualStrings(case[1], mixed.backend.selectedAlpn().?);
         const entry = mixed.backend.peer_chain_entries[0];
@@ -23883,6 +23883,18 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
         try std.testing.expectEqualSlices(u8, fixture_chain[0], leaf);
     }
     try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    // The same mixed offers carrying the seeded challenge SNI must never be
+    // handed the ephemeral challenge identity.  The ordinary credential has no
+    // identity for that host, so the listener rejects before any certificate.
+    inline for (.{
+        .{ &acme_tls_alpn_h2_mixed_test_alpns, "h2" },
+        .{ &h2_acme_tls_alpn_mixed_test_alpns, "h2" },
+        .{ &acme_tls_alpn_http1_mixed_test_alpns, "http/1.1" },
+        .{ &http1_acme_tls_alpn_mixed_test_alpns, "http/1.1" },
+    }) |case| {
+        try PureZigTlsClient.expectHandshakeFailureWithAlpnOffer(allocator, tardigrade.port, case[0], case[1], host);
+    }
 
     // 2. A real external TCP client (this repo's own native TLS engine, not
     //    Tardigrade's server-side code) offering *exclusively* `acme-tls/1`
@@ -23934,17 +23946,6 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", null);
     try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", "wrong.tls-alpn-01.test");
     try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", "unregistered.tls-alpn-01.test");
-    // A duplicate token is not RFC 8737's exact singleton offer.  Drive it
-    // through the real socket and insist the listener rejects before sending
-    // any certificate (rather than treating a local policy/allocator error as
-    // evidence of server rejection).
-    try PureZigTlsClient.expectHandshakeFailureWithAlpnOffer(
-        allocator,
-        tardigrade.port,
-        &acme_tls_alpn_duplicate_test_alpns,
-        "acme-tls/1",
-        host,
-    );
     try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
 }
 

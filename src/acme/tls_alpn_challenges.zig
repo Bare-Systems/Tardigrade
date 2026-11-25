@@ -34,6 +34,14 @@ pub const LookupError = error{OutOfMemory};
 
 pub const CloseOutcome = enum { closed, not_found };
 
+/// Why `Registry.confirm` refused to vouch for a `Lease`.
+pub const ConfirmError = error{ NotAuthorized, Expired };
+
+/// Upper bound on simultaneously live challenge identities (#938). Each
+/// `Registry` slot can have at most one in-flight identity at a time under
+/// normal operation; this is the hard memory bound regardless.
+pub const max_live_identities: u32 = max_entries;
+
 /// An owned, immutable handshake selection. `material` is challenge-private
 /// and must be deinitialized after the handshake consumes it.
 pub const Lease = struct {
@@ -64,6 +72,7 @@ pub const Registry = struct {
     allocator: std.mem.Allocator,
     mutex: compat.Mutex = .{},
     slots: std.ArrayList(Slot) = .empty,
+    live_identities: std.atomic.Value(u32) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{ .allocator = allocator };
@@ -142,6 +151,39 @@ pub const Registry = struct {
             .material = owned_material,
             .expires_at = slot.expires_at,
         };
+    }
+
+    /// Proves a `Lease` is still backed by a live registry authorization. A
+    /// `Lease` is a plain value and can be forged or can outlive `remove`/
+    /// expiry (by design, so an in-flight handshake keeps working), so
+    /// certificate construction must call this and must not treat holding a
+    /// lease as authorization. Succeeds only if, under the registry lock, a
+    /// slot exists for exactly `lease.host` with identical binding, material
+    /// and expiry, and that expiry is still in the future at `now`.
+    pub fn confirm(self: *Registry, lease: *const Lease, now: i64) ConfirmError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.expireLocked(now);
+        const index = self.findIndex(lease.host) orelse return error.NotAuthorized;
+        const slot = self.slots.items[index];
+        if (!std.mem.eql(u8, &slot.binding, &lease.binding)) return error.NotAuthorized;
+        if (!std.mem.eql(u8, slot.material, lease.material)) return error.NotAuthorized;
+        if (slot.expires_at != lease.expires_at) return error.NotAuthorized;
+        if (slot.expires_at <= now) return error.Expired;
+    }
+
+    /// Reserves one of `max_live_identities` temporary-identity slots;
+    /// `false` when the bound is reached. Pair with `releaseIdentity`.
+    pub fn acquireIdentity(self: *Registry) bool {
+        var current = self.live_identities.load(.monotonic);
+        while (current < max_live_identities) {
+            current = self.live_identities.cmpxchgWeak(current, current + 1, .acq_rel, .monotonic) orelse return true;
+        }
+        return false;
+    }
+
+    pub fn releaseIdentity(self: *Registry) void {
+        _ = self.live_identities.fetchSub(1, .acq_rel);
     }
 
     /// Cancels a pending authorization, but only if it is still owned by

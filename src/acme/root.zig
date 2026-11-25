@@ -22,6 +22,8 @@ pub const renewal_policy = @import("renewal_policy.zig");
 pub const renewal_state = @import("renewal_state.zig");
 /// Bounded TLS-ALPN-01 authorization selection state (#932).
 pub const tls_alpn_challenges = @import("tls_alpn_challenges.zig");
+/// Native RFC 8737 TLS-ALPN-01 challenge certificate builder (#938).
+pub const tls_alpn_identity = @import("tls_alpn_identity.zig");
 
 /// Test-only fake CA (see `fake_ca.zig`); absent from non-test builds.
 pub const fake_ca = if (@import("builtin").is_test) @import("fake_ca.zig") else struct {};

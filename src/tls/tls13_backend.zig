@@ -4808,7 +4808,18 @@ pub const Tls13Backend = struct {
         // — the capture must survive for the async resume.
         errdefer self.clearClientHelloPsk();
 
-        try self.beginServerSelection(parsed.legacy_session_id, client_share, sink);
+        // #939: the complete offered ALPN protocol-name list, exactly as the
+        // peer sent it -- not merely the single negotiated result already
+        // captured in `self.selected_alpn` -- so a credential provider can
+        // require exclusive agreement on one protocol (ACME TLS-ALPN-01).
+        // Borrowed from `offers`, itself borrowed from `body`/`raw`: valid
+        // only for the remainder of this synchronous call, matching
+        // `SelectionContext`'s existing borrowed-input contract.
+        var offered_alpn_storage: [tls_negotiation.max_offers][]const u8 = undefined;
+        for (offers.alpn_protocols[0..offers.alpn_protocols_len], 0..) |protocol, i| offered_alpn_storage[i] = protocol.bytes;
+        const offered_alpn = offered_alpn_storage[0..offers.alpn_protocols_len];
+
+        try self.beginServerSelection(parsed.legacy_session_id, client_share, offered_alpn, sink);
     }
 
     /// Server (#484): asks the configured cookie provider for a cookie —
@@ -4887,6 +4898,7 @@ pub const Tls13Backend = struct {
         self: *Tls13Backend,
         session_id: []const u8,
         client_share: PeerKeyShare,
+        offered_alpn: []const []const u8,
         sink: *EventSink,
     ) HandshakeError!void {
         if (session_id.len > self.pending_client_session_id.len) return error.IllegalParameter;
@@ -4906,6 +4918,7 @@ pub const Tls13Backend = struct {
         };
 
         var selection = self.serverSelectionContext();
+        selection.offered_alpn_protocols = offered_alpn;
         // Selection may complete synchronously or return a pending operation
         // (e.g. an async SNI lookup); park the latter and resume later.
         switch (provider.selectCredential(&selection) catch |err|

@@ -600,6 +600,18 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
     };
     var native_tls_provider: ?tls_core.credentials.CredentialProvider = null;
     var h3_credential_provider: ?tls_core.credentials.CredentialProvider = null;
+    // #939 (A6-3 of #759): one process-scoped TLS-ALPN-01 challenge registry
+    // for the native TCP listener only. ACME TLS-ALPN-01 is a TCP TLS
+    // handshake (RFC 8737 S3), never QUIC/H3, so this deliberately wraps only
+    // `native_tls_provider` below -- `h3_credential_provider` keeps using
+    // `native_credentials.?.provider()` directly and never consults it.
+    // Nothing yet populates the registry (order/activation wiring is a later
+    // child); an empty registry costs one exclusivity check per ClientHello
+    // and otherwise behaves exactly like no wrapper at all.
+    var acme_tls_alpn_registry: http.acme.tls_alpn_challenges.Registry = undefined;
+    var acme_tls_alpn_registry_present = false;
+    defer if (acme_tls_alpn_registry_present) acme_tls_alpn_registry.deinit();
+    var acme_tls_alpn_provider: http.acme.tls_alpn_credential.Provider = undefined;
     // Hoisted out of the branch below (and kept alive for the rest of
     // `run()`, not just this block) because the ACME bootstrap wiring
     // further down also needs it every time it rebuilds and republishes
@@ -642,6 +654,17 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
             }
             native_tls_provider = native_credentials.?.provider();
             h3_credential_provider = native_credentials.?.provider();
+            if (cfg.tls_acme_enabled) {
+                acme_tls_alpn_registry = http.acme.tls_alpn_challenges.Registry.init(state_allocator);
+                acme_tls_alpn_registry_present = true;
+                acme_tls_alpn_provider = http.acme.tls_alpn_credential.Provider.init(
+                    native_tls_provider.?,
+                    &acme_tls_alpn_registry,
+                    state_allocator,
+                    native_credentials.?.entropy_source.entropy(),
+                );
+                native_tls_provider = acme_tls_alpn_provider.credentialProvider();
+            }
         }
     }
     defer if (native_credentials) |*store| store.deinit();

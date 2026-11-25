@@ -302,7 +302,9 @@ pub const Registry = struct {
     }
 };
 
-fn isChallengeAlpnOffer(offered_alpn: []const []const u8) bool {
+/// True only when `offered_alpn` is exactly, exclusively, `protocol` --
+/// never when it is merely present alongside anything else (#939).
+pub fn isChallengeAlpnOffer(offered_alpn: []const []const u8) bool {
     return offered_alpn.len == 1 and std.mem.eql(u8, offered_alpn[0], protocol);
 }
 

@@ -137,6 +137,17 @@ pub const SelectionContext = struct {
     /// The negotiated application protocol, when ALPN selected one.
     application_protocol: ?[]const u8,
     auth_policy: AuthPolicy,
+    /// Server role only: the peer's complete offered ALPN protocol-name list,
+    /// in ClientHello offer order (empty when ALPN was absent, when this side
+    /// is the client, or when the caller did not thread it through). Exists
+    /// so a provider can require *exclusive* agreement on one protocol --
+    /// e.g. ACME TLS-ALPN-01 (RFC 8737 S3), which a client must offer with no
+    /// other protocol alongside it -- rather than only seeing the single
+    /// negotiated result in `application_protocol`, which looks identical
+    /// whether the offer was exclusive or merely contained that protocol
+    /// among others. Valid only during the `select` call; see the module's
+    /// lifetime rules above.
+    offered_alpn_protocols: []const []const u8 = &.{},
 
     /// True when the peer offered `scheme`.
     pub fn offersScheme(self: SelectionContext, scheme: SignatureScheme) bool {
@@ -1046,6 +1057,13 @@ pub const MockCredentialProvider = struct {
     last_application_protocol_present: bool = false,
     last_offered_scheme_count: usize = 0,
     last_role: ?Role = null,
+    /// The last selection's complete offered ALPN protocol list, copied into
+    /// mock-owned storage for the same reason as `last_server_name_buf`:
+    /// `SelectionContext.offered_alpn_protocols` is only valid during `select`
+    /// (#939).
+    last_offered_alpn_buf: [16][255]u8 = undefined,
+    last_offered_alpn_len: [16]usize = undefined,
+    last_offered_alpn_count: usize = 0,
 
     pub fn init(identity: Identity) MockCredentialProvider {
         return .{ .identity = identity, .chain_entry = .{identity.certificate_der} };
@@ -1063,6 +1081,14 @@ pub const MockCredentialProvider = struct {
 
     pub fn lastApplicationProtocol(self: *const MockCredentialProvider) ?[]const u8 {
         return if (self.last_application_protocol_present) self.last_application_protocol_buf[0..self.last_application_protocol_len] else null;
+    }
+
+    /// The last selection's complete offered ALPN protocol list, as slices
+    /// into mock-owned storage (valid for the mock's lifetime, up to 16
+    /// entries).
+    pub fn lastOfferedAlpnProtocols(self: *const MockCredentialProvider, out: *[16][]const u8) []const []const u8 {
+        for (0..self.last_offered_alpn_count) |i| out[i] = self.last_offered_alpn_buf[i][0..self.last_offered_alpn_len[i]];
+        return out[0..self.last_offered_alpn_count];
     }
 
     pub fn selectedCredential(self: *MockCredentialProvider) SelectedCredential {
@@ -1098,6 +1124,12 @@ pub const MockCredentialProvider = struct {
             self.last_application_protocol_len = 0;
         }
         self.last_offered_scheme_count = selection.peer_signature_schemes.len;
+        self.last_offered_alpn_count = @min(selection.offered_alpn_protocols.len, self.last_offered_alpn_buf.len);
+        for (selection.offered_alpn_protocols[0..self.last_offered_alpn_count], 0..) |protocol, i| {
+            const n = @min(protocol.len, self.last_offered_alpn_buf[i].len);
+            @memcpy(self.last_offered_alpn_buf[i][0..n], protocol[0..n]);
+            self.last_offered_alpn_len[i] = n;
+        }
         if (self.force_select_error) |err| return err;
         const scheme = self.selectedScheme();
         if (!self.ignore_offer and !selection.offersScheme(scheme)) return error.NoCompatibleSignatureAlgorithm;

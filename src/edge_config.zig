@@ -1144,7 +1144,14 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     };
     const tls_acme_http01_listen = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", "", "0.0.0.0:80") catch unreachable;
     errdefer allocator.free(tls_acme_http01_listen);
-    const tls_acme_test_tls_alpn_challenge = acmeEnvOwned(allocator, "TARDIGRADE_ACME_TEST_TLS_ALPN_CHALLENGE", "", "") catch unreachable;
+    // The synthetic challenge registry is a process-test seam, never an
+    // operator feature.  Compile its environment input out of normal and
+    // release ACME binaries so an inherited variable cannot authorize an
+    // arbitrary host.
+    const tls_acme_test_tls_alpn_challenge = if (build_options.acme_tls_alpn_test_hook_enabled)
+        acmeEnvOwned(allocator, "TARDIGRADE_ACME_TEST_TLS_ALPN_CHALLENGE", "", "") catch unreachable
+    else
+        allocator.dupe(u8, "") catch unreachable;
     errdefer allocator.free(tls_acme_test_tls_alpn_challenge);
     // #884 (G8/design §8.3): naming it `TARDIGRADE_TLS_HTTPS_REDIRECT`
     // (not `..._HTTP_REDIRECT`) keeps it consistent with the generic

@@ -2183,6 +2183,10 @@ pub const Tls13Backend = struct {
     /// not destroy them before the caller has had a chance to read them.
     fn clearFailedHandshakeState(self: *Tls13Backend) void {
         if (self.handshake_committed) return;
+        // A challenge credential is deliberately retained after the server
+        // flight, but a malformed client Finished is terminal too.  Do not
+        // wait for carrier teardown to return its registry lease.
+        self.releasePinnedCredential();
         self.clearClientPskOffersAborted();
         self.selected_client_psk.deinit();
         self.selected_client_psk_present = false;
@@ -5531,7 +5535,11 @@ pub const Tls13Backend = struct {
     /// once. Reachable both synchronously and after resuming a pending
     /// signature.
     fn serverFinishFlight(self: *Tls13Backend, credential: credentials.SelectedCredential, sig_len: usize, sink: *EventSink) HandshakeError!void {
-        defer self.releaseOrPinCredential(credential);
+        // A pin begins only after the complete server flight and its secrets
+        // have been emitted successfully.  On any terminal emission/build
+        // error this credential was never admitted into the handshake-lifetime
+        // slot, so release it immediately instead.
+        errdefer credential.release();
         const schedule = &self.schedule.?;
         if (sig_len > self.pending_signature.len) return self.failCredential(.signature_output_overflow);
 
@@ -5576,6 +5584,7 @@ pub const Tls13Backend = struct {
         // arrives, over the transcript actually preceding it — which, under
         // handshake-time client authentication, includes the client's own
         // Certificate and CertificateVerify. See `onClientFinished`.
+        self.releaseOrPinCredential(credential);
     }
 
     // -----------------------------------------------------------------------

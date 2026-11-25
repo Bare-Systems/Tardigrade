@@ -682,7 +682,7 @@ pub fn run(cfg: *edge_config.EdgeConfig) !void {
                     native_credentials.?.entropy_source.entropy(),
                 );
                 native_tls_provider = acme_tls_alpn_provider.credentialProvider();
-                if (cfg.tls_acme_test_tls_alpn_challenge.len > 0) {
+                if (build_options.acme_tls_alpn_test_hook_enabled and cfg.tls_acme_test_tls_alpn_challenge.len > 0) {
                     seedAcmeTlsAlpnTestChallenge(&acme_tls_alpn_registry, cfg.tls_acme_test_tls_alpn_challenge) catch |err| {
                         state.logger.err(null, "TARDIGRADE_ACME_TEST_TLS_ALPN_CHALLENGE rejected at startup ({s}); refusing to start", .{@errorName(err)});
                         return err;

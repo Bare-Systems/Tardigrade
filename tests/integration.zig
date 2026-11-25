@@ -14841,6 +14841,17 @@ const PureZigTlsClient = struct {
         return out.toOwnedSlice();
     }
 
+    /// The TLS-ALPN-01 listener outcome is terminal at the transport layer:
+    /// unlike an idle HTTP connection, it must actually close its TCP peer.
+    fn expectTransportClose(self: *PureZigTlsClient, timeout_ms: i32) !void {
+        var one: [1]u8 = undefined;
+        const n = readSocketWithPoll(self.stream.handle, &one, timeout_ms) catch |err| switch (err) {
+            error.ConnectionResetByPeer => return,
+            else => return err,
+        };
+        if (n != 0) return error.UnexpectedTransportData;
+    }
+
     fn readExactPlain(self: *PureZigTlsClient, out: []u8, timeout_ms: u64) !void {
         const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
         var offset: usize = 0;
@@ -23679,10 +23690,22 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     // `-Dacme-experimental` gate every other live ACME integration case does.
     try requireGenericNativeTlsProfile();
     if (!integration_options.acme_experimental) return error.SkipZigTest;
+    if (!integration_options.acme_tls_alpn_test_hook_enabled) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "unexpected-acme-dispatch", .connection_header = "close" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
 
     const state_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-acme-tls-alpn-{d}", .{compat.nanoTimestamp()});
     defer allocator.free(state_rel);
@@ -23708,11 +23731,7 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     defer allocator.free(challenge_value);
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
-        .config_text =
-        \\location = /healthz {
-        \\    return 200 alive;
-        \\}
-        ,
+        .config_text = config_text,
         .ready_https_insecure = true,
         .ready_path = "/healthz",
         .extra_env = &.{
@@ -23740,7 +23759,9 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     var control = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
     defer control.deinit();
     try std.testing.expectEqual(@as(u16, 200), control.status_code);
-    try assertContains(control.body, "alive");
+    try assertContains(control.body, "unexpected-acme-dispatch");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+    try upstream.resetCapture();
 
     // 2. A real external TCP client (this repo's own native TLS engine, not
     //    Tardigrade's server-side code) offering *exclusively* `acme-tls/1`
@@ -23748,6 +23769,10 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     //    actual shipping listener and SNI/credential-selection path.
     const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "acme-tls/1", host);
     defer client.destroy();
+    // `applicationDataOpen` is reached after the client constructs Finished;
+    // drive once more to flush it so the server can verify it and take its
+    // terminal challenge-close path.
+    _ = try client.record.drive();
 
     const served_entry = client.backend.peer_chain_entries[0];
     const served_leaf = client.backend.peer_chain[served_entry.start..][0..served_entry.len];
@@ -23774,9 +23799,11 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     acme_identifier_pattern[1] = @intCast(acme_identifier_pattern.len - 2);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, served_leaf, &acme_identifier_pattern));
 
-    // 3. The handshake itself *is* the validation (#939): the server never
-    //    dispatches to HTTP on this connection. No bytes ever arrive.
-    try std.testing.expectError(error.ReadTimeout, client.readPlainToEnd(allocator, 4096, 1_000));
+    // 3. The handshake itself *is* the validation (#939): the listener
+    // closes the transport and never enters HTTP dispatch.
+    try client.expectTransportClose(1_000);
+    compat.sleepNs(100 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
 }
 
 test "failure: malformed and stalled TLS handshakes are rejected without wedging the listener (#270)" {

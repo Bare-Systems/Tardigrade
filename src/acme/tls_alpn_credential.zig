@@ -116,9 +116,18 @@ pub const Provider = struct {
         selection: *const credentials.SelectionContext,
     ) credentials.SelectError!?credentials.Progress(credentials.SelectedCredential) {
         if (selection.role != .server) return null;
-        if (!challenges.isChallengeAlpnOffer(selection.offered_alpn_protocols)) return null;
-        const negotiated = selection.application_protocol orelse return error.NoCredentialAvailable;
-        if (!std.mem.eql(u8, negotiated, challenges.protocol)) return error.NoCredentialAvailable;
+        // The offer and the engine's negotiated result describe the same
+        // connection.  Either side claiming the challenge protocol while the
+        // other does not is contradictory and must not fall through to the
+        // ordinary identity provider (a mixed offer with a forged/synthetic
+        // challenge result was the inverse hole of the exclusive-offer case).
+        const offered_challenge = challenges.isChallengeAlpnOffer(selection.offered_alpn_protocols);
+        const negotiated_challenge = if (selection.application_protocol) |protocol|
+            std.mem.eql(u8, protocol, challenges.protocol)
+        else
+            false;
+        if (offered_challenge != negotiated_challenge) return error.NoCredentialAvailable;
+        if (!offered_challenge) return null;
         return try self.selectChallenge(selection);
     }
 
@@ -296,7 +305,7 @@ test "selects exactly the registry's RFC 8737 identity for an exact SNI and excl
     try testing.expectEqual(@as(usize, 0), inner.select_count);
 }
 
-test "falls through to the wrapped provider whenever the offered ALPN is not exclusively acme-tls/1" {
+test "falls through to the wrapped provider for ordinary non-challenge ALPN negotiation" {
     var registry = challenges.Registry.init(testing.allocator);
     defer registry.deinit();
     try registry.put(1000, "a.example.test", binding_a, valid_key_authorization, 1100);
@@ -322,6 +331,21 @@ test "falls through to the wrapped provider whenever the offered ALPN is not exc
         try testing.expectEqual(@as(usize, 1), inner.select_count);
         try testing.expectEqualSlices(u8, credentials.testdata.certificate_der, credential.certificateChain().leaf().?);
     }
+}
+
+test "never falls through when a non-exclusive offer claims negotiated acme-tls/1" {
+    var registry = challenges.Registry.init(testing.allocator);
+    defer registry.deinit();
+    var inner = credentials.MockCredentialProvider.init(testInnerIdentity());
+    var provider = Provider.init(inner.provider(), &registry, testing.allocator, test_entropy);
+
+    const duplicate_alpn = [_][]const u8{ challenges.protocol, challenges.protocol };
+    const empty_alpn: []const []const u8 = &.{};
+    for ([_][]const []const u8{ &mixed_alpn, &duplicate_alpn, empty_alpn }) |offer| {
+        const selection = baseSelection("a.example.test", offer, challenges.protocol);
+        try testing.expectError(error.NoCredentialAvailable, provider.credentialProvider().selectCredential(&selection));
+    }
+    try testing.expectEqual(@as(usize, 0), inner.select_count);
 }
 
 test "never issues the validation identity when the offer was exclusive but negotiation disagrees" {

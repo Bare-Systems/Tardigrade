@@ -124,6 +124,12 @@ pub fn build(b: *std.Build) void {
         "Compile the #863 real-process H2 session test hook into the gateway binary; test-only, never for release builds",
     ) orelse false;
     build_options.addOption(bool, "h2_test_hook_enabled", h2_test_hook);
+    const acme_tls_alpn_test_hook = b.option(
+        bool,
+        "acme-tls-alpn-test-hook",
+        "Compile the #939 TLS-ALPN-01 synthetic activation hook; test-only, never for release builds",
+    ) orelse false;
+    build_options.addOption(bool, "acme_tls_alpn_test_hook_enabled", acme_tls_alpn_test_hook);
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("src/zig_compat.zig"),
         .target = target,
@@ -396,6 +402,7 @@ pub fn build(b: *std.Build) void {
 
     integration_options.addOption(bool, "acme_experimental", acme_experimental);
     integration_options.addOption(bool, "h2_test_hook_enabled", h2_test_hook);
+    integration_options.addOption(bool, "acme_tls_alpn_test_hook_enabled", acme_tls_alpn_test_hook);
 
     const acme_integration_support_mod = b.createModule(.{
         .root_source_file = b.path("src/acme_integration_support.zig"),
@@ -579,9 +586,10 @@ pub fn build(b: *std.Build) void {
     // job). Pair with `test-acme -Dacme-experimental` for the unit side.
     const integration_acme_smoke_filters = &[_][]const u8{
         "automatic HTTPS (#884): a live HTTP-01 issuance activates a CA-verified TLS listener",
+        "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge and closes without HTTP dispatch (#939)",
     };
     const integration_acme_smoke_step = b.step("test-integration-acme-smoke", "Run the focused ACME-experimental PR-smoke case (#945): a live HTTP-01 issuance activating a CA-verified native TLS listener; requires -Dacme-experimental and fails closed without it or if the filter matches nothing");
-    if (!acme_experimental) {
+    if (!acme_experimental or !acme_tls_alpn_test_hook) {
         // The target case checks `integration_options.acme_experimental` at
         // runtime and calls `return error.SkipZigTest` when it's unset, so
         // the #944 compiled-test-inventory zero-match guard below cannot see
@@ -589,7 +597,7 @@ pub fn build(b: *std.Build) void {
         // compiles and "passes" by skipping -- exactly the "skipped/success"
         // false-green #945 forbids for a curated smoke selection. Check the
         // flag directly instead of relying on the runtime skip to surface.
-        const missing_acme_experimental = b.addFail("test-integration-acme-smoke requires -Dacme-experimental; its target case skips itself (reporting success) without it, which would otherwise silently provide zero coverage");
+        const missing_acme_experimental = b.addFail("test-integration-acme-smoke requires -Dacme-experimental -Dacme-tls-alpn-test-hook; its target cases otherwise skip or cannot activate the test-only TLS-ALPN challenge");
         integration_acme_smoke_step.dependOn(&missing_acme_experimental.step);
     } else {
         // Same zero-match guard as `test-integration-smoke` above, for a

@@ -1308,9 +1308,9 @@ jobs:
           MODE: ${{ needs.mode.outputs.mode }}
         run: |
           if [ "$MODE" = "full" ]; then
-            zig build test-integration -Dacme-experimental --summary all --error-style verbose
+            zig build test-integration -Dacme-experimental -Dacme-tls-alpn-test-hook --summary all --error-style verbose
           else
-            zig build test-integration-acme-smoke -Dacme-experimental --summary all --error-style verbose
+            zig build test-integration-acme-smoke -Dacme-experimental -Dacme-tls-alpn-test-hook --summary all --error-style verbose
           fi
 
   # ── Required result ───────────────────────────────────────────────────────────

@@ -42,30 +42,47 @@ Read the review checklist before making changes:
 
 Use Zig `0.16.0` for all local builds and validation.
 
+For local builds, use `./scripts/zig-build` in place of `zig build` (Python 3
+required, macOS/Linux). It forwards build arguments unchanged, isolates both
+local and global Zig caches in `.zig-cache-managed/`, and automatically clears
+those compiler caches when their combined allocated size exceeds **8 GiB**.
+The limit is checked before and after every build, including failed builds.
+A single build can temporarily exceed it; this is a retention limit, not a
+filesystem quota. The next build after eviction will be a cold build. Set
+`TARDIGRADE_CACHE_MAX_GB=4` to choose a different limit in GiB.
+
+Builds in the same checkout are serialized to keep cleanup safe. Installed
+outputs in `zig-out/`, the normal `.zig-cache/` (which may contain campaign
+evidence), and the shared `~/.cache/zig` are never removed by this command.
+Each checkout has its own limit. Bare `zig build` and scripts that invoke it
+directly bypass this policy and retain their normal unbounded caches; use the
+wrapper for local iteration. Existing `zig build` examples elsewhere in this
+document can be run by substituting `./scripts/zig-build`.
+
 ```bash
 # Format check (matches CI)
 zig fmt --check build.zig src/ tests/
 
 # Unit tests (matches CI)
-zig build test --summary all --error-style verbose
+./scripts/zig-build test --summary all --error-style verbose
 
 # Bounded fast developer/agent gate -- use this for ordinary edit/test/review
 # iteration instead of the full `test` above (see "Test performance" below)
-zig build test-fast --summary all --error-style verbose
+./scripts/zig-build test-fast --summary all --error-style verbose
 
 # Stable Web PKI differential corpus (requires OpenSSL and Go)
-zig build test-pki-differential --summary all --error-style verbose
+./scripts/zig-build test-pki-differential --summary all --error-style verbose
 
 # Full core + extended PKI corpus used by the scheduled/manual CI job
-zig build test-pki-differential-extended --summary all --error-style verbose
+./scripts/zig-build test-pki-differential-extended --summary all --error-style verbose
 
-# Offline PKI mismatch-minimization tests (also run under `zig build test`);
+# Offline PKI mismatch-minimization tests (also run under `./scripts/zig-build test`);
 # verifies the reducer and regenerates every promoted seed byte-for-byte
-zig build test-pki-reduce --summary all --error-style verbose
+./scripts/zig-build test-pki-reduce --summary all --error-style verbose
 
 # Integration tests — builds and drives a live tardigrade process against
 # mock upstreams; requires system OpenSSL. Not required for most contributions.
-zig build test-integration
+./scripts/zig-build test-integration
 
 # Bounded curated smoke subset of the above (#945): startup/health, proxy
 # round-trip, auth-denied origin side effect, invalid config/reload,
@@ -73,18 +90,18 @@ zig build test-integration
 # is what PR CI's smoke mode runs
 # instead of the full `test-integration` above; use it locally for a fast
 # live-process sanity check instead of the full suite.
-zig build test-integration-smoke
+./scripts/zig-build test-integration-smoke
 
 # Failure-mode / chaos suite — a filtered view of the integration harness that
 # exercises broken origins and clients (see "Failure-mode harness" below).
-zig build test-failure
+./scripts/zig-build test-failure
 
 # Pure-Zig QUIC/HTTP-3 package unit tests (no system libraries). Also run under
-# `zig build test`.
-zig build test-quic
+# `./scripts/zig-build test`.
+./scripts/zig-build test-quic
 
 # Release-mode build
-zig build -Doptimize=ReleaseFast
+./scripts/zig-build -Doptimize=ReleaseFast
 ```
 
 The PKI differential harness invokes OpenSSL and Go as argv-spawned child

@@ -15026,6 +15026,75 @@ const tardigrade_test_alpns = [_]tls_core.algorithms.ProtocolName{.{ .bytes = "t
 // #939: an exclusive, single-protocol offer -- exactly the shape a real RFC
 // 8737 TLS-ALPN-01 validation client sends.
 const acme_tls_alpn_test_alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.acme_tls_1};
+/// Writes a minimal, well-formed TLS 1.3 ClientHello record (X25519 share,
+/// Ed25519 + ECDSA P-256 signature schemes, caller-chosen ALPN vector and SNI) to a real TCP
+/// socket and reports the content type of the first record the server sends
+/// back, or null when it closes/resets without sending anything.  Used for
+/// offers the policy-validating `PureZigTlsClient` refuses to construct, so
+/// the bytes provably reach the listener.
+fn probeRawClientHelloFirstRecordType(
+    allocator: std.mem.Allocator,
+    port: u16,
+    alpns: []const []const u8,
+    sni: []const u8,
+) !?u8 {
+    var msg = std.array_list.Managed(u8).init(allocator);
+    defer msg.deinit();
+    const key_pair = try std.crypto.dh.X25519.KeyPair.generateDeterministic([_]u8{0x33} ** 32);
+
+    try msg.appendSlice(&.{ 0x03, 0x03 }); // legacy_version
+    try msg.appendNTimes(0x77, 32); // random
+    try msg.append(0); // session_id
+    try msg.appendSlice(&.{ 0x00, 0x02, 0x13, 0x01 }); // TLS_AES_128_GCM_SHA256
+    try msg.appendSlice(&.{ 0x01, 0x00 }); // compression
+
+    var exts = std.array_list.Managed(u8).init(allocator);
+    defer exts.deinit();
+    try exts.appendSlice(&.{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 }); // supported_versions
+    try exts.appendSlice(&.{ 0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d }); // supported_groups
+    try exts.appendSlice(&.{ 0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x08, 0x07, 0x04, 0x03 }); // signature_algorithms (Ed25519, ECDSA P-256)
+    try exts.appendSlice(&.{ 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 }); // key_share
+    try exts.appendSlice(&key_pair.public_key);
+    var alpn_list_len: usize = 0;
+    for (alpns) |name| alpn_list_len += 1 + name.len;
+    try exts.appendSlice(&.{ 0x00, 0x10 });
+    try exts.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(alpn_list_len + 2))));
+    try exts.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(alpn_list_len))));
+    for (alpns) |name| {
+        try exts.append(@intCast(name.len));
+        try exts.appendSlice(name);
+    }
+    try exts.appendSlice(&.{ 0x00, 0x00 });
+    try exts.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(sni.len + 5))));
+    try exts.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(sni.len + 3))));
+    try exts.append(0); // host_name
+    try exts.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(sni.len))));
+    try exts.appendSlice(sni);
+
+    try msg.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(exts.items.len))));
+    try msg.appendSlice(exts.items);
+
+    var record = std.array_list.Managed(u8).init(allocator);
+    defer record.deinit();
+    const hs_len: u32 = @intCast(msg.items.len);
+    try record.appendSlice(&.{ 0x16, 0x03, 0x01 });
+    try record.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(hs_len + 4))));
+    try record.appendSlice(&.{ 0x01, @intCast(hs_len >> 16), @intCast((hs_len >> 8) & 0xff), @intCast(hs_len & 0xff) });
+    try record.appendSlice(msg.items);
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll(record.items);
+    var first: [1]u8 = undefined;
+    const n = stream.read(&first) catch |err| switch (err) {
+        error.ConnectionResetByPeer => return null,
+        else => return err,
+    };
+    if (n == 0) return null;
+    return first[0];
+}
+
 const acme_tls_alpn_duplicate_test_alpns = [_]tls_core.algorithms.ProtocolName{
     tls_core.algorithms.alpn.acme_tls_1,
     tls_core.algorithms.alpn.acme_tls_1,
@@ -23968,6 +24037,25 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", "wrong.tls-alpn-01.test");
     try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", "unregistered.tls-alpn-01.test");
     try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    // Duplicate-only `acme-tls/1` is not RFC 8737's exact singleton offer.
+    // `PureZigTlsClient` refuses to build it, so send the ClientHello as raw
+    // bytes over a real socket.  A control ClientHello that differs only by
+    // offering the token once proves the hand-built bytes are valid (the
+    // listener answers with a ServerHello handshake record, 0x16); the
+    // duplicate must be rejected before any ServerHello/certificate: the first
+    // thing back is a fatal alert record (0x15) or a bare close.
+    const control_record = try probeRawClientHelloFirstRecordType(allocator, tardigrade.port, &.{"acme-tls/1"}, host);
+    try std.testing.expectEqual(@as(?u8, 0x16), control_record);
+    const duplicate_record = try probeRawClientHelloFirstRecordType(allocator, tardigrade.port, &.{ "acme-tls/1", "acme-tls/1" }, host);
+    if (duplicate_record) |content_type| try std.testing.expectEqual(@as(u8, 0x15), content_type);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    // Ordinary traffic is still healthy after the negatives.
+    var after = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
+    defer after.deinit();
+    try std.testing.expectEqual(@as(u16, 200), after.status_code);
+    try waitForUpstreamCount(&upstream, 1, 2_000);
 }
 
 test "failure: malformed and stalled TLS handshakes are rejected without wedging the listener (#270)" {

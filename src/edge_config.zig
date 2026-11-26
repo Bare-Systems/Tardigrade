@@ -333,6 +333,17 @@ pub const EdgeConfig = struct {
     /// (docs/ACME_AUTOMATIC_HTTPS.md §8.0, #881). Startup-fixed; must differ
     /// from the main listener.
     tls_acme_http01_listen: []const u8,
+    /// `TARDIGRADE_ACME_TEST_TLS_ALPN_CHALLENGE` (`host:keyAuthorization`):
+    /// test-only activation seam (#939) for the native TLS-ALPN-01 challenge
+    /// registry, standing in for the order/activation orchestration that is
+    /// still a later child -- publishes exactly one challenge at startup so
+    /// an external TCP client can exercise the real shipping listener's
+    /// exclusive `acme-tls/1` negotiation and credential selection
+    /// end-to-end. Only ever read when `tls_acme_enabled` is also set, which
+    /// already requires `-Dacme-experimental` on every non-appliance native
+    /// build (see the `tls_acme_enabled` validation below); empty disables
+    /// it. Never documented as a supported operator-facing directive.
+    tls_acme_test_tls_alpn_challenge: []const u8,
     /// `TARDIGRADE_TLS_HTTPS_REDIRECT` (directive `https_redirect`, #884,
     /// design §8.3): optional `308` HTTP->HTTPS redirect served by the
     /// dedicated ACME HTTP-01 listener, for managed hosts only, only once
@@ -845,6 +856,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.tls_acme_domains_spec);
         allocator.free(self.tls_acme_challenges);
         allocator.free(self.tls_acme_http01_listen);
+        allocator.free(self.tls_acme_test_tls_alpn_challenge);
         allocator.free(self.trust_gateway_id);
         allocator.free(self.trust_shared_secret);
         for (self.trusted_upstream_identities) |id| allocator.free(id);
@@ -1132,6 +1144,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     };
     const tls_acme_http01_listen = acmeEnvOwned(allocator, "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", "", "0.0.0.0:80") catch unreachable;
     errdefer allocator.free(tls_acme_http01_listen);
+    // The synthetic challenge registry is a process-test seam, never an
+    // operator feature.  Compile its environment input out of normal and
+    // release ACME binaries so an inherited variable cannot authorize an
+    // arbitrary host.
+    const tls_acme_test_tls_alpn_challenge = if (build_options.acme_tls_alpn_test_hook_enabled)
+        acmeEnvOwned(allocator, "TARDIGRADE_ACME_TEST_TLS_ALPN_CHALLENGE", "", "") catch unreachable
+    else
+        allocator.dupe(u8, "") catch unreachable;
+    errdefer allocator.free(tls_acme_test_tls_alpn_challenge);
     // #884 (G8/design §8.3): naming it `TARDIGRADE_TLS_HTTPS_REDIRECT`
     // (not `..._HTTP_REDIRECT`) keeps it consistent with the generic
     // config-file directive alias (`https_redirect` -> `TARDIGRADE_HTTPS_REDIRECT`
@@ -1978,6 +1999,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_acme_challenges = tls_acme_challenges,
         .tls_acme_eab_requested = tls_acme_eab_requested,
         .tls_acme_http01_listen = tls_acme_http01_listen,
+        .tls_acme_test_tls_alpn_challenge = tls_acme_test_tls_alpn_challenge,
         .tls_https_redirect = tls_https_redirect,
         .http1_enabled = http1_enabled,
         .http2_enabled = http2_enabled,

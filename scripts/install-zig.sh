@@ -37,7 +37,26 @@ if [ ! -x "$zig_bin" ]; then
   trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 
   mkdir -p "$zig_dir"
-  curl -fsSL "$url" -o "$tmp_dir/$archive"
+  # Bound every attempt so a stalled mirror connection cannot consume a CI
+  # job's whole time limit: three attempts plus backoff stay under 8 minutes,
+  # inside the shortest (10 minute) job that runs this script.  A shell loop
+  # rather than `--retry`, so --max-time stalls are retried on old curls too.
+  attempt=1
+  max_attempts=3
+  until curl -fsSL \
+    --connect-timeout 20 \
+    --speed-limit 102400 --speed-time 30 \
+    --max-time 150 \
+    "$url" -o "$tmp_dir/$archive"; do
+    rm -f "$tmp_dir/$archive"
+    if [ "$attempt" -ge "$max_attempts" ]; then
+      echo "failed to download $url after $max_attempts attempts" >&2
+      exit 1
+    fi
+    echo "download attempt $attempt of $max_attempts failed; retrying" >&2
+    sleep $((attempt * 5))
+    attempt=$((attempt + 1))
+  done
   tar -xJf "$tmp_dir/$archive" -C "$zig_dir"
 fi
 

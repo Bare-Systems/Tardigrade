@@ -9,6 +9,8 @@ test {
     _ = @import("acme/renewal_state.zig");
     _ = @import("acme/tls_alpn_challenges.zig");
     _ = @import("acme/tls_alpn_identity.zig");
+    _ = @import("acme/tls_alpn_credential.zig");
+    _ = @import("acme/tls_alpn_handshake_tests.zig");
     _ = @import("acme/csr.zig");
     _ = @import("http/acme_tls_dialer.zig");
     _ = @import("http/acme_challenge_store.zig");

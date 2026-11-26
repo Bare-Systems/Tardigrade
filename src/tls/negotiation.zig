@@ -240,7 +240,7 @@ pub fn negotiateServerHello(policy: policy_mod.Policy, offers: *const ClientHell
         .{ .retry = named_group }
     else
         return error.MissingExtension;
-    const alpn = pickAlpn(policy.alpn_protocols, offers.alpn_protocols[0..offers.alpn_protocols_len]) orelse blk: {
+    const alpn = pickAlpn(policy.alpn_protocols, policy.exclusive_only_alpn_protocols, offers.alpn_protocols[0..offers.alpn_protocols_len]) orelse blk: {
         if (offers.alpn_protocols_len == 0 and policy.allow_absent_alpn) break :blk null;
         return error.NoMutualAlpn;
     };
@@ -382,8 +382,21 @@ fn containsEnum(comptime T: type, list: []const T, value: T) bool {
     return false;
 }
 
-fn pickAlpn(local_preference: []const algorithms.ProtocolName, peer_offers: []const algorithms.ProtocolName) ?algorithms.ProtocolName {
+/// `exclusive_only` entries only match a `peer_offers` that is *exactly*
+/// that one protocol (#939): a mixed or duplicated offer skips them
+/// entirely, even when it contains the protocol, falling through to a
+/// lower-preference ordinary candidate (or no match at all) exactly as if
+/// the exclusive-only protocol were not offered.
+fn pickAlpn(
+    local_preference: []const algorithms.ProtocolName,
+    exclusive_only: []const algorithms.ProtocolName,
+    peer_offers: []const algorithms.ProtocolName,
+) ?algorithms.ProtocolName {
     for (local_preference) |local| {
+        if (containsAlpn(exclusive_only, local)) {
+            if (peer_offers.len == 1 and peer_offers[0].eql(local)) return local;
+            continue;
+        }
         if (containsAlpn(peer_offers, local)) return local;
     }
     return null;
@@ -665,6 +678,76 @@ test "hello negotiation permits absent ALPN only when policy allows it" {
 
     policy.allow_absent_alpn = false;
     try testing.expectError(error.NoMutualAlpn, negotiateServerHello(policy, &offers));
+}
+
+const exclusive_alpn_protocol: algorithms.ProtocolName = .{ .bytes = "acme-tls/1" };
+
+fn baseOffersWithoutAlpn() !ClientHelloOffers {
+    var offers = ClientHelloOffers{};
+    try offers.appendVersion(.tls13);
+    try offers.appendCipherSuite(.tls_aes_128_gcm_sha256);
+    try offers.appendSupportedGroup(.x25519);
+    try offers.appendKeyShare(.{ .group = .x25519, .key_exchange = "share" });
+    return offers;
+}
+
+/// #939: a policy that, alongside ordinary h2/http1.1, recognizes
+/// `exclusive_alpn_protocol` only for an offer that is exactly that one
+/// protocol -- the shape every real native-listener ACME-enabled policy
+/// takes (`negotiated_dispatch.ListenerProtocolPolicy.nativeTlsPolicy`).
+fn exclusiveAlpnPolicy() policy_mod.Policy {
+    var policy = policy_mod.Policy.recordDefault();
+    policy.alpn_protocols = &exclusive_policy_alpns;
+    policy.exclusive_only_alpn_protocols = &exclusive_only_alpns;
+    return policy;
+}
+const exclusive_policy_alpns = [_]algorithms.ProtocolName{ algorithms.alpn.h2, algorithms.alpn.http_1_1, exclusive_alpn_protocol };
+const exclusive_only_alpns = [_]algorithms.ProtocolName{exclusive_alpn_protocol};
+
+test "an exclusive-only protocol negotiates when offered alone" {
+    var offers = try baseOffersWithoutAlpn();
+    try offers.appendAlpn(exclusive_alpn_protocol);
+
+    const selected = try negotiateServerHello(exclusiveAlpnPolicy(), &offers);
+    try testing.expect(selected.alpn.?.eql(exclusive_alpn_protocol));
+}
+
+test "an exclusive-only protocol never negotiates alongside an ordinary one, in either offer order" {
+    for ([_][2]algorithms.ProtocolName{
+        .{ algorithms.alpn.h2, exclusive_alpn_protocol },
+        .{ exclusive_alpn_protocol, algorithms.alpn.h2 },
+    }) |pair| {
+        var offers = try baseOffersWithoutAlpn();
+        try offers.appendAlpn(pair[0]);
+        try offers.appendAlpn(pair[1]);
+
+        const selected = try negotiateServerHello(exclusiveAlpnPolicy(), &offers);
+        try testing.expect(selected.alpn.?.eql(algorithms.alpn.h2));
+    }
+}
+
+test "an exclusive-only protocol never negotiates when mixed with an unrelated, non-policy protocol" {
+    var offers = try baseOffersWithoutAlpn();
+    try offers.appendAlpn(exclusive_alpn_protocol);
+    try offers.appendAlpn(.{ .bytes = "spdy/3" });
+
+    try testing.expectError(error.NoMutualAlpn, negotiateServerHello(exclusiveAlpnPolicy(), &offers));
+}
+
+test "an exclusive-only protocol never negotiates when duplicated" {
+    var offers = try baseOffersWithoutAlpn();
+    try offers.appendAlpn(exclusive_alpn_protocol);
+    try offers.appendAlpn(exclusive_alpn_protocol);
+
+    try testing.expectError(error.NoMutualAlpn, negotiateServerHello(exclusiveAlpnPolicy(), &offers));
+}
+
+test "an exclusive-only protocol absent from the offer leaves ordinary negotiation unaffected" {
+    var offers = try baseOffersWithoutAlpn();
+    try offers.appendAlpn(algorithms.alpn.http_1_1);
+
+    const selected = try negotiateServerHello(exclusiveAlpnPolicy(), &offers);
+    try testing.expect(selected.alpn.?.eql(algorithms.alpn.http_1_1));
 }
 
 test "ClientHello parser rejects present ALPN extension with empty protocol list" {

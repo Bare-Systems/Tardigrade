@@ -868,6 +868,14 @@ pub const Tls13Backend = struct {
     /// The selected credential held across a pending signature (released when
     /// the signature completes, or cancelled at teardown).
     pending_credential: ?credentials.SelectedCredential = null,
+    /// A server credential whose `pin_until_handshake_complete` opted out of
+    /// the ordinary "release once signed" lifecycle (#939): held from
+    /// `serverFinishFlight` through the actual handshake terminus -- the
+    /// peer's verified Finished (`onClientFinished`) on success, or `deinit`
+    /// on any failure/cancellation/timeout -- and released exactly once
+    /// there instead. Ordinary credentials never populate this field; they
+    /// are released immediately as before.
+    pinned_credential: ?credentials.SelectedCredential = null,
     /// Stable, engine-owned signature output buffer. An async signer keeps a
     /// pointer to this across the suspend; the engine reads it on completion.
     pending_signature: [max_signature_len]u8 = undefined,
@@ -2036,6 +2044,10 @@ pub const Tls13Backend = struct {
         // Cancel and release any parked async operation (and held credential)
         // exactly once before tearing down the rest.
         self.cancelPendingAuth();
+        // #939: a pinned server credential whose handshake never reached its
+        // success terminus (failure, cancellation, or timeout) is released
+        // here instead -- exactly once, whichever of the two is reached first.
+        self.releasePinnedCredential();
         crypto_pkg.secrets.secureZero(&self.pending_signature);
         crypto_pkg.secrets.secureZero(&self.pending_client_session_id);
         self.pending_client_session_id_len = 0;
@@ -2171,6 +2183,10 @@ pub const Tls13Backend = struct {
     /// not destroy them before the caller has had a chance to read them.
     fn clearFailedHandshakeState(self: *Tls13Backend) void {
         if (self.handshake_committed) return;
+        // A challenge credential is deliberately retained after the server
+        // flight, but a malformed client Finished is terminal too.  Do not
+        // wait for carrier teardown to return its registry lease.
+        self.releasePinnedCredential();
         self.clearClientPskOffersAborted();
         self.selected_client_psk.deinit();
         self.selected_client_psk_present = false;
@@ -2301,6 +2317,15 @@ pub const Tls13Backend = struct {
             alpn_total = checkedAdd(alpn_total, 1 + name.len) catch return error.InvalidTransportProfile;
             if (alpn_total > std.math.maxInt(u16) or alpn_total + 6 > max_message_len) return error.InvalidTransportProfile;
             for (self.policy.alpn_protocols[0..i]) |prior| {
+                if (prior.eql(protocol)) return error.InvalidTransportProfile;
+            }
+        }
+        // #939: every exclusive-only protocol must also be an ordinarily
+        // advertised one (its encode-length/duplicate bounds above already
+        // cover it) and must not repeat within this narrower list itself.
+        for (self.policy.exclusive_only_alpn_protocols, 0..) |protocol, i| {
+            if (!self.policy.containsAlpn(protocol.bytes)) return error.InvalidTransportProfile;
+            for (self.policy.exclusive_only_alpn_protocols[0..i]) |prior| {
                 if (prior.eql(protocol)) return error.InvalidTransportProfile;
             }
         }
@@ -4808,7 +4833,18 @@ pub const Tls13Backend = struct {
         // — the capture must survive for the async resume.
         errdefer self.clearClientHelloPsk();
 
-        try self.beginServerSelection(parsed.legacy_session_id, client_share, sink);
+        // #939: the complete offered ALPN protocol-name list, exactly as the
+        // peer sent it -- not merely the single negotiated result already
+        // captured in `self.selected_alpn` -- so a credential provider can
+        // require exclusive agreement on one protocol (ACME TLS-ALPN-01).
+        // Borrowed from `offers`, itself borrowed from `body`/`raw`: valid
+        // only for the remainder of this synchronous call, matching
+        // `SelectionContext`'s existing borrowed-input contract.
+        var offered_alpn_storage: [tls_negotiation.max_offers][]const u8 = undefined;
+        for (offers.alpn_protocols[0..offers.alpn_protocols_len], 0..) |protocol, i| offered_alpn_storage[i] = protocol.bytes;
+        const offered_alpn = offered_alpn_storage[0..offers.alpn_protocols_len];
+
+        try self.beginServerSelection(parsed.legacy_session_id, client_share, offered_alpn, sink);
     }
 
     /// Server (#484): asks the configured cookie provider for a cookie —
@@ -4887,6 +4923,7 @@ pub const Tls13Backend = struct {
         self: *Tls13Backend,
         session_id: []const u8,
         client_share: PeerKeyShare,
+        offered_alpn: []const []const u8,
         sink: *EventSink,
     ) HandshakeError!void {
         if (session_id.len > self.pending_client_session_id.len) return error.IllegalParameter;
@@ -4906,6 +4943,7 @@ pub const Tls13Backend = struct {
         };
 
         var selection = self.serverSelectionContext();
+        selection.offered_alpn_protocols = offered_alpn;
         // Selection may complete synchronously or return a pending operation
         // (e.g. an async SNI lookup); park the latter and resume later.
         switch (provider.selectCredential(&selection) catch |err|
@@ -5015,9 +5053,9 @@ pub const Tls13Backend = struct {
         if (psk_selected != null) {
             // PSK-resumed: no Certificate/CertificateVerify flight, so the
             // selected credential (already validated by the caller) is
-            // never consumed — release it here, on the one success path
-            // that reaches this branch.
-            credential.release();
+            // never consumed — release (or pin, #939) it here, on the one
+            // success path that reaches this branch.
+            self.releaseOrPinCredential(credential);
             owned = false;
             self.core.enterPskAuthenticated();
             return self.emitPskFinishFlight(sink);
@@ -5493,10 +5531,15 @@ pub const Tls13Backend = struct {
     }
 
     /// Emit CertificateVerify (with the completed signature) and Finished, then
-    /// the 1-RTT secrets. Releases the credential exactly once. Reachable both
-    /// synchronously and after resuming a pending signature.
+    /// the 1-RTT secrets. Releases (or pins, #939) the credential exactly
+    /// once. Reachable both synchronously and after resuming a pending
+    /// signature.
     fn serverFinishFlight(self: *Tls13Backend, credential: credentials.SelectedCredential, sig_len: usize, sink: *EventSink) HandshakeError!void {
-        defer credential.release();
+        // A pin begins only after the complete server flight and its secrets
+        // have been emitted successfully.  On any terminal emission/build
+        // error this credential was never admitted into the handshake-lifetime
+        // slot, so release it immediately instead.
+        errdefer credential.release();
         const schedule = &self.schedule.?;
         if (sig_len > self.pending_signature.len) return self.failCredential(.signature_output_overflow);
 
@@ -5541,6 +5584,7 @@ pub const Tls13Backend = struct {
         // arrives, over the transcript actually preceding it — which, under
         // handshake-time client authentication, includes the client's own
         // Certificate and CertificateVerify. See `onClientFinished`.
+        self.releaseOrPinCredential(credential);
     }
 
     // -----------------------------------------------------------------------
@@ -5727,6 +5771,28 @@ pub const Tls13Backend = struct {
         };
     }
 
+    /// Release `credential` now, unless it asked (#939) to be held through the
+    /// handshake's actual terminus -- in which case it is parked in
+    /// `pinned_credential` for `onClientFinished` (success) or `deinit`
+    /// (failure/cancellation/timeout) to release exactly once instead.
+    fn releaseOrPinCredential(self: *Tls13Backend, credential: credentials.SelectedCredential) void {
+        if (credential.pin_until_handshake_complete) {
+            self.pinned_credential = credential;
+        } else {
+            credential.release();
+        }
+    }
+
+    /// Release a still-pinned server credential exactly once -- called from
+    /// both the success terminus (`onClientFinished`) and teardown (`deinit`),
+    /// whichever is reached first; a no-op thereafter.
+    fn releasePinnedCredential(self: *Tls13Backend) void {
+        if (self.pinned_credential) |credential| {
+            credential.release();
+            self.pinned_credential = null;
+        }
+    }
+
     /// Cancel and release a parked operation (and any held credential) exactly
     /// once, on handshake teardown or failure.
     fn cancelPendingAuth(self: *Tls13Backend) void {
@@ -5763,6 +5829,9 @@ pub const Tls13Backend = struct {
         // Only now — every terminal fallible step above has succeeded — is
         // this handshake actually committed. See `clearFailedHandshakeState`.
         self.handshake_committed = true;
+        // #939: this is the server's success terminus -- release a pinned
+        // credential's handshake-lifetime hold here, exactly once.
+        self.releasePinnedCredential();
     }
 
     // -----------------------------------------------------------------------

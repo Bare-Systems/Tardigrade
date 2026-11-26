@@ -137,6 +137,17 @@ pub const SelectionContext = struct {
     /// The negotiated application protocol, when ALPN selected one.
     application_protocol: ?[]const u8,
     auth_policy: AuthPolicy,
+    /// Server role only: the peer's complete offered ALPN protocol-name list,
+    /// in ClientHello offer order (empty when ALPN was absent, when this side
+    /// is the client, or when the caller did not thread it through). Exists
+    /// so a provider can require *exclusive* agreement on one protocol --
+    /// e.g. ACME TLS-ALPN-01 (RFC 8737 S3), which a client must offer with no
+    /// other protocol alongside it -- rather than only seeing the single
+    /// negotiated result in `application_protocol`, which looks identical
+    /// whether the offer was exclusive or merely contained that protocol
+    /// among others. Valid only during the `select` call; see the module's
+    /// lifetime rules above.
+    offered_alpn_protocols: []const []const u8 = &.{},
 
     /// True when the peer offered `scheme`.
     pub fn offersScheme(self: SelectionContext, scheme: SignatureScheme) bool {
@@ -165,6 +176,18 @@ pub const SelectedCredential = struct {
     /// provider guarantees it is compatible with the selection context.
     scheme: SignatureScheme,
     vtable: *const VTable,
+    /// When true, the server-role engine does not call `release` as soon as
+    /// this credential's signature has been used (the ordinary, immediate
+    /// lifecycle) -- it instead holds the handle until the handshake's actual
+    /// terminus (the peer's verified Finished, or teardown on failure/
+    /// cancellation/timeout) and releases it exactly once there. For a
+    /// provider whose `release` frees more than just signing material --
+    /// e.g. a single-use authorization slot that must stay claimed for the
+    /// whole handshake, not merely through signing -- the ordinary immediate
+    /// release would let that slot be reused while this handshake is still
+    /// in flight. Defaults to false: every other credential's lifecycle is
+    /// unchanged.
+    pin_until_handshake_complete: bool = false,
 
     pub const VTable = struct {
         /// Return the credential's public DER chain as a borrowed view valid
@@ -1035,6 +1058,9 @@ pub const MockCredentialProvider = struct {
     select_count: usize = 0,
     sign_count: usize = 0,
     release_count: usize = 0,
+    /// Test-only opt-in for a selected handle whose owner needs to remain
+    /// alive until the peer Finished, rather than merely through signing.
+    pin_until_handshake_complete: bool = false,
     /// The last SNI selection saw, copied into mock-owned storage — the
     /// `SelectionContext.server_name` slice is only valid during `select`, so a
     /// mock that wants to remember it MUST NOT retain the borrowed slice.
@@ -1046,6 +1072,13 @@ pub const MockCredentialProvider = struct {
     last_application_protocol_present: bool = false,
     last_offered_scheme_count: usize = 0,
     last_role: ?Role = null,
+    /// The last selection's complete offered ALPN protocol list, copied into
+    /// mock-owned storage for the same reason as `last_server_name_buf`:
+    /// `SelectionContext.offered_alpn_protocols` is only valid during `select`
+    /// (#939).
+    last_offered_alpn_buf: [16][255]u8 = undefined,
+    last_offered_alpn_len: [16]usize = undefined,
+    last_offered_alpn_count: usize = 0,
 
     pub fn init(identity: Identity) MockCredentialProvider {
         return .{ .identity = identity, .chain_entry = .{identity.certificate_der} };
@@ -1065,8 +1098,16 @@ pub const MockCredentialProvider = struct {
         return if (self.last_application_protocol_present) self.last_application_protocol_buf[0..self.last_application_protocol_len] else null;
     }
 
+    /// The last selection's complete offered ALPN protocol list, as slices
+    /// into mock-owned storage (valid for the mock's lifetime, up to 16
+    /// entries).
+    pub fn lastOfferedAlpnProtocols(self: *const MockCredentialProvider, out: *[16][]const u8) []const []const u8 {
+        for (0..self.last_offered_alpn_count) |i| out[i] = self.last_offered_alpn_buf[i][0..self.last_offered_alpn_len[i]];
+        return out[0..self.last_offered_alpn_count];
+    }
+
     pub fn selectedCredential(self: *MockCredentialProvider) SelectedCredential {
-        return .{ .handle = self, .scheme = self.selectedScheme(), .vtable = &credential_vtable };
+        return .{ .handle = self, .scheme = self.selectedScheme(), .vtable = &credential_vtable, .pin_until_handshake_complete = self.pin_until_handshake_complete };
     }
 
     fn selectedScheme(self: *const MockCredentialProvider) SignatureScheme {
@@ -1098,6 +1139,12 @@ pub const MockCredentialProvider = struct {
             self.last_application_protocol_len = 0;
         }
         self.last_offered_scheme_count = selection.peer_signature_schemes.len;
+        self.last_offered_alpn_count = @min(selection.offered_alpn_protocols.len, self.last_offered_alpn_buf.len);
+        for (selection.offered_alpn_protocols[0..self.last_offered_alpn_count], 0..) |protocol, i| {
+            const n = @min(protocol.len, self.last_offered_alpn_buf[i].len);
+            @memcpy(self.last_offered_alpn_buf[i][0..n], protocol[0..n]);
+            self.last_offered_alpn_len[i] = n;
+        }
         if (self.force_select_error) |err| return err;
         const scheme = self.selectedScheme();
         if (!self.ignore_offer and !selection.offersScheme(scheme)) return error.NoCompatibleSignatureAlgorithm;

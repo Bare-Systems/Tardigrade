@@ -1,5 +1,6 @@
 zig-out/
 .zig-cache/
+.zig-cache-managed/
 .zig-global-cache/
 .zig-toolchain/
 __pycache__/

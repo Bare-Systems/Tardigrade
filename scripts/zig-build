@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Run a local Zig build with a bounded, isolated compiler cache (macOS/Linux)."""
+import fcntl
+import math
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+def cache_bytes(path):
+    total = 0
+    for directory, _, files in os.walk(path):
+        for name in files:
+            info = (Path(directory) / name).lstat()
+            total += info.st_blocks * 512
+    return total
+
+
+def trim(cache, limit):
+    size = sum(cache_bytes(cache / name) for name in ('local', 'global'))
+    if size <= limit:
+        return
+    print(f'Tardigrade: compiler cache uses {size / 2**30:.2f} GiB; '
+          f'exceeds {limit / 2**30:g} GiB limit, clearing it.', file=sys.stderr)
+    for name in ('local', 'global'):
+        path = cache / name
+        if path.is_symlink():
+            raise RuntimeError(f'Refusing to clear symlink: {path}')
+        if path.exists():
+            shutil.rmtree(path)
+
+
+def main():
+    repo = Path(__file__).resolve().parent.parent
+    cache = repo / '.zig-cache-managed'
+    limit_gb = float(os.environ.get('TARDIGRADE_CACHE_MAX_GB', '8'))
+    if not math.isfinite(limit_gb) or limit_gb <= 0:
+        raise ValueError('TARDIGRADE_CACHE_MAX_GB must be a positive finite number')
+    args = sys.argv[1:]
+    build_args = args[:args.index('--')] if '--' in args else args
+    for arg in build_args:
+        if any(arg == option or arg.startswith(option + '=')
+               for option in ('--cache-dir', '--global-cache-dir')):
+            raise ValueError('Cache paths are managed by this command; omit cache directory options')
+    if cache.is_symlink():
+        raise RuntimeError(f'Refusing symlink cache directory: {cache}')
+    cache.mkdir(exist_ok=True)
+    # Keep the lock outside the directories being removed. Each checkout has
+    # private caches; concurrent managed builds in that checkout serialize.
+    with (cache / 'build.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for name in ('local', 'global'):
+            if (cache / name).is_symlink():
+                raise RuntimeError(f'Refusing symlink cache directory: {cache / name}')
+        trim(cache, limit_gb * 2**30)
+        result = subprocess.run(
+            [os.environ.get('ZIG', 'zig'), 'build',
+             '--cache-dir', str(cache / 'local'),
+             '--global-cache-dir', str(cache / 'global'), *args], cwd=repo,
+            # If the wrapper is interrupted, Zig keeps the lock until it exits.
+            pass_fds=(lock.fileno(),))
+        # Only trim once Zig has exited, including on a nonzero build result.
+        # Interruptions skip trimming because a child may still be shutting down.
+        trim(cache, limit_gb * 2**30)
+        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f'Tardigrade: {error}', file=sys.stderr)
+        sys.exit(1)

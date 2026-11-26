@@ -14615,7 +14615,15 @@ const PureZigTlsClient = struct {
         psk_now_fn: ?*const fn (*anyopaque) i64 = null,
         early_data_intent: tls_core.tls13_backend.ClientEarlyDataIntent = .{},
         return_after_early_data_ready: bool = false,
+        /// Let the ClientHello out, then hold every later outbound byte at the
+        /// carrier (the client's Finished stays queued, never reaching the
+        /// server) until `releaseHeldWrites`.
+        hold_after_client_hello: bool = false,
     };
+
+    /// Transport-boundary write gate; see `Options.hold_after_client_hello`.
+    hold_writes_after_first: bool = false,
+    carrier_writes_completed: u32 = 0,
 
     allocator: std.mem.Allocator,
     stream: compat.NetStream,
@@ -14633,11 +14641,68 @@ const PureZigTlsClient = struct {
     }
 
     fn createWithOptions(allocator: std.mem.Allocator, port: u16, alpn: []const u8, server_name: ?[]const u8, options: Options) !*PureZigTlsClient {
+        return createWithPolicy(allocator, port, alpnPolicy(alpn), alpn, server_name, options);
+    }
+
+    fn expectHandshakeFailureWithAlpnOffer(allocator: std.mem.Allocator, port: u16, offered: []const tls_core.algorithms.ProtocolName, expected: []const u8, server_name: ?[]const u8) !void {
+        // Connect before allocating so a failed connect leaks nothing; once the
+        // client exists `destroy` owns both the allocation and the socket.
+        // Keep one cleanup owner: a failed handshake is the expected outcome
+        // for this helper, and a second errdefer would double-free it.
+        var stream = try compat.tcpConnectToHost(allocator, test_host, port);
+        const self = allocator.create(PureZigTlsClient) catch |err| {
+            stream.close();
+            return err;
+        };
+        self.* = .{ .allocator = allocator, .stream = stream };
+        defer self.destroy();
+        try setNonBlockingFd(self.stream.handle);
+        self.crypto_provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
+        const policy = tls_core.policy.Policy.fromCapabilities(.record, tls_core.tls13_backend.native_capabilities, offered);
+        self.backend = tls_core.tls13_backend.Tls13Backend.initClientConfigured(
+            try tls_core.production_crypto.freshHandshakeEntropy(),
+            self.cryptoProviderState().cryptoProvider(),
+            .insecure_no_verification,
+            tls_core.tls13_backend.recordConfig(policy),
+            .{ .server_name = server_name },
+        );
+        self.record = try tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(allocator, .client, self.cryptoProviderState().cryptoProvider(), .tls_aes_128_gcm_sha256, self.carrier(), self.backend.backend());
+        self.record.allow_unverified_certificate = true;
+        try self.record.setExpectedAlpn(expected);
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            _ = self.record.drive() catch |err| switch (err) {
+                error.EndOfStream,
+                error.TruncatedStream,
+                error.DecryptError,
+                error.PeerFatalAlert,
+                error.UnexpectedHandshakeMessage,
+                => {
+                    if (self.backend.peer_chain_count != 0) return error.UnexpectedPeerCertificate;
+                    return;
+                },
+                else => return err,
+            };
+            if (self.record.applicationDataOpen()) return error.TestUnexpectedResult;
+            self.waitForReadiness(100) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                error.ConnectionResetByPeer => {
+                    if (self.backend.peer_chain_count != 0) return error.UnexpectedPeerCertificate;
+                    return;
+                },
+                else => return err,
+            };
+        }
+        return error.ReadTimeout;
+    }
+
+    fn createWithPolicy(allocator: std.mem.Allocator, port: u16, policy: tls_core.policy.Policy, expected_alpn: []const u8, server_name: ?[]const u8, options: Options) !*PureZigTlsClient {
         const self = try allocator.create(PureZigTlsClient);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .stream = try compat.tcpConnectToHost(allocator, test_host, port),
+            .hold_writes_after_first = options.hold_after_client_hello,
         };
         errdefer self.stream.close();
         try setNonBlockingFd(self.stream.handle);
@@ -14647,7 +14712,7 @@ const PureZigTlsClient = struct {
             try tls_core.production_crypto.freshHandshakeEntropy(),
             self.cryptoProviderState().cryptoProvider(),
             .insecure_no_verification,
-            tls_core.tls13_backend.recordConfig(alpnPolicy(alpn)),
+            tls_core.tls13_backend.recordConfig(policy),
             .{ .server_name = server_name },
         );
         if (options.ticket_consumer != null or options.psk_lease != null or options.psk_offers != null) {
@@ -14683,7 +14748,7 @@ const PureZigTlsClient = struct {
             self.backend.backend(),
         );
         self.record.allow_unverified_certificate = true;
-        try self.record.setExpectedAlpn(alpn);
+        try self.record.setExpectedAlpn(expected_alpn);
         if (options.return_after_early_data_ready) {
             try self.driveUntilEarlyDataReady(5_000);
             return self;
@@ -14727,9 +14792,27 @@ const PureZigTlsClient = struct {
 
         const deadline = compat.milliTimestamp() + 5_000;
         while (compat.milliTimestamp() < deadline) {
-            _ = self.record.drive() catch return;
+            _ = self.record.drive() catch |err| switch (err) {
+                error.EndOfStream,
+                error.TruncatedStream,
+                error.DecryptError,
+                error.PeerFatalAlert,
+                error.UnexpectedHandshakeMessage,
+                => {
+                    if (self.backend.peer_chain_count != 0) return error.UnexpectedPeerCertificate;
+                    return;
+                },
+                else => return err,
+            };
             if (self.record.applicationDataOpen()) return error.TestUnexpectedResult;
-            try self.waitForReadiness(100);
+            self.waitForReadiness(100) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                error.ConnectionResetByPeer => {
+                    if (self.backend.peer_chain_count != 0) return error.UnexpectedPeerCertificate;
+                    return;
+                },
+                else => return err,
+            };
         }
         return error.ReadTimeout;
     }
@@ -14757,12 +14840,21 @@ const PureZigTlsClient = struct {
         };
     }
 
+    /// A single poll slice with no data is not a failure: the caller's own
+    /// overall deadline decides when the handshake has genuinely stalled.
+    fn waitForReadinessOrRetry(self: *PureZigTlsClient, slice_ms: u64) !void {
+        self.waitForReadiness(slice_ms) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return err,
+        };
+    }
+
     fn driveUntilOpen(self: *PureZigTlsClient, timeout_ms: u64) !void {
         const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
         while (compat.milliTimestamp() < deadline) {
             const driven = try self.record.drive();
             if (self.record.applicationDataOpen()) return;
-            if (!driven.made_progress) try self.waitForReadiness(100);
+            if (!driven.made_progress) try self.waitForReadinessOrRetry(100);
         }
         return error.ReadTimeout;
     }
@@ -14773,7 +14865,7 @@ const PureZigTlsClient = struct {
             const driven = try self.record.drive();
             if (self.backend.earlyDataAttempted() and self.record.stream().readiness().can_write_plaintext) return;
             if (self.record.applicationDataOpen()) return error.EarlyDataNotAttempted;
-            if (!driven.made_progress) try self.waitForReadiness(100);
+            if (!driven.made_progress) try self.waitForReadinessOrRetry(100);
         }
         return error.ReadTimeout;
     }
@@ -14839,6 +14931,17 @@ const PureZigTlsClient = struct {
         }
         if (out.items.len == 0) return error.ReadTimeout;
         return out.toOwnedSlice();
+    }
+
+    /// The TLS-ALPN-01 listener outcome is terminal at the transport layer:
+    /// unlike an idle HTTP connection, it must actually close its TCP peer.
+    fn expectTransportClose(self: *PureZigTlsClient, timeout_ms: i32) !void {
+        var one: [1]u8 = undefined;
+        const n = readSocketWithPoll(self.stream.handle, &one, timeout_ms) catch |err| switch (err) {
+            error.ConnectionResetByPeer => return,
+            else => return err,
+        };
+        if (n != 0) return error.UnexpectedTransportData;
     }
 
     fn readExactPlain(self: *PureZigTlsClient, out: []u8, timeout_ms: u64) !void {
@@ -14933,17 +15036,128 @@ const PureZigTlsClient = struct {
 
     fn carrierWrite(ptr: *anyopaque, bytes: []const u8) tls_core.encrypted_stream.Error!usize {
         const self: *PureZigTlsClient = @ptrCast(@alignCast(ptr));
-        return writeFdNonblocking(self.stream.handle, bytes);
+        if (self.hold_writes_after_first and self.carrier_writes_completed >= 1) return error.WouldBlock;
+        const n = try writeFdNonblocking(self.stream.handle, bytes);
+        if (n > 0) self.carrier_writes_completed += 1;
+        return n;
+    }
+
+    fn releaseHeldWrites(self: *PureZigTlsClient) void {
+        self.hold_writes_after_first = false;
     }
 };
 
 const tardigrade_test_alpns = [_]tls_core.algorithms.ProtocolName{.{ .bytes = "tardigrade-test" }};
+// #939: an exclusive, single-protocol offer -- exactly the shape a real RFC
+// 8737 TLS-ALPN-01 validation client sends.
+const acme_tls_alpn_test_alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.acme_tls_1};
+/// Failure diagnostic: dump the tail of a Tardigrade process's error log so a
+/// CI-only listener stall shows what the server side was doing.
+fn dumpTardigradeLogTail(allocator: std.mem.Allocator, log_path: []const u8) void {
+    const bytes = compat.cwd().readFileAlloc(allocator, log_path, 1024 * 1024) catch return;
+    defer allocator.free(bytes);
+    const tail = if (bytes.len > 16 * 1024) bytes[bytes.len - 16 * 1024 ..] else bytes;
+    std.debug.print("---- tardigrade log tail ({s}) ----\n{s}\n---- end log ----\n", .{ log_path, tail });
+}
+
+/// Writes a minimal, well-formed TLS 1.3 ClientHello record (X25519 share,
+/// Ed25519 + ECDSA P-256 signature schemes, caller-chosen ALPN vector and SNI) to a real TCP
+/// socket and reports the content type of the first record the server sends
+/// back, or null when it closes/resets without sending anything.  Used for
+/// offers the policy-validating `PureZigTlsClient` refuses to construct, so
+/// the bytes provably reach the listener.
+fn probeRawClientHelloFirstRecordType(
+    allocator: std.mem.Allocator,
+    port: u16,
+    alpns: []const []const u8,
+    sni: []const u8,
+) !?u8 {
+    var msg = std.array_list.Managed(u8).init(allocator);
+    defer msg.deinit();
+    const key_pair = try std.crypto.dh.X25519.KeyPair.generateDeterministic([_]u8{0x33} ** 32);
+
+    try msg.appendSlice(&.{ 0x03, 0x03 }); // legacy_version
+    try msg.appendNTimes(0x77, 32); // random
+    try msg.append(0); // session_id
+    try msg.appendSlice(&.{ 0x00, 0x02, 0x13, 0x01 }); // TLS_AES_128_GCM_SHA256
+    try msg.appendSlice(&.{ 0x01, 0x00 }); // compression
+
+    var exts = std.array_list.Managed(u8).init(allocator);
+    defer exts.deinit();
+    try exts.appendSlice(&.{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 }); // supported_versions
+    try exts.appendSlice(&.{ 0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d }); // supported_groups
+    try exts.appendSlice(&.{ 0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x08, 0x07, 0x04, 0x03 }); // signature_algorithms (Ed25519, ECDSA P-256)
+    try exts.appendSlice(&.{ 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 }); // key_share
+    try exts.appendSlice(&key_pair.public_key);
+    var alpn_list_len: usize = 0;
+    for (alpns) |name| alpn_list_len += 1 + name.len;
+    try exts.appendSlice(&.{ 0x00, 0x10 });
+    try exts.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(alpn_list_len + 2))));
+    try exts.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(alpn_list_len))));
+    for (alpns) |name| {
+        try exts.append(@intCast(name.len));
+        try exts.appendSlice(name);
+    }
+    try exts.appendSlice(&.{ 0x00, 0x00 });
+    try exts.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(sni.len + 5))));
+    try exts.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(sni.len + 3))));
+    try exts.append(0); // host_name
+    try exts.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(sni.len))));
+    try exts.appendSlice(sni);
+
+    try msg.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(exts.items.len))));
+    try msg.appendSlice(exts.items);
+
+    var record = std.array_list.Managed(u8).init(allocator);
+    defer record.deinit();
+    const hs_len: u32 = @intCast(msg.items.len);
+    try record.appendSlice(&.{ 0x16, 0x03, 0x01 });
+    try record.appendSlice(&std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(hs_len + 4))));
+    try record.appendSlice(&.{ 0x01, @intCast(hs_len >> 16), @intCast((hs_len >> 8) & 0xff), @intCast(hs_len & 0xff) });
+    try record.appendSlice(msg.items);
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll(record.items);
+    var first: [1]u8 = undefined;
+    const n = stream.read(&first) catch |err| switch (err) {
+        error.ConnectionResetByPeer => return null,
+        else => return err,
+    };
+    if (n == 0) return null;
+    return first[0];
+}
+
+const acme_tls_alpn_duplicate_test_alpns = [_]tls_core.algorithms.ProtocolName{
+    tls_core.algorithms.alpn.acme_tls_1,
+    tls_core.algorithms.alpn.acme_tls_1,
+};
+const acme_tls_alpn_h2_mixed_test_alpns = [_]tls_core.algorithms.ProtocolName{
+    tls_core.algorithms.alpn.acme_tls_1,
+    tls_core.algorithms.alpn.h2,
+};
+const h2_acme_tls_alpn_mixed_test_alpns = [_]tls_core.algorithms.ProtocolName{
+    tls_core.algorithms.alpn.h2,
+    tls_core.algorithms.alpn.acme_tls_1,
+};
+const acme_tls_alpn_http1_mixed_test_alpns = [_]tls_core.algorithms.ProtocolName{
+    tls_core.algorithms.alpn.acme_tls_1,
+    tls_core.algorithms.alpn.http_1_1,
+};
+const http1_acme_tls_alpn_mixed_test_alpns = [_]tls_core.algorithms.ProtocolName{
+    tls_core.algorithms.alpn.http_1_1,
+    tls_core.algorithms.alpn.acme_tls_1,
+};
 
 fn alpnPolicy(alpn: []const u8) tls_core.policy.Policy {
     if (std.mem.eql(u8, alpn, "h2")) return tls_core.policy.Policy.recordH2Only();
     if (std.mem.eql(u8, alpn, "http/1.1")) return tls_core.policy.Policy.recordHttp1Only(false);
     if (std.mem.eql(u8, alpn, "tardigrade-test")) {
         return tls_core.policy.Policy.fromCapabilities(.record, tls_core.tls13_backend.native_capabilities, &tardigrade_test_alpns);
+    }
+    if (std.mem.eql(u8, alpn, "acme-tls/1")) {
+        return tls_core.policy.Policy.fromCapabilities(.record, tls_core.tls13_backend.native_capabilities, &acme_tls_alpn_test_alpns);
     }
     var policy = tls_core.policy.Policy.recordDefault();
     policy.alpn_protocols = &.{};
@@ -23664,6 +23878,262 @@ test "native TLS listener rejects unsupported ALPN before HTTP dispatch" {
     defer control.deinit();
     try std.testing.expectEqual(@as(u16, 200), control.status_code);
     try assertContains(control.body, "negative-control");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+}
+
+test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge and closes without HTTP dispatch (#939)" {
+    // ACME is never valid on the appliance profile, and enabling it here
+    // (even just to populate the test-only registry seam) requires the same
+    // `-Dacme-experimental` gate every other live ACME integration case does.
+    try requireGenericNativeTlsProfile();
+    if (!integration_options.acme_experimental) return error.SkipZigTest;
+    if (!integration_options.acme_tls_alpn_test_hook_enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const fixture_cert_pem = try compat.cwd().readFileAlloc(allocator, tls_paths.cert_path, 256 * 1024);
+    defer allocator.free(fixture_cert_pem);
+    const fixture_chain = try tls_core.identity_loader.certChainFromPemOrDer(allocator, fixture_cert_pem);
+    defer {
+        for (fixture_chain) |entry| allocator.free(entry);
+        allocator.free(fixture_chain);
+    }
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "unexpected-acme-dispatch", .connection_header = "close" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    const state_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-acme-tls-alpn-{d}", .{compat.nanoTimestamp()});
+    defer allocator.free(state_rel);
+    try compat.cwd().makePath(state_rel);
+    defer compat.cwd().deleteTree(state_rel) catch {};
+
+    const http01_port = try findFreePort();
+    const http01_listen = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{http01_port});
+    defer allocator.free(http01_listen);
+
+    // RFC 8555 S8.1 shape: `token "." thumbprint`. The thumbprint must be the
+    // canonical unpadded base64url encoding of a 32-byte digest -- producing
+    // it through the real encoder (rather than a hand-picked literal)
+    // guarantees that round-trip property.
+    const token = "a" ** 32;
+    const thumbprint_bytes: [32]u8 = [_]u8{0x7a} ** 32;
+    var thumbprint: [43]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&thumbprint, &thumbprint_bytes);
+    const key_authorization = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ token, thumbprint });
+    defer allocator.free(key_authorization);
+    const host = "a.tls-alpn-01.test";
+    const challenge_value = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ host, key_authorization });
+    defer allocator.free(challenge_value);
+    const sni_certs = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ host, tls_paths.cert_path, tls_paths.key_path });
+    defer allocator.free(sni_certs);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            // Deliberately unreachable (nothing listens on port 1): nothing
+            // in this case depends on the order/renewal worker ever actually
+            // reaching a CA -- only on the listener's own ALPN wiring and the
+            // test-only registry seam below.
+            .{ .name = "TARDIGRADE_TLS_AUTOMATIC_HTTPS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_AGREE_TOS", .value = "true" },
+            .{ .name = "TARDIGRADE_TLS_ACME_STATE_DIR", .value = state_rel },
+            .{ .name = "TARDIGRADE_TLS_ACME_DOMAINS", .value = "example.com" },
+            .{ .name = "TARDIGRADE_TLS_ACME_DIRECTORY_URL", .value = "https://127.0.0.1:1/directory" },
+            .{ .name = "TARDIGRADE_TLS_ACME_CA_BUNDLE_PATH", .value = "src/pki/testdata/ecdsa_p256_ca.crt" },
+            .{ .name = "TARDIGRADE_TLS_ACME_HTTP01_LISTEN", .value = http01_listen },
+            .{ .name = "TARDIGRADE_ACME_TEST_TLS_ALPN_CHALLENGE", .value = challenge_value },
+            // An explicit ordinary SNI mapping for the challenge host (same
+            // committed fixture identity) so ordinary offers naming it are
+            // served the committed leaf; production SNI policy is untouched.
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+        },
+    });
+    defer tardigrade.stop();
+    errdefer dumpTardigradeLogTail(allocator, tardigrade.log_path);
+
+    // 1. Ordinary HTTPS on the exact same listener, same port, is unaffected
+    //    by the ACME-ALPN wrapper (#939 requirement: never changes ordinary
+    //    ALPN behavior).
+    var control = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
+    defer control.deinit();
+    try std.testing.expectEqual(@as(u16, 200), control.status_code);
+    try assertContains(control.body, "unexpected-acme-dispatch");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+    try upstream.resetCapture();
+
+    // A normal HTTPS client may happen to offer the ACME token alongside an
+    // HTTP protocol.  RFC 8737 says that is not a validation offer: prove the
+    // shipping listener selects the ordinary protocol and the committed leaf,
+    // never the ephemeral challenge identity, for both supported HTTP ALPNs.
+    inline for (.{
+        .{ &acme_tls_alpn_h2_mixed_test_alpns, "h2" },
+        .{ &h2_acme_tls_alpn_mixed_test_alpns, "h2" },
+        .{ &acme_tls_alpn_http1_mixed_test_alpns, "http/1.1" },
+        .{ &http1_acme_tls_alpn_mixed_test_alpns, "http/1.1" },
+    }) |case| {
+        const mixed_policy = tls_core.policy.Policy.fromCapabilities(
+            .record,
+            tls_core.tls13_backend.native_capabilities,
+            case[0],
+        );
+        const mixed = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, mixed_policy, case[1], host, .{});
+        defer mixed.destroy();
+        try std.testing.expectEqualStrings(case[1], mixed.backend.selectedAlpn().?);
+        const entry = mixed.backend.peer_chain_entries[0];
+        const leaf = mixed.backend.peer_chain[entry.start..][0..entry.len];
+        try std.testing.expectEqualSlices(u8, fixture_chain[0], leaf);
+    }
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    // 2. A real external TCP client (this repo's own native TLS engine, not
+    //    Tardigrade's server-side code) offering *exclusively* `acme-tls/1`
+    //    for the seeded host completes a full TLS 1.3 handshake through the
+    //    actual shipping listener and SNI/credential-selection path.
+    // Hold the client's Finished at the transport boundary: the ClientHello
+    // goes out, every later outbound byte stays queued until released.  The
+    // server therefore cannot see Finished, so the challenge handshake (and
+    // its registry gate slot) is provably still pending below.
+    const client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "acme-tls/1", host, .{ .hold_after_client_hello = true });
+    defer client.destroy();
+    try std.testing.expect(client.record.applicationDataOpen());
+    try std.testing.expect(client.record.queuedCiphertextLen() > 0);
+
+    // Ordinary traffic overlapping the pending challenge must keep its
+    // committed identity: a mixed-offer H2 handshake naming the challenge
+    // host with a real H2 request, a mixed-offer HTTP/1.1 handshake with a
+    // real request, and a plain HTTP/1.1 request.
+    {
+        const h2_policy = tls_core.policy.Policy.fromCapabilities(
+            .record,
+            tls_core.tls13_backend.native_capabilities,
+            &h2_acme_tls_alpn_mixed_test_alpns,
+        );
+        {
+            const overlap_h2 = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, h2_policy, "h2", host, .{});
+            defer overlap_h2.destroy();
+            try std.testing.expectEqualStrings("h2", overlap_h2.backend.selectedAlpn().?);
+            const h2_entry = overlap_h2.backend.peer_chain_entries[0];
+            try std.testing.expectEqualSlices(u8, fixture_chain[0], overlap_h2.backend.peer_chain[h2_entry.start..][0..h2_entry.len]);
+            try overlap_h2.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            try overlap_h2.writeHttp2Frame(0x4, 0, 0, &.{});
+            try h2SendHeaders(overlap_h2, allocator, 1, true, &.{
+                .{ .name = ":method", .value = "GET" },
+                .{ .name = ":path", .value = "/healthz" },
+                .{ .name = ":scheme", .value = "https" },
+                .{ .name = ":authority", .value = host },
+            });
+            try h2DrainOrdinaryResponse(overlap_h2, allocator, 1, 200, null, &.{}, 50);
+        }
+
+        const h1_policy = tls_core.policy.Policy.fromCapabilities(
+            .record,
+            tls_core.tls13_backend.native_capabilities,
+            &http1_acme_tls_alpn_mixed_test_alpns,
+        );
+        const overlap_h1 = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, h1_policy, "http/1.1", host, .{});
+        defer overlap_h1.destroy();
+        try std.testing.expectEqualStrings("http/1.1", overlap_h1.backend.selectedAlpn().?);
+        const h1_entry = overlap_h1.backend.peer_chain_entries[0];
+        try std.testing.expectEqualSlices(u8, fixture_chain[0], overlap_h1.backend.peer_chain[h1_entry.start..][0..h1_entry.len]);
+        try overlap_h1.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: a.tls-alpn-01.test\r\nConnection: close\r\n\r\n");
+        const raw = try overlap_h1.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(raw);
+        try assertContains(raw, "200");
+
+        var overlap_http = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
+        defer overlap_http.deinit();
+        try std.testing.expectEqual(@as(u16, 200), overlap_http.status_code);
+        try waitForUpstreamCount(&upstream, 3, 2_000);
+        try upstream.resetCapture();
+    }
+
+    // The challenge client's Finished was withheld the whole time: still
+    // queued, never delivered.
+    try std.testing.expect(client.record.queuedCiphertextLen() > 0);
+
+    // Release the barrier and flush Finished so the server verifies it and
+    // takes its terminal challenge-close path.
+    client.releaseHeldWrites();
+    {
+        const flush_deadline = compat.milliTimestamp() + 5_000;
+        while (client.record.queuedCiphertextLen() > 0) {
+            if (compat.milliTimestamp() >= flush_deadline) return error.WriteFailed;
+            _ = try client.record.drive();
+        }
+    }
+
+    const served_entry = client.backend.peer_chain_entries[0];
+    const served_leaf = client.backend.peer_chain[served_entry.start..][0..served_entry.len];
+
+    // Independent decode: Zig std's own X.509 parser (never Tardigrade's),
+    // self-verifying the signature under the certificate's own embedded key
+    // and checking the exact hostname and validity window.
+    const std_cert = std.crypto.Certificate{ .buffer = served_leaf, .index = 0 };
+    const parsed = try std_cert.parse();
+    try parsed.verify(parsed, compat.unixTimestamp());
+    try parsed.verifyHostName(host);
+
+    // RFC 8737 S3: the critical `id-pe-acmeIdentifier` extension (OID
+    // 1.3.6.1.5.5.7.1.31) carries exactly SHA-256(keyAuthorization) as its
+    // DER OCTET STRING payload. Checked as a raw byte pattern -- independent
+    // of any x509 parser, Tardigrade's or std's -- exactly as
+    // `tls_alpn_identity.zig`'s own unit tests independently verify it.
+    var expected_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key_authorization, &expected_digest, .{});
+    const acme_identifier_prefix = [_]u8{ 0x30, 0x00, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x1f, 0x01, 0x01, 0xff, 0x04, 0x22, 0x04, 0x20 };
+    var acme_identifier_pattern: [acme_identifier_prefix.len + 32]u8 = undefined;
+    @memcpy(acme_identifier_pattern[0..acme_identifier_prefix.len], &acme_identifier_prefix);
+    @memcpy(acme_identifier_pattern[acme_identifier_prefix.len..], &expected_digest);
+    acme_identifier_pattern[1] = @intCast(acme_identifier_pattern.len - 2);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, served_leaf, &acme_identifier_pattern));
+
+    // 3. The handshake itself *is* the validation (#939): the listener
+    // closes the transport and never enters HTTP dispatch.
+    try client.expectTransportClose(1_000);
+    compat.sleepNs(100 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    // 4. The exclusive protocol is a commitment, not a way to obtain a
+    // default certificate.  Exercise the actual TCP listener for no SNI,
+    // wrong SNI, and an unregistered name; each must fail before HTTP
+    // dispatch.  This deliberately uses the same ClientHello shape as the
+    // successful validation above.
+    try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", null);
+    try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", "wrong.tls-alpn-01.test");
+    try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "acme-tls/1", "unregistered.tls-alpn-01.test");
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    // Duplicate-only `acme-tls/1` is not RFC 8737's exact singleton offer.
+    // `PureZigTlsClient` refuses to build it, so send the ClientHello as raw
+    // bytes over a real socket.  A control ClientHello that differs only by
+    // offering the token once proves the hand-built bytes are valid (the
+    // listener answers with a ServerHello handshake record, 0x16); the
+    // duplicate must be rejected before any ServerHello/certificate: the first
+    // thing back is a fatal alert record (0x15) or a bare close.
+    const control_record = try probeRawClientHelloFirstRecordType(allocator, tardigrade.port, &.{"acme-tls/1"}, host);
+    try std.testing.expectEqual(@as(?u8, 0x16), control_record);
+    const duplicate_record = try probeRawClientHelloFirstRecordType(allocator, tardigrade.port, &.{ "acme-tls/1", "acme-tls/1" }, host);
+    if (duplicate_record) |content_type| try std.testing.expectEqual(@as(u8, 0x15), content_type);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    // Ordinary traffic is still healthy after the negatives.
+    var after = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
+    defer after.deinit();
+    try std.testing.expectEqual(@as(u16, 200), after.status_code);
     try waitForUpstreamCount(&upstream, 1, 2_000);
 }
 

@@ -14615,7 +14615,15 @@ const PureZigTlsClient = struct {
         psk_now_fn: ?*const fn (*anyopaque) i64 = null,
         early_data_intent: tls_core.tls13_backend.ClientEarlyDataIntent = .{},
         return_after_early_data_ready: bool = false,
+        /// Let the ClientHello out, then hold every later outbound byte at the
+        /// carrier (the client's Finished stays queued, never reaching the
+        /// server) until `releaseHeldWrites`.
+        hold_after_client_hello: bool = false,
     };
+
+    /// Transport-boundary write gate; see `Options.hold_after_client_hello`.
+    hold_writes_after_first: bool = false,
+    carrier_writes_completed: u32 = 0,
 
     allocator: std.mem.Allocator,
     stream: compat.NetStream,
@@ -14694,6 +14702,7 @@ const PureZigTlsClient = struct {
         self.* = .{
             .allocator = allocator,
             .stream = try compat.tcpConnectToHost(allocator, test_host, port),
+            .hold_writes_after_first = options.hold_after_client_hello,
         };
         errdefer self.stream.close();
         try setNonBlockingFd(self.stream.handle);
@@ -15027,7 +15036,14 @@ const PureZigTlsClient = struct {
 
     fn carrierWrite(ptr: *anyopaque, bytes: []const u8) tls_core.encrypted_stream.Error!usize {
         const self: *PureZigTlsClient = @ptrCast(@alignCast(ptr));
-        return writeFdNonblocking(self.stream.handle, bytes);
+        if (self.hold_writes_after_first and self.carrier_writes_completed >= 1) return error.WouldBlock;
+        const n = try writeFdNonblocking(self.stream.handle, bytes);
+        if (n > 0) self.carrier_writes_completed += 1;
+        return n;
+    }
+
+    fn releaseHeldWrites(self: *PureZigTlsClient) void {
+        self.hold_writes_after_first = false;
     }
 };
 
@@ -23987,34 +24003,78 @@ test "native TLS listener negotiates RFC 8737 TLS-ALPN-01 for a seeded challenge
     //    Tardigrade's server-side code) offering *exclusively* `acme-tls/1`
     //    for the seeded host completes a full TLS 1.3 handshake through the
     //    actual shipping listener and SNI/credential-selection path.
-    const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "acme-tls/1", host);
+    // Hold the client's Finished at the transport boundary: the ClientHello
+    // goes out, every later outbound byte stays queued until released.  The
+    // server therefore cannot see Finished, so the challenge handshake (and
+    // its registry gate slot) is provably still pending below.
+    const client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "acme-tls/1", host, .{ .hold_after_client_hello = true });
     defer client.destroy();
+    try std.testing.expect(client.record.applicationDataOpen());
+    try std.testing.expect(client.record.queuedCiphertextLen() > 0);
 
-    // The challenge handshake is still pinned (client Finished not yet
-    // flushed).  Ordinary traffic overlapping it must keep its committed
-    // identity: a mixed-offer handshake naming the challenge host and a plain
-    // HTTP/1.1 request.
+    // Ordinary traffic overlapping the pending challenge must keep its
+    // committed identity: a mixed-offer H2 handshake naming the challenge
+    // host with a real H2 request, a mixed-offer HTTP/1.1 handshake with a
+    // real request, and a plain HTTP/1.1 request.
     {
-        const overlap_policy = tls_core.policy.Policy.fromCapabilities(
+        const h2_policy = tls_core.policy.Policy.fromCapabilities(
             .record,
             tls_core.tls13_backend.native_capabilities,
             &h2_acme_tls_alpn_mixed_test_alpns,
         );
-        const overlap = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, overlap_policy, "h2", host, .{});
-        defer overlap.destroy();
-        const overlap_entry = overlap.backend.peer_chain_entries[0];
-        try std.testing.expectEqualSlices(u8, fixture_chain[0], overlap.backend.peer_chain[overlap_entry.start..][0..overlap_entry.len]);
+        {
+            const overlap_h2 = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, h2_policy, "h2", host, .{});
+            defer overlap_h2.destroy();
+            try std.testing.expectEqualStrings("h2", overlap_h2.backend.selectedAlpn().?);
+            const h2_entry = overlap_h2.backend.peer_chain_entries[0];
+            try std.testing.expectEqualSlices(u8, fixture_chain[0], overlap_h2.backend.peer_chain[h2_entry.start..][0..h2_entry.len]);
+            try overlap_h2.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            try overlap_h2.writeHttp2Frame(0x4, 0, 0, &.{});
+            try h2SendHeaders(overlap_h2, allocator, 1, true, &.{
+                .{ .name = ":method", .value = "GET" },
+                .{ .name = ":path", .value = "/healthz" },
+                .{ .name = ":scheme", .value = "https" },
+                .{ .name = ":authority", .value = host },
+            });
+            try h2DrainOrdinaryResponse(overlap_h2, allocator, 1, 200, null, &.{}, 50);
+        }
+
+        const h1_policy = tls_core.policy.Policy.fromCapabilities(
+            .record,
+            tls_core.tls13_backend.native_capabilities,
+            &http1_acme_tls_alpn_mixed_test_alpns,
+        );
+        const overlap_h1 = try PureZigTlsClient.createWithPolicy(allocator, tardigrade.port, h1_policy, "http/1.1", host, .{});
+        defer overlap_h1.destroy();
+        try std.testing.expectEqualStrings("http/1.1", overlap_h1.backend.selectedAlpn().?);
+        const h1_entry = overlap_h1.backend.peer_chain_entries[0];
+        try std.testing.expectEqualSlices(u8, fixture_chain[0], overlap_h1.backend.peer_chain[h1_entry.start..][0..h1_entry.len]);
+        try overlap_h1.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: a.tls-alpn-01.test\r\nConnection: close\r\n\r\n");
+        const raw = try overlap_h1.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(raw);
+        try assertContains(raw, "200");
+
         var overlap_http = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
         defer overlap_http.deinit();
         try std.testing.expectEqual(@as(u16, 200), overlap_http.status_code);
-        try waitForUpstreamCount(&upstream, 1, 2_000);
+        try waitForUpstreamCount(&upstream, 3, 2_000);
         try upstream.resetCapture();
     }
 
-    // `applicationDataOpen` is reached after the client constructs Finished;
-    // drive once more to flush it so the server can verify it and take its
-    // terminal challenge-close path.
-    _ = try client.record.drive();
+    // The challenge client's Finished was withheld the whole time: still
+    // queued, never delivered.
+    try std.testing.expect(client.record.queuedCiphertextLen() > 0);
+
+    // Release the barrier and flush Finished so the server verifies it and
+    // takes its terminal challenge-close path.
+    client.releaseHeldWrites();
+    {
+        const flush_deadline = compat.milliTimestamp() + 5_000;
+        while (client.record.queuedCiphertextLen() > 0) {
+            if (compat.milliTimestamp() >= flush_deadline) return error.WriteFailed;
+            _ = try client.record.drive();
+        }
+    }
 
     const served_entry = client.backend.peer_chain_entries[0];
     const served_leaf = client.backend.peer_chain[served_entry.start..][0..served_entry.len];

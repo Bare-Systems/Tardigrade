@@ -129,6 +129,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Check formatting
         run: zig fmt --check build.zig src/ tests/
@@ -249,6 +251,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Build appliance profile (no OpenSSL)
         run: zig build -Doptimize=ReleaseFast -Dtls-profile=appliance
@@ -294,6 +298,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Build general profile (default, no OpenSSL since #649)
         run: zig build -Doptimize=ReleaseFast -Dtls-profile=general
@@ -338,6 +344,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -402,6 +410,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Run reactor foundation tests
         run: zig build test-websocket-reactor --summary all --error-style verbose
@@ -448,6 +458,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -542,6 +554,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -581,6 +595,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Install Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -634,6 +650,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -680,6 +698,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -717,6 +737,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -766,6 +788,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -816,6 +840,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -888,6 +914,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1009,6 +1037,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1061,6 +1091,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Build gateway
         run: zig build -Dtls-profile=general
@@ -1086,6 +1118,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Build gateway
         run: zig build -Dtls-profile=general
@@ -1117,6 +1151,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1183,6 +1219,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1302,6 +1340,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Run experimental ACME unit tests
         run: zig build test-acme -Dacme-experimental --summary all --error-style verbose

@@ -77,6 +77,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Print platform and toolchain evidence
         run: |

@@ -40,6 +40,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Install wrk
         run: sudo apt-get update -qq && sudo apt-get install -y -qq wrk

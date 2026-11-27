@@ -29,6 +29,8 @@ jobs:
 
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Print validator versions
         run: |

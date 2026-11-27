@@ -41,7 +41,7 @@ runs:
       shell: bash
       env:
         ZIG_VERSION: ${{ inputs.version }}
-        ZIG_DOWNLOAD_MIRRORS: ${{ inputs.mirrors || vars.ZIG_DOWNLOAD_MIRRORS }}
+        ZIG_DOWNLOAD_MIRRORS: ${{ inputs.mirrors }}
       run: sh "$GITHUB_ACTION_PATH/../../../scripts/install-zig.sh" "$ZIG_VERSION" "$RUNNER_TEMP/tardigrade-zig"
 
     # Save immediately after verification, even if a later compilation/test

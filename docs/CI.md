@@ -196,11 +196,14 @@ Measured on 2026-11-27, macOS Darwin 25.3.0 ARM64, Zig 0.16.0:
 | Scope | Cold | Warm samples | Warm median |
 | --- | --- | --- | --- |
 | Local installer, official download | 11.802s | 6.326s, 6.168s, 6.120s | 6.168s |
+| Hosted Linux x86_64 | [5.704s](https://github.com/Bare-Systems/Tardigrade/actions/runs/46058840356/job/140707879301) | [4.384s](https://github.com/Bare-Systems/Tardigrade/actions/runs/46058840356/job/140707947238) | 4.384s (one sample) |
+| Hosted macOS ARM64 | [12.979s](https://github.com/Bare-Systems/Tardigrade/actions/runs/46058840298/job/140707936287) | [7.185s](https://github.com/Bare-Systems/Tardigrade/actions/runs/46058840356/job/140707947232) | 7.185s (one sample) |
 
 The local benchmark includes download on the cold run and SHA-256 verification,
 extraction, and version check on every run. It excludes GitHub cache transfer and
-step scheduling, so these numbers do **not** establish hosted runner latency.
-Hosted cold/warm results remain to be collected after the action runs in GitHub.
+step scheduling. The hosted samples include those costs and meet the warm-cache
+target on both measured platforms; they are individual observations, not a
+latency guarantee or a measurement of every supported runner architecture.
 
 ## Cost comparison (PR touching `src/`)
 

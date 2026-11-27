@@ -3,7 +3,7 @@
 # packaging/README.md for current packaging/distribution status.
 
 # debian:bookworm-slim, pinned by digest for reproducible builds.
-FROM debian@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5 AS build
+FROM debian@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2 AS build
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -27,7 +27,7 @@ RUN sh ./scripts/install-zig.sh 0.16.0 /opt/zig \
 RUN zig build -Doptimize=ReleaseFast -Dcpu=baseline
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
-FROM debian@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5 AS runtime
+FROM debian@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2 AS runtime
 
 # Fixed, documented numeric identity: compose.yaml and scripts/test-docker-image.sh
 # pin their tmpfs/ownership checks to these exact values. `useradd --system`

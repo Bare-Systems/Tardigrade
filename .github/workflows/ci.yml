@@ -128,7 +128,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Check formatting
         run: zig fmt --check build.zig src/ tests/
@@ -149,6 +151,9 @@ jobs:
 
       - name: Test CI mode detector and required-result gate (#806)
         run: ./scripts/test-ci-mode.sh
+
+      - name: Test Zig provisioning failure paths (offline)
+        run: python3 scripts/test-install-zig.py
 
       - name: Run shellcheck
         run: find scripts/ packaging/ tests/vectors/pki -name "*.sh" -exec shellcheck {} +
@@ -245,7 +250,9 @@ jobs:
         run: ./scripts/audit-release-binary.sh --self-test
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Build appliance profile (no OpenSSL)
         run: zig build -Doptimize=ReleaseFast -Dtls-profile=appliance
@@ -290,7 +297,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Build general profile (default, no OpenSSL since #649)
         run: zig build -Doptimize=ReleaseFast -Dtls-profile=general
@@ -334,7 +343,9 @@ jobs:
         run: sudo apt-get install -y libssl-dev
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -398,7 +409,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Run reactor foundation tests
         run: zig build test-websocket-reactor --summary all --error-style verbose
@@ -444,7 +457,9 @@ jobs:
         run: sudo apt-get install -y openssl libssl-dev
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -538,7 +553,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -577,7 +594,9 @@ jobs:
         run: sudo apt-get install -y openssl
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Install Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -630,7 +649,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -676,7 +697,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -713,7 +736,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -762,7 +787,9 @@ jobs:
         run: sudo apt-get install -y build-essential curl file git procps
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -812,7 +839,9 @@ jobs:
         run: sudo apt-get install -y wrk
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -884,7 +913,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1005,7 +1036,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1057,7 +1090,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Build gateway
         run: zig build -Dtls-profile=general
@@ -1082,7 +1117,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Build gateway
         run: zig build -Dtls-profile=general
@@ -1113,7 +1150,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1179,7 +1218,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1298,7 +1339,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Run experimental ACME unit tests
         run: zig build test-acme -Dacme-experimental --summary all --error-style verbose

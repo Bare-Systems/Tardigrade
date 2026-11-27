@@ -48,7 +48,9 @@ jobs:
         run: sudo apt-get install -y libssl-dev wrk nghttp2-client jq
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Cache Zig build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

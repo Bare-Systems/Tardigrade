@@ -28,7 +28,9 @@ jobs:
         run: sudo apt-get install -y openssl
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
+        with:
+          mirrors: ${{ vars.ZIG_DOWNLOAD_MIRRORS }}
 
       - name: Print validator versions
         run: |

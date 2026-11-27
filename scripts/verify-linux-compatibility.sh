@@ -77,7 +77,11 @@ docker run --rm --platform linux/amd64 \
     printf "tardi_version=%s\n" "$version_output"
     
     expected="$EXPECTED_VERSION (tls-profile=general, tls-backend=native)"
-    if [ "$version_output" != "$expected" ]; then
+    # Current binaries include source/build provenance; older published releases
+    # retain the original identity. Keep the version/profile/backend checks exact
+    # and require experimental ACME to be disabled when provenance is present.
+    identity=$(printf "%s\n" "$version_output" | sed -E "s/, commit=[^,()]+, acme-experimental=false\\)$/)/")
+    if [ "$identity" != "$expected" ]; then
         echo "unexpected tardi version identity" >&2
         echo "expected: $expected" >&2
         echo "actual:   $version_output" >&2

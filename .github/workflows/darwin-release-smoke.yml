@@ -17,6 +17,8 @@ on:
       - "build.zig"
       - "build.zig.zon"
       - "src/**"
+      - ".github/actions/setup-zig/**"
+      - "scripts/zig-checksums.txt"
       - "scripts/install-zig.sh"
       - "scripts/install.sh"
       - "scripts/test-install.sh"
@@ -85,7 +87,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
 
       - name: Print Zig version
         run: zig version

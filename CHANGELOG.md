@@ -4,6 +4,13 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- GitHub Actions now cache the complete Zig 0.16.0 distribution separately
+  from build artifacts, verify pinned official checksums on every install,
+  and support configurable HTTPS fallback mirrors, including Cloudflare R2.
+  Shared provisioning reports cold/warm timings without adding CI jobs.
+
 ## [0.9.1] - 2026-11-06
 
 ### Fixed

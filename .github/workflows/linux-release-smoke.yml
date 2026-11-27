@@ -17,6 +17,8 @@ on:
       - "build.zig"
       - "build.zig.zon"
       - "src/**"
+      - ".github/actions/setup-zig/**"
+      - "scripts/zig-checksums.txt"
       - "scripts/install-zig.sh"
       - "scripts/verify-linux-compatibility.sh"
       - "scripts/audit-release-binary.sh"
@@ -85,7 +87,7 @@ jobs:
 
       - name: Install Zig
         if: github.event_name != 'workflow_dispatch' || inputs.mode == 'full'
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
 
       - name: Print Zig version
         if: github.event_name != 'workflow_dispatch' || inputs.mode == 'full'

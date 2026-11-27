@@ -204,7 +204,7 @@ jobs:
         run: sudo apt-get install -y rpm
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
+        uses: $/.github/actions/setup-zig
 
       - name: Print Zig version
         run: zig version

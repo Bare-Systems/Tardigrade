@@ -112,6 +112,96 @@ gh workflow run ci.yml --ref <branch> -f mode=auto
 The full dispatch calls every full suite listed above. Obsolete runs of the
 same ref are cancelled (`cancel-in-progress`).
 
+## Zig toolchain provisioning
+
+All workflows that build from source use the shared composite action
+`.github/actions/setup-zig`. It restores the **complete official Zig 0.16.0
+distribution archive** before installation. The archive contains the compiler,
+standard library, headers, and runtime files; caching only the executable would
+not provide a working toolchain. Keeping the upstream `.tar.xz` avoids expanding
+and recompressing thousands of files in the Actions cache. Existing compilation
+caches (`.zig-cache` and `~/.cache/zig`) remain separate.
+
+The exact cache key is
+`zig-toolchain-v1-<version>-<runner.os>-<runner.arch>`, with no prefix matches or
+cross-platform restores. Linux and macOS support both x86_64 and ARM64. The
+installer verifies **every** archive, including restored cache hits, against the
+reviewed SHA-256 pins in `scripts/zig-checksums.txt`, sourced from the
+[official Zig download index](https://ziglang.org/download/index.json).
+It extracts into a temporary directory, checks `zig version`, then replaces the
+installation and adds it to PATH. Re-extraction also repairs missing or modified
+files from an earlier local installation. Downloads are bounded by connection,
+transfer, and low-speed timeouts, with one retry per source. Partial downloads
+and failed extractions are cleaned up. A corrupt cached archive is discarded and
+downloaded again; if an immutable Actions cache entry is corrupt, delete that
+specific key in GitHub's cache UI to prevent repeated downloads.
+
+### Fallback mirrors and Cloudflare R2
+
+Set the repository Actions **variable** `ZIG_DOWNLOAD_MIRRORS` to one HTTPS base
+URL per line, or supply the composite action's `mirrors` input. The installer
+tries `https://ziglang.org/download` first, then the configured mirrors in order
+after a failed download or checksum mismatch. Every source uses the same pinned
+checksum; no checksum is downloaded at runtime. A mirror must serve unmodified
+official archives at `BASE_URL/VERSION/ARCHIVE`, for example:
+
+```text
+https://zig-mirror.example.com/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
+```
+
+A public Cloudflare R2 bucket URL (`https://<bucket-public-id>.r2.dev`) or an R2
+custom domain works with this layout. Upload the official archives under the
+`0.16.0/` prefix and configure the base URL without the version or filename.
+No mirror is enabled by default; CI does not need bucket credentials.
+
+Local and Docker callers retain the existing interface and installation layout:
+
+```bash
+zig_dir=$(sh scripts/install-zig.sh 0.16.0) # default: .zig/0.16.0/zig-<target>-0.16.0
+export PATH="$zig_dir:$PATH"
+# Optional: ZIG_DOWNLOAD_MIRRORS=https://zig-mirror.example.com
+# Optional install root: sh scripts/install-zig.sh 0.16.0 /opt/zig
+```
+
+The archive is retained under `<install-root>/downloads/` for verified offline
+reuse. New versions require reviewed checksum pins before they can be installed.
+
+### Provisioning benchmarks
+
+Every invocation of the composite action reports `cold-cache` (Actions cache
+miss) or `warm-cache` (exact hit), platform, and elapsed seconds in the job log
+and step summary. Its `seconds` and `cache-hit` outputs are available to callers.
+The timer includes cache restore, checksum verification, extraction, version
+check, PATH setup, and cache save on a miss; it excludes later compilation and
+tests. Saving immediately after installation makes the toolchain reusable even
+when a later validation step fails. No benchmark jobs or matrix legs are added.
+
+To collect hosted cold/warm measurements, dispatch the existing full CI workflow
+on the same ref twice and compare the setup summaries on the same platform. An
+exact key must be absent for the first run to be cold; cache scope and concurrent
+jobs may produce a mixture of hits and misses. Full CI covers Linux x86_64/ARM64
+and macOS ARM64; its Darwin release-smoke matrix also covers Intel macOS. The
+warm-cache target is **under 15 seconds**, subject to runner/cache service
+performance; the timing is reported rather than used as a flaky validation gate.
+
+For an isolated local measurement with a fresh temporary install root:
+
+```bash
+python3 scripts/benchmark-zig-provisioning.py --warm-runs 3
+python3 scripts/test-install-zig.py # offline regression tests, also in CI's lint job
+```
+
+Measured on 2026-11-27, macOS Darwin 25.3.0 ARM64, Zig 0.16.0:
+
+| Scope | Cold | Warm samples | Warm median |
+| --- | --- | --- | --- |
+| Local installer, official download | 11.802s | 6.326s, 6.168s, 6.120s | 6.168s |
+
+The local benchmark includes download on the cold run and SHA-256 verification,
+extraction, and version check on every run. It excludes GitHub cache transfer and
+step scheduling, so these numbers do **not** establish hosted runner latency.
+Hosted cold/warm results remain to be collected after the action runs in GitHub.
+
 ## Cost comparison (PR touching `src/`)
 
 | Run | Approx. jobs/legs | Result | Wall clock | Billed runner minutes |

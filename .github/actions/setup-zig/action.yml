@@ -1,0 +1,79 @@
+name: Set up Zig
+description: Restore and verify the complete pinned Zig distribution, then add it to PATH.
+inputs:
+  version:
+    description: Zig version with reviewed pins in scripts/zig-checksums.txt
+    default: '0.16.0'
+  mirrors:
+    description: Newline-separated fallback HTTPS base URLs (BASE/VERSION/ARCHIVE)
+    default: ''
+outputs:
+  cache-hit:
+    description: Whether the exact toolchain archive was restored from the Actions cache
+    value: ${{ steps.cache.outputs.cache-hit }}
+  seconds:
+    description: Wall time including cache restore, verification, extraction, and cache save on a miss
+    value: ${{ steps.timing.outputs.seconds }}
+runs:
+  using: composite
+  steps:
+    - name: Resolve pinned distribution and start timer
+      id: distribution
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        echo "started=$(python3 -c 'import time; print(time.monotonic())')" >> "$GITHUB_OUTPUT"
+        archive=$(sh "$GITHUB_ACTION_PATH/../../../scripts/install-zig.sh" --print-cache-path "$ZIG_VERSION" "$RUNNER_TEMP/tardigrade-zig")
+        echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+    # Cache only the full official distribution archive, never .zig-cache or
+    # ~/.cache/zig. No prefix restore keys: OS, architecture, and version must match.
+    - name: Restore Zig distribution
+      id: cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.distribution.outputs.archive }}
+        key: zig-toolchain-v1-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Verify and install Zig
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+        ZIG_DOWNLOAD_MIRRORS: ${{ inputs.mirrors || vars.ZIG_DOWNLOAD_MIRRORS }}
+      run: sh "$GITHUB_ACTION_PATH/../../../scripts/install-zig.sh" "$ZIG_VERSION" "$RUNNER_TEMP/tardigrade-zig"
+
+    # Save immediately after verification, even if a later compilation/test
+    # fails. GitHub safely arbitrates concurrent jobs filling the same key.
+    - name: Save Zig distribution
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.distribution.outputs.archive }}
+        key: zig-toolchain-v1-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Report provisioning benchmark
+      id: timing
+      shell: bash
+      env:
+        STARTED: ${{ steps.distribution.outputs.started }}
+        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        ZIG_VERSION: ${{ inputs.version }}
+      run: |
+        python3 - <<'PY'
+        import os
+        import time
+
+        elapsed = time.monotonic() - float(os.environ['STARTED'])
+        state = 'warm-cache' if os.environ['CACHE_HIT'] == 'true' else 'cold-cache'
+        platform = f"{os.environ['RUNNER_OS']}/{os.environ['RUNNER_ARCH']}"
+        result = f"Zig {os.environ['ZIG_VERSION']} {platform} {state}: {elapsed:.3f}s"
+        print(result)
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+            output.write(f'seconds={elapsed:.3f}\n')
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+            summary.write(f'### Zig toolchain provisioning\n\n{result}\n\n')
+            summary.write('Includes cache restore, SHA-256 verification, extraction, version check, PATH setup, and cache save on a miss. ')
+            summary.write('Warm-cache target: under 15s; timings depend on runner and cache service performance.\n')
+        PY

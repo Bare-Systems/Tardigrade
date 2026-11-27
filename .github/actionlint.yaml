@@ -5,5 +5,5 @@
 paths:
   .github/workflows/**/*.{yml,yaml}:
     ignore:
-      - 'specifying (action|reusable workflow) "\$/\.github/(actions/ci-mode|workflows/[^\"]+)" in invalid format because ref is missing.*'
+      - 'specifying (action|reusable workflow) "\$/\.github/(actions/(ci-mode|setup-zig)|workflows/[^\"]+)" in invalid format because ref is missing.*'
       - 'reusable workflow call "\$/\.github/workflows/[^\"]+" at "uses" is not following the format.*'
